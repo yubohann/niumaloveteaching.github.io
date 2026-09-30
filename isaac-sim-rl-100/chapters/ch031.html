@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第031章 实现目标条件强化学习 | 机器人仿真学习课程 · Isaac Sim 强化学习训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 任务与技能实现</span>
+    <span class="sep">/</span>
+    <span>第 031 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 任务与技能实现</div>
+    <h1>第 031 章：实现目标条件强化学习</h1>
+    <p class="lead">让一个策略学会"到达任意目标"：把目标写进观测与奖励，再用 hindsight 重标记把每一次失败都变成一次"成功"。</p>
+    <ul class="meta">
+      <li>主题：任务实现 / 目标条件与稀疏奖励</li>
+      <li>相关组件：Isaac Sim、Stable-Baselines3（HER + SAC/TD3）</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 030 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解目标条件 MDP：策略 π(a|s,g) 与价值 V(s,g) 的形式，以及目标作为"输入的一部分"意味着什么。</li>
+      <li>掌握稀疏目标奖励的形式与它的学习困境：为什么 0/1 奖励会让 Q 值几乎无处可学。</li>
+      <li>吃透 hindsight experience replay（HER）：用"实际达成的目标"重标记轨迹，把失败转为成功样本的机制与数学。</li>
+      <li>会在 SB3 环境接口里表达 desired/achieved goal，并配置 HerReplayBuffer（future 策略、采样数）。</li>
+      <li>会调 HER 的三个关键参数（n_sampled_goal、goal_selection_strategy、稀疏奖励阈值）并诊断常见失败模式。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>到上一章为止，你的任务都有固定目标：把方块抬到指定高度、把力保持在 5 N。但真实的机器人要回答的是"把方块抬到<b>任意</b>指定高度"，目标本身就是任务的变量。<strong>目标条件强化学习（goal-conditioned RL, GCRL）把目标 g 提升为观测的一部分，一次训练覆盖一族任务。</strong>它带来的好处是复利式的：训练一个"把物体推到任意位置"的推块策略，就能当抓取、堆叠、装配任务的基础技能被反复调用；而本章要解决的核心困难也由此而来，目标一多，每个具体目标的经验就稀疏了。</p>
+    <p>稀疏目标奖励是最诚实的奖励：到达才算成功，其余全是 0。但 10 万条轨迹里可能一条都到不了目标，"成功"的经验量接近于零，Q 学习根本无从起步。<b>HER 用一个近乎"作弊"但理论上完全正当的翻转解决它：既然没到目标，那就改口说"其实我是想去到那里的"。</b>本章从原理到实现完整走一遍，第 039 章的推动任务会直接复用这套管线。</p>
+  </section>
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 目标条件 MDP：把任务族编进状态</h3>
+    <p>标准 MDP 里策略是 π(a|s)；目标条件 MDP 里，状态被拆成"物理状态"与"目标"两部分，策略变成 π(a | s, g)，价值变成 V(s, g)。<strong>g 在数学上没有引入新理论，把 (s, g) 拼起来就是一个更大的状态，一切 RL 算法照常工作。</strong>它的价值在工程上：一个策略覆盖一族任务；它的代价也在工程上：状态空间比原来大得多，且只有目标附近的数据对当前目标是"有用样本"。</p>
+    <p>目标的表达方式决定一切：</p>
+    <table>
+      <tr><th>目标空间</th><th>例子</th><th>奖励度量</th><th>特点</th></tr>
+      <tr><td>状态目标</td><td>关节角向量、物体位姿</td><td>欧氏距离</td><td>最平滑、HER 最有效</td></tr>
+      <tr><td>任务空间目标</td><td>末端目标位置、物体目标点</td><td>加权距离</td><td>与控制解耦，常与位置增量动作搭配</td></tr>
+      <tr><td>图像目标</td><td>目标状态的一张照片</td><td>像素距离 / 学到的嵌入距离</td><td>容易在图像空间"自欺"（距离不反映真实接近度）</td></tr>
+    </table>
+
+    <h3>2. 稀疏奖励与它的"零点问题"</h3>
+    <p>最常用的目标奖励是稀疏二值式：</p>
+    <div class="formula">
+      r<sub>t</sub> = 1， 若 ‖φ(s<sub>t</sub>) − g‖ ≤ ε；  否则 r<sub>t</sub> = 0
+      <span class="note">φ 是从状态到目标空间的映射（投影函数）；ε 是成功阈值（如 5 cm）</span>
+    </div>
+    <p>它的问题可以用一句话概括：<strong>如果探索永远到不了 ε 邻域，Q 函数的所有目标值都是 0，梯度全都是 0，学习信号不存在。</strong>随机策略在 1 m³ 的目标空间里命中 5 cm 球域的概率约 0.5‰，按 60 Hz 采样平均也要约两千步才碰到一次。塑形（距离负值 −‖φ(s)−g‖）能提供梯度，但它把"走得离目标近"与"到达目标"混为一谈，在第 039 章推块任务里会看到：距离塑形的策略倾向于停在目标旁边不进阈值。GCRL 的现代答案：<b>用稀疏奖励 + HER 解决稀疏性，用距离塑形做辅助信号（可选）</b>。</p>
+
+    <h3>3. HER 的核心：把"达成"重新定义</h3>
+    <p>HER 出自 Andrychowicz 等人的工作，思想只有两句话：<b>(1) 一条轨迹无论去哪，它事实上到达的终点 φ(s<sub>T</sub>) 就是一个"被达成了的目标"；(2) 把这条轨迹的目标重写为它实际到达的位置，那么这条轨迹就是一条成功轨迹。</b>形式化地：对 episode 里第 t 步 transition (s<sub>t</sub>, a<sub>t</sub>, r<sub>t</sub>, s<sub>t+1</sub>, g)，重标记为：</p>
+    <div class="formula">
+      g′ = φ(s<sub>t+k</sub>)，  k ≥ 1（future 策略）；  r′ = 1[ ‖φ(s<sub>t+1</sub>) − g′‖ ≤ ε ]
+      <span class="note">用轨迹中"未来某时刻"真实达到的状态当目标，并据它重算奖励，这条 transition 就变成了成功样本</span>
+    </div>
+    <p>为什么这不算自欺欺人？从最优性看：策略在"重标记目标"下的行为（实际轨迹）是次优的吗？恰恰相反，在重标记后的目标下它就是成功的走法。数学上的保证：优化"对任意目标 g′ 的期望回报"时，任何一条轨迹都对其实际达成的目标有正贡献，<strong>重标记只改变了"哪条轨迹对哪个目标有用"的归属，没有捏造未发生的事实</strong>。它把"失败样本"重新分配到"一个它确实擅长的任务"上，从而让成功信号从 0 变成"每条轨迹一次"。</p>
+
+    <h3>4. future 策略：为什么目标要取自"未来"</h3>
+    <p>重标记时目标怎么选：<b>future</b>，只能取同一 episode 中 t 之后的时刻；<b>episode</b>，整条轨迹任意时刻；<b>random</b>，全缓冲区任意状态。future 是最稳的默认：取未来状态保证"从当前状态出发，几步之内确实能达成该目标"（因果正当）；若取过去状态，重标记的目标可能已经在身后，当前动作无法"达成"它，奖励几乎全是 0，反而有害。future 策略天然还学习"从现在到不久将来的可达性"，这对控制任务正是需要的能力。</p>
+
+    <h3>5. 算法搭配与采样结构</h3>
+    <p>HER 是回放缓冲层的方法，必须搭配支持任意 transition 重标记的 off-policy 算法：SAC 或 TD3（连续控制）、DQN 系（离散）。为什么不能用 PPO？on-policy 数据用完即弃，没有回放缓冲区可供重标记。<strong>GCRL + HER + SAC + 并行环境是仿真操作任务的标准配方</strong>；SB3 的 <code>HerReplayBuffer</code> 直接支持这项组合。需要注意采样率：HER 的采样目标是"以成功目标为中心"的经验，每条原始轨迹可以派生出多条重标记样本（n_sampled_goal 通常 4–8），这等于把数据的"有效密度"在目标空间里扩了一圈。</p>
+
+    <h3>6. 完整算例：HER 的成功样本密度核算</h3>
+    <p>HER 的收益可以用一个可复算的模拟量化。设定：回合 50 步、物体平均步进 2 cm、成功阈值 ε=5 cm、future 策略（t 均匀取 0 到 T−2，k 均匀取 t+1 到 T）。对随机抽出的 20 万组 (t, k) 计算重标记样本的判定：</p>
+    <table>
+      <tr><th>指标</th><th>数值</th><th>含义</th></tr>
+      <tr><td>判定成功的重标记样本占比</td><td>约 22%</td><td>t+1 时刻的位置已落在"未来目标"的 5 cm 内</td></tr>
+      <tr><td>恰为"达成步"的占比</td><td>约 9%</td><td>k = t+1，这一步正好把目标做成，标准的成功 transition</td></tr>
+      <tr><td>随机策略直接命中随机目标的概率</td><td>约 0.05%</td><td>1 m³ 空间里 5 cm 球域的量级（前节结论）</td></tr>
+      <tr><td>有效成功密度提升</td><td>约两个数量级</td><td>22% 对 0.05%</td></tr>
+    </table>
+    <p>三个读法。<strong>第一，HER 的"翻转"带来的是一次系统性的重分配</strong>：每条轨迹的每个时刻都成了"某个可达目标"的样本，T=50 的轨迹贡献 50 个候选目标（对第 t 步而言，未来 49 个时刻的状态都可作它的目标）。<strong>第二，成功判定窗口的宽度由速度决定</strong>：物体步进 2 cm 时，5 cm 阈值让"达成前 2.5 步"的样本也判成功，这意味着成功样本里相当一部分是"还差一步到"的样本，它们提供了关键的"最后冲刺"梯度。<strong>第三，n_sampled_goal=4 的写入成本要按四倍算</strong>：8 个并行环境 × 50 步 × 4 条派生 = 每回合 1600 条 transition 入缓冲，几百万步的训练对应上亿次写入，缓冲区容量与写入带宽是实打实的开销。</p>
+
+    <h3>7. 阈值的上下界与"提前成功"窗口</h3>
+    <p>ε 不是越小越精确，它有一个由运动速度决定的功能区间。以物体步进 v 计，目标在 ε 距离内被判成功，等价于"最多提前 ε/v 步宣告成功"：v=2 cm/步、ε=5 cm 时提前 2.5 步；ε 收到 2 cm 则提前 1 步，但正样本率按 (0.02/0.05)³ ≈ 6.4% 缩水，训练早期几乎无正样本；ε 放大到 20 cm，提前量涨到 10 步，策略只要"朝目标方向冲"就能拿成功，推块任务退化成"大概到达"。<strong>取值纪律：先用"任务要求精度的 2–3 倍"起步，训练稳定后收紧一档再微调，每次收紧都重新观察正样本率与最终定位误差。</strong>评估时用收紧后的严格阈值测，训练用宽松阈值学，这个"训练宽、评估严"的错位是常见做法，但要在实验记录里写清楚，否则复现实验的人会把两个数字混谈。</p>
+
+    <h3>8. 边界与失效模式</h3>
+    <ul>
+      <li><strong>穿过式成功（hit-and-run）</strong>：位置型目标只要求"某一帧落在 ε 球内"，策略可以学会用最快速度冲过目标而不停留。判据：检查成功回合的末速与末位置，若"通过速度高、不停留"，说明任务定义漏了保持要求。修复：成功条件加"N 帧连续在 ε 内"或"末速低于阈值"。</li>
+      <li><strong>开局即成功</strong>：目标采样若允许落在物体初始位置附近，回合在第一步就判定成功，成功率虚高且未被学习。修复：采样时拒绝与初始状态距离小于 2ε 的目标。</li>
+      <li><strong>目标分布的域外评估缺失</strong>：只在训练分布内测，会把"对熟悉目标的记忆"当成目标条件能力。边界值：新目标成功率与熟悉目标相差 10–15 个点以内才算学到了目标条件行为（设计框的标准）。</li>
+      <li><strong>超时样本被当终止丢弃</strong>：回合尽头"最接近目标"的样本恰是最有价值的重标记素材；若框架按终止语义处理超时，这部分样本无法参与重标记。修复：确认 <code>handle_timeout_termination=True</code> 一类开关已启用，并核对超时回合的样本确实进入缓冲。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p><strong>实现路线："定义目标空间 → 观测表达目标 → 稀疏奖励与成功判定 → 接口向 HER 暴露 desired/achieved → 配置回放缓冲与训练器"。</strong>SB3 的 HER 要求环境用字典观测，键名约定固定。</p>
+    <ol>
+      <li><strong>定目标空间</strong>：Push 任务用物体目标位置 (x,y,z) 三维；Reach 用末端目标位置。写清楚坐标帧：世界系还是机器人基座系？<b>用基座系可避免机器人整体平移时目标跟着漂</b>。</li>
+      <li><strong>观测表达</strong>：<code>observation</code>（策略真正看到的）= 物理状态 + desired_goal + achieved_goal 三块拼接；<code>achieved_goal</code> = 当前物体位置；<code>desired_goal</code> = 本回合目标。SB3 靠键名 <code>"observation" / "achieved_goal" / "desired_goal"</code> 来重标记。</li>
+      <li><strong>奖励与成功</strong>：<code>compute_reward(achieved, desired, info)</code> 单点函数：距离 ≤ ε 给 0（或 1），否则 −1；终止 = 成功命中。</li>
+      <li><strong>接口约束</strong>：观察字典模式下，策略输入用 <code>"observation"</code> 键，HER 缓冲用后两个键重算奖励；两者必须来自同一物理状态，不能各算各的。</li>
+      <li><strong>训练器配置</strong>：SAC + HerReplayBuffer；<code>n_sampled_goal=4</code>（每原始 transition 派生 4 条重标记），<code>goal_selection_strategy="future"</code>；并行数从 64–256 起步（off-policy 训练节奏不同于 PPO）。</li>
+    </ol>
+    <table>
+      <tr><th>参数</th><th>推荐值</th><th>理由</th></tr>
+      <tr><td>成功阈值 ε</td><td>5 cm（推块）/ 3 cm（Reach）</td><td>接近任务精度的量级；太小几乎无正样本，太大任务变水</td></tr>
+      <tr><td>奖励形式</td><td>0 / −1（命中/未命中）</td><td>与 HER 重标记配合最干净；负值让"拖步"有成本</td></tr>
+      <tr><td>n_sampled_goal</td><td>4</td><td>样本密度与缓冲写入成本的平衡；任务难时可加到 8</td></tr>
+      <tr><td>goal_selection_strategy</td><td>future</td><td>因果正当性最强；episode/random 只作对照实验</td></tr>
+      <tr><td>缓冲大小</td><td>1e6 条（含重标记）</td><td>目标空间的覆盖需要大量样本；显存不足时降 n_sampled_goal</td></tr>
+      <tr><td>回合长度</td><td>50 步（推块）</td><td>够完成一次推动又不会稀释重标记的目标范围</td></tr>
+    </table>
+    <div class="box warn">
+      <span class="box-title">警告：目标别放进"物理状态"的同一个向量里随意拼接</span>
+      <p>把目标直接塞进 <code>observation</code> 而不拆出 <code>achieved/desired</code> 键，程序能跑，但 HER 就失去了重标记的抓手，它需要能单独读写 goal 分量。可以正常训练但退化成"每个目标各学一套"：训练集里的目标泛化不了新目标。<strong>判断标准：换一个训练时没见过的目标，成功率掉不超过 10–15 个点，才算真学到了目标条件策略。</strong></p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：目标条件环境的接口表达</strong></p>
+    <pre class="code"><code>import numpy as np
+import gymnasium as gym
+from gymnasium import spaces
+
+class PushGoalEnv(gym.Env):
+    """推块的目标条件接口：重点是三个观测键与 compute_reward 的语义"""
+    def __init__(self, num_blocks=1, eps=0.05):
+        self.eps = eps                                # 成功阈值 5 cm：任务精度的量级
+        # achieved_goal：物体当前 xyz；desired_goal：目标 xyz
+        self.observation_space = spaces.Dict({
+            "observation": spaces.Box(-np.inf, np.inf, shape=(16,)),
+            "achieved_goal": spaces.Box(-np.inf, np.inf, shape=(3,)),
+            "desired_goal": spaces.Box(-np.inf, np.inf, shape=(3,)),
+        })
+        self.action_space = spaces.Box(-1.0, 1.0, shape=(7,))   # 7 维连续：调腕部位置
+
+    def _get_obs(self):
+        achieved = self._object_pos()                 # (3,) 真实物理状态：唯一事实来源
+        obs = np.concatenate([self._proprio(), achieved, self.goal])  # 状态+达成+目标
+        return {"observation": obs, "achieved_goal": achieved.copy(),
+                "desired_goal": self.goal.copy()}
+
+    def reset(self, *, seed=None, options=None):
+        super().reset(seed=seed)
+        self._reset_scene()
+        self.goal = self._sample_goal()               # 回合目标：从工作区内随机采
+        return self._get_obs(), {}
+
+    def compute_reward(self, achieved, desired, info):
+        d = np.linalg.norm(achieved - desired, axis=-1)
+        return -(d &gt; self.eps).astype(np.float32)     # 到达 0，未到 -1：稀疏且带步数成本</code></pre>
+    <p>解读：这份接口每处都对接着一个下游需求。<b>为什么 achieved_goal 每次都要 <code>copy()</code>？</b>HER 会把历史期望的目标存进缓冲区，如果目标与 achieved 共享同一块内存，后续状态更新时缓冲区里的"历史目标"会被悄悄改写，重标记数据全被污染，训练诡异失败。这是 SB3 生态最经典的引用 bug。<b>compute_reward 的签名为什么是 (achieved, desired, info)、不去直接读环境状态？</b>因为 HER 重标记时它会被以"虚拟的 achieved/desired"调用，重标记在数据层发生，此时环境早已前进，函数必须只依赖传进来的两个向量，绝不能偷读 <code>self._object_pos()</code>。把这条纪律写进 docstring，能防止未来的自己顺手改坏它。<b>状态里同时放 achieved 与 goal 是否冗余？</b>不冗余：策略需要知道"当前在哪、目标在哪、各自差多少"；把差值 (desired − achieved) 也显式放进 observation 是个好习惯，网络不必做减法。</p>
+
+    <p><strong>片段 2：HER 训练器配置</strong></p>
+    <pre class="code"><code>from stable_baselines3 import SAC
+from stable_baselines3.her import HerReplayBuffer
+from stable_baselines3.common.vec_env import DummyVecEnv
+
+vec_env = DummyVecEnv([lambda: PushGoalEnv() for _ in range(8)])   # 8 个并行实例
+
+model = SAC(
+    "MultiInputPolicy",              # 字典观测必须用 MultiInputPolicy
+    vec_env,
+    replay_buffer_class=HerReplayBuffer,
+    replay_buffer_kwargs=dict(
+        n_sampled_goal=4,            # 每条原始 transition 派生 4 条重标记样本
+        goal_selection_strategy="future",   # 目标只取同回合的未来时刻：因果正当
+        handle_timeout_termination=True,    # 超时不算真终止：保证末尾样本可重标记
+    ),
+    learning_rate=3e-4,
+    batch_size=256,
+    tau=0.05,                        # 目标网络软更新：SAC 的标准配置
+    gamma=0.99,
+    buffer_size=1_000_000,           # off-policy 且目标空间大：缓冲要管够
+    learning_starts=10_000,          # 先灌数据再开训：HER 的前 1 万步大多是"达成目标"
+    train_freq=1,
+    device="cuda",
+)
+model.learn(total_timesteps=2_000_000)
+# 评估纪律：目标从"训练分布内"采 (熟悉区) 与"分布外"采 (泛化区) 各测一组</code></pre>
+    <p>解读：配置里三个参数值得逐一说透。<b>handle_timeout_termination=True 不是可选项</b>：默认语义把"超时"当终止处理，超时帧的 next-obs 不会进入重标记，回合尾部的样本被浪费；更重要的是，超时若被当作真终止，HER 无法用它达成过的状态做重标记，恰好损失了"最接近目标的那些步"。<b>learning_starts=10_000 的含义在 GCRL 里与普通任务不同</b>：普通任务这只是"预热"，而 HER 场景下这 1 万步是"用实际轨迹把目标空间铺开"的过程，每条轨迹都会贡献一个它达成的目标，等重标记开始运作，缓冲里已经有几千个可达目标了。<b>batch_size 与 n_sampled_goal 的关系要算清</b>：每个 batch 项都可能来自重标记，真实采样量乘以 4；显存与计算量都按这个算。最后评估那行注释是 GCRL 特有的纪律：<strong>只在训练分布里测成功率的"成绩"是虚的，泛化到新目标才是目的。</strong></p>
+
+    <p><strong>片段 3：把 HER 思路下沉到并行环境的采样层（可选进阶）</strong></p>
+    <pre class="code"><code>def relabel_batch(episode, n_sample=4, eps=0.05, rng=None):
+    """教学版的 HER 重标记：对一条 episode 生成若干 (obs, g', r', next_obs, done')"""
+    T = len(episode["achieved"])            # 该回合收集到的步数
+    samples = []
+    for _ in range(n_sample):
+        t = rng.integers(0, T - 1)          # 随机选一个时间点 t（留出 t+1）
+        k = rng.integers(t + 1, T)          # future 策略：目标取 t 之后时刻的状态
+        g_new = episode["achieved"][k]      # 用"未来真实达成"的状态当新目标
+        d = np.linalg.norm(episode["achieved"][t + 1] - g_new)
+        r_new = 0.0 if d &lt;= eps else -1.0   # 按新目标重算奖励：只有"真的达成"才算成功
+        samples.append((t, g_new, r_new))   # t 时刻的 (obs, action) 复用，目标与奖励替换
+    return samples
+    # 并行环境下每条环境轨迹都可独立重标记：8 环境 × 每步 4 条派生样本
+    # 重标记比例、缓冲区写入量与显存要一起估算；本片段是理解用，生产用 SB3 的缓冲实现</code></pre>
+    <p>解读：这个教学实现把 HER 的每处细节暴露出来，值得对照 SB3 的封装理解。<b>t 与 k 的约束（k &gt; t）</b>是 future 策略的全部秘密：目标必须来自"当前状态之后"，重标记后的 transition 才物理可行。<b>奖励用 t+1 时刻的 achieved 判定</b>，因为 transition 的奖励属于"执行 a<sub>t</sub> 之后"这一刻；用 t 时刻判定会造成一步的因果错位。<b>done' 的重算常被遗漏</b>：原 episode 里的终止标志是针对旧目标算的（比如"物体被推出界"），重标记后要按新目标重新判定成功终止；不重算的话，缓冲区里会留下"任务成功但 done=1 被当作失败"的矛盾样本，TD 目标值系统性偏负，Q 函数被悄悄毒化。这段代码在生产环境的用途是<b>当 SB3 的 HerReplayBuffer 因并行/自定义观测不便接入时的替代方案</b>；无论哪条路，"重算奖励 + 重算 done + 目标取未来"三件套缺一不可。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>achieved_goal 没复制引用</strong>：历史目标在缓冲区里被后续状态更新改写，重标记数据全部污染。症状：训练损失诡异波动、成功率远低于预期。修复：所有观测字典里的 goal 分量用 <code>.copy()</code> 独立存储。</li>
+      <li><strong>compute_reward 偷读环境内部状态</strong>：签名正确但函数体里读了 <code>self.object_pos</code>。HER 重标记时它返回的是"当前真实物理状态"的距离，与传入的虚拟目标无关，重标记奖励全错。症状：训练初期看着正常，后期 Q 值发散。修复：函数体只用传入的 achieved/desired。</li>
+      <li><strong>done 不随重标记重算</strong>：缓冲区里残留"按旧目标算的成功终止"，TD 目标系统性偏差。症状：价值估计偏低、策略保守。修复：重标记时按新目标重新判定终止。</li>
+      <li><strong>ε 阈值设得太小</strong>：2 cm 的目标球域在 1 m³ 空间里正样本率不足万分之一，HER 的"翻转"样本也几乎全是失败。症状：成功率长期为 0 且毫无上升趋势。修复：ε 先从任务精度的 2–3 倍起步（如目标 2 cm 精度先取 ε=5 cm），收敛后再收紧。</li>
+      <li><strong>用 PPO 硬配 HER</strong>：on-policy 数据不下放缓冲区，HER 无从重标记。症状：代码报错或重标记静默失效。修复：换 SAC/TD3；或改用"目标课程"（第 032 章）来手工制造可达目标。</li>
+      <li><strong>穿过式成功不被发现</strong>：策略全速穿过目标球域，成功帧转瞬即逝，训练与评估都把它当成功。症状：成功率尚可但任务质量差（物体被撞飞、停不住）。修复：成功条件加连续帧保持或末速要求，并在日志里记录成功时刻的速度。</li>
+      <li><strong>目标与初始状态重叠</strong>：采样出的目标离起点小于 2ε，回合首帧即成功，污染成功率统计并给 Q 函数灌入"无动作成功"样本。修复：拒绝采样，或把"起点—目标距离"的最小值写进环境断言。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>定量题：工作空间 1 m³，成功阈值 ε=5 cm。随机目标下"随机策略命中"的概率量级是多少？如果 ε 提高到 10 cm、成功率会变几倍？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>球体积占比 ≈ (4/3)π×0.05³ ≈ 5×10⁻⁴；(0.1/0.05)³=8 倍。这解释了稀疏奖励为什么必须配 HER 或课程。</div></details>
+      </li>
+      <li>对比实验：goal_selection_strategy 设为 future / episode / random 各训练一次，从"重标记样本的成功率"与"最终任务成功率"两个指标解释差异。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>episode/random 会把"过去时刻"的状态设成目标，重标记后当前动作无法达成它，正样本率下降，观察三条曲线的分叉点。</div></details>
+      </li>
+      <li>消融实验：把 compute_reward 偷换成"读环境当前状态"的错误实现（故意引入 bug），观察训练曲线的症状，并说明为什么"初期正常、后期发散"。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>早期缓冲区小、重标记少，错误影响弱；重标记比例上升后奖励与真实转移不匹配，Q 目标噪声积累，这恰好是"静默错误"的教科书样本。</div></details>
+      </li>
+      <li>设计一个"目标泛化评估协议"：训练时目标采自工作区中央 60% 的立方体区域，评估时测三组（同分布 / 边缘 / 分布外角落），给出一份 3×2 的评估矩阵模板并预测哪组掉点最多。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>分布外角落最可能掉点（训练时没见过）；同时测"熟悉目标"与"新目标"两类，量化泛化差距，别只看平均成功率。</div></details>
+      </li>
+      <li>思考题：HER 的重标记目标取"未来状态"，请从因果推断角度论证：为什么"把失败轨迹重标记为对另一个目标的成功"不会让策略学到错误的行为？<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>策略学的是"哪个动作能让我离任意目标更近"的条件分布；重标记只把样本重新分配到它实际擅长的那类目标上，它优化的是"对目标集合的期望回报"，不改变任何一条转移的物理事实。</div></details>
+      </li>
+      <li>用 6 节的方案做一次小模拟：设物体步进速度改为 5 cm/步、ε 仍为 5 cm，用 10 行 Python 复算"判定成功的重标记样本占比"与"提前成功窗口"。解释结果对"推块任务速度上限"的隐含约束。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>v=0.05 时成功窗口收窄到 k−t ≤ 2：占比从 22% 降到约 16%，其中"恰好达成步"仍占约 9%；真正变严的是"提前成功"的缓冲只剩一两步，慢速任务里那种"接近即判成"的稠密信号消失了。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>GCRL 把目标 g 并入状态：一个策略覆盖一族任务；观测字典用 desired/achieved 两个键为 HER 留出重标记抓手。</li>
+      <li>稀疏奖励 r = −1[d &gt; ε] 最诚实但正样本极稀；HER 用"未来达成的状态"重标记目标，把每条轨迹变成对某个目标的成功样本。</li>
+      <li>future 策略（k &gt; t）是默认选择：因果正当、可达性最强；三件套纪律：重算奖励、重算 done、goal 分量独立复制。</li>
+      <li>算法搭配：SAC/TD3 + HerReplayBuffer；n_sampled_goal=4、buffer 1e6、learning_starts 1 万步铺目标空间。</li>
+      <li>下一章解决"目标太多、起点太难"的另一半问题：课程学习，从简单目标到困难目标的分级训练机制。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch030.html">← 第 030 章：实现接触检测与奖励</a>
+    <a class="next" href="ch032.html">第 032 章：实现课程学习 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

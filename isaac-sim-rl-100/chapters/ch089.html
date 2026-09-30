@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第089章 实现动态抓取 | 机器人仿真学习课程 · Isaac Sim 强化学习训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第四篇 · 控制与优化</span>
+    <span class="sep">/</span>
+    <span>第 089 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第四篇 · 控制与优化</div>
+    <h1>第 089 章：实现动态抓取</h1>
+    <p class="lead">目标不再等你：传送带上的工件、被抛出的盒子、来来往往的零件箱。动态抓取要在毫秒级的时间窗口里完成"提前启动、速度匹配、闭爪"，本章讲清拦截点、动量匹配与训练课程。</p>
+    <ul class="meta">
+      <li>主题：控制与优化 / 高动态操作</li>
+      <li>相关组件：Isaac Sim / Isaac Lab / Stable-Baselines3</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 088 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解动态抓取与静态抓取的本质差别：时间窗口、动量匹配与提前启动（anticipation）。</li>
+      <li>会计算"拦截点"：在机器人速度限制与目标运动预测下求解可行的抓取位置与时刻。</li>
+      <li>会设计含速度匹配塑形的奖励，并解释为什么"追着目标跑"是错误的策略形态。</li>
+      <li>会搭建带噪声速度估计、课程学习与成功率评估的动态抓取训练流程。</li>
+      <li>能诊断追击行为、稀疏奖励学不会、抓取瞬间冲击过大等常见问题。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 037 章教过静态抓取：物体静止等你从容伸手。工厂的现实却常常相反，工件在传送带上匀速前进（0.2–0.5 m/s），机械臂必须"在运动中接住"；再激进一点，协作机器人接抛件、空中无人机挂载，甚至要在物体下落的零点几秒里完成闭合。<strong>动态抓取把"能不能抓到"从几何问题变成了时空问题</strong>。</p>
+    <p>它与第 082 章的时间最优、第 086 章的姿态控制一脉相承：极限速度、精确位姿、严格时序的组合。学习方法的独特价值在于：精确的物理预测（摩擦、形变、抓取瞬间的滑动）难以建模，而 RL 可以从历史观测里隐式学到"何时该动"。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 时间窗口：为什么"快点伸手"不够</h3>
+    <p>设目标以速度 v<sub>t</sub> 匀速运动，机械臂末端最大速度 v<sub>max</sub>、最大加速度 a<sub>max</sub>。从静止启动、能以最短时间到达前方某点，要求"加速、达到速度、拦截"三段可行。简化计算（忽略减速，抓取时不需要停）：</p>
+    <div class="formula">
+      加速到 v<sub>max</sub> 需距离 d<sub>acc</sub> = v<sub>max</sub>²/(2a<sub>max</sub>) 与时间 t<sub>acc</sub> = v<sub>max</sub>/a<sub>max</sub>
+      <span class="note">若目标在 d 距离外、以 v_t 迎面而来，机器人必须在剩余时间 d/(v_max+v_t) 内完成加速与接触</span>
+    </div>
+    <p>代入数字：v<sub>max</sub>=1 m/s、a<sub>max</sub>=5 m/s²、d=0.5 m、v<sub>t</sub>=0.3 m/s。接近时间约 0.5/1.3≈0.38 s，加速到满速要 0.2 s、耗距 0.1 m，时间够用，但只剩约 0.18 s 余量给减速与闭爪。<strong>窗口的紧张程度决定：动态抓取必须提前启动。</strong></p>
+
+    <h3>2. 拦截点：把瞄准点放在"未来"</h3>
+    <p>静态抓取瞄准当前位姿；动态抓取要瞄准拦截点 p*：目标在 t* 时刻将到达的位置，且机器人能在 t* 前到达。最简单的匀速直线情形：</p>
+    <div class="formula">
+      p*(t*) = p<sub>0</sub> + v<sub>t</sub>·t*，&nbsp; 满足 ‖p*(t*) − p<sub>robot</sub>(0)‖ ≤ 可达速度 × t*
+      <span class="note">取满足条件的最小 t*（最早拦截）；若不等式无解，该目标物理上抓不到，别浪费算力训练</span>
+    </div>
+    <p>注意 p* 不能只算一次：机器人一旦运动，拦截点会随新观测更新（滚动时域）。工程做法是<strong>每个控制步重算拦截点并作为观测送给策略</strong>，策略学的是"贴着不断刷新的目标走"，固定轨迹复现在这里行不通。</p>
+
+    <h3>3. 动量匹配：抓取瞬间的相对速度</h3>
+    <p>接触瞬间，如果末端与目标速度差 Δv 很大，冲击力约为 F ≈ m·Δv/(Δt<sub>contact</sub>)。数字：m=0.2 kg、Δv=1 m/s、接触时间 5 ms，则 F ≈ 40 N，超过很多协作机器人的末端承受力，工件会被"拍飞"。因此理想的接触条件是：</p>
+    <div class="formula">
+      ‖v<sub>ee</sub> − v<sub>target</sub>‖ → 0 （沿接近方向的分量最关键）
+      <span class="note">不需要完全一致：法向分量差应 &lt; 0.1 m/s，切向可略大</span>
+    </div>
+    <p>这条约束彻底改变了策略形态：<strong>策略的目标从"冲到目标点"变为"以目标的速度到达目标点"</strong>。它通常要求比纯粹的到点运动提前更多开始减速微调，因为还要把自身速度"调整成匹配值"。</p>
+
+    <h3>4. 可抓性：什么速度范围能抓</h3>
+    <p>把以上合成一个可抓性判断（训练前的任务设计依据）：目标速度 v<sub>t</sub> 越大，要求的末端 v<sub>max</sub> 越大；抓取窗口（目标经过工作空间的时间）越短，对加速度与决策频率要求越高。基本量级：</p>
+    <table>
+      <tr><th>目标速度</th><th>抓取难度</th><th>需要的末端能力</th><th>典型应用</th></tr>
+      <tr><td>≤0.2 m/s</td><td>低（可视为准静态）</td><td>v_max ≥ 0.5 m/s</td><td>慢速传送带上料</td></tr>
+      <tr><td>0.3–0.5 m/s</td><td>中（需要拦截）</td><td>v_max ≥ 1.0 m/s；60 Hz 决策足够</td><td>分拣线、包装线</td></tr>
+      <tr><td>0.8–1.5 m/s</td><td>高（需要预测+速度匹配）</td><td>v_max ≥ 2 m/s；建议 100+ Hz 或前馈</td><td>高速分拣、抛接</td></tr>
+      <tr><td>&gt; 2 m/s</td><td>极高（飞行抓取）</td><td>接近人手臂的加速度；建议专用机构</td><td>机器人接抛杂技</td></tr>
+    </table>
+    <p>先确认任务在"可抓区"，再谈训练。让 RL 去学一个物理上没有可行解的任务，是失败调试最常见的原因。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <ol>
+      <li><strong>任务设定</strong>：传送带上匀速移动的方块（0.2–0.4 m/s），基座固定的 6–7 DoF 机械臂，末端两指夹爪。成功判据：夹爪闭合时目标中心在指间（容差 ±2 cm）且相对速度 &lt;0.15 m/s。</li>
+      <li><strong>观测</strong>：目标相对位置与速度（由视觉估计，加噪声）、拦截点相对末端位置、末端位置/速度、最近两帧目标位置（帮助策略校准噪声）。速度估计用 3 帧最小二乘，不要单帧差分。</li>
+      <li><strong>动作</strong>：末端笛卡尔速度指令（含大范围行程）或直接关节速度；建议先速度指令 + 底层 IK，稳定后再试力矩。</li>
+      <li><strong>奖励</strong>：三段式，接近段 r<sub>1</sub>=−‖p<sub>ee</sub>−p*‖；末段（&lt;10 cm）加 r<sub>2</sub>=−‖v<sub>ee</sub>−v<sub>target</sub>‖；接触成功 +1、掉落 −1、超时 −1。速度匹配项只在末段激活，否则策略学会"全程慢速"。</li>
+      <li><strong>课程</strong>：目标速度 0.1 → 0.2 → 0.4 m/s；初始距离由近到远；闭爪时机容差由宽到窄（±80 ms → ±30 ms）。</li>
+      <li><strong>评估</strong>：成功率（按窗口分层）、抓取瞬间相对速度分布（均值与 P90）、时序误差（闭爪时刻与理想时刻差）、以及"空中追跑"的失败模式占比。</li>
+    </ol>
+    <div class="box key">
+      <span class="box-title">设计思维：为什么把"拦截点"算好直接给策略？</span>
+      <p>目标位置的历史、速度估计、机器人自身状态足以联合预测拦截点，网络理论上能学会，但要让 MLP 从数据里重新发现"匀速外推"这个简单规律，需要大量样本。而拦截点计算由几行运动学代码就能给出，是<strong>把已知的物理先验直接喂给策略</strong>的典型做法。真正需要学习的是：噪声下的修正、机器人在达到拦截点途中的微调、以及闭爪时机的判断，这些恰好是解析式最没把握的部分。（第 089 章与第 093 章的多机器人拦截共用同一原则。）</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：拦截点求解与可抓性判断</strong></p>
+    <pre class="code"><code>import numpy as np
+
+def intercept_point(p_target, v_target, p_robot, v_robot_max, a_robot_max,
+                    t_horizon=1.5, dt=1.0 / 60.0):
+    """求最早可行的拦截点：目标匀速、机器人从静止加速到达。
+    返回 (p_intercept, t_intercept, feasible)。"""
+    best_t, best_p, feasible = None, None, False
+    t = dt
+    while t &lt;= t_horizon:
+        p_future = p_target + v_target * t             # 目标在 t 后的位置
+        d = np.linalg.norm(p_future - p_robot)         # 机器人要走的距离
+        # 时间 t 内、从静止加速可达的最大距离（先加速后匀速的梯形简化）
+        t_acc = v_robot_max / a_robot_max              # 加速耗时
+        if t &lt;= t_acc:
+            d_reach = 0.5 * a_robot_max * t * t        # 纯加速段
+        else:
+            d_reach = 0.5 * a_robot_max * t_acc ** 2 + v_robot_max * (t - t_acc)
+        if d_reach &gt;= d:                               # 该时刻来得及：最早解
+            best_t, best_p, feasible = t, p_future, True
+            break
+        t += dt
+    return best_p, best_t, feasible
+</code></pre>
+    <p>解读：这是"抓未来"的数学实现：把目标的未来轨迹参数化，寻找最早满足"机器人可达"的时刻。<code>feasible</code> 的用途贯穿整个训练，若早期的目标速度让这个函数长期返回 False，说明任务设定错了（机械臂速度不够），应先调整任务，调奖励解决不了物理可达性。注意 <code>d_reach</code> 的梯形简化：真实的多关节机械臂可达域是三维的、还受姿态约束，工程上更精确的做法（可达性球近似或采样验证）留给你自己扩展。返回的拦截点每步重算、实时更新，不做一次性固化。</p>
+
+    <p><strong>片段 2：速度匹配奖励与动态抓取的成功判定</strong></p>
+    <pre class="code"><code>class DynamicGraspEnv:
+    """传送带动态抓取：接近 → 速度匹配 → 闭爪。奖励三段式。"""
+
+    def __init__(self, num_envs, v_match_gain=2.0, close_band=0.10):
+        self.v_match_gain = v_match_gain     # 速度匹配权重：与距离项同量级标定
+        self.close_band = close_band         # 末段判定半径 10 cm：只有近距才要求匹配
+
+    def compute_reward(self, p_ee, v_ee, p_tgt, v_tgt, p_intercept,
+                       gripper_closed, success, drop, time_scale=0.01):
+        import torch
+        d_int = torch.linalg.norm(p_intercept - p_ee, dim=-1)
+        r_approach = -torch.clamp(d_int, max=1.0)         # 接近拦截点，截断防主导
+        # 末段：只对"距离已经近"的步施加速度匹配，避免全程要求低速
+        near = d_int &lt; self.close_band
+        dv = torch.linalg.norm(v_ee - v_tgt, dim=-1)
+        r_match = torch.where(near, -self.v_match_gain * dv, torch.zeros_like(dv))
+        # 结果项：抓住 +1、掉到地上 -1、超时由外部给 -1
+        r_outcome = (success.float() * 1.0) + (drop.float() * -1.0)
+        return r_approach + r_match + r_outcome - time_scale
+
+    def check_success(self, gripper_closed, p_grasp, p_tgt, v_ee, v_tgt):
+        import torch
+        # 闭爪且目标在指间 ±2 cm，且相对速度 &lt; 0.15 m/s：三项同时成立
+        in_grasp = torch.linalg.norm(p_grasp - p_tgt, dim=-1) &lt; 0.02
+        slow = torch.linalg.norm(v_ee - v_tgt, dim=-1) &lt; 0.15
+        return gripper_closed &amp; in_grasp &amp; slow
+</code></pre>
+    <p>解读：三段式的每一段都有"防退化"设计。<code>clamp(d_int, max=1.0)</code> 截断接近项：目标远时误差 50 cm 与 90 cm 不该有 40 cm 的梯度差（那会把策略推向"先退远"的怪解）。<code>near</code> 条件把速度匹配限制在末段，否则策略发现"全程慢慢走"最省速度匹配惩罚，这是动态抓取最常见的病态形态。<code>v_match_gain=2.0</code> 的量纲换算：0.1 m/s 的相对速度误差与 10 cm 的距离误差"等重"。成功判定三项缺一不可：夹爪闭合但没夹住（目标擦过）、夹住但速度不匹配（下一秒滑脱）都不算成功，<strong>只在"抓稳"的物理条件下给稀疏奖励，策略才会学出真正的稳接</strong>。</p>
+
+    <p><strong>片段 3：从带噪视觉估计目标速度</strong></p>
+    <pre class="code"><code>import numpy as np
+
+class TargetTracker:
+    """用最近 3 帧位置做最小二乘速度估计：比单帧差分抗噪。"""
+    def __init__(self, history=3, dt=1.0 / 30.0):
+        self.buf = []                       # 存 (t, pos)；视觉 30 Hz
+        self.dt = dt
+
+    def update(self, pos, t):
+        self.buf.append((t, np.asarray(pos, dtype=float)))
+        if len(self.buf) &gt; 3:
+            self.buf.pop(0)
+
+    def velocity(self):
+        if len(self.buf) &lt; 2:
+            return None                     # 样本不足：调用方给零速度或保持上一值
+        ts = np.array([b[0] for b in self.buf])
+        ps = np.stack([b[1] for b in self.buf])        # (k, 3)
+        # 最小二乘拟合 p = p0 + v·t：对每维解斜率，噪声被平均衰减
+        A = np.stack([np.ones_like(ts), ts - ts[0]], axis=1)   # (k, 2)
+        coef, *_ = np.linalg.lstsq(A, ps, rcond=None)
+        return coef[1]                                  # 斜率即速度估计
+</code></pre>
+    <p>解读：为什么不用后向差分：单帧差分把像素/定位噪声放大 √2/dt 倍，30 Hz 下 dt=33 ms，1 mm 噪声变成约 0.043 m/s 的速度噪声，与目标速度 0.3 m/s 同量级，策略会被噪声带偏。3 帧最小二乘把噪声标准差压到约 0.021 m/s（衰减 2 倍），且外推平稳；代价是时间对齐（视觉帧率与控制帧率不同步），<code>update</code> 里显式存时间戳就是为此。<code>velocity()</code> 在样本不足时返回 <code>None</code>；零速度会让"目标是否在动"的语义错误，宁可让调用方处理"未知"状态。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>策略学会"追着目标跑"</strong>：观测只给目标当前位置，最优策略会退化成追逐（永远差一步）。症状是轨迹拖在目标后面。修复：观测给拦截点/预测位置，接近奖励对准拦截点，不要对准当前位置。</li>
+      <li><strong>速度匹配项全程激活</strong>：策略学到"全程龟速"（速度永远接近 0，也"匹配"了慢目标）。修复：只在末段 (<code>near</code>) 激活匹配项，并给时间税。</li>
+      <li><strong>单帧差分估速度</strong>：噪声放大导致策略对虚假速度反应。修复：多帧最小二乘或卡尔曼滤波。</li>
+      <li><strong>稀疏奖励 + 无课程</strong>：初始速度就取 0.4 m/s，发现"抓住"的概率近乎零，价值函数学不动。修复：速度与距离课程，成功率 &gt;70% 再升一档。</li>
+      <li><strong>夹爪闭合时机无信号</strong>：闭爪动作没有被"错过窗口"惩罚，策略学会"一直闭着爪"。修复：过早闭合（目标还在 5 cm 外）与过晚都要有惩罚，闭爪时机要能被观测到（时间/距离特征）。</li>
+      <li><strong>机器人力矩/速度上限不真实</strong>：仿真里给 π rad/s 的关节速度，真机只有一半，训练出的策略"扑"得太快。修复：按真机连续指标设定限幅，并在域随机化中缩小 10%–20%。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>用片段 1 计算：v_max=1.0 m/s、a_max=5 m/s²、目标速度 0.3 m/s、起始距离 0.6 m 时的拦截点与时间；再把 a_max 减半，看是否仍可行。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>把 d_reach 公式独立算一遍：加速段耗距 0.1 m、其余匀速；检查剩余时间是否足够。不可行的情形应触发"任务参数需要调整"的警告。</div></details>
+      </li>
+      <li>对比训练：观测给"目标当前位置" vs 给"拦截点"，记录成功率与末端轨迹与目标的横向距离。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>追击型策略的末端轨迹会平行拖在目标后方 5–15 cm；拦截型会斜插向目标前方。把两条轨迹画在同一张时空图上最直观。</div></details>
+      </li>
+      <li>把速度匹配权重 v_match_gain 设为 0、2、10 各训练一次，记录抓取瞬间相对速度分布与成功率。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>权重太小：接触冲击大、成功率低；太大：到得太慢、错过窗口。用（成功率，相对速度 P90）两栏对比找平衡。</div></details>
+      </li>
+      <li>把闭爪容差从 ±80 ms 收紧到 ±30 ms，预测并验证成功率变化，解释决策频率 60 Hz（16.7 ms/步）带来的量化下限。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>±30 ms 相当于约 2 个控制步的容错；容差小于 2×16.7 ms 时成功率会因离散化断层下降，这是"控制频率决定时序精度上限"的直接证据。</div></details>
+      </li>
+      <li>设计实验：验证策略是否学会"提前启动"。把目标速度从 0 突然跳到 0.3 m/s，记录末端开始运动的时刻相对于目标出现时刻的延迟。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>好的拦截策略在目标出现后 1–3 步内启动（不等待"确认"）；若启动延迟随目标速度增大而增大，说明策略在用反馈补偿，预测成分不足。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>动态抓取的核心是时空问题：时间窗口由机器人加速度/速度上限与目标速度共同决定，务必先做可抓性判断。</li>
+      <li>拦截点 p* 是"目标未来位置 ∩ 机器人可达域"的最早解；每步滚动更新并作为观测，避免策略退化成追击。</li>
+      <li>动量匹配决定接触质量：F ≈ m·Δv/Δt，法向相对速度要压到 &lt;0.1 m/s；速度匹配奖励只在末段激活。</li>
+      <li>速度估计用多帧最小二乘抗噪；成功判定必须"夹住 + 慢速"双条件；课程从慢到快、从近到远。</li>
+      <li>下一章从"抓"升级到"用"：多指手在掌内旋转、重定向物体，动作维度与接触模式都复杂得多，见第 090 章。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch088.html">← 第 088 章：实现视觉伺服</a>
+    <a class="next" href="ch090.html">第 090 章：实现灵巧手操作 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

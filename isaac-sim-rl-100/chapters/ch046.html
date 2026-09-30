@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第046章 实现机械臂轨迹跟踪 | 机器人仿真学习课程 · Isaac Sim 强化学习训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 任务与技能实现</span>
+    <span class="sep">/</span>
+    <span>第 046 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 任务与技能实现</div>
+    <h1>第 046 章：实现机械臂轨迹跟踪</h1>
+    <p class="lead">让机械臂末端沿着时间参数化的参考轨迹走：用相位时钟把"跟踪"变成稳定的问题，用测地线姿态误差定义奖励，用"IK 前馈 + 小残差 RL"的组合把样本效率提上台阶。</p>
+    <ul class="meta">
+      <li>主题：任务实现 / 末端轨迹跟踪</li>
+      <li>相关组件：Isaac Sim / Isaac Lab / Stable-Baselines3（PPO）/ PyTorch</li>
+      <li>预计学时：50 分钟</li>
+      <li>前置章节：第 045 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解轨迹跟踪与"到达目标点"的本质区别：参考量是时间的函数，误差要沿时间轴考核。</li>
+      <li>会设计相位时钟（τ、cos/sin）与参考速度观测，并解释它们为什么把非平稳误差变成平稳信号。</li>
+      <li>掌握姿态误差的正确度量：相对旋转 + 测地线距离，理解四元数双重覆盖带来的符号翻转陷阱。</li>
+      <li>会用傅里叶级数构造可解析求导的循环轨迹，并说明为什么循环轨迹比点对点轨迹更适合 RL。</li>
+      <li>能写出"IK 前馈 + 残差 RL"的组合动作结构，并调好残差缩放量级。</li>
+      <li>会用 RMS 误差、最大误差、相位滞后三个指标评估跟踪质量（平均奖励只作辅助）。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>上一章的双足在时间轴上完成"支撑—摆动"的周期运动，本章的机械臂则在空间里完成"沿轨迹运动"。轨迹跟踪是工业机器人最基础也最苛刻的能力：焊接、涂胶、打磨、切割，全部要求末端沿预定路径以受控速度走过，精度动辄 0.5–2 mm，有的工艺还要求匀速（速度波动影响涂层厚度）。传统方案是逆解出关节轨迹再逐点跟踪，成熟但对动力学误差、负载变化鲁棒性有限；RL 的介入点在于：把跟踪做成一族可泛化的技能，让策略对轨迹形状、负载、执行器偏差都有适应力。</p>
+    <p>本章要讲清三件事：轨迹怎么参数化才"可喂给网络"、姿态误差怎么度量才不产生伪梯度、以及为什么"先 IK 前馈、再让 RL 学残差"是工程上最省样本的组合。这些知识会直接服务于第 047、048 章的力控与柔顺控制，那两章里轨迹不再自由，需要贴着接触面走。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 跟踪问题的时间结构：相位时钟为什么关键</h3>
+    <p>目标点任务里，参考量是一个常数；跟踪任务里，参考量是时间的函数 r(t)。如果观测只给"当前参考位置"，策略面临一个困境：同样的观测值在轨迹的不同时段出现（比如圆上对称的两点），<strong>要做的动作却不同</strong>，它需要知道"现在走到哪了"。解决办法是把相位放进观测：</p>
+    <div class="formula">
+      τ = (t mod T) / T ∈ [0, 1), &nbsp; 观测用 (cos 2πτ, sin 2πτ)
+      <span class="note">T 为轨迹周期；cos/sin 编码避免 τ 在 1→0 处的数值跳变</span>
+    </div>
+    <p>加入相位后有三重收益。第一，问题从"非平稳"变成"平稳"：同一个相位对应的参考位姿固定，"τ→动作"的映射可以稳定学习。第二，<strong>误差信号变成可预测的</strong>：策略能学会"相位 0.7 处轨迹拐弯，我要提前加一点前馈"，这正是相位滞后（phase lag）的来源与修复点。第三，奖励可以按相位分段设计（加速段/匀速段/减速段），这对工艺轨迹非常有用。</p>
+
+    <h3>2. 轨迹的时间参数化与傅里叶表示</h3>
+    <p>一条好喂给网络的轨迹需要"位置 + 速度 + 加速度"都容易拿到。傅里叶级数是天然选择：</p>
+    <div class="formula">
+      p(τ) = c<sub>0</sub> + Σ<sub>k</sub> [a<sub>k</sub>·cos(2πkτ) + b<sub>k</sub>·sin(2πkτ)]
+      <span class="note">圆取 k=1，八字取 k=1,2 组合；速度是把系数乘 2πk/T 后的同族级数</span>
+    </div>
+    <p>为什么采用傅里叶表示，"插值出一堆点再差分求速度"有什么问题？差分会把数值噪声放大进速度（除以 dt 放大 1/dt 倍），而傅里叶的导数有解析式，速度、加速度都精确光滑。另一个实际好处是：<strong>轨迹只需要几个系数就能随机化</strong>，改 c<sub>0</sub> 是平移，改 a<sub>k</sub>、b<sub>k</sub> 是变形状与尺度，训练时每回合随机一组系数，策略就学会了跟踪整个轨迹族，泛化面从一条曲线扩展到一片形状空间。</p>
+    <p>轨迹的时间尺度要注意频率约束：控制回路（50 Hz）能有效跟踪的轨迹频率通常不超过 1/10 控制频率。轨迹周期 4 s 的圆（频率 0.25 Hz）对应速度 0.19 m/s、离心加速度 0.3 m/s²，是很好的入门难度；周期缩到 0.6 s（1.7 Hz）时离心加速度涨到 13 m/s²，已经超出常见机械臂末端的加速度能力。</p>
+
+    <h3>3. 姿态误差：为什么必须用测地线距离</h3>
+    <p>姿态误差最朴素的写法是"参考四元数与当前四元数逐元素相减"，这是错的。四元数空间是单位球面 S³，两个姿态之间的"距离"应该沿球面测地线度量：</p>
+    <div class="formula">
+      R<sub>err</sub> = R<sub>ref</sub><sup>T</sup>·R<sub>cur</sub>, &nbsp; θ = arccos[(tr(R<sub>err</sub>) − 1) / 2] ∈ [0, π]
+      <span class="note">θ 为两姿态之间的最小旋转角；误差向量 e<sub>rot</sub> = θ · u（u 为旋转轴）</span>
+    </div>
+    <p>用四元数实现时有一个著名陷阱：q 与 −q 表示同一个姿态，但逐元素相减会把它们当成"距离 2"。工程做法是先把相对四元数的实部取绝对值（把符号统一到短弧），再转成旋转向量（rotvec）作为 3 维误差输出。这样做的收益是<strong>梯度方向始终指向最短旋转路径</strong>；若不处理符号，策略会在某些姿态附近收到指向"绕远路"的梯度，表现为训练后期出现突然的姿态翻转抖动。</p>
+
+    <h3>4. 奖励：钟形核与三种误差的权重</h3>
+    <p>跟踪奖励的基本形式是钟形核：</p>
+    <div class="formula">
+      r = w<sub>p</sub>·exp(−‖e<sub>pos</sub>‖<sup>2</sup>/σ<sub>p</sub><sup>2</sup>) + w<sub>o</sub>·exp(−‖e<sub>rot</sub>‖<sup>2</sup>/σ<sub>o</sub><sup>2</sup>) − w<sub>v</sub>·‖v − v<sub>ref</sub>‖<sup>2</sup>
+      <span class="note">典型：σ<sub>p</sub> = 5 mm，σ<sub>o</sub> = 0.1 rad，w<sub>p</sub> : w<sub>o</sub> : w<sub>v</sub> = 1 : 0.5 : 0.05</span>
+    </div>
+    <p>为什么用指数核，平方罚有什么问题？指数核在误差小于 σ 时近似平坦（"够好就不折腾"），超过 σ 后快速衰减到零（"差太多就没梯度了"），它教策略"先做对，再做好"，平方罚在误差大时梯度也大，训练早期会把大量梯度花在根本达不到的参考点上，收敛速度被拖慢。参考速度误差项 ‖v − v<sub>ref</sub>‖² 负责"准时"：只有位置对、速度也对，才算真正跟上节奏；单靠位置误差追赶的"滞后跟随"不算。</p>
+
+    <h3>5. IK 前馈 + 残差 RL：把 90% 的工作交给经典方法</h3>
+    <p>纯 RL 从零学跟踪的样本效率很差，它要同时学"逆运动学、动力学补偿、时钟跟随"三件事。工程上的标准组合是：用逆运动学（第 034 章）把参考轨迹解成关节轨迹作为前馈；让 RL 只输出一个<strong>小残差</strong>叠加在前馈上，负责补偿动力学偏差、负载与执行器差异。残差缩放的量级：平移 ±2 mm、旋转 ±0.05 rad，比误差容差略大，刚好够"纠偏"，又小到不会破坏前馈结构。神经网络的输出经过 tanh 或 clip 后乘缩放系数即可。</p>
+
+    <h3>6. 数值算例：圆轨迹的速度、加速度与滞后误差预算</h3>
+    <p>以设计里的圆轨迹（半径 r = 0.12 m）为例，把几个周期的关键量列出来：周期 6 s 时角频率 ω = 1.047 rad/s，线速度 v = rω = 0.126 m/s，离心加速度 a<sub>c</sub> = rω² = 0.13 m/s²；周期 4 s 时为 0.19 m/s 与 0.30 m/s²；周期 2 s 时为 0.38 m/s 与 1.18 m/s²；周期 0.8 s 时为 0.94 m/s 与 7.4 m/s²；周期 0.6 s 时为 1.26 m/s 与 13.2 m/s²。<b>加速度按 ω² 增长：周期缩短一半，离心加速度涨 4 倍。课程把周期从 6 s 收到 0.8 s，等于把动力学负荷从 0.13 提到 7.4 m/s²，约 56 倍</b>，各档之间的难度增量并不均匀，这是"末尾几档最容易卡住"的数学原因。周期随机化 ±30% 时，最难档 0.8 s 会下探到 0.62 s，加速度约 12 m/s²，设计时必须确认末端加速度能力覆盖这个上界，否则参考轨迹本身不可跟踪。</p>
+    <p>滞后误差的预算更值得算。只靠误差反馈的跟踪器，等效一阶时间常数 0.1 s 时，在 0.19 m/s 的圆上产生的位置滞后约 v·τ = 18.8 mm，是位置容差 5 mm 的 3.8 倍；反推容差，要把滞后压进 2 mm 需要有效时间常数低于 2/188 ≈ 10.6 ms。<b>这组数字说明"仅靠反馈必然滞后"，把 IK 前馈与参考速度放进动作与观测，等价于把大部分滞后从回路里预先消掉</b>，这也解释了残差结构的分工：前馈负责"准时"（消除系统性滞后），残差负责"修正"（吸收模型误差与扰动）。评估里的"相位滞后"指标正是这条滞后在误差-相位图上的直接体现：误差向量的方向与参考速度方向相差一个近似恒定的角度时，滞后在数值上就等于该角度除以 ω。</p>
+    <p>轨迹频率约束"不超过控制频率的 1/10"也可以核算：50 Hz 控制、周期 0.8 s（1.25 Hz）时每圈 40 个决策步，轨迹被 40 个位姿点采样，曲率最剧烈处相邻两点的姿态差仍在网络的表达范围内；周期收到 0.25 s（4 Hz）时每圈只剩 12.5 个决策步，等效于用十几个离散点逼近圆，参考轨迹自身的"台阶感"就会进入误差统计。<b>把 1/10 的规则翻译成执行层的语言：每周期至少 10 个决策步，跟踪才有意义；低于这条线时，误差的主导项是参考信号的离散化程度，与控制器质量无关。</b>残差输出的周期性同样受这条约束：策略在 50 Hz 上更新残差，能修正的最高频率约为 5 Hz，恰好覆盖课程全部轨迹档位，再快的扰动交给底层位置伺服。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>搭建轨迹跟踪环境的完整流程：</p>
+    <ol>
+      <li><strong>场景</strong>：Franka 类 7 自由度机械臂，基座固定；末端参考点取 TCP（tool center point）。桌面放一个标记圆环用于可视化参考轨迹，不求参与物理。</li>
+      <li><strong>轨迹库</strong>：三类循环轨迹，圆（周期 2–6 s）、八字（李萨如 k=1,2）、方形逼近（傅里叶前 5 阶）。每回合随机：形状、中心位置 ±5 cm、尺度 0.6–1.4 倍、周期 ±30%。</li>
+      <li><strong>控制</strong>：策略 50 Hz、仿真 200 Hz（decimation=4）；末端动作走位姿伺服接口（第 034 章），底层仍是指令关节角。第一个版本建议直接给关节角残差，避开坐标系转换。</li>
+      <li><strong>观测</strong>（约 38 维）：相位 cos/sin（2）、参考位置（3）、参考速度（3）、当前末端位置（3）、当前末端速度（3）、姿态误差旋转向量（3）、关节角与关节速度（14）、上一步动作（7）。</li>
+      <li><strong>奖励</strong>：位置钟形核 σ<sub>p</sub>=5 mm、姿态钟形核 σ<sub>o</sub>=0.1 rad、速度误差平方罚、关节点速度平滑项；不设"完成奖励"，跟踪没有终点，持续在轨就是全部。</li>
+      <li><strong>课程</strong>：周期从 6 s 逐步缩短到 0.8 s（等价于轨迹速度从 0.06 m/s 提到 0.8 m/s），尺度从 0.5 倍放到 1.4 倍，每档要求 RMS 位置误差小于 8 mm。</li>
+      <li><strong>评估</strong>：稳态段（去掉前 0.5 s 的启动瞬态）的 RMS 位置误差、最大位置误差、相位滞后（误差向量与参考速度的相关时延）。三项一起看才能区分"误差大"与"反应慢"。</li>
+    </ol>
+    <table>
+      <tr><th>方案</th><th>样本效率</th><th>最终精度</th><th>适用</th></tr>
+      <tr><td>纯关节空间 RL</td><td>低（数千万步）</td><td>一般（RMS 5–15 mm）</td><td>研究、端到端学习</td></tr>
+      <tr><td>IK 前馈 + 残差 RL</td><td>高（百万步级）</td><td>高（RMS 1–3 mm）</td><td>工程首选</td></tr>
+      <tr><td>纯 IK 前馈</td><td>无需训练</td><td>受动力学误差限制</td><td>低速、轻载场景</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计思维：为什么循环轨迹比点对点更适合作为第一版任务？</span>
+      <p>循环轨迹的统计特性平稳：圆上每个位置都会被反复经过，误差分布很快收敛，PPO 的回报估计方差小。点对点运动每回合只发生一次加减速，90% 的时间在"启动/停止"这两个最难的瞬态里，学习信号稀疏且高方差。先用循环轨迹把"在轨跟踪"练稳，再叠加启停段，是更稳的课程顺序。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：傅里叶循环轨迹与相位时钟</strong></p>
+    <pre class="code"><code>import numpy as np
+
+class CyclicTrajectory:
+    # 傅里叶级数表示：p = c0 + a1*cos(w t) + b1*sin(w t)，系数可随机化出"一族轨迹"
+    # 关键是速度/加速度都有解析导数：不用差分，避免噪声被 1/dt 放大
+    def __init__(self, center, radius=0.12, period=4.0):
+        self.center = np.asarray(center, dtype=np.float32)  # 轨迹中心（工作空间内）
+        self.radius = float(radius)
+        self.period = float(period)                         # 周期越大速度越小
+        self.omega = 2.0 * np.pi / self.period
+
+    def sample(self, t):
+        tau = (t % self.period) / self.period               # 相位 [0,1)，进观测
+        phase = 2.0 * np.pi * tau
+        # 位置：圆轨迹取 k=1 项
+        p = self.center.copy()
+        p[0] += self.radius * np.cos(phase)
+        p[1] += self.radius * np.sin(phase)
+        # 速度：位置对时间求导，系数多一个 omega（前馈/观测都要用）
+        v = np.zeros(3, dtype=np.float32)
+        v[0] = -self.radius * self.omega * np.sin(phase)
+        v[1] = self.radius * self.omega * np.cos(phase)
+        clock = np.array([np.cos(phase), np.sin(phase)], dtype=np.float32)
+        return p, v, clock</code></pre>
+    <p>解读：这个类只有 20 行，但它体现了轨迹表示的三条原则。第一，<strong>相位是独立输出</strong>：τ 与 (cos 2πτ, sin 2πτ) 同时可用，前者用于内部逻辑（比如判断是否处于瞬态段），后者直接进观测。第二，<strong>速度有解析式</strong>：速度系数是位置系数乘 ω，这是傅里叶表示独有的便利，换成正弦叠加的其它参数化（比如 B 样条）就得自己实现导数。第三，"中心 + 半径 + 周期"三个标量即可随机化整族轨迹，训练时每回合随机采样这三个量，策略自然学会对轨迹中心、大小、快慢的泛化。注意 <code>t % self.period</code> 的取模保证 t 无限增长时相位仍然有界，不要用累加的浮点时间直接算 cos（长时间运行后会有精度漂移）。</p>
+
+    <p><strong>片段 2：测地线姿态误差（含四元数符号处理）</strong></p>
+    <pre class="code"><code>def pose_tracking_error(p_cur, q_cur, p_ref, q_ref):
+    # 位置误差：欧氏向量，方向指向"该往哪修正"
+    e_pos = np.asarray(p_ref, dtype=np.float32) - np.asarray(p_cur, dtype=np.float32)
+
+    # 姿态误差：先算相对旋转 q_err = conj(q_ref) * q_cur（参考系下的偏差）
+    q_rel = quat_multiply(quat_conjugate(q_ref), q_cur)
+    # 四元数双重覆盖：q 与 -q 是同一姿态。取实部为正值，把误差统一到"短弧"
+    if q_rel[3] &lt; 0.0:
+        q_rel = -q_rel
+    # 转成旋转向量（rotvec）：方向 = 最短旋转轴，长度 = 最小旋转角（弧度）
+    e_rot = quat_to_rotvec(q_rel)
+    return e_pos, e_rot</code></pre>
+    <p>解读：这 10 行的每一行都在防一个具体的 bug。第一行到第二行：相对旋转的方向约定很容易搞反，写成 q_cur * conj(q_ref) 就是"世界系下的误差"，而 conj(q_ref) * q_cur 是"参考系下的误差"。两者物理含义不同：奖励里直接算范数看不出差别，但如果你把误差向量接进观测或用作动作方向，坐标系搞反会让"修正方向"完全错误。第三行到第五行：符号处理是重中之重。<code>quat_to_rotvec</code> 内部会把旋转角归一化到 [0, π]，前提是输入四元数实部非负；如果跳过这个 if，q_rel 实部为负时得到的旋转向量长度接近 2π，与真实的微小偏差（趋近 0）完全不符，误差范数突然"爆炸"，策略受到的惩罚与姿态偏差完全不成比例。这类 bug 的典型症状是"训练到某个阶段损失突然尖刺一下又恢复"。</p>
+
+    <p><strong>片段 3：IK 前馈 + 策略残差的目标位姿合成</strong></p>
+    <pre class="code"><code>def compose_residual_target(policy_out, ik_solution, pos_scale=0.002, rot_scale=0.05):
+    # policy_out 通常已经过 tanh，取值范围 [-1,1]，6 维 = 平移 3 + 旋转 3
+    delta = np.clip(np.asarray(policy_out, dtype=np.float32), -1.0, 1.0)
+
+    # 平移残差：限幅 ±2 mm。比跟踪容差（5 mm）略小：够纠偏，不够"另起炉灶"
+    p_target = np.asarray(ik_solution["p"]) + delta[:3] * pos_scale
+
+    # 旋转残差：转成小角度旋转向量再右乘到 IK 姿态上（先修正、后叠加，顺序不能反）
+    q_delta = quat_from_rotvec(delta[3:] * rot_scale)      # 限幅 ±0.05 rad
+    q_target = quat_multiply(np.asarray(ik_solution["q"]), q_delta)
+
+    # 位置与姿态都交给位姿伺服（第 034 章），底层曲线仍是关节角指令
+    return p_target, q_target</code></pre>
+    <p>解读：残差结构的三个关键决定都在缩放上。平移到 ±2 mm 的理由：课程里跟踪容差在 5 mm 量级，残差若大于容差，策略就可以"用残差覆盖前馈"，退化成纯 RL 学跟踪，样本效率优势消失；残差若小于 1 mm，策略连动力学误差（负载变化下 2–5 mm）都补不回来。旋转残差 ±0.05 rad（约 3°）同理对应姿态容差 0.1 rad 的另一半。第二个细节是合成顺序：<strong>q_target = q_ik ⊗ q_residual</strong>（右乘），表示"在 IK 给出的姿态基础上，沿其自身坐标系再转一个小角度"；写成左乘就是把修正加到世界系里，大姿态变化下两者差异明显。第三个细节：整套结构里 RL 的作用是"补差"，所以评估时要单独看"残差量"的统计，若残差长期贴着 ±2 mm 饱和，说明前馈或负载模型有系统误差，应该先修前馈；加大残差范围只会把系统性偏差藏起来。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>观测缺相位</strong>：只给参考位置时，圆轨迹上对称两点观测相同、动作不同，策略学出折中行为，轨迹变成"画椭圆"。症状是误差与相位明显相关（某几个相位误差总是大）。修复：相位 cos/sin 必须进观测。</li>
+      <li><strong>姿态误差用四元数线性差</strong>：训练后期出现姿态抖动或绕远路旋转。修复：用相对四元数 + 符号统一 + rotvec 的测地线误差（片段 2），并写单元测试：同一姿态误差从不同方向接近，误差范数必须连续。</li>
+      <li><strong>轨迹速度超出能力</strong>：周期定得太短，离心加速度超过末端加速度上限，参考轨迹物理上不可跟踪，策略无论怎么训 RMS 误差都下不去。修复：先测末端最大加减速度，再按 a<sub>c</sub> = rω² 反推最小周期。</li>
+      <li><strong>奖励全用平方罚</strong>：早期误差 3–5 cm 时梯度太大，策略在第一阶段就"用力过猛"产生振荡。修复：位置/姿态用指数核，速度误差才用平方罚。</li>
+      <li><strong>残差缩放过大</strong>：残差范围 ±5 cm 以上时，策略学会用残差"重画"轨迹，训练退化成端到端，样本效率崩塌。症状是残差分布长期贴边。修复：残差限幅到手头跟踪容差量级，并监控残差饱和率。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把姿态误差换成四元数逐元素差的范数，训练后观察姿态抖动与收敛步数变化。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>逐元素差在 q 与 −q 附近不连续，误差信号会出现"假尖峰"。观察损失曲线是否出现周期性尖刺，以及末端姿态是否有高频抖动。</div></details>
+      </li>
+      <li>把参考速度从观测里删掉，预测并验证相位滞后（误差最大处集中在轨迹哪一段）。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>没有速度参考，策略只能靠位置误差"追着走"，在轨迹曲率最大处（圆的四个 45° 方向）误差应明显增大，并系统性滞后一个固定相位。</div></details>
+      </li>
+      <li>设计残差缩放扫描实验：pos_scale 取 0、1、2、5 mm 四档，画出"训练步数—最终 RMS 误差"的关系，找出拐点并解释。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>pos_scale=0 即纯 IK 前馈（可直接当基线）；随缩放增大，前期学得更快但最终精度可能变差，残差前馈的"分工"被破坏。拐点通常在跟踪容差的一半附近。</div></details>
+      </li>
+      <li>把圆轨迹随机化为"椭圆 + 略有偏心的李萨如"，训练一个通用策略，并在训练未见的形状（方形）上零样本评估。写出评估协议。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>关键是随机化分布要有"形状多样性"而不能只是尺度变化；零样本评估用 5 种未在训练中出现的傅里叶系数组合，分别报告 RMS 与最大误差。</div></details>
+      </li>
+      <li>解释为什么循环轨迹的回报方差比点对点小：从 PPO 的优势估计（GAE）角度写 3–5 句分析。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>循环轨迹稳态段奖励近似周期平稳，同一相位回报接近；点对点轨迹的动作效果强依赖初相位，同一状态在不同时刻价值不同，优势估计噪声更大。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>跟踪的参考量是时间的函数：相位时钟（τ 的 cos/sin 编码）把非平稳问题变成平稳问题，是观测设计的第一优先级。</li>
+      <li>傅里叶级数轨迹拥有解析的位置/速度/加速度，系数少、可随机化；轨迹频率不超过控制频率的 1/10。</li>
+      <li>姿态误差必须用测地线距离：相对四元数 → 符号统一到短弧 → rotvec；跳过符号处理会引入"2π 级"的假误差。</li>
+      <li>奖励用指数核（位置 5 mm、姿态 0.1 rad）配速度误差平方罚；指数核"先做对再做好"，比平方罚更适合早期训练。</li>
+      <li>工程首选结构是 IK 前馈 + 限幅残差 RL（平移 ±2 mm、旋转 ±0.05 rad），残差饱和率是重要的健康指标。</li>
+      <li>下一章进入<strong>力控</strong>：轨迹跟踪关心位姿误差，力控关心接触里"控制哪一个方向"，你会看到选择矩阵与力闭环的设计。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch045.html">← 第 045 章：实现双足机器人行走</a>
+    <a class="next" href="ch047.html">第 047 章：实现力控任务 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

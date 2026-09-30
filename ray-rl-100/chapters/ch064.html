@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第064章 调优实验的故障恢复 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第四篇 · Ray Tune 超参搜索</span>
+    <span class="sep">/</span>
+    <span>第 064 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第四篇 · Ray Tune 超参搜索</div>
+    <h1>第 064 章：调优实验的故障恢复</h1>
+    <p class="lead">一次数十个试验的搜索跨越数小时，进程崩溃、节点掉线、驱动重启都可能发生。本章梳理三层恢复机制：试验级检查点、实验级状态文件与续跑语义、集群级远端同步，并给出恢复后的预算轴一致性审计方法。</p>
+    <ul class="meta">
+      <li>主题：Ray Tune 调优 / 容错与恢复</li>
+      <li>关键机制：实验状态文件、续跑语义、检查点粒度、远端同步、预算轴一致性</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 063 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>分清三层恢复机制的作用域：试验级检查点、实验级状态恢复、集群级远端同步。</li>
+      <li>掌握续跑语义：<code>resume</code> 的三种取值下，用户做了与否、已终止试验如何处置、新配置在哪里生效。</li>
+      <li>会用 <code>max_failures</code> 让崩溃的试验从最近检查点自动重启，并理解重启带来的重复计算段。</li>
+      <li>会设计检查点间隔与同步周期的配套关系，并用最优间隔模型解释取值依据。</li>
+      <li>会做恢复一致性审计：检查每个试验的预算轴是否连续、是否达到目标预算。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>搜索结果的价值来自“全部试验在同一口径下完成”。一旦中途失败，两种结局都难以接受：从头重跑意味着浪费已投入的算力；随意续跑可能把两套不同口径的结果混进同一份分析。<strong>故障恢复的目标是让续跑之后的结果与原计划保持同一口径：同一试验标识、同一预算轴、同一配置版本。</strong></p>
+    <p>故障的来源不止硬件：训练函数中的数值异常会让单个试验反复崩溃；内存压力会让采样进程被杀；驱动进程重启会让整个实验暂停。不同来源对应不同恢复粒度，粒度选错时，恢复的代价会以重复计算的形式体现。本章先建立故障分类，再逐层给出机制与参数。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 故障分类与恢复粒度</h3>
+    <p>按影响范围把故障分为三类：<strong>（1）单试验崩溃</strong>，如数值异常、单个采样进程被杀，其余试验不受影响；<strong>（2）节点掉线</strong>，其上运行的所有试验同时中断，检查点若在本地盘会一并丢失；<strong>（3）驱动重启</strong>，整个调优实验的调度状态丢失，需要从实验级状态文件重建。对应的恢复粒度依次是：试验从最近检查点重启、试验迁移到新节点继续、实验从状态文件恢复整个试验集合。三层机制的覆盖关系可以叠加：最坏情况下由外到内逐层兜底。</p>
+
+    <h3>1.1 三类故障的检测时点</h3>
+    <p>三类故障的检测时点不同：单试验崩溃在异常抛出时立即可见；节点掉线要等心跳超时或同步失败才暴露，检测延迟通常以分钟计；驱动重启发生在调度进程之外，往往由操作者先发现。检测延迟乘以每分钟的预算消耗就是故障的隐性成本，这也是自动化巡检与远端同步要尽早启用的原因。把检测时点写进演练脚本的观察项，演练才会产出可复用的恢复参数，避免走一遍流程了事。</p>
+
+    <h3>2. 实验状态文件与续跑语义</h3>
+    <p>每次运行 <code>tune.run</code> 都会在实验目录下写出状态文件，记录试验清单、每个试验的阶段（运行、暂停、终止、错误）与检查点索引。续跑行为由 <code>resume</code> 参数控制：<strong><code>False</code> 启动新实验并在目录名上做冲突规避；<code>True</code>（或 AUTO）加载既有状态，未终止的试验继续、已终止的试验跳过；ERRORED_ONLY 只重跑此前出错的试验。</strong>续跑有一个必须遵守的约定：已存在的试验保持它当初的配置，修改后的搜索空间只影响新增试验。这个语义保护了既有结果的可用性，也意味着“改空间后直接续跑”会得到一个混合口径的实验，需要显式记录版本。</p>
+
+    <h3>3. 试验级检查点与失败重启</h3>
+    <p>训练函数在周期的迭代点上保存检查点，内容至少包含：模型与优化器状态、迭代计数器、环境与随机数状态（第 074 章展开）。<code>max_failures</code> 控制单试验允许的重启次数：每次崩溃后，Tune 从该试验最近的检查点重新拉起训练。<strong>重启意味着检查点之后已算的迭代被重算，成果记录里会出现一段重复预算的数据。</strong>去重与审计在恢复后必须执行，否则统计口径被重复折线污染。</p>
+    <div class="formula">
+      期望重算量 ≈ 故障率 λ × 检查点间隔 T / 2 &nbsp;（每单位迭代）
+      <span class="note">保存本身的均摊代价为 c/T，其中 c 是单次保存的等价迭代数；T 取大则重算多，取小则保存开销大</span>
+    </div>
+    <p>把两项代价相加并求极小，得到最优间隔 T* = (2c/λ)<sup>1/2</sup>。这个模型的实用价值在于给出量级判断：<strong>故障率提升 4 倍时，检查点间隔应缩小一半。</strong>实际取值再向上取整到“检查点内容整体一致”的迭代边界。</p>
+
+    <h3>3.1 数值算例：检查点间隔的最优取值</h3>
+    <p>用最优间隔模型做一次完整计算。设故障率 λ=1/500（每 500 个迭代发生一次故障）、单次保存的等价代价 c=0.02 个迭代。两项代价：重算期望 = λ·T/2 = T/1000，保存分摊 = c/T = 0.02/T。对 T 求导置零：λ/2 − c/T² = 0，解得 T* = (2c/λ)<sup>1/2</sup>。代入数字：T* = (2×0.02×500)<sup>1/2</sup> = √20 ≈ 4.47，向上取整到 5 个迭代。逐点验证取整合理：T=1 时总代价 0.0210，T=5 时 0.0090，T=10 时 0.0120，T=20 时 0.0210，最小点确实在 5 附近，两端对称上升。</p>
+    <p>灵敏度读数：故障率提高四倍（λ=1/125）时 T* 减半到约 2.2，取向 3；保存代价翻倍（c=0.04）时 T* 乘 √2 到约 6.3，取向 7。模型给出的是量级判断，落地时向上取整贴合训练循环的整数边界即可；它的作用是防止把间隔定在离最优一个数量级的地方；工程取整仍需照常执行。</p>
+
+    <h3>3.2 恢复演练与重试预算的数值口径</h3>
+    <p>恢复演练按三类故障各做一次最小演练，验收点统一为预算轴连续与配置标识一致；演练中记录实际重算量：检查点间隔 5 个迭代、故障发生在第 17 个迭代时，恢复到第 15 个迭代继续，重算 2 个迭代，与模型给出的"期望半个间隔"吻合。</p>
+    <p>重试预算的估算：设单迭代崩溃概率 2%、试验长度 81 个迭代，至少发生一次崩溃的概率为 1−0.98<sup>81</sup>≈80.5%，崩溃次数按二项分布近似，期望约 1.6 次；max_failures=3 允许三次自动重启，超过三次的概率约 8%，这部分试验会被判失败或需要人工检查。把该概率与配置质量一起评估：瞬时故障占比高时可以提到 4 至 5 次重启，配置病态导致的反复崩溃则应尽早放弃；两者的区分看崩溃是否集中在固定迭代位置，集中出现通常指向配置或数据问题。</p>
+
+    <h3>4. 集群级同步</h3>
+    <p>节点掉线时，本地盘上的检查点随之消失，恢复无从谈起。远端同步把实验目录周期性地复制到共享存储（网络文件系统或对象存储）：每个检查点写入完成后，由同步机制上传；节点故障后，试验在新节点上从共享存储拉取最近检查点继续。<strong>同步周期与检查点间隔存在配套关系：同步周期短于检查点间隔时，故障最多丢失一个检查点；同步周期远长于检查点间隔时，多个检查点可能一起丢失，max_failures 保存的“最近进度”名存实亡。</strong></p>
+
+    <h3>5. 恢复不是复现</h3>
+    <p>需要区分两个概念：<strong>恢复（Resume）从检查点继续，随机流与数据顺序承接历史；复现（Reproduce）从零开始重跑，要求种子、环境版本、代码版本全部对齐。</strong>判断一个恢复是否等价于“原实验从未中断”，验收标准是预算轴连续性与配置版本一致性，这两项可以审计；最终指标接近只能通过统计判读，不构成验收依据。第 074 章会给出种子在两道流程中的角色差异。</p>
+    <p>两种流程的操作口径分别固定：恢复用同一实验名与存储路径续跑，审计看预算轴是否连续、末值是否达标；复现用全新实验名从零启动，审计看终值落在历史分布的分位区间。两类审计都不通过时，排查顺序是先核对环境与依赖版本、再核对检查点结构版本、最后查随机源；顺序颠倒会在随机数问题上消耗大量时间，而版本因素通常更常见也更容易验证。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>恢复设计按故障类型选择机制，再统一定义检查点内容与审计流程。与上一章的差异在于，第 063 章定义评价坐标系，本章保证坐标系在中断后不漂移。</p>
+    <table>
+      <tr><th>故障范围</th><th>机制</th><th>关键参数</th><th>恢复代价</th></tr>
+      <tr><td>单试验崩溃</td><td>检查点 + 自动重启</td><td>检查点间隔、<code>max_failures</code></td><td>重算一个检查点间隔的迭代</td></tr>
+      <tr><td>节点掉线</td><td>远端同步 + 试验迁移</td><td>同步周期、上传目标</td><td>重算一个同步周期内的进度</td></tr>
+      <tr><td>驱动重启</td><td>实验状态文件 + 续跑</td><td><code>resume</code>、实验名、存储路径</td><td>状态回放开销，可忽略</td></tr>
+      <tr><td>配置变更后继续</td><td>新实验或显式版本标记</td><td>实验命名规则</td><td>口径分叉风险，需治理</td></tr>
+    </table>
+    <p>审计的通过线提前写死：预算轴严格递增、末值达到目标预算（或明确标注为调度淘汰）、配置标识与实验记录一致，三条全部通过才启动后续分析；任何一条不通过先修复数据再继续，避免带伤的表格进入后续章节的排序与统计。</p>
+    <p>操作流程四步：</p>
+    <ol>
+      <li><strong>定粒度</strong>：按“可接受的重复计算量”反推检查点间隔，用 T* 模型起算，再对齐到训练循环的整数边界。</li>
+      <li><strong>定落点</strong>：实验目录与同步目标都放在共享存储；本地盘只作为缓存。</li>
+      <li><strong>定重试上限</strong>：<code>max_failures</code> 取 2 至 3；反复崩溃的试验属于配置病态，继续重试只会消耗预算。</li>
+      <li><strong>定审计</strong>：恢复后自动检查每个试验的预算轴连续性、配置标识一致性与目标预算完成度，不通过则修复后再继续。</li>
+    </ol>
+    <div class="box key">
+      <span class="box-title">设计决策：为什么检查点内容要用字典自描述？</span>
+      <p>恢复代码需要按结构解析检查点，结构变化时旧检查点会静默错位。用字典包装并携带结构版本字段，恢复代码先读版本再解析，可以对旧版本做显式迁移。字典的键名就是契约的一部分，改动键名等同于改动接口，需要与第 069 章的实验导出格式一起维护。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：续跑与远端同步配置</strong></p>
+    <pre class="code"><code>from ray import tune
+from ray.tune import SyncConfig
+
+sync_cfg = SyncConfig(
+    # 上传目标：共享存储上的实验归档位置（对象存储或网络文件系统）
+    upload_dir="s3://example-bucket/tune_sync",
+    # 同步周期取 60 秒：与检查点间隔同量级，故障最多丢一个检查点
+    sync_period=60,
+    # 连同检查点工件一起同步：只同步日志而不带检查点无法恢复训练
+    sync_artifacts=True,
+)
+
+tune.run(
+    train_fn,
+    name="ppo_lr_sweep_v2",
+    # 实验目录放在共享存储：驱动重启后状态文件仍可读
+    storage_path="/shared/tune_results",
+    # 从既有状态续跑：未终止试验继续、已终止试验跳过
+    resume=True,
+    # 单试验最多崩溃重启 3 次，每次从最近检查点继续
+    max_failures=3,
+    sync_config=sync_cfg,
+    config=search_space,
+    num_samples=40,
+)</code></pre>
+    <p>解读：四个参数共同定义恢复能力边界。<strong>（1）</strong><code>resume=True</code> 的语义依赖实验名与状态文件的稳定：实验名改了等于新实验，旧状态不会被读取。<strong>（2）</strong><code>max_failures=3</code> 是重试预算，数值越大越能熬过瞬时故障，也越容易为病态配置持续兜圈；2 至 3 次是实用起点。<strong>（3）</strong><code>sync_period</code> 与检查点间隔的配套关系来自上一节的模型：任一环节显著慢于另一环节，都会让“最近进度”的保存量缩水。<strong>（4）</strong>远端目标建议与实验归档分离（同步区与归档区各一处），避免后续导出操作与运行中的同步互相覆盖。参数名与默认值随版本演进，以对应版本的官方文档为准。</p>
+
+    <p><strong>片段 2：带检查点与恢复路径的训练函数</strong></p>
+    <pre class="code"><code>from ray import tune
+
+def train_fn(config):
+    # 恢复路径：返回最近一次保存的检查点；全新试验时为空
+    ckpt = tune.get_checkpoint()
+    start_epoch, state = 0, init_state(config)
+    if ckpt is not None:
+        payload = ckpt.to_dict()   # 结构由训练函数自己约定
+        # 版本字段先行校验，避免旧结构静默错位
+        assert payload["schema"] == 1
+        start_epoch = payload["epoch"]
+        state = payload["state"]
+
+    for epoch in range(start_epoch, config["max_epochs"]):
+        state = advance(state, config)
+        if epoch % config["ckpt_every"] == 0 \
+                or epoch == config["max_epochs"] - 1:
+            # 预算轴（epoch）写入检查点：恢复后计数从断点继续
+            tune.report(
+                episode_return_mean=state["ret"], epoch=epoch,
+                checkpoint=tune.Checkpoint.from_dict(
+                    {"schema": 1, "epoch": epoch + 1, "state": state}))
+        else:
+            # 无检查点的上报：只更新监控曲线，不增加存储负担
+            tune.report(episode_return_mean=state["ret"], epoch=epoch)
+</code></pre>
+    <p>解读：恢复正确性的所有关键点都落在这段函数里。<strong>（1）</strong><code>tune.get_checkpoint()</code> 区分“新试验”与“重启试验”，两者的起跑线不同，混淆会导致重启试验从头开始并留下重复段。<strong>（2）</strong><code>epoch</code> 取自检查点记录：自动计数只知道“重启后上报了几次”，预算轴会从头计算，调度器的同预算比较随之漂移。<strong>（3）</strong><code>schema</code> 字段是检查点自描述的版本号，升级结构时可以编写迁移分支，替代对键缺失的猜测。<strong>（4）</strong>末次迭代强制保存，保证“训练完成”与“检查点存在”两个事件不脱节。轻量检查点的包装类型与接口在 2.x 演进中调整过，以对应版本的官方文档为准。</p>
+
+    <p><strong>片段 3：恢复一致性审计</strong></p>
+    <pre class="code"><code>def audit_resume(df, step="epoch", key="trial_id"):
+    """审计续跑结果：预算轴连续性与完成度。返回问题清单。"""
+    target_epochs = 81   # 实验的预算目标，来自搜索配置中的 max_epochs
+    issues = []
+    for tid, g in df.groupby(key):
+        steps = g.sort_values(step)[step].tolist()
+        # 预算轴必须严格递增：相等说明重复段，回退说明计数错位
+        if any(b &lt;= a for a, b in zip(steps, steps[1:])):
+            issues.append((tid, "预算轴不连续", steps[:3], steps[-3:]))
+        # 完成度：最后预算应达到目标，否则标记为未完成（不视为故障）
+        if steps[-1] &lt; target_epochs - 1:
+            issues.append((tid, "未达目标预算", steps[-1], target_epochs))
+    for tid, kind, a, b in issues:
+        print(f"{tid}: {kind}; 样例 {a} -> {b}")
+    return issues
+
+# 用法：恢复完成后立即审计，通过后再启动后续分析
+issues = audit_resume(results_df)
+assert not any(k == "预算轴不连续" for _, k, _, _ in issues)</code></pre>
+    <p>解读：审计把“恢复是否等价于从未中断”变成可执行的断言。<strong>（1）</strong>预算轴严格递增是最重要的检查：重复段来自重启后未从检查点接续，回退段来自计数器未随检查点保存，两类问题都会污染聚合统计。<strong>（2）</strong>“未达目标预算”单独归类，它可能来自调度器淘汰（正常）或反复崩溃触顶（异常），需要结合试验状态进一步区分。<strong>（3）</strong>审计在恢复完成后立即执行，代价极小，却避免了把坏数据带进第 071 章的排序与统计。结果数据帧的列名在不同版本间略有差异，以对应版本的官方文档为准。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>续跑前改了搜索空间</strong>：老试验保持旧配置，新试验用新空间，一份结果里混合两套口径。症状是同一参数的取值集合出现“无法解释”的两簇。修复：大改空间时用新实验名，或把空间标识写入实验记录并在分析时按标识分层。</li>
+      <li><strong>检查点未包含迭代计数器</strong>：恢复后预算轴从零重算，调度器的比较档位错位，短试验被误判为长试验的同伴。修复：把计数器列入检查点，并纳入恢复审计的断言。</li>
+      <li><strong>同步周期远长于检查点间隔</strong>：节点掉线时最近的多个检查点一并丢失，“从最近检查点继续”退化为“从很久以前继续”。修复：让两者同量级，或缩短同步周期并以检查点完成事件驱动上传。</li>
+      <li><strong>把实验目录放在节点本地盘</strong>：驱动重启后状态文件不可读，试验目录不可达，整个实验只能重跑。修复：实验目录与归档目标统一放到共享存储。</li>
+      <li><strong><code>max_failures</code> 设得过大</strong>：配置病态的试验反复重启，每轮都消耗一份检查点间隔的重算量，预算被低效吸收。修复：上限取 2 至 3，并在重试计数临近上限时告警，人工检查配置。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>为三类故障各设计一条“最小恢复演练”：写明制造故障的方式、期望的恢复粒度与验证点。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>单试验故障可用临时注入异常制造；节点掉线可用终止一个 worker 进程模拟；驱动重启则直接重启调度进程并用同一实验名续跑。验证点统一为预算轴连续性与配置标识一致。</div></details>
+      </li>
+      <li>预测题：<code>max_failures</code> 从 0 改为 3 之后，节点故障率 10% 的环境下，实验完成率与总重复计算量各自如何变化？<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>完成率显著上升，因为瞬时故障不再让试验直接失败；重复计算量上升，量级约为“故障次数 × 检查点间隔的一半”。两者是同一机制的两面。</div></details>
+      </li>
+      <li>推导题：用期望重算量模型 T*=(2c/λ)<sup>1/2</sup>，推导检查点间隔的最优取值。给定单次保存等价于 0.02 个迭代的代价、故障率每 500 迭代一次，求 T* 并给出取整理由。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>λ=1/500，c=0.02，T*=(2×0.02×500)<sup>1/2</sup>=(20)<sup>1/2</sup>≈4.5，向上取整到 5 个迭代。取整应向上并贴合训练循环边界，宁可多存少量也不要出现小数周期。</div></details>
+      </li>
+      <li>设计题：为片段 3 的审计增加“配置标识一致性”检查：从结果数据帧的配置列恢复每个试验的配置，与实验记录中的空间标识比对。写出比对键与异常处理策略。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>比对键用“参数名到取值的映射”的稳定序列化串；异常处理分两类：标识缺失标记为待查，标识冲突直接阻止分析并提示按标识分层。</div></details>
+      </li>
+      <li>实践题：修改片段 2，让检查点同时保存环境与随机数状态，并说明恢复后哪一类随机性仍无法完全对齐。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>可保存 NumPy 与框架的随机数发生器状态；无法完全对齐的是外部并行进程（如多个采样 worker）的独立随机流，除非每个 worker 的状态都被显式收集，这一点在第 074 章展开。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>故障按影响范围分三类，恢复粒度对应为：试验重启、节点迁移、实验状态恢复。</li>
+      <li>续跑语义的要点：实验名稳定、已终止试验跳过、新配置只影响新试验，改空间需显式版本化。</li>
+      <li>检查点必须包含迭代计数器与结构版本；最优间隔由 T*=(2c/λ)<sup>1/2</sup> 给出量级。</li>
+      <li>远端同步周期应与检查点间隔同量级，否则“最近进度”在节点故障时缩水。</li>
+      <li>恢复完成后立即做预算轴审计：严格递增、完成度达标、配置标识一致，三项通过再进入分析。</li>
+      <li>下一章转向并发度控制：试验间并行与试验内并行的资源匹配。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch063.html">← 第 063 章：多目标优化与约束优化</a>
+    <a class="next" href="ch065.html">第 065 章：并行实验与并发度控制 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第100章 综合项目：分布式强化学习训练系统 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第五篇 · 训练工程与系统进阶</span>
+    <span class="sep">/</span>
+    <span>第 100 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第五篇 · 训练工程与系统进阶</div>
+    <h1>第 100 章：综合项目：分布式强化学习训练系统</h1>
+    <p class="lead">一句话：本章把前九十九章的全部机制合成一个完整系统：从需求与容量模型出发，确定架构与决策链，落实验收标准，并回顾全课程的知识地图。</p>
+    <ul class="meta">
+      <li>主题：综合项目 / 系统设计与全课程总结</li>
+      <li>关键机制：容量模型、决策链一致性、验收清单、知识地图</li>
+      <li>预计学时：75 分钟</li>
+      <li>前置章节：第 099 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>掌握"需求、容量、架构"的系统设计方法：把任务目标翻译成资源规划，再翻译成分层组件。</li>
+      <li>能推导设计决策链：算法选择、更新模型、复用方式、采样规模、内存预算、容错与部署之间的约束与耦合。</li>
+      <li>会为目标系统编写验收清单：吞吐、成本、复现、恢复、报告五类标准及对应证据。</li>
+      <li>能识别决策链中的不一致组合（如同策略算法配无界回放、异步更新配固定陈旧阈值）。</li>
+      <li>完成全课程知识回顾，能按五篇结构定位任意一个具体机制所属的位置与依赖关系。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>本课程从 Ray 基础出发，经过 RLlib 接口、算法实现、Tune 搜索，进入训练工程的十四个主题：损失组合、采样效率、并行环境、内存预算、吞吐分析、更新模型、经验共享、数据一致性、资源规划、容错恢复、部署、三条端到端流水线、平台三题与复现、基准。<strong>单点机制都已展开，但真实系统的问题在于组合：每个机制的选择都约束后续选项，错误的组合会在集成阶段集中爆发。</strong></p>
+    <p>综合项目的目标是把"会配置"升级为"会设计"：给定任务特征与硬件条件，能推出一份自洽的系统方案，并说明每个决策的依据与它排除的替代项。设计的检验方式是验收清单：吞吐与成本达标、复现可验证、故障可恢复、结论可报告。<strong>无法被验收清单检验的设计不构成系统方案，只构成一组配置文件。</strong></p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p><strong>系统设计从需求出发，经过容量模型落到架构分层，再用决策链保证各层选择彼此兼容，最后以验收清单收束。</strong>本节按需求与容量、分层架构、决策链、验收四步展开。</p>
+
+    <h3>1. 需求与容量模型</h3>
+    <p>项目场景：4 节点集群、每节点 16 核 1 加速器，训练一个多智能体协作任务，要求在同型硬件上达到采样吞吐目标、在给定样本预算内达到回报阈值、支持抢占环境下的自动恢复、产出可比较的实验报告。需求先翻译为可计算量：</p>
+    <div class="formula">
+      SPS<sub>target</sub> = N<sub>env</sub> · r<sub>env</sub> · η，N<sub>env</sub> ≤ 60（预留 4 核给学习与系统）
+      <span class="note">单实例步率 r<sub>env</sub> 与并行效率 η 由第 089 章的标定流程给出；SPS 目标由此反推实例数的可行域</span>
+    </div>
+    <p>设单实例步率 250、并行效率 0.65，则 60 个实例对应约 9750 步每秒的采样上限；学习侧按小批 512、更新 6 毫秒计每秒可消化约 85000 样本，学习侧富余，系统按"采样受限"形态设计：把并行效率作为首要优化对象，加速器主要供学习与集中式评论家使用。<strong>容量模型给出两组数字：可行的采样上限与两侧平衡比，架构设计必须在它们划定的范围内进行。</strong></p>
+
+    <h3>2. 分层架构与组件契约</h3>
+    <p>系统分为七层，每层的组件与契约如下：</p>
+    <table>
+      <tr><th>层</th><th>组件</th><th>关键契约</th></tr>
+      <tr><td>环境层</td><td>环境工厂、预处理链</td><td>训练与评估共用；种子派生（第 098 章）</td></tr>
+      <tr><td>采样层</td><td>采样进程、片段结构</td><td>整除链、片段长度、并行效率标定</td></tr>
+      <tr><td>数据层</td><td>队列、回放缓冲</td><td>版本标签、滞后上界、优先级退火</td></tr>
+      <tr><td>学习层</td><td>策略与评论家更新</td><td>损失组合、复用预算、显存预算</td></tr>
+      <tr><td>编排层</td><td>放置组、状态机</td><td>整组调度、检查点指引、抢占三段</td></tr>
+      <tr><td>存储层</td><td>检查点、指标、清单</td><td>原子提交、模式版本、版本标识</td></tr>
+      <tr><td>观测层</td><td>吞吐分解、成本计量、报告</td><td>四段分解、资源时间、对比协议</td></tr>
+    </table>
+    <p>层与层之间靠"对象与不变式"通信：样本带版本标签，检查点带清单，报告带数据戳。层的划分服务于可分析性：把不变式限制在相邻两层之间，使故障与变更的影响面可控，组织含义只是附属效果。</p>
+
+    <h3>3. 决策链与一致性约束</h3>
+    <p>七个核心决策按依赖顺序排列，每一步排除若干后续选项：</p>
+    <ol>
+      <li><strong>算法族</strong>：多智能体协作任务选同策略 PPO 系或异步变体（第 081 至 086 章）。</li>
+      <li><strong>更新模型</strong>：此处步时方差中等（0.65 效率提示长尾有限），选同步基底；若实测步时分布变化再切混合结构（第 086 章）。</li>
+      <li><strong>复用方式</strong>：同步基底配短窗口队列；离策略回放仅用于经验共享的补充数据，比例封顶（第 087 章）。</li>
+      <li><strong>采样规模</strong>：实例数与片段长度按整除链闭合，批大小按智能体转移总数计量（第 083、094 章）。</li>
+      <li><strong>内存预算</strong>：帧堆叠观测按 1 字节存储，回放容量受内存与显存双向约束（第 084 章）。</li>
+      <li><strong>容错与编排</strong>：检查点间隔由成本模型给出，抢占三段与断路器就位，孤儿对账例行（第 090、095 章）。</li>
+      <li><strong>复现与验收</strong>：种子派生树、版本标识、基准协议与成本口径随系统交付（第 098、099 章）。</li>
+    </ol>
+    <p><strong>决策链的检查方法是找矛盾组合：同策略算法与高比例回放互斥；异步无界滞后与固定裁剪系数互斥；采样受限形态与继续扩容加速器互斥；保存权重但不保存调度状态的检查点与"恢复后轨迹一致"的目标互斥。</strong>每次修改一个决策时，按链条向下重检受影响的条目，这一习惯能拦截集成阶段的大部分故障。</p>
+
+    <h3>4. 验收清单</h3>
+    <p>验收分五类，每类都有对应证据：<strong>吞吐类</strong>，实测 SPS 与硬件效率达到容量模型预测的 80% 以上，证据为第 099 章的基准报告；<strong>成本类</strong>，成本到阈值与单位成本记录在案，重试与孤儿占比低于约定水平；<strong>复现类</strong>，同种子重跑通过位级或统计一致校验，版本标识入库，证据为重跑对照；<strong>恢复类</strong>，注入终止与抢占信号后，从最近有效检查点恢复且丢弃语义正确，证据为演练日志；<strong>报告类</strong>，按第 097 章协议生成的对比报告可通过数据戳重放。五类全部通过，系统才可交付使用。</p>
+
+    <h3>5. 演进路线</h3>
+    <p>系统按三个方向演进：<strong>纵向扩容</strong>，增加采样实例与加速器时先重测并行效率与平衡比，扩容不得绕过容量模型；<strong>横向扩展</strong>，接入更多任务时复用编排与存储层，按隔离四层检查预算、执行、数据与故障边界；<strong>机制升级</strong>，替换算法或更新模型时按决策链自顶向下评估，保留旧配置的基准数据用于回归对照。<strong>演进的纪律与建设期一致：任何变更都要重走受影响的验收项。</strong></p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>项目落地分六步，产物是一份设计文档、一套配置与一份验收报告。</p>
+    <ol>
+      <li><strong>需求转译</strong>：把任务目标写成吞吐、预算、可靠性、可比较性四组可计算量。</li>
+      <li><strong>容量计算</strong>：标定单实例步率与并行效率，解出采样上限与平衡比，画定可行域。</li>
+      <li><strong>架构定稿</strong>：七层组件与契约表；确认每层的不变式可测试。</li>
+      <li><strong>决策链评审</strong>：逐项写出选择与排除理由，运行矛盾组合检查。</li>
+      <li><strong>实现与集成</strong>：按第 092 至 094 章的流水线模板装配，复用编排与存储层（第 095、096 章）。</li>
+      <li><strong>验收演练</strong>：五类验收逐项执行，注册基准档案与回归阈值。</li>
+    </ol>
+    <h3>资源与参数索引</h3>
+    <table>
+      <tr><th>项</th><th>取值</th><th>来源章节</th></tr>
+      <tr><td>采样实例</td><td>56（4 节点 × 14）</td><td>第 083、089 章</td></tr>
+      <tr><td>批 / 小批 / 轮数</td><td>按转移总数 12000 / 512 / 4</td><td>第 082、094 章</td></tr>
+      <tr><td>检查点间隔</td><td>约 30 分钟等效步数</td><td>第 090 章成本模型</td></tr>
+      <tr><td>滞后上界</td><td>4 个策略版本</td><td>第 086、088 章</td></tr>
+      <tr><td>种子派生</td><td>摘要派生五条流</td><td>第 098 章</td></tr>
+      <tr><td>验收指标</td><td>SPS、成本到阈值、恢复时长窗口</td><td>第 099 章</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：为什么先算容量模型再定配置？</span>
+      <p>硬件清单决定上限，需求决定下限，容量模型是两者的翻译器。以硬件开场的设计容易先入为主地"用满资源"，而以需求开场可能假设不存在的采集能力。容量模型先给出可行域，架构与参数在域内求解，验收时再回到同一模型核对偏差，整条链路闭环。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>以下片段基于 Ray 2.x 时期的通用写法，接口随版本演进，以对应版本的官方文档为准。</p>
+
+    <p><strong>片段 1：系统主配置（决策链的代码化）</strong></p>
+    <pre class="code"><code>from ray.rllib.algorithms.appo import APPOConfig
+
+def system_config(total_envs=56, batch=12000, minibatch=512, epochs=4):
+    """系统主配置：把决策链逐项落为参数，注释标注依据章节。
+    同步基底加短窗口回放：滞后上界受版本过滤约束（第 086、088 章）。"""
+    assert batch % total_envs == 0, "批须被实例数整除（第 083 章）"
+    return (
+        APPOConfig()
+        .environment("crowd_collab_v1")             # 环境版本锁定（第 098 章）
+        .env_runners(
+            num_env_runners=56,                      # 4 节点 x 14 进程
+            num_envs_per_worker=1,                   # 纯 Python 环境步：靠进程并行
+            rollout_fragment_length=batch // total_envs,
+        )
+        .training(
+            train_batch_size=batch,                  # 按智能体转移总数计量
+            sgd_minibatch_size=minibatch,
+            num_sgd_iter=epochs,                     # 每样本复用 4 次（第 082 章）
+            vf_loss_coeff=1.0, entropy_coeff=0.01,   # 损失组合（第 081 章）
+            replay_proportion=0.3,                   # 短窗口回放比例封顶（第 087 章）
+            replay_buffer_num_slots=8,               # 队列深度即滞后上界
+        )
+        .resources(num_gpus=1)                       # 学习器独占加速器（第 089 章）
+    )</code></pre>
+    <p>解读：主配置是决策链的最终编码形式。<strong>（1）</strong>整除断言、实例数与片段长度来自容量模型，配置层直接拦截不一致组合。<strong>（2）</strong>回放比例与队列深度显式封顶：同步基底允许短窗口复用，上界即滞后上界，与版本过滤（第 088 章）共管。<strong>（3）</strong>每个参数旁标注依据章节：配置自解释，评审与回归时能快速定位参数来源与修改影响。</p>
+
+    <p><strong>片段 2：编排入口（容错与隔离的绑定）</strong></p>
+    <pre class="code"><code>def submit_system_job(spec_store):
+    """系统作业提交：整组资源加检查点指引加抢占处理器。
+    编排层只认规格：资源、失败策略与恢复指引全部声明化。"""
+    bundles = (
+        tuple({"CPU": 1} for _ in range(56))     # 采样资源包：整组调度单元
+        + ({"CPU": 4, "GPU": 1},)                 # 学习资源包
+    )
+    spec = JobSpec(                               # 第 095 章的模式与校验
+        job_id="marl-crowd-0001",                 # 幂等键兼检查点命名空间前缀
+        entrypoint="train_marl.py",
+        bundles=bundles,
+        max_retries=3,                            # 与断路器窗口一致（第 090 章）
+        checkpoint_dir="cks/marl-crowd-0001",     # 专属目录：隔离四层之一
+        resume_from="cks/marl-crowd-0001/ckpt-550000",
+    )
+    spec.validate()
+    # 提交返回作业标识：后续状态由状态机推进，提交方不直接管理进程
+    return spec_store.submit(spec)
+
+# 抢占路径由编排层转发信号（第 095 章三段），训练侧注册处理器：
+# 收到信号完成一次检查点写入再退出，重调度后按 resume_from 续跑</code></pre>
+    <p>解读：编排入口把容错与隔离的机制绑定到规格上。<strong>（1）</strong>资源包按角色区分：采样包只含 CPU、学习包含加速器，整组申请消除部分占用。<strong>（2）</strong>job_id 同时作为幂等键与检查点前缀：提交语义与存储隔离共用一个标识，重复提交与目录冲突同时被拦截。<strong>（3）</strong>恢复指引显式给出最近有效检查点，抢占与故障两条路径共用同一续跑逻辑，避免"人工指定检查点"成为恢复流程的隐藏依赖。</p>
+
+    <p><strong>片段 3：验收脚本（五类标准的自动检查）</strong></p>
+    <pre class="code"><code>def acceptance_report(bench, recovery_log, fingerprint, repro_ok):
+    """验收脚本：五类标准逐项核对，输出通过或待修。
+    每项附证据字段：验收以证据为准，不以声明为准。"""
+    checks = {
+        # 吞吐类：实测不低于容量模型预测的 80%
+        "throughput": bench["sps"] &gt;= 0.8 * bench["sps_predicted"],
+        # 成本类：重试与孤儿占比低于 10%
+        "cost": (bench["retry_share"] + bench["orphan_share"]) &lt; 0.10,
+        # 恢复类：演练中从最近检查点恢复且丢弃语义正确
+        "recovery": recovery_log["resumed_from"] == recovery_log["latest_ckpt"]
+                    and recovery_log["dropped_cleanly"],
+        # 复现类：同种子重跑通过一致级别校验，版本标识入库
+        "reproducibility": repro_ok and bool(fingerprint.get("git")),
+        # 报告类：对比报告可由数据戳重放
+        "reporting": bench.get("report_replayable", False),
+    }
+    failed = [k for k, ok in checks.items() if not ok]
+    print(f"验收 {'通过' if not failed else '未通过：' + ','.join(failed)}")
+    return {"checks": checks, "passed": not failed}
+
+# 验收全部通过后：基准与版本标识归档（第 099 章），
+# 报告数据戳入库（第 097 章），系统进入可运营状态</code></pre>
+    <p>解读：验收脚本把前九十九章的机制收束为可执行判据。<strong>（1）</strong>五类检查分别对应吞吐、成本、恢复、复现与报告，每项都引用具体证据字段，主观结论不入验收。<strong>（2）</strong>阈值（80%、10%）写入脚本常量并随设计文档存档，调整阈值需要显式修改与评审，防止验收标准随实现漂移。<strong>（3）</strong>通过后的归档动作把系统接入回归体系：此后的任何变更都必须与归档基准对照，形成"建设、验收、回归"的长期闭环。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>跳过容量模型直接配置</strong>：参数拼装完成后才发现采样与学习严重失衡。修复：先标定、再计算平衡比，配置从可行域内取值。</li>
+      <li><strong>决策链矛盾组合</strong>：同策略算法配高比例回放、异步无界滞后配固定裁剪。修复：按链条逐项评审，把矛盾检查写成配置断言。</li>
+      <li><strong>验收标准后置</strong>：系统"能跑"即交付，吞吐与成本无人核对。修复：验收清单随设计文档冻结，五类证据缺一不可。</li>
+      <li><strong>容错只有检查点没有编排</strong>：作业侧抢占不落盘、孤儿资源不回收，账目与进度双失真。修复：容错机制与编排状态机绑定实现（第 090、095 章）。</li>
+      <li><strong>报告与数据脱节</strong>：结论数字与数据戳不匹配，无法重放。修复：报告管线全自动生成，数据戳入库并纳入回归测试。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>计算题：沿用本章场景，若单实例步率降到 200、并行效率 0.65，56 个实例的采样上限是多少？若要达到 9000 步每秒，需要怎样调整实例数或片段结构？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>上限约 7280 步/秒；需约 70 个实例，超出 60 核预算，须先提高并行效率或降低目标。</div></details>
+      </li>
+      <li>设计题：把本章系统改造成"图像观测的单智能体任务"版本，列出决策链中需要改动的条目与被排除的替代项。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>预处理链与内存预算重做；采样侧推理成本上升；回放存储改 1 字节每像素；其余决策按链条重检。</div></details>
+      </li>
+      <li>评审题：找出一个"运算上可行但决策链矛盾"的配置组合，并说明矛盾在集成阶段会以什么症状出现。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>例如小队列深度的异步配置配大复用轮数：滞后上界形同虚设，症状为裁剪比例高企与回报震荡。</div></details>
+      </li>
+      <li>综合题：为你的目标任务写一份完整设计文档提纲：需求转译、容量模型、七层架构、决策链、验收清单与演进路线，每节标注依赖的课程章节。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>按本章六步流程组织；决策链每项写"选择、依据、排除项"三栏，验收五类各配证据来源。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <p><strong>全课程回顾（五篇知识地图）</strong></p>
+    <ul class="summary">
+      <li><strong>第一篇 · Ray 基础与分布式编程</strong>：远程函数与 Actor、对象存储与共享内存、任务 DAG 与资源管理、故障恢复、Data 与 Serve 入门。这些原语是后续一切机制的执行底座。</li>
+      <li><strong>第二篇 · RLlib 核心接口与训练</strong>：环境接口、策略评估与检查点、自定义模型与训练器、向量化与多环境并行、GPU 训练与生态集成。这一篇建立了单任务的训练闭环。</li>
+      <li><strong>第三篇 · RLlib 算法实现</strong>：DQN 到 AlphaZero 风格算法、探索与归一化、LSTM 与多智能体、算法选择与模型选择、吞吐调优与稳定性诊断。这一篇给出了算法库与适用判据。</li>
+      <li><strong>第四篇 · Ray Tune 超参搜索</strong>：搜索算法与调度器、搜索空间设计、多目标与约束、故障恢复、并行实验控制、结果分析与导出、种子管理。这一篇建立了"实验即搜索"的工作方式。</li>
+      <li><strong>第五篇 · 训练工程与系统进阶</strong>：从损失组合与采样效率出发，经吞吐分析、更新模型、经验共享、一致性、资源规划与容错，进入部署、三条端到端流水线、平台化三题、复现与基准，最终在本章完成系统级综合。</li>
+    </ul>
+    <p><strong>综合项目结论</strong>：系统设计的方法论可概括为"需求、容量、架构、决策链、验收"五步；<strong>任何配置选择都必须能在决策链上找到位置与依据，任何交付都必须能被五类验收标准检验。</strong></p>
+    <ul class="summary">
+      <li>七层架构与相邻层不变式，是拆分复杂系统的稳定方式。</li>
+      <li>决策链的基本约束：同策略与高回放互斥、异步与无界滞后互斥、容量模型约束扩容方向。</li>
+      <li>五类验收：吞吐、成本、恢复、复现、报告；证据随档案归档，回归长期有效。</li>
+      <li>课程到此结束。后续可沿两个方向深入：算法前沿（更大规模模型与更高效采样）与系统前沿（更细粒度编排与更严格的确定性），两条路线都以本课程的度量与工程纪律为共同基础。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch099.html">← 第 099 章：性能基准与成本分析</a>
+    <a class="next" href="../index.html">返回课程目录 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

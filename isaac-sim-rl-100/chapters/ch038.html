@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第038章 实现堆叠任务 | 机器人仿真学习课程 · Isaac Sim 强化学习训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 任务与技能实现</span>
+    <span class="sep">/</span>
+    <span>第 038 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 任务与技能实现</div>
+    <h1>第 038 章：实现堆叠任务</h1>
+    <p class="lead">抓取之后的第二课：把方块精确地放到另一个方块头上，对齐、下放、释放、稳定，四重判据一个都不能少。</p>
+    <ul class="meta">
+      <li>主题：任务实现 / 精密放置</li>
+      <li>相关组件：Isaac Sim、Stable-Baselines3</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 037 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>掌握堆叠任务的规格与它相对抓取任务新增的三个物理约束：平面内对齐、姿态对齐、释放后的稳定性。</li>
+      <li>会设计"对齐形塑 + 释放事件 + 稳定性验证"的奖励结构，并理解每项为何不能省。</li>
+      <li>掌握用"目标位姿误差势能"做密集信号的方法：差分形式、分通道（xy/z/姿态）权重。</li>
+      <li>会实现稳定性检验：延迟判据 + 底部方块位移监控，防止"刚放上就判定成功"的假阳性。</li>
+      <li>会把抓取预训练策略迁移到堆叠任务（复用 + 冻结的工程做法）。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>上一章的抓取解决了"拿起来"，本章解决"放得准"。别小看这一层：抬升只要求力与摩擦过关，而堆叠是<b>亚厘米级的三维定位</b>，两个 4 cm 方块的接触面只有 16 cm²，放偏 2 cm 就会压出边缘、放歪 10° 就会整塔倒塌。真实世界的装配、码垛、桌面上的一切"整理"操作，本质都是本章任务的变体。</p>
+    <p>堆叠任务的奖励结构也因此复杂了一层：抓取任务是"事件梯"（几步一个大台阶），堆叠还需要在台阶之间铺上"对齐滑梯"，用目标位姿误差的势能差分，把"离放好还差多少"变成每步可感的信号。<strong>它同时教会你两件对后续所有精密任务都通用的技术：目标位姿误差的分通道权重，以及"释放后验证"的延迟成功判据。</strong>这两件技术在插拔（041 章）里会再次登场。</p>
+  </section>
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 放置几何：目标位姿由什么决定</h3>
+    <p>把方块 A 放到方块 B 上，"放好了"的标准位姿是：</p>
+    <div class="formula">
+      p<sub>target</sub> = p<sub>B</sub> + (0, 0, h<sub>B</sub> + h<sub>A</sub>/2)，  姿态 = 与 B 对齐（前两个轴平行）
+      <span class="note">h 为方块半高；4 cm 方块时目标高度 = B 顶面 + 2 cm = 方块中心位置</span>
+    </div>
+    <p>误差因此有三个通道：<b>平面内误差 d<sub>xy</sub></b>（决定是否压在边缘上）、<b>高度误差 d<sub>z</sub></b>（悬空或穿插）与<b>姿态误差 θ</b>（面接触退化）。三个通道的容差完全不同：平面内 2 cm 是"半边长以内"，高度 1.5 cm（两个方块堆叠时高度容差应覆盖接触面的可压缩性），姿态 10°（接触面还能稳定承托）。<strong>容差由任务的物理稳定性约束反推得出，这也是本章评估指标按通道分开报告的原因。</strong>做成"总误差"会掩盖"远处高精度、近处低精度"的错误分布。</p>
+
+    <h3>2. 势能差分奖励：对齐滑梯的数学</h3>
+    <p>把每个通道的误差做成势能项，奖励取差分（第 036 章讲过的势能奖励定理在此复用）：</p>
+    <div class="formula">
+      r<sub>align</sub> = k<sub>xy</sub>·Δd<sub>xy</sub> + k<sub>z</sub>·Δd<sub>z</sub> + k<sub>θ</sub>·Δθ，  Δx = x<sub>t−1</sub> − x<sub>t</sub>
+      <span class="note">通道权重取 k<sub>xy</sub>:k<sub>z</sub>:k<sub>θ</sub> ≈ 1 : 0.5 : 0.2，xy 最难也最重要，姿态容差最宽</span>
+    </div>
+    <p>权重比例的物理依据：通道的"可修改性"与其对任务的敏感度。xy 误差由整个手臂的粗定位决定、精细控制最难，给最高权重；z 误差经过接触后主要由下放动作控制，权重居中；姿态在重力与接触的作用下常被动修正（放歪一点会自己坐平），给最低权重。<strong>另一个纪律：差分奖励只在"抓握手上有物体"时发，空手移动不对应任何真实进度。</strong>与抓取任务的抬升项同款掩码逻辑。</p>
+
+    <h3>2.1 数值算例：对齐滑梯的收益预算与接触面几何</h3>
+    <p>先算对齐滑梯在整局里的收益上限。xy 通道从 30 cm 收敛到 2 cm，误差减少 0.28 m，k<sub>xy</sub> = 1.0 累计 0.28；z 通道从 15 cm 收敛到 1.5 cm，减少 0.135 m，k<sub>z</sub> = 0.5 累计 0.068；姿态从 0.5 rad 收敛到 0.175 rad，减少 0.325 rad，k<sub>θ</sub> = 0.2 累计 0.065。三项合计约 0.41。<b>把它与事件梯并排：释放 +2.0 是滑梯总量的约 5 倍，成功 +15 是它的约 37 倍，滑梯的角色被量级钉在"过程信号"上。</b>反过来说，如果训练后发现策略"对齐做得很好但从不释放"，第一检查项就是滑梯与释放的量级比：滑梯被整体调大到 2 以上时，策略有充分理由停在"对齐好了但夹着"的状态。滑梯还存在一个隐性下界：k 不能小到与时间税同量级（0.01/步），否则对齐段与"停着不动"没有区别，阶段梯度消失。</p>
+    <p>再看容差的几何含义。4 cm 边长的方块，xy 误差 2 cm 时上下方块的重叠宽度只剩 2 cm，接触面积 8 cm²（标称 16 cm² 的一半）；误差放宽到 3 cm 时重叠 1 cm、面积 4 cm²。<b>接触面积随误差的下降不是线性的：误差从 2 cm 增到 3 cm 只多了 1 cm，承托面积却从 50% 掉到 25%</b>，这就是容差必须压在 2 cm 以内的物理依据；越接近半边长，抗扰动余量塌得越快，塔在外力（下放冲击、夹爪回撤）下失稳的概率非线性上升。高度容差 1.5 cm 的来历类似：它要覆盖下放过程的"搭接间隙"与接触环节的可压缩量，过小会把物理上已经稳定的堆叠误判成"悬空未接触"，反而制造假失败。</p>
+    <p>稳定性窗口的数值核算：判定要求位姿达标、速度低于 5 cm/s、接触保持三者连续 15 步。若方块以 5 cm/s 的临界速度漂移，15 步（250 ms）内的位移上限是 0.05×0.25 = 12.5 mm，仍在 xy 容差 2 cm 之内，说明窗口结束时"还压在线内"的方块很难被惯性带出容差。<b>窗口长度与速度阈值由此配成一对：速度阈值放宽，窗口就必须加长，两者共同保证"成功判定之后的稳定性"。</b>评估里报告的"成功前平均保持时间"若密集贴在 15 步（大量回合刚好踩线），说明策略在玩时间擦边，应加长窗口或收紧速度阈值做复核。</p>
+
+    <h3>3. 释放事件：为什么需要"松手奖励"</h3>
+    <p>堆叠有一个抓取没有的阶段：<b>释放</b>。方块必须离开夹爪，堆叠才算完成，夹着不放只是"举着"。奖励设计上，释放需要专门的事件信号：</p>
+    <div class="formula">
+      r<sub>release</sub> = +2.0 · 1[ 在位姿误差内 ∧ 夹爪张开 ∧ 方块速度回落 ]
+      <span class="note">三个条件同时成立才发：位置对了(对齐)、真松开了(张爪)、放稳了(速度低)，防"松手砸下去"领奖</span>
+    </div>
+    <p>没有释放事件会怎样？策略学到的最优行为是"放到位、夹住不动"，成功率指标永远卡住（评估判据要求释放），但奖励曲线看起来"没有症状"。<strong>释放事件把"完成"的定义与评估对齐，这是奖励设计与评估指标一致性的典型案例。</strong>+2.0 的量级安排：对齐滑梯全程累计约 1–2（每步 0.01–0.05×几十步），释放 +2 明显高于滑梯，保证"对齐最终要兑现成释放"，只停在"对齐好了"会白白丢掉这笔收益。</p>
+
+    <h3>4. 稳定性验证：延迟成功判据</h3>
+    <p>刚放上的瞬间，方块可能还带着速度，只是"搭着"，尚未"坐稳"。若此时判成功，回合提前结束，策略学会了"快速轻放碰运气"的脆弱行为。<strong>稳定性验证的标准做法：成功判据要求"位姿误差持续满足 + 方块与下方方块接触持续存在 + 速度低于阈值"连续 T 个控制步（如 15 步 = 250 ms），同时期间监控下方方块：位移超过 2 cm 即判"塔倒了"。</strong>延迟判据的时间尺度怎么定？经验值取"物体自由落体从接触面弹起回落一次"的周期量级，250 ms 对 4 cm 方块（弹跳半周期约 100–150 ms）足够看完一次完整的"稳定过程"。代价是成功判定滞后 250 ms：对评估无影响，对训练意味着"成功状态"的样本多 15 帧，反而有助于值函数学习"稳定"的含义。</p>
+
+    <h3>5. 抓取策略的迁移：先学会拿，再学放</h3>
+    <p>堆叠任务的失败分布有个特点：<b>早期几乎全是抓取失败，中期是搬不到位，后期才是放不准。</b>从零训练等于让策略同时学三件事。工程上标准做法是"技能叠加"：先用第 037 章训练好的抓取策略初始化，再在其上训练"搬与放"。三种复用方式由浅入深：</p>
+    <ul>
+      <li><b>初始化网络</b>：把抓取策略的网络权重灌给新任务网络（观测维度不同时需在输入层做补齐，输出层一致），学习率减半微调。</li>
+      <li><b>预训练 + 冻结</b>：冻结底层特征提取，只训练顶层与新观测（方块 B 相对位姿）相关的部分，适合算力紧张时。</li>
+      <li><b>教师蒸馏</b>：把抓取策略当教师，堆叠策略用第 033 章的 BC 预热，当两个任务动作空间差异较大时更稳。</li>
+    </ul>
+    <p>经验结论：<b>初始化网络 + 新观测补齐</b>的性价比最高，通常省掉 30%–50% 的总训练步数。课程设置上，"两个方块初始距离"是最有效的难度轴：从 5 cm（抓起就能放）逐步拉到 30 cm（搬运动作完整）。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p><strong>任务规格：</strong>桌上放两个 4 cm 方块（A 待搬运、B 作底座），Franka 把 A 抓起、搬到 B 正上方、对准姿态后放下，使 A 稳定坐在 B 上。</p>
+    <table>
+      <tr><th>规格</th><th>设计</th><th>理由</th></tr>
+      <tr><td>观测（31 维）</td><td>本体(15, 沿用 037 章) + A 相对末端位姿(7) + A 相对 B 的位姿差(6) + B 位移量(3)</td><td>"相对 B 的位姿差"是放置精度的直接表达；B 位移量用于稳定性监控</td></tr>
+      <tr><td>动作（8 维）</td><td>与第 037 章完全一致（7 关节增量 + 夹爪宽度增量）</td><td>动作空间一致才能复用抓取预训练网络</td></tr>
+      <tr><td>目标位姿</td><td>p<sub>B</sub> + (0,0,4 cm)，姿态与 B 对齐</td><td>固定边长方块的目标解析式；方块尺寸随机化时按半径计算</td></tr>
+      <tr><td>容差</td><td>xy &lt; 2 cm，z &lt; 1.5 cm，θ &lt; 10°，速度 &lt; 5 cm/s</td><td>由"放上不滑落"的物理稳定性反推（见原理 1）</td></tr>
+      <tr><td>奖励</td><td>抓取梯（037 章全套）+ 对齐势能 1.0/0.5/0.2 + 释放 +2 + 成功 +15 − 塔倒 −3</td><td>滑梯接事件梯；释放与成功量级见原理 3</td></tr>
+      <tr><td>终止</td><td>成功（持续 15 步）｜塔倒（B 位移 &gt; 2 cm）｜超时 150 步</td><td>稳定性延迟判据；塌塔为真失败</td></tr>
+      <tr><td>课程</td><td>方块间距 5 → 15 → 30 cm；容差 xy 4 → 3 → 2 cm 收紧</td><td>先近后远；容差收紧让策略逐步逼近精度</td></tr>
+    </table>
+    <p>奖励量级推理：<b>对齐滑梯的全程累计</b>，xy 从 30 cm 到 2 cm 共减少 0.28 m，k<sub>xy</sub>=1.0 时累计 0.28，加 z 与姿态共约 0.4，远小于释放 +2 与成功 +15，保证"滑梯只是过程信号"。<b>塔倒 −3 与成功 +15 的比例（1:5）</b>表达"宁可放不准重试，砸倒底座的代价最大"；塔倒同时意味着 B 的位移破坏了后续所有对齐信号，给终止是正确的。<b>超时 150 步</b>比抓取任务的 100 步长：搬运+对齐的自然耗时更长，压缩时限会让策略在尚未学会对齐时就被"时间税"惩罚。</p>
+    <div class="box key">
+      <span class="box-title">设计思维：成功判据的两个来源要对账</span>
+      <p>本任务的判据有"两本账"：奖励层的成功事件（+15）与评估层的成功指标。实践中必须逐项对账：<strong>奖励容差若比评估容差宽，训练会奖励一个评估不认的行为（虚高）；反评估容差更宽，策略会在"评估成功但没拿到 +15"的状态里徘徊。</strong>对账方式：把奖励判据与评估判据写成同一个函数（一个 <code>check_stack_success()</code> 两处调用），容差参数统一从配置读。这条纪律在课程最后评估所有任务时都会被重复检查，第 041 章插拔的"插入深度阈值"会把它的反面代价展示得最清楚。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：分通道对齐势能与释放事件</strong></p>
+    <pre class="code"><code>def stack_align_reward(prev_errs, errs, grasped, released_now, obj_vel):
+    """对齐滑梯（分通道差分） + 释放事件；只在手上有物体时生效"""
+    d_xy_prev, d_z_prev, d_th_prev = prev_errs      # 上一帧三通道误差
+    d_xy, d_z, d_th = errs                          # 本帧三通道误差
+    in_hand = grasped.float()                       # 掩码：空手移动不算任何进度
+    r_align = in_hand * (1.0 * (d_xy_prev - d_xy)   # xy 通道：权重 1.0（最难最重要）
+                       + 0.5 * (d_z_prev - d_z)     # z 通道：0.5
+                       + 0.2 * (d_th_prev - d_th))  # 姿态：0.2（常被接触被动修正）
+    # 释放事件三条件：位姿误差在容差内、夹爪已张开、物体速度回落
+    pos_ok = (d_xy &lt; 0.02) &amp; (d_z &lt; 0.015) &amp; (d_th &lt; 0.175)
+    released_ok = (released_now &amp; pos_ok &amp; (obj_vel.norm(dim=-1) &lt; 0.05))
+    r_release = 2.0 * released_ok.float()
+    return r_align + r_release</code></pre>
+    <p>解读：三个设计点。<b>(1) 差分用"上帧误差 − 本帧误差"</b>：负值代表"走远了"，自动变惩罚，不需要额外的"远离惩罚"项，这是势能奖励的自带福利。误差本身有上限（工作区尺度），所以差分天然有界。<b>(2) 姿态误差的阈值 0.175 rad</b>：约 10°，与评估容差一致（对账纪律）；注意这里比较的是"姿态误差的某种标量度量"（如旋转向量的模），实现时统一度量方式。<b>(3) 释放条件里的速度检查是"防砸"键</b>：松开但方块还在下落时速度大，不给释放奖励，要求"放稳再松"，"低空抛落"不给奖。释放事件本身是瞬时判定（无需持续窗口）：因为后续的成功判据会用 15 步延迟验证稳定性，释放这一层不需要重复抗噪。</p>
+
+    <p><strong>片段 2：稳定性验证状态机与终止</strong></p>
+    <pre class="code"><code>class StackSuccess:
+    """延迟成功判据：位姿达标 + 接触保持 + 速度低，连续 15 步才算成功"""
+    def __init__(self, num_envs, hold_steps=15, bottom_disp_tol=0.02, device="cuda"):
+        self.hold_steps = hold_steps              # 250 ms：看完一次弹跳回落的稳定过程
+        self.bottom_disp_tol = bottom_disp_tol    # 底座位移阈值：超过即"塔倒了"
+        self.hold = torch.zeros(num_envs, dtype=torch.long, device=device)
+
+    def update(self, errs, released, obj_vel, contact_ok, bottom_disp, reset_mask):
+        d_xy, d_z, d_th = errs
+        stable = ((d_xy &lt; 0.02) &amp; (d_z &lt; 0.015) &amp; (d_th &lt; 0.175)
+                  &amp; released                            # 必须已松手
+                  &amp; (obj_vel.norm(dim=-1) &lt; 0.05)        # 速度回落
+                  &amp; contact_ok)                          # A 与 B 的接触持续存在
+        self.hold = torch.where(stable, self.hold + 1, torch.zeros_like(self.hold))
+        success = self.hold &gt;= self.hold_steps
+        collapsed = released &amp; (bottom_disp &gt; self.bottom_disp_tol)   # 已松手且底座位移超限
+        self.hold[reset_mask] = 0                 # 重置清单：延迟计数器必须归零
+        return success, collapsed</code></pre>
+    <p>解读：与第 037 章"成功保持 3 步"相比，这里把延迟判据升级成了完整的稳定性体检。<b>(1) 为什么把 <code>released</code> 也放进 stable 条件？</b>因为"夹着且位姿达标"是中间状态不是成功，不要求释放会回到原理 3 说的"举着不完成"陷阱。<b>(2) 接触条件是"稳定性"的物理核心</b>：位姿达标但悬空（离底座 1 mm 的悬停）在误差尺度内看不出来，接触判据把它排除；实现上用 A-B 接触对或高度阈值即可。<b>(3) 底座位移与塌塔判定用"已释放"做前置</b>：搬运阶段碰撞导致底座移动（还没放）不算塌塔，它属于"搬运不干净"，由对齐误差反映；只有"放了之后塔散了"才是塌塔。这又是一个"同一物理量在不同阶段语义不同"的判别案例，阶段标志（released）再次成为语义开关。<b>(4) hold 计数器的清零只在"任一条件破缺"时发生</b>：短暂的速度毛刺会打断累计，这正是想要的严格语义，成功需要"真正稳定"的 250 ms。</p>
+
+    <p><strong>片段 3：抓取预训练的迁移接入</strong></p>
+    <pre class="code"><code>def load_grasp_pretrain(stack_policy, grasp_ckpt_path, device="cuda"):
+    """把 037 章抓取策略的权重灌入堆叠策略：观测维度不同的层做补齐"""
+    ckpt = torch.load(grasp_ckpt_path, map_location=device)["policy"]
+    stack_sd = stack_policy.state_dict()
+    for name, param in ckpt.items():
+        if name not in stack_sd:
+            continue                              # 抓取网络独有的层：跳过
+        if stack_sd[name].shape == param.shape:
+            stack_sd[name].copy_(param)           # 同形状直接搬：主干特征与动作头
+        elif stack_sd[name].dim() == 2 and param.dim() == 2 \
+             and stack_sd[name].shape[1] &gt; param.shape[1]:
+            # 输入层观测变宽：旧权重放左侧，新观测列零初始化（初始不干扰已学特征）
+            stack_sd[name][:, :param.shape[1]].copy_(param)
+    stack_policy.load_state_dict(stack_sd)
+    for g in stack_policy.parameters():
+        g.requires_grad_(True)                    # 全网络可训练，但学习率打五折
+    return stack_policy
+    # 微调配置：lr=1.5e-4（常规 3e-4 的一半），前 20 个 update 用抓取任务评估回归测试</code></pre>
+    <p>解读：权重迁移的细节全在"观测变宽"这一分支。<b>新观测列为什么零初始化？</b>旧的输入权重对应"本体 + 物体相对位姿"这些已在抓取任务中训练过的特征；新增的"相对 B 的位姿差"等维度对应权重置零，第一层的输出在初始时刻与抓取策略完全一致，策略从"会抓"的起点出发，新信息随训练逐步"接线"，不会因为随机初始化把旧特征冲乱。<b>为什么学习率打五折？</b>与第 033 章"BC 预热后小步微调"同理：保护已学到的精细技能（抓握的闭合时机）不被新任务的粗梯度冲垮。<b>回归测试那行注释是工程纪律</b>：微调的前 20 个 update，定期用抓取任务的评估脚本跑一遍，如果抓取成功率突然跳水，说明微调破坏了旧技能，应进一步降 lr 或先冻结主干。这类"技能叠加"的工程化程度，往往是仿真策略能否迁移到复杂长时序任务的分水岭。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>无释放事件</strong>：奖励里没有"松手"信号，策略放到位后夹着不走，成功判定永远不触发。症状：对齐误差很小但成功率接近零。修复：释放 +2，且评估与奖励共用同一判据。</li>
+      <li><strong>稳定性验证时长太短</strong>：3 步就开始判成功，方块还在弹跳就被计入"稳定"。症状：评估时重测堆叠，塔频繁倒。修复：15 步（250 ms），兼顾一次完整弹跳周期。</li>
+      <li><strong>对齐势能不分通道</strong>：使用总误差欧氏距离，策略用 z 方向精度"补偿"xy 粗放（总距离变小但压在边缘上）。症状：放上去总歪。修复：分通道权重，xy 单独给高权重。</li>
+      <li><strong>底座位移不监控</strong>：碰撞把底座推偏了还继续对齐到旧目标位姿，永远对不上；或"塔已倒"但判据没触发。症状：成功率低且失败样本诡异。修复：B 位移 &gt; 2 cm 判塔倒并终止。</li>
+      <li><strong>迁移时输入层整层重置</strong>：直接把旧权重丢掉重训，白费第 037 章的成果。症状：训练前 50 个 update 曲线与从零训练完全一致。修复：旧列保留、新列零初始化，lr 减半并做回归测试。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>计算题：方块边长 4 cm，xy 误差 2 cm 时 A 悬空在 B 边缘的部分占比多少？如果容差放宽到 3 cm，稳定接触面积还剩多少？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>误差 2 cm 时重叠宽度 2 cm（50%）；3 cm 时只剩 1 cm（25%），接触面积急剧缩小，抗扰动能力下降约一半以上。</div></details>
+      </li>
+      <li>消融实验：释放奖励从 +2 改成 +0.2，观察"夹着不放"行为是否出现（统计释放事件率与对齐误差的时序）。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>+0.2 时"继续夹着"没有收益但也没有损失，部分环境会停在"举着"状态；看释放率曲线。</div></details>
+      </li>
+      <li>实验设计：把稳定性验证从 15 步改成 5 步与 30 步，预测并验证"训练成功率、评估重测稳定性、成功判定延迟"三个指标的变化。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>5 步：训练成功率虚高、重测掉塔多；30 步：成功率更可信但回合变长、样本效率略降。</div></details>
+      </li>
+      <li>迁移实验：分别用"从零训练"与"抓取预训练初始化"训练堆叠任务，画出成功率曲线并统计达到 60% 成功率所需步数，给出节省比例。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>预期节省 30%–50%；如果省得很少，检查输入层补齐方式与 lr 是否直接把先验冲掉。</div></details>
+      </li>
+      <li>思考题：为什么"塔倒"用终止 + 大罚，软惩罚（像间隙势场那样）为什么不可取？从"状态可恢复性"的角度论证。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>底座被推偏后，旧的对齐目标已失效（任务需要重规划正确目标），软惩罚会诱导策略"对着错误目标继续对齐"；终止让这个不可恢复分支干净地结束。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>堆叠 = 抓取梯 + 对齐滑梯 + 释放事件 + 稳定性验证；目标位姿解析式给出，容差由物理稳定性反推。</li>
+      <li>对齐奖励分三通道差分（xy 1.0 : z 0.5 : θ 0.2），只用"手上有物体"时发；释放 +2 三条件（对齐、张爪、速度低）。</li>
+      <li>成功 = 位姿达标 + 已释放 + 接触保持 + 速度低，连续 15 步；底座位移 &gt; 2 cm 判塔倒终止。</li>
+      <li>技能叠加：抓取策略权重迁移（旧列保留、新列零初始化、lr 减半、回归测试），省 30%–50% 训练量。</li>
+      <li>下一章换掉抓取这个前提：不用爪子，用"推"把物体挪到目标，非夹持操作的奖励与控制设计。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch037.html">← 第 037 章：实现抓取任务</a>
+    <a class="next" href="ch039.html">第 039 章：实现推动任务 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

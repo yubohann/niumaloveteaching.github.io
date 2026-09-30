@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第011章 世界模型中的动作条件视频预测 | 具身智能学习课程 · VLA 与世界模型联合训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · 基础框架与联合训练</span>
+    <span class="sep">/</span>
+    <span>第 011 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · 基础框架与联合训练</div>
+    <h1>第 011 章：世界模型中的动作条件视频预测</h1>
+    <p class="lead">本章把 003 章的单帧预测升级为动作驱动的视频预测：动作如何注入网络、时序结构如何组织、时序一致性如何约束，以及“反事实预测”这一世界模型独有能力如何被验证。</p>
+    <ul class="meta">
+      <li>主题：世界模型 / 动作条件视频预测</li>
+      <li>关键公式：p<sub>ϕ</sub>(o<sub>t+1:t+m</sub> | o<sub>≤t</sub>, a<sub>t:t+m-1</sub>)</li>
+      <li>预计学时：65 分钟</li>
+      <li>前置章节：第 010 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>明确动作条件视频预测与 003 章单帧预测、004 章动作生成在输入输出与目标上的差别。</li>
+      <li>掌握三类动作注入机制：token 拼接、调制式条件（AdaLN、FiLM）、交叉注意力，理解各自成本与表达力。</li>
+      <li>理解时序结构设计：空间与时间注意力分解、因果掩码与并行化训练。</li>
+      <li>掌握时序一致性损失的构造方式及其抑制帧间闪烁的机理。</li>
+      <li>能设计反事实预测验证：同一历史下切换动作序列，检验预测对动作的响应保真度。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>003 章的世界模型只会回答“接下来会看到什么”，不会回答“如果做这个动作会看到什么”。第二个问题才是规划与策略训练需要的：<strong>动作条件视频预测让模型具备反事实推演能力，同一段历史配不同动作序列可以生成不同的未来。</strong>没有这项能力，006 章的想象轨迹只能复现数据里的平均走势，无法评估新动作的后果。</p>
+    <p>从单帧到视频序列带来三个新问题：动作必须与画面帧严格同步注入，网络结构必须处理时间维，预测结果必须保证时序连贯，避免退化为逐帧的独立回归。011 章逐一解决，并与 003 章共用损失基础设施、与 010 章共用融合模块。</p>
+    <p>与相邻章节的边界：036 章讨论多步误差修正的专项方法，054 章讨论物理一致性约束，本章聚焦“模型结构与条件机制”本身，属于能力构建章。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 任务定义与三个目标的边界</h3>
+    <p>动作条件视频预测的条件端有两路：观测历史与动作序列；目标端是未来多帧画面。</p>
+    <div class="formula">
+      p<sub>ϕ</sub>(o<sub>t+1:t+m</sub> | o<sub>≤t</sub>, a<sub>t:t+m-1</sub>)
+      <span class="note">m 为预测步长（5–15）；a 与 o 的对齐关系：动作 a<sub>t+k</sub> 执行后产生观测 o<sub>t+k+1</sub></span>
+    </div>
+    <p>三个目标的边界：003 章预测单帧且无动作条件；004 章输出动作；<strong>本章同时处理动作输入与画面序列输出，核心增量是“动作到画面变化的因果响应”</strong>。评估也随目标改变：视频预测要看换动作后画面是否合理跟着变。</p>
+    <p>对齐关系用一个八步算例固定下来：历史为 o<sub>0</sub>、o<sub>1</sub> 两帧，动作 a<sub>1</sub> 在 o<sub>1</sub> 之后执行，第一帧预测 o<sub>2</sub>，它由历史 o<sub>≤1</sub> 与 a<sub>1</sub> 共同决定；依次类推，最后的 a<sub>8</sub> 产生 o<sub>9</sub>。监督对共八组 (a<sub>k</sub>, o<sub>k+1</sub>)，k 从 1 到 8，实现层面对应的两个张量切片错开一位：动作切片从 t 起，观测目标切片从 t+1 起。10 fps 采样下相邻帧间隔 100 毫秒，注入错位一整帧在八步开环推演中累计为 800 毫秒的画面超前，动作跟随的时序评估会立刻暴露该偏差。</p>
+    <p>步长 m 的取值范围也有误差依据：设单步预测误差为 ε，m 步开环推演的误差在独立误差近似下按 ε·√m 增长，在最坏累计假设下按 ε·m 增长。ε=0.05、m=8 时两种估计分别给出 0.14 与 0.40，前者对应平均场景，后者对应误差同向叠加的场景；m 提到 15 则上界升到 0.75，接近失去参考意义。区间 5 到 15 的取舍即在这条曲线上：短步长监督密集但规划视野不足，长步长视野大而梯度信号被误差主导。</p>
+
+    <h3>2. 动作注入机制</h3>
+    <p>动作进入网络有三种主流方式，表达力与成本依次上升。<strong>token 拼接</strong>把动作映射为 token 与视觉 token 同序列排列；<strong>调制式条件</strong>用动作生成缩放与平移参数，调制主干特征（AdaLN、FiLM 风格）；<strong>交叉注意力</strong>让视觉特征查询动作表示。</p>
+    <div class="formula">
+      h′ = γ(a)·LN(h) + β(a)
+      <span class="note">调制式注入：γ、β 由动作向量经小网络生成；LN 为层归一化，注入成本只随层数增长</span>
+    </div>
+    <p>选择依据：动作维度低（d<sub>a</sub>=7）时，拼接需要把动作扩展成 token，占用序列长度；调制式用低维向量直接控制每层特征，成本与序列长度无关，是视频预测的常用选择；交叉注意力适合动作本身结构化（例如子目标序列）的场景，算力允许时作为增强。<strong>动作注入强度需要验证：条件过弱时模型退化为无条件预测，对动作变化无响应，反事实检验可以暴露这一点。</strong></p>
+    <p>三种注入的成本能统一到“每帧每层”口径比较。token 拼接：动作扩展为 1 个 token 使序列从 196 增到 197，注意力矩阵规模按 (197/196)<sup>2</sup> 增大 1.02%；调制式：7 维动作加 16 维帧号经两层 MLP 生成 1024 维调制参数，乘加约 5.4×10<sup>5</sup> 次，相对空间注意力矩阵的 196<sup>2</sup>×512 ≈ 2.0×10<sup>7</sup> 约占 2.7%；交叉注意力：视觉查询单个动作键值，矩阵 196×1，规模最小，但每层都需要独立的动作编码通路。三者成本都在主干的百分之几以内，<strong>选择的依据是表达力与失效模式，算力不构成门槛</strong>。三种方式的对照见下表。</p>
+    <p>动作通道的预处理同样是注入质量的前提：不同通道的量纲差异可跨越数个数量级（关节角以弧度计、夹爪开合在 -1 到 1 之间），未归一化的动作经 MLP 后由大方差通道主导调制参数，小通道的动作信息在数值上被吞掉。修复方式与 002 章一致：按通道做 z 分数归一化，统计量随数据集版本冻结；诊断方式是逐通道反转扰动动作，观察调制参数的响应是否与通道尺度成比例。调制网络的第二层零初始化让训练起点为恒等映射，与残差结构配合把早期训练的信号保真放在首位。</p>
+    <table>
+      <tr><th>注入方式</th><th>每帧每层附加成本</th><th>表达力</th><th>典型失效</th></tr>
+      <tr><td>token 拼接</td><td>注意力矩阵约 +1%</td><td>中：动作与视觉 token 对称交互</td><td>动作信号被视觉 token 淹没</td></tr>
+      <tr><td>调制式（AdaLN 风格）</td><td>约 2.7%（相对空间注意力）</td><td>中高：逐层全局作用</td><td>条件过弱退化为无条件预测</td></tr>
+      <tr><td>交叉注意力</td><td>矩阵 196×1，极小</td><td>高：支持结构化动作序列</td><td>动作编码器与主干联合训练不稳</td></tr>
+    </table>
+
+    <h3>3. 时序结构：分解与因果掩码</h3>
+    <p>全时空联合注意力成本随帧数平方增长，常用做法是分解：帧内空间注意力加跨帧时间注意力。<strong>分解的代价是丢失部分时空联合模式，收益是成本从乘性降到加性。</strong>训练用因果掩码并行化：第 k 帧只可见前 k 帧，一次前向覆盖全部未来帧。</p>
+    <p>把注意力分数规模精确记账：T=10 帧、每帧 L=196 个空间 token 时，联合注意力的分数矩阵为 (1960)<sup>2</sup> ≈ 3.84×10<sup>6</sup> 个；按本模块的分解结构，空间注意力为 10×196<sup>2</sup> ≈ 3.84×10<sup>5</sup> 个，时间注意力对空间均值后的帧向量为 10<sup>2</sup> = 100 个，总量约 3.84×10<sup>5</sup>，降到联合的十分之一；帧数继续增大时前者的平方项把差距按 T 的比例继续拉开。分解的代价在时间注意力的输入形式：每帧被压缩成单个向量，丢失“哪个空间位置在哪一帧如何移动”的联合模式。精细接触任务（抓取点的毫米级位移）对该损失敏感，折中方案是时间侧使用每帧的若干区域摘要 token（例如分四区各池化一个），数量与成本随区域数线性增长，细节保留高于单一均值。</p>
+    <p>因果掩码就位后需要一个自检用例：取 T=4 的输入，把第 3、4 帧替换为随机噪声，重新前向；若第 1、2 帧的输出发生任何变化，说明掩码存在泄漏。该测试只依赖前向，纳入单元测试后掩码方向错误在训练前即可拦截。推理阶段另有两种模式的取舍：批量模式一次输出 m 帧，帧间不串联误差，测试成本低；自回归模式逐帧把预测喂回历史，贴近部署形态，误差沿链累积，m=8 时的开环误差上界与上文的 ε·m 同阶。验证集同时报两条曲线，两条之间的差距即模型对自身预测分布的适应程度。</p>
+
+    <h3>4. 时序一致性损失</h3>
+    <p>逐帧独立回归会让相邻帧各自“平均化”，拼接起来出现闪烁与形变抖动。时序一致性损失约束帧间差分：</p>
+    <div class="formula">
+      L<sub>temp</sub> = Σ<sub>k</sub> ‖(ô<sub>k+1</sub> - ô<sub>k</sub>) - (o<sub>k+1</sub> - o<sub>k</sub>)‖
+      <span class="note">比较预测帧差与真实帧差；对运动区域的权重可再按帧差幅度加权</span>
+    </div>
+    <p>该损失抑制闪烁的机理：闪烁对应帧差的错误高频分量，直接比较帧差把监督集中到“变化量”上，逐帧重建误差中的静态背景误差被剥离。权重与原重建损失同量级起步，过大时模型会牺牲单帧质量换取平滑，需要两项指标联合监控。</p>
+    <p>“静态剥离”用一个两像素算例说清。静态背景像素：真实帧值为 0.50 与 0.50，帧差 0.00，预测帧值为 0.49 与 0.51，帧差 0.02，帧差损失贡献 0.02；同一像素的逐帧重建误差各约 0.01，两帧合计 0.02，量级相近，且只要预测纹理有偏差它就会持续贡献误差。运动区像素：真实帧值 0.20 与 0.80，帧差 0.60，预测帧值 0.30 与 0.70，帧差 0.40，帧差损失贡献 0.20。帧差项把静态区的监督压到最低，同时把运动区的误差放大呈现；当运动区帧差误差成为主导项后，优化先修正运动幅度，继续增大权重则越过合理点，出现幅度被压小、画面近似慢动作的过度平滑，这也是监控帧差幅值比的直接原因。</p>
+
+    <h3>5. 反事实预测与评估</h3>
+    <p>动作条件的价值可直接检验：同一段历史分别配真实动作与扰动动作推演，比较预测差异。<strong>合理模型应“动作跟随”：扰动方向与画面变化方向一致，幅度单调。</strong>评估三部分：重建质量、时序质量、响应保真度；第三项最易被遗漏，对下游判别力最强。</p>
+    <p>响应保真度的量化做法：取同一历史下成对的动作扰动（放大、反转、置零三类），分别推演得到画面差异向量 Δô，与真实数据中对应动作变化的差异向量 Δo 配对，报告余弦相似度与幅值比。余弦回答方向是否正确，幅值比回答幅度是否匹配，后者沿用与时序监控相同的 20% 偏离阈值。阈值校准取训练分布的分位值：正常动作对上的余弦中位数作为下界参考，低于该值的模型判定为条件响应可疑。整套评估只依赖前向计算，可纳入每个验证周期，成本与常规验证同阶。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>结构：视觉前端复用 003 章分块编码；时空分解主干；动作逐层调制注入；解码器沿用 003 章。全部未来帧并行监督，推理支持自回归与批量两种模式。</p>
+    <h3>关键参数起点</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>预测步长 m</td><td>8</td><td>监督的帧数</td><td>与全课程约定一致，误差累积可控</td></tr>
+      <tr><td>动作注入</td><td>调制式（AdaLN）</td><td>条件机制</td><td>低成本且表达力足够，交叉注意力作增强项</td></tr>
+      <tr><td>时空结构</td><td>空间与时间分解</td><td>主干组织</td><td>成本从乘性降到加性</td></tr>
+      <tr><td>时间注意力层数</td><td>4</td><td>跨帧融合深度</td><td>与预测步长同量级</td></tr>
+      <tr><td>时序损失权重</td><td>0.5</td><td>帧差监督强度</td><td>与重建损失同量级起步</td></tr>
+      <tr><td>因果掩码</td><td>开启</td><td>信息方向约束</td><td>预测任务必须禁止看到未来帧</td></tr>
+      <tr><td>帧采样步长</td><td>每秒 10 帧输入</td><td>时间分辨率</td><td>与数据采集频率一致</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：动作条件逐层注入</span>
+      <p>动作若只在入口注入，会随层数加深被静态特征稀释，网络倾向退化为无条件预测。逐层调制让动作在每个尺度重新参与竞争，反事实响应显著增强；低维动作的小调制网络开销可忽略。</p>
+    </div>
+    <p>衔接与差异：003 章的预测器预测单帧且无动作条件，本章改为序列输出加逐层条件；006 章的 rollout 使用本章模型获得“动作可改变未来”的能力；010 章的融合模块负责把语言条件并入动作表示后再注入。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>片段以视频扩散与动作条件世界模型的公开设计为参照（含 AdaLN 调制与时空分解注意力的通行做法），接口随版本演进。第 1 段给出调制模块。</p>
+
+    <p><strong>片段 1：动作调制模块（AdaLN 风格）</strong></p>
+    <pre class="code"><code>import torch
+import torch.nn as nn
+
+class ActionModulation(nn.Module):
+    """动作调制：把低维动作映射为缩放与平移参数，逐层调制主干特征。"""
+    def __init__(self, d_model=512, action_dim=7):
+        super().__init__()
+        # 动作与帧号拼接后映射：动作必须知道自己作用于第几帧，防止时序错位
+        self.mlp = nn.Sequential(nn.Linear(action_dim + 16, d_model),
+                                 nn.GELU(),
+                                 nn.Linear(d_model, 2 * d_model))
+        self.frame_embed = nn.Embedding(64, 16)     # 帧号嵌入：上限覆盖长序列
+
+    def forward(self, h, action, frame_idx):
+        # h (B, T, L, d)：批量、帧、空间 token；action (B, d_a) 为该帧动作
+        cond = torch.cat([action, self.frame_embed(frame_idx)], dim=-1)
+        gamma, beta = self.mlp(cond).chunk(2, dim=-1)     # (B, d) 各半
+        # 广播到空间维做调制：同一帧内所有 token 共享该帧动作的调制参数
+        return h * (1.0 + gamma[:, None, None]) + beta[:, None, None]</code></pre>
+    <p>解读：<strong>（1）</strong>1+γ 的写法以恒等映射为中心初始化，调制网络输出接近零时网络退化为主干本身，训练起点稳定。<strong>（2）</strong>条件拼接帧号嵌入：省略帧号时同一动作在各帧的调制相同，加速与减速段无法区分。<strong>（3）</strong>调制在每层执行，动作信息不被深层静态特征稀释，这是反事实响应强度的结构来源。</p>
+
+    <p><strong>片段 2：时空分解主干与因果掩码</strong></p>
+    <pre class="code"><code>def causal_mask(T):
+    """因果掩码：第 k 帧只能关注前 k 帧，训练并行化与信息方向约束并存。"""
+    # 上三角置为负无穷：softmax 后未来位置的注意力权重归零
+    m = torch.full((T, T), float("-inf"))
+    return torch.triu(m, diagonal=1)
+
+class VideoDynamics(nn.Module):
+    """时空分解主干：空间注意力逐帧独立，时间注意力跨帧因果。"""
+    def __init__(self, d_model=512, nhead=8, depth=4):
+        super().__init__()
+        layer = nn.TransformerEncoderLayer(d_model, nhead, 4 * d_model,
+                                           batch_first=True, norm_first=True)
+        self.temporal = nn.TransformerEncoder(layer, num_layers=depth)
+        self.spatial = nn.TransformerEncoder(layer, num_layers=2)
+
+    def forward(self, x, attn_mask=None):
+        # x (B, T, L, d)：先做帧内空间融合，再做跨帧时间融合
+        B, T, L = x.shape[:3]
+        xs = self.spatial(x.reshape(B * T, L, -1)).view(B, T, L, -1)
+        # 时间注意力以帧为 token：空间维展平进特征，实现时间与空间解耦
+        xt = self.temporal(xs.mean(dim=2), mask=attn_mask)   # (B, T, d)
+        # 时间上下文广播回每个空间 token，供解码器使用
+        return xs + xt.unsqueeze(2)</code></pre>
+    <p>解读：<strong>（1）</strong>空间与时间注意力串联执行，成本从 O((T·L)²) 降到 O(T²+L²) 量级，是长序列可训练的关键。<strong>（2）</strong>因果掩码上三角置负无穷，配合并行训练一次前向覆盖全部未来帧；掩码写错让模型看到未来帧，训练损失异常低而开环推演失败。<strong>（3）</strong>时间 token 用空间均值压缩会损失细节；细节敏感场景可让时间注意力直接取全空间 token，成本上升。</p>
+
+    <p><strong>片段 3：时序一致性损失</strong></p>
+    <pre class="code"><code>def video_loss(pred, target, w_recon=1.0, w_temp=0.5):
+    """视频预测损失：逐帧重建加入帧差一致性，抑制闪烁与形变抖动。"""
+    # pred、target (B, T, 3, H, W)：逐帧 L1 提供基础对齐信号
+    recon = nn.functional.l1_loss(pred, target)
+    # 帧差比较把监督集中到“变化量”，静态背景误差被自然剥离
+    d_pred = pred[:, 1:] - pred[:, :-1]
+    d_true = target[:, 1:] - target[:, :-1]
+    temp = nn.functional.l1_loss(d_pred, d_true)
+    # 两项权重同量级起步：时序项过大会牺牲单帧质量换取过度平滑
+    total = w_recon * recon + w_temp * temp
+    return total, {"recon": float(recon), "temp": float(temp)}</code></pre>
+    <p>解读：<strong>（1）</strong>帧差损失不引入光流模块，完全可微；需要更强约束时替换为特征空间帧差或光流监督。<strong>（2）</strong>两项分量分列返回，便于观察“重建改善而时序恶化”或相反的失配模式，该失配是权重调参的直接依据。<strong>（3）</strong>帧差对噪声敏感，数据端需保证帧间亮度稳定（002 章的图像归一化在此再次生效）。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>动作与帧错位</strong>：a<sub>t+k</sub> 被注入到第 k 帧（正确位置为第 k+1 帧），预测整体超前一拍。修复：按“动作执行后产生观测”的对齐规则写单元测试断言。</li>
+      <li><strong>因果掩码失效</strong>：掩码方向或形状写错，模型看到未来帧，训练损失异常低。修复：用训练与开环两种模式的预测误差差值为信号定位泄漏。</li>
+      <li><strong>条件被忽略</strong>：反事实响应测试中换动作后画面几乎不变，模型退化为无条件预测。修复：加强逐层注入、提高动作条件在损失中的可分性，检查动作 token 是否被归一化淹没。</li>
+      <li><strong>时序过度平滑</strong>：时序损失权重过大，运动幅度被压小，画面变“慢动作”。修复：监控预测帧差与真实帧差的幅值比，偏离 1 超过 20% 时回调权重。</li>
+      <li><strong>序列长度失控</strong>：m 与历史帧数同时上调，显存随帧数增长超限。修复：压帧采样频率或缩短 m，先保时序分辨率再谈步长。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>历史 2 帧、预测 8 帧、每帧 196 个空间 token，计算联合注意力与分解注意力的矩阵规模比值。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>联合规模 (10×196)² 约 3.8×10⁶，分解为 (10²+196²) 约 3.9×10⁴，相差约两个数量级。</div></details>
+      </li>
+      <li>把时序损失权重从 0.5 提到 2.0，预测运动幅度与重建指标各怎样变化，给出判断依据。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>运动幅度被压低、帧差幅值比小于 1，逐帧重建指标恶化；用帧差幅值比与重建指标联合判断。</div></details>
+      </li>
+      <li>推导：说明帧差损失如何分解为“运动区域项与静态区域项”，并解释静态区域为何贡献接近零。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>帧差在静态区域接近零，预测与真实的差为零，贡献可忽略；损失集中在运动区域，监督效率高于逐帧重建。</div></details>
+      </li>
+      <li>设计反事实响应保真度的完整评估：构造动作扰动、定义响应相关性指标、给出阈值校准方法。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>扰动可取“放大/反转/置零”三类；指标用预测差异与真实差异的相关系数；阈值取训练集统计的分位值。</div></details>
+      </li>
+      <li>构造实验：分别用入口一次注入与逐层注入训练同一模型，比较反事实响应强度与重建指标，解释权衡。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>逐层注入的反事实响应显著更强，重建指标差异不大；若逐层注入拖慢训练，检查调制网络是否占用了过多前沿计算。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>动作条件视频预测输出未来多帧，条件端含动作序列，核心增量是动作到画面变化的因果响应。</li>
+      <li>三类动作注入中，调制式条件以低成本实现逐层控制，交叉注意力作为增强选项。</li>
+      <li>时空分解把成本从乘性降到加性，因果掩码保证信息方向。</li>
+      <li>时序一致性损失约束帧差，抑制闪烁；权重需与重建指标联合监控。</li>
+      <li>反事实预测检验是动作条件模型的必备评估，<strong>换动作而不变画面即条件失效</strong>。</li>
+      <li>下一章进入语言侧实现：VLA 策略中的语言指令编码器。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch010.html">← 第 010 章：多模态输入融合模块实现</a>
+    <a class="next" href="ch012.html">第 012 章：VLA策略中的语言指令编码器 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

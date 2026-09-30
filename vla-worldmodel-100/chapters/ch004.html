@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第004章 VLA策略网络生成动作指令 | 具身智能学习课程 · VLA 与世界模型联合训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · 基础框架与联合训练</span>
+    <span class="sep">/</span>
+    <span>第 004 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · 基础框架与联合训练</div>
+    <h1>第 004 章：VLA策略网络生成动作指令</h1>
+    <p class="lead">本章处理策略侧的核心问题：把融合表征变成动作。覆盖连续回归、离散 token、扩散生成三类动作头的取舍，动作块与滚动执行机制，以及块间融合抑制重规划抖动。</p>
+    <ul class="meta">
+      <li>主题：VLA 策略 / 动作生成</li>
+      <li>关键公式：A<sub>t</sub> = π<sub>θ</sub>(o<sub>t-k:t</sub>, l) ∈ R<sup>H×d<sub>a</sub></sup></li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 003 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解动作输出空间的定义：单步维度、动作块长度与物理含义（关节角、末端位姿、增量指令）。</li>
+      <li>掌握连续回归、离散 token 自回归、扩散生成三类动作头的训练目标与适用场景。</li>
+      <li>理解交叉注意力动作头从多模态融合表征中提取动作信息的机制。</li>
+      <li>掌握动作块的滚动执行与块间融合（Temporal Ensembling），理解其抑制抖动的原理。</li>
+      <li>能诊断模式平均、分箱边界误差、低频通道被淹没三类典型问题并给出修复方案。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>003 章让世界模型学会了预演画面，本章转向策略侧：给定观测与语言指令，生成可执行的动作。<strong>动作头的设计是整个策略链路上决策密度最高的环节</strong>：它决定数据需要标注到什么精度、推理延迟的量级、以及策略能否表达“同一场景多种合理动作”的多模态性。</p>
+    <p>公开工作提供了三条成熟路线：RT 系列把动作离散化为 token 与语言模型统一序列建模，扩散策略（Diffusion Policy）把动作块生成建模为条件去噪，更多轻量实现直接用回归头输出连续动作。<strong>三条路线在表达能力、推理成本、工程复杂度上各有取舍，本章给出统一的比较框架与实现骨架。</strong></p>
+    <p>分工：动作归一化在 002 章约定；动作头与主干的梯度耦合在 009 章分析；时序动作生成的深入变体在 053 章展开。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 动作输出空间</h3>
+    <p>动作的单步维度 d<sub>a</sub> 由机器人构型决定：单臂 6 关节加 1 夹爪为 7，双臂或含移动底盘时升到 14 以上。动作的物理语义按控制接口分为三类：关节位置、关节速度、末端增量位姿与夹爪指令。关节位置控制在配置空间连续，避障约束容易施加；末端增量位姿控制在任务空间连续，抓放类任务更直观，两类接口的动作损失尺度不同，数据集混用时需要按接口分桶。</p>
+    <div class="formula">
+      A<sub>t</sub> = π<sub>θ</sub>(o<sub>t-k:t</sub>, l) ∈ R<sup>H×d<sub>a</sub></sup>
+      <span class="note">A<sub>t</sub> 为动作块；H 取 8–16，d<sub>a</sub> 单臂取 7；输出经 002 章的归一化反变换后才可执行</span>
+    </div>
+    <p><strong>输出整块是推理延迟与响应性的折中</strong>：10 Hz 下 H=16 约 1.6 秒动作预算，策略每秒只推理一次；代价是块内无法中途改意，突发变化需等重规划。块长与执行步数分开配置，机制见第 4 节。</p>
+
+    <h3>2. 三类动作头与取舍</h3>
+    <p><strong>连续回归头</strong>用全连接层直接输出 a，目标为 Huber 或 L1：单次前向、延迟最低；但存在单峰假设，同一观测下多种合理动作时收敛到均值，例如绕障的左右路径被平均成撞向障碍。</p>
+    <p><strong>离散 token 头</strong>把每个维度均匀分箱（常用 256 档），与语言统一为 token 流自回归生成：天然多模态、可复用语言模型结构；缺点是量化分辨率受量程限制，细粒度装配敏感。</p>
+    <p><strong>扩散与流生成头</strong>学习从噪声到动作块的去噪过程，条件为融合表征：多模态表达强、质量高；代价是迭代采样成本，用 10–50 步少步采样控制延迟。对照表如下。</p>
+    <table>
+      <tr><th>动作头</th><th>训练目标</th><th>单块推理成本</th><th>多模态</th><th>适用场景</th></tr>
+      <tr><td>连续回归</td><td>Huber / L1</td><td>1 次前向</td><td>弱</td><td>单模态、低延迟要求</td></tr>
+      <tr><td>离散 token</td><td>交叉熵</td><td>H·d<sub>a</sub> 步自回归</td><td>强</td><td>与语言模型统一建模</td></tr>
+      <tr><td>扩散生成</td><td>噪声回归</td><td>10–50 步去噪</td><td>强</td><td>多模态示教、精细操作</td></tr>
+    </table>
+
+    <h3>3. 条件化：动作查询读取融合表征</h3>
+    <p>动作头从主干读取融合表征 memory（视觉、语言、本体感知 token）。高效条件化方式是交叉注意力：为每个时间槽位分配可学习查询，从 memory 提取与自身时刻相关的信息。<strong>查询数等于块长，槽位共享 memory 保持场景一致，查询向量不同保持步间差异。</strong>该结构即插即用，主干替换不改接口。</p>
+
+    <h3>4. 滚动执行与块间融合</h3>
+    <p>闭环执行的标准模式是滚动时域：执行前 m 步后重规划，m 小于 H 使相邻块部分重叠。<strong>重叠区是平滑性的来源，也是抖动风险点</strong>：两次推理的块可能给出不同动作，直接切换会产生加速度突变。</p>
+    <p>重叠结构用数字描述：H=16、m=8 时相邻块重叠 H-m = 8 步，每个执行步平均被 H/m = 2 个块覆盖，最长覆盖 2 层。重叠层数决定融合可用信息的多少，也决定迟到块的权重要压得多低，与本节融合公式中的 γ 直接对应。</p>
+    <div class="formula">
+      â<sub>t</sub> = Σ<sub>i</sub> w<sub>i</sub> · A<sub>i</sub>[s] ，w<sub>i</sub> ∝ γ<sup>i</sup>
+      <span class="note">A<sub>i</sub>[s] 为第 i 个历史块对当前步的预测；γ 取 0.5 左右，块越新权重越大</span>
+    </div>
+    <p>该加权融合即时间集成（Temporal Ensembling）：新块主导，旧块提供平滑先验。γ 过大退化为取最新块，抖动回归；γ 过小响应迟滞。<strong>γ 与执行步数需联合调节</strong>，共同决定响应性对平滑性的平衡。</p>
+
+    <h3>5. 采样与确定性</h3>
+    <p>离散头按温度采样，温度趋零退化为贪心；扩散头默认确定性路径（DDIM 风格），便于复现。<strong>训练随机、推理确定是动作生成的一致原则</strong>：随机性覆盖多模态，确定性保证稳定执行；探索需求（015 章）单独配置采样噪声。</p>
+
+    <h3>6. 数值算例：时间集成权重与量化误差</h3>
+    <p>时间集成的权重形态可以直接算。维护最近 4 个块、γ=0.5 时，原始权重为 1、0.5、0.25、0.125，归一化后新块占 53.3%，旧块依次 26.7%、13.3%、6.7%。用参与率 1/Σw<sub>i</sub><sup>2</sup> 衡量实际贡献的等效块数：γ=0.5 时为 2.65 个块，γ=0.25 降到 1.65，γ=0.9 升到 3.95，γ=0.05 只剩 1.11。<strong>参与率把平滑程度变成可调可测的数字</strong>：γ=0.9 附近接近均匀平均，切换冲击最小而旧块影响最大；γ 小于等于 0.05 时融合退化为取最新块，抖动回归。</p>
+    <table>
+      <tr><th>γ</th><th>新块权重</th><th>参与率（等效块数）</th><th>执行行为</th></tr>
+      <tr><td>0.9</td><td>0.29</td><td>3.95</td><td>接近均匀平均，平滑但迟滞</td></tr>
+      <tr><td>0.5（默认）</td><td>0.53</td><td>2.65</td><td>新块主导，兼顾平滑与响应</td></tr>
+      <tr><td>0.25</td><td>0.75</td><td>1.65</td><td>响应快，平滑有限</td></tr>
+      <tr><td>0.05</td><td>0.95</td><td>1.11</td><td>退化为最新块，抖动回归</td></tr>
+    </table>
+    <p>用两个块的具体数字看切换冲击的抑制幅度。旧块给出当前步动作 0.50 弧度，新块给出 0.56，直接切换的跳变为 0.06 弧度，约 3.4 度。取 γ=0.5 时两个块的归一化权重为 0.667 与 0.333，融合输出为 0.667×0.56 + 0.333×0.50 = 0.54 弧度，跳变压到 0.04 弧度，约 2.3 度。块队列更长时抑制更强，但代价同样是响应迟滞，这与参与率的数字互相印证。</p>
+    <p>量化误差的上界推导给出第二个数字。量程 R 均匀分箱 B 档时步长为 R/B，四舍五入误差不超过半个步长。关节量程取 R=2.0 弧度、B=256 时，误差上界为 2/(2×256) = 0.0039 弧度，约 0.224 度；箱数提到 1024 后上界降到约 0.056 度。<strong>误差与量程成正比、与箱数成反比</strong>：量程大一倍的关节在同样箱数下绝对误差翻倍，精细装配类任务需要扩箱，或先做尺度归一化再分箱。</p>
+    <p>去噪步数与控制周期的预算关系一并给出。20 步采样意味着单块推理的串行成本约为单次前向的 20 倍（忽略调度与预处理），在 100 毫秒控制周期下每步去噪的时间预算约 5 毫秒；实测单步耗时接近预算时，优先减少去噪步数并检查质量回退幅度，再考虑缩短动作块。</p>
+    <p>三类动作头的推理预算放到同一口径比较。H=16、d<sub>a</sub>=7 的动作块，离散 token 头按步与维度展开需要 H×d<sub>a</sub> = 112 个自回归位置；扩散头按 20 步去噪计；回归头只需一次前向。以单次前向耗时为单位，三者的串行成本约为 1、20、112，相差两个数量级。<strong>串行成本是选型的第一道筛子：实时预算紧张的场景先排除高串行成本的头，再谈表达力。</strong></p>
+    <p>动作空间的物理量纲给一组参照值。关节位置动作为 ±π 弧度量级；末端位置增量在 10 Hz 下取 0.05 米每步时对应 0.5 米每秒的末端速度；夹爪开度为 0 到 1 的归一化标量。三类量程相差两个数量级，经 002 章的分位数归一化统一压到 [-1, 1]，但归一化不改变物理响应速度的差异，控制增益的标定需要回到物理单位进行。</p>
+
+    <h3>7. 交叉注意力头的成本核对</h3>
+    <p>动作头的计算成本常被高估，用数字核对：查询数等于块长 16，memory 长度按 001 章的约定约 1418，注意力矩阵为 16×1418 ≈ 2.3 万项，打分与加权求和合计约 2.3×10<sup>7</sup> 次乘加；主干自注意力在 1418 个 token 上的同类运算约 2.1×10<sup>9</sup> 次乘加，动作头的注意力部分比它小近两个数量级。计算主体在跨注意力的两路键值投影：它们作用在 1418 个 memory token 上，合计约 2×1418×512<sup>2</sup> ≈ 7.4×10<sup>8</sup> 次乘加，约为注意力运算的三十倍；查询与输出投影合计只有约 8×10<sup>6</sup> 量级。结论：<strong>为动作头增补步间注意力结构带来的计算增量相对主干前向可以忽略，限制其收益的是数据分布与监督信号质量，补出结构本身优先级不高。</strong></p>
+    <p>训练目标的排布还有一个易错细节：动作块 H 个槽位共享同一组查询，损失在块内各步独立计算，块尾接近 episode 末端时需要掩码。常规做法是由数据侧保证窗口末端对齐 episode 内部、动作块始终完整（002 章），动作侧不再处理变长，避免两处掩码逻辑叠加后互相抵消。</p>
+
+    <h3>8. 边界与失效模式</h3>
+    <ul>
+      <li><strong>执行步数越界</strong>：m 取到 H 时相邻块没有重叠，融合队列只剩一个块，时间集成失效；m 取 1 时重叠期最长、平滑最强，推理调用增至每秒十次。常用区间为 m 属于 [H/4, H/2]。</li>
+      <li><strong>融合队列跨任务污染</strong>：任务切换或人工接管后，队列中旧块来自另一个上下文，融合会把已失效的动作拉进当前输出。修复：任务边界清空队列，或按块时间戳做二次衰减。</li>
+      <li><strong>离散头的低音量程</strong>：夹爪等通道量程小，与关节共享统一分箱时有效箱数不足，开合动作呈阶梯状。修复：按维度独立归一化后分箱，或对该通道引入残差回归补偿。</li>
+      <li><strong>确定性采样与多样性评估冲突</strong>：部署时固定初始噪声保证复现，评估多模态能力时需要更换噪声种子重复采样，两套模式要在配置中显式区分，避免评估结果被固定种子掩盖。</li>
+      <li><strong>跨块对齐的时间基准</strong>：融合按“当前步”对齐各块预测时若使用帧序号，重规划节奏变化会放大对齐误差。修复：块内步索引换算成时间戳后再插值，口径与 002 章时间对齐的约定一致，便于统一校验。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>链路：融合表征进入所选动作头；回归头一次前向输出；离散头逐 token 解码；扩散头迭代去噪。三者共享同一损失接口，便于消融切换。</p>
+    <h3>关键参数起点</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>动作块 H</td><td>16</td><td>单次预测长度</td><td>与全课程约定一致，10 Hz 下约 1.6 秒</td></tr>
+      <tr><td>执行步数 m</td><td>8</td><td>重规划周期</td><td>取 H/2，兼顾响应与平滑</td></tr>
+      <tr><td>单步维度 d<sub>a</sub></td><td>7</td><td>动作空间维度</td><td>单臂六关节加夹爪</td></tr>
+      <tr><td>去噪步数</td><td>20</td><td>扩散采样成本</td><td>少步采样质量与延迟的折中</td></tr>
+      <tr><td>融合系数 γ</td><td>0.5</td><td>块间权重衰减</td><td>起步值，与 m 联合调节</td></tr>
+      <tr><td>动作头学习率</td><td>3e-4</td><td>头部更新步长</td><td>高于主干（1e-4）以加速头部收敛</td></tr>
+      <tr><td>批量大小</td><td>128</td><td>梯度估计方差</td><td>动作任务显存友好，可到 256</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：三类动作头并行保留，按数据分布与算力选型</span>
+      <p>扩散头表达力最强但迭代采样受限；离散头与语言模型亲和但分辨率需补偿；回归头在单模态任务上延迟最低。统一接口下保留三选项，选型由数据分布与算力预算决定，016 与 029 章会再次用到。</p>
+    </div>
+    <p>与相邻章节的差异：001 章的骨架用简单广播加线性层生成动作，本章升级为交叉注意力并引入三类生成机制；003 章预测图像、本章预测动作，两者输出对象与损失形态完全不同；011 章将把动作作为条件反过来影响画面预测，形成对称闭环。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>片段以 RT 系列、扩散策略与主流 VLA 实现的公开设计为参照，接口随版本演进。第 1 段给出交叉注意力动作头。</p>
+
+    <p><strong>片段 1：交叉注意力动作块头</strong></p>
+    <pre class="code"><code>import torch
+import torch.nn as nn
+
+class ChunkActionHead(nn.Module):
+    """动作块头：可学习查询经交叉注意力读取融合表征，一次输出 H 步动作。"""
+    def __init__(self, d_model=512, nhead=8, chunk=16, action_dim=7):
+        super().__init__()
+        self.chunk = chunk
+        # 查询为纯参数：每个查询对应动作块中的一个时间槽位，彼此独立
+        self.query = nn.Parameter(torch.zeros(1, chunk, d_model))
+        # 批维在前：与整个课程的主干张量约定一致，避免转置样板代码
+        self.cross = nn.MultiheadAttention(d_model, nhead, batch_first=True)
+        self.norm = nn.LayerNorm(d_model)
+        self.proj = nn.Linear(d_model, action_dim)
+        nn.init.zeros_(self.proj.bias)      # 零偏置初始化：训练早期输出接近原点
+
+    def forward(self, memory):
+        # memory (B, L, d_model)：视觉、语言、本体感知的融合表征
+        q = self.query.expand(memory.shape[0], -1, -1)
+        # 查询读取融合表征：每个动作槽位提取与自身时刻相关的场景与指令信息
+        attn, _ = self.cross(q, memory, memory, need_weights=False)
+        h = self.norm(q + attn)             # 残差加归一化：稳定早期训练梯度
+        return self.proj(h)                 # (B, chunk, action_dim)</code></pre>
+    <p>解读：<strong>（1）</strong>动作槽位独立查询、共享 memory，场景一致性由 memory 提供，步间差异由查询向量提供，结构上避免了相邻步预测互相覆盖。<strong>（2）</strong>查询零初始化配合投影零偏置，训练早期输出接近归一化空间原点，避免开局大幅度随机动作。<strong>（3）</strong>need_weights 关闭注意力权重返回，节省显存与计算；需要可视化时（026 章）再打开。</p>
+
+    <p><strong>片段 2：扩散动作头的训练目标</strong></p>
+    <pre class="code"><code>class DiffusionActionHead(nn.Module):
+    """条件扩散动作头：动作块生成建模为去噪，训练目标为噪声回归。"""
+    def __init__(self, d_model=512, chunk=16, action_dim=7, steps=50):
+        super().__init__()
+        self.chunk, self.action_dim, self.steps = chunk, action_dim, steps
+        # 噪声步嵌入：不同噪声水平对应不同去噪难度，网络必须感知当前档位
+        self.step_embed = nn.Embedding(steps, d_model)
+        self.in_proj = nn.Linear(action_dim, d_model)
+        layer = nn.TransformerDecoderLayer(d_model, 8, 4 * d_model, batch_first=True)
+        self.decoder = nn.TransformerDecoder(layer, num_layers=4)
+        self.out = nn.Linear(d_model, action_dim)
+
+    def forward(self, noisy, t, memory):
+        # noisy (B, chunk, action_dim)：加噪后的动作块；t (B,) 为噪声档位
+        cond = self.in_proj(noisy) + self.step_embed(t).unsqueeze(1)
+        h = self.decoder(cond, memory)      # 以融合表征为条件做去噪
+        return self.out(h)                  # 预测注入的噪声 eps
+
+def diffusion_loss(head, action_gt, memory, steps=50):
+    """训练期加噪采样：随机档位注入噪声，监督模型还原该噪声。"""
+    t = torch.randint(0, steps, (action_gt.shape[0],), device=action_gt.device)
+    noise = torch.randn_like(action_gt)
+    # 噪声强度随档位线性递增：高档位接近纯噪声，低档位接近干净动作
+    scale = (t.float() / steps).view(-1, 1, 1)
+    noisy = (1 - scale) * action_gt + scale * noise
+    eps_pred = head(noisy, t, memory)
+    return nn.functional.mse_loss(eps_pred, noise)</code></pre>
+    <p>解读：<strong>（1）</strong>训练时随机抽噪声档位，单次前向即可计算损失，无需展开整条采样链，这是扩散训练与推理成本不对称的原因。<strong>（2）</strong>线性插值示意加噪，真实实现用余弦或平方根噪声调度（Noise Schedule），接口相同。<strong>（3）</strong>条件端 memory 来自共享主干，扩散头只负责生成；主干同时接收策略与预测两路梯度的事实留到 009 章分析。</p>
+
+    <p><strong>片段 3：去噪采样与块间融合</strong></p>
+    <pre class="code"><code>import numpy as np
+
+@torch.no_grad()
+def sample_chunk(head, memory, steps=20):
+    """从纯噪声迭代去噪采样动作块；确定性更新便于复现与部署调试。"""
+    B = memory.shape[0]
+    x = torch.randn(B, head.chunk, head.action_dim, device=memory.device)
+    for t in reversed(range(steps)):
+        tt = torch.full((B,), t, dtype=torch.long, device=memory.device)
+        # 每步减去预测噪声的等分：DDIM 确定性更新的简化形式
+        x = x - head(x, tt, memory) / steps
+    return x
+
+def fuse_chunks(history, decay=0.5):
+    """块间融合：各历史块对当前步的预测按指数权重平均，抑制切换抖动。"""
+    vals = [chunk[0] for chunk in history]      # 每个块给出的当前步动作
+    w = decay ** np.arange(len(vals))           # 新块排在末位，权重最高
+    w = w / w.sum()                             # 权重归一化，保持动作量纲
+    return sum(wi * v for wi, v in zip(w, vals))</code></pre>
+    <p>解读：<strong>（1）</strong>采样循环从最高档位开始逐步去噪，steps 参数直接控制推理成本，工程上先按 20 步验证质量再下调。<strong>（2）</strong>确定性更新省去随机项，块间差异只来自条件与初始噪声，便于定位抖动来源。<strong>（3）</strong>融合只需各块对当前步的预测，内存维护最近若干块的首步预测即可，队列长度 4 足够。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>回归头的模式平均</strong>：同一观测下存在多种合理动作时输出中间值，表现为机器人在障碍前犹豫或停滞。修复：改用扩散或离散头，或对数据做模式分离。</li>
+      <li><strong>分箱边界误差</strong>：离散 token 头在相邻箱边界反复跳变，动作出现高频抖动。修复：分箱数提到 256 以上，或加入残差回归项补偿量化误差。</li>
+      <li><strong>块边界切换抖动</strong>：重规划瞬间动作跳变，末端执行器产生冲击。修复：启用块间融合并调 γ，或降低执行步数使重叠区更长。</li>
+      <li><strong>低频通道被淹没</strong>：夹爪开合等低频维度的损失远小于高频关节，训练后期仍在错误状态。修复：按维度归一化损失或加权，单独监控各维误差。</li>
+      <li><strong>归一化反变换缺位</strong>：训练在归一化空间进行，部署时忘做反变换，动作幅度整体错位。修复：把反变换内嵌到策略输出接口，002 章的参数随权重一同发布。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>动作块 H=16、执行步数 m=8、控制频率 10 Hz，计算重规划周期与两个相邻块的重叠步数。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>重规划周期 0.8 秒；块覆盖 16 步、每 8 步重规划一次，相邻块重叠 8 步。</div></details>
+      </li>
+      <li>把融合系数 γ 从 0.5 改为 0.05，预测执行阶段的平滑性与响应性变化。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>γ 越小旧块权重越高，轨迹更平滑但响应迟滞，突变场景下转向变慢；应在含突变的任务上量化响应延迟。</div></details>
+      </li>
+      <li>推导：设动作量程为 R、分箱数为 B，给出均匀分箱的量化误差上界，并解释它为何与动作维度的动态范围成正比。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>误差上界 R/(2B)。量程越大绝对误差越大，高精度任务需扩箱数或做尺度归一化。</div></details>
+      </li>
+      <li>设计消融实验：在同一示教数据集上比较回归头、离散头、扩散头的成功率与推理延迟，给出预期结论与选型建议模板。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>单模态下三者接近，回归延迟最低；多模态下回归明显落后，扩散与离散接近而扩散更慢。选型按模态数与延迟预算决定。</div></details>
+      </li>
+      <li>构造一个“模式平均”可复现的小实验：设计两条绕障轨迹作为数据，训练回归头并观察输出轨迹，再对照扩散头的输出。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>固定起终点、中央放障碍，左右两条示教轨迹。回归头输出穿过障碍的中线，扩散头可采样出左或右整条轨迹；用动作分布熵量化差异。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>动作输出空间由构型与控制接口决定，输出动作块 A<sub>t</sub> ∈ R<sup>H×d<sub>a</sub></sup>，H 取 8–16。</li>
+      <li>三类动作头：回归最快但多模态弱，离散与语言模型亲和但有量化误差，扩散表达强但迭代采样成本高。</li>
+      <li>交叉注意力动作头以独立查询读取共享 memory，结构即插即用。</li>
+      <li>滚动执行加块间融合是平滑性的标准方案，<strong>γ 与执行步数共同决定响应性对平滑性的平衡</strong>。</li>
+      <li>训练随机、推理确定是动作生成的一致原则，探索需求单独配置。</li>
+      <li>下一章把两路输出的监督统一起来：联合训练中的损失函数设计。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch003.html">← 第 003 章：世界模型预测下一帧图像</a>
+    <a class="next" href="ch005.html">第 005 章：联合训练中的损失函数设计 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

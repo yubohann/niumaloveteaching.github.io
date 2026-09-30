@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第038章 分布式训练与并行采样 | 多智能体强化学习课程 · CTDE 框架与协同算法</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 训练工程与稳定性</span>
+    <span class="sep">/</span>
+    <span>第 038 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 训练工程与稳定性</div>
+    <h1>第 038 章：分布式训练与并行采样</h1>
+    <p class="lead">本章讲并行采样的系统设计：向量化环境与自动重置、演员学习器（Actor-Learner）架构、批量策略推理、权重同步频率与数据新鲜度，以及多进程下随机种子与归一化统计的一致性管理。</p>
+    <ul class="meta">
+      <li>主题：系统架构 / 吞吐与数据供给</li>
+      <li>关键公式：吞吐率 ≈ N<sub>env</sub> × n<sub>actor</sub> / 单步耗时</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 037 章 训练稳定性与种子方差</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解并行化的三个层次：单进程向量化环境、多进程演员学习器架构、多机扩展，及各自的收益与代价。</li>
+      <li>掌握向量化环境的实现要点：批量步进、回合结束的部分重置与掩码处理。</li>
+      <li>掌握批量策略推理与权重同步机制，理解策略版本滞后对数据新鲜度的影响。</li>
+      <li>掌握多进程实验中随机种子独立化与归一化统计集中更新的纪律。</li>
+      <li>能计算给定架构的吞吐率上界，并按吞吐需求选择环境数与演员数量。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 037 章从统计角度讨论种子，本章从系统角度讨论样本供给。多智能体训练的环境交互是主要瓶颈：一个回合包含各智能体的逐步决策，单进程串行采集时每秒环境步数被 Python 解释与单核计算限制在几百到几千的量级，而典型任务需要数十万到上千万环境步的交互。并行采样把交互分散到多个环境实例与多个进程，把吞吐率提升一到两个数量级，是训练可迭代性的基础。</p>
+    <p>并行化同时改变训练动力学的数据侧条件：多个采集源产生数据的时刻与策略版本不再一致，回放池收到的是&quot;多版本混合&quot;数据；每个采集进程的随机序列必须独立化，否则各环境产生高度相关的轨迹，统计上等于只有一个环境。本章建立并行系统的结构认知，第 039 章在此基础上讨论同步与异步更新对算法语义的影响。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 并行化的三个层次</h3>
+    <table>
+      <tr><th>层次</th><th>实现方式</th><th>适用规模</th><th>主要代价</th></tr>
+      <tr><td>单进程向量化</td><td>环境批量步进接口，NumPy 层并行</td><td>16 至 64 个环境</td><td>受单核与 Python 开销限制</td></tr>
+      <tr><td>多进程演员</td><td>独立进程跑环境，队列传递数据</td><td>32 至 256 个环境</td><td>进程间通信与版本滞后管理</td></tr>
+      <tr><td>多机分布式</td><td>网络化队列与参数服务器</td><td>数百以上环境</td><td>网络延迟、容错与一致性</td></tr>
+    </table>
+    <p><strong>扩展顺序遵循&quot;先向量化、再多进程、最后多机&quot;：每一层的复杂度上一档才承担下一档的结构改动。</strong>骨架选择的原则是按吞吐需求反推：目标吞吐除以单环境步进速率得到环境数，再除以单进程承载上限得到进程数。</p>
+    <p>三个层次的复杂度差异体现在工程成本上：向量化只需统一环境接口；多进程要处理数据序列化、异常退出与种子隔离；多机要增加一致性协议与故障恢复。选择顺序因此是先确认单机向量化达到上限（单核利用率饱和、内存充足），再引入进程；多机只在单机吞吐无法满足实验节奏时启用，并用小规模对照验证通信开销没有吞掉收益。</p>
+
+    <h3>2. 向量化环境与部分重置</h3>
+    <p>向量化环境把 N<sub>env</sub> 个实例的状态组织为批量张量，<code>step</code> 接收批量动作、返回批量观测。多智能体环境再叠加一层智能体维度，数据形状为（环境数，智能体数，观测维度）。</p>
+    <p>回合长度不齐是向量化实现的核心难点：某一环境完成回合时，其余环境仍在进行，需要对完成环境执行重置并保持其他环境不动。实现上：</p>
+    <div class="formula">
+      obs<sub>new</sub> = done ⊙ reset(env) + (1 − done) ⊙ step_result
+      <span class="note">done 为逐环境完成掩码；自动重置后旧回合的最后观测需先写入回放池再丢弃</span>
+    </div>
+    <p>容易出错的位置有两处：其一，完成环境的最后一步观测与奖励必须在重置前记录，漏记会让回放数据缺尾；其二，重置产生的新回合初始观测不能进入同一条过渡数据的目标观测位，否则目标值跨越回合边界。向量化缓冲区的写入逻辑通常以&quot;环境维度独立、智能体维度统一&quot;组织，与第 023 章的回合式缓冲对接时按环境分别收尾。实现细节上还有一处容易漏测：完成掩码的类型转换。布尔掩码写入回放池时若存为浮点以便与折扣项相乘，读取端需要按精确值判定，测试用例应覆盖掩码取 0 与取 1 两侧以及批次内多环境同时完成的边界。</p>
+
+    <h3>3. 演员学习器架构与权重同步</h3>
+    <p>演员学习器（Actor-Learner）架构把系统分为两侧：演员进程只与环境交互、积累过渡数据；学习器进程只从队列取数据、执行优化。两侧的耦合方式决定数据新鲜度：</p>
+    <ul>
+      <li><strong>中心推理。</strong>演员发送观测，学习器侧批量推理后回传动作。策略版本始终最新，通信往返在每一步发生，对延迟敏感。</li>
+      <li><strong>本地推理。</strong>演员持有策略参数副本并本地计算动作，学习器定期广播权重。通信量小，动作由旧版本策略产生，滞后时间由广播频率决定。</li>
+    </ul>
+    <p>滞后时间是数据新鲜度的核心参数：设广播间隔为 T<sub>b</sub>、演员回传间隔为 T<sub>d</sub>，数据到达学习器时的策略版本滞后量级约为两者之和除以更新周期。第六至八章的离策略算法对滞后有容忍度（配合重要性修正），同策略算法（PPO 一类）要求滞后控制在一个更新周期之内，实践上把广播频率设为每次更新后立即广播。</p>
+    <p>批量推理是吞吐的关键实现：把 N<sub>env</sub> 个动作请求堆叠成批次一次前向，卷积与矩阵运算的利用率远高于逐环境调用。小网络在 CPU 上的逐环境推理可能是主要瓶颈，此时用工作池或批量接口把调用次数降一个量级。</p>
+    <p>批量推理的收益存在上限：单次推理的耗时由固定开销（启动、调度）与批量计算两部分组成，环境数增加后固定开销被摊薄，批量计算的线性部分开始主导，耗时随环境数线性增长。测量方法是对不同环境数记录单批推理耗时，拟合出固定与线性两个分量；线性分量占比超过八成时，继续加大环境数不再改善推理侧利用率，吞吐瓶颈已经转移。</p>
+
+    <h3>4. 多进程的一致性与随机性</h3>
+    <p>三项纪律构成并行系统的正确性基础：</p>
+    <ul>
+      <li><strong>种子独立化。</strong>每个进程使用由主种子派生的独立随机序列（种子由主种子与进程号经确定性映射派生，保证不同进程互不相同），避免所有环境产生重复轨迹。检测方法是对比不同进程前 100 步的动作序列，出现高重复率即配置错误。</li>
+      <li><strong>统计集中更新。</strong>观测与奖励的归一化统计（第 026 章）只在学习器侧更新，演员使用广播快照，防止多进程竞争写入造成统计分叉。</li>
+      <li><strong>版本标记。</strong>每条过渡数据附带产生它的策略版本号，回放池按版本可查；非平稳分析（第 032 章）与新旧数据比例控制都依赖版本标记。</li>
+    </ul>
+    <p><strong>并行化本身不改变算法的样本复杂度，只改变单位墙钟时间内可执行的更新次数；速度收益只有在优化步数同步放大时才转化为学习进程的加速，否则只是更快地积累了未消费的数据。</strong>吞吐率与学习进度的换算关系是下一章同步与异步更新的讨论主题。</p>
+
+    <h3>5. 数值算例：吞吐上界与同步开销的核算</h3>
+    <p>用一组具体耗时核算并行收益。单环境步进 2 毫秒、批量推理一次 0.5 毫秒：单环境串行时每步 2.5 毫秒，吞吐约 400 环境步每秒；32 个环境批量步进时，整批仍是 2.5 毫秒，吞吐约 32 ÷ 0.0025 = 12800 环境步每秒，理想加速比为 32。<strong>只要环境步进与推理都能批量执行，吞吐上界就是环境数与单步耗时的比值；采集侧被摊薄之后，剩余耗时项决定实际加速比。</strong></p>
+    <p>权重广播的开销按更新周期摊薄：每 256 个环境步执行一次参数广播，每次广播与序列化开销 50 毫秒，则每个更新周期中同步占 50 ÷ (256 × 2.5 毫秒) ≈ 7.8% 的时间。广播频率提高一倍（每 128 步一次），同步占比升到约 16%，吞吐上限里约有六分之一被同步占用：<strong>广播频率的选择同时在滞后与吞吐两侧计费，必须高频广播的场合应把环境批调大以摊薄单位开销。</strong></p>
+    <p>队列积压的增长可以手算：采集速率是消费速率的 1.2 倍时，队列每 10 个批次净增 2 批；队列容量为 4 批时，不到 20 个批次就会撑满并触发背压，此后采集被暂停，实际吞吐回落到消费速率。<strong>背压本身不是故障，它把速率错配转化为采集空闲；需要警惕的是没有背压的无界队列，积压让数据版本滞后持续增长，先于任何训练故障表现为吞吐数字的虚高。</strong></p>
+    <p>版本滞后与广播频率的换算：广播每次更新执行、演员每采集 64 步刷新一次权重时，数据到达学习器时的版本差约为队列内批次数乘刷新间隔。队列占用 2 批时滞后约 128 步，占用 4 批时约 256 步，与第 039 章的滞后上限 τ<sub>max</sub> 直接对应，两个参数应在同一张配置表里联调。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>系统由四个模块组成：向量化环境池、策略推理服务、数据队列与学习器。队列容量是有界参数，背压使演员在队列满时暂停采集，防止数据堆积与版本陈旧。</p>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>向量化环境数</td><td>16 至 32</td><td>单进程并行度</td><td>按单环境步进耗时与内存上限反推</td></tr>
+      <tr><td>演员进程数</td><td>4 至 8</td><td>跨进程并行度</td><td>CPU 核数的半数起步，预留学习器资源</td></tr>
+      <tr><td>队列容量</td><td>2 到 4 批</td><td>背压与缓冲</td><td>过大增加陈旧数据，过小使演员频繁等待</td></tr>
+      <tr><td>权重广播频率</td><td>每次优化步后</td><td>控制版本滞后</td><td>同策略算法必须每步广播；离策略可放宽</td></tr>
+      <tr><td>推理批大小</td><td>等于环境数</td><td>前向利用率</td><td>按显存与延迟折中；多演员共享推理服务时按池化批处理</td></tr>
+      <tr><td>数据版本标记</td><td>启用</td><td>新鲜度管理</td><td>与第 023 章回放池版本字段合并</td></tr>
+    </table>
+    <p>与第 037 章的衔接点：并行实验的种子管理分两级：实验级主种子决定权重初始化与评测局面，进程级子种子决定采集序列；报告方差时的种子编号指实验级主种子，进程数变化不影响其可复现性。</p>
+    <p>资源预留方案在部署前明确：学习器独占一个进程与显存预算，演员进程按 CPU 核数分配，每个演员的内存按环境实例数乘单实例占用估算。单进程向量化环境数过大时单步延迟反而上升（缓存命中率下降），实测的收益曲线通常在 32 到 64 个环境之间出现拐点，超过拐点后应转向多进程，不再加大单进程批。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：向量化步进与部分重置</strong></p>
+    <pre class="code"><code>import numpy as np
+
+class VectorizedMultiAgentEnv:
+    """N 个环境的批量步进：完成的环境自动重置，其余保持连续。"""
+    def __init__(self, n_envs, env_factory, seed):
+        self.n_envs = n_envs
+        # 每个环境派生独立种子：防止批量环境产生重复轨迹
+        self.envs = [env_factory(seed + 7919 * i) for i in range(n_envs)]
+        self.obs = np.stack([e.reset() for e in self.envs])       # (N, n_agents, obs_dim)
+
+    def step(self, actions):
+        """actions: (N, n_agents) 的批动作；返回批量过渡与完成掩码。"""
+        obs_next, rewards, dones, infos = [], [], [], []
+        for i, env in enumerate(self.envs):
+            o, r, d, info = env.step(actions[i])
+            if d:
+                # 完成环境：先记录终步数据，再重置并只替换该环境的观测
+                info["final_obs"] = o
+                o = env.reset()
+            obs_next.append(o); rewards.append(r); dones.append(d); infos.append(info)
+        # 目标观测位使用重置后的新回合初始观测也无碍：
+        # 完成掩码使目标值截断自举，新回合观测不会进入时序差分目标
+        out = {"obs_next": np.stack(obs_next), "reward": np.stack(rewards),
+               "done": np.array(dones, dtype=np.float32), "infos": infos}
+        self.obs = out["obs_next"]
+        return out</code></pre>
+    <p>解读：<strong>循环体内的两行顺序是正确性关键：先保存终步观测到 <code>info</code>，再重置环境；漏存终步观测会让每条回合的最后一步数据缺失。</strong>注释里解释了一个常见疑惑：重置后的初始观测写入 <code>obs_next</code> 并不污染训练，因为完成掩码在目标计算处截断自举（第 024 章）。子种子用固定质数乘子派生，避免不同环境种子接近导致的相关序列；该函数保留环境循环，真实实现会用批量接口替换，但语义保持一致。</p>
+
+    <p><strong>片段 2：批量策略推理</strong></p>
+    <pre class="code"><code>import torch
+
+@torch.no_grad()
+def batched_act(policy, obs_batch, avail_batch, eps, rng):
+    """把 N 个环境的观测堆叠为一批做推理，返回批动作与对数概率。"""
+    n_env = obs_batch.shape[0]
+    obs = obs_batch.reshape(n_env, -1)                # 环境与智能体维展平为批
+    # no_grad 推理：采样不进计算图，避免显存泄漏与无谓开销
+    logits = policy(obs)
+    logits = logits.masked_fill(avail_batch.reshape(n_env, -1) == 0, -1e9)
+    probs = torch.softmax(logits, dim=-1)
+    actions = torch.multinomial(probs, 1).squeeze(-1)  # 逐行采样
+    # epsilon 探索用批量掩码合并：一次采样决定哪些行替换为均匀随机动作
+    explore = torch.rand(n_env) &lt; eps
+    uniforms = torch.randint(0, logits.shape[-1], (n_env,))
+    actions = torch.where(explore, uniforms, actions)
+    return actions.reshape(obs_batch.shape[:2]).cpu().numpy()</code></pre>
+    <p>解读：<code>reshape</code> 把（环境，智能体）两维折叠进批维，一次前向完成全部动作计算，这是吞吐的主要来源。<strong>探索处理采用批量掩码：一次伯努利采样决定整批中哪些行执行随机动作，与第 025 章的共享随机数策略在&quot;批&quot;这一层保持语义一致；若任务要求逐智能体独立探索，可把随机数生成放到展平后的行上。</strong>不可行动作的填充值沿用 −1e9 约定（第 028 章），推理端与训练端保持同一口径。</p>
+
+    <p><strong>片段 3：演员循环与版本标记推送</strong></p>
+    <pre class="code"><code>def actor_loop(worker_id, env_pool, policy_snapshot, queue, stop_flag):
+    """单个演员进程：采集一批过渡，附带策略版本号后入队。"""
+    rng = np.random.RandomState(1000 + worker_id)      # 进程级独立随机源
+    while not stop_flag.is_set():
+        batch = env_pool.rollout(steps=64, policy=policy_snapshot, rng=rng)
+        # 版本号来自策略快照的元数据：供学习器做新鲜度管理与统计
+        batch["policy_version"] = policy_snapshot.version
+        queue.put(batch, timeout=5)                     # 有界队列：背压使采集暂停
+        policy_snapshot = policy_snapshot.refresh()     # 拉取最新广播权重
+
+def learner_accept(queue, buffer, learner_version, max_stale=2):
+    """学习器侧接收：过期版本数据丢弃，保持池内新鲜度。"""
+    while not queue.empty():
+        batch = queue.get()
+        if batch["policy_version"] &lt; learner_version - max_stale:
+            continue                                    # 版本过旧：丢弃防止滞后污染
+        buffer.push_batch(batch)</code></pre>
+    <p>解读：<strong>版本标记把&quot;数据新鲜度&quot;从模糊概念变成可编程约束：<code>max_stale</code> 参数直接定义可接受的最大版本滞后，与第 023 章的缓冲期管理共用同一字段。</strong>有界队列的 <code>put</code> 超时构成背压：学习器消费慢时演员自动等待，防止无界内存增长。快照刷新接口 <code>refresh</code> 是收敛点，实现上可以是参数拉取或共享内存读取；本片段不展示具体传输机制，语义上保证演员在使用某版本期间参数一致。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>各进程默认种子相同。</strong>所有环境产生相同轨迹，统计上等效于单环境训练却支付并行成本。症状是不同进程回传数据高度重复。修复：种子按进程号派生，加入重复率自动检测。</li>
+      <li><strong>终步观测丢失。</strong>完成环境先重置再记录，每条回合缺最后一步，时序差分目标的终值错误。修复：记录顺序固定为&quot;先存后重置&quot;，单元测试覆盖回合边界。</li>
+      <li><strong>多进程各自更新归一化统计。</strong>统计量分叉使各进程输入变换不一致（第 026 章）。修复：统计只在学习器侧更新，演员读快照。</li>
+      <li><strong>无界队列。</strong>采集快于消费时内存持续增长，数据陈旧且版本混乱。修复：队列容量按批次设置，put 超时形成背压。</li>
+      <li><strong>推理与评测的隔离缺陷。</strong>批量推理未关闭梯度使显存随步数增长；评测环境混入并行池被训练序列污染。修复：推理出口统一 <code>no_grad</code>；评测使用独立实例与独立种子区间。</li>
+          </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>计算：设单环境步进耗时 2 毫秒、动作推理单批 0.5 毫秒、目标吞吐为每秒 5 万环境步，求所需的向量化环境数与演员进程数的下界，并指出哪一环最先成为瓶颈。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>单环境串行每秒约 500 步，5 万步需要约 100 个环境并行；推理批处理随环境数摊薄，若学习器更新频率跟不上，瓶颈转移到优化侧。</div></details>
+      </li>
+      <li>改参数预测：把权重广播频率从每次更新后放宽到每 10 次更新后，预测数据版本滞后分布、离策略修正强度与训练稳定性三方面的变化。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>滞后分布整体右移，旧版本数据占比上升；重要性修正或裁剪机制的负担加重；同策略算法下稳定性明显恶化，离策略算法下影响温和。</div></details>
+      </li>
+      <li>设计：为一个 24 环境、4 智能体的任务设计演员学习器通信方案，给出推理位置（中心或本地）、队列结构、版本管理策略与评测隔离方案，并说明选择理由。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>环境数中等时本地推理加每次更新广播即可；队列按批承载，容量 2 到 4；评测进程独立于演员池。</div></details>
+      </li>
+      <li>实验设计：在固定算法与超参数下，测量环境数从 4 增加到 32 时的吞吐率、数据滞后分布与达到固定回报的墙钟时间，绘制三条曲线并解释吞吐增益与实际加速不成比例的原因。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>吞吐近似线性上升但滞后分布随队列占用恶化，有效样本新鲜度下降；墙钟加速低于吞吐增益，差额来自旧数据占比上升与优化侧瓶颈。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>并行化分三层：向量化环境、多进程演员、多机扩展；按吞吐需求反推环境数与进程数。</li>
+      <li>向量化步进的核心是完成掩码与部分重置；终步数据先存后重置，重置观测依靠截断不污染目标值。</li>
+      <li>演员学习器架构的取舍在推理位置与权重广播频率，数据滞后由广播间隔与队列占用共同决定。</li>
+      <li>三项纪律：种子独立派生、归一化统计集中更新、过渡数据附版本标记。</li>
+      <li>下一页讨论并行系统的动力学后果：<strong>同步批次更新与异步流水更新在偏离度、样本利用效率与稳定性上的系统对比</strong>。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch037.html">← 第 037 章：训练稳定性与种子方差</a>
+    <a class="next" href="ch039.html">第 039 章：异步更新与同步更新对比 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

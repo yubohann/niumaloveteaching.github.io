@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第056章 Ray Tune与RLlib联合训练流程 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第四篇 · Ray Tune 超参搜索</span>
+    <span class="sep">/</span>
+    <span>第 056 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第四篇 · Ray Tune 超参搜索</div>
+    <h1>第 056 章：Ray Tune与RLlib联合训练流程</h1>
+    <p class="lead">训练器即试验：RLlib 算法对象天然实现 Tune 的可训练协议，搜索空间直接映射到算法配置键，报表字段成为调度器的决策输入；关键工程点是评估指标的选择、检查点频率与试验资源的三方匹配。</p>
+    <ul class="meta">
+      <li>主题：Ray Tune 调优（与 RLlib 集成）</li>
+      <li>关键机制：训练器协议、指标桥接、检查点配置</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 055 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解 RLlib 算法对象与 Tune 可训练协议的对应关系：迭代训练、报表、检查点三个接口。</li>
+      <li>掌握搜索空间到 RLlib 配置键的映射方法，能列出强化学习任务的高价值搜索维度。</li>
+      <li>掌握评估指标与训练指标的区别，能选择抗噪声的早停指标并说明理由。</li>
+      <li>会配置联合运行的检查点频率、停止条件与资源声明，理解三者与后续调度器的依赖关系。</li>
+      <li>能读取搜索结果表，按指标排序选出最优配置并定位对应的最优检查点。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>RLlib 与 Tune 出自同一技术栈，算法对象实现了可训练协议：每轮训练返回报表字典，支持保存与恢复检查点。这带来一个结构性便利：<strong>无需把训练脚本改写成目标函数，直接把算法类与配置交给 Tune 即可开始搜索。</strong>训练器的内部并行（采样 worker、学习设备）与 Tune 的试验并行（多个试验共享集群）构成两层并行，资源声明把两者衔接起来。</p>
+    <p>联合流程的工程难点集中在指标与状态两侧：调度器按指标做生死决策，指标必须抗噪声；暂停与重启依赖检查点，频率必须与调度粒度匹配。本章把这两条链路讲清楚。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p>本节按"协议对接、指标桥接、检查点衔接、资源两层次"四层展开。</p>
+
+    <h3>1. 协议对接：训练器即试验</h3>
+    <table>
+      <tr><th>Tune 概念</th><th>RLlib 对应物</th><th>行为</th></tr>
+      <tr><td>可训练对象</td><td>算法类（如 PPO、SAC）</td><td>由 Tune 按配置构建并运行</td></tr>
+      <tr><td>训练迭代</td><td><code>train()</code> 一轮</td><td>采样加学习一个批次，返回报表</td></tr>
+      <tr><td>指标上报</td><td>报表字典的扁平化字段</td><td>奖励、迭代数、时间、损失等</td></tr>
+      <tr><td>检查点</td><td><code>save()</code> / 恢复接口</td><td>保存模型、优化器与采样器状态</td></tr>
+      <tr><td>停止响应</td><td>由 Tune 包装层处理</td><td>优雅退出并保留最近检查点</td></tr>
+    </table>
+    <p>由于训练迭代返回的报表本身就是指标载体，联合流程的"上报"步骤被自动完成。<strong>用户需要显式配置的只有三件事：搜索空间里的参数、停止条件里的键名、检查点频率。</strong></p>
+
+    <h3>2. 指标桥接：训练指标与评估指标</h3>
+    <p>RLlib 报表包含两类奖励字段：训练侧（采样过程中的回合回报）与评估侧（周期性评估运行的回报）。两者的噪声差异显著：训练侧数据来自探索策略、回合长度不一、受最新策略波动影响；评估侧使用固定的评估协议与确定性动作，方差小得多。<strong>调度器按指标做淘汰决策时，训练侧指标会把"运气差的种子"误判为"配置差"，评估侧指标是早停与选择的首选依据。</strong></p>
+    <p>评估的代价需要计入预算：评估运行占用额外环境步，评估频率过高会显著挤压训练吞吐。经验折中是每若干训练轮评估一次，评估回合数与训练回合数比例控制在 1:10 至 1:5。</p>
+
+    <h3>3. 检查点衔接：频率与粒度的匹配</h3>
+    <p>检查点频率由两类需求共同决定：<strong>容错需求</strong>要求最坏损失不超过一个检查点间隔的训练量；<strong>调度需求</strong>要求暂停式调度器能在任意决策点重启试验，检查点间隔大于调度粒度时，重启会回退到旧状态，浪费训练量。对早停调度器，检查点间隔应不大于评估间隔，使每次"淘汰判定"都有对应的状态可恢复。存储成本随频率线性上升，容量规划时按"检查点数 × 单点体积"预留。</p>
+    <p>频率失配的代价可以折算：评估间隔 5 轮、检查点频率 15 轮时，决策点最多回退 10 轮再重训，反复淘汰时重复训练量成倍累积；单轮 30 秒时每次回退最多多花 5 分钟，10 次判定累计约 50 分钟，已经超过一次小规模搜索的单试验预算。反过来检查点频率远高于评估间隔时，腾出的回退收益很小，写入成本却按频率线性上涨，5 与 5 对齐是多数配置的起点。</p>
+
+    <h3>4. 两层并行与资源声明</h3>
+    <p>试验内部的算法使用采样 worker 与学习设备，构成第一层并行；Tune 在集群上并发多个试验，构成第二层并行。资源声明的正确姿势是：<strong>单试验声明等于内部实际需求（采样 worker 数对应的 CPU、学习设备的 GPU），集群总容量除以单试验声明得到并发试验数。</strong>例如 64 CPU 的池子、单试验 8 CPU，最多 8 个试验并发；若同时启用评估 worker，评估也占用 CPU，声明时一并计入。</p>
+    <p>并发试验之间的资源竞争体现在学习设备上：多个试验共享一张 GPU 时，声明小数 GPU（如 0.25）并接受学习变慢，这是"以时间换搜索宽度"的常见交换；对时间敏感的场景则改为每试验独占，减少并发。</p>
+
+    <h3>5. 评估开销的定量控制</h3>
+    <div class="formula">
+      评估开销占比 = e / ( k · b + e )
+      <span class="note">e 为单次评估消耗的环境步，k 为评估间隔轮数，b 为每轮训练的环境步；e = 2048、b = 8192 时，k = 2 占比约 11.1%，k = 5 约 4.8%，k = 10 约 2.4%</span>
+    </div>
+    <p>参数组合的数值对照：</p>
+    <table>
+      <tr><th>评估间隔 k</th><th>评估开销占比</th><th>退化检测延迟</th><th>适用阶段</th></tr>
+      <tr><td>2</td><td>约 11.1%</td><td>最短</td><td>早期趋势观察</td></tr>
+      <tr><td>5</td><td>约 4.8%</td><td>中</td><td>常规搜索</td></tr>
+      <tr><td>10</td><td>约 2.4%</td><td>较长</td><td>长训练、稳定阶段</td></tr>
+    </table>
+    <p>间隔与评估回合数是两个独立旋钮：回合数决定测量精度，间隔决定检测频率与开销；先用间隔把开销压进预算，再按决策阈值要求提高回合数。</p>
+
+    <h3>6. 并发试验与资源利用率的核算</h3>
+    <p>集群 96 CPU 与 4 张 GPU，单试验声明 8 CPU 与 0.5 GPU：CPU 维度容纳 12 个试验，GPU 维度容纳 8 个，并发取 8。此时 CPU 使用 64/96 ≈ 67%，GPU 使用 100%；空闲的 32 个 CPU 不足以形成第 9 个完整试验。两种调整方向：把部分试验改为纯 CPU 配置，或把 GPU 声明降到 0.25 换取最多 16 个并发（CPU 维度回落到 12 成为新约束）。<strong>两条约束的松紧关系由声明比例决定，调整声明比例是把空闲资源换成搜索宽度的常规手段。</strong></p>
+
+    <h3>7. 检查点回退量的核算</h3>
+    <p>暂停式调度器在决策点淘汰试验时，未保存的训练量随回退丢弃：</p>
+    <div class="formula">
+      最坏回退样本量 = 检查点间隔（轮） × 每轮样本量
+      <span class="note">间隔 10 轮、每轮 8192 样本时最坏丢弃约 8.2 万样本；间隔收紧到 5 轮后回退量减半，检查点份数与存储写入同步翻倍</span>
+    </div>
+    <p>间隔与评估对齐（同为 5 轮）时，每个判定点都有可恢复状态；频率高于评估时存储成本上升而回退收益递减，低于评估时出现"判定后无点可回"的浪费。数值权衡：间隔从 10 收紧到 5，回退量从 8.2 万降到 4.1 万样本，按单点体积与磁盘预算核对后确定取舍。</p>
+
+    <h3>8. 训练指标与评估指标的对照</h3>
+    <table>
+      <tr><th>维度</th><th>训练指标</th><th>评估指标</th></tr>
+      <tr><td>数据来源</td><td>探索策略的采样回合</td><td>固定协议的评估回合</td></tr>
+      <tr><td>动作选择</td><td>带探索噪声</td><td>确定性动作</td></tr>
+      <tr><td>统计窗口</td><td>随采样节奏浮动</td><td>回合数可控，方差低</td></tr>
+      <tr><td>系统代价</td><td>随训练自然产生</td><td>额外环境步与进程</td></tr>
+      <tr><td>用途</td><td>监控训练过程</td><td>早停、排序与取优</td></tr>
+    </table>
+    <p>选优可信度的数值判据：头部差距与头部标准差的比较给出参考，前 5 名标准差为 12、头名优势为 8 时，头名优势小于波动，需要重复验证。重复次数按平方根缩减标准误：同一配置重复 3 次，标准误降到单次的约 0.58 倍。<strong>可行流程是先取前 3 至 5 个配置，各重复 2 至 3 个种子，再用重复均值做最终排序。</strong></p>
+    <p>重复次数的定量结论更直接：要让头名优势进入显著区间，需要 头名差距 ≥ 2×σ/√r，反解 r ≥ (2σ/差距)²。头名差距 8、头部标准差 12 时 r ≥ (24/8)²=9，单个配置约需 9 粒种子；只要求差距达到一倍标准误时 r ≥ (12/8)²≈2.3，3 粒种子起步即可。两阶段策略的总评估数等于候选数乘重复数：前 5 名各重复 3 次会新增 15 次评估，占 60 次试验预算的四分之一，这是让排序结论可信的最低代价。</p>
+    <p>GPU 共享的代价同样可以量化：四个试验共享一张卡、每试验声明 0.25 GPU 时，学习侧轮流获得时间片，单个试验的学习时间近似变为独占时的四倍；学习时间原本占比不高时整体影响有限，占比高时则要重新划分并发与设备。小数声明的意义是让调度器把四份合计为一张卡的配额，避免超额并发在显存上互相挤压；共享比例与并发数的乘积不能超过物理卡数，这条约束在声明阶段核对一次即可，避免并发协商时出现隐性超额。</p>
+    <p>结果表的读取细节：嵌套超参在表中以展开路径出现，读取脚本按 config/ 前缀匹配，固定列名随版本变动会失配；停止键名写错时的排查顺序是先打印单试验报表键、再核对版本文档、最后修改配置，三步顺序颠倒会浪费时间在配置猜谜上。资源声明的评审点：声明值之和不超过集群容量、评估进程计入声明、并发数按 CPU 与 GPU 两条约束的较小值取；批量搜索启动前，先用单试验核对一次报表键与停止条件。实验记录同时保存停止条件的实际触发字段：哪个条件先满足决定试验的实际训练量，横向比较时只使用训练量相近的试验。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>联合搜索流程按六步执行。</p>
+    <ol>
+      <li><strong>确定搜索维度</strong>：从高价值参数起步（学习率、批次、折扣、熵系数），维度控制在 3 至 6 个。</li>
+      <li><strong>映射到配置键</strong>：搜索空间的键名与算法配置键逐字对应，嵌套项用完整路径。</li>
+      <li><strong>配置评估</strong>：启用周期性评估，选择评估指标作为排序与早停依据。</li>
+      <li><strong>设置停止与检查点</strong>：迭代计数兜底，检查点间隔不大于评估间隔。</li>
+      <li><strong>声明资源</strong>：与内部并行度一致，核算并发试验数。</li>
+      <li><strong>运行与取优</strong>：按评估指标排序，导出最优检查点。</li>
+    </ol>
+    <h3>高价值搜索维度表</h3>
+    <table>
+      <tr><th>维度</th><th>配置键示例</th><th>范围建议</th><th>理由</th></tr>
+      <tr><td>学习率</td><td><code>lr</code></td><td>1e-5–1e-2（对数）</td><td>影响面最大，跨数量级差异常见</td></tr>
+      <tr><td>采样批次</td><td><code>train_batch_size</code></td><td>4096–65536</td><td>与学习率耦合，见 051 章缩放规则</td></tr>
+      <tr><td>折扣因子</td><td><code>gamma</code></td><td>0.95–0.999</td><td>决定规划时程，任务相关性强</td></tr>
+      <tr><td>熵系数</td><td><code>entropy_coeff</code></td><td>1e-4–1e-2</td><td>探索强度，见 043 章</td></tr>
+      <tr><td>网络宽度</td><td><code>model.fcnet_hiddens</code></td><td>64–512</td><td>容量与样本量匹配，见 048 章</td></tr>
+    </table>
+    <p>与上一章的差异：055 章搭建通用搜索骨架，本章把骨架的每个插槽换成 RLlib 的现成部件；目标函数不再需要手写，注意力转移到指标选择与检查点策略。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：直接搜索 RLlib 算法</strong></p>
+    <pre class="code"><code>from ray import tune
+
+analysis = tune.run(
+    "PPO",                                   # 训练器名即目标：无需包装函数
+    config={
+        "env": "CartPole-v1",
+        "framework": "torch",
+        "num_env_runners": 4,                # 试验内部并行：与资源声明匹配
+        "train_batch_size": 8192,
+        # 搜索维度直接写在配置键上，键名与算法配置逐字一致
+        "lr": tune.loguniform(1e-5, 1e-2),
+        "gamma": tune.uniform(0.95, 0.999),
+        "entropy_coeff": tune.loguniform(1e-4, 1e-2),
+        "model": {"fcnet_hiddens": tune.choice([[64, 64], [128, 128], [256, 256]])},
+        # 评估指标：早停与排序优先使用评估侧数据（噪声更低）
+        "evaluation_interval": 5,
+        "evaluation_num_env_runners": 2,
+    },
+    num_samples=32,
+    resources_per_trial={"cpu": 6, "gpu": 0.25},   # 4+2 采样与评估 CPU
+    stop={"training_iteration": 100, "evaluation/episode_reward_mean": 450},
+    checkpoint_config=tune.CheckpointConfig(
+        checkpoint_frequency=5,              # 不大于评估间隔：暂停重启不回退
+        checkpoint_at_end=True,
+    ),
+    local_dir="./tune_ppo",
+)
+
+best = analysis.get_best_config(metric="evaluation/episode_reward_mean", mode="max")
+print("最优超参：", best)</code></pre>
+    <p>解读：逐块说明。<strong>（1）</strong>训练器名直接作为目标，RLlib 的报表自动成为指标来源；配置字典里既有固定项也有分布对象，Tune 在构建试验时解析。<strong>（2）</strong>资源声明 6 CPU 对应 4 个采样 worker 加 2 个评估 worker，声明与实际并行一致，并发数按集群容量换算。<strong>（3）</strong>停止条件是复合字典：迭代计数兜底，评估奖励达标则提前结束；评估键名前缀由评估统计自动生成，写错前缀会静默失效，需要核对报表。<strong>（4）</strong>检查点频率 5 与评估间隔 5 对齐，保证每个淘汰判定点都有可恢复状态。</p>
+
+    <p><strong>片段 2：Tuner 接口与最优检查点导出</strong></p>
+    <pre class="code"><code>from ray import tune
+from ray.tune import Tuner, RunConfig, CheckpointConfig
+
+tuner = Tuner(
+    "SAC",                                   # 训练器名或配置对象均可
+    param_space={
+        "env": "Pendulum-v1",
+        "framework": "torch",
+        "tau": tune.loguniform(1e-3, 1e-1),   # 目标网络软更新系数（053 章）
+        "lr": tune.loguniform(1e-5, 1e-3),
+        "train_batch_size": tune.choice([2048, 4096, 8192]),
+        "evaluation_interval": 5,
+    },
+    tune_config=tune.TuneConfig(
+        num_samples=40,
+        metric="evaluation/episode_reward_mean",
+        mode="max",                           # 指定方向：最大化评估回报
+    ),
+    run_config=RunConfig(
+        stop={"training_iteration": 120},
+        checkpoint_config=CheckpointConfig(
+            checkpoint_frequency=10, checkpoint_at_end=True),
+        storage_path="./tune_sac",            # 结果与检查点的集中存储位置
+    ),
+)
+
+results = tuner.fit()
+best_result = results.get_best_result(metric="evaluation/episode_reward_mean",
+                                      mode="max")
+print("最优指标：", best_result.metrics["evaluation/episode_reward_mean"])
+print("检查点路径：", best_result.checkpoint.path)
+# 后续可用该检查点恢复训练或导出推理工件（050 章的导出流程）</code></pre>
+    <p>解读：新版 Tuner 接口把运行配置拆分为 param_space、tune_config、run_config 三段，职责更清晰。<strong>（1）</strong>metric 与 mode 在 tune_config 中声明一次，排序、最优查询与部分调度器共享该口径，避免多处书写不一致。<strong>（2）</strong><code>best_result</code> 同时携带指标与检查点路径，检查点可直接进入恢复或导出流程，这是"搜索结果到生产工件"的交接点。<strong>（3）</strong>storage_path 为实验落盘位置，后续章节的实验导入、对比与恢复都依赖它。接口随版本演进，旧版 tune.run 与新版 Tuner 可混用但不应在同一工程中交叉引用。</p>
+    <p>接口混用是联合流程的常见故障源：同一工程内同时使用 <code>tune.run</code> 与 <code>Tuner</code> 时，实验目录结构、检查点对象与结果表字段会出现两套形态，后续的导入与分析脚本要同时兼容两套口径，维护成本翻倍。开工前确认版本的默认接口，全工程统一，并在实验记录里标注接口版本与存储路径，让后续章节的脚本只面对一种形态。</p>
+
+    <p><strong>片段 3：结果表读取与噪声检查</strong></p>
+    <pre class="code"><code>import pandas as pd
+
+def summarize_search(analysis, metric="evaluation/episode_reward_mean", top=5):
+    """读取结果表：按指标排序取前若干名，并检查头部差距。"""
+    df = analysis.results_df.copy()
+    df = df.dropna(subset=[metric]).sort_values(metric, ascending=False)
+    head = df.head(top)[[metric, "training_iteration", "config/lr",
+                         "config/gamma", "config/entropy_coeff"]]
+    print(head.to_string(index=False))
+    # 头部差距在噪声量级以内时，"最优"不可信：应扩试验数或做重复验证
+    gap = df[metric].iloc[0] - df[metric].iloc[1] if len(df) &gt; 1 else 0.0
+    spread = df[metric].head(top).std()
+    if gap &lt; spread:
+        print(f"提示：头名与次名差距 {gap:.1f} 小于前 {top} 名标准差 {spread:.1f}，"
+              "结论需重复种子验证")
+    return df
+
+# 输出列包含超参路径：config/ 前缀对应 param_space 中的嵌套键
+# 噪声检查的目的：防止把一次幸运评估当作最优配置（051 章的种子协议同源）</code></pre>
+    <p>解读：这段分析函数把"选优"升级为"选优加可信度检查"。<strong>（1）</strong>结果表按指标排序后直接输出关键超参列，配置与指标同屏对照。<strong>（2）</strong>头名差距与头部标准差的比较给出可信度判据：差距小于波动时，最优配置的选择本质上是噪声抽签，需要重复验证或扩大样本。<strong>（3）</strong>列名中的 <code>config/</code> 前缀对应嵌套参数路径，嵌套搜索维度（如模型字典内的宽度）会以展开路径出现，读取时注意匹配。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>用训练指标做早停</strong>：训练侧回报含探索噪声，调度器频繁误杀种子不佳的配置，搜索结论被噪声主导。修复：启用周期性评估，早停与排序统一使用评估指标。</li>
+      <li><strong>检查点频率低于调度粒度</strong>：暂停式调度器要求恢复时只能回到很久之前的状态，反复重启浪费大量训练量。修复：检查点间隔不大于评估间隔。</li>
+      <li><strong>资源声明与内部并行脱节</strong>：评估 worker 未计入声明，试验之间超额占用，评估阶段拖慢所有试验。修复：声明值为采样与评估 worker 之和，外加必要的 GPU。</li>
+      <li><strong>停止键名前缀错误</strong>：评估指标的键名前缀与实际报表不符，条件静默失效，试验全部跑满迭代上限。修复：先跑单试验打印报表键，再写停止条件。</li>
+      <li><strong>搜索维度过多</strong>：一次搜索铺开十个维度，试验数不足以覆盖，结果无统计意义。修复：按高价值表收敛到 3 至 6 个维度，其余参数固定在合理默认值。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>计算：集群 96 CPU、4 张 GPU；单试验声明 8 CPU 与 0.5 GPU，CPU 与 GPU 两条约束下的并发试验数各是多少？最终并发取多少？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>CPU 约束 12 个，GPU 约束 8 个，最终并发 8；若想提高并发可把 GPU 声明降为 0.25 或将部分试验改为纯 CPU 搜索。</div></details>
+      </li>
+      <li>解释为什么评估指标比训练指标更适合早停，从数据来源、动作选择与回合统计三个角度对比两者噪声来源。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>评估用固定协议与确定性动作、回合数可控；训练侧受探索噪声与策略更新节奏影响，短窗口统计方差大。</div></details>
+      </li>
+      <li>为一次三参数搜索设计停止与检查点方案：训练上限 150 轮、评估间隔 5 轮，给出停止条件、检查点频率与最坏回退量的估算。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>检查点频率取 5 与评估对齐，最坏回退一个检查点间隔即 5 轮；停止条件为迭代 150 与评估指标阈值复合。</div></details>
+      </li>
+      <li>推导：设每次评估成本为 e 个环境步、评估间隔为 k 轮、每轮训练成本为 b 个环境步，写出评估开销占比表达式并给出把它控制在 15% 以内的参数组合。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>占比为 e/(k·b+e)；b=8192、e=2048 时 k 取 2 以上即可低于 15%，实际还须考虑评估回合数设置。</div></details>
+      </li>
+      <li>解释 <code>checkpoint_at_end</code> 与固定频率检查点的分工：没有它会在什么场景丢失结果？<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>训练在两次定期检查点之间结束（含提前停止）时，末段训练量没有对应状态；开启后保证每个试验都有终态检查点供取优与导出。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>RLlib 算法天然实现 Tune 协议，联合流程只需配置搜索空间、停止条件与检查点三件事。</li>
+      <li>搜索维度映射到算法配置键，键名逐字对应；高价值维度为学习率、批次、折扣、熵系数与网络宽度。</li>
+      <li>评估指标抗噪声，是早停与排序的首选；评估成本计入预算，间隔与回合数需权衡。</li>
+      <li>检查点间隔不大于评估间隔，保证调度决策点都有可恢复状态；末态检查点保证结果不丢。</li>
+      <li>两层并行通过资源声明衔接：单试验声明等于内部并行需求，集群容量决定并发试验数。</li>
+      <li>下一章进入搜索算法本体：网格搜索与随机搜索的样本复杂度差异，以及为什么随机搜索常以更低成本胜出。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch055.html">← 第 055 章：Ray Tune超参调优入门</a>
+    <a class="next" href="ch057.html">第 057 章：网格搜索与随机搜索 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

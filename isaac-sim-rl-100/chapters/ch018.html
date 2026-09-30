@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第018章 使用Stable-Baselines3训练Franka | 机器人仿真学习课程 · Isaac Sim 强化学习训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · 仿真环境与训练框架</span>
+    <span class="sep">/</span>
+    <span>第 018 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · 仿真环境与训练框架</div>
+    <h1>第 018 章：使用Stable-Baselines3训练Franka</h1>
+    <p class="lead">把训练范式搬到 7 自由度连续控制：用 VecNormalize 管好 20 维混合量纲观测，配置更大的策略网络，认识"百万步预算"的现实成本，并守住评估协议的一致性。</p>
+    <ul class="meta">
+      <li>主题：训练框架 / 连续控制与观测归一化</li>
+      <li>相关组件：Stable-Baselines3（PPO、VecNormalize）、Franka 到达环境</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 017 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解连续控制任务的算法选择逻辑：PPO 与 SAC 的适用边界，为什么本任务从 PPO 起步。</li>
+      <li>掌握 VecNormalize 的用法与陷阱：训练统计的积累、评估时必须加载同一份统计并冻结。</li>
+      <li>会为 7 自由度任务配置网络规模（net_arch）与训练预算（1–3 百万步量级）。</li>
+      <li>能估算训练墙钟成本与降本旋钮（decimation、render、并行化）。</li>
+      <li>会用"成功率 + 平均最小距离"双指标评估策略，识别"够不着/接近但不够准/学会"三种状态。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>Franka 到达任务的接口与 Cartpole 完全同构，但每一处都"更难"：动作从 1 维变 7 维、观测从 4 维变 20 维且量纲混杂、回合从几十步变几百步、收敛从十万步级变百万步级。第十七章的"四步范式"不变，需要新增的是三件事：<strong>观测与奖励的数值管理</strong>（否则混合量纲会把学习拖垮）、<strong>网络与预算的升级</strong>、以及<strong>更严格的评估纪律</strong>（训练成本越高，评估错误越昂贵）。</p>
+    <p>本章训出的模型是后续章节的基线：019/020 章改奖励、021 章加域随机化、022 章并行化提速，都会在它的基础上做对照。所以本章格外强调"可复现、可比较"，把基线做扎实，后面的每次改进才有意义。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 连续控制：PPO 还是 SAC？</h3>
+    <p>到达任务是连续动作空间（7 维 Box）。主流选择有两类：<strong>PPO</strong>（on-policy，第十七章已熟悉）与 <strong>SAC</strong>（Soft Actor-Critic，off-policy，用回放池反复利用历史数据）。两者对比如下：</p>
+    <table>
+      <tr><th>维度</th><th>PPO</th><th>SAC</th></tr>
+      <tr><td>样本效率</td><td>较低（数据用完即弃）</td><td>较高（回放池复用）</td></tr>
+      <tr><td>稳定性</td><td>对奖励量级相对鲁棒</td><td>对奖励尺度敏感：须先做奖励缩放</td></tr>
+      <tr><td>并行扩展</td><td>强：采集可高度并行（022 章）</td><td>弱：更新是串行瓶颈</td></tr>
+      <tr><td>调参成本</td><td>低（默认值常可用）</td><td>中（温度系数、回放池、随机化）</td></tr>
+    </table>
+    <p>本课程从 PPO 起步（鲁棒、利于并行）；何时换 SAC？采样成本极高且并行受限时，样本效率才值得调参成本。</p>
+
+    <h3>2. VecNormalize：20 维混合量纲的救兵</h3>
+    <p>016 章的观测混合了关节角（±1）、关节速度（±1）、TCP 与目标位置（约 ±0.8），虽然都归一化过，但分布形状差异仍在。更不用说你接下来会加传感器特征、图像嵌入等更多模态。<strong>VecNormalize</strong> 在环境与算法之间加一层"运行统计"：</p>
+    <div class="formula">
+      obs′ = clip( (obs − μ<sub>run</sub>) / (σ<sub>run</sub> + ε), −10, 10 )
+      <span class="note">μ_run、σ_run 是训练过程中累积的运行均值与标准差，随采样的增加逐步稳定</span>
+    </div>
+    <p>两个必须记住的性质。第一，<strong>统计量随训练变化</strong>：早期归一化用的是"未收敛的统计"，这正是它自适应的意义；但也意味着<strong>评估时绝不能让统计继续更新</strong>，否则同一个策略在不同评估轮次里看到的观测分布不同，数字没法比。正确做法：评估时把 <code>training</code> 设为 False（冻结统计）并加载训练结束时的统计文件。第二，<strong>奖励一般不要归一化</strong>（<code>norm_reward=False</code>）：归一化会让"成功奖励"的相对权重随进步漂移，对稀疏事件尤其危险；保持物理量纲更可控。</p>
+
+    <h3>3. 网络与预算的升级</h3>
+    <p>Cartpole 用默认 [64, 64] 双隐层就够；Franka 的输入输出维度高一个量级，策略需要拟合"从 20 维观测到 7 维动作"的高维映射，推荐 <code>net_arch=[256, 256]</code>（约 13 万参数的 MLP，在 1–3 百万步预算下容量与样本效率平衡）。更大的网络（512×512）在这个任务上收益有限但训练更慢；更小的网络（64×64）则明显欠拟合，你会看到成功率卡在 40% 上下上不去。</p>
+    <p>预算估算用老公式：1 百万 RL 步 × (2/60 s) ≈ 9.3 小时仿真时间。RTF 取 50（单环境、含 7 自由度物理与观测组装）时，纯物理的墙钟开销约为仿真时长的五十分之一；再叠加每步的策略推理与每 1024 步一次的 PPO 更新。这个量级可以接受，但多组对照实验应依赖并行化摊薄成本；本章先出基线，022 章并行化后吞吐近似线性提升。</p>
+
+    <h3>4. 双指标评估：成功率之外要看"最小距离"</h3>
+    <p>到达任务的评估若只看成功率，会把"完全没学会"和"学会了但不精确"混在一起。追加一个指标：<strong>每回合记录的"最小 TCP–目标距离"</strong>。三种典型组合：成功率 0%、最小距离 ≈ 初始距离（0.4 m 量级），策略原地不动或乱动，没学动；成功率 0–30%、最小距离 0.06–0.10 m，已经学会接近但精度不够，应检查成功阈值、奖励细节或继续训练；成功率持续上升、最小距离 < 0.05 m，正常学会。这套诊断比单看回报曲线精确得多，因为回报里还混着"接近奖励"与"成功奖励"两部分。</p>
+
+    <h3>5. 观测统计的收敛速度</h3>
+    <p>VecNormalize 的运行统计在前多少步内稳定下来？以单个维度为例，标准差估计的相对误差约为：</p>
+    <div class="formula">
+      相对误差 ≈ 1 / √(2n)
+      <span class="note">n = 10⁴ 步时约 0.7%；n = 10⁵ 步时约 0.2%（对接近正态的维度）</span>
+    </div>
+    <p>运行统计在一万步量级已基本可用，但仍在缓慢漂移；百万步预算下它早已稳定。两个推论：训练早期的评估数字受统计漂移影响，小幅波动可以先忽略；评估时冻结统计（training=False）之所以关键，是因为冻结后的评估条件与部署条件一致，而训练中统计仍会随新数据微调。一个容易踩的对应坑：不要复用训练环境做评估，它的统计处于更新状态，评估数字会随训练进程漂移；评估环境从构建起就应当是独立的冻结实例。统计文件与模型同名归档的纪律在第 7 节还会以检查表的形式出现，它是执行层面最容易被省略的一步。训练中途某次评估的绝对值可能低于终值，视觉上呈现"回头"也属正常，判断时应以多轮趋势为准，单点数字不作数。</p>
+
+    <h3>6. 网络容量的核算</h3>
+    <p>把 [256, 256] 的参数量逐层加一遍，容量升级的代价立即清楚：</p>
+    <div class="formula">
+      单套 MLP 参数 ≈ (20×256 + 256) + (256×256 + 256) + (256×7 + 7) ≈ 7.3 × 10⁴
+      <span class="note">[64, 64] 约 0.6 × 10⁴；[512, 512] 约 27.7 × 10⁴；actor 与 critic 各一套，总量约为单套的两倍</span>
+    </div>
+    <table>
+      <tr><th>net_arch</th><th>单套参数量</th><th>预期表现</th></tr>
+      <tr><td>[64, 64]</td><td>约 0.6 万</td><td>欠拟合，本任务成功率约 40% 见顶</td></tr>
+      <tr><td>[256, 256]</td><td>约 7.3 万</td><td>容量与样本效率平衡（本章默认）</td></tr>
+      <tr><td>[512, 512]</td><td>约 27.7 万</td><td>容量富余、更新变慢，收益有限</td></tr>
+    </table>
+    <p>每次更新的耗时与参数量近似成正比：从 [256, 256] 升到 [512, 512]，单次梯度计算约慢 3–4 倍，成功率未必提升。容量选择的原则是先匹配任务的映射复杂度：20 维到 7 维的连续映射，7 万参数量级已经够用；把预算花在环境并行上，回报比堆网络明显。若后续加入视觉观测，网络规模的主战场转移到卷积主干，按层乘加的核算方法不变。</p>
+
+    <h3>7. 预算执行的滚动核对</h3>
+    <p>百万步训练有多个可以中途核对的数字，写成一张检查表：</p>
+    <table>
+      <tr><th>检查点</th><th>期望值</th><th>异常时先查</th></tr>
+      <tr><td>10 万步</td><td>最小距离中位数明显低于初始 0.4 m</td><td>观测归一化与奖励符号</td></tr>
+      <tr><td>50 万步</td><td>成功率从 0 起步并开始上升</td><td>总预算与 net_arch 容量</td></tr>
+      <tr><td>100 万步</td><td>成功率进入 40%–70% 区间</td><td>gamma、n_steps 与奖励量级</td></tr>
+      <tr><td>150 万步</td><td>成功率稳定、曲线变平</td><td>进入正式评估与归档</td></tr>
+    </table>
+    <p>检查表把"什么时候该停"从感觉变成数字：连续三个评估间隔的增益都小于 2% 时，可以停训做正式评估；曲线变平常被误判为"还能再训"，用增益判据可以省下大量计算。配套的归档节奏：每 10 万步保留一个 checkpoint，只保留最近三个，既能回退对比又不占满磁盘；模型、统计文件与实验配置始终同名成套保存。</p>
+    <p>若在 10 万步时最小距离没有明显下降，先暂停训练复查数据管线（观测归一化、奖励符号、TCP 计算），比继续消耗算力更划算；排查顺序按"数据 → 奖励 → 动作缩放"走，覆盖多数问题。检查点与统计文件成套保存，回退时无需重算且可直接复现评估；同一核算方法也适用于 Actor 与 Critic 分离的大型网络，按模块分别加总即可。</p>
+
+    <h3>8. 评估误报与漏报的抽样成本</h3>
+    <p>把成功率的抽样波动折算成置信区间，评估回合数的选择立刻有据可依：</p>
+    <table>
+      <tr><th>真实成功率</th><th>回合数</th><th>标准误</th><th>95% 置信半宽</th></tr>
+      <tr><td>0.85</td><td>50</td><td>5.1%</td><td>±9.9%</td></tr>
+      <tr><td>0.85</td><td>200</td><td>2.5%</td><td>±4.9%</td></tr>
+      <tr><td>0.60</td><td>50</td><td>6.9%</td><td>±13.6%</td></tr>
+    </table>
+    <p>表里的数字直接影响实验结论的可靠性：50 个回合的评估会把 85% 与 75% 的真实能力混进同一区间，用它比较两版模型时，只有相差约 20 个百分点起步的差异才算"看得见"；百万步级训练的对照实验若只跑 50 个评估回合，很可能把种子噪声读成"改进有效"。实践折中是两档口径：探索期用 50 回合快速排序，正式对照与归档结论用 200–500 回合，并把"回合数 + 置信半宽"随成功率一起报告。评估的墙钟成本并不高：200 回合 × 200 步 = 4 万个环境步，控制步长 1/30 s、RTF = 50 时约 1500 环境步/秒，合计约 27 秒，相对 14 小时的仿真时长可以忽略，这正是"敢把评估样本量加大"的底气。</p>
+    <p>再补一条与第 4 节呼应的口径：成功率悬浮在置信区间内、两版模型难分高下时，改看"最小距离中位数"更灵敏。它是连续量，抽样的标准误随样本量开方收缩，且不依赖成功阈值这一个人为台阶；距离中位数从 0.080 m 降到 0.062 m 这样的变化，在成功率上可能完全不可见，在距离分布上却清晰可辨。两把尺子配合使用，判断"继续训练是否还有收益"就有了双重依据。</p>
+    <p>还有一个与模型选择直接相关的抽样数字：<code>EvalCallback</code> 默认用 20 个回合挑"最优 checkpoint"，在真实成功率 0.85 附近，20 回合的标准误约 8.0%（95% 置信半宽约 ±16%）。"最优"经常是评估噪声里抽得顺的那一个，真实能力最强的那个未必入选；正式结论必须以训练结束后用独立评估脚本跑的 200 回合复核为准。检查清单里再补一条断言：加载统计文件后，对一组固定观测做归一化，输出的均值应接近 0、标准差应接近 1；若均值漂移到 0.3 附近，说明评估侧加载的统计与训练侧不同源，评估数字立即作废重建，不必等看完曲线才发现问题。</p>
+    <p>双指标的记录格式也一并固定：每回合记录"成功标志"与"最小距离"，评估结束后报告成功率的置信区间、最小距离的中位数与两个分位数（P10 与 P90）。P90 的作用是照看尾部：中位数 0.06 m 表示典型表现，P90 若在 0.15 m 以上，说明每十个回合就有一个"够得很勉强"的场景，部署时的失败风险主要由它决定。成功阈值与两个指标的关系要写清楚：阈值从 0.05 m 收紧到 0.02 m 时，成功率可能从七成掉到三成，而最小距离的分布几乎不变；这种"成功率变了、精度没变"的情形说明改进的方向是阈值附近的收敛行为，对照实验时应同时看两列数字再做结论。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>训练 Franka 到达的完整流程：</p>
+    <ol>
+      <li><strong>包装环境</strong>（016 章环境 + Monitor + VecNormalize；记录统计文件路径）。</li>
+      <li><strong>分离评估管道</strong>（评估环境同样包 VecNormalize，但统计来自训练侧，<code>training=False</code>）。</li>
+      <li><strong>配置 PPO</strong>（net_arch=[256,256]、n_steps=1024、batch_size=256、lr=3e-4、gamma=0.98）。</li>
+      <li><strong>训练与回调</strong>（EvalCallback 每 2 万步；CheckpointCallback 每 10 万步，百万步训练必须有点可回退）。</li>
+      <li><strong>双指标评估</strong>（50 个固定种子：成功率 + 最小距离分布）。</li>
+      <li><strong>归档</strong>（模型、VecNormalize 统计、配置、评估报告一起存档，它们是不可拆分的整体）。</li>
+    </ol>
+    <table>
+      <tr><th>参数</th><th>取值</th><th>理由</th></tr>
+      <tr><td>net_arch</td><td>[256, 256]</td><td>20 → 7 的映射需要容量；与预算匹配</td></tr>
+      <tr><td>n_steps</td><td>1024</td><td>回合尺度约 200 步：每批覆盖约 5 个回合</td></tr>
+      <tr><td>gamma</td><td>0.98</td><td>有效视野 50 步 ≈ 1.7 s，覆盖到达动作的规划尺度</td></tr>
+      <tr><td>total_timesteps</td><td>1.5e6</td><td>Reach 的常见收敛区间：1–3 百万步</td></tr>
+      <tr><td>norm_obs / norm_reward</td><td>True / False</td><td>观测归一化必要；奖励保持物理量纲</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计思维：为什么模型与归一化统计必须一起存档？</span>
+      <p>策略网络学到的映射是"归一化后观测 → 动作"。只保存网络权重而丢了 μ/σ 统计，重建部署环境时就无法把原始观测恢复到训练时的分布，策略会以"没见过"的输入工作，性能下降且难以排查（因为看起来只是"效果差一点"）。把"模型 + 统计 + 配置 + 评估报告"当一个不可分的产物归档，是 021 章做迁移、后面做 sim2real 时的基本素养。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：带归一化的环境包装（训练/评估两套）</strong></p>
+    <pre class="code"><code>import numpy as np
+from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.vec_env import VecNormalize
+
+def make_vec_env(env_kwargs, seed, training):
+    """建一个单环境 VecEnv：DummyVecEnv 提供向量化接口，VecNormalize 管观测统计。"""
+    env = DummyVecEnv([lambda: FrankaReachEnv(**env_kwargs)])  # lambda：延迟构造实例
+    env.seed(seed)                                  # 向量化接口的种子设置
+    env = VecNormalize(
+        env,
+        norm_obs=True,        # 观测归一化：20 维混合量纲任务的关键一步
+        norm_reward=False,    # 奖励不归一化：保留 -d/+5 的物理量纲语义
+        clip_obs=10.0,        # 观测裁剪：异常值不会冲击网络
+        training=training,    # 训练 True / 评估 False（冻结统计，见 2 节）
+    )
+    return env
+
+train_env = make_vec_env({"decimation": 2}, seed=0, training=True)
+eval_env = make_vec_env({"decimation": 2, "render": False}, seed=5000, training=False)
+print("训练/评估环境就绪；评估统计将在训练中同步后再载入")</code></pre>
+    <p>解读：<code>DummyVecEnv</code> 把单个环境包装成"向量环境"接口（即使只有一个环境），这是 SB3 需要的统一契约，022 章换成 <code>SubprocVecEnv</code> 就能并行跑多个实例，上层代码不变。<code>training=training</code> 这个参数容易漏：评估环境在构建时就应当处于冻结模式，防止评估过程中统计被悄悄更新。三个环境参数的分工要理清：<code>norm_obs</code> 是"归一化观测"，<code>clip_obs</code> 是"限制极端观测"，<code>training</code> 是"是否允许统计更新"，它们控制的是不同的东西，缺一不可。</p>
+
+    <p><strong>片段 2：PPO 配置、训练与回调</strong></p>
+    <pre class="code"><code>from stable_baselines3 import PPO
+from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback
+
+model = PPO(
+    "MlpPolicy",
+    train_env,
+    policy_kwargs=dict(net_arch=[256, 256]),  # 7-DOF 任务：容量比 Cartpole 升一档
+    n_steps=1024,          # 约 5 个回合的横截面数据
+    batch_size=256,        # 连续控制常用 256：梯度噪声与吞吐的平衡
+    gamma=0.98,            # 有效视野 50 步 ≈ 1.7 仿真秒：覆盖到达动作尺度
+    gae_lambda=0.95,
+    clip_range=0.2,
+    learning_rate=3e-4,
+    verbose=1,
+    seed=0,
+)
+
+callbacks = [
+    EvalCallback(eval_env, n_eval_episodes=20, eval_freq=20_000,
+                 deterministic=True, best_model_save_path="./logs/franka_best"),
+    CheckpointCallback(save_freq=100_000, save_path="./logs/franka_ckpt"),  # 护身符
+]
+model.learn(total_timesteps=1_500_000, callback=callbacks)  # 约 14 小时仿真时间
+
+model.save("./logs/franka_stage1")
+train_env.save("./logs/vecnormalize_stage1.pkl")  # 统计与模型同存：缺一不可
+print("训练完成：模型与归一化统计均已保存")</code></pre>
+    <p>解读：配置的每个选择都沿用第十七章的"对齐任务时标"方法：1024 步一批 ≈ 5 个 200 步的回合；gamma=0.98 → 视野 50 步，与"接近目标后再微调几厘米"所需的规划尺度匹配。两个回调的分工：<code>EvalCallback</code> 负责"选优"（保存评估回报最高点），<code>CheckpointCallback</code> 负责"兜底"（每 10 万步存一次），百万步训练耗时以小时计，没有 checkpoint 的策略是拿一个小时去赌一次不崩溃。<code>train_env.save(...)</code> 保存的不只是统计量，还包括 VecNormalize 的完整配置（clip 范围等），评估与部署时整体加载，避免"半套配置"的错配。</p>
+
+    <p><strong>片段 3：用训练统计做正式评估（双指标）</strong></p>
+    <pre class="code"><code>import numpy as np
+from stable_baselines3 import PPO
+from stable_baselines3.common.vec_env import VecNormalize
+
+eval_env = make_vec_env({"decimation": 2}, seed=9000, training=False)
+eval_env = VecNormalize.load("./logs/vecnormalize_stage1.pkl", eval_env)  # 载入训练统计
+eval_env.training = False          # 再次确认冻结：评估中的统计绝不更新
+model = PPO.load("./logs/franka_best/best_model")
+
+successes, min_dists = [], []
+for ep in range(50):
+    obs = eval_env.reset()                       # 向量接口：批量 reset
+    dist_ep = []
+    done = False
+    while not done:
+        action, _ = model.predict(obs, deterministic=True)
+        obs, reward, dones, infos = eval_env.step(action)  # 向量接口返回 4 元组
+        # VecEnv 接口与单环境不同：done 之后自动 reset，本回合数据在 infos 里
+        dist_ep += [infos[0]["distance"]] if "distance" in infos[0] else []
+        done = bool(dones[0])
+    successes.append(infos[0].get("episode", {}).get("is_success", False))
+    min_dists.append(min(dist_ep) if dist_ep else float("nan"))
+
+print(f"成功率 {np.mean(successes):.0%}   最小距离中位数 {np.nanmedian(min_dists):.3f} m")</code></pre>
+    <p>解读：这段代码有三个与第十七章不同的关键点。<strong>第一，VecNormalize.load 必须在评估环境构建后执行</strong>：先建新的评估环境、再"把训练统计装上去"，然后确认 <code>training=False</code>，顺序错了（先 load 再重建）统计就白费了。<strong>第二，向量接口的 step 返回四元组且"回合结束自动重置"</strong>：与单环境的五元组不同，终止信息通过 <code>dones</code> 与 <code>infos</code> 传递（Monitor 包装会把 episode 统计放进 <code>infos[0]["episode"]</code>）。写评估脚本时要对着接口文档核对此处。<strong>第三，双指标同时统计</strong>：成功率来自 info，最小距离逐回合收集，即使这一版模型成功率为零，"最小距离中位数从 0.35 降到 0.08"也说明训练在正向推进，值得继续，不必推倒重来。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>评估时忘了加载/冻结归一化统计</strong>：策略面对分布不同的观测，性能掉一大截且难排查。修复：评估脚本模板化（load + training=False + 断言），与训练脚本共享同一份统计文件。</li>
+      <li><strong>归一化奖励</strong>：成功奖励 +5 与 −d 的相对大小随统计漂移，学习信号失真。修复：<code>norm_reward=False</code>，奖励的缩放交给 016 章的量级设计。</li>
+      <li><strong>网络太小</strong>：64×64 的 MLP 在 7 自由度任务上欠拟合，成功率长期卡在 30–40%。修复：net_arch=[256,256] 起步，按评估曲线再调。</li>
+      <li><strong>预算按 Cartpole 的量级给</strong>：20 万步在 Reach 上通常只够学到"大致接近"。修复：1.5–3 百万步量级；用最小距离曲线的下降趋势判断是否值得继续。</li>
+      <li><strong>只存了模型权重</strong>：归一化统计、配置未归档，复现/部署时无法还原观测分布。修复：模型 + pkl 统计 + 配置文件 + 评估报告捆绑归档。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>计算墙钟成本：1.5e6 RL 步、decimation=2、RTF 分别取 30 与 120 时，纯物理时间各是多少？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>仿真时间 = 1.5e6 × 2/60 = 50000 秒 ≈ 13.9 小时；除以 RTF 得纯物理墙钟（30 → 27.8 分钟；120 → 7 分钟），再加上策略推理与网络更新的开销。</div></details>
+      </li>
+      <li>解释 VecNormalize 的 <code>training=False</code> 与 <code>norm_reward=False</code> 分别防止什么问题，在评估脚本里各在哪一行体现。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>前者防统计漂移（评估不更新 μ/σ），后者防奖励语义漂移（成功奖励的权重被动态改变）。</div></details>
+      </li>
+      <li>设计 PPO 与 SAC 的对照实验：在同一步数预算下比较成功率，再在"固定墙钟预算"下比较（按实测吞吐把墙钟折算为步数），两种口径的结论是否一致？说明该用哪个口径选算法。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>等步数下 SAC 大概率更高效（样本效率优势）；等墙钟下差距缩小（SAC 更新慢）。选择口径应贴合你的真实约束。</div></details>
+      </li>
+      <li>训练三个不同种子（0/1/2）的模型，报告成功率的均值±标准差。若三个种子分别是 85%、60%、75%，你会如何向同事描述这个模型的能力？<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>73% ± 13% 与"85%"是完全不同量级的可靠性声明；单种子结果不足以支撑结论，这是 021 章对照实验的基础纪律。</div></details>
+      </li>
+      <li>实验设计：把成功阈值从 0.05 收紧到 0.02，预测"成功率"与"最小距离中位数"两个指标的变化，并解释为什么"最小距离"更适合用来追踪训练进步。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>阈值收紧后成功率可能大降，但最小距离的分布几乎不变，精度追踪与任务口径解耦。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>连续控制从 PPO 起步（鲁棒、易扩展）；SAC 在采样昂贵的场景才值得付出调参成本。</li>
+      <li>VecNormalize 管理混合量纲观测：训练中积累统计、评估时加载并冻结；奖励保持物理量纲不归一化。</li>
+      <li>7 自由度任务用 [256,256] 网络与 1.5–3 百万步预算；checkpoint 与 pkl 统计是百万步训练的护身符。</li>
+      <li>评估用"成功率 + 最小距离中位数"双指标；多种子报告均值±方差，单次结果不作数。</li>
+      <li>下一章：019 实现自定义奖励函数，基线就绪，开始系统性地设计奖励：分量、权重、单位与量级。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch017.html">← 第 017 章：使用Stable-Baselines3训练Cartpole</a>
+    <a class="next" href="ch019.html">第 019 章：实现自定义奖励函数 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

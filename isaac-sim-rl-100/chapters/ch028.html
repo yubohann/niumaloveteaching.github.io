@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第028章 实现基于点云的观察 | 机器人仿真学习课程 · Isaac Sim 强化学习训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · 仿真环境与训练框架</span>
+    <span class="sep">/</span>
+    <span>第 028 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · 仿真环境与训练框架</div>
+    <h1>第 028 章：实现基于点云的观察</h1>
+    <p class="lead">几何信息的最简表达：1024 个无序三维点如何喂给网络，从 PointNet 的对称函数到坐标归一化、降采样与特征增强的全部工程细节。</p>
+    <ul class="meta">
+      <li>主题：观测设计 / 几何模态</li>
+      <li>相关组件：Isaac Sim（深度相机 / LiDAR）、PyTorch（PointNet 风格编码器）</li>
+      <li>预计学时：50 分钟</li>
+      <li>前置章节：第 027 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解点云的数据格式与本质：无序集合，为什么"乱序不改变语义"迫使网络结构满足置换不变性。</li>
+      <li>掌握 PointNet 的核心思想：共享 MLP + 对称聚合函数（max pooling）为什么能处理集合。</li>
+      <li>会从深度图/雷达反投影得到点云，并完成裁剪、降采样、坐标系对齐与归一化四步预处理。</li>
+      <li>能写出一个点云编码器，并与本体状态拼接成策略观测。</li>
+      <li>说清点云与像素两条模态各自的适用场景与成本差异。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>上一章的图像很通用，但有两个硬伤：<b>维度高</b>（49K 维起步）和<b>丢失几何</b>（照片里 1 米和 0.5 米的物体可以长得一模一样，透视让深度信息难以精确恢复）。点云正好补这两刀：1024 个点×3 坐标 = 3072 维，比图像小一个数量级；每个点携带真实三维坐标，距离、形状、遮挡关系直接可算。</p>
+    <p>更重要的是工程与现实的对齐：<strong>LiDAR、深度相机、结构光传感器，真机上最常用的三维传感器，输出都是点云格式。</strong>在仿真里把点云观测管线跑通，等于为后面的 sim-to-real 打好一条最直接的通路。本章的重点从"数据长什么样"开始，因为点云的"无序性"是一个与图像截然不同的结构性质，它决定了你只能用特定类型的网络。</p>
+  </section>
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 数据格式：无序集合</h3>
+    <p>点云是一组点 P = { p<sub>1</sub>, p<sub>2</sub>, …, p<sub>N</sub> }，每个 p<sub>i</sub> ∈ ℝ<sup>3</sup>（或带法向量/强度等附加特征）。<strong>集合的语义与顺序无关：</strong>把 p<sub>1</sub> 和 p<sub>100</sub> 交换，物理世界没有任何变化。这一个性质立刻否决了一批网络结构：MLP 对固定位置有固定权重，输入顺序换了输出就换；CNN 假设网格邻接，而点云没有规则网格。于是问题变成：<b>设计一个函数 f，使 f(乱序的点集) 恒等于同一个值</b>，置换不变性（permutation invariance）。</p>
+
+    <h3>2. PointNet 的答案：对称函数分解</h3>
+    <p>数学上的关键观察：任何对称函数（集合输入、输出与顺序无关）都可以分解为</p>
+    <div class="formula">
+      f( {p<sub>1</sub>,…,p<sub>N</sub>} ) = g( max<sub>i</sub> h(p<sub>i</sub>) ) 或 g( Σ<sub>i</sub> h(p<sub>i</sub>) )
+      <span class="note">h 是逐点共享的 MLP；max/mean 是聚合算子；g 是后续网络，聚合后顺序信息彻底消失，输出天然与顺序无关</span>
+    </div>
+    <p>直觉：<b>对每个点用同一把"尺子"h 测量（共享 MLP），再用一个对顺序不敏感的统计量汇总（逐维取 max）。</b>h 逐点共享意味着所有点共用权重，与 CNN 的权值共享异曲同工，参数量与点数 N 无关。为什么聚合用 max、不用 mean？max 保留"存在性"信息：只要有任意一个点激活了某特征通道，它就留在结果里；mean 会把少数关键点（如目标的边缘）稀释掉。这也是 PointNet 论文著名的鲁棒性来源：<b>丢弃部分点（遮挡、噪声）时，只要关键点还在，max 聚合的特征几乎不变。</b></p>
+
+    <h3>3. 预处理四步：什么进网络，网络就只学剩下的</h3>
+    <p>原始点云是相机坐标系下的百万级点数，直接进网络是浪费，大量点落在工作台之外、机械臂本体上、甚至环境边框。<strong>预处理的目标是"把已知的几何变换与裁剪在数据层做掉，让网络只学真正未知的部分"</strong>：</p>
+    <ol>
+      <li><b>裁剪</b>：只保留工作空间立方体（如机器人前方 0.8×0.8×0.6 m）内的点。</li>
+      <li><b>降采样</b>：固定采出 N=1024 个点。随机采样简单快速；最远点采样（FPS）覆盖更均匀但慢。RL 里随机采样足够：每步都要算，速度优先。</li>
+      <li><b>坐标系对齐</b>：把点云变换到机器人末端或基座坐标系。若用腕部相机，点云天然在腕部坐标系，<strong>此时"目标在腕部坐标下的位置"正是策略需要的东西，网络不再需要学习"相机怎么摆"这个已知变换</strong>。</li>
+      <li><b>归一化</b>：平移到质心、缩放到单位球（除以最大半径）。量级统一后，网络的第一层不必迁就"坐标值是 0.1 还是 100"。</li>
+    </ol>
+
+    <h3>4. 从深度图反投影：点云从哪来</h3>
+    <p>深度相机给出每个像素的深度 d(u,v)，用相机内参矩阵 K 反投影得到三维点：</p>
+    <div class="formula">
+      p = d(u,v) · K<sup>−1</sup> · [u, v, 1]<sup>T</sup>
+      <span class="note">K 含焦距 f<sub>x</sub>, f<sub>y</sub> 与光心 c<sub>x</sub>, c<sub>y</sub>；算出的是相机坐标系下的点，再用外参转到目标坐标系</span>
+    </div>
+    <p>LiDAR 则更直接：每束激光的仰角、方位角与距离合成球坐标，转成笛卡尔坐标。仿真里的好处是遮挡可被物理引擎正确计算，点云里"哪些区域没有点"本身就是信息（遮挡即形状），这与真机一致，而纯真值状态观测没有这种特性。这也是点云做 sim-to-real 迁移成本较低的深层原因。</p>
+
+    <h3>5. 点云 vs 像素 vs 体素：三条几何表达路线的取舍</h3>
+    <table>
+      <tr><th>路线</th><th>优点</th><th>代价</th><th>适用</th></tr>
+      <tr><td>像素（RGB/深度图）</td><td>CNN 生态成熟、信息最丰富</td><td>49K 维起步、几何精度靠深度补</td><td>纹理/颜色重要、传感器是相机</td></tr>
+      <tr><td>点云</td><td>3K 维、几何直接、与 LiDAR 一致</td><td>需要置换不变网络、点数需固定</td><td>几何为主、真机用深度/LiDAR</td></tr>
+      <tr><td>体素</td><td>可用 3D CNN、结构规整</td><td>分辨率与显存立方增长（64³≈26 万格）</td><td>小范围高精度已有地图时</td></tr>
+    </table>
+    <p><strong>机器人操作任务里点云的"性价比"通常最高：维度小、几何准、和深度相机天然对接。</strong>后续抓取、堆叠（037/038 章）用点云做观测时，抓取点、支撑面这些量都能从点云几何直接算，这是纯像素做不到的。</p>
+
+    <h3>6. 完整算例：从深度图到编码特征的全程账</h3>
+    <p>把 128×128 深度图跑一遍管线，每段的规模与代价列成表（单环境）：</p>
+    <table>
+      <tr><th>阶段</th><th>规模</th><th>说明</th></tr>
+      <tr><td>原始反投影</td><td>16 384 点 × 3 = 49 152 维</td><td>与 RGB 像素同量级，点云降维靠的是采样，原始模态本身并不省</td></tr>
+      <tr><td>裁剪后（工作空间盒内约 30%）</td><td>约 4 900 点</td><td>比例随场景变化，遮挡多时会骤降</td></tr>
+      <tr><td>固定采样</td><td>1 024 点 × 3 = 3 072 维</td><td>送入网络的实际维度，约为图像的 1/16</td></tr>
+      <tr><td>编码后特征</td><td>256 维</td><td>与本体状态拼接后进入策略网络</td></tr>
+    </table>
+    <p>编码算量：逐点 MLP 3→64→128→256 的每点 MAC 数 = 3×64 + 64×128 + 128×256 = 41 152；1024 点合计约 4214 万 MAC，512 环境一次批量前向约 43.2 GFLOPs，与 027 章 CNN 的 69.5 GFLOPs 同档甚至更省。<strong>说明点云"贵"的地方在采样与预处理代码的效率，不在网络本身。</strong>显存侧：512 环境的 1024×3 张量只有约 6.3 MB，比图像堆叠缓冲的 0.4 GB 小两个数量级。</p>
+    <p>预处理里最值得警惕的是"逐环境采样循环"：片段 1 的 for 循环每个环境要两次小内核启动加索引写入，按每次约 25 µs 的保守估计，512 环境就是约 12.8 ms，与一个控制步的时长同量级，预处理循环的批量化因此是硬需求。<strong>批量化写法是行业必修</strong>：给每个点生成随机分数、对无效点置 −1、沿点维取 top-N，全程一次内核完成；代价只是实现复杂一点，换来的是把这段从 10 ms 量级压回 1 ms 以内。</p>
+
+    <h3>7. 采样、归一化与聚合的边界条件</h3>
+    <ul>
+      <li><strong>有效点不足 N 时的行为</strong>：遮挡严重时裁剪后可能只剩几百个点，随机采样会重复取点。重复点让"点密度"这个统计量失真（同一物理表面被计多次）。判据：把"有效点数占比"作为一维观测或日志指标，长期过低说明相机视角需要调整。</li>
+      <li><strong>离群点主导单位球缩放</strong>：最大半径对单个离群点极敏感，一个漂到 2 m 的噪点会把 0.5 m 的云压到 1/4 尺度。修复：改用 95 分位半径，或先做统计剔除；仿真里点云干净，这个风险小，迁移到真机深度相机时必须处理。</li>
+      <li><strong>max 聚合的稀释对照</strong>：抓取任务里目标表面点可能只占 8%；若把 max 换成 mean，假设目标点在某通道激活值 1.0、其余点接近 0，则 mean 输出约 0.08，信号被稀释 12.5 倍，而 max 保持 1.0。这给出了"边界点迟钝"症状的定量解释。</li>
+      <li><strong>DGCNN 的真实代价</strong>：暴力 k 近邻的距离计算约 1024²×3 ≈ 315 万次乘加/环境，相对逐点 MLP 的 4214 万 MAC 只是零头；它的代价在边卷积的特征维度与邻接存储上。几何任务简单时先用 PointNet，确实需要平面/边缘特征再升级。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p><strong>管线是"采点 → 裁剪 → 降采样 → 变换 → 归一化 → 编码"六段。</strong>与第 027 章图像管线对照着看：图像在"归一化"之后直接进卷积，点云多了一个"结构与网络共同设计"的维度（置换不变）。</p>
+    <ol>
+      <li><strong>采点</strong>：深度图以 30 Hz 或更低的节奏更新，反投影得到相机系点云，形状 (N<sub>raw</sub>, 3)。</li>
+      <li><strong>裁剪</strong>：按工作空间盒子做掩码，剔除工作台外、机械臂本体、环境边框；仿真里还能按需剔除特定物体。</li>
+      <li><strong>降采样固定点数</strong>：随机采样到 N=1024。<b>固定 N 是硬要求</b>，batch 张量必须规整。</li>
+      <li><strong>变换与归一化</strong>：转到腕部/基座坐标系，去重心、缩放到单位球。</li>
+      <li><strong>编码</strong>：共享 MLP（3→64→128→256 逐点）→ 逐维 max → 全局特征 (256,)；与本体状态拼接进策略网络。</li>
+    </ol>
+    <table>
+      <tr><th>设计点</th><th>推荐值</th><th>理由</th></tr>
+      <tr><td>点数 N</td><td>1024</td><td>操作任务几何简单；512 也常用，2048 收益边际</td></tr>
+      <tr><td>裁剪盒</td><td>前方 0.8×0.8×0.6 m</td><td>覆盖 Franka 工作空间；太大引入无关点</td></tr>
+      <tr><td>坐标帧</td><td>腕部或基座（固定一个）</td><td>腕部系让"目标相对位置"直接可读；基座系轨迹更平稳</td></tr>
+      <tr><td>归一化</td><td>质心 + 单位球</td><td>量级统一到 O(1)，与本体观测尺度兼容</td></tr>
+      <tr><td>每点特征</td><td>xyz（可加法向）</td><td>RL 中法向增益有限；需要局部几何时用 DGCNN 类结构</td></tr>
+      <tr><td>更新频率</td><td>每 2 个控制步</td><td>几何变化低于控制频率；省一半反投影开销</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计思维：让网络学"难的部分"，几何交给代码</span>
+      <p>相机外参、工作空间范围、目标质心位置，这些量你都知道精确值，就绝不该让网络从点云里"悟"出来。<strong>预处理越充分，网络容量越集中在真正的不确定性上。</strong>一个判据：如果某个几何量你能用三行代码算出，那就别把它留给 256 维的 MLP 隐式编码。点云任务里这条原则的收益格外大，因为几何计算在 CPU/GPU 上是纯函数，没有采样噪声。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：从深度图到固定点数、归一化的点云</strong></p>
+    <pre class="code"><code>import torch
+
+def depth_to_points(depth, intrinsics, extrinsics=None):
+    """(N_env, H, W) 深度图 → (N_env, H*W, 3) 相机/目标系点云"""
+    n, h, w = depth.shape
+    fx, fy, cx, cy = intrinsics                   # 焦距与光心：来自相机配置
+    v, u = torch.meshgrid(torch.arange(h, device=depth.device, dtype=torch.float32),
+                          torch.arange(w, device=depth.device, dtype=torch.float32),
+                          indexing="ij")          # 像素栅格：一次生成，整批复用
+    x = (u - cx) / fx * depth                     # 反投影公式 p = d · K⁻¹ [u,v,1]
+    y = (v - cy) / fy * depth
+    pts = torch.stack([x, y, depth], dim=-1)      # (N_env, H, W, 3)，相机坐标系
+    pts = pts.reshape(n, h * w, 3)
+    return pts
+
+def preprocess_batch(pts, crop_min, crop_max, num_points=1024, frame_T=None):
+    """六段式预处理：裁剪 → 可选坐标变换 → 采样 → 去重心 → 归一化"""
+    mask = ((pts &gt;= crop_min) &amp; (pts &lt;= crop_max)).all(dim=-1)   # (N_env, P) 布尔
+    out = torch.zeros(pts.shape[0], num_points, 3, device=pts.device)
+    for e in range(pts.shape[0]):                 # 采样必须逐环境做：每环境有效点数不同
+        valid = pts[e][mask[e]]                   # 只保留工作空间内的点
+        if valid.shape[0] == 0:
+            continue                              # 空点云：保持全零（此环境本步无信号）
+        idx = torch.randint(0, valid.shape[0], (num_points,), device=pts.device)
+        out[e] = valid[idx]                       # 随机上采样/下采样到固定 N：速度优先
+    if frame_T is not None:
+        out = torch.einsum("nij,npj-&gt;npi", frame_T,                          # 刚体变换
+                           torch.cat([out, torch.ones_like(out[..., :1])], -1))[..., :3]
+    centroid = out.mean(dim=1, keepdim=True)      # 去重心：平移不变性交给数据层
+    out = out - centroid
+    scale = out.norm(dim=-1).max(dim=-1, keepdim=True).values + 1e-6   # 最大半径
+    return out / scale.unsqueeze(-1)              # 缩放到单位球：量级归一到 O(1)</code></pre>
+    <p>解读：这段代码有一个必须解释的设计，<b>为什么采样与归一化"逐环境"做，而反投影"整批"做？</b>反投影是对每个像素的纯逐元素运算，天然向量化；但每个环境的有效点数不同（遮挡不同、裁剪结果不同），要压到统一的 N 点必须逐环境抽样。这个循环的开销随 N<sub>env</sub> 线性，但在 1024 点规模下仍远小于渲染本身，可以接受。<b>空点云的 <code>continue</code> 分支容易被删，但它是鲁棒性关键</b>：相机被完全遮挡时（比如机械臂正好挡在镜头前），没有这行的实现会抛异常或产生 NaN；保留全零点云 + 后续编码器对零点的确定性输出，等价于给策略一个"本步没有视觉信息"的诚实信号。<b>最后的单位球缩放换了标准的减均值除标准差吗？</b>是的，点云场景里用最大半径更能保证"没有离群点漏网"，避免个别远处的点把整朵云压扁。</p>
+
+    <p><strong>片段 2：PointNet 风格编码器</strong></p>
+    <pre class="code"><code>import torch, torch.nn as nn
+
+class PointNetEncoder(nn.Module):
+    """置换不变的集合编码器：(N_env, P, 3) → (N_env, 256)"""
+    def __init__(self, in_dim=3, feature_dim=256):
+        super().__init__()
+        # 共享 MLP：所有点用同一组权重（1×1 卷积等价实现），参数量与点数无关
+        self.point_mlp = nn.Sequential(
+            nn.Conv1d(in_dim, 64, 1), nn.ELU(),        # 用 Conv1d(kernel=1) 实现逐点 MLP
+            nn.Conv1d(64, 128, 1), nn.ELU(),           # 点是"长度为 P、通道为 3"的序列
+            nn.Conv1d(128, feature_dim, 1), nn.ELU(),
+        )
+        self.global_mlp = nn.Sequential(               # 聚合之后的后处理：精炼全局特征
+            nn.Linear(feature_dim, feature_dim), nn.ELU(),
+            nn.Linear(feature_dim, feature_dim),
+        )
+
+    def forward(self, pts):
+        # pts 必须先转成 (N_env, 3, P)：把"点"当序列长度，把"坐标"当通道
+        x = pts.transpose(1, 2)                        # (N_env, P, 3) → (N_env, 3, P)
+        x = self.point_mlp(x)                          # (N_env, 256, P)：每个点一个 256 维描述
+        g = torch.max(x, dim=-1).values                # (N_env, 256)：逐维 max 聚合
+        # 用 max 聚合：保留"存在性"，关键边缘点不会被大量平面点稀释
+        return self.global_mlp(g)                      # 全局特征，交给策略网络拼接本体状态</code></pre>
+    <p>解读：<b>用 <code>Conv1d(kernel=1)</code> 实现"共享 MLP"是社区惯例</b>：一维卷积在序列每个位置用同一组权重做全连接，正好就是"逐点共享 MLP"，而且代码里不会出现对点数 P 的循环。<code>transpose</code> 的细节必须说清：卷积把"特征"放在通道维、把"样本"放在序列维，所以点坐标要当通道、点数当长度，顺序写反会把点云当 3 元素的序列处理，网络照样能跑、梯度照样回传，但学到的东西完全不同（相当于"每朵云只被看成 3 个大特征"），这类"静默错误"没有报错提示，只能靠形状断言防。<b>聚合后的 <code>global_mlp</code> 不是必需但值得有</b>：max 聚合丢掉了"有多少点参与"之类的统计信息，两层 MLP 给它补一点非线性容量；同时把特征维度稳定在 256，方便与状态向量拼接。想要局部几何（平面、边缘、曲面）时，用 DGCNN 类结构在点之间建 k 近邻图再聚合，代价是每步多一次邻域搜索，只有任务确实需要精细几何时才升级。</p>
+
+    <p><strong>片段 3：组装观测与训练侧拼接</strong></p>
+    <pre class="code"><code>class PointCloudObs:
+    """把传感器数据、预处理、编码串成一条链；训练器只看到 (N, 256+state_dim)"""
+    def __init__(self, env, num_points=1024, crop=(0.2, 0.8)):
+        self.env = env
+        self.encoder = PointNetEncoder(in_dim=3, feature_dim=256).to(env.device)
+        self.num_points = num_points
+        self.crop_min = torch.tensor([-0.4, -0.4, 0.02], device=env.device)   # 工作空间盒
+        self.crop_max = torch.tensor([ 0.4,  0.4, 0.6],  device=env.device)
+
+    def obs(self):
+        depth = self.env.camera.get_depth()               # (N_env, H, W)：批量取深度
+        pts = depth_to_points(depth, self.env.intrinsics)
+        pts = preprocess_batch(pts, self.crop_min, self.crop_max,
+                               self.num_points, self.env.gripper_T)   # 变换到腕部系
+        with torch.no_grad():                             # 编码器随策略一起被优化：
+            feat = self.encoder(pts)                      # 这里保留梯度（训练时去掉 no_grad）
+        state = self.env.proprio_state()                  # 关节角/速度/夹爪宽 (N_env, ~20)
+        return {"point_feat": feat, "state": state}
+        # 训练器侧再拼：critic 可额外挂真值目标位置（不对称结构，参第 027 章）</code></pre>
+    <p>解读：这段代码的重点是"归谁管"的边界。<b>编码器是策略网络的一部分，不是环境的一部分</b>，环境的职责到"输出干净的固定点数云"为止；编码器参数随 PPO 一起更新，所以训练时绝不能包 <code>no_grad</code>（评估时才可以）。把编码器放在观测组装层的好处：换编码器（PointNet → DGCNN）不动环境，换环境（相机换 LiDAR）不动网络，<strong>接口是"1024×3 的归一化点云"，这个契约稳定且可测试</strong>。另一个细节：<code>gripper_T</code>（腕部到相机的外参）每步都在变，点云变换要跟着更新，如果忘了这一步，用腕部相机而点云停留在世界系，网络面对的就是一个"坐标系随动作漂移"的观测，训练会诡异地慢且不可复现。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>点数不固定</strong>：每步直接拼接原始可变长点云，batch 张量形状不稳定，训练器报错或静默截断。修复：预处理阶段强制采样到固定 N，且全流程断言形状。</li>
+      <li><strong>坐标帧混乱</strong>：反投影输出在相机系，却直接和腕部系状态向量拼接；网络需要隐式学一个随动作变化的旋转变换。症状：训练极慢、策略动作漂移。修复：明确"点云进编码器前统一到什么坐标系"，并把外参变换做成每步更新。</li>
+      <li><strong>没做量级归一化</strong>：世界坐标下的点数值到米级甚至更大，共享 MLP 第一层把学习容量浪费在适应数值范围上。修复：去重心 + 单位球缩放，量级统一 O(1)。</li>
+      <li><strong>用 mean 聚合代替 max</strong>：平面点云里目标边缘点占比极小，均值聚合会把它们稀释到接近零。症状：策略对物体边界迟钝。修复：max 聚合；若确实要统计量，可额外 concat 一个 mean 分支作补充。</li>
+      <li><strong>编码器误包 no_grad</strong>：训练时忘了打开梯度，编码器永远停在初始化参数，点云特征变成"固定随机投影"。症状：策略只能靠本体状态学，点云像噪声。修复：训练路径保留梯度，只有评估路径 no_grad。</li>
+      <li><strong>逐环境采样循环成为瓶颈</strong>：预处理里的 for 循环在 512 环境时约 10 ms/步，比渲染预算还高。症状：点云任务吞吐远低于同规模图像任务。修复：改成"随机分数 + top-N"的批量采样，全程单内核。</li>
+      <li><strong>离群点压扁整朵云</strong>：单位球缩放被单个噪点主导，正常结构被缩到极小。症状：真机上成功率突然低于仿真。修复：用 95 分位半径或统计剔除离群点后再归一化。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>设计一个形状断言实验：故意把点云 (N,P,3) 误传给 (N,3,P) 期望的编码器，记录训练损失曲线的异常，并解释为什么"错形状也能跑"。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>观察第一层 Conv1d 的输入通道数不匹配时是否报错；想想哪些错形状恰好"通道数也对得上"，这类静默错误最危险。</div></details>
+      </li>
+      <li>把 N 从 1024 依次改成 256、4096，记录编码耗时、显存与任务成功率。给出你任务上的性价比拐点。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>成功率对 N 的敏感度取决于任务所需的几何精细度（抓小物体对 N 敏感，推大箱子不敏感）。</div></details>
+      </li>
+      <li>坐标帧实验：同一任务分别用"相机系点云"和"腕部系点云"训练，比较收敛速度，并给出坐标帧选择的一般原则。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>腕部系让"目标相对夹爪的位置"直接可读，通常收敛更快；基座系的优势是轨迹更稳定、便于迁移到固定相机部署。</div></details>
+      </li>
+      <li>实现一个消融：把 max 聚合换成 mean，训练到收敛，从"目标边缘点占比"的角度解释两者的成功率差异（提示：统计裁剪后目标相关点的数量占比）。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>抓取任务里目标表面点可能只占总点数 5%–10%；mean 会让这些点的特征贡献按比例缩水。</div></details>
+      </li>
+      <li>思考题：如果任务只需要"物体中心与朝向"，最短的观测是什么？请论证点云观测在什么条件下会退化为"不如直接给质心坐标"。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>若几何先验完全已知（单一刚体、无遮挡），质心+朝向（6 维）就是充分统计量；点云的价值来自"形状未知/多物体/遮挡"的不确定性。</div></details>
+      </li>
+      <li>按 6 节的账复算：把逐环境采样循环换成批量 top-N 后，若单步预处理从 12.8 ms 降到 0.8 ms，在 30 Hz 相机、每 2 控制步更新一次点云的配置下，每秒节省多少计算时间？并说明这部分时间能否直接转化为吞吐。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>点云每 2 控制步更新一次，60 Hz 控制下更新率 30 Hz，节省按 30 Hz 计：12 ms × 30 ≈ 0.36 s/s；能否转化为吞吐取决于单步预算里省下的是否是瓶颈段，若渲染依然是瓶颈，收益要到渲染侧对齐后才能兑现。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul>
+      <li>点云是无序集合，置换不变性是网络设计的硬约束；PointNet 用"共享 MLP + max 聚合"优雅满足它。</li>
+      <li>预处理四步，裁剪、降采样、坐标变换、单位球归一化，把已知几何在数据层做掉，网络只学真正不确定的部分。</li>
+      <li>固定点数 N（1024 常用）是 batch 对接的硬要求；空点云要给全零 + 诚实信号。</li>
+      <li>坐标系必须明确且每步更新（腕部相机的外参在动）；编码器是策略的一部分，训练时保留梯度。</li>
+      <li>下一章最后一种模态：力/力矩传感器，接触世界的观测通道，为第 030 章的接触奖励与第 041 章的插拔任务做铺垫。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch027.html">← 第 027 章：实现基于像素的观察</a>
+    <a class="next" href="ch029.html">第 029 章：实现基于力传感器的观察 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第065章 并行实验与并发度控制 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第四篇 · Ray Tune 超参搜索</span>
+    <span class="sep">/</span>
+    <span>第 065 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第四篇 · Ray Tune 超参搜索</div>
+    <h1>第 065 章：并行实验与并发度控制</h1>
+    <p class="lead">同一批算力可以切成“少数大试验”或“多数小试验”，切法决定搜索的宽度与反馈的速度。本章讲清试验间并行与试验内并行的换算关系、并发上限的三重约束（资源、调度器、搜索算法），以及并发度对贝叶斯建议和早停收益的影响。</p>
+    <ul class="meta">
+      <li>主题：Ray Tune 调优 / 并发度与资源匹配</li>
+      <li>关键机制：max_concurrent_trials、资源上限、建议批量、超额订阅</li>
+      <li>预计学时：50 分钟</li>
+      <li>前置章节：第 064 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>分清两级并行：试验间并行（试验数量维度）与试验内并行（采样 worker 维度），会做两者之间的算力换算。</li>
+      <li>掌握并发上限的三重约束：物理资源、调度器结构需求、搜索算法的建议批量，最终取最小值。</li>
+      <li>会用 <code>max_concurrent_trials</code> 与函数级资源声明控制并发，并解释每一步参数的取值依据。</li>
+      <li>理解并发度对贝叶斯优化建议质量与 ASHA 淘汰时机的影响，会为不同搜索算法选择合适并发。</li>
+      <li>会识别超额订阅的收益区间与风险区间，避免采样进程与训练主进程争抢核。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>超参搜索的时间账由两个因子相乘：完成全部试验需要的总计算量，以及同时能推进多少计算。<strong>总计算量由空间与预算决定，同时推进量由并发度决定，两者共同决定搜索的墙钟时间与反馈延迟。</strong>把并发调大并不总是更快：每个试验分到的资源变少、单试验变慢，早停调度器拿到结果的时间整体后移，搜索反馈的“回路延迟”反而上升。</p>
+    <p>上一章解决了中断后续跑的一致性，本章解决“一口气能跑多少个”。Ray Tune 的资源管理由调度循环统一处理：试验需要先声明资源，获得资源后才能启动；暂停的试验释放资源并回到队列。理解这个循环，才能把并发参数设置在物理可行且算法友好的区间。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 两级并行的换算</h3>
+    <p>全局并行度由两项组成：试验间并行数 C（同时活跃的试验数）与试验内并行数 W（每个试验的采样 worker 数），乘积 C×W 近似为采样进程总量，再叠加每个试验的驱动与学习进程开销。以 64 物理核为例，配置 C=8、W=6 时采样并行 48，加 8 个试验管理进程共 56，尚有余量；配置 C=12、W=6 时总量 84，进入超额订阅区。<strong>同样的 64 核，切成 4×16 或 16×4 的墙钟时间完全不同：切法越偏向试验内，单试验越快、试验总数越少。</strong></p>
+    <div class="formula">
+      C × W + C × o ≈ 物理核数 &nbsp;（o 为每试验的固定管理开销，通常 1 至 2 核）
+      <span class="note">C 越大搜索越宽、反馈越慢；W 越大单试验越快、可完成的试验越少；两者在同一池子里竞争</span>
+    </div>
+
+    <h3>2. 并发上限的三重约束</h3>
+    <p>可达并发取三个上限的最小值：<strong>（1）物理资源上限</strong>，由总核数、总卡数与单试验声明换算：C<sub>res</sub> = min(⌊CPU/CPU<sub>trial</sub>⌋, ⌊GPU/GPU<sub>trial</sub>⌋)；<strong>（2）调度器结构上限</strong>，ASHA 需要同一档的试验成批收齐才能比较，PBT 需要整个种群同时运行，并发低于种群规模的 PBT 退化；<strong>（3）搜索算法上限</strong>，顺序性贝叶斯优化假设“拿到全部历史再提案”，并行提案件数越多，建议基于的结果越陈旧，质量下降越明显。</p>
+    <p>最终并发数写成三者的最小值再留一档缓冲：C = min(C<sub>res</sub> − 1, C<sub>sched</sub>, C<sub>alg</sub>)。缓冲用于吸收检查点上传、恢复迁移等瞬时占用，避免资源池被瞬时任务打满后整队等待。</p>
+
+    <h3>3. 并发对搜索算法的影响</h3>
+    <p>随机搜索与网格搜索的建议不依赖历史，并发大小只影响吞吐，不影响建议分布。<strong>基于模型的搜索算法（贝叶斯优化及其变体）在并行下有“陈旧建议”问题：并行批次中的建议都基于同一份历史，批次越宽，靠后的建议越可能重复已探索区域。</strong>实践中的取舍是：并发控制在 4 至 8，或选择为并行批次专门设计的搜索变体。该上限写进 C<sub>alg</sub>，与资源约束取最小后执行。</p>
+
+    <h3>4. 并发对早停收益的影响</h3>
+    <p>ASHA 的收益来自“把弱试验的剩余预算转给强试验”。这个转化需要两个条件：同档内有多数试验完成该档，以及强试验在资源配置上拿得回资源。<strong>并发过低时，每档收齐慢，淘汰决策延迟；并发过高时，每个试验资源少，单试验超时风险上升，且暂停的试验重新入队后与待运行试验竞争资源，调度路径变长。</strong>稳定的做法是让并发略高于“一个档位的典型收齐规模”，再让调度器的 <code>choose_trial_to_run</code> 负责回收流向。</p>
+
+    <h3>5. 超额订阅的收益与风险</h3>
+    <p>声明 CPU 0.5、GPU 0.1 这类分数资源允许物理上超额分配：多个进程分时共享同一核或同一卡。收益在于抹平阶段性空闲（等待网络、磁盘、环境步进的时间可以被别的进程利用）。<strong>风险在于同步阶段：一旦多个试验同时进入计算密集段，分时切换的开销会集中爆发，表现为吞吐抖动，平均值本身不会明显下降。</strong>经验边界是：采样型后台 worker 可以适度超额订阅；负责参数更新的训练进程保持 1:1 的核声明，避免与采样进程互相挤压。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>并发设计按“先单试验、再总量、后取最小”的顺序进行：<strong>先确定一个试验需要多少资源，再由集群总量推可达并发，再按调度器与算法需求收缩，最后留出缓冲。</strong>与上一章的差异在于，第 064 章保证单条链路不中断，本章把资源铺开到多条链路上。</p>
+    <ol>
+      <li><strong>定单试验资源</strong>：按模型规模与采样并行需求估算，样本数 4k 至 64k 步的场景常用 CPU 4 核、GPU 0.5 块起步。</li>
+      <li><strong>算资源上限</strong>：按公式取 CPU 与 GPU 两个方向的最小值，注意分数声明的取整方向。</li>
+      <li><strong>收缩算法上限</strong>：随机搜索可用满额；贝叶斯类建议限制在 4 至 8。</li>
+      <li><strong>核对调度器需求</strong>：PBT 的并发不得低于种群规模；ASHA 的并发不低于每档收齐规模的 1.5 倍左右。</li>
+      <li><strong>留缓冲并验证</strong>：减一档作为缓冲，先运行若干完整迭代，观察队列长度与空转率，再微调。</li>
+    </ol>
+    <table>
+      <tr><th>场景</th><th>并发建议</th><th>理由</th></tr>
+      <tr><td>随机搜索 + ASHA，60 个试验</td><td>资源满额减一</td><td>建议不依赖历史，宽并发直接换来宽覆盖</td></tr>
+      <tr><td>贝叶斯优化 + 无早停，60 个试验</td><td>4 至 8</td><td>限制陈旧建议的批次宽度</td></tr>
+      <tr><td>PBT，种群 8 至 16</td><td>等于种群规模</td><td>淘汰与复制需要全部成员在场</td></tr>
+      <tr><td>少量大试验（每试 16 核以上）</td><td>2 至 4</td><td>资源碎片化时大试验难排上，保持少量持续运行</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：为什么并发要有缓冲档？</span>
+      <p>资源池同时承载活跃试验与瞬时任务：检查点上传、恢复迁移、日志写入都需要 CPU 与磁盘带宽。把并发压到资源的理论上限时，任何瞬时任务都会让调度循环短暂失衡，表现为试验启动延迟与吞吐毛刺。留一档缓冲的成本可控，收益是调度稳定。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：函数级资源声明与并发上限</strong></p>
+    <pre class="code"><code>from ray import tune
+from ray.tune.search.optuna import OptunaSearch
+
+# 函数级资源声明：Tune 按此排队与装箱，必须与算法内部并行配置一致
+trainable = tune.with_resources(
+    train_fn,
+    resources={"cpu": 4, "gpu": 0.5},
+)
+
+tune.run(
+    trainable,
+    search_alg=OptunaSearch(),
+    # 集群 64 核 / 8 卡：资源上限 min(64//4, 8/0.5)=16
+    # 人工上限取 6：贝叶斯优化的并行提案批次控制在个位数
+    max_concurrent_trials=6,
+    num_samples=60,
+    config=search_space,
+)</code></pre>
+    <p>解读：这段配置把三重约束中最紧的一条落到了参数上。<strong>（1）</strong><code>tune.with_resources</code> 声明的资源是排队与装箱的依据，训练函数内部若还创建采样 worker，其核数必须被计入声明，否则“声明 4 核、实际占用 10 核”会让资源池过载。<strong>（2）</strong><code>max_concurrent_trials=6</code> 取自算法上限；若用随机搜索，可放宽到资源上限减一，即 15。<strong>（3）</strong>GPU 声明用小数，同一块卡可由多个试验分时共享；分数声明的取整为向下取整，计算时避免浮点误差带来的少算一档。接口与参数名随版本演进，以对应版本的官方文档为准。</p>
+
+    <p><strong>片段 2：并发预算计算器</strong></p>
+    <pre class="code"><code>def concurrency_budget(total_cpu=64, total_gpu=8.0,
+                       cpu_per_trial=4, gpu_per_trial=0.5,
+                       alg_limit=6, buffer_slots=1):
+    """三重约束取最小：物理资源、算法上限，再留缓冲档。"""
+    by_cpu = total_cpu // cpu_per_trial
+    # 分数 GPU 用容差修正浮点误差，避免 8/0.5 算成 15
+    by_gpu = int(total_gpu / gpu_per_trial + 1e-9) if gpu_per_trial else 10**9
+    resource_cap = min(by_cpu, by_gpu)
+    budget = min(resource_cap - buffer_slots, alg_limit)
+    # 返回负值时说明单试验声明已超出集群，需要先调整声明
+    if budget &lt;= 0:
+        raise ValueError("单试验资源超过集群容量，先下调声明")
+    print(f"CPU 上限 {by_cpu}，GPU 上限 {by_gpu}，最终并发 {budget}")
+    return budget
+
+concurrency_budget()                          # 6（算法上限收紧）
+concurrency_budget(alg_limit=10**9)           # 15（资源上限减缓冲）
+</code></pre>
+    <p>解读：计算器把一条容易出错的心算变成可复用函数。<strong>（1）</strong>取整方向统一为向下，并对浮点除法加容差：<code>8 / 0.5</code> 在二进制浮点下可能略低于 16，直接取整会少一档。<strong>（2）</strong>缓冲档从资源结果里减，不从算法上限里减：算法上限描述建议质量，不需要缓冲。<strong>（3）</strong>非法组合（单试验声明超过集群）显式报错，把配置错误挡在实验启动之前。<strong>（4）</strong>两次调用分别展示“算法收紧”与“资源收紧”两种主导情形，便于在设计讨论中对照。</p>
+
+    <p><strong>片段 3：两级并行的全局核账</strong></p>
+    <pre class="code"><code>PHYSICAL_CPUS = 64
+
+def global_parallelism(trials, env_runners, overhead_per_trial=1):
+    """统计全局并行度：试验间 × 试验内 + 每试验管理开销。"""
+    sampling = trials * env_runners
+    overhead = trials * overhead_per_trial
+    total = sampling + overhead
+    state = "超额订阅" if total &gt; PHYSICAL_CPUS else "资源充足"
+    print(f"C={trials}, W={env_runners}: 采样 {sampling} + 管理 {overhead}"
+          f" = {total} 核（{state}）")
+    return total
+
+# 同一池子里的三种切法：观察反馈回路与单试验速度的权衡
+global_parallelism(trials=4,  env_runners=16)   # 64+4，超额
+global_parallelism(trials=8,  env_runners=6)    # 48+8，留有余量
+global_parallelism(trials=16, env_runners=3)    # 48+16，管理开销占比上升
+</code></pre>
+    <p>解读：三行调用覆盖了切法的三个典型区间。<strong>（1）</strong>C=4、W=16 的切法单试验最快，但反馈回路长：每个结论要等四分之一批结果才能合成，早停调度器的作用面被压窄。<strong>（2）</strong>C=8、W=6 的切法在 64 核上留出 8 核余量给瞬时任务，是“宽度与速度”的均衡点。<strong>（3）</strong>C=16、W=3 的切法反馈最快、搜索最宽，代价是管理开销占比从 12.5% 升到 25%，且每个试验只分到 3 个采样 worker，单试验吞吐可能不足以支撑早停判据的稳定。核账的目标是让每个切法的代价可见，唯一最优并不存在。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>声明资源与算法内部并行配置不一致</strong>：<code>with_resources</code> 声明 4 核，RLlib 配置里却创建 8 个采样 worker，实际占用远超声明，资源池过载且调度失真。症状是试验启动时间随机拉长。修复：让声明值与内部 worker 数量加管理开销对齐。</li>
+      <li><strong><code>max_concurrent_trials</code> 大于资源上限</strong>：超出部分仍会排队，参数看起来“没有生效”。症状是并发数始终低于设置值。修复：先算资源上限，人工参数只用于向下收紧。</li>
+      <li><strong>贝叶斯优化并发过宽</strong>：并行批次中的建议基于同一份陈旧历史，重复探索同一区域，收敛变慢。症状是不同试验的配置高度相似。修复：并发限制在 4 至 8，或改用为并行设计的搜索变体。</li>
+      <li><strong>并发低于调度器结构需求</strong>：PBT 的种群不齐、ASHA 的档位收不齐，淘汰与复制逻辑空转。修复：并发不低于种群规模；ASHA 并发高于档位收齐规模的 1.5 倍。</li>
+      <li><strong>超额订阅集中在计算密集段</strong>：采样进程与训练主进程抢核，吞吐在同步点出现毛刺。修复：训练主进程保持 1:1 核声明，只对等待型后台进程做分数声明。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>算一算：集群 96 核、4 卡，单试验声明 CPU 6 核、GPU 0.25 块。资源上限是多少？若用贝叶斯优化并把算法上限设为 8，最终并发是多少？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>CPU 方向 96/6=16；GPU 方向 4/0.25=16；资源上限 16，减一档缓冲得 15，与算法上限 8 取小，最终并发 8。</div></details>
+      </li>
+      <li>预测题：把 <code>max_concurrent_trials</code> 从 8 提到 16（资源允许），观察 60 个试验的完成时间、每个试验的平均墙钟时间与 ASHA 的淘汰次数，预测三者的变化方向并解释。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>完成时间可能先降后平；单试验墙钟时间上升（资源变少）；淘汰次数先升后降，因为档位收齐更快但单试验到达档位的速度变慢，两条效应的强弱决定净结果。</div></details>
+      </li>
+      <li>推导题：从公式 C×W + C×o ≈ N 出发，给定 N=64、o=2，为“最大化每小时完成的试验数”推导 C 与 W 的关系，并讨论为什么目标函数还要叠加早停收益项才能得到完整结论。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>W=(N−2C)/C=N/C−2。完成速率还取决于单试验时长随 W 的变化（通常次线性），且早停依赖同档比较的样本量，收益项与 C 正相关。完整目标应为“完成速率 × 淘汰节省比例”，缺少后者会偏向小 C。</div></details>
+      </li>
+      <li>设计题：为资源碎片场景设计排队策略：集群同时存在 8 核与 2 核两类试验，目标是不让 2 核试验被大试验插队饿死。写出你会在并发与声明层面做的两处调整。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>为两类试验设定统一的小声明（如全部降到 2 核 + 分数 GPU），或控制大试验并发并让调度器优先回收暂停试验；关键是让“需要的资源量”与“可回收的资源量”成整数倍关系，减少碎片。</div></details>
+      </li>
+      <li>实践题：用片段 3 的核账函数为你的集群写一份并发方案：列出单试验声明、C、W、缓冲档与预期队列行为，并用一次覆盖若干完整迭代的试运行验证。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>验证时观察三个量：活跃试验数是否稳定在 C、试验启动等待是否接近 0、核心利用率是否在 80% 至 90% 区间；偏离时优先调声明，再考虑调 C。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>两级并行的换算关系 C×W + C×o ≈ 核数；切法决定搜索宽度与反馈速度，不存在普遍最优。</li>
+      <li>并发上限取三重约束的最小值：物理资源、调度器结构需求、搜索算法建议批量，再留一档缓冲。</li>
+      <li>贝叶斯类搜索的并发宜控制在 4 至 8；随机搜索可直接使用资源满额。</li>
+      <li>PBT 并发不低于种群规模，ASHA 并发高于档位收齐规模的 1.5 倍，早停收益才能兑现。</li>
+      <li>分数资源允许超额订阅，收益在等待型任务，风险在同步计算段；训练主进程保持 1:1 声明。</li>
+      <li>下一章深入资源分配本身：GPU 份额、放置策略与多 worker 试验的资源结构。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch064.html">← 第 064 章：调优实验的故障恢复</a>
+    <a class="next" href="ch066.html">第 066 章：资源分配与GPU使用调优 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

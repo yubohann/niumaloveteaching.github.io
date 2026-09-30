@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第041章 RLlib实现MARL算法 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第三篇 · RLlib 算法实现</span>
+    <span class="sep">/</span>
+    <span>第 041 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第三篇 · RLlib 算法实现</div>
+    <h1>第 041 章：RLlib实现MARL算法</h1>
+    <p class="lead">从单策略到多策略：策略映射（Policy Mapping）如何把智能体分派到策略、参数共享（Parameter Sharing）与独立策略（Independent Policies）各自适用于什么任务、非平稳性（Non-stationarity）为什么会破坏单智能体算法的收敛假设。</p>
+    <ul class="meta">
+      <li>主题：RLlib 训练（多智能体算法）</li>
+      <li>关键机制：策略映射、参数共享、集中式训练分布式执行（CTDE）</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 040 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解多智能体任务相对单智能体的三处本质差异：联合动作空间、非平稳转移、信用分配（Credit Assignment）。</li>
+      <li>掌握策略映射函数（Policy Mapping Function）的语义与一致性约束，知道它为什么必须可复现。</li>
+      <li>掌握参数共享（Parameter Sharing）与独立策略（Independent Policies）的取舍，能按角色对称性规划共享范围。</li>
+      <li>会配置 RLlib 多智能体接口，并逐策略读取训练指标诊断更新是否发生。</li>
+      <li>能设计共享与独立的对照实验，用量化指标评估样本效率差异。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>多智能体强化学习（Multi-Agent Reinforcement Learning, MARL）要处理的环境里，转移概率依赖全部智能体的联合动作（Joint Action），任何一个智能体的策略更新都会改变其余智能体面对的转移分布。把单智能体算法复制若干份、各自训练，会持续违反"环境平稳"这一收敛前提，训练曲线表现为互相追逐的震荡。</p>
+    <p>RLlib 的解法是把多智能体组织成"策略集合 + 映射函数 + 训练名单"三件套：采样阶段按映射把每个智能体的经验分派给对应策略，训练阶段按名单更新参数。本章讲透这套组织方式的原理与配置，它是后续自博弈、种群训练等复杂范式的基础设施。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p>本节回答一个问题：多智能体训练的组织结构，究竟在解决什么数学与系统层面的困难。</p>
+
+    <h3>1. 从 MDP 到多智能体：三处本质变化</h3>
+    <p>多智能体环境在数学上对应随机博弈（Stochastic Game）：状态 s、联合动作 a = (a<sub>1</sub>, …, a<sub>N</sub>)、转移 P(s′ | s, a)、各智能体回报 R<sub>i</sub>。相对单智能体马尔可夫决策过程（Markov Decision Process, MDP），有三处变化直接冲击算法设计：</p>
+    <ul>
+      <li><strong>非平稳性</strong>：智能体 i 的转移分布是 P(s′ | s, a<sub>i</sub>, π<sub>−i</sub>)，依赖其余智能体的当前策略 π<sub>−i</sub>。他人每更新一次，i 面对的"环境"就变一次，基于固定环境假设的价值估计会被持续推翻。</li>
+      <li><strong>信用分配</strong>：团队回报由全体动作共同产生，把回报归因到单个智能体的某个动作是病态问题。共享回报训练的是"团队行为"，个体奖励设计则决定行为如何分工。</li>
+      <li><strong>样本归属</strong>：每个时刻产生 N 份经验（观测、动作、回报各一组），采样批次按策略拆分，单策略分到的数据量取决于映射结果。</li>
+    </ul>
+    <p>非平稳性的强度可以用更新频率差来感受：对手策略每 K 轮更新一次、学习者每轮都更新时，学习者面对的是一个缓慢漂移的环境，价值目标的有效稳定窗口约等于对手的更新周期。把对手更新频率降下来（冻结或低频陪练）能显著恢复平稳性，这条工程手段与自博弈章节的对手池设计直接衔接。</p>
+
+    <h3>2. 策略映射：多智能体训练的分派中枢</h3>
+    <p>RLlib 用策略映射函数把智能体 ID 映射到策略 ID：<code>policy_mapping_fn(agent_id, episode, worker, **kwargs)</code>。它在两类位置被调用：采样 worker 上决定用哪份参数计算动作，训练阶段决定经验写入哪份批次。两个调用点相距很远，映射函数<strong>必须满足确定性约束</strong>：同一 episode 内同一 agent_id 必须得到同一结果，且不能依赖本地随机数或墙上时间，否则经验会被写入与产生它的参数不对应的批次，优势函数与梯度全部错位。</p>
+    <p>允许依赖 episode 参数是刻意设计：它支持"每局重新分边"的对练范式，只要随机性来自 episode 层级的种子，所有 worker 就能得到一致结论。</p>
+
+    <h3>3. 参数共享与独立策略：样本效率与表征能力的权衡</h3>
+    <table>
+      <tr><th>组织方式</th><th>机制</th><th>优势</th><th>代价</th></tr>
+      <tr><td>参数共享</td><td>全部 agent 映射到同一 policy_id，经验汇入同一批次</td><td>样本效率约提升 N 倍；共享参数带来隐式课程</td><td>要求空间一致；难以表达角色差异；容量竞争</td></tr>
+      <tr><td>独立策略</td><td>每个 agent 一份参数，各自更新</td><td>表征能力最强，角色差异充分表达</td><td>每份策略的数据量缩小约 N 倍，学习更慢</td></tr>
+      <tr><td>按组共享</td><td>按角色或队伍分组，组内共享、组间独立</td><td>折中方案，实践中用得最多</td><td>需要预先定义角色划分</td></tr>
+    </table>
+    <p>共享策略的近似结论可以量化：设采样批次共 B 条经验，共享策略一次梯度更新用到全部 B 条；独立策略下平均每份策略只见到 B/N 条。<strong>在空间一致的同质角色任务里，共享带来的样本效率收益通常远大于表征损失。</strong></p>
+    <p>用片段 1 的奖励结构再算一笔：每步成本 0.02、成功奖励 2.0、回合上限 50 步。平均 40 步成功时单局每智能体回报为 2.0 − 0.02 × 40 = 1.2；始终不成功则以 −0.02 × 50 = −1.0 收尾。团队奖励在智能体之间共享，行为差异都落进同一个数字里，信用分配的质量直接决定协作是否出现：奖励设计过粗时，搭便车的行为获得同样的回报，训练出的分工因此不稳定。</p>
+
+    <h3>4. 集中式训练与分布式执行</h3>
+    <p>集中式训练分布式执行（Centralized Training with Decentralized Execution, CTDE）是缓解非平稳性与信用分配的主流范式：训练阶段 Critic 允许读取全局状态或全体观测，价值估计因此更稳定；执行阶段 Actor 只依赖本地观测，部署时无需通信。RLlib 中没有强制的 CTDE 开关，一种常见做法是通过共享 Critic 网络（vf_share_layers 之外的参数共享）或自定义模型在 forward 里拼接全局信号来实现。</p>
+    <p>策略梯度的更新目标仍是 PPO 截断形式，只是在多智能体批次上按策略归属分别估计优势：</p>
+    <div class="formula">
+      L<sup>clip</sup>(θ) = E<sub>t</sub>[ min( ρ<sub>t</sub>(θ)·Â<sub>t</sub>, clip(ρ<sub>t</sub>(θ), 1−ε, 1+ε)·Â<sub>t</sub> ) ]
+      <span class="note">ρ<sub>t</sub>(θ) = π<sub>θ</sub>(a<sub>t</sub>|o<sub>t</sub>) / π<sub>old</sub>(a<sub>t</sub>|o<sub>t</sub>)；共享策略时 Â<sub>t</sub> 来自多个 agent 的优势估计，按批次混合更新同一份参数</span>
+    </div>
+
+    <h3>5. 指标口径：多智能体报表与单智能体不同</h3>
+    <p>多智能体任务里 <code>episode_reward_mean</code> 的默认口径是"每个 episode 内全部智能体回报之和"，量纲约为单智能体的 N 倍。<strong>跨任务比较奖励水平时必须换算成每智能体平均值。</strong>训练健康度则依赖逐策略指标：共享策略在 <code>info.learner</code> 下只有一个条目，独立策略有 N 个条目，某条目的 <code>policy_loss</code> 恒为零通常意味着该策略未列入训练名单。</p>
+
+    <h3>6. 数值算例：策略数、批次分裂与收敛代价</h3>
+    <p>把"批次按策略拆分"算成一张表。总批次 8192 时：单份共享策略一次更新使用全部 8192 条；N = 2 的独立策略各得约 4096 条，梯度噪声按平方根上升约 1.41 倍；N = 4 时各得 2048 条，噪声约 2.00 倍；N = 8 时各得 1024 条，噪声约 2.83 倍。若要在独立策略下维持与共享相同的单策略有效批次，总采样量需要按 N 放大。这就是"样本效率约 N 倍"说法的定量来源，也是异质角色拆分策略后训练变慢的原因。</p>
+    <table>
+      <tr><th>策略划分数 N</th><th>每策略每批数据量</th><th>相对梯度噪声</th><th>维持同等单策略批次所需总采样量</th></tr>
+      <tr><td>1（共享）</td><td>8192</td><td>1.00</td><td>8192</td></tr>
+      <tr><td>2</td><td>4096</td><td>约 1.41</td><td>16384</td></tr>
+      <tr><td>4</td><td>2048</td><td>约 2.00</td><td>32768</td></tr>
+      <tr><td>8</td><td>1024</td><td>约 2.83</td><td>65536</td></tr>
+    </table>
+    <p>报表口径的换算给一个算例：双智能体任务报表显示回报均值 380，每智能体口径为 190；若单智能体基线是 200，直接看队级数字会误判为大幅超过基线，换算后其实是略低于基线。奖励量纲差 N 倍还会连带影响熵系数与学习率的感知尺度，多智能体实验的对照表里应固定记录口径。</p>
+
+    <h3>7. 边界与失效模式</h3>
+    <p>变长智能体集合是环境层的边界：智能体中途退出后观测字典的键减少，共享策略的批次里样本数随之波动；若某个策略在某轮批次中一条数据都没有，多数实现会以空批次跳过更新，该策略停在原地。极端情形需要监控每策略的样本计数下限，必要时用固定长度的填充或调整终止逻辑。</p>
+    <p>映射函数的边界在恢复与评估：从检查点恢复时映射函数逻辑必须一并复现，否则智能体被分派到不同的策略，行为与训练时不一致；评估流程必须复用训练映射，报表才可比。自博弈类任务会把映射函数的作用升级为"对手生成器"，此时映射的输出空间随训练阶段演化，版本管理要覆盖映射逻辑本身。</p>
+    <p>CTDE 的执行边界出现在部署：集中式 Critic 只在训练期存在，部署时只有本地观测可用的 Actor；训练期的全局信号若被 Actor 误用（例如自定义模型把全局特征拼进策略输入），部署环境里该信息缺失会让行为退化。设计时把 Actor 的输入集与部署时可得的信息逐一核对，是 CTDE 落地的固定动作。</p>
+    <p>冻结对手还有停滞边界：对手长期不更新时，学习者可能收敛到只克制这套固定策略的解法，一旦对手恢复更新，性能迅速回退。缓解手段是安排陪练对手的轮换或按周期解冻，把对手池的多样性当成超参来管理。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>把一个多智能体任务接入 RLlib PPO，按以下五步推进。</p>
+    <ol>
+      <li><strong>空间对齐</strong>：先检查各智能体的观测、动作空间能否统一。能统一的先统一（补齐维度、对齐取值范围），统一是参数共享的前提；无法统一的角色走独立策略。</li>
+      <li><strong>共享范围决策</strong>：对称角色（同型机器人、同型单位）全局共享；异质角色按组共享；对抗双方完全独立以保留博弈策略的差异。</li>
+      <li><strong>编写映射函数</strong>：只依赖 agent_id 与 episode 元数据，保持确定性；评估配置必须复用同一映射。</li>
+      <li><strong>声明策略集合与训练名单</strong>：<code>policies</code> 列出全部策略及空间，<code>policies_to_train</code> 列出参与更新的策略（冻结对手时留空）。</li>
+      <li><strong>规划采样与验证</strong>：采样批次按策略拆分，独立策略数量多时相应放大 <code>train_batch_size</code>；开训后逐策略检查损失与 KL。</li>
+    </ol>
+    <h3>关键配置参数</h3>
+    <table>
+      <tr><th>参数</th><th>典型值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td><code>policies</code></td><td>策略 ID 集合或空间字典</td><td>声明可用策略</td><td>与环境的 agent 分组一一对应</td></tr>
+      <tr><td><code>policy_mapping_fn</code></td><td>自定义函数</td><td>agent 到策略的分派</td><td>确定性；训练与评估一致</td></tr>
+      <tr><td><code>policies_to_train</code></td><td>列表</td><td>限定参与更新的策略</td><td>冻结对手、分阶段训练时使用</td></tr>
+      <tr><td><code>count_steps_by</code></td><td>agent_steps / env_steps</td><td>批次计数口径</td><td>智能体生命周期不一致时选 agent_steps</td></tr>
+      <tr><td><code>train_batch_size</code></td><td>8192 步</td><td>全局采样批次</td><td>按策略数放大，保证每策略批次充分</td></tr>
+      <tr><td><code>num_env_runners</code></td><td>8（4–64）</td><td>并行采样数</td><td>与环境步进代价匹配</td></tr>
+    </table>
+    <p>批次放大有一条直接算式：希望每份策略每轮至少见到 4096 条数据时，N 份独立策略要求全局批次至少 4096 × N。N = 4 时为 16384，N = 8 时为 32768；若全局批次保持 8192 不动，每份策略只有 1024 至 2048 条，梯度噪声相对共享配置放大 2 至 2.83 倍。共享与独立的对照实验要把这条算式写进方案，否则两组的单策略数据量并不对等，结论无法归因。</p>
+    <p>与上一章的差异：IMPALA 处理的是单策略下的一条采样流，本章把采样流按策略分流，<strong>批次、并行度、指标三处口径都随策略数量发生变化</strong>。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：最小多智能体环境（MultiAgentEnv）</strong></p>
+    <pre class="code"><code>import gymnasium as gym
+from gymnasium.spaces import Box, Discrete
+from ray.rllib.env.multi_agent_env import MultiAgentEnv
+
+class CoopGrid(MultiAgentEnv):
+    """两智能体协作网格：观测与动作空间完全一致，是参数共享的前提。"""
+    def __init__(self, config=None):
+        super().__init__()
+        # 观测 4 维：自身坐标与相对目标坐标，统一缩放到 [-1, 1]
+        self.observation_space = Box(-1.0, 1.0, (4,), dtype="float32")
+        self.action_space = Discrete(5)          # 上/下/左/右/停留
+        self.max_steps = 50
+        self.agents = ["agent_0", "agent_1"]     # 本局参与的智能体集合
+        self._agent_ids = set(self.agents)       # 基类据此校验动作字典的键
+
+    def _obs(self, agent):
+        x, y = self.pos[agent]
+        return [x / 4.0, y / 4.0, (3 - x) / 4.0, (3 - y) / 4.0]
+
+    def reset(self, *, seed=None, options=None):
+        self.pos = {"agent_0": [0, 0], "agent_1": [1, 0]}
+        self.t = 0
+        return {a: self._obs(a) for a in self.agents}, {}
+
+    def step(self, action_dict):
+        # 动作字典只包含仍存活的 agent，RLlib 按映射函数选择策略计算动作
+        moves = {0: (0, 1), 1: (0, -1), 2: (1, 0), 3: (-1, 0), 4: (0, 0)}
+        for a, act in action_dict.items():
+            dx, dy = moves[act]
+            self.pos[a] = [self.pos[a][0] + dx, self.pos[a][1] + dy]
+        self.t += 1
+        done = all(self.pos[a] == [3, 3] for a in self.agents)
+        reward = 2.0 if done else -0.02            # 团队共享回报
+        terminated = {a: done for a in self.agents}
+        # "__all__" 是全局终止约定，漏写会让采样器认为 episode 永不结束
+        terminated["__all__"] = done
+        truncated = {"__all__": self.t &gt;= self.max_steps}
+        obs = {a: self._obs(a) for a in self.agents if not done}
+        rew = {a: reward for a in self.agents}
+        return obs, rew, terminated, truncated, {}</code></pre>
+    <p>解读：多智能体环境接口的核心约定有三处。<strong>（1）</strong>观测与回报都以字典返回，键是 agent_id，采样器据此把每条经验路由到映射函数指定的策略。<strong>（2）</strong>终止字典除每个 agent 的布尔值外必须包含 <code>"__all__"</code> 键，它是环境声明"本局结束"的唯一官方通道；遗漏会让 rollout 无限进行，worker 被永久占用。<strong>（3）</strong>已终止的 agent 从观测字典中移除，这要求策略在训练时能处理"变长智能体集合"，RLlib 通过各策略独立批次绕开该问题。</p>
+
+    <p><strong>片段 2：两种映射函数与 PPO 多智能体配置</strong></p>
+    <pre class="code"><code>from ray.rllib.algorithms.ppo import PPOConfig
+
+def shared_mapping(agent_id, episode, worker=None, **kwargs):
+    # 全部 agent 映射到同一 policy_id：经验汇入同一批次，参数共享
+    return "shared_policy"
+
+def independent_mapping(agent_id, episode, worker=None, **kwargs):
+    # 每个 agent 独占一份参数；对抗训练中可用于固定对手与学习者
+    return "learner" if agent_id == "agent_0" else "opponent"
+
+config = (
+    PPOConfig()
+    .environment(CoopGrid)
+    .framework("torch")
+    .env_runners(num_env_runners=8, num_envs_per_env_runner=4)
+    .training(
+        train_batch_size=8192,      # 按策略拆分，共享策略独占全部数据
+        lr=3e-4,
+        gamma=0.99,
+        lambda_=0.95,
+        entropy_coeff=0.01,         # 协同早期保留探索，避免策略过早趋同
+    )
+    .multi_agent(
+        policies={"shared_policy"},          # 只声明一个策略即参数共享
+        policy_mapping_fn=shared_mapping,
+        policies_to_train=["shared_policy"],
+    )
+)
+# 注：multi_agent 的参数形态随版本演进，新版以 AlgorithmConfig.multi_agent
+# 与 RLModuleSpec 声明策略空间，以对应 Ray 版本的官方文档为准。</code></pre>
+    <p>解读：映射函数与配置之间存在强耦合，逐点说明设计意图。<strong>（1）</strong>映射只引用配置中声明过的 policy_id，拼写错误会在训练启动时报"未知策略"，属于最早暴露的配置错误。<strong>（2）</strong><code>independent_mapping</code> 与 <code>policies_to_train</code> 配合即可实现"学习者对固定对手"：对手策略在名单之外，只采样不更新，这正是 042 章自博弈的起点。<strong>（3）</strong>两台以上机器共享策略时，本片段配置可原样扩展，因为映射逻辑与智能体数量无关。</p>
+
+    <p><strong>片段 3：逐策略指标诊断</strong></p>
+    <pre class="code"><code>result = algo.train()
+
+# 队级口径：多智能体报表里的 episode_reward_mean 是各 agent 回报之和，
+# 与单智能体任务的奖励量纲不同，比较前先除以智能体数量
+team_return = result["env_runners"]["episode_reward_mean"]
+per_agent = team_return / 2.0
+
+learner = result["info"]["learner"]
+for pid, stats in sorted(learner.items()):
+    s = stats["learner_stats"]
+    # 策略未列入训练名单时 policy_loss 恒为 0，这是最隐蔽的配置错误
+    print(pid, "policy_loss=", round(s["policy_loss"], 4),
+          "kl=", round(s["mean_kl_loss"], 4))
+# 指标键路径随版本演进（旧版在 info.learner 下），以官方文档为准</code></pre>
+    <p>解读：这段代码演示多智能体训练的两个检查动作。<strong>（1）</strong>奖励口径换算：把队级回报除以智能体数量后再与单智能体基线比较，避免"奖励看起来涨了 2 倍"的误判。<strong>（2）</strong>逐策略损失巡检：每个策略都应出现非零且波动的 policy_loss，恒零条目直接指向 <code>policies_to_train</code> 或映射函数的问题。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>空间不一致却配置共享策略</strong>：两个智能体观测维度不同（如 4 维与 6 维）仍映射到同一策略，采样阶段报形状不匹配，或更隐蔽地静默截断。修复：先做空间对齐（补齐、投影到统一维度），无法对齐就按角色拆分策略。</li>
+      <li><strong>映射函数带随机性</strong>：函数体内调用 <code>random.choice</code> 或读取本地时间，不同 worker 对同一 agent 给出不同策略，经验与参数错配。修复：随机分组放进 episode 元数据（由种子驱动，全局一致），映射只做查表。</li>
+      <li><strong>漏配训练名单</strong>：新增对手策略后未加入 <code>policies_to_train</code>，该策略永远停在初始化参数，采样数据全部作废。症状：该策略的 policy_loss 恒为 0。</li>
+      <li><strong>用错奖励口径</strong>：把队级回报当作单智能体回报调参，学习率、熵系数按错误的奖励量级设定，导致策略更新幅度失当。修复：统一换算到每智能体平均值再比较。</li>
+      <li><strong>终止条件缺 "__all__"</strong>：episode 永不结束，采样吞吐随运行时间衰减，最终触发环境步数上限报错。修复：每个 <code>step</code> 返回的 terminated 字典显式写入 <code>"__all__"</code> 键。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把片段 1 的环境扩展到 4 个智能体（两两协作、目标相同）。保持参数共享配置不变，说明为什么这段代码只需改 <code>agents</code> 列表与初始坐标。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>映射函数与智能体数量无关，共享策略的批次由采样器自动汇聚。注意奖励口径随 N 放大，报表换算系数要同步改成 4。</div></details>
+      </li>
+      <li>把全局共享策略改为"每智能体独立策略"，预测三件事：样本效率、收敛所需的采样步数、报表中的策略条目数量。设计一个对照实验验证预测。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>独立策略下每份策略约分到 1/N 的经验，达到同等性能需要更多采样；条目数量变为 N。对照实验固定种子与总采样步数，只改映射函数。</div></details>
+      </li>
+      <li>推导：设总采样批次 B 条经验、N 个空间一致的对称智能体，证明参数共享下单次更新使用的有效样本量约为独立策略的 N 倍（忽略策略间数据分布差异）。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>从采样器按映射分派经验出发：共享时全部 B 条进入同一批次；独立时按映射均匀分派，每份策略期望得到 B/N 条。</div></details>
+      </li>
+      <li>设计一个三类角色的任务（2 个侦察、2 个采集、1 个指挥），给出策略划分方案（几份策略、映射逻辑、训练名单），并说明共享范围选择的依据。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>侦察与采集若观测动作空间一致可合并为一份共享策略；指挥角色观测含全局信息，单独一份。映射按 agent_id 前缀查表，全部列入训练名单。</div></details>
+      </li>
+      <li>解释为什么策略映射函数必须可复现，并给出一个反例场景：mapping 使用 worker 本地随机数时，训练会出现什么具体错误现象。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>经验写入的批次与产生动作的参数不对应时，重要性比值失去意义，优势估计错位，表现为策略损失剧烈震荡且评估性能与训练性能大幅背离。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>多智能体相对单智能体的三处变化：联合动作引发的非平稳转移、信用分配、经验按策略分流。</li>
+      <li>策略映射函数是多智能体训练的分派中枢，确定性是硬约束，episode 级元数据是其唯一的随机性出口。</li>
+      <li>参数共享把 N 条轨迹汇成一份批次，样本效率约提升 N 倍，前提是空间一致；独立策略保留角色差异，代价是每份数据量缩小。</li>
+      <li>CTDE 让 Critic 在训练期读取全局信息、Actor 在执行期只依赖局部观测，是缓解非平稳性的主流范式。</li>
+      <li>多智能体报表的奖励是队级求和，逐策略损失巡检是发现配置错误的第一手段。</li>
+      <li>下一章进入 AlphaZero 风格算法：自博弈（Self-play）让映射函数的作用升级为"对手生成器"，搜索与策略网络的结合将引入新的训练目标。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch040.html">← 第 040 章：RLlib实现IMPALA算法</a>
+    <a class="next" href="ch042.html">第 042 章：RLlib实现AlphaZero风格算法 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第085章 实现关节限位约束 | 机器人仿真学习课程 · Isaac Sim 强化学习训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第四篇 · 控制与优化</span>
+    <span class="sep">/</span>
+    <span>第 085 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第四篇 · 控制与优化</div>
+    <h1>第 085 章：实现关节限位约束</h1>
+    <p class="lead">关节不能想转多少就转多少：机械挡块、线缆与编码器共同划出了物理边界。本章讲清硬约束（动作重映射）与软约束（裕度势垒）的取舍，让策略既不撞墙也不过分保守。</p>
+    <ul class="meta">
+      <li>主题：控制与优化 / 关节空间约束</li>
+      <li>相关组件：Isaac Sim / Isaac Lab / Stable-Baselines3</li>
+      <li>预计学时：45 分钟</li>
+      <li>前置章节：第 084 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解关节限位（joint limits）的来源与两类实现：物理硬限位与控制器软限位。</li>
+      <li>掌握两种约束进动作空间的方法：tanh 重映射与"无界输出 + 裕度惩罚"，会说清各自的学习代价。</li>
+      <li>会设计带安全裕度的 hinge 型势垒奖励，并解释为什么不用 1/x 型势垒。</li>
+      <li>会把"到限位的归一化距离"放进观测，让策略学会提前减速与换姿态。</li>
+      <li>能处理 continuous 关节、单位混淆与"卡边振荡"等典型问题。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>每个真实关节都有行程边界：谐波减速器里有机械挡块，线缆束限制了手腕转角，编码器也只在有限范围内绝对测量。仿真里如果放任策略越过这些边界，学到的动作在真机上要么被硬件拦停、要么直接撞坏限位销，这是"仿真能跑、真机不敢上"的经典原因之一。</p>
+    <p>上一章的奇异约束作用在任务空间（雅可比降秩），本章的限位约束作用在关节空间（每个 q<sub>i</sub> 的区间）。数学上它们都是"带约束的最优化"，但工程手法完全不同：奇异靠可操作度指标"感知并绕行"，限位则可以直接改写动作空间，<strong>把不可能的动作从源头掐掉</strong>。学完本章，你把两类约束都装进了训练框架。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 约束的数学形态</h3>
+    <p>带限位的任务本质是约束优化：</p>
+    <div class="formula">
+      max<sub>π</sub> J(π)&nbsp;&nbsp;s.t.&nbsp;q<sub>min,i</sub> ≤ q<sub>i</sub>(t) ≤ q<sub>max,i</sub>&nbsp;&nbsp;∀i, t
+    </div>
+    <p>与奇异问题的区别：奇异是"能力退化"（想做也做不到），限位是"物理隔离"（根本不许去）。这类逐维区间约束有三种处理哲学，各有清晰代价：</p>
+    <table>
+      <tr><th>方案</th><th>做法</th><th>优点</th><th>代价</th></tr>
+      <tr><td>硬投影</td><td>动作/状态直接 clamp 到区间</td><td>实现最简单</td><td>梯度在边界被截断；策略"卡边"反复撞墙</td></tr>
+      <tr><td>重映射</td><td>tanh 输出线性映射到安全区间</td><td>永不越界，结构保证</td><td>想越界的意图没有梯度信号；边界附近分辨率降低</td></tr>
+      <tr><td>软约束</td><td>裕度惩罚（势垒）+ 观测裕度</td><td>保留全部表达力，可学习贴边利用行程</td><td>惩戒系数要调；训练早期会试探越界</td></tr>
+    </table>
+
+    <h3>2. 势垒函数：hinge 平方与 1/x 的取舍</h3>
+    <p>定义到最近限位的距离 d<sub>i</sub> = min(q<sub>i</sub> − q<sub>min,i</sub>, q<sub>max,i</sub> − q<sub>i</sub>)，惩罚直接建立在这个量上：</p>
+    <p>经典的倒数势垒 1/d 在 d→0 时梯度趋于无穷：数值上会把梯度炸到 NaN，而且远未接触边界时惩罚已很大（d=0.1 rad 罚 10、d=0.02 rad 罚 50），策略会过度保守。实用替代是<strong>带安全裕度的 hinge 惩罚</strong>：</p>
+    <div class="formula">
+      r<sub>limit</sub> = −k · Σ<sub>i</sub> max(0, m<sub>safe</sub> − d<sub>i</sub>)²
+      <span class="note">m_safe 是安全裕度（取行程的 5%–10%）；d ≥ m_safe 时惩罚恒为零</span>
+    </div>
+    <p>它有势垒的精神（越近罚越重，平方使梯度连续），却没有数值病害：在 d = m<sub>safe</sub> 处惩罚与梯度都为 0，策略在安全区内完全自由，只在最后 5% 行程里感到"软墙"。</p>
+
+    <h3>3. 动作重映射：把边界焊进结构</h3>
+    <p>位置控制模式（第 004 章）下，最直接的做法是把网络输出 a ∈ (−1, 1) 线性映射到安全区间：</p>
+    <div class="formula">
+      q<sub>target,i</sub> = (q<sub>max,i</sub> − q<sub>min,i</sub>) / 2 · (1 − ε) · a<sub>i</sub> + (q<sub>max,i</sub> + q<sub>min,i</sub>) / 2
+      <span class="note">ε=0.02 留出 2% 边距；输出 a=±1 恰好落在安全边界上</span>
+    </div>
+    <p>这是"结构保证"：无论网络输出什么，指令永远合法。但它有一个隐蔽的学习代价，当策略<strong>想要</strong>超出限位时（例如任务奖励诱导它继续伸展），a 早已饱和在 ±1，梯度信息为零，策略无法从中学到"应该换个姿态绕开"。所以重映射适合"限位就是设计意图的一部分"的场景（安全护栏），而<strong>需要精细利用行程的任务（紧凑空间装配）更推荐软约束</strong>，让策略自己学会贴边。</p>
+
+    <h3>4. 观测：让策略"看得到墙"</h3>
+    <p>策略要提前规划就得知道离墙多远。把 q<sub>i</sub> 归一化到 [−1, 1]（相对行程中心）后，位置本身已隐含裕度；但更直接的是单独给出归一化裕度：</p>
+    <div class="formula">
+      ĝ<sub>i</sub> = d<sub>i</sub> / (行程的一半)，&nbsp; ĝ ∈ [0, 1]（0=贴边，1=居中）
+      <span class="note">对行程 1 rad 与 0.1 rad 的关节，ĝ 都给出"还剩百分之几余量"的统一语义</span>
+    </div>
+    <p>对连续回转关节（continuous joint，区间是 ±∞ 或 ±π 环绕），裕度没有意义，要单独处理成周期性编码（sin/cos 编码角度，见常见坑）。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <ol>
+      <li><strong>先读真实限位</strong>：从 USD 关节的物理属性或 articulation API 读取每个关节的上下限（不同版本接口名有差异，以官方文档为准），不要手抄，CAD 改一次你就错一次。</li>
+      <li><strong>统一单位与符号</strong>：Isaac Sim 内部用弧度；导入的 URDF/USD 可能是角度制。上下限顺序个别资产会颠倒，读取后做一次健全性检查（lower &lt; upper）。</li>
+      <li><strong>选方案</strong>：安全关键演示用重映射（永不越界）；需要学习"贴边策略"的任务用软约束（hinge 势垒 + 观测裕度）。两者也可以叠加：重映射把动作框在 98% 行程内，软约束在 90% 处开始提醒。</li>
+      <li><strong>裕度 m<sub>safe</sub> 取行程的 5%</strong>：1 rad 行程给 0.05 rad（约 3°）。太小来不及减速；太大白白浪费行程。对大行程关节（如 ±π）用比例裕度，对小行程绝对裕度更稳。</li>
+      <li><strong>权重与课程</strong>：惩罚系数 k 让限位项在危险时占总奖励的 20%–30%（用记录曲线调）；训练早期可以放宽 m<sub>safe</sub>（如 2%），成功稳定后收紧，先学走路再学不踩线。</li>
+      <li><strong>评估指标</strong>：任务成功率、d<sub>i</sub> 的最小值分布、"贴边时长占比"（d &lt; m<sub>safe</sub> 的步数比例）、以及仿真里限位碰撞的接触力峰值。</li>
+    </ol>
+    <div class="box key">
+      <span class="box-title">设计思维：约束的"三层防线"</span>
+      <p>工程系统从不靠单一机制防越界。推荐三层：<strong>底层</strong>用重映射/速度限幅做结构性兜底（不可能越界）；<strong>中层</strong>用裕度惩罚与观测做学习引导（策略主动避开）；<strong>顶层</strong>用评估指标监控贴边行为（发现退化再收紧参数）。第 084 章的 DLS 限幅与本章思路一脉相承，给学习系统配"物理保险"，永远比指望它自己守规矩更可靠。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：读取限位并构造归一化观测与裕度</strong></p>
+    <pre class="code"><code>def build_limit_obs(joint_pos, joint_vel, lower, upper, continuous_mask):
+    """构造带限位信息的观测。
+    joint_pos/joint_vel: (B, n)；lower/upper: (n,) 弧度制的上下限；
+    continuous_mask: (n,) 布尔，标记无限位（无限回转）的关节。"""
+    import torch
+    B, n = joint_pos.shape
+    # 半行程：用于把位置归一化到 [-1, 1]；continuous 关节给 1 避免除零
+    half = torch.where(continuous_mask, torch.ones_like(lower),
+                       (upper - lower) / 2.0)
+    center = torch.where(continuous_mask, torch.zeros_like(lower),
+                         (upper + lower) / 2.0)
+    q_norm = ((joint_pos - center) / half).clamp(-1.5, 1.5)  # 限幅防异常值
+    # 归一化裕度：0=贴边，1=居中；只对有限位关节有意义
+    d = torch.minimum(joint_pos - lower, upper - joint_pos) / half  # ∈ [0,1]
+    margin = torch.where(continuous_mask, torch.ones_like(d), d.clamp(0.0, 1.0))
+    obs = torch.cat([q_norm, joint_vel, margin], dim=-1)
+    return obs, margin
+</code></pre>
+    <p>解读：这个函数的三处细节都值得说。（1）<code>clamp(-1.5, 1.5)</code> 是防御性的：软约束方案允许策略偶尔越界，归一化后可能出现 ±1.2 的值，截断到 1.5 避免极端值污染观测分布；（2）裕度用 <code>d / half</code> 得到 0–1 的无量纲量，与其它观测同尺度，<strong>把所有"还剩多少余量"都变成百分比是观测工程的一条通用原则</strong>；（3）<code>continuous_mask</code> 单独处理：回转关节给常数 1（裕度无意义），避免上下限为 ±∞ 时算出 NaN。顺带提醒：<code>joint_pos</code> 若来自 articulation 的完整状态，注意索引对齐，夹爪等附属关节通常不在主臂限位表里。</p>
+
+    <p><strong>片段 2：两条路线的动作处理（重映射 vs 软约束）</strong></p>
+    <pre class="code"><code>import torch
+
+class JointLimitActions:
+    """两种限位动作处理：A) tanh 输出重映射（硬保证）；
+       B) 原始输出 + hinge 裕度惩罚（软约束，保留贴边表达能力）。"""
+
+    def __init__(self, lower, upper, mode="soft", eps=0.02,
+                 m_safe_ratio=0.05, k_limit=1.0):
+        self.lower, self.upper = lower, upper
+        self.center = (upper + lower) / 2.0
+        self.half = (upper - lower) / 2.0
+        self.mode = mode
+        self.eps = eps                        # 重映射时保留的边距比例
+        self.m_safe = m_safe_ratio * self.half  # 安全裕度（按行程取比例）
+        self.k_limit = k_limit                # 势垒权重：占总奖励 20%-30% 为宜
+
+    def to_joint_target(self, action):
+        # 重映射：a ∈ (-1,1) 线性映射到 [q_min+ε, q_max-ε]，结构上永不越界
+        safe_half = self.half * (1.0 - self.eps)
+        return self.center + safe_half * torch.tanh(action)
+
+    def limit_penalty(self, joint_pos):
+        # 软约束：d = 到最近限位的距离；d 小于 m_safe 时才收费（hinge 平方）
+        d = torch.minimum(joint_pos - self.lower, self.upper - joint_pos)
+        violation = torch.clamp(self.m_safe - d, min=0.0)   # 裕度外恒为 0
+        return self.k_limit * torch.sum(violation ** 2, dim=-1)
+</code></pre>
+    <p>解读：两种模式放在同一个类里方便对比实验。<code>to_joint_target</code> 是对片段 1 公式的直接实现：<code>safe_half * tanh(a)</code> 保证输出严格落在 98% 行程内，<strong>tanh 在这里提供的是白捡的饱和特性</strong>：网络输出再大也压不破这条线。<code>limit_penalty</code> 的 <code>clamp(min=0)</code> 正是 hinge 操作：安全区内梯度精确为零，策略在这些区域的策略梯度不受任何干扰；<code>**2</code> 让惩罚在刚进入裕度时足够温和、贴着限位时足够强硬。<code>m_safe</code> 按行程比例取值：一个行程 2.8 rad 的肩关节与 1.4 rad 的腕关节按同一比例留余量，物理意义一致。把 <code>k_limit</code> 从 1 拉到 10，你会观察到策略宁可在目标点附近留误差也不再贴边，这就是"约束的定价"。</p>
+
+    <p><strong>片段 3：训练循环中监控贴边行为</strong></p>
+    <pre class="code"><code>stats = {"edge_ratio": [], "min_margin": [], "success": []}
+for it in range(3000):
+    obs = env.observe()
+    action = policy(obs)
+    tau = policy_head_to_tau(action)          # 力矩模式：动作直接是力矩
+    obs, reward, done, info = env.step(tau)
+    # 贴边率：有多少比例的关节-步处于危险区（裕度 &lt; 2 倍安全裕度）
+    margin = info["limit_margin"]             # (B, n)，来自片段 1
+    edge = (margin &lt; 2.0 * env.m_safe_ratio).float().mean()
+    stats["edge_ratio"].append(edge.item())
+    stats["min_margin"].append(margin.min().item())
+    stats["success"].append(info["reached"].float().mean().item())
+    if it % 200 == 0:
+        print(f"iter {it}: 贴边率 {edge:.3f} 最小裕度 {margin.min():.3f} "
+              f"成功率 {stats['success'][-1]:.2f}")
+    # 若贴边率长期 &gt; 10% 且成功率停滞，说明任务需求真的越界了：
+    # 要么目标采样超出了工作空间，要么机构行程不够；先查任务定义再看系数
+</code></pre>
+    <p>解读：这段代码回答"约束有没有起作用"的问题。<code>edge_ratio</code> 定义在 2 倍安全裕度处，比裕度内部更早发出信号，是为了<strong>预警</strong>：策略频繁地"接近"危险区，说明它在把限位当"软墙"蹭，长期下去接触力统计会恶化。判读方法：贴边率高但成功率也高 → 任务确实需要用到行程边缘，可以接受但仍需关注接触力；贴边率高而成功率不涨 → 大概率是目标采样越界（任务在物理上就不可行），继续调惩罚系数是缘木求鱼。最后一段注释体现了调试顺序：<strong>先怀疑任务定义，再怀疑奖励系数</strong>，这条经验适用于所有约束类训练。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>单位混用（弧度 vs 角度）</strong>：URDF 导入的角度制限位直接和弧度制的关节状态比较，裕度算出来差 57 倍。症状是策略"莫名其妙"地不敢动或完全忽略限位。修复：读取后立刻统一到弧度并做数量级抽查。</li>
+      <li><strong>上下限顺序颠倒</strong>：个别资产的 lower/upper 字段反了，hinge 距离恒为负，惩罚永远为零。修复：载入时断言 lower &lt; upper，失败则交换或报错。</li>
+      <li><strong>用 1/d 势垒</strong>：数值梯度爆炸，训练出现 NaN 或极端保守。修复：hinge 平方势垒（片段 2），惩罚有明确的支持集（d &lt; m<sub>safe</sub>）。</li>
+      <li><strong>clamp 状态造成"卡边"</strong>：直接对关节角 clamp 会让策略在边界处反复输出越界指令，位置控制器的积分项持续饱和（"windup"），松开后猛冲。修复：用惩罚 + 观测引导，别让控制器硬扛。</li>
+      <li><strong>continuous 关节未特殊处理</strong>：±π 环绕的角度（如 −3.13 rad 与 +3.13 rad 相差 0.02 rad）被当成"接近 +π 上限"处理，策略对回转关节的行为完全错乱。修复：用 sin/cos 编码或明确标记为无限位。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把 m<sub>safe</sub> 设为行程的 2%、5%、10% 各训练一次，记录成功率、到点时间与最小裕度，找到你的任务的最优裕度。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>裕度太小等于没有缓冲（接触限位的冲击统计会变差）；太大浪费行程（绕路变多）。观察"最小裕度"是否随 m<sub>safe</sub> 同步抬升。</div></details>
+      </li>
+      <li>对比重映射与软约束在训练早期的探索速度（相同超参与步数下，看成功率爬升曲线）。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>重映射把动作空间压小，早期随机探索"更安全"但覆盖不全；软约束更自由但会先撞几次边界。记录达到 50% 成功率所需步数。</div></details>
+      </li>
+      <li>实现连续回转关节的最短路径控制：给定当前角与目标角，输出 (目标角 − 当前角 + π) mod 2π − π 的方向指令。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>模运算把"转 +350°"变成"转 −10°"；注意实现里 mod 对负数的处理，Python 的 % 与 C 的 % 行为不同。</div></details>
+      </li>
+      <li>把某个关节的行程人为缩小 20%，分别做"从头训练"与"在旧策略上微调"，比较两者适应时间。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>微调要同时更新观测归一化参数（half/center 变了），否则旧策略的输入语义全错，适应反而更慢。</div></details>
+      </li>
+      <li>设计实验：把观测里的裕度通道去掉再训练，预测并验证贴边率与成功率的变化。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>没有裕度观测的策略只剩位置归一化可用，"靠近边界"的预警信号变弱，贴边率通常会上升、成功率下降。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>关节限位是关节空间的区间约束；处理哲学有三：硬投影（clamp）、重映射（tanh 结构保证）、软约束（裕度势垒）。</li>
+      <li>实用势垒是 hinge 平方：r = −k·Σmax(0, m<sub>safe</sub>−d)²，安全区内零惩罚、贴近限位急剧加重，避开 1/d 的数值病害。</li>
+      <li>重映射永不越界但抹掉越界意图的梯度；需要贴边利用行程的任务选软约束，安全兜底可两者叠加。</li>
+      <li>观测给出归一化裕度（0=贴边、1=居中）；continuous 关节用 sin/cos 编码，不做裕度处理。</li>
+      <li>下一章从"关节能不能动"转向"末端怎么摆"：姿态表示的坑（万向锁、四元数双覆盖）会直接影响定向控制的效果，见第 086 章。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch084.html">← 第 084 章：实现避奇异位形</a>
+    <a class="next" href="ch086.html">第 086 章：实现末端执行器定向控制 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

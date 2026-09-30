@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第063章 实现图神经网络策略 | 机器人仿真学习课程 · Isaac Sim 强化学习训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第三篇 · 高级强化学习专题</span>
+    <span class="sep">/</span>
+    <span>第 063 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第三篇 · 高级强化学习专题</div>
+    <h1>第 063 章：实现图神经网络策略</h1>
+    <p class="lead">当智能体是一串连杆、一支机器人队列、或一片交互中的物体时，状态天然是"图"：本章用消息传递（message passing）让策略在变量数量的节点之间推理，并把它接进 Isaac Sim 的多机器人场景。</p>
+    <ul class="meta">
+      <li>主题：策略网络 / 关系推理与消息传递</li>
+      <li>相关组件：Isaac Sim / Isaac Lab / PyTorch</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 062 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解图的表示：节点特征、边特征、邻接关系，以及消息传递的通用公式。</li>
+      <li>说清置换不变性（permutation invariance）为什么是机器人多体系统的硬需求，以及如何用聚合函数保证它。</li>
+      <li>掌握三种机器人图构建方式：关节链拓扑、多机器人通信图、物体交互图。</li>
+      <li>会用 PyTorch 写出不依赖第三方图库的批量消息传递层（含 <code>index_add_</code> 聚合）。</li>
+      <li>会处理"多个图拼成一个大图"的批处理，并正确做全局池化。</li>
+      <li>能诊断过平滑、方向错误、特征量纲混乱等典型失效模式。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 062 章的 Transformer 把状态看成一条有序序列。但很多机器人系统的结构表现为"网络"：一条 12 自由度的机械臂，各连杆通过关节连成树；4 台协作搬运的移动机器人，谁在谁旁边取决于编队关系，与固定编号无关；抓取场景里物体与手指之间的接触关系每时每刻都在变化。</p>
+    <p>把这些硬塞进 MLP 或 RNN 有两个问题：一是<strong>维度随实体数量爆炸</strong>（4 台机器人的两两相对信息有 12 组，8 台变成 56 组）；二是<strong>编号敏感</strong>，把 1 号机器人的数据换到 3 号位置，MLP 学到的行为完全不同，而"谁编号是 1"毫无物理意义。图神经网络（Graph Neural Network, GNN）用共享权重的消息传递在本地邻居之间交换信息，天然对节点顺序不变、对节点数量可扩展：<strong>4 台机器人上训好的策略，8 台组成编队时不需要改结构</strong>（第 094 章编队任务会直接吃这个红利）。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 图的基本元素与消息传递公式</h3>
+    <p>一张图 G=(V, E) 由节点集合 V 和边集合 E 组成。每个节点 i 带特征 h<sub>i</sub> ∈ R<sup>d<sub>node</sub></sup>（例如连杆的位姿、速度），每条从 j 指向 i 的边带宽特征 e<sub>ji</sub> ∈ R<sup>d<sub>edge</sub></sup>（例如关节角、相对位置）。一层消息传递做三件事：</p>
+    <div class="formula">
+      m<sub>ij</sub> = φ<sub>θ</sub>( h<sub>i</sub>, h<sub>j</sub>, e<sub>ij</sub> )　　h<sub>i</sub>′ = ψ<sub>θ</sub>( h<sub>i</sub>, □<sub>j∈N(i)</sub> m<sub>ij</sub> )
+      <span class="note">φ 生成消息、□ 是聚合算子（求和/平均/最大值）、ψ 更新节点表示；θ 在所有节点间共享</span>
+    </div>
+    <p>逐项体会它的物理含义：<strong>消息 m<sub>ij</sub> 是"邻居 j 对 i 说的话"</strong>，由双方状态和它们之间这条边（关节/相对位姿）共同决定；<strong>聚合 □ 是"同时听多个邻居"</strong>，必须对邻居顺序不变；<strong>更新 ψ 是"结合自己原有的认知"</strong>。堆叠 L 层后，每个节点能"看到" L 跳以内的邻居，信息像涟漪一样扩散。</p>
+
+    <h3>2. 置换不变性：为什么聚合必须是求和/平均/最大</h3>
+    <p>假设节点特征不变，把节点 i 的邻居 {a, b, c} 重新编号成 {c, a, b}。如果聚合函数是求和，输出 Σ m 与顺序无关；如果是拼接（concatenation），输出就会随编号变化。同理，所有节点共享同一个 φ、ψ，则整图节点集重排后输出只是跟着重排，网络学到的是"关系模式"，与"第几个节点"无关，这就是 GNN 对多机器人系统的本质优势。反过来说，<strong>一旦你在消息函数里混入了节点绝对编号（如 one-hot 编号），置换不变性就被破坏</strong>，泛化到新队伍规模的能力随之消失。</p>
+
+    <h3>3. 三种机器人图构建法</h3>
+    <table>
+      <tr><th>场景</th><th>节点</th><th>边与边特征</th></tr>
+      <tr><td>单条机械臂（关节链）</td><td>每个连杆</td><td>关节连接，边=关节角+轴方向；树状结构</td></tr>
+      <tr><td>多机器人协作</td><td>每台机器人</td><td>距离小于阈值的机器人两两相连，边=相对位置+距离</td></tr>
+      <tr><td>抓取/装配场景</td><td>手指、物体、目标点</td><td>接触对相连，边=接触法向力+相对速度</td></tr>
+    </table>
+    <p>本课程选用"关节链 + 多机器人"混合场景：每台移动机械臂内部用关节图，机器人之间有通信边。一个关键工程选择是<strong>全用相对量</strong>：节点特征用"相对基座/队长的位姿"，边特征用"相对位置与距离"。这样整支队伍平移 1 米，输入不变，策略输出不变，平移等变性是省数据的大杀器。</p>
+
+    <h3>4. 深度与过平滑：2–3 层就够了</h3>
+    <p>每层消息传递相当于一次"邻域平均"。层数太多会出现过平滑（over-smoothing）：所有节点的表示趋同，网络失去分辨能力。机器人任务的经验值是 <strong>2–3 层</strong>：单条 6 自由度链 2 层即可覆盖首尾；4–8 台机器人的编队 3 层覆盖 3 跳邻居，配合距离阈值已经足够。此外还可以加"虚拟主节点"（把全局池化结果广播回所有节点）替代堆层数，代价更低。</p>
+
+    <h3>5. 计算量核算</h3>
+    <p>消息计算量是 O(E·d²)，E 为边数。一条 12 自由度机械臂的树图只有 11 条边（双向算 22），4 台机器人内部 88 条边；通信边 M 台机器人全连接是 M(M−1)，M=4 时 12 条。总计约百条边的规模，单步推理在 GPU 上不到 1 ms，<strong>GNN 的算力瓶颈通常不在消息传递，而在每步重建图的 Python 开销</strong>，后面代码里会专门处理。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>落地流程：定拓扑 → 定特征 → 写网络 → 批处理 → 接训练。</p>
+    <ol>
+      <li><strong>定拓扑</strong>：关节树的边集合在仿真加载后就是固定的，只在"第一次构建"时算一次并缓存 <code>edge_index</code>；通信图每条仿真步都可能变（机器人会移动），但可以用"距离阈值 + 每 N 步更新一次"近似，N=4 时策略仍能捕捉编队结构，而图重建频率降到 15 Hz。</li>
+      <li><strong>定特征</strong>：节点特征 7 维 = 相对基座位置 (2) + 机体速度 (3) + 关节角正弦余弦 (2)。边特征 5 维 = 相对位置 (3) + 距离 (1) + 关节角正弦 (1)。全部标到 −1～1 量级，避免网络第一层被大数淹没。</li>
+      <li><strong>网络</strong>：3 层消息传递，d<sub>node</sub>=64、d<sub>msg</sub>=128、d<sub>edge</sub>=16；之后按批索引做均值池化得到每台机器人的全局向量，再拼接自身节点表示 → MLP(256) → 动作头。</li>
+      <li><strong>批处理</strong>：Isaac Sim 里 4096 个并行环境各自有 4 台机器人，统一拼成一张"大图"：节点总数 4096×4×13（含连杆）足以压垮 Python 循环，所以节点特征、边特征都用张量一次性构造，靠 <code>batch_index</code> 向量区分环境。聚合用 <code>index_add_</code> 完成，全程无 Python 循环。</li>
+      <li><strong>训练接入</strong>：与第 062 章相同，包成 SB3 的 <code>BaseFeaturesExtractor</code>；环境侧负责把"观测字典"打包成扁平的节点/边/批索引三件套。</li>
+    </ol>
+    <div class="box key">
+      <span class="box-title">设计思维：为什么不让 GNN 直接输出动作？</span>
+      <p>让全部节点输出动作会浪费算力：只有"队长/末端执行器"需要精细化动作，其余节点（连杆）只是信息中转。所以策略只读取与执行器相关的节点表示（例如末端节点 + 全局池化向量拼接）。<strong>消息传递负责"想"，小 MLP 负责"做"</strong>，这种分工在 Static/动态图上都通用。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：从 Isaac Sim 场景构建图数据（拓扑缓存 + 每步填特征）</strong></p>
+    <pre class="code"><code>import numpy as np
+
+class RobotGraphBuilder:
+    """关节树拓扑固定：edge_index 只算一次；每步只刷新节点/边特征。"""
+    def __init__(self, link_names, joint_pairs):
+        self.n = len(link_names)
+        # 无向边拆成两条有向边：消息传递需要"谁对谁说"的明确方向
+        src, dst = [], []
+        for a, b in joint_pairs:
+            src += [a, b]
+            dst += [b, a]
+        self.edge_index = np.array([src, dst], dtype=np.int64)  # [2, E]，缓存复用
+
+    def step_features(self, link_poses, link_vels, joint_angles):
+        # 节点特征用相对量：整机平移时输入不变，策略输出也不变（平移等变）
+        rel_xy = link_poses[:, :2] - link_poses[0:1, :2]        # 相对基座位置
+        node = np.concatenate([rel_xy, link_vels[:, :3],
+                               np.sin(joint_angles)[:, None],
+                               np.cos(joint_angles)[:, None]], axis=1)
+        # 边特征：相对位置 + 距离 + 关节角正弦，全部压到 ±1 量级
+        d = link_poses[self.edge_index[1], :3] - link_poses[self.edge_index[0], :3]
+        edge = np.concatenate([d, np.linalg.norm(d, axis=1, keepdims=True),
+                               np.sin(joint_angles)[:, None]], axis=1)
+        return node.astype(np.float32), edge.astype(np.float32)</code></pre>
+    <p>解读：<code>edge_index</code> 用 <code>[2, E]</code> 的"源-目标"数组来表达邻接关系：关节树边数远小于 n²，稀疏存储才能撑住批量规模（4096 环境 × 13 连杆：稀疏 ~22 条边/图，稠密矩阵 169 个元素里约 87% 是零）。<strong>无向边拆两条</strong>是消息传递的惯例：关节的"父子"语义不对称，两个方向的消息参数若共享权重，网络就无法区分"上游"和"下游"；拆成双向且共享 φ 依然保持置换不变性。<strong>特征用相对量</strong>是本章最重要的设计决定：它让策略天然对队伍整体平移不敏感，等价于免费获得了数据增强。</p>
+
+    <p><strong>片段 2：置换不变的批量消息传递层</strong></p>
+    <pre class="code"><code>import torch
+import torch.nn as nn
+
+class MessagePassingLayer(nn.Module):
+    """一层消息传递。聚合用 index_add_（求和），保证对邻居顺序与数量不变。"""
+    def __init__(self, d_node=64, d_edge=16, d_msg=128):
+        super().__init__()
+        self.phi = nn.Sequential(                                    # 消息生成器 φ
+            nn.Linear(2 * d_node + d_edge, d_msg), nn.ELU(),
+            nn.Linear(d_msg, d_msg), nn.ELU())
+        self.psi = nn.Sequential(                                    # 节点更新器 ψ
+            nn.Linear(d_node + d_msg, d_node), nn.ELU())
+
+    def forward(self, h, edge_index, e):
+        src, dst = edge_index[0], edge_index[1]                      # [E]
+        m = self.phi(torch.cat([h[src], h[dst], e], dim=-1))         # [E, d_msg]
+        agg = torch.zeros_like(h).index_add_(0, dst, m)              # 按目标节点求和
+        return self.psi(torch.cat([h, agg], dim=-1))                 # [N, d_node]</code></pre>
+    <p>解读：这 10 行是 GNN 的心脏。<code>h[src]</code>、<code>h[dst]</code> 是"邻居看自己"和"自己看邻居"两路视角，拼接后送进 φ，<strong>双向信息在消息内部显式区分</strong>。<code>index_add_</code> 语义是"把 m 的第 k 行加到 agg 的第 dst[k] 行"，完成按邻域求和聚合；它对 dst 的顺序完全免疫，因此节点重排不影响输出（置换不变性由构造保证，不靠数据分布）。换成 <code>index_reduce_</code> 的 <code>mean</code> 或 <code>amax</code> 得到均值/最大聚合：均值对度数敏感（度大的节点被稀释）、最大对单个强邻居敏感，求和是表达能力最强的默认选择，代价是度大时数值会膨胀，实际工程里常对求和结果再除一个 <code>√度数</code> 做归一化。别用 Python for 循环逐节点聚合：4096 环境 × 52 个节点的循环会让单步耗时从亚毫秒涨到几十毫秒。</p>
+
+    <p><strong>片段 3：批处理与全局池化，多图拼一大图</strong></p>
+    <pre class="code"><code>class GNNPolicy(nn.Module):
+    """批量多图策略：h/edge_index/e 是整批环境共享的大图，batch 标记节点归属。"""
+    def __init__(self, d_node=64, d_edge=16, d_msg=128, d_act=12, layers=3):
+        super().__init__()
+        self.inp = nn.Linear(7, d_node)                  # 原始节点特征（7 维）→ 统一维度
+        self.ein = nn.Linear(5, d_edge)                  # 原始边特征 → 统一维度
+        self.layers = nn.ModuleList([MessagePassingLayer(d_node, d_edge, d_msg)
+                                     for _ in range(layers)])
+        self.head = nn.Sequential(nn.Linear(2 * d_node, 256), nn.ELU(),
+                                  nn.Linear(256, d_act))
+
+    def forward(self, h, edge_index, e, batch, self_node):
+        h, e = self.inp(h), self.ein(e)
+        for layer in self.layers:
+            h = h + layer(h, edge_index, e)              # 残差连接，缓解过平滑
+        # 全局池化：把每个环境的全部节点均值成向量，按 batch 编号聚合
+        ecount = torch.bincount(batch).clamp(min=1).unsqueeze(-1)   # 每个图的节点数
+        gsum = torch.zeros(int(batch.max()) + 1, h.shape[-1],
+                           dtype=h.dtype, device=h.device).index_add_(0, batch, h)
+        g = gsum / ecount                                # [B, d_node]
+        z = torch.cat([h[self_node], g[batch[self_node]]], dim=-1)  # 自节点+全局上下文
+        return self.head(z)                              # 只对执行器节点输出动作</code></pre>
+    <p>解读：批量处理的关键是三个张量，节点特征 <code>h</code>（[N<sub>总</sub>, d]）、边索引 <code>edge_index</code>（指向大图全局编号）、归属向量 <code>batch</code>（每个节点属于哪个环境）。<strong>残差连接 <code>h = h + layer(h, ...)</code></strong> 不只是防梯度消失，还直接缓解过平滑：即使消息层趋向均匀，原始特征仍沿残差保留。池化用 <code>bincount</code> 求每图节点数再除，是为了在"机器人数量可变"时池化结果仍可比（否则 8 台的队伍全局向量会天然比 4 台的大）。最后只把执行器节点 <code>self_node</code> 的表示与全局向量拼接输出动作，实验里这比"所有节点输出动作再取平均"收敛快约 20%，因为无关连杆不再参与动作回归。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>每步重建拓扑</strong>：把 <code>edge_index</code> 放进 <code>step()</code> 里用 Python 循环重建。症状是训练吞吐骤降（单环境从 2000 步/秒掉到 200）。修复：拓扑加载时算一次缓存；动态通信图每 4 步更新一次。</li>
+      <li><strong>聚合用了拼接或加权和</strong>：把邻居消息按编号拼接，破坏置换不变性。症状是训练能过、换机器人起始编号就崩。修复：强制使用求和/均值/最大等置换不变算子，并用"随机打乱输入顺序、输出应逐位不变"写单元测试。</li>
+      <li><strong>批索引与节点编号混用</strong>：<code>index_add_</code> 的目标索引必须是<strong>图内局部编号</strong>，批量拼接时要整体偏移或统一用全局编号，混用会把消息加到别的环境头上。症状是性能随并行环境数变化。修复：构造数据时统一约定一套全局编号，写测试验证"拆批单独推理 == 合批推理"。</li>
+      <li><strong>特征量纲失控</strong>：相对位置用米、速度用米/秒，直接拼接后量纲差异达 10 倍，第一层线性层被大数主导。症状是策略只对位置敏感、对速度钝感。修复：逐特征归一化到 ±1，或用层归一化并记录每维统计。</li>
+      <li><strong>层数一味加深</strong>：加到 6–8 层追求"更强的全局推理"，结果过平滑、性能不升反降。症状是节点表示间余弦相似度趋近 1。修复：回到 2–3 层 + 残差 + 虚拟主节点（全局向量广播）方案。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>写一个单元测试：随机打乱节点编号与边顺序，验证网络输出逐位不变。解释哪些改动会破坏这个性质。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>注意输入重排后输出也要对应重排；对每个节点的输出做比较，不要只比较池化后的全局向量。</div></details>
+      </li>
+      <li>把关节图的边特征从"关节角正余弦"改为"关节角原始值"，预测并验证性能变化，解释量纲与周期性的影响。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>关节角在 ±180° 附近跳变，原始值在边界不连续；正余弦编码把环面展成连续二维特征。</div></details>
+      </li>
+      <li>把通信图的更新频率从每步改为每 4 步，测量训练吞吐与最终回报的变化，并给出你的推荐值。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>移动机器人 60 Hz 下 4 步约 67 ms，编队拓扑变化远慢于此；吞吐收益主要来自 Python 侧图重建减少。</div></details>
+      </li>
+      <li>设计一个实验：4 台机器人训练的策略直接部署到 6 台机器人场景（复制两台、坐标对称摆放），观察零样本性能，分析失败模式属于"分布外"还是"瓶颈结构"。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>置换不变性保证节点身份无关，但不保证密度分布无关：6 台更拥挤，边密度更高，聚合尺度变化，先试池化归一化版本。</div></details>
+      </li>
+      <li>把全局池化均值换成最大池化，在"队形保持"任务上对比性能，解释两种聚合各自捕捉什么信息。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>均值反映"平均队形偏差"，最大反映"最远的那个离群者"，安全类任务通常更在意后者。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>消息传递 = 邻域检索 + 置换不变聚合 + 节点更新；φ 生成消息、□ 聚合、ψ 更新，θ 全局共享。</li>
+      <li>机器人里三种图：关节链、机器人通信图、物体交互图；特征尽量用<strong>相对量与周期编码</strong>，换来平移等变与数值稳定。</li>
+      <li>置换不变性由聚合函数（求和/均值/最大）保证，别让编号信息混进特征；这是"4 台训、8 台用"的根基。</li>
+      <li>工程上：拓扑缓存、特征张量化、<code>index_add_</code> 聚合、2–3 层 + 残差防过平滑。</li>
+      <li>下一章把两章的信息流合流：Transformer 的编码器负责单模态内部，GNN 负责实体间关系，再往上拼一层多模态融合，图像、本体感知、力反馈各走各的编码器，最后在特征层对齐。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch062.html">← 第 062 章：实现Transformer策略</a>
+    <a class="next" href="ch064.html">第 064 章：实现多模态融合 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第010章 多模态输入融合模块实现 | 具身智能学习课程 · VLA 与世界模型联合训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · 基础框架与联合训练</span>
+    <span class="sep">/</span>
+    <span>第 010 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · 基础框架与联合训练</div>
+    <h1>第 010 章：多模态输入融合模块实现</h1>
+    <p class="lead">本章实现视觉、语言、本体感知三路输入的融合模块：模态嵌入与顺序约定、以语言为条件的交叉注意力、模态丢弃正则，以及融合深度与计算成本的配平。</p>
+    <ul class="meta">
+      <li>主题：模型结构 / 多模态融合</li>
+      <li>关键公式：F = CrossAttn(Q=视觉, K=V=语言) ⊕ 本体感知</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 009 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解早融合、交叉注意力融合、晚融合三类结构的差异与适用边界。</li>
+      <li>掌握模态嵌入（Modality Embedding）与位置嵌入的职责划分及 token 顺序约定。</li>
+      <li>会实现视觉查询语言的交叉注意力融合块，并正确处理注意力掩码。</li>
+      <li>掌握模态丢弃（Modality Dropout）正则的实现与缩放细节。</li>
+      <li>能给融合深度与计算成本做量化配平，并诊断掩码、嵌入、长度失衡类问题。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>001 章的骨架用简单拼接完成三模态合并，009 章指出不同层级的梯度分布差异显著。<strong>融合模块要回答一个结构问题：让三路模态以什么方式交换信息，才能既保留各自的局部表征，又建立任务需要的跨模态依赖。</strong>拼接只提供浅层共现，注意力能建立条件依赖，两者的容量与成本都不同。</p>
+    <p>VLA 场景的语言与视觉关系具有方向性：语言指令是条件，视觉是内容，动作是答案。这种方向性支持不对称融合，视觉 token 作为查询去读取语言 token，再由动作头读取融合结果。对称的全连接注意力也能工作，但计算成本更高且引入不必要的反向依赖。</p>
+    <p>本章位于结构实现链路的第二站：001 章给骨架、本章给融合、012 章给语言编码器的深入实现。世界模型侧与策略侧共用同一融合模块，两路损失的梯度在此交汇，009 章的诊断工具在本章结构上直接可用。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 三类融合结构与适用边界</h3>
+    <p><strong>早融合</strong>把三模态 token 直接拼接送入同一主干，成本最低，跨模态交互由主干的自注意力隐式完成；<strong>交叉注意力融合</strong>保留两路独立编码，在中间层用注意力建立条件依赖；<strong>晚融合</strong>各模态独立编码到高层后再合并，交互最少，适合模态间弱相关的任务。<strong>VLA 的常规选择是中层的交叉注意力融合</strong>：既让视觉在进入动作头前完成语言条件化，又不必在底层混合统计差异极大的模态。三类结构的对照如下。</p>
+    <table>
+      <tr><th>结构</th><th>交互时机</th><th>计算成本</th><th>适用</th></tr>
+      <tr><td>早融合</td><td>编码入口</td><td>低</td><td>模态弱异构、延迟敏感</td></tr>
+      <tr><td>交叉注意力</td><td>中间层</td><td>中（随两路长度乘积增长）</td><td>存在明确条件方向的多模态任务</td></tr>
+      <tr><td>晚融合</td><td>高层输出</td><td>低</td><td>模态独立、决策级聚合</td></tr>
+    </table>
+
+    <h3>2. 模态嵌入与 token 顺序</h3>
+    <p>三路 token 共享同一主干时，网络需要两套坐标信息：位置嵌入标识 token 在自身模态内的空间或序列位置，模态嵌入标识 token 属于哪一路。两者职责分离，<strong>用同一张嵌入表兼任会导致“第 5 个视觉 token”与“第 5 个语言 token”无法区分</strong>。token 排列约定为视觉、本体感知、语言，顺序固定后所有下游模块的切片索引一致，避免跨章对齐混乱。</p>
+    <p>token 预算由分块尺寸直接决定，每帧数量为 (H/p)×(W/p)：224 分辨率配 16 分块得到 14×14 = 196 个 token，两帧共 392 个，加本体单 token 后查询总长 393；语言侧上限 48 决定键值长度。视觉与语言的 token 数相差约一个数量级，注意力分数矩阵为 393×48 ≈ 1.9×10<sup>4</sup> 个元素，规模很小。条件方向的选择依据在语义层面：视觉需要携带语言条件进入动作头，查询侧取视觉与下游消费方式一致；两种方向的矩阵规模相同，成本不构成区分理由。分块从 16 改到 14 时每帧 token 变为 16×16 = 256，查询长度增大 31%，融合栈各项成本按同一比例上升，这是分辨率不变时最灵敏的调节旋钮。分辨率换成 256 并保持 16 分块时同样得到 256 token/帧，两帧查询长度增至 513，效果一致。</p>
+
+    <h3>3. 交叉注意力融合块</h3>
+    <p>融合块以视觉与本体的拼接序列为查询，语言序列为键与值：</p>
+    <div class="formula">
+      F = LayerNorm(Q + CrossAttn(Q, K, V)),  Q = [视觉; 本体]，K = V = 语言
+      <span class="note">残差加归一化与主干约定一致；注意力掩码屏蔽语言侧的补齐 token</span>
+    </div>
+    <p>计算成本为 O(L<sub>q</sub>·L<sub>k</sub>·d)，视觉 token 通常上千（14×14 分块），语言只有几十，乘积在可接受范围。融合深度取 2–4 块：<strong>一层注意力即可建立全局条件，多层用于迭代细化，但收益随层数迅速衰减</strong>，而每层都要重复两路 token 的投影开销。视觉长度远大于语言时，键值投影可在块间缓存复用。把单块的乘加次数完整记账，成本结构才可配平：取 d=512、语言 48 token、视觉两帧共 392 token，前馈隐层为 4 倍宽，分解如下表。</p>
+    <table>
+      <tr><th>成本项</th><th>乘加次数</th><th>占比</th></tr>
+      <tr><td>查询投影</td><td>约 1.0×10<sup>8</sup></td><td>10.6%</td></tr>
+      <tr><td>键值投影（K 与 V 各一次）</td><td>约 2.5×10<sup>7</sup></td><td>2.6%</td></tr>
+      <tr><td>注意力矩阵（QK 与 AV 各一次）</td><td>约 1.9×10<sup>7</sup></td><td>2.0%</td></tr>
+      <tr><td>前馈网络（升维与降维）</td><td>约 8.2×10<sup>8</sup></td><td>84.8%</td></tr>
+      <tr><td>单块合计</td><td>约 9.7×10<sup>8</sup></td><td>100%</td></tr>
+    </table>
+    <p>参数量口径同样清楚：单块含注意力四组投影 4d<sup>2</sup> 与前馈两层 8d<sup>2</sup>，合计 12d<sup>2</sup>；d=512 时单块约 3.1×10<sup>6</sup> 参数，两块栈约 6.3×10<sup>6</sup>，相对主干是小数，融合的能力瓶颈更多取决于深度与训练配比，参数容量不构成限制。</p>
+    <p>两个可以立即使用的结论：其一，语言键值投影占单块约 2.6%，两块配置下跨块缓存节省总成本的 1.3%，块数增加时收益按块数线性累积，因此缓存接口在深融合栈中才有明显回报；其二，块内第一大头是前馈网络，占约 85%，视觉从两帧加到四帧时查询长度翻倍，单块成本从约 9.7×10<sup>8</sup> 升到约 1.9×10<sup>9</sup>，各成分同步增长。<strong>加深融合块的边际成本主要落在前馈网络上，压缩视觉帧数或加大分块同样主要削减前馈成本，注意力矩阵始终是小项。</strong></p>
+    <p>交叉注意力相对全序列自注意力的节省也可以算出来：三路拼接后单层自注意力序列长 393+48=441，投影、矩阵与前馈合计约 1.47×10<sup>9</sup> 乘加，而交叉注意力单块约 0.97×10<sup>9</sup>，节省 34%。节省来自两处：查询侧不再为 48 个语言 token 计算查询共享的注意力行，前馈也只作用于 392 个查询 token（全序列为 441 个）。方向性融合同时降低计算与语义冗余，这是 VLA 常规选择不对称结构的另一层依据。</p>
+
+    <h3>4. 模态丢弃正则</h3>
+    <p>训练期以概率 p 随机丢弃某一路模态的输入（置零或替换为可学习的空模态嵌入），迫使网络在缺少单模态时仍能决策。<strong>损失需要按保留概率缩放：保留概率越低，保留样本的损失权重越高，训练与推理的期望一致</strong>，与丢弃法的经典推导相同。丢弃的粒度按 batch 还是按样本需要区分：按样本丢弃提高个体鲁棒性，按批次丢弃代价更低但对个体样本的鲁棒性训练不足，VLA 场景通常取按样本。</p>
+    <p>缩放的期望一致性两行即可推出：丢弃掩码独立同分布，保留概率为 keep，样本在保留时按 L/keep 计入、丢弃时计入 0，期望为 keep·(L/keep) = L，与不丢弃时相等。数值上 keep=0.9 时缩放因子为 1.111；若遗漏缩放，激活期望只有原值的 90%，幅度被系统性压低 10%，等价于每一步额外施加一次向零的收缩，长时间训练会把输出推向欠激活。校验手段固定成一条：同一批输入分别在开启与关闭丢弃两种模式下前向，比较激活均值，两者应在统计误差内一致，不一致即缩放实现有误。</p>
+    <p>丢弃概率区间的依据来自组合概率：语言与本体两路按 p=0.1 独立丢弃时，单个样本两路齐全的概率为 0.9<sup>2</sup>=0.81，至少缺一路的样本约占 19%；p 提到 0.4 时齐全概率降到 0.36，多数样本处于缺失状态，监督信号的结构被改写，收敛明显变慢。这就是默认区间取 0.05 到 0.15 的量化理由。运行期监控每个批次的模态缺失样本占比，与设定概率对照，偏差超过两个百分点说明采样实现有问题。</p>
+
+    <h3>5. 融合深度与成本配平</h3>
+    <p>融合相关成本由三项构成：两路 token 的键值投影、注意力矩阵、融合块的前馈网络。交叉注意力的矩阵为查询与键值长度之积，键值侧固定 48 时随视觉长度线性增长；只有改成全序列自注意力后，该项才随长度平方增长并成为瓶颈。配平策略按优先级排列：<strong>先用步长更大的视觉分块降低 token 数，再调融合深度，最后才考虑降低分辨率</strong>。世界模型侧的观察窗口（k 帧）会让视觉 token 数倍增，可行性检查必须先于结构选型。</p>
+    <p>适用边界与失效模式有两条必须提前写明。其一，语言条件是必要条件：训练数据若全部带指令，部署时遇到无指令或短指令场景，语言路径退化为空嵌入，动作分布随即漂移；缓解手段是在训练集中混入固定比例的空指令样本，让空嵌入成为“见过”的状态，这与模态丢弃的空嵌入机制共用同一套参数。其二，两路模态的统计差异过大时，融合块前的归一化承担对齐全责：视觉特征方差远大于本体单 token 是常态，独立归一化把两侧拉回可比尺度；若省略归一化直接做注意力，点积被大方差一侧主导，等效于丢弃另一侧的信息，诊断特征是注意力权重长期集中在单一路模态上。</p>
+    <p>掩码缺失的代价同样可以量化。语言批内按 48 上限补齐，某样本实际 30 个有效 token、18 个补齐位，若注意力权重在键值上近似均匀，单个查询在补齐位上的权重质量约为 18/48 = 37.5%，即超过三分之一的注意力被浪费；softmax 的尺度还会放大概率数值的补齐位置，实际浪费常高于该比例。修复即一行掩码，成本远低于重新训练，因此掩码参数应作为接口的必填项，由调用方显式传入。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>模块组织：三路独立前端输出同维 token，加模态与位置嵌入，拼接后过若干交叉注意力融合块，输出统一 memory 供策略头与世界模型头消费。掩码与模态丢弃作为可选项注入；缓存的键值投影用于跨块复用。</p>
+    <h3>关键参数起点</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>d<sub>model</sub></td><td>512</td><td>统一嵌入维度</td><td>与全课程主干一致</td></tr>
+      <tr><td>融合块数</td><td>2</td><td>跨模态细化深度</td><td>收益随层数衰减，2 层覆盖多数场景</td></tr>
+      <tr><td>注意力头数</td><td>8</td><td>并行子空间数</td><td>d<sub>model</sub>/64 的常规配置</td></tr>
+      <tr><td>模态丢弃概率</td><td>0.1（按样本）</td><td>单模态鲁棒性</td><td>过高会拖慢收敛，0.05–0.15 区间</td></tr>
+      <tr><td>语言 token 上限</td><td>48</td><td>键值长度控制</td><td>与 002 章截断约定一致</td></tr>
+      <tr><td>视觉分块</td><td>16×16</td><td>token 数控制</td><td>224 输入下 196 个 token/帧</td></tr>
+      <tr><td>键值缓存</td><td>开启</td><td>跨块复用投影</td><td>语言侧投影只算一次</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：模态丢弃不作用于世界模型路径</span>
+      <p>世界模型的监督目标需要完整的观测历史，丢弃视觉会破坏预测任务的输入完整性。丢弃正则只作用于策略路径的语言与本体感知，视觉的丢弃通过独立的数据增强（002 章）处理。若需要检验世界模型对缺失观测的鲁棒性，使用专门的遮挡训练，通用丢弃开关不承担这项职责。</p>
+    </div>
+    <p>衔接与差异：001 章的拼接融合升级为交叉注意力；009 章的干涉诊断用于检查融合层是否被某一路主导；012 章把语言前端替换为更强的编码器后，本模块接口不变。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>片段以多模态 Transformer 与 VLA 实现的公开设计为参照，接口随版本演进。第 1 段给出交叉注意力融合块。</p>
+
+    <p><strong>片段 1：交叉注意力融合块</strong></p>
+    <pre class="code"><code>import torch
+import torch.nn as nn
+
+class CrossFusionBlock(nn.Module):
+    """以视觉与本体为查询、语言为键值的融合块；视觉在此完成语言条件化。"""
+    def __init__(self, d_model=512, nhead=8, ffn_ratio=4):
+        super().__init__()
+        self.norm_q = nn.LayerNorm(d_model)          # 查询侧与键值侧分离归一化
+        self.norm_kv = nn.LayerNorm(d_model)
+        self.cross = nn.MultiheadAttention(d_model, nhead, batch_first=True)
+        self.ffn = nn.Sequential(nn.Linear(d_model, ffn_ratio * d_model),
+                                 nn.GELU(),
+                                 nn.Linear(ffn_ratio * d_model, d_model))
+        self.norm_ffn = nn.LayerNorm(d_model)
+
+    def forward(self, q, kv, kv_padding_mask=None):
+        # q (B, Lq, d)：视觉与本体拼接；kv (B, Lk, d)：语言
+        # 预归一化：注意力前先归一化，深层网络的梯度尺度更稳定
+        a, _ = self.cross(self.norm_q(q), self.norm_kv(kv), self.norm_kv(kv),
+                          key_padding_mask=kv_padding_mask, need_weights=False)
+        q = q + a                                    # 残差：保底保留原始视觉信息
+        return q + self.ffn(self.norm_ffn(q))        # 前馈细化再做一次残差</code></pre>
+    <p>解读：<strong>（1）</strong>查询与键值使用独立的归一化层，两路模态的统计差异在归一化后对齐，避免共用归一化互相牵制。<strong>（2）</strong>key_padding_mask 屏蔽语言补齐位置，缺少掩码时注意力会分配给补齐 token，表现为长指令尾部信息异常影响动作。<strong>（3）</strong>残差保证融合退化时保留原始特征：删除交叉注意力即退化为拼接主干。</p>
+
+    <p><strong>片段 2：模态丢弃与嵌入组装</strong></p>
+    <pre class="code"><code>def modality_dropout(tokens, keep_prob=0.9, null_embed=None):
+    """按样本丢弃一路模态；用可学习的空嵌入替换以保留对齐的位置。"""
+    if null_embed is None or keep_prob &gt;= 1.0:
+        return tokens
+    B = tokens.shape[0]
+    # 每样本独立采样：按 batch 丢弃会让整批都缺同一模态，个体鲁棒性不足
+    keep = torch.rand(B, 1, 1, device=tokens.device) &lt; keep_prob
+    # 替换为空嵌入：置零会与真实 token 的分布产生系统性偏差
+    out = torch.where(keep, tokens, null_embed.expand_as(tokens))
+    # 按保留概率缩放：补偿丢弃带来的期望偏移，与丢弃法原理一致
+    return out / keep_prob
+
+def add_modality_embedding(vis, prop, txt, modality_embed, pos_embed):
+    """加模态与位置两类嵌入：前者标识来源，后者标识模态内位置。"""
+    # 切片顺序固定：视觉在前、本体居中、语言在后，全课程保持同一约定
+    vis = vis + modality_embed[0] + pos_embed[0][:, :vis.shape[1]]
+    prop = prop + modality_embed[1]              # 本体单 token，无需位置嵌入
+    txt = txt + modality_embed[2] + pos_embed[2][:, :txt.shape[1]]
+    return torch.cat([vis, prop, txt], dim=1)</code></pre>
+    <p>解读：<strong>（1）</strong>空嵌入是可学习参数，让“缺失模态”成为网络见过的第三种状态，比置零更稳定。<strong>（2）</strong>缩放与丢弃法推导一致；遗漏缩放会让训练与推理的激活期望不一致，输出幅度偏移。<strong>（3）</strong>模态嵌入与位置嵌入分离，视觉跨帧的 token 数变化时只需调整位置嵌入的切片范围，模态语义不受影响。</p>
+
+    <p><strong>片段 3：融合栈组装与键值缓存</strong></p>
+    <pre class="code"><code>class FusionStack(nn.Module):
+    """融合栈：语言键值投影缓存一次，供多个融合块复用减少重复计算。"""
+    def __init__(self, d_model=512, blocks=2):
+        super().__init__()
+        self.blocks = nn.ModuleList(
+            [CrossFusionBlock(d_model) for _ in range(blocks)])
+
+    def forward(self, q, kv, kv_padding_mask=None):
+        # 键值投影由各块的注意力内部完成；若需跨块缓存，可抽出投影层统一计算
+        for block in self.blocks:
+            q = block(q, kv, kv_padding_mask)
+        return q
+
+def fuse_and_pool(fusion, vis, prop, txt, txt_mask=None):
+    """融合后池化出场景摘要：供策略头与世界模型头共享的 memory 表示。"""
+    # 查询序列为视觉与本体，语言经掩码传入，保证条件方向正确
+    q = torch.cat([vis, prop], dim=1)
+    kv_mask = ~txt_mask.bool() if txt_mask is not None else None
+    q = fusion(q, txt, kv_mask)
+    # 池化用均值代表场景；动作头最终通过交叉注意力再读取全部 token（004 章）
+    return q.mean(dim=1), q</code></pre>
+    <p>解读：<strong>（1）</strong>缓存策略在注释中给出扩展方向：把键值投影抽到栈外计算一次，块数增加时收益线性增长；两块的默认配置下收益有限，保持实现简洁。<strong>（2）</strong>注意力掩码习惯与环境一致：传入的 txt_mask 为真表示有效 token，内部取反后符合 PyTorch 的 key_padding_mask 约定，<strong>这一取反是最常见的掩码方向错误来源</strong>，在接口处注明可降低出错率。<strong>（3）</strong>返回摘要与全序列两个视图，融合只执行一次。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>掩码方向写反</strong>：把有效位置当成补齐屏蔽，模型只看见补齐符号，损失居高不下。修复：接口层统一“真表示有效”的约定，并加一组小张量单元测试。</li>
+      <li><strong>模态嵌入缺失</strong>：三路 token 直接拼接，主干无法分辨来源，早期训练出现模态间串扰。修复：加入独立模态嵌入，并在可视化中检查同层不同模态的表示分布。</li>
+      <li><strong>丢弃缩放遗漏</strong>：模态丢弃后未按保留概率缩放，训练与推理期望不一致。修复：丢弃函数返回前统一缩放，并对开启与关闭丢弃两种模式的激活均值做对比断言。</li>
+      <li><strong>视觉长度失控</strong>：多帧窗口使视觉 token 数倍增，注意力矩阵平方增长拖垮吞吐。修复：加大分块步长或减少历史帧数，先压 token 数再谈融合深度。</li>
+      <li><strong>在世界模型路径启用通用丢弃</strong>：预测监督的输入被随机残缺，预测误差虚高。修复：丢弃只作用于策略条件路径，世界模型用专门的遮挡增强。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>视觉 196 token（每帧）、历史 2 帧、语言 48 token，计算查询与键值长度为卷积注意力的矩阵规模，并说明缓存哪个投影收益最大。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>查询约 392，键值 48，矩阵很小；成本主体在投影与前馈网络，缓存语言侧键值投影收益最大。</div></details>
+      </li>
+      <li>把模态丢弃概率从 0.1 提到 0.4，预测单模态鲁棒性与收敛速度的变化，给出观测指标。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>鲁棒性升但训练信号变稀、收敛变慢甚至欠拟合；用单模态消融成功率与损失曲线联合判断。</div></details>
+      </li>
+      <li>推导：说明按保留概率缩放的期望一致性来源，并解释按样本丢弃与按批次丢弃在梯度估计上的差异。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>缩放后保留样本的期望等于原分布的期望；按样本丢弃的梯度估计方差更大但覆盖更全，按批次丢弃等价于降低该模态的整体学习率。</div></details>
+      </li>
+      <li>设计融合结构的消融实验：拼接、一层交叉、两层交叉、四层交叉，给出参数量、吞吐与任务指标三维对比表的设计。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>参数量随块数近线性增长，吞吐下降；任务指标预期两层后收益饱和，按三类指标交叉点选型。</div></details>
+      </li>
+      <li>构造实验：在语言补齐掩码写反的情况下训练 1000 步，记录动作损失曲线与注意力可视化，解释异常的典型形态。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>损失初始偏高且下降缓慢；注意力热图上有效语言位置权重被摊薄，补齐位置获得异常权重。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>三类融合结构中，VLA 常规选择中层的交叉注意力，条件方向为视觉查询语言。</li>
+      <li>模态嵌入与位置嵌入职责分离，token 顺序约定为视觉、本体、语言。</li>
+      <li>融合块三件套：独立归一化、掩码、残差；预归一化对深层梯度更友好。</li>
+      <li>模态丢弃按样本执行并缩放，空嵌入替代置零，且不作用于世界模型路径。</li>
+      <li>成本瓶颈在注意力矩阵与视觉 token 数，<strong>先压 token 数再加深融合</strong>。</li>
+      <li>下一章进入动作条件视频预测：世界模型如何按动作推演整段画面。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch009.html">← 第 009 章：联合训练中的梯度流分析</a>
+    <a class="next" href="ch011.html">第 011 章：世界模型中的动作条件视频预测 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

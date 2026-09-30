@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第046章 集中式路径规划 | 多机器人协同学习课程 · ROS2 通信与系统集成</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第三篇 · 协同控制与任务协同</span>
+    <span class="sep">/</span>
+    <span>第 046 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第三篇 · 协同控制与任务协同</div>
+    <h1>第 046 章：集中式路径规划</h1>
+    <p class="lead">一个"大脑"持有全局地图与全队状态，统一求解无冲突路径：讲透联合配置空间的爆炸、CBS 的两层架构、以及中心化方案必须支付的通信与单点故障账单。</p>
+    <ul class="meta">
+      <li>主题：协同规划 / 集中式架构</li>
+      <li>关键机制：联合配置空间、CBS 冲突树、滚动窗口重规划、计划版本号</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 045 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解集中式规划的定义与边界：中央节点需要哪些输入、产出什么、刷新频率如何。</li>
+      <li>会用数量级估算说明"联合配置空间不可直接搜索"，并解释 CBS 为什么能把问题拆回可解规模。</li>
+      <li>掌握 CBS 的两层结构：低层单机时空 A*、高层冲突树与约束分裂，理解其最优性与最坏复杂度。</li>
+      <li>能设计滚动窗口重规划流程，包括窗口长度、重规划周期、计划版本号与衔接方式。</li>
+      <li>能判断什么时候该用集中式、什么时候必须转向分布式，并给出量化标准。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>045 章及其之前的所有控制都在"局部"：跟队、避障、过门，每台机器人只依赖邻居与环境的一块信息。但有一类冲突局部永远看不见：两台机器人各自绕开对方继续走，五分钟后又在下一个路口相遇；仓储里四台车在环形通道里互相让行，形成局部解不开的僵局。要彻底消除这类问题，需要有人掌握全局，这就是集中式路径规划。</p>
+    <p>集中式是 046–049 四章"规划与调度"组的第一章：本章讲"一个大脑统一求解"的做法、能力与代价；047 章讲没有大脑时怎么办；048 章讲有多个平等大脑如何协商；049 章讲规划出来的路径在跟踪阶段如何消解残余冲突。先学"理想方案"，后面的取舍才有参照系。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 问题定义与联合配置空间的威压</h3>
+    <p>集中式规划的标准输入有四件：全局栅格地图（含障碍）、每台机器人的当前位姿与目标、机器人几何（半径/足迹）、时间预算；输出是每台机器人的一条带时间戳的无冲突路径。最"正统"的解法是把 N 台机器人看成一个联合系统，在联合配置空间里搜索，但这个空间的规模是致命的：</p>
+    <div class="formula">
+      联合空间规模 ≈ |G|<sup>N</sup>
+      <span class="note">20 m × 20 m、分辨率 0.1 m 的地图约 4×10<sup>4</sup> 个格子；N = 4 时约 2.6×10<sup>18</sup> 个联合状态</span>
+    </div>
+    <p>即使按每秒 10<sup>12</sup> 个状态的处理速度估计，算完也要约 2.6×10<sup>6</sup> 秒（一个月量级）；若再把时间维按 0.5 s 一格、10 s 窗口展开（20 格），数字还要再乘 20。结论很硬：<strong>联合配置空间只能用来写论文证明存在性，不能用来写工程</strong>。任何能在秒级出解的集中式方法，本质都是"把联合搜索拆成单机搜索 + 冲突协调"，CBS 是其中最干净的一种。</p>
+
+    <h3>2. CBS：低层单机、高层冲突树</h3>
+    <p>冲突基搜索（Conflict-Based Search, CBS）把问题分成两层：</p>
+    <ul>
+      <li><strong>低层</strong>：为每台机器人单独做时空 A*，暂时无视其他机器人，搜索空间退回单机规模。</li>
+      <li><strong>高层</strong>：检查所有路径对之间的冲突。冲突有两种：<strong>顶点冲突</strong>（两台机器人同一时刻在同一格）与<strong>边冲突</strong>（同一时间窗内交换位置，实际中对撞穿过）。发现一个冲突 (a, b, t, cell) 后分裂出两个高层节点：给 a 加约束"t 时刻不得进入 cell"，或给 b 加同样的约束；两条分支各重跑一台机器人的低层搜索。</li>
+    </ul>
+    <p>在最小代价（总路径长度或总时间）意义下，CBS 保证找到<strong>最优无冲突解</strong>，且只要每个单机问题可解就是完备的；最坏复杂度仍是指数，但结构化地图上（走廊、仓库）通常几十到几百个高层节点内收敛。它还有一个工程友好的性质：约束是"局部的时空禁令"，天然可以做成数据结构共享与增量重算，一台机器人改路径，只需要给受其影响的路径对重新查冲突，不必全量重建。</p>
+
+    <h3>3. 滚动窗口：让"离线最优"变成"在线可用"</h3>
+    <p>全局一次性规划在实际系统里不可行：地图会变、任务会更新、机器人会迟到。工程做法是<strong>滚动时域（receding horizon）</strong>：每次只规划未来 T<sub>h</sub> 秒（典型 10 s）的窗口，每 T<sub>r</sub> 秒（典型 2 s）或在事件触发时重算一次。窗口外不负责，窗口内保证无冲突。三个衔接细节必须处理：</p>
+    <ul>
+      <li><strong>起点对齐</strong>：重规划时机器人的"起点"是未来一小段应到达的位置（约 0.5 s 后），避免每条新计划都从"此刻位置"出发导致轨迹打折。</li>
+      <li><strong>执行中的平滑过渡</strong>：新计划的前 0.5 s 与旧计划做时间对齐拼接，不让速度出现台阶。</li>
+      <li><strong>计划版本号</strong>：中央每轮发布自增版本，执行端只接受更高版本，杜绝乱序旧包把新计划覆盖。</li>
+    </ul>
+
+    <h3>4. 通信与计算账单</h3>
+    <p>集中式最容易被低估的是"账单"。输入侧：全局地图同步（0.05 m 分辨率、100 m × 100 m 时约 4 MB 的原始栅格，必须用增量/压缩传输）、每台机器人状态（50 Hz 位姿汇聚到中央）、任务更新；输出侧：每轮计划下发。计划本身很便宜，一条 10 s 窗口、0.5 s 采样、20 个路径点的计划约 20 × 16 字节 = 320 字节，N = 10 台每 2 s 一轮，总速率不到 2 kB/s。真正贵的是地图与状态的持续汇聚，以及中央节点的计算占用：N = 10、每轮百级高层节点时，中央需要几百毫秒级的求解时间，这就是为什么窗口要小、机器人数量要控制。</p>
+    <div class="formula">
+      经验边界：单中央节点稳定覆盖 N ≤ 10–15（结构化地图、窗口 10 s）
+      <span class="note">超过后建议分组分域（每域一个中央）或切换到分布式/协商式方案</span>
+    </div>
+
+    <h3>5. 集中式的"汇率"：拿什么换什么</h3>
+    <p>用一句话总结这笔交易：<strong>用计算集中、通信汇聚与单点脆弱，换全局最优、无死锁保证、可验证的无冲突</strong>。当你的场景是"空间紧张、路径交织密集、事故代价高、场地有稳定基础设施"的仓储或产线时，这个汇率是划算的；当场景是"开阔、通信间歇、机器人数多"的野外任务时，汇率会瞬间反转，这正是下一章存在的理由。中央节点还必须配一条降级路径：执行端持续监测中央心跳，2 s 内无新计划就切换到本地规划（048 章的协商式或 047 章的分布式），把"单点故障"变成"性能降级"。</p>
+
+    <h3>6. 数值算例：规模、内存、带宽三本账</h3>
+    <p>用本章参数把三笔开销算到一起，每一笔都取中间档位，选型时不必凭感觉。<strong>规模账</strong>：20 m × 20 m、0.1 m 分辨率的栅格约 4×10<sup>4</sup> 个格子，4 台机器人的联合配置空间是 (4×10<sup>4</sup>)<sup>4</sup> ≈ 2.6×10<sup>18</sup> 个状态；即便按每秒 10<sup>12</sup> 个状态的处理器速度，也要约 2.6×10<sup>6</sup> 秒（一个月量级）；把时间维按 0.5 s 一格、10 s 窗口展开（20 格）后还要再乘 20，约一年半。数字的用途是给出"必须拆问题"的定量理由：CBS 低层把搜索压回单机规模，4×10<sup>4</sup> 格乘 20 个时间片也只有 8×10<sup>5</sup> 个状态的量级，比联合空间小 12 个数量级以上。</p>
+    <p><strong>内存账</strong>：CBS 每个高层节点保存全队路径集，10 台 × 20 点 × 3 个 8 字节数值 = 4.8 kB，加父指针与约束集按 6 kB 估，2000 节点的预算约 12 MB，机载计算单元完全可以容纳；若窗口放大到 30 s（60 点），内存与求解时间同步乘 3，这是窗口不能随意加大的原因之一。</p>
+    <p><strong>带宽账</strong>：计划消息 20 点 × 16 字节 = 320 B/条，10 台机器人每 2 s 一轮，出向流量约 1.6 kB/s；入向状态汇聚 10 台 × 20 Hz × 50 B = 10 kB/s；地图增量按 5 kB/s 量级。三者合计约 17 kB/s，普通 WiFi 余量充足。真正吃紧的是时间预算：单轮求解 500 ms、周期 2 s，占用率 25%，中央节点还有四分之三的时间留给别的模块；若求解时间翻倍到 1 s，占用率到 50%，任何一次内存回收抖动或系统升级都会让节拍失稳，必须先把预算降下来再上线。</p>
+    <p>每节点预算也值得单独算：500 ms ÷ 2000 节点 = 0.25 ms/节点，而一次低层时空 A*（8×10<sup>5</sup> 状态量级）的耗时是毫秒级，真实收敛用到的节点数往往远小于预算上限；预算触顶更多出现在病态场景（窄道密布、大量对头）。把"本轮用了多少节点、是否触顶"做成指标上报，比事后在日志里找"为什么慢了"高效得多。</p>
+    <p>代价函数的影响同样可以量化：把"等待 0.5 s"的代价从 0 调到 1.0 当量（相当于 2 格位移）后，同一张地图上 CBS 会明显偏向绕行解，总完成时间可能上升 10–15% 但单机等待分布变均匀。代价函数是集中式方案里最"软"的参数，改它之前先明确优化目标（总时间、最大延误还是公平性），不同的目标本身就对应不同的最优解，没有条件谈"最优"就是空谈。把优化目标写进部署文档并在验收里复测，是集中式规划走向可维护的最后一步。</p>
+    <p>集中式内部三档做法的对照，选型时可以按这张表对号入座：</p>
+    <table>
+      <tr><th>方法</th><th>搜索空间</th><th>最优性</th><th>完备性</th><th>适用规模</th></tr>
+      <tr><td>联合空间搜索</td><td>|G|<sup>N</sup>（指数爆炸）</td><td>最优</td><td>完备</td><td>仅 N ≤ 2–3</td></tr>
+      <tr><td>优先级规划</td><td>N 次单机搜索</td><td>顺序相关、次优</td><td>不完备</td><td>大，但解质量波动</td></tr>
+      <tr><td>CBS</td><td>单机搜索 + 冲突树</td><td>给定代价下最优</td><td>单机可解时完备</td><td>N ≤ 10–15</td></tr>
+    </table>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <ol>
+      <li><strong>节点划分</strong>：一个 <code>central_planner</code> 节点（可与某台机器人的机上计算共享），负责状态汇聚、冲突求解与计划下发；每台机器人一个 <code>plan_executor</code>，负责接收计划、本地插值与执行（执行层细节见 049 章）。</li>
+      <li><strong>状态汇聚</strong>：每台机器人 20 Hz 发布 <code>/fleet/state/robotN</code>（位姿 + 速度 + 是否在线），中央以 10 Hz 汇总为内部快照。丢失状态超过 0.5 s 的机器人从本轮规划中剔除（并通知其他人）。</li>
+      <li><strong>地图</strong>：中央维护一份 <code>OccupancyGrid</code>（0.05 m 分辨率）；机器人侧只上报局部更新（增量栅格或压缩位图），避免全图风暴。</li>
+      <li><strong>求解</strong>：CBS，时间分辨率 0.5 s、窗口 10 s、最大高层节点 2000（预算用尽则输出"当前最好无冲突解"或降级为速度协调）。</li>
+      <li><strong>下发</strong>：自定义 <code>PlanMsg</code>（<code>robot_id</code>、<code>version</code>、<code>poses[]</code> 含时间戳），Reliable、Volatile；执行端拒绝低版本、拒绝"起点离自己当前位置超过 1 m"的计划。</li>
+      <li><strong>验收</strong>：10 台机器人、8 m × 12 m 仓储地图、50 个随机任务序列：全部任务完成、零碰撞、无死锁（任意 30 s 内全队总位移不为零）、中央单轮求解时间 P95 小于 500 ms。</li>
+    </ol>
+    <h3>参数表</h3>
+    <table>
+      <tr><th>参数</th><th>取值</th><th>依据</th></tr>
+      <tr><td>地图分辨率</td><td>0.05 m</td><td>与底盘半径 0.25 m 匹配；再细对路径质量无实质提升却放大内存与带宽</td></tr>
+      <tr><td>窗口 T<sub>h</sub></td><td>10 s</td><td>覆盖至少两次完整重规划周期，留出执行缓冲</td></tr>
+      <tr><td>重规划周期 T<sub>r</sub></td><td>2 s</td><td>与 WiFi 抖动、任务更新频率匹配；更短则计划抖动</td></tr>
+      <tr><td>时间分辨率</td><td>0.5 s</td><td>0.5 m/s 速度下对应 0.25 m/格；再粗会漏检边冲突</td></tr>
+      <tr><td>高层节点预算</td><td>2000</td><td>约 500 ms 求解预算的经验上限</td></tr>
+      <tr><td>心跳超时</td><td>2 s</td><td>超过两个重规划周期未见新计划即降级</td></tr>
+    </table>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：顶点冲突与边冲突检测</strong></p>
+    <pre class="code"><code>def find_conflict(plan_a, plan_b):
+    """扫描两条时空路径的冲突。plan 为逐采样点的 (t, x, y) 列表。"""
+    n = min(len(plan_a), len(plan_b))
+    for k in range(n):
+        _, xa, ya = plan_a[k]
+        _, xb, yb = plan_b[k]
+        if (xa, ya) == (xb, yb):
+            return ("vertex", k, (xa, ya))      # 顶点冲突
+        if k + 1 &lt; n:
+            axn, ayn = plan_a[k + 1][1], plan_a[k + 1][2]
+            bxn, byn = plan_b[k + 1][1], plan_b[k + 1][2]
+            # 边冲突：同窗内互换位置，相当于对撞穿过
+            if (axn, ayn) == (xb, yb) and (bxn, byn) == (xa, ya):
+                return ("edge", k, (xa, ya))
+    return None</code></pre>
+    <p>解读：冲突检测只做两种判断，却在工程里有三个不能省的细节。第一，<strong>时间必须对齐</strong>：两条路径在相同采样时刻比较，所以低层 A* 输出的路径要先重采样到统一的 0.5 s 网格。第二，<strong>"重叠"要用膨胀后的格</strong>：碰撞判据取两中心距离小于半径之和，把机器人膨胀成 1–2 格后即可复用同格判据，简单且保守。第三，<strong>边冲突必须显式查</strong>：只查顶点会漏掉两台 0.5 m/s 的机器人在同一 0.5 s 窗内对穿的情形，这是仿真里"明明规划无冲突却撞了"的头号原因。函数返回第一个冲突的位置与类型，供高层分裂约束使用。</p>
+
+    <p><strong>片段 2：CBS 高层主循环</strong></p>
+    <pre class="code"><code>import heapq
+
+def cbs(robots, grid, max_nodes=2000):
+    """简化版 CBS：低层 A*（支持时空约束），高层冲突树分裂。"""
+    root = [astar(grid, r.start, r.goal, set()) for r in robots]
+    if any(p is None for p in root):
+        return None                                 # 单机无解 -&gt; 整体无解
+    heap = [(sum(len(p) for p in root), 0, root, [set() for _ in robots])]
+    counter = 0
+    for _ in range(max_nodes):
+        cost, _, paths, cons = heapq.heappop(heap)
+        pair = any_conflict(paths, find_conflict)   # 返回 (a, b, kind, k, cell)
+        if pair is None:
+            return paths                            # 无冲突：CBS 最优性成立
+        a, b, kind, k, cell = pair
+        for who in (a, b):                          # 两条分支分别加约束
+            new_cons = [set(c) for c in cons]
+            new_cons[who].add((kind, k, cell))      # 该机 k 时刻禁入 cell
+            new_path = astar(grid, robots[who].start,
+                             robots[who].goal, new_cons[who])
+            if new_path is None:
+                continue                            # 该分支无解，剪枝
+            new_paths = list(paths)
+            new_paths[who] = new_path
+            counter += 1
+            new_cost = cost - len(paths[who]) + len(new_path)
+            heapq.heappush(heap, (new_cost, counter, new_paths, new_cons))
+    return None                                     # 预算耗尽：交上层降级</code></pre>
+    <p>解读：这段骨架展示了 CBS 的骨架逻辑：<strong>优先队列始终弹出总代价最小的节点</strong>（保证最优性），无冲突时立即返回。每处理一个冲突就分裂成"约束 a"与"约束 b"两条分支，把选择权交给搜索，这正是 CBS 比"固定优先级规划"更强的地方：优先级规划只探索了一棵固定顺序的树，CBS 探索所有顺序并在其中找最优。代价是内存：每个高层节点都要存一份完整路径集，N = 10、路径 20 点时单节点约 3 kB，预算 2000 节点约 6 MB，可以接受。返回 <code>None</code> 不是失败，它触发设计里的降级路径（速度协调或分布式），系统的可用性不吊死在一个求解器上。</p>
+
+    <p><strong>片段 3：窗口重规划与版本化下发</strong></p>
+    <pre class="code"><code>class PlanDispatcher(Node):
+    """中央侧：定时窗口重规划，下发带版本号的计划。"""
+    def __init__(self):
+        super().__init__("central_planner")
+        from fleet_msgs.msg import PlanMsg          # 自定义：含 version 字段
+        self.pub = self.create_publisher(PlanMsg, "/fleet/plan", 10)
+        self.version = 0
+        self.create_timer(2.0, self.replan)         # Tr = 2 s
+
+    def replan(self):
+        snapshot = self.snapshot_states()           # 10 Hz 汇总的全队快照
+        starts = {rid: self.predict(snapshot[rid], 0.5)
+                  for rid in snapshot}              # 起点对齐：0.5 s 后位置
+        plans = self.solve_window(starts, horizon=10.0, dt=0.5)
+        if plans is None:                           # 求解失败：非致命，降级
+            self.degrade_to_velocity_coordination()
+            return
+        self.version += 1
+        for rid, pts in plans.items():
+            msg = PlanMsg()
+            msg.robot_id, msg.version = rid, self.version
+            msg.poses = pts                         # 逐点 (t, x, y, yaw) 序列
+            self.pub.publish(msg)</code></pre>
+    <p>解读：<code>replan</code> 里的每一行都对应前文的一个设计决定：<strong>快照</strong>保证本轮求解基于同一时刻的状态；<strong>起点对齐</strong>（按 0.5 s 外推的 <code>predict</code> 调用）让新计划从"执行端到时候会到的位置"出发，避免执行端被迫瞬移或原地等；<strong>版本号自增</strong>让执行端有明确的取舍依据；<strong>求解失败走降级路径</strong>：在线系统里"暂时次优"永远好过"停止服务"，异常是最差的处理方式。还有一个隐含约束：<code>replan</code> 的执行时间必须远小于 2 s 周期，否则定时器会堆积，实践中加一个"繁忙标志"，上一轮未完就跳过本轮并记录指标，超频次数是中央节点健康度的第一告警项。示例基于 rclpy 通用接口（<code>Node</code>、<code>create_timer</code>、<code>create_publisher</code>），不同发行版的细节以官方文档为准；<code>PlanMsg</code> 为自定义消息，需在功能包中定义。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>只查顶点冲突不查边冲突</strong>：仿真里两条路径"无冲突"，实机对撞。修复：<code>find_conflict</code> 必须包含边冲突分支；测试用例里显式构造对穿场景。</li>
+      <li><strong>计划版本号缺失</strong>：WiFi 抖动导致旧计划后到，执行端执行过期路径。修复：PlanMsg 带单调版本；执行端拒绝低版本；顺便校验计划起点与当前位置距离（超过 1 m 视为过期）。</li>
+      <li><strong>中央节点单点故障</strong>：中央进程崩溃或掉线，全队停在原地。修复：执行端心跳监测 + 2 s 超时降级到本地规划；中央可迁移到任意一台机器人，状态用轻度冗余（地图靠各机增量重建）。</li>
+      <li><strong>地图不一致</strong>：中央地图与各机局部地图偏差（动态障碍、误差积累），计划在实机上不可行。修复：计划下发后执行端做"可行性预检"（路径是否撞局部障碍），不可行立即上报请求重规划；动态障碍标注进地图时带时间戳与置信度。</li>
+      <li><strong>重规划频率过高导致轨迹抖动</strong>：每 0.5 s 重算一次，计划稍微变化就让机器人左右摇摆。修复：加"计划变化惩罚"（切换路径才重规划）或对静默场景降低重规划频率，配合执行端的拼接平滑。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>计算：30 m × 30 m 地图、分辨率 0.1 m、5 台机器人。联合配置空间的状态数量级是多少？若改用 CBS，低层单机搜索的状态数是多大量级？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>单机约 9×10<sup>4</sup> 格，联合空间约 (9×10<sup>4</sup>)<sup>5</sup> ≈ 6×10<sup>24</sup>；CBS 低层仍是单机规模，差距近 20 个数量级。</div></details>
+      </li>
+      <li>两条路径：A 在 t = 2.0 s 位于格 (5,3)，B 在 t = 2.5 s 位于格 (5,3)，采样间隔 0.5 s。判断这是顶点冲突、边冲突还是无冲突，并说明"膨胀判据"下结论是否变化。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>不同时刻同格不是顶点冲突；再看相邻采样是否互换位置判断边冲突。膨胀后会引入"对角擦肩"型冲突，需要按膨胀半径重新判定。</div></details>
+      </li>
+      <li>把时间分辨率从 0.5 s 改成 1.0 s，预测并论证：CBS 的解会不会变差（路径更长）？会不会漏掉某些冲突？用具体速度数字举一例说明漏检。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>1 m/s 机器人每步移动 1 m，两步之间可能"穿过"对向机器人的格子而不在同采样点重合；把两机速度设为 0.6 m/s、格距 0.5 m 可构造漏检例子。</div></details>
+      </li>
+      <li>为 8 台机器人的仓储场景写一份集中式部署方案：地图分辨率、窗口与周期、节点预算、消息契约（PlanMsg 字段）、降级策略与验收指标，并估算中央的单轮计算与带宽开销。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>参考本章参数表；带宽按"状态汇聚 10 台 × 20 Hz × 50 B + 计划 8 × 320 B / 2 s"估；降级写明心跳、切换条件与恢复条件。</div></details>
+      </li>
+      <li>讨论：为什么 CBS 的"最优"只在给定代价函数下成立？如果你把"等待"的代价调高，解会怎样变化？设计一个代价函数让"绕远路"优于"等待 5 s"或反之。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>代价函数不同，最优解不同。给等待加固定惩罚（每 0.5 s 罚 1.0 当量）会逼出绕行解；降低惩罚则更倾向等待。用同一地图跑两组参数对比总时间。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>集中式规划 = 全局地图 + 全队状态 + 统一求解；联合配置空间 |G|<sup>N</sup> 不可直接搜索，所有可用方案都是"单机搜索 + 冲突协调"。</li>
+      <li>CBS 两层结构：低层单机时空 A*，高层冲突树（顶点/边冲突）加时空约束分裂；保证最优与完备，最坏指数、实践中可控。</li>
+      <li>滚动窗口（窗口 10 s、周期 2 s）+ 起点对齐 + 版本化下发，是在线使用集中式规划的三个必备工程件。</li>
+      <li>集中式的代价：地图与状态汇聚带宽、中央计算占用、单点故障；规模经验上限 N ≈ 10–15，且必须有降级路径。</li>
+      <li>下一章拆除"大脑"：<strong>分布式路径规划</strong>，每台机器人只用自己的局部地图与邻居信息规划，比较通信开销与最优性的彻底权衡。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch045.html">← 第 045 章：多机器人协同编队避障</a>
+    <a class="next" href="ch047.html">第 047 章：分布式路径规划 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

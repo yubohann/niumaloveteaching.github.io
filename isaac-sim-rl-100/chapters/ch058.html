@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第058章 实现离线强化学习 | 机器人仿真学习课程 · Isaac Sim 强化学习训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第三篇 · 高级强化学习专题</span>
+    <span class="sep">/</span>
+    <span>第 058 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第三篇 · 高级强化学习专题</div>
+    <h1>第 058 章：实现离线强化学习</h1>
+    <p class="lead">只有一份固定的历史数据、不能再和环境交互：本章讲透分布偏移为何会让朴素 TD 学习崩溃，并给出 CQL 与 IQL 两条保守主义的实现路径，以及 Isaac Sim 数据集采集的工程流程。</p>
+    <ul class="meta">
+      <li>主题：高级专题 / 离线 RL 与分布偏移</li>
+      <li>相关组件：Isaac Sim / Isaac Lab / PyTorch / 自实现（CQL、IQL）</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 057 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>能说清离线 RL 的设定：固定数据集、零新交互，以及它为什么在机器人领域重要（真机数据贵、试错有风险）。</li>
+      <li>理解分布偏移与外推误差：为什么对数据外动作的 Q 估计会虚高，以及 bootstrapping 如何放大它。</li>
+      <li>掌握行为克隆（BC）作为强基线的价值与局限（协变量偏移），会用"BC 差多少"判断是否需要值方法。</li>
+      <li>能实现 CQL 的保守惩罚项与 IQL 的 expectile 回归，并解释各自"不查询 OOD 动作"的策略。</li>
+      <li>会设计离线数据集的采集流程：脚本控制器 + 多档噪声、混质量数据、episode 边界记录。</li>
+      <li>能选出正确的评估协议：离线策略选择（OPE）与有限在线评测的取舍。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 057 章的 PPO 需要不断与环境交互；但很多场合这条路被堵死：医疗决策不能试错、工业产线不能停机试验、真机采集一条轨迹的成本是仿真的几百倍。离线强化学习（offline RL）回答的问题是：<strong>给定一份已经收集好的、有限的交互数据集，能不能从中"榨"出一个比数据来源更好的策略？</strong></p>
+    <p>这听起来很有吸引力，但有一道深坎，分布偏移。数据集只覆盖了状态-动作空间的一小部分，而学习中的策略会想访问数据集之外的动作；对这些从未见过的动作，价值估计没有任何约束，误差会在自举（bootstrapping）中滚雪球。本章先讲清这个机制，再给出两条解法：CQL 用惩罚把 OOD 动作的 Q 压下去，IQL 干脆改变算法结构、永远不查询 OOD 动作。数据集怎么造、策略怎么评，也在本章一并交代。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 设定与基线：BC 能走多远</h3>
+    <p>数据集 D = {(s, a, r, s′, done)} 由某个行为策略 μ（人类演示、脚本控制器、旧版本策略）产生。最朴素的解法是行为克隆（BC）：把 a 当标签做监督学习，最小化 −log π<sub>θ</sub>(a|s)。它有一个精确可知的失败模式，协变量偏移：</p>
+    <div class="formula">
+      训练误差 ~ O(ε·T²)，ε 为单步误差、T 为回合长度
+      <span class="note">BC 的策略在"自己没见过的状态"上会累积错误，误差随步数平方增长</span>
+    </div>
+    <p>直观解释：BC 只在数据分布上保证了近似正确；一旦策略有一点点不同，它进入的状态就偏离数据集，而那里没有监督信号纠正它，偏差越滚越大。因此 BC 的性能上限大约与数据质量同阶（数据是专家给的，BC 接近专家；数据是随机的，BC 也接近随机）。要"超越数据"，必须引入值函数，这正是离线 RL 的价值，也是风险的来源。</p>
+
+    <h3>2. 分布偏移与外推误差：Q 值为什么会在 OOD 动作上虚高</h3>
+    <p>TD 学习的更新式与动作选择耦合在一起：</p>
+    <div class="formula">
+      Q(s, a) ← r + γ·max<sub>a′</sub> Q(s′, a′)
+      <span class="note">更新目标里对 a′ 取了最大值，这个 max 会对"从未见过的动作"取 Q 的估计值</span>
+    </div>
+    <p>对数据集内的动作，Q 有真实回报的约束；对 OOD 动作，Q 只是一个从函数近似里"外推"出来的数字。两种误差在 max 操作下被挑选：<strong>随机噪声中偏高的那些估计总是被 max 选中</strong>，于是虚高被不断写入目标值，误差在自举中指数放大（价值估计发散）。策略看到虚高的 Q，就一去不回头地冲向 OOD 区域，离线 RL 最经典的失败轨迹。</p>
+    <p>工程上判断"是否发生了外推病"有个指标：在评估时统计策略动作与数据集中"最近邻动作"的距离。健康训练的这条曲线应该保持在数据支持集附近；如果它持续外扩而回报反而上升，基本可以断定是虚高。</p>
+
+    <h3>3. 解法一：CQL，把 OOD 动作的 Q 压下去</h3>
+    <p>保守 Q 学习（CQL）直接在损失里加一项保守惩罚：</p>
+    <div class="formula">
+      L<sub>CQL</sub> = α·( E<sub>a~π</sub>[Q(s, a)] − E<sub>a~D</sub>[Q(s, a)] ) + L<sub>TD</sub>
+      <span class="note">α 常取 1–10；第一个期望用当前策略采样的动作（可能 OOD），第二个用数据集动作</span>
+    </div>
+    <p>目标函数的语义：<strong>压低策略会选的动作的 Q，抬高数据集里真实经历过的动作的 Q</strong>。这样即使某个 OOD 动作的外推值偶然很高，惩罚项也会把它拉回来；而数据内动作的价值被保护，学习的"标尺"始终锚定在数据分布上。代价是保守性可能过头：α 太大时策略退化为"只敢做数据里的事"，甚至不如 BC；实践中 α 从 1 起调，用"离线评估 + 少量在线评测"逐步加压。</p>
+
+    <h3>4. 解法二：IQL，换掉 max，绕开 OOD 查询</h3>
+    <p>隐式 Q 学习（IQL）的思路更精巧：<strong>如果算法从不查询"a 不在数据里"的 Q，外推误差就无从发生</strong>。它用 expectile 回归学一个"偏上分位"的状态价值 V：</p>
+    <div class="formula">
+      L<sup>τ</sup><sub>2</sub>(u) = |τ − 1{u &lt; 0}| · u², &nbsp; 用 u = Q(s, a) − V(s) 拟合，τ ∈ (0.5, 1) 常取 0.7
+      <span class="note">正残差（Q 高于 V）被权重 τ 放大，负残差被压缩，V 收敛到 Q 的高分位</span>
+    </div>
+    <p>为什么 τ = 0.7、不用 1.0（max）？因为 max 的分位数估计在有限数据上方差极大；0.7 分位是一个"略偏乐观但稳定"的折中，得到的 V 略高于平均 Q，A = Q − V 有正有负，能用来做优势加权。策略提取（policy extraction）也不做梯度上升：直接用 <strong>优势加权回归（AWR）</strong>，让数据集中优势为正的动作获得更大权重的行为克隆：</p>
+    <div class="formula">
+      权重 w = exp(β·(Q(s, a) − V(s)))，带裁剪；目标 = −w·log π<sub>θ</sub>(a | s)
+    </div>
+    <p>IQL 全程只使用"数据集里真实出现过的 (s, a)"，没有任何一步需要问"如果我在这个状态做别的动作会怎样"，这就是它对分布偏移免疫的原理。工程上它也比 CQL 简单（无额外采样、超参少），是当前离线 RL 的常用首选基线。</p>
+
+    <h3>5. 数据为王：覆盖度决定上限</h3>
+    <p>离线算法的表现上限由数据决定，算法选择改变不了这个上限。三类典型数据集：</p>
+    <table>
+      <tr><th>数据集类型</th><th>来源</th><th>特点</th><th>适合</th></tr>
+      <tr><td>随机数据</td><td>均匀随机动作</td><td>覆盖广但质量低</td><td>研究 OOD 覆盖；练 CQL 的靶子</td></tr>
+      <tr><td>中等数据</td><td>旧策略 + 噪声（加噪专家）</td><td>质量与覆盖兼顾</td><td>最实用的起点</td></tr>
+      <tr><td>专家数据</td><td>人类演示 / 优化控制器</td><td>质量高但覆盖窄</td><td>BC 已很强，RL 增量有限</td></tr>
+    </table>
+    <p>对机器人任务，"加噪专家"数据集最有性价比：脚本控制器（第 034 章的 IK、第 032 章的课程控制）在每条轨迹上叠加不同强度的动作噪声，既保证大部分状态有可行动作，又覆盖一定宽度的探索。经验配比：50% 低噪声（接近专家）+ 30% 中噪声 + 20% 高噪声。额外的细节：采集时记录 episode 边界（done 与 episode id），这是 TD 更新不做跨回合自举的前提。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>以"插销装配"（042 章的简化版）为例搭建完整的离线流程：</p>
+    <ol>
+      <li><strong>数据来源</strong>：用脚本控制器（基于相对位姿的 IK 伺服 + 编写好的搜孔策略）在随机初始条件下采集 2000 条回合，约 100 万条转移。</li>
+      <li><strong>噪声混合</strong>：三条采集线，低噪声（σ=0.05）、中噪声（σ=0.15）、高噪声（σ=0.4），比例 5:3:2；每条轨迹的动作噪声独立采样，保证"同一状态附近有多种动作"。</li>
+      <li><strong>数据字段</strong>：s、a、r、s′、done、episode_id、behavior_logp（可选，用于某些加权方法）。存储用浮点 16 压缩转动量（1M 条约 0.4 GB）。</li>
+      <li><strong>归一化</strong>：用数据集统计量（不是在线统计）做状态/动作/奖励归一化，全局只算一次并冻结，离线场景里统计量也必须来自数据，不能"看到未来"。</li>
+      <li><strong>算法</strong>：先跑 BC 基线（MLP 256×2，监督学习 20 万步）；再跑 IQL（expectile τ=0.7，β=3.0）；最后跑 CQL（α=5）。三者同评估协议对比。</li>
+      <li><strong>TD 边界</strong>：更新时按 episode_id 与 done 处理终止，done 帧的 TD 目标不含 γV(s′)（终止）或按截断逻辑处理，和 057 章一致。</li>
+      <li><strong>评估</strong>：先离线策略选择（用 FQE 或简单的重要性采样估计策略价值），再做"有限在线评测"：在仿真里跑 100 回合取均值，离线算法最终要在"能否超越数据"上见真章。</li>
+    </ol>
+    <table>
+      <tr><th>算法</th><th>预期表现</th><th>超参敏感度</th><th>适用</th></tr>
+      <tr><td>BC</td><td>≈ 数据平均质量；不超越但稳定</td><td>低</td><td>基线、专家数据</td></tr>
+      <tr><td>IQL</td><td>超越数据 10–40%；接近专家</td><td>中（β 与 τ）</td><td>首选工程方案</td></tr>
+      <tr><td>CQL</td><td>接近 IQL；调参类多</td><td>高（α）</td><td>需要显式保守控制时</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计思维：为什么"离线 RL 是仿真数据的最好出路"？</span>
+      <p>Isaac Sim 能把数据采集的成本压到极低，这恰好给离线 RL 提供了最理想的燃料：先用脚本策略/课程策略/旧模型在仿真里生成百万级"加噪专家"数据，再离线训练一个新策略，<strong>不需要新的仿真交互，甚至可以在没有 GPU 物理的机器上纯算力训练</strong>。之后把离线策略部署到真机，用有限的在线交互做微调（衔接第 065 章的 sim-to-real）。这条"仿真采数据 → 离线训练 → 真机微调"的流水线，是当前机器人学习最可复制的工程范式之一。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：离线数据集的采集（加噪专家 + 边界记录）</strong></p>
+    <pre class="code"><code>import numpy as np
+
+def collect_offline_dataset(env, scripted_policy, n_episodes=2000, seed=0):
+    rng = np.random.default_rng(seed)
+    data = {k: [] for k in ("s", "a", "r", "s_next", "done", "episode_id")}
+    # 三条采集线：噪声强度不同 -> 数据"质量-覆盖"分布有梯度
+    # 全用专家的数据覆盖太窄（OOD 病）；全用随机的数据质量太差（没法学好）
+    for ep in range(n_episodes):
+        # 每 10 条回合中 5 条低噪声、3 条中噪声、2 条高噪声（质量-覆盖配比 5:3:2）
+        slot = ep % 10
+        sigma = 0.05 if slot &lt; 5 else (0.15 if slot &lt; 8 else 0.40)
+        obs = env.reset()
+        done = False
+        while not done:
+            a_expert = scripted_policy(obs)                 # 脚本/IK 控制器输出
+            # 动作加噪：把"专家轨迹"扩展成一个管状分布，容纳探索性动作
+            a = np.clip(a_expert + rng.normal(0.0, sigma, size=a_expert.shape), -1.0, 1.0)
+            s_next, r, done, info = env.step(a)
+            # 逐条存转移：done 与 episode_id 是 TD 更新时"不跨回合自举"的依据
+            data["s"].append(obs.astype(np.float32))
+            data["a"].append(a.astype(np.float32))
+            data["r"].append(float(r))
+            data["s_next"].append(s_next.astype(np.float32))
+            data["done"].append(bool(done))
+            data["episode_id"].append(ep)
+            obs = s_next
+    return data</code></pre>
+    <p>解读：采集代码里最重要的是三个数据设计决定。第一，<strong>噪声分档</strong>：σ 从 0.05 到 0.40 形成"专家—中等—探索"三档数据。为什么不能只用专家数据？因为专家几乎从不犯错，数据里没有"从错误中恢复"的状态-动作对，学出来的策略一旦偏离就没法自救；也不能全用大噪声，因为数据质量太低会让 learn-to-be-better 的目标无从谈起。第二，<code>np.clip</code> 到动作边界：噪声可能把动作推出执行范围，如果不裁剪，数据里会混入"物理上执行不了"的动作标签，策略会学着输出越界动作。第三，<code>done</code> 与 <code>episode_id</code> 逐条记录：离线训练时 TD 目标绝不能跨越回合边界（回合末的 r 后面不存在 s′ 的延续），漏掉这个标志是最常见的"离线价值估计诡异偏高"的原因。补充一个工程习惯：<code>rng</code> 显式播种、数据采集与环境版本号一起存档，半年后复现失败时你会感谢自己。</p>
+
+    <p><strong>片段 2：CQL 的保守损失项</strong></p>
+    <pre class="code"><code>import torch
+
+def cql_loss(q_data, q_policy, alpha=5.0):
+    # 保守惩罚：抬高"数据里真实做过的动作"的 Q，压低"策略想做的动作"的 Q
+    # 前提：q_policy 的动作来自当前策略采样（大概率落在数据支持集之外）
+    # 直观理解：给 OOD 动作的 Q 估计算一笔"风险成本"，抵消外推虚高
+    penalty = q_policy.mean() - q_data.mean()
+    return alpha * penalty
+
+def total_offline_loss(batch, q_net, q_target, gamma=0.99, alpha=5.0):
+    q_data = q_net(batch.s, batch.a)                    # 数据集动作的 Q
+    with torch.no_grad():
+        # TD 目标：a' 用数据集里的"下一动作"（batch.a_next），避开策略的 max 查询
+        # 这是离线版的关键改写：目标不查询策略未验证过的动作区域
+        y = batch.r + gamma * (1.0 - batch.done) * q_target(batch.s_next, batch.a_next)
+    td = ((q_data - y) ** 2).mean()                     # 常规 TD 回归
+    a_pi = q_net.policy(batch.s)                        # 当前策略在该状态的动作
+    q_pi = q_net(batch.s, a_pi)                         # 策略动作的 Q（可能 OOD）
+    return td + cql_loss(q_data, q_pi, alpha), td.item()</code></pre>
+    <p>解读：CQL 的实现里有两个容易写错的点。第一，TD 目标中的下一动作 <code>batch.a_next</code> 必须来自数据集，如果图省事写成 <code>q_target(s_next, policy(s_next))</code>，就等于在目标里重新引入了"策略自选动作"，外推误差原地回归，CQL 的惩罚项和 TD 目标会互相冲突。第二，<code>q_policy</code> 的采样动作应当从当前策略分布里采（或用策略的均值动作），并为每个状态采若干个候选取平均，采样越多，惩罚对"OOD 高地"的估计越准。经验上每个状态采 10 个候选即可，再增加收益很小。α 的选择是从 1 开始做扫描：α 太大时 Q 值整体被压低、策略变得畏手畏脚（表现为回报接近 BC），α 太小时 OOD 病复发（表现为评估动作距离持续外扩），这两个信号为你划定了 α 的可用区间。</p>
+
+    <p><strong>片段 3：IQL 的 expectile 价值与优势加权回归</strong></p>
+    <pre class="code"><code>import torch
+
+def expectile_loss(residual, tau=0.7):
+    # 非对称平方损失：残差为正（Q 高于 V）权重 tau，为负权重 1-tau
+    # tau=0.7 表示 V 学的是 Q 的 70 分位点：比均值乐观一点、比 max 稳得多
+    weight = torch.where(residual &gt; 0.0, tau, 1.0 - tau)
+    return weight * (residual ** 2)
+
+def iql_losses(batch, q_net, v_net, target_q):
+    with torch.no_grad():
+        q_data = target_q(batch.s, batch.a)             # 只用数据集动作，不查询 OOD
+        y = batch.r + 0.99 * (1.0 - batch.done) * target_q(batch.s_next, batch.a_next)
+    q = q_net(batch.s, batch.a)                          # Q 网络：标准 TD 回归，输入同样是数据动作
+    q_loss = ((q - y) ** 2).mean()
+
+    v = v_net(batch.s).squeeze(-1)                       # V 网络：expectile 回归到 Q 的分位
+    v_loss = expectile_loss((q_data - v).detach(), tau=0.7).mean()
+
+    # 策略提取（AWR）：数据动作的优势 A = Q - V 越大，行为克隆的权重越高
+    adv = q_data - v.detach()
+    w = torch.exp(3.0 * adv).clamp(max=100.0)            # beta=3，裁剪防少数样本主导
+    logp = q_net.log_prob(batch.s, batch.a)              # π(a|s) 的对数概率（同一个网络里）
+    pi_loss = -(w * logp).mean()
+    return q_loss, v_loss, pi_loss</code></pre>
+    <p>解读：IQL 三块损失的分工值得逐行说。Q 网络：仍是标准 TD 回归，但所有出现动作的地方（batch.a、batch.a_next）都来自数据集，IQL 的"离线安全性"就建立在这一条上：全流程没有一步向网络询问"某个没见过的动作值多少"。V 网络：注意 <code>.detach()</code>，expectile 回归的目标 Q 应当视为常数，V 在追一个"不动的分位数"；不 detach 时 Q 和 V 会互相追逐，训练不稳。τ=0.7 的作用见理论部分：它让 V 略高于平均 Q，从而 A 有正有负；τ 调到 1.0 就退化成了"V 追 max"，方差回来。策略提取用加权 BC：<code>beta=3.0</code> 控制"好动作"拉开多少，<code>clamp(max=100)</code> 限制单样本权重，在 100 万条数据里，个别样本的 Q 估计可能虚高，不裁剪会让策略被这一条数据带偏。注意权重只放大,不做梯度上升，这让 IQL 的策略永远停留在"数据动作的加权组合"里，是它保守性的来源，也是它对数据集覆盖质量敏感的原因。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>TD 目标里查询策略动作</strong>：写成了 max<sub>a′</sub>Q(s′, a′) 或 π(s′) 的动作，离线病立刻复发。症状是 Q 值发散、评估动作越跑越偏。修复：离线 TD 目标只用数据集里的 (s′, a′)；CQL 的 OOD 项只出现在惩罚里，不进入目标。</li>
+      <li><strong>跨回合自举</strong>：done 帧仍用 γV(s′) 做目标，把"下一回合的开头"接在了这一回合的尾部。症状是策略学出"结束前莫名行为"。修复：done 掩码（片段 2 的 1−done），并抽查 20 条 done 帧的 TD 目标是否合理。</li>
+      <li><strong>用在线统计归一化</strong>：离线场景没有"未来"数据，归一化统计量必须从数据集算出并冻结。症状是训练前期与评估期分布不一致。修复：数据集统计量 + 评估时复用同一份。</li>
+      <li><strong>BC 都没跑就上花哨算法</strong>：IQL 与 CQL 都有实现 bug 的可能，没有 BC 基线你就不知道 30% 的差距是算法问题还是实现问题。修复：BC 永远第一个跑，并把它当作"下限+参照系"。</li>
+      <li><strong>只看离线估计就宣布成功</strong>：FQE 等离线评估自身有误差，可能高估。修复：仿真场景下一律补"有限在线评测"（100 回合）；真机场景则先用模型预测做风险筛查（056 章的模型在这里很好用），小批量试跑。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>只用低噪声（σ=0.05）数据训练 IQL 与 BC，对比两者成绩，并解释为什么此时 IQL 的增益变小。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>数据越接近专家，BC 的协变量偏移影响越小；IQL 的增量主要来自"在数据支持集内挑出更好的动作"，当数据本身已经很好时空间有限。</div></details>
+      </li>
+      <li>把 CQL 的 α 从 1 扫到 50，画出"评估回报—策略动作距离"的散点，找出 OOD 病复发的临界 α。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>α 小时回报先升后突然崩塌（外推病）；α 大时回报稳定但偏低（过度保守）。"动作距离"指标能提前预警崩塌。</div></details>
+      </li>
+      <li>把数据集里的 done 掩码去掉（错误地跨回合自举），对比训练稳定性与最终成绩。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>跨回合自举会把不同初始条件下的轨迹接在一起，价值函数引入系统性噪声；观察 Q 值分布的方差暴涨。</div></details>
+      </li>
+      <li>设计实验区分"离线算法真的超越数据"与"只是拟合了数据中的高分动作"：写出数据质量分位与策略成绩的对照方案。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>把数据集按回报分位切 5 档，分别训 BC，画出"数据分位 vs BC 成绩"曲线作为参照。IQL 若超过最高分位的 BC，才是真正的学习增益。</div></details>
+      </li>
+      <li>把 056 章的集成模型接进来做全离线评估：用模型 rollout 估计策略回报，与真评估对比，报告误差。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>模型评估适合做"相对排序"（A 策略是否比 B 好），绝对数值通常不靠谱。先检查排序准确率，再考虑用于筛选。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>离线 RL 的敌人是分布偏移：TD 更新里的 max 操作会系统性挑选 OOD 动作上虚高的 Q，误差在自举中滚雪球。</li>
+      <li>BC 是必跑的基线：无需值函数、稳定，但受协变量偏移限制，性能约等于数据质量本身。</li>
+      <li>CQL 用"压 OOD、抬数据内"的保守惩罚把外推值拉回来，α 是保守强度旋钮；TD 目标只能使用数据集动作。</li>
+      <li>IQL 用 expectile（τ=0.7）学分位价值、AWR 提取策略，全程不查询 OOD 动作；超参少、稳定性好，是工程首选。</li>
+      <li>数据决定上限："加噪专家"三档混合最实用；done 与 episode_id 必须逐条记录；归一化统计量冻结自数据集。</li>
+      <li>下一章扩展参与者的数量：<strong>多智能体强化学习</strong>，非平稳、信用分配、CTDE 三件套，与 049 章的任务工程正好互补。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch057.html">← 第 057 章：实现无模型强化学习</a>
+    <a class="next" href="ch059.html">第 059 章：实现多智能体强化学习 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

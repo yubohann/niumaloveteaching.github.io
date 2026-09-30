@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第044章 RLlib自定义奖励归一化 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第三篇 · RLlib 算法实现</span>
+    <span class="sep">/</span>
+    <span>第 044 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第三篇 · RLlib 算法实现</div>
+    <h1>第 044 章：RLlib自定义奖励归一化</h1>
+    <p class="lead">尺度统一是训练稳定的前提：奖励归一化（Reward Normalization）与优势归一化（Advantage Normalization）分别作用在哪个环节、运行统计量（Running Statistics）如何用指数滑动平均或 Welford 算法在线估计、多智能体与多 worker 下统计口径如何保持一致。</p>
+    <ul class="meta">
+      <li>主题：RLlib 训练（奖励处理）</li>
+      <li>关键机制：运行均值方差、归一化时机、多智能体统计口径</li>
+      <li>预计学时：50 分钟</li>
+      <li>前置章节：第 043 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解奖励尺度如何经由价值损失与梯度传播影响策略更新幅度，能解释同一组超参为何在不同奖励单位下表现迥异。</li>
+      <li>区分奖励归一化与优势归一化的作用位置与数学效果，知道什么时候用哪一个。</li>
+      <li>掌握在线统计量估计方法：指数滑动平均（EMA）与 Welford 递推，理解各自对异常值的响应。</li>
+      <li>会在 RLlib 策略后处理钩子中实现奖励变换，并避免破坏时序差分目标与回合边界。</li>
+      <li>能为多智能体任务设计逐智能体统计口径，并处理多 worker 并行下的统计同步问题。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>强化学习的超参数与奖励单位强耦合。每步奖励 1 的任务与每步奖励 100 的任务，即使最优策略相同，价值损失的量级相差四个数量级，经由共享网络主干传播后，策略梯度的有效步长也随之变化。换一个环境就要重调学习率，这是训练工程里的高频痛点。</p>
+    <p>奖励归一化把任意尺度的奖励映射到统计意义上可比的范围，让超参在不同任务间迁移。它同时是数值稳定的手段：价值目标与优势的方差被压缩后，梯度裁剪与学习率调度才有稳定的工作点。本章讲透统计口径、作用时机与分布式实现三个问题。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p>本节先厘清"归一化谁、在哪归一化"，再进入统计量与并行一致性问题。</p>
+
+    <h3>1. 尺度的传播路径：从奖励到梯度</h3>
+    <p>奖励 r 经折扣求和进入价值目标，价值网络以均方误差拟合：(V<sub>θ</sub>(s) − G<sub>t</sub>)²。若奖励整体放大 k 倍，回归目标的量级放大 k 倍，价值损失的梯度放大约 k 倍，优化轨迹随之改变。优势函数 Â = G − V 同样放大 k 倍，策略梯度的步长因此随奖励单位漂移。<strong>把奖励的统计尺度固定下来，等于把学习率从"奖励单位的函数"中解放出来。</strong></p>
+    <p>一个重要的数学事实需要记住：在回合制任务里，把全部奖励乘以正常数 k 不改变最优策略，只改变价值量级；而减去常数 c 会改变最优策略（因为存在时间折扣，早拿到的平移与晚拿到的平移不等价）。这决定了归一化实现的尺度选择：<strong>优先做仿射变换中的缩放，平移项需要与折扣因子一起审视。</strong></p>
+
+    <h3>2. 两种归一化：奖励侧与优势侧</h3>
+    <table>
+      <tr><th>方式</th><th>作用对象</th><th>数学效果</th><th>典型用法</th></tr>
+      <tr><td>奖励归一化</td><td>环境回报，在计算回报与自举目标之前</td><td>改变整个学习问题的尺度</td><td>奖励量级跨任务差异大时启用</td></tr>
+      <tr><td>优势归一化</td><td>批次内的优势估计 Â</td><td>只压缩批次内梯度尺度，不改变问题尺度</td><td>PPO 等策略梯度算法的常规项</td></tr>
+      <tr><td>价值目标归一化</td><td>价值回归标签</td><td>稳定价值头训练</td><td>配合奖励归一化使用</td></tr>
+    </table>
+    <p>优先顺序有讲究：<strong>能靠优势归一化解决的问题，不要动奖励本身；只有奖励单位本身失控（量级漂移、任务间不可比）时才启用奖励归一化。</strong>两者叠加时归一化两次会让损失尺度难以解释，调试时先关闭一层再定位问题。</p>
+
+    <h3>3. 在线统计量：EMA 与 Welford</h3>
+    <p>归一化需要均值 μ 与标准差 σ，而奖励分布随策略变化，只能用在线估计。指数滑动平均维护一个衰减窗口：</p>
+    <div class="formula">
+      μ ← (1−α)·μ + α·r ； σ² ← (1−α)·σ² + α·(r − μ)²
+      <span class="note">α 为更新率；α = 0.001 对应的有效窗口约 1000 个样本。EMA 对最新分布更敏感，但早期样本被逐渐遗忘</span>
+    </div>
+    <p>Welford 递推维护全历史统计，数值稳定且无需保存全部样本：μ<sub>n</sub> = μ<sub>n−1</sub> + (r<sub>n</sub> − μ<sub>n−1</sub>)/n，方差以类似的增量式更新。两者的选择标准：<strong>奖励分布随策略变化明显时用 EMA，希望统计反映全局历史时用 Welford。</strong>处理长期训练任务时还应对样本数设上限（窗口化 Welford），避免早期极端值永久影响统计。</p>
+    <p>归一化变换本身为 r′ = clip( (r − μ) / (σ + ϵ), −c, c )，其中 ϵ 防止除零，裁剪系数 c 控制异常值的杠杆。裁剪会引入偏差，故 c 不宜过小；常用 5 至 10。</p>
+
+    <h3>4. 多智能体口径与多 worker 一致性</h3>
+    <p>多智能体任务里各智能体的奖励量级可能不同。全局统计把全部智能体混合计算，量大的智能体主导统计，量小的智能体被压缩到近零尺度，梯度贡献被淹没；逐智能体统计保留各自的相对结构，代价是需要为每个智能体维护独立状态并在检查点中保存。<strong>默认选择逐智能体统计，仅在奖励量纲确实一致时退化为全局统计。</strong></p>
+    <p>并行采样带来第二层问题：每个 worker 独立累积统计量，若就地归一化，同一个奖励值在不同 worker 上被换算成不同数值，批次数据不再同分布。三种处理按成本递增：其一，提高 EMA 的时间常数并接受轻微不一致；其二，由算法层周期性聚合各 worker 统计并广播（统计量的合并有解析公式，均值按样本数加权）；其三，奖励进批次时不归一化，训练侧统一做优势归一化，从根本上绕开奖励侧分布式统计。</p>
+
+    <h3>5. 数值算例：尺度传播、EMA 窗口与平移反例</h3>
+    <p>尺度传播的量级先算清楚：γ = 0.99、每步奖励 1、有效视野 100 步时，价值目标是约 63.4；奖励放大 100 倍后同一策略的价值目标约 6339.7，均方误差损失放大约 10<sup>4</sup> 倍，损失对参数的梯度随目标线性放大 100 倍。同一学习率下，奖励单位放大 100 倍的实验等效于把步长放大 100 倍，这就是"换环境必须重调学习率"的数值根源。归一化把奖励压回零均值、单位标准差的尺度，学习率的工作点因此与奖励单位脱钩。</p>
+    <p>EMA 的窗口用权重衰减核算：更新率 α 的样本经过约 1/α 次更新后权重降到 (1−α)<sup>1/α</sup> ≈ e<sup>−1</sup> ≈ 0.368。α = 0.001 对应约 1000 个样本，α = 0.01 对应约 100 个，α = 0.0001 对应约 10000 个。窗口长度要与回合长度匹配：窗口远大于回合长度时统计平缓但漂移响应慢，远小于时跟随快但尺度抖动。</p>
+    <table>
+      <tr><th>更新率 α</th><th>有效窗口（样本数）</th><th>窗口后权重</th><th>响应特征</th></tr>
+      <tr><td>0.01</td><td>约 100</td><td>0.366</td><td>跟随快、统计噪声大</td></tr>
+      <tr><td>0.001</td><td>约 1000</td><td>0.368</td><td>常用起点</td></tr>
+      <tr><td>0.0001</td><td>约 10000</td><td>0.368</td><td>平稳、漂移滞后</td></tr>
+    </table>
+    <p>平移改变排序的反例给一个：设每步奖励 0、到达终点奖励 +1、γ = 0.99。策略甲立刻到达终点，价值 1.0；策略乙多走一步再到达，价值 0 + 0.99 × 1 = 0.99，甲严格更优。把全部奖励平移 +0.5 后，每步奖励变为 0.5、终点奖励 1.5：甲的价值 1.5，乙的价值 0.5 + 0.99 × 1.5 = 1.985，排名反转。缩放不改变策略排序，平移可以改变，实现中应把平移项与折扣、回合终止设计一起审视。</p>
+
+    <h3>6. 边界与失效模式</h3>
+    <p>分布漂移的边界：策略改进会让奖励分布整体移动，EMA 存在固有滞后，窗口远长于改进节奏时，归一化尺度在分布移动后的一段时间内失准，价值目标普遍偏大或偏小，表现为价值损失阶段性抬升。判断方法是把统计均值画进监控，与归一化后奖励的均值一并看：后者应接近零，持续偏离零就是窗口失配的信号。监控面板放统计均值、归一化奖励均值、价值损失三条曲线，即可覆盖多数尺度失配情形；发现任一曲线越界，先回查统计窗口与裁剪界，再怀疑学习率。</p>
+    <p>裁剪与稀疏奖励的边界：奖励 +100、运行标准差 20 时标准化值恰为 5，裁剪界 c = 5 处在临界；标准差若降到 10，标准化值为 10，被裁到 5，信号损失一半。稀疏大额事件的任务应放大 c，或改用缩放不平移的变体，减少对末端成功信号的扭曲。</p>
+    <p>自举尺度一致性：归一化改变训练用奖励的尺度，价值网络学到的是归一化尺度的价值；从截断状态自举时，下游优势估计与价值损失若混入未归一化的原始奖励（例如回放数据来自旧版本处理），目标尺度就不一致。实现纪律是入口处统一变换，原始值只放单独字段。</p>
+    <p>多智能体的另一条边界在共享项与个体项：逐智能体统计保留了各队员的尺度差异，但任务奖励由团队共享项与个体项相加而成时，分开统计会同时改变两项的相对权重。此时应把共享项与个体项分别归一化后再合并，或在奖励设计阶段就固定量纲。</p>
+
+    <h3>7. Welford 递推与跨 worker 合并的算例</h3>
+    <p>Welford 递推的性质一眼可见：μ<sub>n</sub> = μ<sub>n−1</sub> + (x<sub>n</sub> − μ<sub>n−1</sub>) ÷ n，第 n 个样本的修正步长是偏差的 1÷n；n = 1000 时单个样本只能移动统计量的千分之一，统计快速硬化，这正是长训练需要窗口化 Welford 的原因。跨 worker 合并用两组加权公式：合并均值按样本数加权；合并方差等于组内方差的加权平均再加组间项。</p>
+    <p>代入一组数：A 组 100 个样本、均值 1、方差 1；B 组 300 个样本、均值 2、方差 1。合并均值为 (100×1 + 300×2) ÷ 400 = 1.75；两组方差的加权平均是 1，加上组间项后合并方差约 1.19，比组内平均高约 19%。漏掉组间项的实现会系统性低估方差，归一化后的奖励分布偏高尾，这也是练习 4 要验证的公式细节。合并公式需要样本数参与，检查点里必须保存（样本数、均值、二阶矩）三元组；EMA 版本对应保存（均值、方差、初始化标记），缺一项都会让恢复后的统计失真。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>从诊断到上线的完整流程分五步。</p>
+    <ol>
+      <li><strong>诊断奖励尺度</strong>：记录原始奖励的均值、标准差、最小值、最大值；量级跨回合漂移超过一个数量级时考虑归一化。</li>
+      <li><strong>选择层次</strong>：先确认算法是否已做优势归一化；PPO 开启该项通常已足够，奖励侧保持原始尺度便于解释回报曲线。</li>
+      <li><strong>选择统计口径</strong>：单智能体用全局 EMA；多智能体用逐智能体 EMA；统计窗口长度按任务回合长度取 500 至 5000 个样本。</li>
+      <li><strong>接入实现</strong>：在策略后处理钩子中对奖励做变换，确保变换发生在回报计算与自举之前，评估指标保持原始奖励。</li>
+      <li><strong>验证</strong>：确认价值损失量级进入稳定区间，奖励曲线换算回原始尺度后再与基线对比。</li>
+    </ol>
+    <h3>参数表</h3>
+    <table>
+      <tr><th>参数</th><th>典型值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>EMA 更新率 α</td><td>0.001</td><td>统计窗口长度</td><td>约对应 1000 个样本；回合越长取值越小</td></tr>
+      <tr><td>裁剪系数 c</td><td>5–10</td><td>限制异常值杠杆</td><td>奖励含稀疏大额事件时取大值</td></tr>
+      <tr><td>稳定项 ϵ</td><td>1e-8–1e-5</td><td>防除零</td><td>与浮点精度匹配</td></tr>
+      <tr><td>统计口径</td><td>逐智能体</td><td>多智能体尺度</td><td>奖励量纲不一致时必选</td></tr>
+      <tr><td>优势归一化</td><td>开启</td><td>批次梯度尺度</td><td>PPO 常规配置，不改变问题尺度</td></tr>
+    </table>
+    <p>与上一章的差异：043 章调整数据分布宽度，本章调整目标尺度；前者改变探索行为，后者改变优化问题的数值条件，两者叠加配置时需要分别记录，避免归因混淆。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：EMA 运行统计量</strong></p>
+    <pre class="code"><code>import numpy as np
+
+class RunningStatsEMA:
+    """奖励在线统计：均值与方差用指数滑动平均维护。
+    采用 EMA 维护统计量：策略改进后奖励分布会整体平移，
+    旧数据不应继续影响归一化尺度。"""
+    def __init__(self, alpha=0.001, eps=1e-5):
+        self.alpha, self.eps = alpha, eps
+        self.mean, self.var = 0.0, 1.0
+        self.inited = False
+
+    def update(self, values):
+        values = np.asarray(values, dtype=np.float64)
+        batch_mean, batch_var = values.mean(), values.var()
+        if not self.inited:
+            self.mean, self.var, self.inited = batch_mean, batch_var, True
+            return
+        # 先更新均值再更新方差：原文写法用旧均值会高估方差
+        self.mean = (1 - self.alpha) * self.mean + self.alpha * batch_mean
+        self.var = (1 - self.alpha) * self.var + self.alpha * batch_var
+
+    def normalize(self, r, clip=10.0):
+        std = max(np.sqrt(self.var), self.eps)   # sqrt 保护：早期 var 可能极小
+        return float(np.clip((r - self.mean) / std, -clip, clip))</code></pre>
+    <p>解读：三个实现细节值得说明。<strong>（1）</strong>以批为单位更新统计，比逐样本更新的噪声更小，批量大小与采样批次对齐便于解释窗口长度。<strong>（2）</strong>初始化时直接吸收第一批统计，避免前几百步在 μ=0、σ=1 的无意义状态上归一化。<strong>（3）</strong>方差下界保护：早期样本极集中时 σ 趋近于零，除零会把正常奖励放大成异常值。</p>
+
+    <p><strong>片段 2：在策略后处理中接入归一化</strong></p>
+    <pre class="code"><code>class NormalizedRewardPolicy(TorchPolicy):
+    """对训练用奖励做归一化，评估指标保留原始奖励。"""
+    def __init__(self, observation_space, action_space, config):
+        super().__init__(observation_space, action_space, config)
+        # 统计量挂在策略上：随检查点保存，恢复训练后尺度不重置
+        self.reward_stats = RunningStatsEMA(alpha=0.001)
+
+    def postprocess_trajectory(self, sample_batch, other_agent_batches=None, episode=None):
+        rewards = sample_batch["rewards"].astype(np.float64)
+        self.reward_stats.update(rewards)
+        # 变换必须发生在回报计算与 GAE 之前，否则时序差分目标仍含旧尺度
+        sample_batch["rewards"] = np.array(
+            [self.reward_stats.normalize(r) for r in rewards], dtype=np.float32)
+        # 保留原始奖励：报表与评估曲线需要物理含义，不能展示归一化值
+        sample_batch["raw_rewards"] = rewards.astype(np.float32)
+        return super().postprocess_trajectory(sample_batch, other_agent_batches, episode)
+
+    def get_state(self):
+        state = super().get_state()
+        state["reward_stats"] = {"mean": self.reward_stats.mean,
+                                 "var": self.reward_stats.var,
+                                 "inited": self.reward_stats.inited}
+        return state
+
+    def set_state(self, state):
+        super().set_state(state)
+        s = state["reward_stats"]
+        self.reward_stats.mean, self.reward_stats.var = s["mean"], s["var"]
+        self.reward_stats.inited = s["inited"]</code></pre>
+    <p>解读：逐块说明设计意图。<strong>（1）</strong>钩子时机的选择是关键：后处理运行在回报计算之前，批内奖励一旦被改写，后续广义优势估计（Generalized Advantage Estimation, GAE）自然使用新尺度。<strong>（2）</strong>额外存放 <code>raw_rewards</code> 字段，指标体系与调试图像继续用物理奖励，避免"奖励曲线被压到 ±10"的困惑。<strong>（3）</strong>统计量并入检查点：恢复训练时若统计重置，前若干批会被错误尺度归一化，造成训练尖峰。</p>
+
+    <p><strong>片段 3：多智能体逐智能体统计与一致性检查</strong></p>
+    <pre class="code"><code>import numpy as np
+
+def normalize_per_agent(batches, stats_dict, clip=10.0):
+    """batches: {agent_id: 批次}；每个智能体维护独立统计量，
+    避免奖励量级大的智能体主导尺度、小的智能体梯度被淹没。"""
+    out = {}
+    for aid, batch in batches.items():
+        stats = stats_dict.setdefault(aid, RunningStatsEMA(alpha=0.001))
+        r = batch["rewards"].astype(np.float64)
+        stats.update(r)
+        batch["rewards"] = np.array([stats.normalize(x, clip) for x in r],
+                                    dtype=np.float32)
+        out[aid] = batch
+    return out
+
+def check_scale_consistency(worker_stats_list):
+    """巡检：各 worker 统计量的均值差异超过阈值时，说明归一化不同步。"""
+    means = np.array([s.mean for s in worker_stats_list])
+    spread = means.max() - means.min()
+    if spread &gt; 0.5 * max(1.0, abs(means.mean())):
+        print("统计量不同步：考虑周期性聚合广播或改用优势归一化")
+    return spread</code></pre>
+    <p>解读：这段代码对应理论部分的两个分布式要点。<strong>（1）</strong>统计字典按 agent_id 分键，逐智能体的 EMA 使各队友保持相对量级；若队员奖励设计本身就是量纲一致的，这里可直接退化为单键。<strong>（2）</strong>巡检函数把"统计漂移"从隐患变成可观测指标：各 worker 均值离散度与小批量聚合的阈值比较，为切换同步策略提供依据。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>对评估指标做归一化</strong>：把归一化写进环境包装器，评估回报也被变换，曲线失去物理含义且不可与历史实验对比。修复：变换只发生在训练轨迹后处理中，评估走独立路径。</li>
+      <li><strong>归一化发生在回报计算之后</strong>：逐条改写样本奖励但时序差分目标已按旧尺度计算，梯度尺度实际未统一。修复：确认钩子顺序，必要时同时改写价值目标。</li>
+      <li><strong>初始统计未初始化</strong>：λ 从零样本开始训练，前几百步以 μ=0、σ=1 归一化，奖励被放大或压缩成错误尺度。修复：首批直接吸收统计。</li>
+      <li><strong>裁剪系数过小吃掉稀疏信号</strong>：任务完成时 +100 的稀疏奖励被裁到 +5，优势估计无法区分成功与部分成功。修复：稀疏大额奖励任务提高裁剪界，或改用不裁剪的缩放变体。</li>
+      <li><strong>统计量未入检查点</strong>：中断恢复后统计归零，恢复点附近出现训练尖峰甚至发散。修复：把统计并入 <code>get_state</code> / <code>set_state</code>。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把片段 1 的 EMA 更新率从 0.001 改为 0.01 与 0.0001，预测统计窗口长度、对分布漂移的响应速度与归一化后的奖励方差差异。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>α 越大窗口越短，响应快但统计噪声大；α 太小则分布漂移后尺度长期失配。固定任务各跑一遍，比较价值损失曲线的前期波动幅度。</div></details>
+      </li>
+      <li>推导：在回合制任务中，把奖励全部乘以 k &gt; 0 保持最优策略不变；举一个反例说明减去常数 c 会改变最优策略（提示：与折扣因子相关）。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>缩放不改变任何两个策略的回报排序；平移 c 时，早达成回合的策略少承受一步 c 的惩罚，γ 越小平移的时序差异越明显，排序可能反转。</div></details>
+      </li>
+      <li>设计实验：同一环境用两组奖励单位（每步 1 与每步 100）训练，固定所有超参，验证奖励归一化把两者的学习曲线拉回一致。给出预期与失败情形的解释。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>未归一化时两组曲线的有效步长大致相差 100 倍；归一化后应接近重合。失败情形常见于统计窗口过短或裁剪界截断了规模差异。</div></details>
+      </li>
+      <li>实现逐智能体统计量的聚合广播：给出跨 worker 合并均值的加权公式，并说明为何方差合并需要额外的组间方差项。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>合并均值按样本数加权；总方差等于组内方差按样本数加权 + 各组均值与总均值偏差的平方加权，漏掉第二项会系统性低估方差。</div></details>
+      </li>
+      <li>解释为什么"奖励归一化加优势归一化"同时开启会让调试变难，给出一个只开启其中一层即可解决问题的典型场景。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>两层叠加后损失数值同时受批次统计与环境统计影响，异常时无法区分来源。奖励量级正常但批次优势波动大的场景，只用优势归一化即可。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>奖励尺度经由价值损失与优势估计传播到梯度，统一尺度是超参跨任务迁移的数值前提。</li>
+      <li>奖励归一化改变问题尺度，优势归一化只压缩批次梯度；能用后者解决时不启用前者。</li>
+      <li>在线统计用 EMA 或 Welford：前者跟随分布漂移，后者反映全局历史，长任务需窗口化。</li>
+      <li>变换必须发生在回报与自举计算之前，评估指标保持原始奖励，统计量必须随检查点存取。</li>
+      <li>多智能体默认逐智能体统计；多 worker 下统计不同步是主要风险，巡检离散度或退化为训练侧优势归一化。</li>
+      <li>下一章进入部分可观测环境：当单帧观测不足以决策时，用 LSTM 与序列打包把历史信息纳入模型。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch043.html">← 第 043 章：RLlib自定义探索策略</a>
+    <a class="next" href="ch045.html">第 045 章：RLlib使用LSTM处理部分可观测环境 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第044章 实现四足机器人行走 | 机器人仿真学习课程 · Isaac Sim 强化学习训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 任务与技能实现</span>
+    <span class="sep">/</span>
+    <span>第 044 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 任务与技能实现</div>
+    <h1>第 044 章：实现四足机器人行走</h1>
+    <p class="lead">给四足机器人设计一套"会走路"的学习环境：用步态相位时钟告诉策略该迈哪条腿，用周期性奖励约束抬脚、着地与不滑步，让策略在 2000 万步内学会稳定的 trot 小跑。</p>
+    <ul class="meta">
+      <li>主题：任务实现 / 足式运动控制</li>
+      <li>相关组件：Isaac Sim / Isaac Lab / rsl_rl 风格 PPO</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 043 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解足式行走的稳定性来源：支撑多边形、trot 步态的对角腿配对，以及"相位"这一核心概念。</li>
+      <li>会构造相位时钟观测（cos/sin 编码 + 期望触地指示），并说清它为什么能大幅降低学习难度。</li>
+      <li>掌握周期性奖励的设计：摆动腿腾空时间、足端离地高度、支撑腿零滑移、触地方案一致性。</li>
+      <li>看懂速度跟踪的指数核奖励 exp(−‖e‖²/σ²) 的物理含义与 σ 的调法。</li>
+      <li>会写"残差式"动作映射：关节目标 = 默认站姿 + 每关节缩放 × 策略输出，并说明为什么比直接输出关节角好。</li>
+      <li>能诊断常见的退化解：蹦跳、拖腿、滑步、抖动，并给出对应的奖励修改。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>足式机器人能在轮子去不了的地方工作：楼梯、碎石、窄梁。但"走起来"这件事对传统控制来说是一道难题，四足系统是欠驱动的浮动基座系统，12 个关节扭矩要同时管 6 自由度躯干运动与 4 只脚的落地时机，手工设计步态与摆腿轨迹需要大量先验。强化学习从 2019 年前后开始在这个领域全面胜出：同一个策略可以学会小跑、跛行、上下坡，抗住侧向推力，几乎不需要人工步态设计。</p>
+    <p>但"不需要人工步态设计"不等于"没有设计"。恰恰相反，能否训出四条腿稳定的步态，几乎完全取决于两件事：<strong>观测里有没有相位信息</strong>、<strong>奖励有没有约束住抬脚与着地</strong>。本章就把这两件事讲透，并用它衔接下一章的双足行走，双足没有对角腿可以配对，稳定性挑战会再上一个台阶。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 支撑多边形：四足为什么比双足容易</h3>
+    <p>机器人会不会翻倒，看重心在地面的投影是否落在<strong>支撑多边形（support polygon）</strong>内，所有着地足端点构成的凸包。四足站立时是四边形，面积大；行走时四足轮换：</p>
+    <table>
+      <tr><th>步态</th><th>着地足组合</th><th>支撑多边形</th><th>说明</th></tr>
+      <tr><td>四足支撑（walk 瞬时）</td><td>3 足</td><td>三角形</td><td>静态稳定，速度慢</td></tr>
+      <tr><td>对角小跑（trot）</td><td>对角 2 足</td><td>一条对角线</td><td>动态稳定，工程最常用</td></tr>
+      <tr><td>疾驰（gallop）</td><td>0–2 足</td><td>无</td><td>有腾空相，训练难度最高</td></tr>
+    </table>
+    <p>trot 之所以成为默认选择：对角腿成对运动（左前 + 右后 vs 右前 + 左后），身体在两条对角支撑之间切换，重心投影的横向摆动小，且两条支撑线交叉经过质心附近，稳定性余量最大。步频典型 1.5–2.5 Hz，对应一个步态周期 0.4–0.7 s。</p>
+
+    <h3>2. 相位时钟：把"该迈哪条腿"告诉策略</h3>
+    <p>步态的本质是周期性的接触时序。定义全局时钟 t ∈ [0, 1)（走完一个周期归零），每条腿有自己的相位：</p>
+    <div class="formula">
+      φ<sub>i</sub> = (t + o<sub>i</sub>) mod 1, &nbsp; o = [0, 0.5, 0.5, 0]（FL, FR, RL, RR）
+      <span class="note">相位前 50% 为支撑期（stance），后 50% 为摆动期（swing）</span>
+    </div>
+    <p>把相位放进观测（用 cos 2πφ、sin 2πφ 编码，避免 0/1 边界处的数值跳变）带来两个好处。第一，<strong>策略获得了"现在处于哪个步态阶段"的先知信息</strong>：支撑腿要蹬地、摆动腿要抬脚，两种动作模式差异巨大，没有相位信息时策略要靠动作后果自己反推，样本效率极低。第二，<strong>奖励可以按相位门控</strong>：只在腿处于摆动期时考核抬脚高度，只在支撑期考核滑移，同一时刻最多考核一个语义，梯度干净。</p>
+    <p>工程经验：加不加相位观测，trot 的收敛步数相差约 3–5 倍。这是四足训练里性价比最高的一行代码。</p>
+
+    <h3>3. 周期性奖励：用四个物理量把步态"钉住"</h3>
+    <p>步态奖励不追求"像参考轨迹"，只约束四个可直接测量的物理量：</p>
+    <ul>
+      <li><strong>触地方案一致性</strong>：摆动腿离地、支撑腿着地，用与期望布尔向量的匹配率给分。它把"什么时候抬哪条腿"从探索空间里拿掉（相位已给定），策略只需学好"怎么抬"。</li>
+      <li><strong>摆动约束</strong>：摆动腿的足端水平速度要超过 0.15 m/s、离地高度超过 6 cm，否则会出现<strong>拖腿</strong>，脚贴地蹭着往前挪，虽然也能"前进"，但真机上会把脚磨坏、也过不了台阶。这就是典型的奖励黑客攻击，必须用速度门槛封死。</li>
+      <li><strong>支撑不滑移</strong>：支撑腿接触地面的同时水平速度大，说明脚在打滑，按 |v<sub>xy</sub>| 线性扣分。真实地面摩擦有限，滑步策略在真机上会退化成"抽筋"。权重取 −1.0 量级，比抬脚奖励大，体现"宁可不抬、不许滑"的优先级。</li>
+      <li><strong>速度跟踪</strong>：exp(−‖v<sub>xy</sub> − v<sub>cmd</sub>‖²/σ²)，指数核的好处是"轻微偏差几乎不罚、大偏差快速饱和"，σ=0.5 时误差 0.5 m/s（err/σ = 1）衰减到 0.37，误差 0.7 m/s 时只剩 0.14。它让策略先"大致对上方向"，再慢慢细化，比线性罚（−‖e‖）的梯度行为更温和。</li>
+    </ul>
+
+    <h3>4. 动作映射：残差式关节目标 + PD 驱动</h3>
+    <p>四足常用的动作接口是"12 维归一化动作 → 目标关节角 → 关节 PD"。目标角围绕一个手工标定的默认站姿加偏移（不从零出发）：</p>
+    <div class="formula">
+      q<sub>target</sub> = q<sub>default</sub> + s ⊙ a, &nbsp; a ∈ [−1, 1]<sup>12</sup>
+      <span class="note">s 为逐关节缩放，典型：髋外摆 0.1 rad、髋俯仰/膝 0.25–0.5 rad</span>
+    </div>
+    <p>三个理由：默认站姿保证"什么都不做"时机器人能站住（探索从可行解附近出发）；逐关节缩放体现关节的重要性差异（外摆角大了容易翻，膝角大了跨步高）；关节 PD 让底层执行器比 RL 输出更"顺滑"，RL 不需要考虑电机的电流环，物理上等价于一个弹簧-阻尼驱动器，控制频率 50 Hz（仿真 200 Hz、decimation=4）足够。</p>
+
+    <h3>5. 数值算例：指数跟踪核的衰减表与步态时间预算</h3>
+    <p>把 exp(−‖e‖²/0.25) 做成衰减表，指数核的行为一目了然：误差 0.25 m/s 时得 0.78（轻微偏差几乎不罚），0.354 m/s 时 0.61，0.5 m/s 时 0.37，0.7 m/s 时 0.14，1.0 m/s 时 0.018。<b>表的拐点在 σ 附近：误差从 0.5 增到 0.7 m/s（+40%），奖励直接减半再减半；而 0.25 m/s 以内的变化几乎无损。</b>这给调参一个明确定位：σ 应覆盖"可接受的跟踪误差带"，1 m/s 的速度量程取 σ = 0.5，意味着 ±0.25 m/s 以内都算"接近正确"；σ 缩到 0.25 时 0.25 m/s 的误差就衰减到 0.37，起步瞬态会被过度惩罚；放大到 1.0 时 1 m/s 的误差仍有 0.37，跟踪精度上不去。</p>
+    <p>步态的时间预算同样值得核算。周期 T = 0.5 s 的 trot，策略 50 Hz 时每周期 25 个决策步；duty = 0.5 时每条腿支撑期长 0.25 s，等于 12.5 个决策步，相位窗口足够策略在支撑期内做几次微调。速度 1.0 m/s 时机身每周期前进 v·T = 0.5 m，足端的触地节奏随之确定：支撑期内足端相对机身从身前 0.125 m 移到身后 0.125 m（相对速度 1.0 m/s），摆动期必须在 0.25 s 内把足端送回身前，折算摆动腿相对机身速度约 1.0 m/s、相对地面约 2.0 m/s。<b>这组数字解释了"摆动速度 &gt; 0.15 m/s"阈值为什么取得这么低：它只是"脚确实在往前送"的最低证据，真正的摆动速度由步幅与周期决定，量级远高于阈值。</b>若把周期减半到 0.25 s（步频 4 Hz），同样的速度意味着腿的往复频率翻倍，支撑期只剩 6 个决策步，滑移与冲击的容错空间同步收窄。</p>
+    <p>步态参数的三档对照也能手算：周期 0.35 s（步频 2.86 Hz）、0.5 s（2 Hz）、0.8 s（1.25 Hz）下，1.0 m/s 巡行时每周期步幅分别为 0.35 m、0.5 m、0.8 m，支撑期（duty 0.5）为 0.175 s、0.25 s、0.4 s，折合决策步 8.75、12.5、20 步。<b>周期长的档位单次支撑更久、步幅更大，对髋关节行程与躯干稳定性的要求同步上升；周期短的档位腿的往复更快、接触事件更密集，对动作延迟更敏感。</b>这解释了"周期短滑移上升、周期长侧向稳定性下降"的双向趋势：步频选择本质上是"延迟容忍度"与"稳定性余量"之间的取舍，不是越快越好或越慢越稳的单向关系。</p>
+    <p>惩罚项的量级最后核一遍：关节扭矩罚 −1e-5×τ² 在 τ = 50 N·m 时是 −0.025、τ = 150 N·m 时是 −0.225；关节加速度罚 −1e-7×q̈² 在 q̈ = 100 rad/s² 时是 −0.001。两项的量级都比触地一致性（上限 0.3）与摆动约束（上限 0.5）小一到两个数量级，<b>它们的作用是"在等价策略之间偏好更省力、更平滑的解"，不足以改变任务目标本身</b>；如果发现策略为了压低扭矩罚而拒绝做大步幅的支撑蹬地，说明扭矩罚与速度跟踪的比例失衡，应回调权重；继续加训练步数解决不了比例失衡。</p>
+    <p>终止阈值也做物理核对：躯干高度 0.20 m（初始 0.35 m 的约六成）、横滚/俯仰 0.8 rad（约 46°）、接触力 400 N。以 25 kg 级整机的重力 245 N 为参照，400 N 约合 1.6 倍体重，单次触地冲击达到这个量级说明动作已从"落脚"恶化成"砸地"，真机上最先受损的是减速器与足端。<b>三条终止线分别对应"高度塌陷、姿态失控、冲击超限"三类不可恢复状态，任何一条触发后回合不再产生有效正回报</b>，训练日志里三条终止原因的占比是调参的第一入口：姿态终止占比高就查直立项与侧向稳定性，冲击终止占比高就查落脚速度与 PD 阻尼。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>搭建四足行走环境的完整流程：</p>
+    <ol>
+      <li><strong>资产与初始化</strong>：四足机器人（12 自由度：每条腿 3 关节）；初始高度 0.35 m，轻微随机化（±0.01 m）防止策略"踩在空气上"开回合。</li>
+      <li><strong>控制链</strong>：仿真 200 Hz（physics_dt = 1/200），策略 50 Hz（decimation=4）；关节 PD 增益按关节标定（例如髋外摆 K<sub>p</sub>=100、大腿 K<sub>p</sub>=150、膝 K<sub>p</sub>=150，K<sub>d</sub> 取 2–5）。</li>
+      <li><strong>速度指令</strong>：v<sub>x</sub> ∈ [0, 1.0] m/s、v<sub>y</sub> ∈ [−0.3, 0.3]、ω<sub>z</sub> ∈ [−0.8, 0.8] rad/s，每 5 s 重采样一次。课程：从 ±0.3 m/s 的低速区间开始，达到跟踪误差阈值后放宽。</li>
+      <li><strong>观测</strong>（约 45–48 维）：躯干线/角速度、重力在躯干系的投影、速度指令、关节位置与速度偏差、上一步动作、相位时钟（8 维 cos/sin）+ 期望触地（4 维）。</li>
+      <li><strong>奖励</strong>：见下表，每一项都对应一个退化解。权重不是拍脑袋：先只开"速度跟踪 + 存活"，确认能跟踪，再逐项加约束，观察每加一项后哪种退化解消失。</li>
+      <li><strong>终止</strong>：躯干高度低于 0.20 m、横滚/俯仰超过 0.8 rad（约 45°）、或接触力超过 400 N。终止时给 0 返回值并打断引导，防策略学"摔了也拿分"。</li>
+      <li><strong>域随机化</strong>：躯干质量 ±20%、地面摩擦 0.4–1.0、PD 增益 ±20%、动作延迟 0–20 ms，四足对摩擦和延迟很敏感，这两项是 sim-to-real 的必调项（第 065 章展开）。</li>
+    </ol>
+    <table>
+      <tr><th>奖励项</th><th>权重</th><th>形式</th><th>压制的退化解</th></tr>
+      <tr><td>速度跟踪</td><td>1.0</td><td>exp(−‖e‖²/0.25)</td><td>原地不动</td></tr>
+      <tr><td>触地方案一致</td><td>0.3</td><td>匹配率</td><td>四条腿同时蹦</td></tr>
+      <tr><td>摆动抬脚/前摆速度</td><td>0.5</td><td>阈值内计数</td><td>拖腿蹭行</td></tr>
+      <tr><td>支撑零滑移</td><td>−1.0</td><td>−|v<sub>xy</sub>| 加权</td><td>滑步推进</td></tr>
+      <tr><td>躯干高度/姿态</td><td>−0.5/−0.3</td><td>平方误差</td><td>趴地爬行</td></tr>
+      <tr><td>关节扭矩/加速度</td><td>−1e-5/−1e-7</td><td>平方</td><td>抖动、暴力蹬地</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计思维：为什么用 50 Hz 策略 + 200 Hz 物理？</span>
+      <p>足式运动的接触事件在 10 ms 量级，物理积分必须细（200–400 Hz）才不失真；但策略决策不需要这么快，50 Hz 已能给足反应余量，还能让每步决策"看见"4 个物理步的结果，信用分配更干净。策略频率再往上（如 200 Hz）常见两个后果：动作噪声被高频放大（抖动），训练吞吐下降。经验规则：<strong>物理频率 ≥ 4 × 策略频率，接触越硬比值越大</strong>。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：步态相位时钟与期望触地</strong></p>
+    <pre class="code"><code>import numpy as np
+
+# trot 步态：对角腿同相。相位偏移 [FL, FR, RL, RR] = [0, 0.5, 0.5, 0]
+GAIT_OFFSET = np.array([0.0, 0.5, 0.5, 0.0], dtype=np.float32)
+
+def gait_clock(sim_time, period=0.5, duty=0.5):
+    # 全局时钟 t ∈ [0,1)：period=0.5 s 即步频 2 Hz，一个周期两条对角腿各撑一半
+    t = (sim_time % period) / period
+    phase = (t + GAIT_OFFSET) % 1.0              # 每条腿的相位
+    # 用 (cos, sin) 编码相位：标量相位在 0/1 交界处会"跳变"，网络难以学到周期性
+    ang = 2.0 * np.pi * phase
+    clock = np.stack([np.cos(ang), np.sin(ang)], axis=-1).reshape(-1)   # 8 维
+    # duty=0.5：相位前一半为支撑期。expected_contact 同时进观测与奖励
+    expected_contact = (phase &lt; duty).astype(np.float32)
+    return clock, expected_contact</code></pre>
+    <p>解读：这段代码是四足训练里"信息密度"最高的 10 行。三个设计点：第一，<code>duty=0.5</code> 决定了每条腿支撑与摆动的时间比，trot 用 0.5 最稳；调大到 0.7 会得到"更慢、更稳但步幅小"的步态，可以按负载情况选择。第二，相位用 cos/sin 二元组表达；标量 φ 在接近 1 时"归零"，MLP 会认为这是一个巨大的跳变；cos/sin 把周期映射到单位圆上，相邻相位在数值上也相邻，这是处理一切周期量的标准手法。第三，<code>expected_contact</code> 一份数据两用：进观测让策略知道"下一步该谁落地"，进奖励判断"实际触地是否与计划一致"，两处共用同一个真值来源，不会出现观测与奖励口径不一致的经典 bug。</p>
+
+    <p><strong>片段 2：周期性步态奖励（含相位门控）</strong></p>
+    <pre class="code"><code>def gait_reward(contacts, feet_vel_xy, foot_height, base_vel_xy, cmd,
+                expected_contact):
+    # contacts / expected_contact 均为 4 维布尔；摆动期定义为 expected_contact 为假
+    swing_mask = ~expected_contact.astype(bool)
+
+    # 1) 触地方案一致性：真实触地与期望一致才给分，直接压制"四条腿一起蹦"
+    r_contact = 0.3 * np.mean(contacts == expected_contact)
+
+    # 2) 摆动约束：既要抬起来（height 大于 6 cm），又要往前送（水平速度大于 0.15）
+    #    只给"离地"奖励会被拖腿策略钻空子：贴着地面蹭也算离地 1 mm
+    r_swing = 0.5 * np.mean(swing_mask * (foot_height &gt; 0.06)
+                            * (feet_vel_xy &gt; 0.15))
+
+    # 3) 支撑零滑移：接触状态下水平速度线性扣分，权重比抬脚项大
+    r_slip = -1.0 * np.mean((~swing_mask) * np.abs(feet_vel_xy))
+
+    # 4) 速度跟踪：指数核在误差 0.5 m/s 处衰减到 e^-1，温和引导的软跟踪
+    err = np.linalg.norm(cmd[:2] - base_vel_xy)
+    r_track = np.exp(-(err ** 2) / 0.25)
+    return float(r_contact + r_swing + r_slip + r_track)</code></pre>
+    <p>解读：四个子项对应四类退化解，逐项看。触地一致性项采用"匹配率"的软判据：早期策略偶尔踏错相位仍能拿到部分分数，避免训练一开始就零梯度。摆动约束里两个条件相乘是关键，高度够但速度不够（原地抬腿）或速度够但抬得太低（拖腿蹭）都拿不到分，这是与奖励黑客直接对抗的写法；如果把两个条件改成相加，拖腿策略可以靠"速度分"补偿"高度分"。滑移项在统计意义上对所有支撑腿取平均，注意 <code>~swing_mask</code> 与 <code>swing_mask</code> 乘的是两个互斥的集合，绝不会对同一条腿同时考核"抬起"和"不滑"。速度跟踪项的 σ=0.5（即代码中除以 0.25）是一个可调旋钮：σ 太小（如 0.05）策略在误差稍大时几乎拿不到梯度，学不动；σ 太大（如 1.0）策略对速度误差"无所谓"，跟踪精度上不去。经验值是目标速度量程的一半左右。</p>
+
+    <p><strong>片段 3：残差式关节目标映射</strong></p>
+    <pre class="code"><code># 12 个关节顺序：FL/FR/RL/RR × (外摆, 髋俯仰, 膝)
+Q_DEFAULT = np.array([0.0, 0.9, -1.8,   0.0, 0.9, -1.8,
+                      0.0, 0.9, -1.8,   0.0, 0.9, -1.8])   # 默认站姿（弧度）
+# 缩放体现关节差异：外摆小（0.1），髋/膝大（0.25–0.5），避免大动作直接失稳
+ACTION_SCALE = np.array([0.1, 0.25, 0.5,  0.1, 0.25, 0.5,
+                         0.1, 0.25, 0.5,  0.1, 0.25, 0.5])
+Q_MIN = np.array([-0.6, -0.4, -2.6,  -0.6, -0.4, -2.6,
+                  -0.6, -0.4, -2.6,  -0.6, -0.4, -2.6])
+Q_MAX = np.array([ 0.6,  2.4, -0.6,   0.6,  2.4, -0.6,
+                   0.6,  2.4, -0.6,   0.6,  2.4, -0.6])
+
+def policy_to_joint_targets(action):
+    action = np.clip(action, -1.0, 1.0)          # 保险丝：PPO 早期输出可能越界
+    # 残差形式：以默认站姿为基准添加偏移。什么都不学的时候机器人至少站得住
+    q_target = Q_DEFAULT + ACTION_SCALE * action
+    # 关节限位保护：物理引擎里撞限位会产生巨大恢复力，等于人为制造"爆力"事件
+    return np.clip(q_target, Q_MIN, Q_MAX)</code></pre>
+    <p>解读：残差映射的核心思想是"给策略一个好的出发点"。完全从零输出 12 维关节角，意味着探索空间包含大量"关节互相打架"的姿态，PPO 要在里面找到会站立的区域要花大量样本；以标定好的站姿为基准，探索自动围绕可行区域展开。逐关节缩放承担两层作用：数量级上限定单步动作幅度（外摆 0.1 rad、膝 0.5 rad），语义上告诉网络"哪些关节是主角"。注意 Q_DEFAULT 里膝是负角（−1.8 rad），四足膝盖"向后弯"的机构在 URDF 里通常以负角表示屈膝，如果你的机器人参照系不同，这个向量必须按实际 URDF 的零位重新标定，抄错会导致"开机瞬间腿反向折叠"。最后的限位裁剪（clip 到 Q_MIN/Q_MAX）不是可有可无的保险：数值上一旦撞限位，PhysX 的限位约束会用强弹簧把你顶回来，接触力尖峰可能直接触发骤停，训练日志里会看到莫名其妙的 reward 崩溃。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>观测里没有相位</strong>：策略要花数倍样本自己推断步态时序，常见结局是"蹦跳前进"或"四条腿同相"的伪步态。症状是触地匹配率长期低于 0.5。修复：加相位时钟（cos/sin）与期望触地。</li>
+      <li><strong>拖腿退化解</strong>：只奖励"抬脚"高度或"离地时间"，策略学会贴地蹭行，足端高度 1 cm、速度很慢也能拿分。修复：抬脚高度与水平速度必须同时约束（相乘），并给支撑滑移重罚。</li>
+      <li><strong>PD 增益不匹配</strong>：增益太低腿"软"、躯干下沉（高度从 0.35 掉到 0.28 m）；太高则关节高频抖动，扭矩罚项飙升。症状是训练初期就出现 20 Hz 以上的嗡嗡振荡。修复：按关节分别标定 K<sub>p</sub>、K<sub>d</sub>（K<sub>d</sub> 取 2·√K<sub>p</sub>·m 量级的临界阻尼值），并把增益随机化 ±20%。</li>
+      <li><strong>只给速度跟踪奖励</strong>：退化成"滑行"，四条腿僵直、靠高频小步抖动蹭地前进。修复：必须开触地一致性与滑移罚，后者是滑行策略的直接克星。</li>
+      <li><strong>终止条件太宽松</strong>：机器人都翻肚了还能继续拿时间分，学习信号被污染。修复：高度、姿态、接触力三条终止线全开，并确认终止回合的 return 严格为负（或零），不让"摔倒前多蹭几步"有任何好处。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把步态周期从 0.5 s 调整到 0.35 s 与 0.8 s 各训练一次，记录速度跟踪误差与足端滑移量的变化。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>周期短=步频高，响应快但对延迟敏感、滑移上升；周期长=步幅大，单腿支撑时间长、侧向稳定性下降。两组数据对比能直观看到"步频—稳定"的权衡。</div></details>
+      </li>
+      <li>删掉奖励中的支撑零滑移项（其余不变），训练后统计支撑腿水平速度分布，验证滑步退化解的出现。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>重点看支撑期的 |v_xy|（摆动期不必看）：滑步策略在支撑期会有持续 0.1–0.3 m/s 的"拖地带速"。</div></details>
+      </li>
+      <li>把相位观测的 cos/sin 编码换成单标量相位（0–1），对比收敛步数并解释数值跳变问题。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>关注 0.99 与 0.01 这两帧：物理上只差 0.02 周期，标量输入却差了 100 倍。观察策略在相位过零附近是否出现异常抬腿。</div></details>
+      </li>
+      <li>设计一个实验区分"策略真的学会了 trot"与"策略只是碰巧走得快"：写出你需要记录的三个物理量及其判定阈值。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>触地序列的对角配对率、单周期内四足触地切换次数、支撑期滑移速度，真 trot 三者分别为约 1.0、4、小于 0.05 m/s。</div></details>
+      </li>
+      <li>把 duty 从 0.5 调到 0.7（支撑期变长），预测步态形态、最大速度与能耗的变化方向，并设计验证实验。<span class="lv">★★★</span></li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>四足的稳定性来自支撑多边形：trot 用对角腿配对，把支撑退化为一条对角线，但步频高、摆动小，是工程上训练成本最低的步态。</li>
+      <li>相位时钟（cos/sin + 期望触地）是最关键的一行观测设计，让策略不必自己推断步态时序，收敛步数减少 3–5 倍。</li>
+      <li>周期性奖励用四项封死退化解：触地一致性对蹦跳、抬脚+前摆速度对拖腿、零滑移对滑步、指数核速度跟踪对原地不动。</li>
+      <li>动作用"默认站姿 + 逐关节缩放 × 策略输出"的残差形式，策略从可行解附近开始探索；最后必须做关节限位裁剪。</li>
+      <li>物理 200 Hz + 策略 50 Hz 是足式的常用配置；终止条件（高度/姿态/接触力）必须严格，避免"摔倒前多蹭几步"。</li>
+      <li>下一章把同样的框架搬到<strong>双足</strong>上：没有对角腿可以配对，支撑多边形退化到一条窄线，你会看到捕获点、落足点规划与更严格的奖励设计。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch043.html">← 第 043 章：实现移动机器人导航</a>
+    <a class="next" href="ch045.html">第 045 章：实现双足机器人行走 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

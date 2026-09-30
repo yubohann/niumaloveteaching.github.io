@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第049章 SAC的分布式实现 | 深度强化学习课程 · PPO、SAC 与多智能体系统</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 离策略方法与 SAC</span>
+    <span class="sep">/</span>
+    <span>第 049 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 离策略方法与 SAC</div>
+    <h1>第 049 章：SAC的分布式实现</h1>
+    <p class="lead">把"采集"与"学习"拆成两个角色：多个采集线程并行跑环境、往共享回放池里灌数据，主线程当学习器按积压的步数补更新。先测吞吐，再让整条流水线转起来。</p>
+    <ul class="meta">
+      <li>主题：分布式 RL 架构 / 生产者-消费者模式</li>
+      <li>关键公式：吞吐<sub>系统</sub> ≈ min(采集吞吐, 学习吞吐 ÷ UTD)</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 048 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解"采集器 + 学习器 + 共享回放池"的分布式 RL 标准架构，以及它与单线程训练循环的对应关系。</li>
+      <li>用 <code>threading</code> 实现线程安全回放池与多采集器，掌握锁粒度的取舍。</li>
+      <li>测量采集吞吐（steps/s）与 worker 数量的关系，理解 GIL 对 Python 线程加速比的限制。</li>
+      <li>监控学习器的"更新滞后"，理解 update-to-data（UTD）比在异步系统中的实际含义。</li>
+      <li>知道教学版（线程）与生产版（多进程/多机）的差别，以及迁移时要改哪几处。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>单线程 SAC 循环里，环境交互和梯度更新交替进行：环境步偏 numpy 计算，梯度步偏 torch 计算，两者经常互相空等。网络变大、环境变慢时瓶颈更明显，采集器闲着等更新、学习器闲着等数据。分布式训练把两个角色解耦：采集器只跑环境（可以并行），学习器只从回放池取数据做梯度（可以独占算力）。</p>
+    <p>这是 SAC 相对 PPO 的又一处工程优势：<strong>off-policy 的共享回放池天然是"生产者-消费者"队列</strong>，采集与学习不需要严格同步。真实系统（Ape-X、R2D2 类）用数十上百个采集进程配一个或几个学习器。本章用单进程多线程做教学简化：结构、指标、瓶颈都真实，只是把"进程/机器"换成了"线程"。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 生产者-消费者模型</h3>
+    <p>把回放池看作一条带容量的缓冲区：采集器是生产者，学习器是消费者，双方通过锁互斥访问。系统吞吐由两侧的较小者决定：</p>
+    <div class="formula">
+      吞吐<sub>系统</sub> ≈ min( 采集吞吐, 学习吞吐 ÷ UTD )
+      <span class="note">UTD（update-to-data）= 每条新数据平均触发多少次梯度更新</span>
+    </div>
+    <p>符号说明：采集吞吐是全体 worker 每秒收集的环境步数；学习吞吐是单机每秒能做的梯度更新次数；UTD 是学习器给自己定的"每步数据补几次更新"（本章取 1，即收集多少步就补多少次）。当采集吞吐超过学习吞吐时，回放池被填满、<strong>更新滞后持续增长</strong>，学习器成为瓶颈；反之回放池始终很浅、采集器空等。设计目标就是让两侧匹配：调 worker 数、批大小或 UTD。</p>
+
+    <div class="box key">
+      <span class="box-title">数值例子：用吞吐公式做一次配平</span>
+      <p>用一组假设数字走一遍配平计算（以本机实跑为准）。设 4 个采集线程合计能产出约 800 步/秒；学习器每次更新在 CPU 上耗时约 6.7 毫秒，即约 150 次更新/秒；UTD=1。</p>
+      <p><strong>系统吞吐</strong> ≈ min(800, 150 ÷ 1) = 150 步/秒。也就是说，即使采集器再快，整条流水线也只能按学习器的节奏前进，多余的步数全部堆进回放池。</p>
+      <p><strong>更新滞后</strong>的增长速率约为 800 − 150 = 650 步/秒：10 秒后滞后约 6500 步，回放池很快被填满。日志里看到"滞后持续增大 + 回放池满"，就是学习器成为瓶颈的签名。</p>
+      <p><strong>配平方案一</strong>：把 UTD 降到 0.2（每收集 5 步数据补 1 次更新），系统吞吐变成 min(800, 150÷0.2) = min(800, 750) = 750 步/秒，两侧接近平衡；代价是每条数据平均被学习的次数变少，样本效率需要重新评估。<strong>配平方案二</strong>：减少采集线程到 2 个，采集吞吐降到约 450 步/秒，仍高于 150，说明这台机器上学习器才是真正的稀缺资源，加采集器只会加剧积压。解读：先用吞吐基准测出两侧的原始能力，再用 UTD 与 worker 数把两者对齐，比盲目堆 worker 有效得多。</p>
+    </div>
+
+    <h3>2. 同步与异步</h3>
+    <ul>
+      <li><strong>同步式</strong>：所有采集器用同一版本参数采完一批，学习器更新后一起分发新参数。偏差小、易调试，但每轮最慢的 worker 决定整体速度。</li>
+      <li><strong>异步式</strong>：每个采集器自由推进，随时用最新参数（或周期性拉取）。吞吐高，但数据来自不同版本的策略，回放池里混着"过时经验"，需要重要性修正或容忍偏差。</li>
+    </ul>
+
+    <h3>2.1 三种组织方式的对照</h3>
+    <table>
+      <tr><th>维度</th><th>单线程交替</th><th>同步式并行</th><th>异步式并行（本章）</th></tr>
+      <tr><td>结构</td><td>采集与更新交替执行</td><td>所有采集器同版本参数，采完一轮再更新</td><td>各采集器自由推进，学习器按积压补更新</td></tr>
+      <tr><td>吞吐上限</td><td>两者互相空等，最低</td><td>受最慢 worker 约束</td><td>由两侧较小者决定，可满负荷</td></tr>
+      <tr><td>数据偏差</td><td>无</td><td>无</td><td>有：回放池混着不同版本的策略数据</td></tr>
+      <tr><td>实现复杂度</td><td>最低</td><td>中：需要屏障与参数分发</td><td>高：锁、停止标志、滞后监控</td></tr>
+      <tr><td>适用场景</td><td>小任务、调试</td><td>对可复现性要求高时</td><td>吞吐优先的大规模训练</td></tr>
+    </table>
+    <p>对照的结论是"按目标选结构"：本章的教学实现选择了异步式的骨架（共享回放池 + 积压驱动），因为它最贴近真实分布式系统；若把可复现性放在第一位，同步式更合适，代价是吞吐被最慢的采集器拖住。</p>
+
+    <h3>3. 为什么线程版只是教学</h3>
+    <p>CPython 的 GIL 让同一时刻只有一个线程执行字节码。numpy 与 torch 的底层 C 运算在多数情况下会释放 GIL，所以环境步进与网络前向能获得一定并行度；但 Python 层的循环、锁竞争、事件查询仍然串行。因此线程版加速比通常在 1.3×～2.5×，远低于 4 个线程的理想线性加速。<strong>真实部署用多进程绕开 GIL</strong>，代价是参数与数据需要序列化或共享内存。本章额外设 <code>torch.set_num_threads(1)</code>，避免 torch 内部线程池和采集线程抢核。</p>
+    <p>从线程版迁移到进程版，需要改动的其实是三处：其一，共享回放池从"内存共享 + 锁"改为"每进程本地池 + 定期向主进程传输"，传输内容就是 (s, a, r, s′, done) 五元组，序列化开销成为新的成本项；其二，策略参数的同步从"隐式共享"变为"显式广播"，采集进程要么周期性拉取最新参数，要么接受参数延迟（真正的异步算法就是后者）；其三，统计量（总步数、回合回报）不能再靠共享字典，需要汇总通道。三处改完，架构就从"教学版"升级为"可横向扩展版"，算法逻辑一行不用动。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+
+    <h3>数据流</h3>
+    <p>运行分两个阶段。<strong>阶段一（吞吐基准）</strong>：用纯随机动作测量 1 与 W 个采集器的 steps/s，不涉及学习，单独启停线程。<strong>阶段二（训练）</strong>：启动 W 个采集线程（每个独立环境、共享策略与回放池），主线程扮演学习器，每轮读取总步数、计算积压、最多补 64 次更新后 look 循环；每 2000 步评估并打印吞吐、回放池大小与"更新滞后"。结束后停线程、汇总结论。</p>
+
+    <h3>模块划分</h3>
+    <table>
+      <tr><th>组件</th><th>职责</th><th>关键点</th></tr>
+      <tr><td><code>SharedReplay</code></td><td>带锁的环形回放池</td><td><code>add</code> 与 <code>sample</code> 都在锁内完成；<code>sample</code> 里 <code>.copy()</code> 防止采样后数组被覆写</td></tr>
+      <tr><td><code>collector_worker</code></td><td>每线程一个环境，策略采样并写池</td><td>每 20 步检查一次停止标志；回合回报写进共享 <code>stats</code></td></tr>
+      <tr><td><code>benchmark_throughput</code></td><td>纯随机动作测量 1 vs W 个采集器的 steps/s</td><td>与训练逻辑解耦</td></tr>
+      <tr><td>学习器主循环</td><td>按积压步数补更新，定期评估</td><td>每轮最多补 64 次更新，避免长时间占住 GIL</td></tr>
+    </table>
+
+    <h3>关键超参数</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用与取值理由</th></tr>
+      <tr><td><code>--workers</code></td><td>4</td><td>采集线程数；与 CPU 核数和环境开销相关</td></tr>
+      <tr><td><code>--bench-workers</code></td><td>1,4</td><td>吞吐基准的对照点</td></tr>
+      <tr><td><code>--bench-steps</code></td><td>1500</td><td>每个采集器在基准阶段的步数，避免测得太短噪声大</td></tr>
+      <tr><td><code>--start-steps</code></td><td>1000</td><td>随机探索预算，按 worker 数均分给各线程</td></tr>
+      <tr><td><code>--max-steps</code></td><td>16000</td><td>训练阶段总步数上限；评估按总步数触发</td></tr>
+      <tr><td><code>--buffer-size</code> / <code>--batch-size</code></td><td>100000 / 256</td><td>与前面章节一致，保证回放池够深、批量稳定</td></tr>
+    </table>
+
+    <p>两个阶段的划分还有一个测试方法上的好处：吞吐基准用纯随机动作，完全不依赖学习器的状态，因此可以单独复现、单独比较机器性能；训练阶段的吞吐则混着锁竞争与 GIL 调度，两者相减才能估算"学习器抢走了多少采集能力"。若训练吞吐远低于基准吞吐，说明竞争开销显著，此时优先调小学习器的每轮更新上限或减少 worker 数，把环境本身太慢的嫌疑放在最后。</p>
+
+    <h3>与前一章的差异点</h3>
+    <ul>
+      <li>前几章都是"单线程采样循环"；本章把采集循环搬进 <code>--workers</code> 个线程，新增共享回放池与生产者-消费者协调。</li>
+      <li>新增吞吐基准阶段与"更新滞后"指标，这是分布式系统独有的观测量。</li>
+      <li>回放池从无锁单线程结构变成带锁结构，<code>sample</code> 增加 <code>.copy()</code> 保证线程安全。</li>
+      <li>固定 <code>torch.set_num_threads(1)</code>，让吞吐对比不受 torch 内部并行度干扰。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：一把锁保护的回放池</strong></p>
+    <pre class="code"><code>class SharedReplay:
+    """用一把锁保护的环形回放池：写入与采样都串行化，保证线程安全。"""
+
+    def __init__(self, capacity: int, obs_dim: int, act_dim: int):
+        self.capacity = capacity
+        self.obs = np.zeros((capacity, obs_dim), dtype=np.float32)
+        self.next_obs = np.zeros((capacity, obs_dim), dtype=np.float32)
+        self.act = np.zeros((capacity, act_dim), dtype=np.float32)
+        self.rew = np.zeros((capacity, 1), dtype=np.float32)
+        self.done = np.zeros((capacity, 1), dtype=np.float32)
+        self.ptr = 0
+        self.size = 0
+        self.lock = threading.Lock()         # 全部读写都在这一把锁内完成
+
+    def add(self, obs, act, rew, next_obs, done) -&gt; None:
+        with self.lock:
+            i = self.ptr                     # 临界区只有 5 次数组赋值，极短
+            self.obs[i] = obs
+            self.act[i] = act
+            self.rew[i] = rew
+            self.next_obs[i] = next_obs
+            self.done[i] = done
+            self.ptr = (self.ptr + 1) % self.capacity
+            self.size = min(self.size + 1, self.capacity)
+
+    def sample(self, batch_size: int) -&gt; dict:
+        with self.lock:
+            idx = np.random.randint(0, self.size, size=batch_size)
+            return {                         # .copy()：离开锁后数据也不会被环形覆写
+                "obs": torch.as_tensor(self.obs[idx].copy()),
+                "act": torch.as_tensor(self.act[idx].copy()),
+                "rew": torch.as_tensor(self.rew[idx].copy()),
+                "next_obs": torch.as_tensor(self.next_obs[idx].copy()),
+                "done": torch.as_tensor(self.done[idx].copy()),
+            }</code></pre>
+    <p>解读：<strong>（1）</strong>锁的粒度是设计的核心：<code>add</code> 临界区只有 5 次数组赋值（微秒级），<code>sample</code> 在锁内完成索引抽样与拷贝，<strong>绝不能在持锁期间做 torch 前向或优化器更新</strong>，否则采集器会被阻塞到秒级。<strong>（2）</strong><code>.copy()</code> 不能省：<code>self.obs[idx]</code> 本身是副本，但一旦有人把接口改成切片 <code>self.obs[a:b]</code> 就会返回视图，环形覆写会让训练"边训边变"。显式拷贝是防御性写法。<strong>（3）</strong>返回的已经是 torch 张量，学习器拿到即可用；rolling buffer 的 <code>size</code> 与 <code>ptr</code> 都在锁内维护，读到的状态永远自洽。</p>
+
+    <p><strong>片段 2：采集线程，每 20 步看一眼停止标志</strong></p>
+    <pre class="code"><code>def collector_worker(worker_id: int, env_id: str, seed: int, agent: SAC,
+                     buffer: SharedReplay, stats: dict, args,
+                     stop_event: threading.Event) -&gt; None:
+    """单个采集器：独立环境 + 共享策略 + 共享回放池。"""
+    env = make_env(env_id, seed + worker_id * 1000)      # 每个 worker 独立种子
+    obs, _ = env.reset(seed=seed + worker_id * 1000)
+    ep_ret = 0.0
+    local_steps = 0
+    random_steps = max(args.start_steps // max(args.workers, 1), 10)
+
+    while not stop_event.is_set():
+        # 每 20 步检查一次停止标志，减少事件查询开销
+        for _ in range(20):
+            if stop_event.is_set():
+                break
+            if local_steps &lt; random_steps:
+                action = env.action_space.sample()       # 预热期随机探索
+            else:
+                action = agent.act(obs, deterministic=False)  # no_grad 推理
+            next_obs, rew, terminated, truncated, _ = env.step(action)
+            buffer.add(obs, action, rew, next_obs, float(terminated))
+            obs = next_obs
+            ep_ret += rew
+            local_steps += 1
+            with stats["lock"]:
+                stats["total_steps"] += 1                # 学习器靠它判断预算
+                if terminated or truncated:
+                    stats["ep_returns"].append(ep_ret)
+                    ep_ret = 0.0
+            if terminated or truncated:
+                obs, _ = env.reset()
+                ep_ret = 0.0</code></pre>
+    <p>解读：<strong>（1）</strong>每个 worker 用 <code>seed + worker_id * 1000</code> 的独立种子，保证轨迹多样、互不重合。<strong>（2）</strong>内层 for 循环一次跑 20 步再查 <code>stop_event</code>：事件查询本身有开销，逐站查询会拖慢采集，20 步是一个实测舒服的折中。<strong>（3）</strong>策略推理走 <code>agent.act</code>（内部 <code>no_grad</code>）且<strong>不</strong>加锁：多线程共享同一份参数做前向，在 torch 下是安全的读操作，这也是"共享策略"能用内存换性能的地方。<strong>（4）</strong><code>total_steps</code> 与 <code>ep_returns</code> 的写入都在 <code>stats["lock"]</code> 内，统计量也必须线程安全，否则计数器会丢更新。<strong>（5）</strong>注意 reset 与 ep_ret 清零做了两次（锁内记录、锁外复位），顺序不能乱。</p>
+
+    <p><strong>片段 3：学习器按"积压"打工，不抢 GIL</strong></p>
+    <pre class="code"><code>    n_updates = 0
+    last_steps = 0
+    next_eval_at = args.eval_every
+
+    while stats["total_steps"] &lt; args.max_steps:
+        with stats["lock"]:
+            total = stats["total_steps"]
+        # 学习器节奏：新收集多少步，就补多少次更新（update-to-data ≈ 1）
+        backlog = total - last_steps
+        if buffer.size &gt;= max(args.start_steps, args.batch_size) and backlog &gt; 0:
+            n_todo = min(backlog, 64)  # 每次循环最多补 64 次，避免长时间占住 GIL
+            for _ in range(n_todo):
+                agent.update(buffer.sample(args.batch_size), args)
+                n_updates += 1
+            last_steps += n_todo
+        else:
+            time.sleep(0.002)  # 数据不够时让出 CPU 给采集线程
+
+        if total &gt;= next_eval_at:
+            eval_ret = evaluate(agent, env, args.eval_episodes)
+            eval_returns.append(eval_ret)
+            elapsed = time.time() - t_start
+            print(f"[学习器] 步数 {total:6d} | 更新 {n_updates:6d} | 回放池 {buffer.size:6d} | "
+                  f"吞吐 {total / elapsed:7.1f} steps/s | 评估 {eval_ret:8.1f} | "
+                  f"更新滞后 {total - last_steps:5d}")
+            while next_eval_at &lt;= total:
+                next_eval_at += args.eval_every</code></pre>
+    <p>解读：<strong>（1）</strong><code>backlog = total − last_steps</code> 就是"更新滞后"：环境已经收集了多少步、学习器还没补的账。它与 UTD 的关系是：每轮把 backlog 消化掉一部分，长期均值反映两侧速率的差。<strong>（2）</strong><code>n_todo = min(backlog, 64)</code> 是本章最重要的工程细节：没有这个上限，学习器会一口气跑几百次更新、长时间占住 GIL，采集线程几近停摆，吞吐反而崩掉。<strong>（3）</strong>数据不够时 <code>time.sleep(0.002)</code> 主动让出 CPU，这是 Python 线程协作的礼节，比空转 loop 友善得多。<strong>（4）</strong>评估在主线程做（复用训练环境对象），评估间隔用 <code>next_eval_at</code> 累加推进，跨多个评估点时 while 循环一次补足，避免漏评。</p>
+
+    <p>完整可运行脚本（附录）：<a href="../code/ch049.py" download>code/ch049.py</a></p>
+    <pre class="sh"><code>python code/ch049.py                            # 基准 + 4 采集器训练 16000 步，CPU 约 3–5 分钟
+python code/ch049.py --quick                    # 快速跑通：约 40 秒
+python code/ch049.py --workers 8 --bench-workers 1,8   # 对比 1 与 8 个采集器</code></pre>
+    <p>预期：<strong>纯采集吞吐随 worker 数提升，但加速比低于线性（约 1.5×～2.5×），这是 GIL 与锁竞争的真实代价</strong>；学习器吞吐低于纯采集，"更新滞后"稳定在几百到上千步，回放池持续被填满；评估回报曲线照常爬升，说明异步采集不影响学习正确性。以实跑为准，不同机器的核数与调度差异会让数字波动。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>采样返回的数组是池内视图</strong>：花式索引 <code>self.obs[idx]</code> 会返回副本、看似安全；改成切片就变成视图，环形覆写让训练数据"边训边变"。统一显式 <code>.copy()</code> 最省心。</li>
+      <li><strong>持锁做 torch 前向</strong>：把 <code>agent.update</code> 包进锁里，采集器全部饿死。锁只保护共享数据结构的读写，计算一律放锁外。</li>
+      <li><strong>忘记 <code>torch.set_num_threads(1)</code></strong>：torch 默认按核数开内部线程，与采集线程严重超订，吞吐可能反而比单线程低。</li>
+      <li><strong>退出时没设 <code>daemon=True</code> 或不 <code>join(timeout)</code></strong>：某个 worker 卡在环境步里时主程序无法退出。daemon 线程 + 超时 join 是常见兜底组合。</li>
+      <li><strong>学习器一次补太多更新</strong>：没有 64 次上限，主线程长时间占住 GIL，采集吞吐骤降；日志上表现为"吞吐越来越低 + 滞后越来越大"同时出现。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把 <code>--bench-workers</code> 改成 <code>1,2,4,8</code>，画出吞吐-采集器数量曲线。它从哪一点开始不再增长？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>只改参数。Pendulum 的 step 极轻，GIL 与调度开销占比高，观察加速比的边际收益，通常在 4 个采集器之后就迅速变小。</div></details>
+      </li>
+      <li>把学习器每轮的更新上限从 64 改成 512，跑到结束。预测"更新滞后"与吞吐的变化，再验证。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>上限越大，主线程一次占住 GIL 越久，采集线程被饿住，吞吐反而可能下降。对比修改前后的 steps/s 与滞后均值。</div></details>
+      </li>
+      <li>让每个采集器维护"本地策略副本"：worker 每 500 步从共享策略 <code>load_state_dict</code> 复制一次，其余时间用本地副本推理。这引入参数延迟，观察评估回报的变化。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>本地副本可用 <code>copy.deepcopy(agent.policy)</code>，推理时不受主线程更新影响。真正异步系统（Ape-X）就这样工作；延迟过大时早期评估回报会变差。</div></details>
+      </li>
+      <li>把共享回放池改成 <code>collections.deque(maxlen=N)</code> 加读写分离的两把锁，对比吞吐与代码复杂度。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>deque 的 append 是 O(1)，但随机访问 <code>deque[i]</code> 是 O(n)，采样要先转 list，这是"数据结构选型影响吞吐"的实例。实测对比后你会更理解 numpy 环形数组的设计动机。</div></details>
+      </li>
+      <li>用 <code>multiprocessing</code> 把采集器改成两个进程（环境与推理在子进程，回放池用管道传输），与本实现对比吞吐，解释进程方案为什么能突破 GIL。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>子进程各自初始化环境与策略，通信只传 (s,a,r,s′,done) 五元组；Windows 下 spawn 需要 <code>if __name__ == "__main__"</code> 保护与可序列化函数。目标在于测出"进程数 2 的吞吐是否超过线程数 4"，不必写出完整版实现。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>分布式 SAC 的标准结构是<strong>生产者（采集器）/ 消费者（学习器）+ 共享回放池</strong>，off-policy 特性让它天然适合这种解耦。</li>
+      <li>系统吞吐由两侧的较小者决定，UTD 与 worker 数量是配平速率的主旋钮；"更新滞后"是判断瓶颈在哪里的直接指标。</li>
+      <li>本章实现完成了线程安全池、多采集器、积压驱动的学习器与吞吐基准；加速比低于线性是 GIL 的真实代价。</li>
+      <li>异步采集不改变 SAC 的算法正确性，但真实系统要注意参数版本延迟带来的分布偏差。</li>
+      <li>配平计算是本章的决策工具：系统吞吐 = min(采集, 学习 ÷ UTD)，滞后增长速率 = 采集 − 学习 ÷ UTD；两个式子就能判断该加 worker 还是该降 UTD。</li>
+      <li>从线程到进程的迁移只动三处：回放池传输方式、参数广播方式、统计汇总方式；算法核心不需要任何修改。</li>
+      <li>瓶颈的读法：滞后持续增大说明学习器落后，滞后长期接近 0 说明采集器供不上；两种情形对应完全相反的调参方向。</li>
+      <li>下一章把"调参"本身自动化：用短试跑做随机搜索，把超参数组合的选择变成可复现的流程。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch048.html">← 第 048 章：SAC的梯度裁剪</a>
+    <a class="next" href="ch050.html">第 050 章：SAC的自动超参数搜索 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

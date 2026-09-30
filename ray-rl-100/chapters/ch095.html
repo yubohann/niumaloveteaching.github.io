@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第095章 训练平台化：作业编排与资源隔离 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第五篇 · 训练工程与系统进阶</span>
+    <span class="sep">/</span>
+    <span>第 095 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第五篇 · 训练工程与系统进阶</div>
+    <h1>第 095 章：训练平台化：作业编排与资源隔离</h1>
+    <p class="lead">一句话：本章设计训练作业的编排机制：作业规格的数据模型、生命周期状态机、整组调度算法与资源隔离边界，全部落在可验证的数据结构与转换规则上。</p>
+    <ul class="meta">
+      <li>主题：平台化 / 作业编排（Job Orchestration）</li>
+      <li>关键机制：作业规格模式、状态机、整组调度（Gang Scheduling）、隔离边界</li>
+      <li>预计学时：65 分钟</li>
+      <li>前置章节：第 094 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>能定义一个训练作业规格（Job Spec）的数据模型，覆盖资源、入口、失败策略与检查点指引四类字段。</li>
+      <li>掌握作业生命周期的状态机设计：状态集合、转换条件、持久化与恢复。</li>
+      <li>理解整组调度的原理与死锁规避：资源包一次获取、超时释放、碎片整理。</li>
+      <li>掌握隔离机制的分层：放置组级别的预算隔离、进程级配额、临时目录与端口的隔离。</li>
+      <li>会设计抢占路径：信号、检查点、资源释放三段的协调，以及提交侧的幂等去重。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>三条端到端流水线在单任务视角下已经完整，但一组训练任务共享集群时会互相干扰：资源申请缺乏统一口径导致超卖、某个任务异常退出后放置组泄漏、抢占时未落盘造成重算。<strong>平台化的任务是把这些"任务之间的接口"定义成显式的数据结构与状态转换：作业规格约束能申请什么，状态机约束何时申请与释放，调度算法约束资源如何分配，隔离机制约束干扰如何被限制。</strong></p>
+    <p>本章坚持技术视角：不讨论职责分工与流程制度，只讨论数据模型、算法与机制。判断设计优劣的标准同样技术化：状态转换是否完备、资源账目是否守恒（申请减释放等于占用）、隔离违规是否可检测。这三个标准贯穿全章。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p><strong>编排系统的核心是三张账：作业规格给出的资源请求账、状态机维护的生命周期账、隔离机制保障的占用账；三张账一致时系统可预测，不一致时产生泄漏与死锁。</strong>本节按数据模型、状态机、调度与隔离依次展开。</p>
+
+    <h3>1. 作业规格的数据模型</h3>
+    <p>作业规格是提交方与编排方之间的契约，字段按四类组织：</p>
+    <table>
+      <tr><th>类别</th><th>字段示例</th><th>校验规则</th></tr>
+      <tr><td>身份与入口</td><td>job_id、entrypoint、参数、环境镜像</td><td>job_id 全局唯一；入口可执行</td></tr>
+      <tr><td>资源请求</td><td>资源包列表（CPU、GPU、内存、自定义标签）</td><td>包内资源为正数；总量不超过配额</td></tr>
+      <tr><td>失败策略</td><td>max_retries、restart_window、优先级</td><td>与断路器参数一致（第 090 章）</td></tr>
+      <tr><td>状态指引</td><td>检查点目录、恢复偏好（从头或续跑）</td><td>目录可写；恢复指引与检查点协议一致</td></tr>
+    </table>
+    <p>规格的两条纪律：<strong>其一，提交幂等</strong>，以 job_id 为去重键，重复提交返回既有作业，新建请求被去重拦截；<strong>其二，规格不可变</strong>，变更通过新版本规格与新作业表达，运行中的作业规格保持冻结。可变规格会让"状态恢复后按哪版规格继续"出现二义性，破坏可复现性。</p>
+
+    <h3>2. 生命周期状态机</h3>
+    <p>作业状态集合取九个：提交（Submitted）、校验（Validating）、排队（Queued）、资源分配中（Provisioning）、运行（Running）、检查点中（Checkpointing）、成功（Succeeded）、失败（Failed）、被抢占（Preempted）。转换规则按事件驱动：</p>
+    <div class="formula">
+      Submitted → Validating → Queued → Provisioning → Running → Succeeded
+      <span class="note">任一步校验失败或超时进入 Failed；Running 收到抢占信号先转 Checkpointing，落盘完成后转 Preempted 再回 Queued</span>
+    </div>
+    <p>状态机的三个设计要点：<strong>转换完备</strong>，每个状态对每类事件都有明确去向，未定义事件记录为异常，静默忽略会掩盖设计缺口；<strong>持久化</strong>，每次转换先落盘再执行副作用，编排器自身崩溃后可按日志重建状态；<strong>终态收敛</strong>，Succeeded、Failed、Preempted 之外的所有状态都有超时兜底，防止作业永久停在中间态。被抢占作业回队列时保留检查点指引，重调度后从最近有效检查点恢复。</p>
+
+    <h3>3. 整组调度与死锁规避</h3>
+    <p>训练作业的资源包之间存在强耦合（采样进程与学习器必须同时就绪），逐个获取会形成部分占用：先拿到 CPU 包的任务占着资源等待 GPU 包，而 GPU 被另一个等待 CPU 的任务占住，双方都无法前进，即资源死锁。<strong>整组调度（Gang Scheduling）一次申请全部资源包，全部满足才提交，任一不满足则整体等待，从机制上消除部分占用。</strong></p>
+    <p>调度算法在可行节点集合上做装箱（Bin Packing）：按剩余容量降序放置较大的资源包，优先填满已开使用的节点，减少碎片。避免碎片化的两个辅助手段：预留（Reservation），为排队中的大作业预留未来释放的资源；回填（Backfill），在小作业不拖延大作业预定开始时间的前提下插空运行。工程实现中整组申请用放置组承载（第 089 章），等待设显式超时，超时把作业放回队列并让出位置，防止队列头部阻塞。</p>
+
+    <h3>4. 隔离边界的分层</h3>
+    <p>隔离的目标是让作业的异常与负载不外溢。技术手段按边界分层：</p>
+    <ul>
+      <li><strong>预算隔离</strong>：作业的总资源由放置组的资源包界定，组件超出声明部分无法获得调度；分数资源的记账由调度器保证不超卖。</li>
+      <li><strong>执行隔离</strong>：每个作业的进程组独立，环境变量、临时目录与本地端口中不共享可写路径；检查点目录按作业独占命名空间，避免覆盖。</li>
+      <li><strong>数据隔离</strong>：对象存储的键前缀按作业划分；共享缓存（如数据集缓存）只读挂载，写入路径重定向到作业私有空间。</li>
+      <li><strong>故障隔离</strong>：节点级故障域与作业的副本分布联动（第 086、089 章的长尾与替换逻辑），故障节点上的作业组件按策略重启，整作业取消只作为兜底。</li>
+    </ul>
+    <p>隔离的验证方式是注入测试：作业 A 故意写坏自己的检查点目录、占满声明的显存，观察作业 B 的状态与吞吐是否受影响。<strong>无法被注入测试证伪的隔离声明，不构成保证。</strong></p>
+
+    <h3>5. 抢占路径与幂等提交</h3>
+    <p>抢占是优先级调度的必要机制，其正确性由三段协调保证：<strong>通知段</strong>，编排器先向作业发送信号并等待确认，不直接终止进程；<strong>落盘段</strong>，作业收到信号后完成一次检查点写入（第 090 章的抢占处理器）并回报；<strong>释放段</strong>，编排器收到回报后释放放置组与资源，未在超时内回报则强制回收并记录异常。<strong>三段之间的顺序不可交换：先释放资源会让落盘缺少资源而失败，先落盘后通知则可能写入正在被回收的目录。</strong>幂等提交与抢占配套：被抢占作业回队列后重新调度，可能得到不同节点集合，启动逻辑按幂等设计（检查点存在则续跑），重复执行不产生副作用。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>编排机制的实现分六步，产物是规格模式、状态机定义与调度器三件套。</p>
+    <ol>
+      <li><strong>定义规格模式</strong>：字段、类型与校验规则；提供模式版本号，兼容旧版提交。</li>
+      <li><strong>实现状态机</strong>：状态与事件表、转换函数、持久化格式（追加日志加快照）。</li>
+      <li><strong>接入整组调度</strong>：放置组承载、装箱排序、等待超时与回队列。</li>
+      <li><strong>铺设隔离边界</strong>：目录、端口、对象键前缀的命名单一来源，来自规格中的 job_id。</li>
+      <li><strong>实现抢占三段</strong>：通知、落盘确认、释放，以及超时兜底。</li>
+      <li><strong>注入测试</strong>：溢出、异常退出、重复提交、抢占各一条用例，验证账目守恒。</li>
+    </ol>
+    <h3>状态与事件对照表</h3>
+    <table>
+      <tr><th>当前状态</th><th>事件</th><th>下一状态</th><th>副作用</th></tr>
+      <tr><td>Validating</td><td>校验通过</td><td>Queued</td><td>入队，记录提交时间</td></tr>
+      <tr><td>Queued</td><td>资源满足</td><td>Provisioning</td><td>创建放置组</td></tr>
+      <tr><td>Provisioning</td><td>就绪</td><td>Running</td><td>启动入口进程</td></tr>
+      <tr><td>Running</td><td>收到抢占信号</td><td>Checkpointing</td><td>转发信号，计时等待</td></tr>
+      <tr><td>Checkpointing</td><td>落盘确认</td><td>Preempted</td><td>释放放置组，回队列</td></tr>
+      <tr><td>任意中间态</td><td>超时</td><td>Failed</td><td>释放资源，记录超时原因</td></tr>
+    </table>
+    <div class="box warn">
+      <span class="box-title">与上一章的差异</span>
+      <p>第 094 章在单个任务内部组织策略与采样；本章处理任务之间的资源契约：规格是"任务向平台说什么"，状态机是"平台向任务保证什么"，隔离是"任务之间互不看见什么"。三层合起来构成多任务共存的最小可信结构。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>以下片段基于 Ray 2.x 时期的通用写法，接口随版本演进，以对应版本的官方文档为准。</p>
+
+    <p><strong>片段 1：作业规格的数据模型与校验</strong></p>
+    <pre class="code"><code>from dataclasses import dataclass, field
+
+@dataclass(frozen=True)
+class JobSpec:
+    """作业规格：提交方与编排方的契约。
+    frozen=True 保证不可变：变更通过新版本规格表达，运行中冻结。"""
+    job_id: str                                  # 全局唯一，兼作幂等去重键
+    entrypoint: str                              # 可执行入口
+    bundles: tuple = field(default_factory=tuple)  # 资源包列表，整组调度单元
+    priority: int = 0
+    max_retries: int = 3
+    checkpoint_dir: str = ""                     # 作业私有检查点命名空间
+    resume_from: str = ""                        # 恢复指引：空串表示从头开始
+
+    def validate(self):
+        """校验规则集中在一处：提交入口与恢复路径共用同一判据。"""
+        assert self.job_id and self.entrypoint, "身份字段不可为空"
+        assert self.bundles, "至少一个资源包"
+        for b in self.bundles:
+            # 资源包只允许正数：负数或零会让记账出现倒欠
+            assert all(v > 0 for v in b.values()), f"非法资源包 {b}"
+        # 检查点目录以 job_id 为前缀：隔离边界由命名单一来源保证
+        assert self.checkpoint_dir.startswith(self.job_id), "检查点目录须专属"
+        return True</code></pre>
+    <p>解读：规格模型把契约固化在类型层。<strong>（1）</strong><code>frozen=True</code> 从语言层阻止运行中修改：状态恢复的"按哪版规格"二义性被结构消除。<strong>（2）</strong>job_id 兼任幂等键与隔离前缀：一个是提交语义，一个是存储语义，同一标识贯穿两处保证一致性。<strong>（3）</strong>校验断言把非法输入拦在入队之前；资源包为正的检查对应资源记账守恒：任何负值都会让"申请减释放"的账目失真。</p>
+
+    <p><strong>片段 2：状态机转换函数</strong></p>
+    <pre class="code"><code>TRANSITIONS = {
+    ("submitted", "validate_ok"): "validating",
+    ("validating", "passed"): "queued",
+    ("queued", "resources_ready"): "provisioning",
+    ("provisioning", "ready"): "running",
+    ("running", "preempt_signal"): "checkpointing",
+    ("checkpointing", "saved"): "preempted",
+    ("running", "finished"): "succeeded",
+    ("running", "error"): "failed",
+}
+TERMINAL = {"succeeded", "failed", "preempted"}
+
+def transition(state, event, journal, now):
+    """纯函数转换：先落盘再返回新状态，编排器崩溃后可按日志重建。
+    未定义事件不静默忽略：记录异常并保持原状态，交由对账处理。"""
+    key = (state, event)
+    if key not in TRANSITIONS:
+        # 未定义转换是设计缺口或非法事件，日志必须留痕
+        journal.append({"at": now, "from": state, "event": event,
+                        "result": "rejected"})
+        return state
+    nxt = TRANSITIONS[key]
+    journal.append({"at": now, "from": state, "event": event,
+                    "result": "ok", "to": nxt})
+    if nxt in TERMINAL:
+        # 终态统一释放资源：账目守恒的收口点
+        journal.append({"at": now, "action": "release_resources"})
+    return nxt</code></pre>
+    <p>解读：状态机以转换表加纯函数实现。<strong>（1）</strong>转换表把全部合法路径集中可见；未定义事件记录为 <code>rejected</code> 并保持原状态，供对账扫描发现设计缺口。<strong>（2）</strong>先写日志再返回新状态：编排器自身崩溃后，日志是重建状态的唯一依据，这一步的顺序不可交换。<strong>（3）</strong>终态释放资源集中在一个收口点，任何路径进入终态都会记账释放，防止资源泄漏到后续作业。</p>
+
+    <p><strong>片段 3：整组调度与超时回收</strong></p>
+    <pre class="code"><code>import ray
+from ray.util.placement_group import placement_group, remove_placement_group
+
+def schedule_job(spec, timeout_s=600):
+    """整组调度：一次申请全部资源包，全部就绪才提交。
+    超时回收：把队列头部阻塞转化为显式失败，避免死等。"""
+    pg = placement_group(list(spec.bundles), strategy="PACK")
+    try:
+        # ready 等待期间不占用其他资源：部分就绪不会形成占用死锁
+        ray.get(pg.ready(), timeout=timeout_s)
+    except ray.exceptions.GetTimeoutError:
+        # 超时路径：移除放置组并让出队列位置，由重试策略决定后续
+        remove_placement_group(pg)
+        return {"job_id": spec.job_id, "state": "queued", "reason": "timeout"}
+    # 就绪后把放置组与规格一起移交启动器：组件按 bundle 索引绑定
+    return {"job_id": spec.job_id, "state": "provisioning",
+            "placement_group": pg, "spec": spec}
+
+def gc_orphans(active_job_ids, listed_groups):
+    """孤儿回收：平台级对账，清理没有活跃作业对应的放置组。
+    对账口径为"申请减释放等于占用"，是账目守恒的定期校验。"""
+    removed = []
+    for group, owner in listed_groups:
+        if owner not in active_job_ids:
+            remove_placement_group(group)
+            removed.append(owner)
+    return removed</code></pre>
+    <p>解读：调度函数围绕死锁规避组织。<strong>（1）</strong>资源包一次性提交，等待期间不持有任何部分资源：部分占用的前提被消除，跨作业的循环等待无从形成。<strong>（2）</strong>超时路径显式回收放置组并回队列：队列头部的大作业不会永久阻塞后续小作业，回填的空间由此释放。<strong>（3）</strong>孤儿回收是第二道防线：进程被强杀等路径可能跳过显式释放，定期对账以"申请减释放等于占用"的口径清理，保证长期运行下资源账目不漂移。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>逐个申请资源包</strong>：进程持有部分资源等待其余资源，与另一作业形成循环等待。修复：整组申请，任一不满足则整体等待。</li>
+      <li><strong>放置组随进程退出才释放</strong>：进程被强杀时资源残留。修复：终态统一释放加定期孤儿对账。</li>
+      <li><strong>检查点目录共享</strong>：两个同名作业写同一路径互相覆盖。修复：目录以 job_id 为前缀，校验强制专属。</li>
+      <li><strong>抢占直接终止进程</strong>：跳过落盘段，重算量放大。修复：通知、落盘确认、释放三段有序执行，超时兜底。</li>
+      <li><strong>状态机缺失超时事件</strong>：作业停在 Provisioning 等中间态永久占位。修复：所有非终态定义超时转换，超时进 Failed 并释放资源。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>设计题：为"3 类训练任务（单机小任务、单机 GPU 任务、多机分布式任务）"设计资源包模板与整组调度排序策略，说明碎片控制方式。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>按资源包大小降序调度；大任务用预留或回填；小任务包内 CPU 与 GPU 分离声明。</div></details>
+      </li>
+      <li>预测题：把整组调度的超时从 600 秒缩短到 60 秒。预测队列吞吐、大作业成功率与碎片状态的变化。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>短超时让出位置频繁，小作业吞吐上升；大作业等待重叠降低、成功率下降；碎片因频繁重排而波动加大。</div></details>
+      </li>
+      <li>分析题：解释"先释放资源再落盘"为什么会失败，并给出一种在资源紧张时仍能完成落盘的替代设计。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>写检查点需要 CPU 与磁盘缓冲；替代方案是编排器延迟释放一个短窗口，或检查点写入独立的共享存储服务。</div></details>
+      </li>
+      <li>验证题：为幂等提交设计一组测试用例：重复提交、提交后立即崩溃、抢占后重试、规格版本升级，说明每个用例的预期状态序列。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>重复提交返回既有作业；提交后崩溃靠日志重建；抢占重试进 Preempted 再回 Queued；版本升级生成新作业而旧作业冻结。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>作业规格按身份入口、资源请求、失败策略与状态指引四类字段建模；不可变与幂等是两条硬纪律。</li>
+      <li>状态机以转换表与纯函数实现：先落盘再执行副作用，未定义事件留痕，全状态有超时兜底。</li>
+      <li>整组调度消除部分占用，从机制上规避死锁；超时回收与孤儿对账维护账目守恒。</li>
+      <li>隔离分预算、执行、数据与故障四层；隔离声明必须能被注入测试证伪。</li>
+      <li>下一章处理编排产生的大量实验数据：组织方式、索引与检索。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch094.html">← 第 094 章：端到端实践：多智能体任务训练流水线</a>
+    <a class="next" href="ch096.html">第 096 章：训练平台化：实验数据组织与检索 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

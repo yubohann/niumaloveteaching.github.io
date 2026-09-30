@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第039章 世界模型的动态学习率调整 | 具身智能学习课程 · VLA 与世界模型联合训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 联合训练进阶与策略能力</span>
+    <span class="sep">/</span>
+    <span>第 039 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 联合训练进阶与策略能力</div>
+    <h1>第 039 章：世界模型的动态学习率调整</h1>
+    <p class="lead">联合训练中骨干、动力学、动作头与语言编码器的梯度尺度各不相同；本章讲清参数组差异化设计、预热与退火的调度原理，以及基于验证信号的反应式调整。</p>
+    <ul class="meta">
+      <li>主题：学习率调度（learning rate schedule） / 多模块协同训练</li>
+      <li>关键公式：warmup 线性上升；余弦退火 η<sub>t</sub> = η<sub>min</sub> + (η<sub>max</sub> − η<sub>min</sub>)·(1 + cos(πt/T))/2；平台检测</li>
+      <li>预计学时：50 分钟</li>
+      <li>前置章节：第 038 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解自适应优化器下"有效步长"的构成，能解释为什么相同学习率在不同模块上产生不同的实际更新量。</li>
+      <li>掌握参数组差异化设计：骨干、动力学核心、解码头与语言编码器各自的学习率比例。</li>
+      <li>掌握预热（warmup）与余弦退火（cosine annealing）的调度形式与适用条件。</li>
+      <li>会设计基于验证信号的反应式调整：平台检测、梯度范数监控与想象误差反馈。</li>
+      <li>能诊断预热失效、调度与批量不同步、动力学学习率过大三类问题。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>联合训练的参数量集中在四类模块：视觉骨干、世界模型动力学、动作头与语言编码器。四类模块的梯度统计差异显著：预训练骨干的梯度经过大量数据打磨、范数较小；新初始化的解码头梯度初期很大；语言编码器在对比损失下梯度方向嘈杂。用单一学习率训练时，某个模块要么欠拟合要么过冲，训练曲线上表现为"一个指标稳定、另一个震荡"。</p>
+    <p>学习率调度解决两件事：训练早期的稳定性（预热避免随机初始化的大梯度破坏预训练权重）与训练后期的收敛质量（退火让参数在低谷附近精修）。联合训练还多一层约束：世界模型的学习率直接影响想象轨迹的稳定性，而策略的优化目标依赖想象轨迹，两者通过更新节奏耦合。</p>
+    <p>本章与第 037 章的衔接：RL 集成的更新频率比决定"多久更新一次"，学习率决定"每次更新多大"，两者共同决定模块间相对步速；与第 040 章的正则化衔接：调度与正则共同控制有效容量。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 有效步长与模块间的隐式不平衡</h3>
+    <p>Adam 类优化器的更新近似为该模块梯度方向上的等范数步：</p>
+    <div class="formula">
+      Δθ ≈ − η · m̂ / ( √v̂ + ε ) ，单步范数近似与 η 成正比、与梯度尺度弱相关
+      <span class="note">m̂、v̂ 为一阶与二阶矩估计；归一化让 Adam 对梯度尺度不敏感，但仍受梯度方向一致性影响</span>
+    </div>
+    <p>Adam 的归一化抵消了纯尺度差异，却带来新的不平衡：梯度方向一致性高的模块（稳定的预测任务）二阶矩小，实际步长接近满额；梯度方向嘈杂的模块（对比对齐、探索中的策略）二阶矩大，有效步长被压缩。因此"所有模块同一学习率"在实践中等价于对嘈杂模块欠训练、对稳定模块过训练。<strong>参数组比例的设定依据是各模块梯度的信噪比，信噪比高的模块给更小的学习率。</strong></p>
+    <p>单步范数的上界可以解析：Adam 的更新在偏差修正后满足 ‖Δθ‖ ≤ η · (1 − β<sub>1</sub>) / √(1 − β<sub>2</sub>)。常用超参 β<sub>1</sub> = 0.9、β<sub>2</sub> = 0.999 对应系数 (1 − 0.9) / √0.001 ≈ 3.16，训练最初几步的有效步长可达名义学习率的 3 倍以上。这个放大作用在预训练权重上尤其危险：二阶矩估计尚未稳定，个别方向的巨大更新会破坏已打磨好的特征。预热期的线性上升让二阶矩统计在低步长下完成收敛，代价只是总步数中几个百分点的进度。</p>
+
+    <h3>2. 预热与退火的调度形式</h3>
+    <p>两类基础调度组合成常用曲线。预热阶段线性上升：</p>
+    <div class="formula">
+      η<sub>t</sub> = η<sub>max</sub> · t / T<sub>warm</sub> ，t 不超过 T<sub>warm</sub>
+      <span class="note">T<sub>warm</sub> 常取总步数的 3% 至 10%；预训练权重、大批量、Adam 优化器都需要预热期稳定二阶矩</span>
+    </div>
+    <p>退火阶段余弦形式：</p>
+    <div class="formula">
+      η<sub>t</sub> = η<sub>min</sub> + ( η<sub>max</sub> − η<sub>min</sub> ) · ( 1 + cos( π · t / T<sub>total</sub> ) ) / 2
+      <span class="note">η<sub>min</sub> 取峰值的 1% 至 10%；余弦曲线在后期变化平缓，参数在低谷附近停留更久</span>
+    </div>
+    <p>数值算例：基准 η<sub>max</sub> = 1 × 10<sup>−4</sup>、η<sub>min</sub> = 1 × 10<sup>−5</sup>、总步数 10 万、预热占 5%（5000 步）。第 5000 步学习率为 1 × 10<sup>−4</sup>；退火进行到一半（约第 52500 步）时 η = 1 × 10<sup>−5</sup> + 9 × 10<sup>−5</sup> × 0.5 = 5.5 × 10<sup>−5</sup>；进度 0.25 与 0.75 处分别为约 8.68 × 10<sup>−5</sup> 与 2.32 × 10<sup>−5</sup>，两端变化快、中段平缓，与余弦函数的导数形态一致。末期保留 1 × 10<sup>−5</sup> 供持续适应新数据。</p>
+    <p>替代方案是一次循环（one-cycle）：上升、平台、下降三段组合，追求固定步数下的快速收敛；以及分段常数加平台触发。选择依据是训练预算是否固定：固定预算用余弦或一次循环，开放预算用平台触发的反应式调度。联合训练还会在退火之外补充一个常驻的稳定期（恒定为峰值 10%），防止世界模型在训练最末期因学习率过小停止适应新数据。四种调度形态的对照：</p>
+    <table>
+      <tr><th>调度</th><th>收敛速度</th><th>稳定性</th><th>适用预算</th></tr>
+      <tr><td>恒定学习率</td><td>中</td><td>末期易震荡</td><td>试跑与基线</td></tr>
+      <tr><td>预热 + 余弦</td><td>中，末期平稳</td><td>高</td><td>固定步数训练</td></tr>
+      <tr><td>一次循环</td><td>快</td><td>中，依赖退火段质量</td><td>固定预算的短周期任务</td></tr>
+      <tr><td>平台触发</td><td>视数据而定</td><td>高，需要冷却期</td><td>开放预算</td></tr>
+    </table>
+    <p>批量与学习率的缩放规则：批量扩大 k 倍时，线性规则把学习率乘 k，平方根规则乘 √k。批量 256 扩到 1024（4 倍）时线性规则取 4 倍、平方根规则取 2 倍。经验上小批量用线性规则、大批量用平方根规则并配合更长的预热；联合训练改动批量时必须同步重算调度曲线的总步数，让所有模块在同一时基上退火。</p>
+
+    <h3>3. 参数组比例</h3>
+    <p>四类模块的起点比例（以骨干为基准 1 倍）：</p>
+    <table>
+      <tr><th>模块</th><th>相对学习率</th><th>理由</th></tr>
+      <tr><td>视觉语言骨干</td><td>1×（如 1×10<sup>−4</sup>）</td><td>预训练充分，需保护</td></tr>
+      <tr><td>世界模型动力学</td><td>1× 至 2×</td><td>与骨干同源起步，稳定性优先</td></tr>
+      <tr><td>动作头 / 解码头</td><td>3×</td><td>随机初始化，需要快速形成输出分布</td></tr>
+      <tr><td>语言编码器</td><td>0.5×</td><td>对比梯度嘈杂，抑制更新幅度</td></tr>
+    </table>
+    <p>学习率与更新频率的乘积核算：世界模型每 4 步更新一次、学习率 2 × 10<sup>−4</sup>，与每 2 步更新一次、学习率 1 × 10<sup>−4</sup>，对每步数据产生的期望更新量分别为 2 / 4 = 0.5 与 1 / 2 = 0.5，相对步速相同；两种配置的差别在梯度噪声的累积方式，低频大步配置的更新方向更陈旧，稳定性略差。参数变更记录应同时包含学习率与更新频率，避免两者分别漂移。</p>
+    <p>预热比例的经验边界：低于总步数 3% 的预热在预训练骨干上常常不足，个别批次出现损失尖峰；超过 10% 会明显压缩高学习率区间的时长，总预算小的任务尤其敏感。预热是否充分的直接证据在前数千步的损失曲线上：健康曲线单调下降且无反复尖峰；预热不足时曲线出现阶梯状回跳，回跳位置伴随梯度范数的量级尖峰。</p>
+    <p>比例的调整信号来自逐模块梯度范数与损失曲线的联合监控：某模块损失长期高于同组其他模块且梯度范数偏低，说明学习率不足；损失震荡且梯度范数尖峰频繁，说明学习率过大。世界模型的动力学核心另有特别约束：其学习率影响想象轨迹的稳定性，调大后若想象回报曲线抖动加剧，即使训练损失下降也应回调。<strong>动力学学习率的验收指标落在下游：想象与真实回报差值的稳定性。</strong></p>
+    <p>与权重衰减的交互：解耦权重衰减（AdamW）在更新中附加 −ηλθ 项，学习率大的模块衰减也快。动作头学习率是骨干的 3 倍时，同样的 λ 让动作头参数以约三倍速度向零收缩，输出层收缩过强会让输出分布偏平。工程上给高学习率模块单独降低 λ（例如减半），或把偏置与归一化参数排除在衰减之外。</p>
+    <p>监控的三个口径：梯度范数记录中位数与 95 分位，中位数反映典型更新量、95 分位反映尖峰强度；损失曲线按模块分组记录（视觉对齐、动力学预测、动作回归、语言对齐），组间的"剪刀差"（一组下降、另一组上升）是参数组比例失衡的最早信号；想象回报差值按 100 步窗口滑动平均，避免单窗口噪声触发误判。</p>
+    <p>参数组的拆分粒度需要克制：四组是起点，继续按层或按张量细分会让学习率搜索空间迅速膨胀，调参成本超过收益；确有单层敏感的特殊情况（例如动作输出的最后一层）时用乘子单独处理，并在训练记录中标注例外。跨版本对比时固定分组定义，分组变更按模型结构变更对待。</p>
+
+    <h3>4. 反应式调整与平滑</h3>
+    <p>固定调度之外，基于验证信号的反应式调整提供第二层保护：验证损失在窗口内不再改善时按比例下调学习率。三个工程细节决定其效果：</p>
+    <ul>
+      <li><strong>检测窗口</strong>：窗口长度应覆盖损失曲线的噪声周期，过短会频繁触发；常用为 500 至 2000 步。</li>
+      <li><strong>下调比例与下限</strong>：每次下调至 0.3 至 0.5 倍，设全局下限防止学习率趋零。</li>
+      <li><strong>平滑与滞后</strong>：对验证损失取移动平均后再比较，并且下调后设置冷却期，避免连续触发。</li>
+    </ul>
+    <p>平台触发的数值形态：初始学习率 1 × 10<sup>−4</sup>、下调比例 0.4、下限为初始值的 5%（5 × 10<sup>−6</sup>）。连续触发时学习率序列为 1 × 10<sup>−4</sup>、4 × 10<sup>−5</sup>、1.6 × 10<sup>−5</sup>、6.4 × 10<sup>−6</sup>，第四次触发前触及下限并按 5 × 10<sup>−6</sup> 截断；每次触发之前至少经过一个检测窗口加一个冷却期（默认 1000 + 2000 步），一万步内最多触发三次。平台调整与退火曲线的叠加需要在调度器层面统一实现（把触发降幅折算为衰减因子并与曲线相乘），两个独立的写入者会互相覆盖，这是实现时最容易出错的位置；触发事件写入训练记录后，复盘时核对每次下调对应的验证损失改善量，改善量低于阈值的触发会被识别为误触发。</p>
+    <p>除验证损失外，可选信号还有梯度范数（尖峰频率）与不确定性输出（校准漂移）。多信号并用时需要避免同时触发多个变量调整，一次训练周期内只动一个参数，是排查归因的基本纪律。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>学习率系统由参数组定义、调度器、监控与调整策略四部分组成。与第 038 章的差异：038 调整损失权重与数据构成，本章调整优化的步长结构。</p>
+    <ol>
+      <li><strong>参数组定义</strong>：四个模块四组，按上表比例乘以基准学习率；解耦的权重衰减（AdamW）单独配置。</li>
+      <li><strong>调度器</strong>：线性预热（总步数 5%）接余弦退火（降至峰值 10%）；编写为按步计算的纯函数，便于复现。</li>
+      <li><strong>监控</strong>：按模块记录梯度范数的中位数与 95 分位、损失曲线、想象与真实回报差值。</li>
+      <li><strong>调整策略</strong>：默认固定调度；验证平台触发时按比例下调并进入冷却期；每次调整写入训练记录供复盘。</li>
+    </ol>
+    <h3>超参数起点表</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>基准学习率</td><td>1×10<sup>−4</sup></td><td>骨干学习率</td><td>预训练模型的微调惯例</td></tr>
+      <tr><td>动作头倍率</td><td>3×</td><td>加速输出分布形成</td><td>损失收敛速度</td></tr>
+      <tr><td>动力学倍率</td><td>1× 至 2×</td><td>平衡适应与稳定</td><td>想象回报差值曲线</td></tr>
+      <tr><td>语言编码器倍率</td><td>0.5×</td><td>抑制嘈杂梯度</td><td>对齐损失的信噪比</td></tr>
+      <tr><td>预热比例</td><td>总步数的 5%</td><td>早期稳定性</td><td>损失曲线的早期形态</td></tr>
+      <tr><td>退火终点</td><td>峰值的 10%</td><td>后期精修与持续适应</td><td>验证损失的平台高度</td></tr>
+      <tr><td>平台检测窗口</td><td>1000 步</td><td>触发判定</td><td>验证损失的噪声周期</td></tr>
+      <tr><td>下调比例与冷却期</td><td>0.4 倍 / 2000 步</td><td>防止震荡触发</td><td>触发频率统计</td></tr>
+    </table>
+    <div class="box tip">
+      <span class="box-title">技巧：把学习率变化与更新频率比一起管理</span>
+      <p>模块间的相对步速由"学习率 × 更新频率"共同决定。世界模型改成每 4 步更新一次且学习率翻倍，与每 2 步更新一次学习率不变，相对步速近似等价。调整任一参数时记录另一参数，避免两处独立漂移造成的隐性失衡。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>以下片段参照公开的训练调度实现设计，版本中立；PyTorch 风格，接口随版本演进。</p>
+
+    <p><strong>片段 1：参数组与预热余弦调度</strong></p>
+    <pre class="code"><code>import math
+import torch
+
+def build_param_groups(model, base_lr=1e-4):
+    """四类模块四组学习率：比例依据梯度信噪比设定。"""
+    return [
+        {"name": "backbone", "lr": base_lr,
+         "params": model.backbone.parameters()},
+        {"name": "dynamics", "lr": base_lr * 1.5,
+         "params": model.world_model.dynamics.parameters()},
+        {"name": "heads", "lr": base_lr * 3.0,
+         "params": model.action_head.parameters()},
+        {"name": "language", "lr": base_lr * 0.5,
+         "params": model.language_encoder.parameters()},
+    ]
+
+def warmup_cosine(step, total, warmup_ratio=0.05, min_ratio=0.1):
+    """线性预热接余弦退火；返回学习率倍数，纯函数便于复现。"""
+    warm = max(1, int(total * warmup_ratio))
+    if step &lt; warm:
+        return step / warm                       # 预热期线性上升
+    progress = (step - warm) / max(1, total - warm)
+    progress = min(progress, 1.0)
+    # 余弦曲线：1 降到 min_ratio，后期变化平缓
+    cos_term = (1 + math.cos(math.pi * progress)) / 2
+    return min_ratio + (1 - min_ratio) * cos_term
+
+def make_scheduler(optimizer, total_steps):
+    # LambdaLR 按倍数缩放各组基准学习率，组间比例保持不变
+    return torch.optim.lr_scheduler.LambdaLR(
+        optimizer, lambda s: warmup_cosine(s, total_steps))
+</code></pre>
+    <p>解读：<strong>（1）</strong>四组学习率用同一条调度曲线缩放：比例关系在整个训练过程中保持，避免组间比例随调度漂移；<strong>（2）</strong>LambdaLR 记录初始学习率并逐组相乘，实现上只需一个调度器；<strong>（3）</strong>调度写成纯函数，步数与曲线形态可回放验证，与训练框架的日志对照即可核对；<strong>（4）</strong>退火终点保留 10%：世界模型在整个训练周期都要适应新数据，零学习率会让其僵化。</p>
+
+    <p><strong>片段 2：基于验证平台的动态调整</strong></p>
+    <pre class="code"><code>class PlateauController:
+    """验证平台检测：平滑曲线在窗口内无改善时按比例下调学习率。"""
+    def __init__(self, optimizer, window=1000, factor=0.4,
+                 cooldown=2000, floor_ratio=0.05):
+        self.optimizer = optimizer
+        self.window = window
+        self.factor = factor
+        self.cooldown = cooldown
+        self.floor_ratio = floor_ratio
+        # 记录各组初始学习率：下限按初始值比例计算，与调度缩放独立
+        self.initial = [g["lr"] for g in optimizer.param_groups]
+        self.best = float("inf")
+        self.history = []
+        self.last_adjust = -10 ** 9
+
+    def update(self, step, val_loss):
+        self.history.append(val_loss)
+        smoother = sum(self.history[-10:]) / min(len(self.history), 10)
+        if step - self.last_adjust &lt; self.cooldown:
+            return False                          # 冷却期内只观察不调整
+        if smoother &lt; self.best - 1e-4:
+            self.best = smoother                  # 仍有改善：刷新最优值
+            return False
+        if len(self.history) &lt; self.window:
+            return False
+        # 触发：各组学习率等比下调，下限锚定初始值防止趋零
+        for group, init_lr in zip(self.optimizer.param_groups, self.initial):
+            group["lr"] = max(group["lr"] * self.factor,
+                              init_lr * self.floor_ratio)
+        self.last_adjust = step
+        self.history = []
+        return True
+</code></pre>
+    <p>解读：<strong>（1）</strong>先对最近 10 个记录点平滑再比较，抑制验证损失的短期噪声；<strong>（2）</strong>冷却期防止连续触发造成的断崖式下降；<strong>（3）</strong>下调作用于全部参数组且保持组间比例，与调度器的设计原则一致；<strong>（4）</strong>下限用"当前值 × floor_ratio"实现，只允许一次比例下调空间，语义上防止学习率无界趋零；触发返回 True 供调用方记录，调整事件进入训练记录供复盘。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>预热过短或缺失</strong>：训练前几百步损失尖峰、个别层权重被破坏。修复：预热覆盖总步数的 5% 左右；大批量训练时加倍。</li>
+      <li><strong>调度与批量变化不同步</strong>：批量加倍而未调整学习率，有效步长变化。修复：批量改变时按线性缩放同步调整学习率，并且调度曲线的总步数以"样本量"为单位；批量变化时迭代次数会随之漂移。</li>
+      <li><strong>动力学学习率过大</strong>：想象回报曲线抖动、真实回报差值扩大。修复：回调动力学倍率，验收指标用下游想象稳定性；其自身损失下降不足以说明动力学健康。</li>
+      <li><strong>所有模块共用学习率</strong>：动作头欠拟合与骨干过拟合同时出现。修复：按模块梯度信噪比拆组，比例为起点微调。</li>
+      <li><strong>平台检测窗口过短</strong>：验证噪声频繁触发下调，学习率断崖式下降。修复：窗口覆盖噪声周期，平滑后再判定，加冷却期。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把退火终点从峰值的 10% 降到 1%。预测训练末期验证损失、世界模型对新数据的适应速度与误差增长曲线的变化。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>末期验证损失略降（精修更充分），但新数据适应变慢，误差增长曲线在跨分布评估上劣化。联合训练中"持续适应"的价值通常高于最后的精修收益。</div></details>
+      </li>
+      <li>推导：余弦调度在第 t/T = 0.5 时的学习率值，并证明其导数为零（曲线在此处变化率最小）。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>t/T = 0.5 时 cos(π/2) = 0，η = (η<sub>max</sub>+η<sub>min</sub>)/2；导数 −(η<sub>max</sub>−η<sub>min</sub>)·π·sin(πt/T)/(2T) 在该点为零，曲线最平缓，对应的训练阶段是过渡区。</div></details>
+      </li>
+      <li>设计调度消融：恒定学习率、预热加余弦、一次循环三种调度，在相同总步数下比较验证损失与想象稳定性指标，给出选择依据。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>恒定学习率末期损失最高；一次循环前中期收敛快但末期可能过冲；预热加余弦最稳。选择依据是训练预算是否固定与是否允许中段暂停评估。</div></details>
+      </li>
+      <li>把平台检测的下调比例从 0.4 改为 0.9（温和下调）。预测触发频率、训练损失轨迹与最终性能的变化，说明下调比例设计的权衡。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>温和下调让触发更频繁、轨迹更平滑但总降幅有限；激进下调单次到位但易过度。权衡点由"达到目标损失所需的总下调量"与"触发次数成本"决定。</div></details>
+      </li>
+      <li>计算：η<sub>max</sub> = 1 × 10<sup>−4</sup>、η<sub>min</sub> = 1 × 10<sup>−5</sup>，预热 5000 步、总步数 10 万，求第 2500、5000、52500、75000 步的学习率。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>预热期线性：第 2500 步为峰值一半 5 × 10<sup>−5</sup>；第 5000 步达峰值 1 × 10<sup>−4</sup>；退火进度 0.5 时 5.5 × 10<sup>−5</sup>；进度约 0.737（第 75000 步）约 2.45 × 10<sup>−5</sup>。手算结果与纯函数调度器的输出核对一次。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>Adam 的归一化让有效步长取决于梯度方向的信噪比，模块间的学习率差异由此而来。</li>
+      <li>四类模块的参数组比例以骨干为基准，动作头加速、语言编码器减速、动力学以想象稳定性验收。</li>
+      <li>线性预热保障早期稳定，余弦退火完成后期精修，退火终点保留小额学习率维持持续适应。</li>
+      <li>平台触发的反应式调整需要窗口、平滑与冷却期三件套，调整保持组间比例。</li>
+      <li>学习率与更新频率的乘积决定模块相对步速，两个参数统一记录、统一调整。</li>
+      <li>下一章进入正则化技术：控制有效容量，防止联合训练在有限数据上过拟合。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch038.html">← 第 038 章：VLA策略的语义理解增强</a>
+    <a class="next" href="ch040.html">第 040 章：联合训练中的正则化技术 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

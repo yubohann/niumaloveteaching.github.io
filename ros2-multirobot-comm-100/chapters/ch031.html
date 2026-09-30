@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第031章 多机器人协同感知 | 多机器人协同学习课程 · ROS2 通信与系统集成</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 数据分发与协同感知</span>
+    <span class="sep">/</span>
+    <span>第 031 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 数据分发与协同感知</div>
+    <h1>第 031 章：多机器人协同感知</h1>
+    <p class="lead">单机的视野有死角、会被遮挡；本章设计"谁看到了什么"的共享机制，在哪里提炼、传什么、怎么组织，才能让车队拥有超越个体的视野。</p>
+    <ul class="meta">
+      <li>主题：协同感知 / 感知数据共享</li>
+      <li>关键机制：检测共享消息设计、世界系转换、过期缓存、近邻去重、带宽-信息权衡</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 030 章（多传感器数据时间对齐）</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解协同感知的三层价值：视场互补、遮挡互补、多视角置信度提升，以及各自的量化方式。</li>
+      <li>掌握感知共享架构光谱：原始数据 / 特征 / 检测结果三种模式的带宽与信息量对比。</li>
+      <li>会设计检测共享消息：身份、类别、世界系位姿、不确定度、时间戳、来源，一个都不能少。</li>
+      <li>会实现"接收-缓存-去重-合并"的协同感知流水线，用 TTL 与一致性检查防幽灵目标。</li>
+      <li>能估算协同感知的带宽开销，并给出"值不值得共享"的判据。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>如果只把每台机器人当作独立的感知单元，车队相对单机几乎没有"感知红利"：走廊拐角后的行人、被货架遮挡的托盘、大车底部的空隙，单机一律看不见。协同感知的目标是把车队变成一个<strong>分布式传感器阵列</strong>：每台机器人贡献自己的视角，系统获得任一单机都无法拥有的认知。</p>
+    <p>但这件事的边界被网络卡得很死，一帧原始图像 2.7 MB，一张点云 2 MB，而一台网关节点的带宽就那么大。上一章（时间）与更早的章节（空间、压缩）为此铺垫：<strong>协同感知的可行性取决于"在哪里提炼、传什么"</strong>。本章的选择是把提炼做在数据源头（边缘），只共享紧凑的检测/特征描述，并用严格的时空一致性把它们组织成一张全局视图。融合的数学（概率、权重、一致性）留给第 032 章，本章先把<strong>架构与协议</strong>立起来。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 协同感知的价值从哪来</h3>
+    <ul>
+      <li><strong>视场互补</strong>：交叉路口的车辆/机器人，各自的 FOV 拼起来覆盖死角。量化：协同覆盖增益 = 车队联合视野面积 ÷ 各机视野之和（考虑重叠）。</li>
+      <li><strong>遮挡互补</strong>：同一目标被 A 的视角遮挡、却被 B 清晰看到。这是"多视角"最硬的价值：遮挡造成的漏检无法通过单机的后处理补回。</li>
+      <li><strong>置信度提升</strong>：同一目标被多机同时观测 → 通过证据叠加降低虚警（例如单机置信度 0.8 的两条独立证据，在 log-odds 域叠加后约 0.94）。这里要小心相关性（第 029 章的教训），共享同一底图或同一检测模型的证据不能简单当独立。</li>
+    </ul>
+    <p>三种价值的共同基础是<strong>统一的坐标系与时间轴</strong>：A 看到的行人在 A 的 map 系里是 (3.2, 1.5)，换算到 world 系（第 024/025 章）并带上时刻（第 030 章），才能与 B 的观测对上。<strong>协同感知精度差 50% 来自时空对齐，30% 来自融合，20% 来自检测器</strong>，这条经验比例值得贴在架构文档里。</p>
+
+    <h3>2. 共享的光谱：传什么决定一切</h3>
+    <table>
+      <tr><th>层级</th><th>单帧大小（每目标）</th><th>信息量</th><th>带宽（10 目标 × 10 Hz × 5 机）</th><th>适用</th></tr>
+      <tr><td>原始数据（图/点云）</td><td>2–3 MB/帧</td><td>最全，支持重算</td><td>1–1.5 GB/s（不可行）</td><td>科研示范、有线小规模</td></tr>
+      <tr><td>特征/描述子</td><td>10–100 KB/帧</td><td>可二次匹配</td><td>5–50 MB/s（吃紧）</td><td>跨机 SLAM、重识别</td></tr>
+      <tr><td>检测/对象列表</td><td>50–300 B/目标</td><td>语义结果 + 不确定度</td><td>0.25–1.5 MB/s（轻松）</td><td>协同避障、跟踪、调度</td></tr>
+    </table>
+    <p>数量级差距说明：<strong>除非任务明确需要原始数据（跨机建图、离线复盘），否则共享检测结果</strong>。检测消息小还有一个隐式好处：小消息在无线网络上的投递更稳定（分片少、重传便宜），协同链路的实时性反而更好。</p>
+    <p>把上表换成一次完整算术：5 台机器人、每台每帧 8 个目标、每目标 200 B、10 Hz，检测级共享的聚合带宽为 5 × 8 × 200 B × 10 Hz = 80 KB/s（约 0.64 Mbps）；若改为共享 320 × 240 灰度 JPEG（约 15 KB/帧），同样频率下是 750 KB/s，接近前者的 10 倍，而且接收端每帧都要解码，CPU 开销另计。<strong>数量级之差决定架构：检测级共享可以全队广播，原始数据只适合按需、定向、限时拉取。</strong></p>
+
+    <h3>3. 检测共享消息的设计</h3>
+    <p>一条协同检测消息至少包含七类字段，缺任何一个都会在某个下游场景里引发故障：</p>
+    <ul>
+      <li><strong>身份与来源</strong>：detection_id、source_robot_id ， 用于去重、溯源与责任定位；</li>
+      <li><strong>类别</strong>：class_id + 类别表版本 ， 不同机器人的"人=1、车=2"分配可能不同，类别表要么全局统一，要么随消息带版本；</li>
+      <li><strong>世界系位姿</strong>：位置 + 朝向（若目标有方向），换算必须在本机完成（用本机定位与 TF），不要发"本机系坐标"让别人换（别人没有你完整的坐标链）；</li>
+      <li><strong>不确定度</strong>：位置协方差（或一个简化的置信圆半径），融合与关联的判据；</li>
+      <li><strong>时间戳</strong>：观测时刻，过期缓存与对齐的依据；</li>
+      <li><strong>置信度</strong>：检测器输出的分数，证据强度；</li>
+      <li><strong>时效字段</strong>（可选但推荐）：TTL 或"有效期"。<strong>协同感知的目标都会移动，把过期信息标出来是防止幽灵目标的第一道防线。</strong></li>
+    </ul>
+
+    <h3>4. 接收流水线：缓存、一致性与去重</h3>
+    <p>接收端的工作流固定为四步：<strong>① 时空校验</strong>（时间戳在窗口内？坐标能换算到本机系？）；<strong>② 入缓存</strong>（按来源与时间组织）；<strong>③ 关联去重</strong>（与已有目标做近邻匹配）；<strong>④ 合并发布</strong>（生成对外的融合视图，第 032 章展开概率细节）。其中两个易错点：</p>
+    <ul>
+      <li><strong>TTL 必须比"目标可能移动的尺度"保守</strong>：行人 1.4 m/s，400 ms 内最多走 0.56 m，仍在 0.6 m 关联门限的量级内。TTL 大于 1 秒时，用旧位置去关联新观测会把"两个行人"错并成一个。TTL 起点建议 0.3–0.4 s。</li>
+      <li><strong>关联半径必须计入定位误差</strong>：两台机器人各 10 cm 定位误差 + 检测误差 10 cm，同一目标在两机视图里可能相差 20–30 cm。<strong>关联门限小于这个值会把同一目标当两个（重影），大于则会把相邻两个目标并成一个。</strong>起点 0.5–0.8 m，随精度实测调整。</li>
+    </ul>
+    <div class="formula">
+      TTL 上界 ≈ 关联门限 ÷ 目标最大移动速度；两机观测差的标准差 σ<sub>pair</sub> = √(σ<sub>locA</sub>² + σ<sub>detA</sub>² + σ<sub>locB</sub>² + σ<sub>detB</sub>²)
+      <span class="note">门限 0.6 m、行人 1.4 m/s：TTL 不超过约 0.43 s，取 0.3–0.4 s；定位与检测各 10 cm 时 σ<sub>pair</sub> = √(0.01+0.01+0.01+0.01) ≈ 0.2 m，门限取 2σ 到 3σ 即 0.4–0.6 m，与本章起点值一致</span>
+    </div>
+    <p>两条公式合起来回答"参数为什么是这些数"：门限由两机的定位与检测误差合成决定，TTL 由"目标在门限尺度内的移动时间"决定。实践顺序是先按定位精度定门限，再由门限与目标速度定 TTL 上界，最后用实测的"重影率"与"误并率"微调。定位误差升到 30 cm 时 σ<sub>pair</sub> 升到 0.6 m 量级，门限须放宽到 1 m 上下，此时 TTL 上界也放宽到 0.7 s，但"误并"风险随门限同步上升，系统应当把这种状态标记为"关联不确定"，把精度变化如实暴露出来。</p>
+    <div class="box key">
+      <span class="box-title">设计决策：为什么把换算放在数据产生地（各机自报世界系坐标）？</span>
+      <p>本机掌握完整的坐标链（本机→world），换算发生在数据产生地，误差来源单一、可审计；中心节点要做换算，必须同时持有所有机器人的定位与标定版本，任何一处过期都会造成系统性错位，且故障面大。<strong>边缘转换 = 数据本地化 + 中心只做融合</strong>，与第 023 章"边缘提炼"一脉相承。代价是各机必须都有世界系定位（第 029 章的职责）。</p>
+    </div>
+    <h3>5. 融合架构的三种组织方式</h3>
+    <p>检测消息怎么汇聚，决定了通信量、延迟与单点，需要在上系统前选定：</p>
+    <table>
+      <tr><th>融合架构</th><th>通信模式</th><th>通信量量级</th><th>端到端延迟</th><th>单点与扩展</th></tr>
+      <tr><td>中心融合</td><td>各机上传检测，中心出全队视图</td><td>O(N) 汇聚</td><td>多一段汇聚与分发</td><td>中心是单点；可与监控共用同一台机器</td></tr>
+      <tr><td>边缘融合（各机自建全队视图）</td><td>广播检测，成员各自订阅</td><td>共享介质上 O(N²) 投递</td><td>一跳，最短</td><td>无单点；N 大时带宽与计算重复</td></tr>
+      <tr><td>分层融合</td><td>邻域边缘融合加区域汇总</td><td>介于两者之间</td><td>一跳加一级汇总</td><td>扩展最好；实现复杂度最高</td></tr>
+    </table>
+    <p>选择标准：<strong>车队小、要最快反应，用边缘融合；有中心节点且更看重全局一致性，用中心融合；N 超过十台且感知数据持续增大，才值得投入分层架构</strong>。无论哪种，检测消息的七类字段与接收流水线的四步校验都保持不变，架构替换只改变数据流向，不改变协议本身，这正是本章先把消息与流水线立起来的原因。</p>
+
+    <h3>6. 数值算例：证据叠加与端到端延迟预算</h3>
+    <p>先看置信度的账。单机检测置信度 0.8 对应的对数几率是 ln(0.8 ÷ 0.2) = 1.386；两机独立观测同一目标时证据相加得 2.772，反解置信度 0.94；三机得 4.158，反解 0.985。<strong>从 0.8 到 0.94 只需要两台独立观测，这说明协同感知对虚警的压制是立竿见影的；但前提是"独立"</strong>：若两机用的是同一检测模型、共享同一张底图，误差相关，真实的提升远小于这个数字，极端情形（同源转发）提升为零，第 029 章的相关性陷阱在感知层再次出现。</p>
+    <p>再看延迟预算。以"交叉路口协同避障"为例，端到端链路为：检测器出帧（周期 100 ms，平均年龄 50 ms）→ 网络传输 20 ms → 接收端校验与关联 10 ms → 融合视图发布（下一个 10 Hz 节拍，最坏等待 100 ms）。最坏路径合计约 230 ms，平均约 130 ms；对照"15 m 处提前约 1 s 发现横穿目标"的需求，还有数倍余量。真正吃掉预算的是两个 10 Hz 节拍，<strong>把检测与融合提到 20 Hz 可以把最坏延迟压到 130 ms 量级，代价是带宽与 CPU 各翻一倍</strong>；而这两项在本章的数量级下都不贵，80 KB/s 即 0.64 Mbps，仅占百兆链路的 0.6%。这份预算表也提示了优化顺序：要压延迟先动频率，再动网络路径，检测器本身的推理时间是最后才值得碰的部分。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <ol>
+      <li><strong>定共享粒度</strong>：按任务选检测级/特征级；默认检测级（带宽友好），跨机建图场景才上升为特征级。</li>
+      <li><strong>定消息与类别表</strong>：定义 Detection 消息（上节七类字段）+ 全局类别表；类别表变更属于接口变更，走版本管理。</li>
+      <li><strong>定频率与话题</strong>：检测发布 10 Hz 左右（不高于本机检测器输出频率）；每个机器人一个 <code>/robotN/detections</code> 话题，融合节点订阅全部（话题扇入在第 034 章有系统化方案）。</li>
+      <li><strong>定接收策略</strong>：TTL 0.3–0.4 s；关联门限 0.5–0.8 m；定位误差大时门限相应放宽并记录"关联不确定"标志。</li>
+      <li><strong>定验收指标</strong>：协同检出率提升（相比单机）、虚警率变化、带宽、端到端延迟（观测到合并视图发布）。</li>
+    </ol>
+    <table>
+      <tr><th>参数</th><th>起点值</th><th>依据</th></tr>
+      <tr><td>检测发布频率</td><td>10 Hz</td><td>与本机检测器同频，不制造新瓶颈</td></tr>
+      <tr><td>TTL</td><td>0.4 s</td><td>行人最大位移 0.56 m，与 0.6 m 关联门限匹配</td></tr>
+      <tr><td>关联门限</td><td>0.6 m</td><td>两机定位 + 检测误差合成量级</td></tr>
+      <tr><td>融合视图频率</td><td>10 Hz</td><td>与输入同频，保持实时</td></tr>
+      <tr><td>带宽预算（5 目标 × 200 B × 10 Hz × 5 机）</td><td>约 50 KB/s</td><td>相对链路容量可忽略</td></tr>
+    </table>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：本机检测转世界系并发布</strong></p>
+    <pre class="code"><code>class DetectionSharer(Node):
+    """把本机检测器的结果换算到 world 系并共享给车队（小消息、高频率）。"""
+    def __init__(self, robot_id):
+        super().__init__("det_sharer", namespace=f"robot{robot_id}")
+        self.rid = robot_id
+        self.buf = Buffer()                      # TF 缓冲（第 024 章）
+        self.listener = TransformListener(self.buf, self)
+        # 检测共享是周期性小消息：Best-effort 足够，丢一帧还有下一帧
+        self.pub = self.create_publisher(DetectionArray, "detections", 10)
+        self.sub = self.create_subscription(
+            DetectionArray, "detections_local", self.on_local, 10)
+
+    def on_local(self, msg):
+        out = DetectionArray()
+        out.source_id = self.rid
+        out.header.frame_id = "world"            # 声明输出坐标系：绝不发本机系
+        out.header.stamp = msg.header.stamp      # 保留检测时刻（第 030 章）
+        for det in msg.detections:
+            try:
+                tr = self.buf.lookup_transform(
+                    "world", det.header.frame_id, det.header.stamp)
+            except Exception:
+                continue                         # 坐标链断：宁可少发，不发错坐标
+            x, y = apply_transform(tr, det.x, det.y)   # 含旋转的完整变换
+            det_out = Detection()
+            det_out.id = det.id
+            det_out.class_id = det.class_id
+            det_out.x, det_out.y = x, y
+            det_out.cov_xy = det.cov_xy          # 不确定度必须随行（第 032 章的权重）
+            det_out.stamp = det.header.stamp     # 观测时刻（= 与 header 一致）
+            det_out.confidence = det.confidence
+            out.detections.append(det_out)
+        self.pub.publish(out)                    # 每帧约 10 目标 × 200 B = 2 KB</code></pre>
+    <p>解读：这个"共享发布者"节点承担的是<strong>坐标与时间的一致性出厂检查</strong>。<strong>（1）</strong>转换失败时 <code>continue</code> 跳过，绝不发本机系坐标：一个错误的坐标会污染整个车队的融合视图，比缺一条检测的代价大得多，"宁可少发，不发错"在协同感知里是铁律。<strong>（2）</strong>每条检测单独做 TF 查询（带自己的原始时间戳）：如果整个 DetectionArray 用接收时刻统一查询，多目标的时间差异就被抹掉了（片段里统一用 msg.header.stamp，实际系统应在检测器里逐目标打戳）。<strong>（3）</strong>协方差随行：只发 (x, y) 不发不确定度的消息，在融合端无法区分"激光精确测得"和"视觉远处估计"，所有证据权重只能拍脑袋（第 032 章会展开其代价）。<strong>（4）</strong>消息体量的数量级（2 KB/帧）与原始图像（2.7 MB）相差千倍，这正是协同感知可行的前提。</p>
+
+    <p><strong>片段 2：接收-缓存-校验</strong></p>
+    <pre class="code"><code>class RemoteIngest(Node):
+    """订阅邻居机器人的检测流：TTL 缓存 + 时空校验，为融合提供候选。"""
+    def __init__(self, self_id, neighbors):
+        super().__init__("remote_ingest")
+        self.self_id = self_id
+        self.cache = dict()                      # robot_id -> [(stamp, det), ...]
+        for rid in neighbors:
+            self.create_subscription(
+                DetectionArray, f"/robot{rid}/detections",
+                lambda m, r=rid: self.on_remote(r, m), 10)
+        self.create_timer(0.1, self.prune)       # 10 Hz 清理过期缓存
+
+    def on_remote(self, rid, msg):
+        if msg.source_id == self.self_id:
+            return                               # 防御：看到自己的回声（第 034 章路由环路）
+        now = self.now_sec()                     # 与发送端同一时间基准（已同步）
+        for det in msg.detections:
+            age = now - det.stamp                # 数据年龄：接收端自己算，不信任声明
+            if age &gt; 0.4 or age &lt; -0.1:          # 太旧/未来（时钟问题）都拒绝
+                continue
+            self.cache.setdefault(rid, []).append((det.stamp, det))
+        # 一致性检查：本机已知的静态障碍附近不应出现邻居的"目标"
+        self.validate_against_static_map(self.cache.get(rid, []))
+
+    def prune(self):
+        now = self.now_sec()
+        for rid in list(self.cache):
+            # 过期数据一次性清掉：旧位置比没有位置更危险
+            self.cache[rid] = [(s, d) for (s, d) in self.cache[rid]
+                               if now - s &lt;= 0.4]</code></pre>
+    <p>解读：接收端的第一职责是"不信任"，对时间、对来源、对自己的回声都保持警惕。<strong>（1）</strong>年龄由接收端自己按本地时间算（<code>age = now − stamp</code>），不读发送端声明的"有效期"：发送端时钟不可全信，本地时间基准才是裁决者；<code>age &lt; −0.1</code> 的"未来数据"直接暴露时钟同步故障，属于必须记录的异常。<strong>（2）</strong>把静态地图作为交叉校验：如果邻居报了一个"目标"深深嵌在本机已知的墙里，要么是邻居定位漂了、要么是分类错了，这种目标应先标记"可疑"，暂缓进入融合视图。<strong>（3）</strong>清理用重建列表，代码简单且不产生遍历中的修改问题；每 100 ms 一次的清理频率与数据实时性匹配。<strong>（4）</strong>"看到自己的回声"的防御不是杞人忧天：一旦系统里加了路由/桥接（第 034 章）或有人把话题重映射错，自己的消息会绕一圈回来，产生"自己检测自己"的怪象。</p>
+
+    <p><strong>片段 3：近邻去重与合并视图</strong></p>
+    <pre class="code"><code>def build_fleet_view(local_dets, remote_candidates, gate=0.6):
+    """把本机与远端检测合成一张视图：近邻关联去重，多源证据取加权平均。
+    这里是"结构版"：概率权重与一致性的严格处理在第 032 章展开。"""
+    view = []
+    used = set()                                 # 已关联的远端检测下标
+    for det in local_dets:
+        mates = []
+        for k, (stamp, rdet) in enumerate(remote_candidates):
+            if k in used:
+                continue
+            d = ((det.x - rdet.x) ** 2 + (det.y - rdet.y) ** 2) ** 0.5
+            # 门限必须计入两机定位误差：小于误差尺度的"重复"才是真重复
+            if d &lt;= gate and det.class_id == rdet.class_id:
+                mates.append(k)
+        if mates:
+            for k in mates:
+                used.add(k)                      # 一条远端只归属一个本机目标
+            # 简化加权：按置信度线性平均（严格做法用信息矩阵，第 032 章）
+            w0 = det.confidence
+            xs, ys, ws = det.x * w0, det.y * w0, w0
+            for k in mates:
+                rdet = remote_candidates[k][1]
+                xs += rdet.x * rdet.confidence
+                ys += rdet.y * rdet.confidence
+                ws += rdet.confidence
+            fused = Detection(id=det.id, class_id=det.class_id,
+                              x=xs / ws, y=ys / ws,
+                              sources=1 + len(mates))    # 记录证据数量供下游评估
+        else:
+            fused = det                          # 无同伴：原样保留（单机也能工作）
+        view.append(fused)
+    return view</code></pre>
+    <p>解读：合并阶段的三个决策都会直接影响协同质量。<strong>（1）</strong>关联门限 <code>gate=0.6</code> 同时被"重影"与"误并"两个方向约束：太小时同一目标在两机视图里未合并（融合视图出现两个同名目标）；太大时相距 1 m 的两个行人被并成一个。<strong>（2）</strong><code>used</code> 集合保证"一条远端证据只被使用一次"：没有它，两个相邻本机目标会共享同一条远端检测，等价于把证据复制了两份，概率上的重复计数，第 029 章已经见过它的危害。<strong>（3）</strong><code>sources</code> 字段记录目标背后有几条证据：下游（规划、调度）据此区分"单机看到"与"多机确认"。这正是协同感知交付给任务的真正增量，<strong>不只是"看得更远"，更是"知道得更有把握"</strong>。加权平均按置信度的简化在这里够用，但若两机证据相关（共用底图/同一模型），第 032 章的协方差交叉才是正确工具。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>发本机系坐标</strong>：接收方没有完整的坐标链，换算出的世界位置全错；症状是"目标散布在机器人们自己的位置上"。修复：数据产生地完成到 world 的换算（片段 1）。</li>
+      <li><strong>没有 TTL 或 TTL 过长</strong>：旧检测拿来关联新观测，一个行人被"拉"成一条残影轨迹。修复：TTL 按目标速度与可接受误差推导（起点 0.3–0.4 s）。</li>
+      <li><strong>类别表不统一</strong>：A 的 class 1 是"人"、B 的 1 是"车"，融合视图里目标类别随机跳动。修复：全局类别表 + 版本字段；变更走接口流程。</li>
+      <li><strong>关联门限小于定位误差</strong>：同一目标在两机视图里永不合并，协同的结果是"双倍目标"。修复：门限 = 两机定位误差 + 检测误差的合成量级，实测调优。</li>
+      <li><strong>共享原始图像"反正带宽还有很多"</strong>：占用的余量在故障/重传时段成为夺走控制流带宽的元凶。修复：默认检测级共享，原始数据仅按需、定向、限时拉取。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>算带宽：5 台机器人、每台每帧 8 个目标、每目标 200 B、10 Hz。检测级共享的聚合带宽是多少？若改为共享小尺寸(320×240)灰度 JPEG 图（15 KB/帧），差多少倍？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>检测级约 80 KB/s；图像 ≈ 15 KB × 10 Hz × 5 = 750 KB/s，差约 10 倍。别忘了图像还要算解码 CPU。</div></details>
+      </li>
+      <li>把 TTL 从 0.5 s 改到 2 s，预测"幽灵目标"出现的场景，并设计一个能自动捕捉它的实验（例如行人快速横穿会合区域）。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>行人 1.4 m/s，2 s 走 2.8 m；旧位置关联新观测时会生成"中途残影"。实验：单一目标直线走，统计融合视图里同时存在的目标数是否大于 1。</div></details>
+      </li>
+      <li>推导：两机定位误差各 σ<sub>loc</sub>=10 cm、检测器位置误差 σ<sub>det</sub>=10 cm。同一目标两机视图的位置差近似服从什么分布？把关联门限定在 2σ 处应为多少？<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>每机误差先合成：σ<sub>i</sub> = √(10² + 10²) ≈ 14 cm；两机观测差是两独立量之差，σ<sub>pair</sub> = √(14² + 14²) ≈ 20 cm，取 2σ ≈ 0.4 m、3σ ≈ 0.6 m，与本章门限起点一致。定位误差升到 30 cm 时 σ<sub>pair</sub> ≈ 0.63 m，门限放宽到 1 m 量级并记录"关联不确定"标志，精度决定门限。</div></details>
+      </li>
+      <li>设计题：为"交叉路口协同避障"设计完整共享方案：消息字段、频率、TTL、关联门限、定位精度要求（能否满足 0.5 m 门限），以及单机降级行为。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>先反推：要让车辆在 15 m 处提前 1 s 发现横穿目标，要求系统端到端延迟 &lt; 300 ms、位置误差 &lt; 0.5 m；据此设定各环节预算，并规定"无他机数据时如何保守驾驶"。</div></details>
+      </li>
+      <li>思考：协同感知带来的"置信度提升"在什么条件下是真实的，什么条件下是幻象？结合第 029 章的相关性陷阱分析"两机共用同一检测模型"的情形。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>同模型共享的系统性偏差（如同样的遮挡误检模式）让两机错误相关，独立证据假设不成立，置信度提升被高估，结论：置信度叠加要按相关性打折，或采用保守融合。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>协同感知的三种红利：视场互补、遮挡互补、置信度提升；共同前提是统一坐标与统一时间。</li>
+      <li>共享粒度决定可行性：检测级（百字节）是默认选择，原始数据只在确需场景按需拉取。</li>
+      <li>检测消息七要素：身份、类别、世界系位姿、不确定度、时间戳、置信度、来源（TTL 为推荐项）。</li>
+      <li>接收流水线：自算年龄、TTL 缓存、静态地图交叉校验、近邻去重且证据不重复使用。</li>
+      <li>下一章从"结构"深入"数学"：<strong>多机器人感知数据融合</strong>，log-odds 如何叠加证据、信息矩阵如何加权轨迹、冲突如何检测与处置。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch030.html">← 第 030 章：多传感器数据时间对齐</a>
+    <a class="next" href="ch032.html">第 032 章：多机器人感知数据融合 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

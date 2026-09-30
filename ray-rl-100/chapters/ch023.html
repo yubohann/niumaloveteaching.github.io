@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第023章 RLlib自定义环境采样器 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · RLlib 核心接口与训练</span>
+    <span class="sep">/</span>
+    <span>第 023 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · RLlib 核心接口与训练</div>
+    <h1>第 023 章：RLlib自定义环境采样器</h1>
+    <p class="lead">采样器（Sampler）负责把策略与环境的一次次交互整理成训练批次。本章讲清采样器在训练循环中的位置、批次字段契约、接口的版本演进，以及在什么情况下值得替换采样器本身。</p>
+    <ul class="meta">
+      <li>主题：RLlib 训练 / 采样数据流</li>
+      <li>关键机制：采样循环、批次字段契约、片段长度、外部数据源接入</li>
+      <li>预计学时：50 分钟</li>
+      <li>前置章节：第 022 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解采样器在训练循环中的位置，说清采样、后处理与学习三个阶段的数据流向。</li>
+      <li>掌握采样批次（SampleBatch）的字段契约，理解字段缺失为何会在后处理阶段集中暴露。</li>
+      <li>理解采样器接口随版本演进的形态差异，掌握其中不变的核心约定。</li>
+      <li>会判断需求该由环境包装、回调还是采样器解决，避免过度定制。</li>
+      <li>能设计一个接入外部数据源的自定义采样器并验证其批次可被训练流程消费。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>标准采样路径是"策略给动作、环境给反馈"的循环：观测送入策略网络，动作在环境中执行，转移被逐条记录，累积到片段长度后提交给训练流程。多数定制需求可以在环境包装层或回调层解决，但当数据来源不是环境协议的交互时（外部仿真器回放、离线数据重放、人机混合示范注入），标准循环无法表达，此时才需要替换采样器。</p>
+    <p>采样器是批次数据的生产者，它的输出直接进入优势估计与损失计算。<strong>字段不完整或回合边界标志错误的批次，会在训练流程深处引发难以定位的错误，因此先理解数据契约再动手改造。</strong></p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p>采样器处在数据流的上游，其职责可以概括为：按策略与环境交互，把结果整理成字段完备、边界正确的训练批次。</p>
+
+    <h3>1. 训练循环中的位置</h3>
+    <p>RLlib 的一轮训练分为三段：采样、后处理与学习。<strong>采样器只在第一段活动：</strong>持有环境副本与策略引用，循环执行"观测送入策略、动作送入环境、转移写入缓冲"，累积到片段长度或回合结束后提交批次。后处理阶段在全批次上计算优势（例如广义优势估计，Generalized Advantage Estimation, GAE），学习阶段更新网络参数。采样器的边界由此明确：优势计算与损失构造属于后处理与学习器。</p>
+
+    <h3>2. 批次字段契约</h3>
+    <p>采样批次是列式存储：每一列是一个按时间排列的数组。<strong>最小可用字段包括观测（obs）、动作（actions）、奖励（rewards）与回合结束标志；</strong>对带策略比率的算法（PPO、IMPALA 等），后处理还需要动作分布输入（action_dist_inputs）与旧策略对数概率（action_logp）；部分算法需要价值预测（vf_preds），也有算法在训练时重算。字段长度必须一致，抽样顺序必须与时间顺序对应。</p>
+    <div class="formula">
+      批次 = { obs<sub>t</sub>, a<sub>t</sub>, r<sub>t</sub>, done<sub>t</sub>, logπ<sub>old</sub>(a<sub>t</sub>|s<sub>t</sub>), … }，t = 1…T
+      <span class="note">所有列共享同一时间轴；GAE 按回合边界分段计算，边界标志错误会让优势跨回合串联，价值目标失真</span>
+    </div>
+
+    <h3>3. 接口演进与不变量</h3>
+    <p>采样接口随 Ray 版本发生过迁移：早期以采样器类（Sampler，含同步与异步实现）为中心，通过子类化替换；过渡期提供样本收集器（SampleCollector）定制批次组装；新 API 栈把采样归入环境执行器（EnvRunner），rollout 返回回合列表。名称与基类路径随版本变化（以对应 Ray 版本的官方文档为准），<strong>不变的核心约定有三条：与策略交互生成转移、按片段长度或回合边界切分、输出字段完备且可被后处理直接消费。</strong></p>
+
+    <h3>4. 自定义采样的典型动机</h3>
+    <ul>
+      <li><strong>外部数据源</strong>：数据来自仿真器、日志回放或人工示范，不经过标准环境接口。</li>
+      <li><strong>混合采样</strong>：在线策略采样与离线数据按比例混合，例如每批次注入一定比例的示范转移。</li>
+      <li><strong>自定义探索编排</strong>：采样阶段按脚本或课程切换动作选择逻辑，不适合放在环境层表达。</li>
+      <li><strong>调试与记录</strong>：把每步的中间量写入批次，供离线分析使用。</li>
+    </ul>
+
+    <h3>5. 片段长度与批次口径的定量关系</h3>
+    <p>批次口径由三个量共同决定：总环境数 N、片段长度 L、训练批次大小 B。在按长度截断模式下，一轮采样提交的样本量等于环境数乘以每个环境推进的步数；取 B = N × L 时每个环境恰好提交一个片段，批次组装无需额外补齐。数值示例：N = 16、L = 250，每轮得到 4000 样本。若回合平均长度约 120 步，250 步的片段平均横跨约两个回合边界，片段内回合数在 2 至 3 之间浮动，这属于按长度截断的正常现象；广义优势估计（GAE）在每个回合边界处断开分段，片段内部的优势不跨回合串联。</p>
+    <div class="formula">
+      B = N × L × (1 + ε)，ε 为补齐余量，理想情况取零
+      <span class="note">N = 16、L = 250 时 B = 4000；L 取大则单批样本多、参数更新间隔拉长，取小则优势估计方差上升，L 的调整应同时核对批次整除关系</span>
+    </div>
+
+    <h3>6. 两种片段切分模式的对比</h3>
+    <table>
+      <tr><th>模式</th><th>片段端点</th><th>批次长度</th><th>优势估计特性</th><th>适用场景</th></tr>
+      <tr><td>按长度截断（truncate_episodes）</td><td>固定步数处截断，端点可落在回合中间</td><td>恰好等于设定值</td><td>截断处由价值自举补偿，片段内分段完整</td><td>吞吐优先、回合长度偏长的默认选择</td></tr>
+      <tr><td>按回合结束（complete_episodes）</td><td>真实回合边界</td><td>随回合长度浮动</td><td>每个片段覆盖完整回合，方差较低</td><td>回合长度短、需要完整回合统计的任务</td></tr>
+    </table>
+    <p>选择依据：回合长度在数十步量级且浮动不大时，用按回合结束模式获得最干净的边界；回合长度长或浮动大时，用按长度截断模式稳定批次节奏，由自举补偿截断处的价值。<strong>两种模式下回合边界标志都必须真实反映终止与截断，标志错误造成的偏差不会触发任何报错。</strong></p>
+
+    <h3>7. 示范混合的数值示例</h3>
+    <p>取示范比例 0.2、训练批次 4000，每批含 800 条示范转移与 3200 条在线转移。设某状态下行为策略选中动作的概率为 0.3，当前策略选中同一动作的概率为 0.6。正确的旧对数概率列对示范条目填 ln 0.3 ≈ −1.204，对在线条目填 ln 0.6 ≈ −0.511；重要性比率按 exp(ln 0.6 − ln 0.3) = 2.0 计算，示范样本的更新按两倍权重修正。若把示范条目的旧对数概率为简化而直接填成当前策略值，比率恒为一，示范转移与当前策略的分布偏移未被修正，训练后期策略会被示范行为持续牵制，评估回报出现平台期。<strong>混合采样的实现要点是：来源不同的转移分别填充与其生成策略匹配的字段，拼接后统一进入后处理。</strong></p>
+    <p>比率修正会改变两类样本在更新中的质量占比。上例中示范样本的有效权重合计为 800 × 2.0 = 1600，在线样本为 3200 × 1.0 = 3200，示范样本按条数占 20%，按更新质量占到 1600 / (1600 + 3200) ≈ 33%。<strong>比例参数写的是条数占比，实际生效的是权重占比，两者在高比率区间相差可观：</strong>比率升到 4 时示范样本的质量占比达到一半，示范行为对策略的牵引被放大，调参时需要按质量占比核算；条数占比会低估示范样本的实际牵引。</p>
+
+    <h3>8. 缓冲队列的陈旧度与字节量核算</h3>
+    <p>异步数据源经队列进入采样侧时，队列深度直接决定训练数据的老化程度。设外部源每秒产出 1.5 个片段、训练侧每秒消费 1 个片段、队列深度上限 4：产出快于消费，队列迅速填满并按"淘汰最旧"策略滚动，一个新片段从入队到被消费平均要等待 4 次淘汰，最旧数据的年龄约为 4 秒。消费速率降到 0.5 个每秒时，同一深度下年龄翻倍到 8 秒。<strong>陈旧度近似等于队列深度除以消费速率，深度决定可吸收的产量抖动，也决定数据老化；两者此消彼长。</strong></p>
+    <div class="formula">
+      最旧数据年龄 ≈ 队列深度 / 消费速率（队列持续饱和时的估算）
+      <span class="note">深度 4、消费 1 片段每秒时约 4 秒；深度 16 时约 16 秒。年龄越过算法容忍度后，重要性修正也不足以补偿分布偏移，训练回报开始抖动</span>
+    </div>
+    <p>字节量按片段规模核算：低维观测下单转移约 70 字节，片段长度 4000 的片段约 274 KB；队列深度 4 加在途片段，瞬时常驻约 1 至 2 MB，属于可控量级。图像观测按单转移 28 KB 计，同样片段为 112 MB，队列的每一格都变成显存之外的主要内存项，深度取值必须与内存预算联立。<strong>三类深度档位的取舍如下表：</strong></p>
+    <table>
+      <tr><th>队列深度</th><th>可吸收的产量波动</th><th>最旧数据年龄（消费 1 片段每秒）</th><th>适用情形</th></tr>
+      <tr><td>1</td><td>几乎为零</td><td>约 1 秒</td><td>外部源产量稳定，对新鲜度要求最高</td></tr>
+      <tr><td>4</td><td>数秒级抖动</td><td>约 4 秒</td><td>默认起点，多数异步仿真器</td></tr>
+      <tr><td>16</td><td>较长的源中断</td><td>约 16 秒</td><td>源间歇性强且算法容忍陈旧数据</td></tr>
+    </table>
+    <p>深度核算与第 035 章的回放池是同一类问题：都在"吸收波动"与"数据新鲜度"之间取点。差别在于回放池的年龄按容量与更新次数计，队列的年龄按深度与消费速率计，两处都应把年龄作为显式指标记录；容量数字单独提供的信息不足。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>决策顺序：先穷尽轻量方案。环境包装能表达的用包装，观测后处理能表达的用回调，数据来源与采样节奏都需要改变的才子类化采样器。</p>
+    <table>
+      <tr><th>需求</th><th>首选方案</th><th>理由</th></tr>
+      <tr><td>观测变换、奖励缩放</td><td>环境包装器</td><td>改动局部，不动数据流</td></tr>
+      <tr><td>统计指标、轨迹过滤</td><td>回调函数</td><td>在既有生命周期点上插桩</td></tr>
+      <tr><td>外部数据源、混合采样</td><td>自定义采样器</td><td>数据来源本身超出环境协议</td></tr>
+      <tr><td>异步仿真器回放</td><td>自定义采样器加缓冲队列</td><td>采样节奏与训练节奏解耦</td></tr>
+    </table>
+    <table>
+      <tr><th>参数</th><th>示例值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td><code>fragment_len</code></td><td>250</td><td>片段步数上限</td><td>由训练批次除以总环境数反推，保持整除</td></tr>
+      <tr><td><code>demo_ratio</code></td><td>0.2</td><td>示范样本占比</td><td>从 0.1 起步逐档上调，以评估回报是否改善为准</td></tr>
+      <tr><td><code>queue_maxlen</code></td><td>4 个片段</td><td>异步数据缓冲深度</td><td>覆盖一个完整片段的产量波动，再大则数据陈旧度上升</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：自定义采样器必须遵守的两条不变量</span>
+      <p>第一条：<strong>片段切分语义与 batch_mode 一致</strong>。声明按长度截断时，每片段步数不超过设定值；声明按回合结束时，片段必须落在真实回合边界上。第二条：<strong>回合边界标志必须真实反映终止与截断</strong>。后处理按这些标志分段计算优势，错误标志造成的偏差不会报错，只会让训练曲线缓慢恶化。两条不变量是采样器与训练流程之间的隐形合同。</p>
+    </div>
+    <p>示范比例在训练过程中可以调度：早期取高值以快速建立基本行为，后期降到低值让在线策略主导；比例调度记录在实验配置中便于复现。异步缓冲与在线采样并行运行时，取数顺序按到达时间处理，队列溢出优先淘汰最旧片段，控制训练数据的陈旧度。</p>
+    <p><strong>替换采样器后的验证清单：</strong>字段完整性，对照目标算法的后处理字段清单逐项核对；列长一致性，对每一列断言长度相同；边界真实性，统计每个片段内回合结束标志出现次数并与环境日志比对；吞吐对照，与默认采样器比较 sample_throughput；可复现性，固定种子两次运行得到相同批次。任一项不通过都应回到采样器实现排查，避免把接口问题带入超参搜索阶段。</p>
+    <p>与上一章差异：第 022 章调整的是并行结构（进程与副本的比例），采样逻辑保持默认；本章替换采样逻辑本身，负责批次字段的正确性。实现后必须验证：字段完整、长度一致、边界正确、吞吐可接受。下一章把采样与学习的编排关系放到进程层面讨论。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：自定义采样器的契约骨架</strong></p>
+    <pre class="code"><code>import numpy as np
+from ray.rllib.policy.sample_batch import SampleBatch
+
+
+class DemoMixSampler:
+    """契约示意：在标准采样中按比例混入离线示范转移。
+
+    基类与注册路径随 Ray 版本演进（早期为 Sampler 子类，
+    新 API 栈归入 EnvRunner），这里展示不变的核心约定。
+    """
+
+    def __init__(self, env, policy, fragment_len=200, demo_ratio=0.2):
+        self.env = env                  # 与策略交互的环境副本
+        self.policy = policy            # 动作由当前策略产生
+        self.fragment_len = fragment_len  # 片段长度，需与 batch_mode 约定一致
+        self.demo_ratio = demo_ratio    # 示范数据占比，其余为在线采样
+        self.obs, _ = self.env.reset(seed=None)
+
+    def sample(self):
+        # 第一步：按在线策略走满片段长度，记录完整字段
+        obs_list, act_list, rew_list, done_list = [], [], [], []
+        for _ in range(self.fragment_len):
+            action = self.policy.compute_single_action(self.obs)
+            next_obs, reward, terminated, truncated, _ = self.env.step(action)
+            obs_list.append(self.obs)
+            act_list.append(action)
+            rew_list.append(reward)
+            done_list.append(terminated or truncated)  # 边界标志真实反映回合结束
+            if terminated or truncated:
+                self.obs, _ = self.env.reset(seed=None)
+            else:
+                self.obs = next_obs
+        # 第二步：把字段整理为列式存储，所有列共享同一时间轴
+        batch = SampleBatch({
+            SampleBatch.OBS: np.asarray(obs_list, dtype=np.float32),
+            SampleBatch.ACTIONS: np.asarray(act_list, dtype=np.float32),
+            SampleBatch.REWARDS: np.asarray(rew_list, dtype=np.float32),
+            SampleBatch.DONES: np.asarray(done_list, dtype=np.bool_),
+        })
+        return batch  # 字段完备性由算法后处理阶段校验</code></pre>
+    <p>解读：骨架只实现最小字段集，是因为它面向的算法后处理只需要观测、动作、奖励与边界标志。<strong>每一列的长度必须等于片段实际步数，时间顺序必须与执行顺序一致；</strong>示范数据的混入发生在批次组装之后（对示范片段补齐 action_logp 等字段再拼接），本片段先保证在线一侧正确。基类与注册方式随版本变化，升级时核对官方文档的迁移说明。</p>
+
+    <p><strong>片段 2：注入配置与版本对应</strong></p>
+    <pre class="code"><code>from ray.rllib.algorithms.ppo import PPOConfig
+
+# 旧 API 栈：把采样器类挂到算法配置，由采样工作进程实例化
+config = (
+    PPOConfig()
+    .environment(env=LineGoalEnv)
+    .env_runners(num_env_runners=4, num_envs_per_env_runner=1,
+                 rollout_fragment_length=200)
+    .training(train_batch_size=4000)
+)
+# 过渡期写法示意：sample_collector 用于定制批次组装；
+# 采样器类本身的替换入口随版本不同（worker.sampler 或 EnvRunner），
+# 升级前务必核对对应版本官方文档，避免沿用旧路径导致静默回退默认实现
+config.build_algo()
+print("采样器注入点以对应 Ray 版本官方文档为准")</code></pre>
+    <p>解读：这段配置强调一个操作要点：采样器的注入点与批次组装配置是两个不同的扩展位。<strong>sample_collector 控制的是一批转移如何拼成 SampleBatch，采样器控制的是转移如何产生；</strong>混用两者的入口是常见错误。替换类未生效时 RLlib 通常不报错，会安静使用默认实现；验证方式是对比替换前后批次中的自定义字段是否存在。</p>
+
+    <p><strong>片段 3：批次校验小工具</strong></p>
+    <pre class="code"><code>def validate_batch(batch, fragment_len):
+    """在提交训练前校验字段：长度一致性与边界标志。"""
+    n = len(batch["obs"])
+    for key in ("actions", "rewards", "dones"):
+        assert len(batch[key]) == n, f"字段 {key} 长度不一致"
+    # 边界标志必须为布尔值且至少出现一次回合结束，
+    # 否则优势估计会把跨回合的转移串联起来
+    assert batch["dones"].dtype == np.bool_, "dones 必须为布尔列"
+    assert batch["dones"].any() or fragment_len == n, \
+        "未见回合边界时，片段长度必须与设定值一致"
+    return True
+
+
+# 在自定义采样器的 sample() 返回前调用，让错误停留在采样阶段
+# validate_batch(batch, fragment_len)</code></pre>
+    <p>解读：校验函数把两类隐性错误变成显式断言：字段长度不一致会在拼接张量时暴露为难以定位的形状错误，提前校验可直接指出列名；回合边界缺失意味着环境未正确返回终止标志，或采样器忽略了回合重启。<strong>把校验放在采样与训练之间，是自定义采样器最划算的一笔工程投入。</strong></p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>替换未生效</strong>：注入路径写错或随版本失效，RLlib 静默使用默认采样器。症状是自定义字段不存在。修复：在采样器内加打印或计数器，确认实例被调用。</li>
+      <li><strong>忽略片段长度约定</strong>：采样器按固定步数返回，但批次模式声明为回合结束。症状是批次组装等待或报出伪边界。修复：让切分语义与配置声明保持一致。</li>
+      <li><strong>边界标志错误</strong>：把截断当成终止，或者忘记回合重启。症状是训练曲线缓慢恶化且难以归因。修复：终止与截断分开处理，重启后同步更新采样器的观测缓存。</li>
+      <li><strong>在 sample 中做阻塞调用</strong>：外部数据源等待过长，采样进程超时被调度层替换。症状是日志出现工作进程重启。修复：阻塞读取移入缓冲队列，采样侧只做非阻塞取数。</li>
+      <li><strong>批次字段与算法不匹配</strong>：给算法多填或漏填字段。症状是后处理报错或比率恒等于一。修复：按目标算法的后处理代码逐项核对字段清单。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把片段长度由 200 调至 50，预测优势估计的方差与批次组装频率的变化方向。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>片段变短，跨界引导增多，优势估计依赖更多前值，方差上升；批次提交更频繁，组装与通信开销占比提高。</div></details>
+      </li>
+      <li>判断下列需求各应选用环境包装、回调还是自定义采样器：奖励缩放、轨迹长度统计、按比例注入示范数据、外部仿真器异步回放。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>奖励缩放在包装器；长度统计在回调；示范注入与异步回放需要控制采样节奏或数据来源，属于采样器范畴。</div></details>
+      </li>
+      <li>推导：若混合采样中示范比例为 0.2，批次内旧策略对数概率列为何必须按来源分别填充？说明忽略该点的后果。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>重要性比率依赖旧策略对数概率；示范转移来自行为策略，若填成当前策略的值，比率恒为一而使修正失效，正负样本权重失衡。</div></details>
+      </li>
+      <li>设计实验：在相同训练批次下对比默认采样器与自定义采样器的吞吐，给出测量口径（样本每秒、批次组装耗时、迭代耗时）。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>固定其余配置只替换采样器；吞吐看 sample_throughput，组装耗时在采样器内加计时器统计。</div></details>
+      </li>
+      <li>为外部仿真器设计采样器：仿真器通过消息队列持续输出转移，要求采样不阻塞、回合边界可恢复，说明缓冲队列容量与丢弃策略。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>后台线程或反馈线程填充定长队列，采样侧批量取数；队列溢出时优先丢弃旧转移，避免训练数据陈旧度增长。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>采样器只负责训练循环第一段：与策略交互、切分片段、输出批次；优势与损失属于后处理与学习器。</li>
+      <li>批次是列式结构，最小字段为观测、动作、奖励与回合边界标志，带比率的算法还需动作分布输入与旧对数概率。</li>
+      <li>接口随版本从 Sampler 迁移到 SampleCollector 与 EnvRunner，不变的是交互生成、片段切分与字段完备三条约定。</li>
+      <li>定制顺序为先包装器、再回调、最后采样器，避免为局部需求替换数据层。</li>
+      <li>边界标志与片段语义必须与配置声明一致；批次校验应在采样阶段完成。</li>
+      <li>下一章讨论采样与学习在多进程层面的编排方式：多环境并行训练。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch022.html">← 第 022 章：RLlib与环境向量化</a>
+    <a class="next" href="ch024.html">第 024 章：RLlib多环境并行训练 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

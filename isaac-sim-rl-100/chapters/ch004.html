@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第004章 实现关节位置控制 | 机器人仿真学习课程 · Isaac Sim 强化学习训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · 仿真环境与训练框架</span>
+    <span class="sep">/</span>
+    <span>第 004 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · 仿真环境与训练框架</div>
+    <h1>第 004 章：实现关节位置控制</h1>
+    <p class="lead">把策略的输出变成"目标关节角"：理解两级闭环的分工，掌握动作的三种表示与缩放裁剪，并解释为什么位置控制下手臂会"垂一点"。</p>
+    <ul class="meta">
+      <li>主题：控制模式 / 关节位置伺服</li>
+      <li>相关组件：Isaac Sim（ArticulationController、位置驱动）</li>
+      <li>预计学时：45 分钟</li>
+      <li>前置章节：第 003 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解位置控制的两级闭环结构：策略（外环，低频决策）与位置伺服（内环，物理步内执行）各自负责什么。</li>
+      <li>掌握 RL 中位置动作的三种表示：绝对目标、相对默认位姿的偏移、增量式，知道各自适用场景。</li>
+      <li>会实现"归一化动作 → 物理目标"的缩放与裁剪，并解释动作饱和为什么会让训练变慢。</li>
+      <li>能用 Δq<sub>ss</sub> = τ<sub>gravity</sub>/K<sub>p</sub> 估算稳态跟踪误差，判断它是正常现象还是配置错误。</li>
+      <li>会给位置目标加变化率限制，理解目标突变与驱动器饱和、振荡之间的关系。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>强化学习策略的输出是一串抽象数字，而物理引擎接受的是"目标关节角"这样的物理量。位置控制就是这两者之间的第一座桥：策略说"肩关节转到 −0.5 rad"，驱动器负责在物理步内把关节伺服过去。</p>
+    <p>大多数机械臂操作任务（到达、抓取、放置）在 RL 里都从位置控制起步，因为<strong>它让策略不必学习"如何维持一个姿态"这件底层的事</strong>，只需决定"姿态是什么"，样本效率显著高于直接输出力矩。005、006 章会分别给出速度与力矩两座桥，三座桥的适用场景不同，本章先把最常用的这座修好。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 两级闭环：策略在"外"，伺服在"内"</h3>
+    <p>位置控制下的系统是两个嵌套的闭环：</p>
+    <div class="formula">
+      外环（策略）：s<sub>t</sub> → π<sub>θ</sub> → a<sub>t</sub> → q*<sub>t</sub> &nbsp;&nbsp;|&nbsp;&nbsp; 内环（驱动器）：q*<sub>t</sub> → PD → τ → q
+      <span class="note">外环每个决策周期跑一次（如 60 Hz 或每 4 个物理步一次）；内环在每个物理步内由 PhysX 执行</span>
+    </div>
+    <p>为什么要分层？因为"把一个关节即时稳定在某个角度"是一个已被经典控制解决的问题，用 PD 伺服解决只需要两个参数；如果让神经网络从零学这件事，它要消耗大量样本去发现"误差大就加大力矩"这种规律。<strong>把确定性、可解析的部分交给控制器，把决策、规划的部分交给策略，是机器人 RL 最核心的架构思想。</strong>代价是：策略实际能控制的是"目标"，真正的关节角受驱动器动态约束（下一节）。</p>
+
+    <h3>2. 位置控制下的稳态误差：手臂为什么会"垂一点"</h3>
+    <p>驱动器力矩为 τ = K<sub>p</sub>(q* − q) − K<sub>d</sub>·q̇。当关节在重力矩 τ<sub>g</sub> 下静止（q̇=0）时，力矩平衡给出：</p>
+    <div class="formula">
+      Δq<sub>ss</sub> = q* − q<sub>∞</sub> = τ<sub>g</sub> / K<sub>p</sub>
+      <span class="note">例如 τ_g = 20 N·m、Kp = 400 N·m/rad 时，稳态偏差 0.05 rad ≈ 2.9°</span>
+    </div>
+    <p>这是 PD 位置控制的内在天性：<strong>要产生力矩，就必须保留一部分位置误差</strong>。偏差大小与重力负载成正比、与 Kp 成反比。想吞掉它，要么加前馈（重力补偿力矩，把 τ<sub>g</sub> 预先算出并叠加），要么提高 Kp，但后者受 003 章的稳定性约束。对 RL 任务来说，通常不需要精确到零误差：观测里包含真实关节角，策略会自己适应这 3° 的偏差。</p>
+
+    <h3>3. 动作的三种表示</h3>
+    <table>
+      <tr><th>表示</th><th>公式</th><th>优点</th><th>缺点</th><th>适用</th></tr>
+      <tr><td>绝对目标</td><td>q* = a（缩放后）</td><td>表达力完整，可达任意姿态</td><td>需要按关节逐一缩放；越界动作多</td><td>全空间操作任务</td></tr>
+      <tr><td>相对默认位姿</td><td>q* = q<sub>def</sub> + a·Δq<sub>max</sub></td><td>天然落在任务相关区域；动作语义统一</td><td>远离默认位姿的目标难表达</td><td>到达、抓取、示教附近任务</td></tr>
+      <tr><td>增量式</td><td>q*<sub>t</sub> = clip(q*<sub>t−1</sub> + a·Δq<sub>step</sub>)</td><td>目标平滑；有"速度感"</td><td>目标会漂移，需限幅管理</td><td>精细操作、遥操作风格任务</td></tr>
+    </table>
+    <p>归一化动作 a ∈ [−1, 1]<sup>n</sup> 是 RL 库（如 Stable-Baselines3）的默认约定：<code>tanh</code> 高斯策略天然输出有界区间上的动作。你的工作是把 [−1,1] 映射到物理上合理的范围，并保证<strong>整个区间内的动作都既合法（不越限）又有意义（不饱和）</strong>。以 Franka 手臂为例：Δq<sub>max</sub> 取 0.5 rad 时 τ 需求约 Kp×0.5 = 200 N·m，超过 87 N·m 上限会饱和；把 Δq<sub>max</sub> 降到 0.2 左右更稳。</p>
+
+    <h3>4. 目标变化率与"阶跃杀伤"</h3>
+    <p>位置目标是阶跃信号时，驱动器瞬间产生巨大误差力，受 τ<sub>max</sub> 饱和后表现为：启动猛、到位冲、超调大。真机的伺服总线通常以有限速率接收目标，因此对目标加变化率限制（rate limit）更接近真机行为：</p>
+    <div class="formula">
+      q*<sub>t</sub> ← clip( q*<sub>t−1</sub> + Δq<sub>rate</sub>, &nbsp;q*<sub>target</sub> 方向 )
+      <span class="note">Δq_rate 例如 2 rad/s：以 60 Hz 计，每步目标最多移动 0.033 rad</span>
+    </div>
+    <p>它同时带来一个 RL 上的好处：动作到效果更连续、更可预测，策略更容易学到"目标动多少，末端动多少"的映射。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>实现一个位置控制接口的完整步骤：</p>
+    <ol>
+      <li><strong>缓存默认位姿</strong>（reset 时读取当前关节角作为 q<sub>def</sub>，后续动作都相对它计算）。</li>
+      <li><strong>确定 Δq<sub>max</sub> 向量</strong>（逐关节给值：大臂行程大给小一点、腕部给小、夹爪给平动行程；依据是"一步内物理上合理的变化幅度"）。</li>
+      <li><strong>动作映射</strong>（q* = q<sub>def</sub> + a·Δq<sub>max</sub>，再 clip 到关节限位）。</li>
+      <li><strong>变化率限制</strong>（对 q* 相对上一目标的增量再做一次裁剪）。</li>
+      <li><strong>下发动作</strong>（构造 <code>ArticulationAction(joint_positions=q*)</code> 交给控制器，每个物理步或每个决策步执行）。</li>
+      <li><strong>诊断</strong>（记录跟踪误差与实测力矩，确认既没有大面积饱和，也没有稳态偏差超预期）。</li>
+    </ol>
+    <div class="box key">
+      <span class="box-title">设计思维：动作空间采用"相对默认位姿"表示的收益？</span>
+      <p>假设任务是"把方块推到桌面中央"，机械臂只有在默认位姿附近的小邻域内活动。用绝对角度时，策略要浪费样本探索整个关节限位空间（Franka 关节 1 的范围是 ±2.9 rad），而其中 90% 的动作与任务无关。相对表示把探索范围压缩到任务邻域，<strong>同样的样本预算下收敛更快</strong>。如果你的任务确实需要大范围运动，再扩大 Δq<sub>max</sub> 或退回绝对表示。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：把归一化动作映射为位置目标并下发</strong></p>
+    <pre class="code"><code>import numpy as np
+from isaacsim.core.utils.types import ArticulationAction  # 动作容器，路径随版本有差异
+
+# 每个关节允许的最大偏移：大臂 0.2 rad、肘 0.3、腕 0.5（腕行程相对大但惯量小）
+DQ_MAX = np.array([0.2, 0.2, 0.3, 0.3, 0.5, 0.5, 0.5, 0.04, 0.04])
+
+def action_to_target(action, q_default, q_lower, q_upper):
+    """把策略动作 a ∈ [-1,1]^9 映射为合法且安全的关节位置目标。"""
+    action = np.clip(action, -1.0, 1.0)          # 防御性裁剪：策略探索时可能发出越界值
+    q_target = q_default + action * DQ_MAX       # 相对默认位姿的偏移表示
+    return np.clip(q_target, q_lower, q_upper)   # 物理上限：绝不把目标写到限位之外
+
+controller = robot.get_articulation_controller()
+dof_props = robot.dof_properties            # 属性表：含每个关节的 lower/upper 限位
+action = policy(obs)  # 示意：来自你的策略网络；范围 [-1,1]
+q_target = action_to_target(action, q_default, dof_props["lower"], dof_props["upper"])
+controller.apply_action(ArticulationAction(joint_positions=list(q_target)))</code></pre>
+    <p>解读：三层保护各司其职。<strong>第一层 clip 保证输入语义正确</strong>（超出 [−1,1] 的动作可能是数值噪声，裁掉它比放大它更安全）；<strong>第二层缩放把抽象的 −1..1 翻译成物理量</strong>，DQ_MAX 的选择直接决定策略"一步能走多远"；<strong>第三层 clip 到限位是物理正确性的最后防线</strong>，如果目标超过关节限位，驱动器会在限位处持续顶住，产生持续饱和力矩，既浪费动作又可能触发保护。为什么要事先把 q_default 缓存下来、不每次读当前位置？因为"相对偏移"如果以当前位置为基准，就变成了增量式：目标会随实际状态漂移，同一动作在不同状态下效果不同，训练难度完全不同。两种表示选一种，不要混。</p>
+
+    <p><strong>片段 2：给目标加变化率限制</strong></p>
+    <pre class="code"><code>class RateLimitedPositionTarget:
+    """把策略给出的目标变化限制在每步不超过 max_step，模拟真机伺服总线的接收速率。"""
+    def __init__(self, q_init, max_step):
+        self.q_cmd = np.asarray(q_init, dtype=float).copy()  # 当前"已下发"的目标
+        self.max_step = np.asarray(max_step, dtype=float)    # 每步允许的目标增量
+
+    def update(self, q_want):
+        # 计算期望增量，裁剪到 ±max_step，再累加到当前目标上
+        delta = np.clip(np.asarray(q_want) - self.q_cmd, -self.max_step, self.max_step)
+        self.q_cmd += delta
+        return self.q_cmd
+
+# 60 Hz 下 max_step=2 rad/s / 60 ≈ 0.033 rad：大范围挥臂需要约 0.5 秒走完 1 rad
+limiter = RateLimitedPositionTarget(robot.get_joint_positions(), max_step=np.full(9, 0.033))
+for i in range(240):                                       # 4 秒演示循环
+    q_want = action_to_target(policy(obs), q_default, q_low, q_high)
+    controller.apply_action(ArticulationAction(joint_positions=list(limiter.update(q_want))))
+    world.step(render=False)</code></pre>
+    <p>解读：这个类解决的是"阶跃杀伤"问题，把任意大的目标变化摊成连续小步。为什么采用"每步增量裁剪"、不对最终目标做插值？因为增量式实现天然无状态假设：即使策略突然给一个很远的自标，物理上也是平滑逼近；且实现只有四行。注意 max_step 的量级推导：真机伺服总线常见 100–1000 Hz 接收目标，每周期增量极小；仿真里取 2 rad/s 的目标速率已经相当激进，可以让大范围运动在 0.5 秒级完成，同时明显减少饱和冲击。参数选择的原则是：<strong>让限速落在"舒适区"、避免成为瓶颈</strong>，如果任务需要更快，先检查 τ<sub>max</sub> 能否支付加速度需求。</p>
+
+    <h3>5. 稳态偏差的逐关节量化</h3>
+    <p>把稳态公式逐个关节算一遍，"垂一点"的量级立刻清楚，也不必再把它当异常。按 Franka 的近似负载参数估算：</p>
+    <table>
+      <tr><th>关节</th><th>重力力矩估算 τ<sub>g</sub></th><th>K<sub>p</sub>（N·m/rad）</th><th>Δq<sub>ss</sub> = τ<sub>g</sub>/K<sub>p</sub></th></tr>
+      <tr><td>关节 2（大臂）</td><td>约 10 N·m（m ≈ 4 kg、r ≈ 0.25 m）</td><td>800</td><td>0.013 rad ≈ 0.7°</td></tr>
+      <tr><td>关节 4（肘）</td><td>约 5 N·m（m ≈ 2 kg、r ≈ 0.25 m）</td><td>400</td><td>0.013 rad ≈ 0.7°</td></tr>
+      <tr><td>关节 7（腕）</td><td>约 0.5 N·m（m ≈ 0.5 kg、r ≈ 0.1 m）</td><td>150</td><td>0.003 rad ≈ 0.2°</td></tr>
+    </table>
+    <p>三行的量级都在 0.003–0.013 rad，小于多数任务的容差。<strong>终点偏差小、过程误差大</strong>是位置伺服的典型特征：策略刚下达一个大目标时，动态误差峰值可达稳态值的数倍，再随阻尼衰减到 τ<sub>g</sub>/K<sub>p</sub>。诊断时要区分"最终停在哪"与"中途偏多少"两个指标，前者反映负载，后者反映带宽与饱和。</p>
+
+    <h3>6. 决策频率、动作重复与目标速率上限</h3>
+    <p>策略不需要每个物理步都决策。设动作重复步数（action repeat）为 K，则决策周期与动作空间允许的最大等效目标速率为：</p>
+    <div class="formula">
+      Δt<sub>decision</sub> = K · physics_dt，&nbsp;v<sub>max</sub> ≈ Δq<sub>max</sub> / Δt<sub>decision</sub>
+      <span class="note">K = 4、physics_dt = 1/60 s 时决策频率 15 Hz、周期 66.7 ms；Δq_max = 0.2 rad 对应等效速率约 3 rad/s</span>
+    </div>
+    <p>这条公式把三个参数连成一体：Δq<sub>max</sub>、K 与变化率限制。若限速设 2 rad/s 而 Δq<sub>max</sub>/Δt<sub>decision</sub> = 3 rad/s，限速器会比动作空间本身更紧，"最大动作"永远走不到位，动作分辨率被浪费。核对规则：<strong>限速值略大于动作空间允许的最大等效速率</strong>，让限速挡住冲击，又不成为瓶颈。K 的常见档位：</p>
+    <table>
+      <tr><th>K（动作重复）</th><th>决策频率（60 Hz 物理）</th><th>适用场景</th></tr>
+      <tr><td>1</td><td>60 Hz</td><td>精细操作、接触密集任务</td></tr>
+      <tr><td>4</td><td>15 Hz</td><td>常规机械臂操作（本课程默认）</td></tr>
+      <tr><td>8–10</td><td>6–7.5 Hz</td><td>粗粒度移动、导航类任务</td></tr>
+    </table>
+    <p>K 增大时单条轨迹的决策次数减少，回放缓冲的样本密度下降，但每条样本覆盖的物理时间更长。做采样预算时用"决策步数"计价，与"物理步数"的换算系数就是 K。</p>
+
+    <h3>7. 动作幅度到末端位移的快速估算</h3>
+    <p>关节动作最终会放大到末端，量级估算用圆弧近似：末端距该关节轴 L 时，关节转角 Δq 对应末端位移 Δx ≈ L · Δq。以工作半径 L ≈ 0.8 m 为例：</p>
+    <div class="formula">
+      Δx ≈ L · Δq
+      <span class="note">Δq = 0.2 rad 时 Δx ≈ 16 cm；Δq = 0.05 rad 时 Δx ≈ 4 cm</span>
+    </div>
+    <p>这个估算解释了为什么"推方块到中心"这类任务常把 Δq<sub>max</sub> 降到 0.05–0.1 rad 档：单步末端位移 4–8 cm 已足够覆盖目标邻域，接触冲击也小。用 Δx ≈ L·Δq 反推动作幅度，比在训练里直接试错快得多：先由任务的空间尺度定 Δx，再除以臂长换回 Δq。多关节同时运动时位移会叠加，估算值可作为上界使用。再给一组数字：Δq = 0.05 rad、L = 0.8 m 给出单步 4 cm 位移；任务若要求单步位移不超过 1 cm，则 Δq 上限约 0.0125 rad。远端关节（腕部）的工作半径更小，同样的 Δq 对应更细的位移，可以单独放宽。</p>
+    <p>给位置控制接口定三条验收判据，训练前先过一遍：<strong>可达性</strong>（把动作固定为 ±1 各跑 1 秒，末端覆盖范围应包住任务区域）；<strong>平稳性</strong>（阶跃与连续动作下跟踪误差不发散，力矩占比不长期贴近 100%）；<strong>分辨率</strong>（动作的最小变化引起的末端位移小于任务容差，容差 1 cm 时对应 Δq 应小于约 0.0125 rad，按 L = 0.8 m 折算）。三条判据分别对应探索空间、动力学安全与动作精细度，任何一条不满足都会在训练曲线上表现为收敛困难。</p>
+
+    <h3>8. 目标速率的整链条预算</h3>
+    <p>动作幅度、决策周期与限速是同一根链条上的三个环节，把它们写成一个等式再逐档代入，参数该取多少就不再是手感问题：</p>
+    <div class="formula">
+      v<sub>eq</sub> = Δq<sub>max</sub> / (K · physics_dt)，&nbsp; Δx<sub>step</sub> ≈ L · Δq<sub>max</sub>
+      <span class="note">v_eq 是动作空间允许的等效目标速率；Δx_step 是单次决策末端可移动的距离，L 取工作半径量级 0.8 m</span>
+    </div>
+    <p>取 Δq<sub>max</sub> = 0.2 rad、physics_dt = 1/60 s，逐档计算 K = 1、4、8：</p>
+    <table>
+      <tr><th>K</th><th>决策频率</th><th>等效目标速率 v<sub>eq</sub></th><th>末端等效速度（L = 0.8 m）</th><th>单步末端位移</th></tr>
+      <tr><td>1</td><td>60 Hz</td><td>12 rad/s</td><td>约 9.6 m/s</td><td>16 cm</td></tr>
+      <tr><td>4</td><td>15 Hz</td><td>3 rad/s</td><td>约 2.4 m/s</td><td>16 cm</td></tr>
+      <tr><td>8</td><td>7.5 Hz</td><td>1.5 rad/s</td><td>约 1.2 m/s</td><td>16 cm</td></tr>
+    </table>
+    <p>读表的关键在最后两列的对照：<strong>单步位移固定，等效速度随 K 反比缩小</strong>。K = 1 时动作空间允许的等效目标速率高达 12 rad/s，远超关节速度上限（约 2.2 rad/s）与执行器动态能力，说明"一步走到目标"物理上做不到；K = 4 时等效速率降到 3 rad/s，仍略高于真机伺服总线常见的接收速率。限速器的位置由此确定：<strong>取值略高于动作空间的等效速率，又不成为瓶颈</strong>。若限速取 2 rad/s 而 K = 1，动作空间承诺的 12 rad/s 被砍到六分之一，策略输出的大动作与中动作在物理端没有区别，动作分辨率被浪费；把 K = 4 与限速 3–4 rad/s 配对，两者就落在同一量级。</p>
+    <p>选择 Δq<sub>max</sub> 的方法也在这条链上：先由任务空间尺度定单步末端位移（邻域任务 4–8 cm），再除以 L 换回关节幅度（0.05–0.1 rad 档），最后检查 K 与限速的乘积是否覆盖它。三个参数任何一处改动都要把整条链重算一遍，这是位置控制接口最重要的维护纪律。</p>
+    <p>稳态偏差的消除方式也可以量化对比：PD 位置控制下 Δq<sub>ss</sub> = τ<sub>g</sub> / K<sub>p</sub>，以 2 节的算例（τ<sub>g</sub> = 20 N·m、K<sub>p</sub> = 400 N·m/rad）约 0.05 rad（约 2.9°）。加前馈（用质量-质心模型算出重力矩并叠加到命令上）后，剩余偏差约等于前馈模型的误差份额：模型误差 5% 时残余约 0.0025 rad（约 0.14°），相比原来的 0.05 rad 缩小一个数量级。是否值得加前馈，取决于任务容差与该关节的重力工况：容差 1 cm（约 0.0125 rad）时前馈带来的收益可见，容差 5 cm 时它不影响成败。</p>
+    <p>动作幅度与限位余量的联动也值得算一次。本章的相对动作表示以默认姿态为基准，单个关节的动作空间宽度是 ±Δq<sub>max</sub>。002 章的余量核对给出 joint4 的余量约 0.716 rad：Δq<sub>max</sub> 取 0.2 rad 时，单步最大偏移只占余量的 28%，大多数采样动作不受限位裁剪；把 Δq<sub>max</sub> 放大到 1.5 rad 时，0.716 / 1.5 ≈ 0.48，超过一半幅度的动作会撞进裁剪，动作维度间的有效分辨率随之受损。这条计算与练习 2 的观察一致：<strong>动作幅度放大到超过限位余量的一半，收益就开始为负</strong>。默认姿态越靠近行程中点，可用的 Δq<sub>max</sub> 越宽，这也把 002 章的余量核对与本章的动作设计接到了一起。</p>
+    <p>接触任务还需要额外的幅度约束。推挤、擦拭类任务里，末端与物体接触后的一步位移会直接转化为穿深或推力冲击：单步末端位移 16 cm（Δq = 0.2 rad、L = 0.8 m）意味着一步之内可以"跨过"接触状态，穿深尖峰与接触力尖峰随之出现。把动作幅度降到 Δq ≤ 0.05 rad（单步约 4 cm）并配合 K = 1 或 2 的决策频率，接触事件在两个决策点之间至少被采样一次，诊断面板里的力矩占比曲线才能保持平稳。</p>
+
+    <p><strong>片段 3：跟踪误差与饱和诊断</strong></p>
+    <pre class="code"><code>q = robot.get_joint_positions()                # 实际关节角
+TAU_LIMIT = np.full(9, 87.0)                   # Franka 关节力矩上限约 87 N·m（含夹爪用 60）
+q_err = limiter.q_cmd - q                      # 目标与实际的差：静态时反映重力偏差
+tau_meas = robot.get_measured_joint_efforts()  # 实测关节力矩（含驱动器输出，接口名随版本变化）
+
+print(f"最大跟踪误差 {np.abs(q_err).max():.3f} rad")  # 运动段峰值约 0.03-0.06 rad；稳态收窄到 0.01 rad 量级
+print("力矩占限额比例:", np.round(np.abs(tau_meas) / TAU_LIMIT, 2))  # 接近 1.0 说明接近饱和
+
+# 诊断逻辑：误差大 + 力矩打满 = 饱和（减小 DQ_MAX 或加大 τ_max）
+#           误差平稳但非零 + 力矩未满 = PD 固有稳态偏差（正常）
+#           误差持续增大 + 力矩很小 = 驱动器模式不对或增益没生效</code></pre>
+    <p>解读：这三行打印构成位置控制系统的最小诊断面板。核心是<strong>用"误差 × 力矩"两个维度区分三类问题</strong>：饱和（两者都大）、正常偏差（误差恒定为 τ<sub>g</sub>/K<sub>p</sub> 量级、力矩有富余）、配置错误（误差发散但力矩很小，说明驱动器根本没出力）。每个新任务先跑几秒这个面板，能省下大量调试时间。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>动作缩放过大导致长期饱和</strong>：症状是策略动作总是被 clip、跟踪误差大且训练几乎不进步。修复：把 DQ_MAX 调小到"典型动作不饱和"的水平（先用手动测试找量级）。</li>
+      <li><strong>把稳态误差当 bug 反复调 Kp</strong>：位置控制下有 τ<sub>g</sub>/K<sub>p</sub> 的偏差是正常的。修复：先估算量级（用片段 3 的公式），只有明显超出预期才怀疑配置。</li>
+      <li><strong>混用相对与增量表示</strong>：q_default 在 reset 后没有更新，导致目标基准漂移。修复：reset 时同步刷新所有缓存（q_default、limiter 内部状态）。</li>
+      <li><strong>目标突变造成接触任务穿透</strong>：推挤类任务中目标一步跳变会让末端撞击物体。修复：加变化率限制（片段 2），或降低决策频率与 DQ_MAX 的乘积。</li>
+      <li><strong>把限位裁剪写在缩放之前</strong>：顺序错误会让"相对默认位姿的偏移"被关节限位截断，靠近限位时动作完全失效。修复：先缩放再裁剪，且默认位姿应远离限位（选中间姿态）。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>估算 Franka 关节 2（大臂）在默认位姿下需要多大重力力矩，用 τ<sub>g</sub>/K<sub>p</sub> 预测稳态偏差，再用仿真验证。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>关节 2 附近的连杆质量约 3–5 kg、质心距离约 0.2–0.3 m，τ ≈ m·g·r 量级；仿真里读 <code>get_measured_joint_efforts()</code> 对比。</div></details>
+      </li>
+      <li>把 DQ_MAX 第三项（肘关节）从 0.3 改成 1.5，观察饱和诊断面板的变化，并解释为何"更大的动作空间不等于更强的能力"。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>盯"力矩占限额比例"这一项：动作越大，达到同样误差所需的 τ 越快撞上 87 N·m。</div></details>
+      </li>
+      <li>实现增量式动作表示（q* += a·Δq_step），与相对表示做对比实验：在同一任务下各训练 2 万步，比较收敛速度。写下你对两种表示优劣的结论。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>注意增量式的目标要有硬限幅（比如距默认位姿不超过 0.8 rad），否则策略会把目标"开出"工作区。</div></details>
+      </li>
+      <li>推导：若 τ<sub>max</sub> 充足，位置误差从 0.2 rad 收敛到 0.02 rad 的时间由什么决定？给出一阶近似表达式并与实测对照。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>从 J·q̈ = −Kd·q̇ − Kp·Δq 出发，临界阻尼附近误差衰减时间常数约 2/ω_n；代入 ω_n 数值即可。</div></details>
+      </li>
+      <li>实验设计：把变化率限制从 2 rad/s 改成 0.5 rad/s，先预测"到达任务成功率"和"平均完成时间"的变化方向，再设计一个 30 回合的对比实验验证。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>限速直接影响"物理上最快的运动速度"，成功率可能不变（动作仍可达）但完成时间变长；若任务奖励含时间项则成功率也可能掉。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>位置控制 = 两级闭环：策略低频决定"目标姿态"，PD 伺服在物理步内执行；分层让策略专注于决策，样本效率显著提升。</li>
+      <li>归一化动作到物理目标的映射有三步：clip 输入、按 Δq<sub>max</sub> 缩放、clip 到关节限位；动作表示优先选"相对默认位姿"。</li>
+      <li>PD 位置控制天然存在稳态偏差 Δq<sub>ss</sub> = τ<sub>g</sub>/K<sub>p</sub>（约百分之几弧度），不是故障；要消除需前馈补偿。</li>
+      <li>变化率限制模拟真机伺服总线，把阶跃目标平滑成渐进目标，减少饱和与接触冲击。</li>
+      <li>下一章：005 实现关节速度控制，当目标量从"角度"换成"角速度"，系统特性与适用任务（轮子、传送带、夹爪闭合）都会改变。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch003.html">← 第 003 章：配置关节驱动器</a>
+    <a class="next" href="ch005.html">第 005 章：实现关节速度控制 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

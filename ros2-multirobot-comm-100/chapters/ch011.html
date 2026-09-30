@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第011章 QoS服务质量配置：可靠性与持久性 | 多机器人协同学习课程 · ROS2 通信与系统集成</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · 通信基础与系统搭建</span>
+    <span class="sep">/</span>
+    <span>第 011 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · 通信基础与系统搭建</div>
+    <h1>第 011 章：QoS服务质量配置：可靠性与持久性</h1>
+    <p class="lead">QoS 是发布者与订阅者之间的端到端合同。本章把两个最核心的条款，可靠性（丢不丢）与持久性（晚到者拿不拿到），的机制、代价与组合讲透。</p>
+    <ul class="meta">
+      <li>主题：通信基础 / 服务质量</li>
+      <li>关键机制：Reliable/Best-effort 重传语义、Volatile/Transient-local 晚加入者机制、depth 与历史</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 002 章、第 010 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>建立 QoS 是"端到端合同"的完整心智模型：发布端声明提供什么、订阅端声明要求什么，由中间件判定兼容。</li>
+      <li>理解 Reliable 的实现代价（重传、窗口、延迟尾部）与 Best-effort 的适用语义，会按数据的失效模式二选一。</li>
+      <li>理解 Transient-local 的"晚加入者"机制：谁在存历史、多深、何时发放；知道它与可靠性必须如何搭配。</li>
+      <li>会做四象限组合设计：状态流、事件/配置、传感器流各自的可靠性与持久性取法。</li>
+      <li>会量化 late-joiner 风暴：20 台机器人同时上线时，大消息 + Transient-local 的瞬时带宽冲击与缓解手段。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 002 章给过一张"QoS 起点模板"，当时的建议是"按消息语义选可靠性"。本章把这句口号展开成可执行的工程决策：<strong>为什么控制指令必须 Reliable、激光扫描却最好 Best-effort、共享地图必须 Transient-local</strong>，每一条都要付出代价，每一条都要能说清代价才配放进设计文档。</p>
+    <p>多机器人系统里，QoS 用错的后果分两类：<strong>一类是"静默不匹配"</strong>，两端合同谈不拢，数据一条不来，日志里毫无痕迹（下一章的系统化排查主题）；<strong>另一类是"隐性成本"</strong>，合同签了，但重传把延迟尾部拉长、或晚加入者机制让 20 台机器人同时上线时网络被历史数据挤爆。两类错误的代价都不小，而预防它们只需要本章这一套判断标准。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. QoS 合同模型：提供、要求、兼容判定</h3>
+    <p>每一端在创建端点时声明一组策略。发布者声明的是"我能提供什么"（offered），订阅者声明的是"我要求什么"（requested），DDS 对每条策略做兼容性判定：<strong>只有订阅者的全部要求都被发布者的提供覆盖，匹配才能建立</strong>。关键推论：不匹配不会报错，只是数据静默不来。本章聚焦两条主线策略，其余（截止时间、寿命、活跃性）放到第 012 章的选型矩阵里。</p>
+    <div class="formula">
+      匹配 ⟺ 对每条 QoS 策略：requested ≤ offered（订阅端的要求不超过发布端的承诺）
+      <span class="note">例：订阅端要求 Reliable，发布端只提供 Best-effort → 不匹配；反过来则匹配（强提供可以满足弱要求）</span>
+    </div>
+
+    <h3>2. Reliability：重传的机制与它的账单</h3>
+    <p>Reliable 的语义是"确认送达"：发布端给每条消息编号，订阅端确认收到；发现丢包时发布端<strong>重传</strong>。为此中间件维护确认状态、心跳报文和发送窗口。Best-effort 则"发出即放下"：不确认、不重传，丢就丢了。</p>
+    <p>Reliable 的账单有三项：</p>
+    <ul>
+      <li><strong>延迟尾部变长</strong>：正常帧走 5 ms，丢过的那帧要等重传，端到端可能到几十毫秒，平均延迟好看，p99 未必。对实时控制，延迟尾部比平均值更要命（第 015 章展开）。</li>
+      <li><strong>带宽放大</strong>：重传与确认报文都是真实流量；无线环境丢包率高时，Reliable 的实际带宽消耗可以是名义值的 1.5 倍以上。</li>
+      <li><strong>背压风险</strong>：订阅端慢时，待确认队列积压，发布端要么丢最旧（受 history 限制）要么延迟膨胀，这就是"可靠性换不来实时性"的机制根源。</li>
+    </ul>
+    <p>选择标准回到数据语义：<strong>"丢了会破坏状态一致性"的（控制指令、参数变更、任务事件）→ Reliable；"丢了下一帧就补上"的（传感器流、调试可视化）→ Best-effort</strong>。一个常被忽略的量化：10 Hz 传感器流用 Reliable，在丢包率 5% 的 WiFi 上，每秒额外还要处理约 0.5 次重传及确认，单个话题无所谓，20 台 × 10 个传感器话题就不是小数了。</p>
+    <div class="formula">
+      期望传输次数 = 1 ÷ (1 − p)；重传把带宽放大同样的倍数
+      <span class="note">p 为单次丢包率：5% → 约 1.05 倍；20% → 1.25 倍；50% → 2 倍。确认与心跳报文另有一笔小额的固定开销</span>
+    </div>
+    <p>再补一条可靠传输的定量边界：可靠通道的有效吞吐受"发送窗口 ÷ 往返时间"限制。窗口 8 条、单条 10 KB、RTT 20 ms 时，单条可靠流的理论上限约 8 × 10 KB ÷ 0.02 s = <strong>4 MB/s</strong>；窗口调大能抬高上限，代价是内存与重传时的突发。这解释了两个现象：大消息话题在长 RTT 链路上"怎么调都慢"；窗口不足时，发送端大部分时间在等确认，真正传数据的窗口被压缩。</p>
+
+    <h3>3. Durability：晚加入者能不能拿到"当前值"</h3>
+    <p>默认 Volatile 语义是"只传未来"：订阅者加入之后发布的新消息才收得到，加入前的历史一律没有。这对"新闻类"数据合理，对"现状类"数据就是灾难：新启动的机器人订阅共享地图，凭什么是空的？Transient-local 解决的正是这件事：<strong>发布端为话题保留最近的历史样本（深度由 history/depth 决定），新的订阅者一旦匹配，就立刻收到这些样本，不需要发布端重新发一遍。</strong></p>
+    <p>机制细节值得掰开：发现协议让双方知道彼此匹配，订阅端发现"我来晚了，而你有历史"，于是发一个历史请求，发布端把保留的样本按可靠通道补发。因此有两条硬约束：<strong>（1）Transient-local 必须搭配 Reliable</strong>，历史补发不能靠"尽力而为"；<strong>（2）发布端要有"历史"可发</strong>，它至少发布过一次，且你没把深度设成 0。发布端进程重启后历史清空，直到它重新发布第一条。</p>
+    <div class="formula">
+      late-joiner 突刺带宽 ≈ 历史消息大小 × 保留条数 × 同时加入的订阅端数
+      <span class="note">2 MB 地图 × keep_last(1) × 20 台同时启动 = 40 MB 瞬时流量，足以让一条 WiFi 信道满载数秒到十几秒</span>
+    </div>
+    <p>补发的账单可以分层看：发布端付出的是"常驻内存 + 上行突发"，每个晚到订阅者触发一次按历史深度的补发；2 MB 地图、keep-last(1) 时单次补发 2 MB，20 台同时上线就是 40 MB 的突发。缓解手段按有效性排序：<strong>（1）压缩消息</strong>，地图类数据压掉数倍，突刺同比缩小；<strong>（2）错峰启动</strong>，把 20 次补发摊到 10 s，均值约 4 MB/s，已占百兆链路实测吞吐（约 11 MB/s）的三分之一，只能缓解不能根治；<strong>（3）改拉取式</strong>，大对象走"版本号通知 + 按需服务调用拉取"，让机器人按自身带宽与时机申请数据（第 016、023 章展开）。</p>
+    <p>Volatile 语义下的"首帧等待"也要计入预算：10 Hz 的话题，新订阅者平均等 50 ms、最坏 100 ms 才拿到第一帧，通常无感；但对 0.2 Hz 的全局状态话题，首帧等待可达 5 s，若消费者开机即用，等待期就是一段"数据真空"。这类话题要么改用 Transient-local 补发，要么在协议里加一条"数据就绪"信号让消费者显式等待。</p>
+
+    <h3>4. 四象限组合：每条数据找到自己的格子</h3>
+    <table>
+      <tr><th>组合</th><th>语义</th><th>典型数据</th><th>备注</th></tr>
+      <tr><td>Reliable + Volatile</td><td>不丢，但只管未来</td><td>cmd_vel、关节状态、里程计</td><td>状态"账本"：缺失破坏一致性</td></tr>
+      <tr><td>Reliable + Transient-local</td><td>不丢，且照顾晚到者</td><td>地图、参数快照、任务事件</td><td>发布端持续占内存保存历史</td></tr>
+      <tr><td>Best-effort + Volatile</td><td>不重传，只要最新</td><td>scan、image、detections</td><td>新闻类：旧帧无价值</td></tr>
+      <tr><td>Best-effort + Transient-local</td><td>无效组合（不匹配）</td><td>，</td><td>历史补发需要可靠通道，别这么配</td></tr>
+    </table>
+    <p>把这四个格子记熟，90% 的 ROS2 话题选型可以直接落位。剩下的 10%，需要多深的历史、要不要用 keep-all、要不要叠加截止时间，属于第 012 章的精细题。</p>
+    <p>再记一条容易混淆的边界：<strong>持久性与重传是两件事</strong>。Reliable 负责"本次连接期间把消息送到"，Transient-local 负责"信息在时间上存活，供给未来才加入的订阅者"。发布端重启会让两者同时归零：未确认队列清空、历史也清空。因此"机器人重启后地图还在"不能只靠 Transient-local，还要有发布端的重启重播逻辑，或更深的持久化机制（DDS 还有一档 PERSISTENT 级持久性，ROS 2 常规接口通常不暴露）。</p>
+
+    <h3>5. 历史与深度：重传缓冲与"留给晚到者的底片"</h3>
+    <p>history 策略决定"保留哪些样本"：keep-last(depth) 保留最近 depth 条，keep-all 保留全部（只适合低频率小消息，否则内存失控）。depth 的角色随场景切换：</p>
+    <ul>
+      <li>对 Volatile 状态流：depth 是发送/重传缓冲的容量，深一点抗抖动，深过头则延迟堆积（第 002 章的结论在此复用）。</li>
+      <li>对 Transient-local 话题：depth 是"晚到者能补到的条数"。地图话题要 keep-last(1)，最新一张就够；任务事件流可能要 keep-last(10)，补到最近 10 条事件才够判断上下文。</li>
+    </ul>
+    <p>一个工程细节：多数实现允许把 history 配成"为发布存一份、为晚到者存多份"的混合语义（通过 depth 与采样组合），但教学与评审时坚持用最小心智模型，<strong>"depth 就是保留条数，多了不要"</strong>，遇到具体分歧再查对应中间件的文档。</p>
+    <p><strong>边界：Reliable 不等于"无限缓冲"。</strong>发送侧的 history 容量一旦被填满（订阅端迟迟不确认），keep-last 语义会顶掉最旧的未确认样本，那个慢订阅者仍然会丢数据，只是丢得"有通知"。所以"慢消费端 + 深历史"只能推迟问题，无法消除问题：深历史把丢帧点从应用层挪到中间件层，把"处理不过来"翻译成"缓冲区溢出"。真正的解法是让消费速度与发布速度对齐，或者让慢端只订阅"最新值"语义的话题。</p>
+    <p>keep-all 的代价也可以立刻算出来：50 Hz × 10 KB 的话题用 keep-all，数据以 500 KB/s 的速率无限积累，一分钟约 30 MB、十分钟约 300 MB，嵌入式工控机很快就不堪重负。<strong>keep-all 只适合低频小消息</strong>（如每小时一条的配置事件），高频数据一律 keep-last。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>把第 002 章的话题目录升级成"QoS 设计表"，四步法：</p>
+    <ol>
+      <li><strong>先问失效模式</strong>：丢一条会怎样？若答案是"状态错乱/任务丢失"→ 账本 → Reliable；若答案是"下一帧更好"→ 新闻 → Best-effort。</li>
+      <li><strong>再问晚到场景</strong>：新启动的消费者需要"当前值"吗？需要 → Transient-local（并检查发布端内存成本）；不需要 → Volatile。</li>
+      <li><strong>定深度</strong>：状态流 depth 5–10（抗抖动）；事件流按"补几条够用"定；地图 keep-last(1)。</li>
+      <li><strong>算一次风暴预算</strong>：所有 Transient-local 话题列出来，按"大小 × 条数 × 订阅端数"估算 worst-case 突发，超过链路容量 30% 就要缓解（错峰启动、压缩、缩深度）。</li>
+    </ol>
+
+    <h3>QoS 设计表（巡逻车队示例）</h3>
+    <table>
+      <tr><th>话题</th><th>可靠性</th><th>持久性</th><th>depth</th><th>理由</th></tr>
+      <tr><td>/robotN/cmd_vel</td><td>Reliable</td><td>Volatile</td><td>1</td><td>控制指令不许丢；只要最新（旧指令执行有害）</td></tr>
+      <tr><td>/robotN/odom</td><td>Reliable</td><td>Volatile</td><td>10</td><td>状态账本；深度抗抖动</td></tr>
+      <tr><td>/robotN/scan</td><td>Best-effort</td><td>Volatile</td><td>5</td><td>新闻类；深度仅做缓冲，丢了不在乎</td></tr>
+      <tr><td>/fleet/map</td><td>Reliable</td><td>Transient-local</td><td>1</td><td>晚加入机器人要拿到当前地图</td></tr>
+      <tr><td>/fleet/task_event</td><td>Reliable</td><td>Transient-local</td><td>10</td><td>任务事件不许丢；补最近 10 条供上下文</td></tr>
+    </table>
+
+    <div class="box key">
+      <span class="box-title">设计决策：为什么控制指令不用 Transient-local？</span>
+      <p>一个自然的诱惑："既然指令重要，给它也加上晚到者保护？"问题是语义不匹配：<strong>控制指令的时效性以毫秒计，历史指令不但无用，还会造成危险</strong>，让新加入的订阅者收到 3 秒前的"前进"指令并执行，只会制造事故。Transient-local 的正确适用面是"历史仍有价值的现状类数据"（地图、任务、配置），判据是那句老话：<strong>这条数据的旧副本，现在读起来还有意义吗？</strong>有 → 值得补；没有 → Volatile 才是对的保护（因为它顺带节省了发布端内存与突刺风险）。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：同节点内两种合同并存，控制流与感知流</strong></p>
+    <pre class="code"><code>from rclpy.qos import (QoSProfile, ReliabilityPolicy, DurabilityPolicy,
+                       HistoryPolicy)
+
+class BaseController(Node):
+    """底盘控制器：给"指令"和"感知"分别签订合适的 QoS 合同。"""
+    def __init__(self, robot_id):
+        super().__init__("base_ctrl", namespace=f"robot{robot_id}")
+        # 合同一：控制指令用 Reliable；depth=1 表示只要最新一条，
+        # 旧指令被新指令覆盖是"特性"：迟到 200 ms 的速度指令没有执行价值
+        cmd_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
+                             durability=DurabilityPolicy.VOLATILE)
+        # 合同二：激光扫描用 Best-effort；丢了不重传，等下一帧更新鲜
+        scan_qos = QoSProfile(depth=5, reliability=ReliabilityPolicy.BEST_EFFORT,
+                              durability=DurabilityPolicy.VOLATILE)
+        self.sub_cmd = self.create_subscription(Twist, "cmd_vel", self.on_cmd, cmd_qos)
+        self.sub_scan = self.create_subscription(LaserScan, "scan", self.on_scan, scan_qos)
+        self.last_cmd = Twist()
+        self.last_scan = None
+
+    def on_cmd(self, msg):
+        self.last_cmd = msg            # 只保存最新指令：与 depth=1 的语义互为表里
+
+    def on_scan(self, msg):
+        self.last_scan = msg           # 感知回调极短：数据面保持薄（第 002 章）</code></pre>
+    <p>解读：<strong>（1）</strong>同一个节点里两种合同并存是常态，"可靠性按数据语义定"意味着逐话题决策，不存在全局开关。<strong>（2）</strong><code>depth=1</code> 与"只保存最新指令"的代码配成一对语义：合同层面丢弃旧指令，应用层面也从不处理迟到的指令，两层同时对"旧数据无价值"这一事实负责。<strong>（3）</strong>注意这里没有显式指定 history 策略：keep-last 是多数实现的默认；如果你需要 keep-all（罕用），务必显式写出并写清理由，隐式依赖默认值是配置类事故的温床。</p>
+
+    <p><strong>片段 2：地图发布，Transient-local 的完整用法</strong></p>
+    <pre class="code"><code>class MapServer(Node):
+    """共享地图发布：晚加入的机器人必须立刻拿到"当前地图"。"""
+    def __init__(self):
+        super().__init__("map_server")
+        # 组合要点：Transient-local 必须叠加 Reliable（历史补发走可靠通道），
+        # depth=1 表示"为晚到者保留最新一张地图"；多存无益，只是内存与突刺
+        qos = QoSProfile(depth=1,
+                         reliability=ReliabilityPolicy.RELIABLE,
+                         durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                         history=HistoryPolicy.KEEP_LAST)
+        self.pub = self.create_publisher(OccupancyGrid, "/fleet/map", qos)
+        self.map = None
+        # 地图低频更新：事件式发布（第 002 章），每次重建完才发一版
+        self.create_subscription(OccupancyGrid, "/fleet/map_update", self.on_update, qos)
+
+    def on_update(self, msg):
+        self.map = msg
+        self.pub.publish(self.map)     # 发布后自动成为"留给晚到者的底片"
+
+    # 晚加入的订阅者匹配成功时，无需本节点做任何事：
+    # DDS 会用保留的历史样本自动完成补发（深度=1，补最新一张）</code></pre>
+    <p>解读：<strong>（1）</strong>三个参数缺一不可：Reliable（可靠补发）、Transient-local（保留历史）、depth=1（保留一份）。把这段与片段 1 对照阅读，能看清 QoS 设计的本质，<strong>一份合同要同时回答"丢不丢"与"晚到者怎么办"两个问题</strong>。<strong>（2）</strong>最后一段注释点出 Transient-local 最优雅的地方：补发是 DDS 的自动行为，业务代码无需维护"订阅者列表"与任何补发逻辑；把机制用对，代码量随之变小。<strong>（3）</strong>代价栏：这个发布者在整个生命周期内常驻至少一份地图的内存（几十 KB 到几 MB 视分辨率）；如果地图很大且订阅端多，还要防范第 3 节算过的 late-joiner 突刺，<strong>缓存成本可见，突刺成本要靠启动编排去化解</strong>。</p>
+
+    <p><strong>片段 3：QoS 核对，把两端的合同打印出来</strong></p>
+    <pre class="code"><code># 查看快照式合同对照：发布端与订阅端各自的 QoS 一目了然
+ros2 topic info /fleet/map --verbose
+# 输出里重点看：Reliability 与 Durability 两行，两端必须"要求 ≤ 提供"
+# 快速判断示例：
+#   发布端 RELIABLE + 订阅端 RELIABLE            → 匹配
+#   发布端 RELIABLE + 订阅端 BEST_EFFORT         → 匹配（强提供满足弱要求）
+#   发布端 BEST_EFFORT + 订阅端 RELIABLE         → 不匹配（静默不连通）
+# 用命令行显式指定 QoS 订阅，验证"到底能不能收到"：
+ros2 topic echo /fleet/map --qos-durability transient_local --qos-reliability reliable</code></pre>
+    <p>解读：<code>--verbose</code> 的输出是排障战场上的第一张地图：它给出每个端点的完整合同，一列一列对照就能定位兼容性问题。<strong>方向记忆法：订阅端是"提要求"的，要求不能高于提供</strong>。<code>ros2 topic echo</code> 支持显式指定 QoS 后，可以亲手验证兼容性，给 <code>/fleet/map</code> 配一个 Volatile 的 echo，你会看到正常数据流；而给一个 Best-effort 的话题配 Reliable 的 echo，它会静默地什么都不打印：<strong>亲手制造一次"静默不匹配"，比读十遍文档记得牢。</strong></p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>方向记反导致误判</strong>：以为"Best-effort 发布 + Reliable 订阅"能用，实际不匹配且无报错，得出一堆错误结论。修复：记住"要求 ≤ 提供"；用 <code>topic info --verbose</code> 现场核对。</li>
+      <li><strong>Transient-local 发布会话为空</strong>：发布端进程重启后、还没发布第一条数据，此时连上的订阅者补不到历史，界面显示空白地图。修复：发布端启动即重发一版当前数据；订阅端对"长时间无数据"要告警，不能静默（第 006 章的应用层监控）。</li>
+      <li><strong>忘了 Transient-local 的内存与突刺账单</strong>：把 200 MB 的点云地图设成 Transient-local + depth=10，发布端内存直接起飞，20 台机器人重启时全网瘫一分钟。修复：大消息用压缩（第 023 章）+ keep-last(1) + 错峰启动（第 019 章）。</li>
+      <li><strong>用 Reliable 传高频视觉流</strong>：为了"不丢帧"把 30 Hz 图像设成 Reliable，WiFi 上重传挤占带宽，画面反而更卡、其他话题延迟全线恶化。修复：视觉类流回 Best-effort；要完整帧请用压缩或"整段传输完再通知"的模式。</li>
+      <li><strong>depth 与业务语义脱节</strong>：任务事件流用默认 depth，晚加入的机器人只补到 1 条事件，缺少上下文做出错误决策。修复：按"消费者需要几条上下文"显式设定（如 10 条），并在设计表里写明依据。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>判断兼容性（写"匹配/不匹配"并说明方向）：(a) 发布 Reliable+Volatile、订阅 Reliable+Volatile；(b) 发布 Best-effort+Volatile、订阅 Reliable+Volatile；(c) 发布 Reliable+Transient-local、订阅 Best-effort+Volatile；(d) 发布 Best-effort+Transient-local、订阅 Best-effort+Transient-local。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>(a) 匹配；(b) 不匹配（要求强于提供）；(c) 匹配（弱要求被满足，但晚到者补发仍可能发生，补发走可靠通道）；(d) 无效组合：Transient-local 与 Best-effort 搭配在多数实现里不成立，务必显式核对。</div></details>
+      </li>
+      <li>预测题：给共享地图把 depth 从 1 改成 20（keep-last）。网络层面会发生什么？某台新机器人上线时它的地图订阅体验如何变化？发布端内存呢？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>晚加入者补发 20 张历史地图（可能大部分是过时版本），突刺流量 ×20；有 LZ 式历史跳变风险（订阅端依次重放旧地图）；发布端内存 ×20。结论：现状类数据保留"最新一份"通常就是最优。</div></details>
+      </li>
+      <li>推导题：3 MB 地图、keep-last(1)。20 台机器人在 10 秒内错峰上线（每 0.5 秒一台），平均突刺带宽是多少？若同时上线，峰值带宽多少？对比百兆链路（约 12 MB/s 实测）给出结论。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>错峰：3 MB / 0.5 s = 6 MB/s 均值（仍不小！）；同时：60 MB 在数秒内爆发，远超 100 M 链路。结论：大消息的 late-joiner 补发即使错峰也吃掉半条链路，压缩与"按需拉取"是更彻底的解（提示：对比第 016 章、第 023 章）。</div></details>
+      </li>
+      <li>设计题：为一个"编队间距"参数设计 QoS：编队控制器要收到最近一次间距设定，且历史值（改动该参数的审计场景）也要可回放。给出话题拆分方案与各自的 QoS 组合。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>拆两条：现状类 /fleet/formation_gap（Reliable+TL+depth1）与事件类 /fleet/formation_gap_changes（Reliable+TL+depth10）。一"值"一"历"，各配各的合同，这是"现状 vs 历史"的一般解法。</div></details>
+      </li>
+      <li>改配置并预测：把控制指令的 depth 从 1 改成 50，在"遥控台 100 Hz 发布、底盘偶发 50 ms 卡顿"的场景下，预测底盘收到的指令的变化（时间跨度、执行效果），并解释为什么这对控制是危险的。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>卡顿后底盘会依次消化最多 50 条指令（约 0.5 s 的历史），执行的是"过去的动作序列"，相当于把机器人变成延迟 0.5 s 的回放器。控制类数据的 depth 必须显式收紧到 1–2（或由 deadline 兜底），这是语义正确的要求，取小是应有之义。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>QoS 是端到端合同：订阅端提要求、发布端做提供，要求 ≤ 提供才匹配；不匹配静默发生。</li>
+      <li>Reliable = 编号 + 确认 + 重传，代价是延迟尾部、带宽放大与背压；账本类数据用它，新闻类数据用 Best-effort。</li>
+      <li>Transient-local = 发布端替晚到者保留历史，必须搭配 Reliable；判据是"旧副本现在读还有意义吗"。</li>
+      <li>四象限：Reliable+Volatile（状态）、Reliable+TL（地图/事件）、Best-effort+Volatile（感知）；Best-effort+TL 无效。</li>
+      <li>depth 双角色：重传缓冲（Volatile 流）与晚到者底片（TL 话题）；大消息 + 多订阅端 = late-joiner 突刺，要预算要缓解。</li>
+      <li>下一章系统化：<strong>QoS 匹配规则与策略选择</strong>，完整的兼容性矩阵、预置 profile 与选型决策树。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch010.html">← 第 010 章：使用DDS发现协议配置</a>
+    <a class="next" href="ch012.html">第 012 章：QoS匹配规则与策略选择 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

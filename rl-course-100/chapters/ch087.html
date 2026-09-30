@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第087章 多智能体环境：粒子环境 | 深度强化学习课程 · PPO、SAC 与多智能体系统</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第五篇 · 多智能体环境与实践</span>
+    <span class="sep">/</span>
+    <span>第 087 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第五篇 · 多智能体环境与实践</div>
+    <h1>第 087 章：多智能体环境：粒子环境</h1>
+    <p class="lead">从零搭一个"粒子环境"：3 个速度控制的质点要把 3 个随机摆放的地标全部覆盖，用独立 PPO + 参数共享训练，看覆盖率如何从随机的 0.3 爬到 0.8 以上，以及碰撞惩罚怎样逼出"各占一角"的分工。</p>
+    <ul class="meta">
+      <li>主题：环境设计 / 粒子环境与覆盖任务（MPE 类）</li>
+      <li>关键公式：r = −mean<sub>j</sub> min<sub>i</sub> d(i,j) + 0.2·covered − 0.1·collisions</li>
+      <li>预计学时：50 分钟</li>
+      <li>前置章节：第 086 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解"粒子环境"的核心抽象：速度控制的二维质点、纯相对观测、基于距离的团队势函数奖励。</li>
+      <li>掌握一个完全内联的 simple-spread 类环境的实现：随机地标布局、碰撞判定、覆盖率统计。</li>
+      <li>用独立 PPO + 参数共享训练 3 个粒子，理解为什么纯相对观测让参数共享成为可能。</li>
+      <li>观察奖励塑形的三个组成部分（距离势函数、覆盖加成、碰撞惩罚）各自对行为的影响。</li>
+      <li>学会把"覆盖率"作为任务成功的直接指标，不被势函数回报的平滑曲线迷惑。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>粒子环境（particle environment）是多智能体强化学习最经典的测试床之一：一群二维平面上的质点，通过移动完成覆盖、编队、追逐等任务。它便宜（纯运动学，不挂物理引擎）、可批量仿真、任务可调，因此几乎每篇多智能体论文都会先在上面做实验。复现它的最小版本，等于给后 14 章造一台"可控的多智能体实验仪"。</p>
+    <p>本章的覆盖任务（spread）看似简单，却浓缩了多智能体学习的几个核心困难：奖励是"每个地标到最近粒子距离"的<strong>最小值聚合</strong>，天然带非线性，谁离得近谁"代表"团队，分工质量直接决定回报；粒子之间既要协作（分散到不同地标）又要避免碰撞（局部约束）；每回合地标随机旋转，策略只能学"看相对位置"，背绝对坐标这条路走不通。注意本章与前五篇的分工变化：算法退回最朴素的独立 PPO，主角是<strong>环境设计</strong>，为什么用速度控制、为什么奖励要三块拼、为什么观测必须相对，每个零件都要交代清楚。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 粒子动力学：比纯速度控制多一点惯性</h3>
+    <p>与前面章节的加速度控制不同，粒子环境通常直接控制速度。本章取一个折衷：动作先经过一阶惯性，再积分位置：</p>
+    <div class="formula">
+      v<sub>t+1</sub> = clip(0.6·v<sub>t</sub> + 0.12·a<sub>t</sub>, −1, +1)<br>
+      p<sub>t+1</sub> = clip(p<sub>t</sub> + v<sub>t+1</sub>, −1, +1)
+    </div>
+    <p>符号：v 是速度、a 是策略输出的动作指令、p 是位置，clip 把两向量都限制在 ±1 的场地内。摩擦系数 0.6 让粒子带一点"滑行"惯性：松开动作后速度逐渐衰减，不会立刻停住。这比纯速度控制更接近真实移动机器人的手感，也让策略必须学会<strong>提前减速预判</strong>，想精确停在覆盖半径 0.1 的圈里，靠"松手即停"是不行的。</p>
+
+    <h3>2. 覆盖奖励的三块拼图</h3>
+    <p>设地标集合 L（|L|=3）、粒子集合 N（|N|=3），d(i,j) 是粒子 i 到地标 j 的距离。团队奖励为三项之和：</p>
+    <div class="formula">
+      r<sub>t</sub> = −(1/|L|)·Σ<sub>j∈L</sub> min<sub>i∈N</sub> d(i,j) + 0.2·|{j : min<sub>i</sub> d(i,j) &lt; r<sub>cover</sub>}| − 0.1·#collisions
+    </div>
+    <p>第一项是<strong>稠密势函数</strong>：即使还没到位，任何粒子靠近任何地标都会提升回报，给策略提供平滑的学习梯度。第二项是<strong>稀疏任务信号</strong>：每个被占住（有粒子进入 0.1 半径）的地标额外加 0.2。第三项<strong>碰撞惩罚</strong>约束局部行为。三项各司其职：只有第一项，策略能学会靠近地标，但 0.1 圈内外的回报差很小，占据判定得不到锐化，末态覆盖率偏低；只有第二项，早期探索几乎无信号；缺第三项，粒子之间保持间距的行为得不到激励，轨迹会频繁重叠。</p>
+
+    <h3>3. 相对观测与参数共享</h3>
+    <p>每个粒子的观测只包含<strong>相对量</strong>：自己的位置速度、其他粒子相对坐标、三个地标相对坐标。没有任何绝对信息（除了自己位置用于边界感知），这带来两个好处：</p>
+    <ul>
+      <li>策略具有平移与旋转的不变性，学会"朝最近的空地标走"这一条规则，就能应用到任意布局；</li>
+      <li>3 个粒子可以共用同一个网络（参数共享），把 3 条轨迹合并成一个训练批次，样本效率直接 ×3。</li>
+    </ul>
+    <p>补充一个直觉：正因为地标每回合随机旋转，"哪个粒子负责哪个地标"没有固定答案，策略必须学会动态分配，这正是多智能体任务区别于单智能体的核心难度。</p>
+
+    <h3>4. 为什么必须同时报"覆盖率"</h3>
+    <p>团队回报是势函数与稀疏加成的混合，数值会平滑上升，但它无法区分"粒子都聚在中心附近"与"真正完成了覆盖"。覆盖率 <code>covered / |L|</code> 直接数"有几个地标被占住"，是最诚实的任务指标。训练日志里两个数字要一起看：<strong>回报告诉你能不能优化，覆盖率告诉你任务有没有真完成</strong>。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+
+    <h3>模块划分</h3>
+    <table>
+      <tr><th>组件</th><th>职责</th><th>关键点</th></tr>
+      <tr><td><code>ParticleCoverEnv</code></td><td>3 粒子覆盖 3 地标（纯 numpy）</td><td>随机旋转地标；速度控制 + 摩擦；碰撞与覆盖判定</td></tr>
+      <tr><td><code>PPOActorCritic</code></td><td>参数共享的共享躯干 AC 网络</td><td>状态无关 <code>log_std</code>；<code>atanh</code> 重算比率</td></tr>
+      <tr><td><code>compute_gae</code></td><td>共享奖励下的 (T, N) 优势估计</td><td>奖励一条、价值矩阵；截断不切断 bootstrap</td></tr>
+      <tr><td><code>collect_rollout</code></td><td>采样 2048 步并统计回合指标</td><td>覆盖率、末态覆盖率、碰撞数随回合累计</td></tr>
+      <tr><td><code>ppo_update</code></td><td>裁剪目标的多轮小批量更新</td><td>熵正则 0.01 防止过早收缩</td></tr>
+      <tr><td><code>evaluate</code></td><td>确定性评估</td><td>平均覆盖率与末态覆盖率分开报告</td></tr>
+    </table>
+
+    <h3>关键超参数</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用与取值理由</th></tr>
+      <tr><td><code>max_steps</code></td><td>60000</td><td>覆盖任务通常 3 万～6 万步内接近收敛</td></tr>
+      <tr><td><code>rollout</code></td><td>2048</td><td>每次更新约 40 个回合的数据（每回合 50 步）</td></tr>
+      <tr><td><code>epochs</code> / <code>batch_size</code></td><td>4 / 256</td><td>6144 样本 = 每轮 24 个小批量</td></tr>
+      <tr><td><code>gamma</code> / <code>lam</code></td><td>0.95 / 0.95</td><td>回合 50 步，0.95 的有效视野约 20 步</td></tr>
+      <tr><td><code>cover_radius</code></td><td>0.1</td><td>覆盖判定半径；相对 2×2 的世界很严格，逼出精确停靠</td></tr>
+      <tr><td><code>accel / friction</code></td><td>0.12 / 0.6</td><td>决定粒子机动性；调大摩擦让"刹车"更难</td></tr>
+    </table>
+
+    <h3>数据流</h3>
+    <p>每回合：随机旋转并摆放地标 → 粒子从中心出发 → 50 步内每个时间步"采样动作 → 环境推进 → 记录转移与回合统计" → 采满 2048 步后逐时间步做 (T, N) 的 GAE → 展平 6144 个样本做 4 轮裁剪更新 → 每 1 万步用确定性策略评估一次。评估与训练共用同一个环境对象，但替换为独立的随机流（<code>seed+321</code> / <code>seed+999</code>），保证布局多样性不依赖训练走过的路径。</p>
+
+    <h3>与前一章的差异</h3>
+    <p>第 086 章是"算法视角"的分布式 SAC，环境只是陪练；本章翻开第五篇，主角变成<strong>环境设计</strong>。算法退回最朴素的独立 PPO，但环境的每个零件都要交代：为什么用速度控制、为什么奖励要三块拼、为什么观测必须相对、覆盖率怎么统计。后面的 088–100 章都会沿用这套"环境设计方法论"，只是任务换成捕食、足球、交通等。</p>
+
+    <div class="box key">
+      <span class="box-title">三个细节决定训练成败</span>
+      <p>1) <strong>地标随机旋转</strong>：半径在 0.5～0.7 之间随机、初始角随机，防止策略背下"三角形朝哪边"，强迫它学相对几何。</p>
+      <p>2) <strong>覆盖率统计在环境内部完成</strong>：<code>info["coverage"]</code> 让采样器、评估器共用同一套判定，不会出现"训练一个口径、评估另一个口径"。</p>
+      <p>3) <strong>没有真终止、只有 50 步截断</strong>：GAE 里 <code>done</code> 恒为 0，价值可以学"多走一步还能多覆盖"的延续收益。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：随机地标布局，把"背坐标"的路堵死</strong></p>
+    <pre class="code"><code>def reset(self, rng: np.random.Generator):
+    # 地标：随机旋转角 + 随机半径的三边形，每回合布局都不同
+    theta = rng.uniform(0.0, 2.0 * np.pi)
+    radius = rng.uniform(0.5, 0.7)
+    angles = theta + np.linspace(0.0, 2.0 * np.pi, self.n_landmarks, endpoint=False)
+    self.landmarks = np.stack([radius * np.cos(angles),
+                               radius * np.sin(angles)], axis=1).astype(np.float32)
+    # 粒子：从中心附近随机出发，速度清零
+    self.pos = rng.uniform(-0.2, 0.2, size=(self.n_agents, 2)).astype(np.float32)
+    self.vel = np.zeros((self.n_agents, 2), dtype=np.float32)
+    self.steps = 0
+    return self._obs()</code></pre>
+    <p>解读：<code>reset</code> 决定了任务分布的形状，是环境设计的第一个开关。<strong>（1）</strong>三个地标保持"近似正三角形、朝向随机、半径抖动"的结构：既保证任务可行（总能被三个粒子覆盖），又让"哪个地标离哪个粒子近"每回合都不同，分工无法被写死成常数。<strong>（2）</strong>半径 0.5～0.7 的范围经过挑选：太大会让地标贴近 ±1 边界，粒子在边界附近的机动空间被压缩。行程不构成瓶颈：速度的稳态值为 0.3、50 步最多可走约 14.5 个单位，而任何粒子到目标地标的距离都不超过 1 个单位。<strong>（3）</strong>粒子从中心 ±0.2 出发、初速为零：起点近但不重合，避免"出生即碰撞"的负奖励噪声。<strong>（4）</strong><code>endpoint=False</code> 保证三个地标均匀分布不重复角落，这是几何布局的标准写法。注意 <code>rng</code> 由外部传入：训练、评估各用自己的流，随机源谁产生谁负责，这是本项目所有环境的统一约定。</p>
+
+    <p><strong>片段 2：纯相对观测的构造</strong></p>
+    <pre class="code"><code>def _obs(self) -&gt; np.ndarray:
+    obs = []
+    for i in range(self.n_agents):
+        # 其他粒子的相对位置：j 的位置减去 i 的位置，天然居中在"我"身上
+        others = [self.pos[j] - self.pos[i]
+                  for j in range(self.n_agents) if j != i]
+        # 三个地标的相对位置：粒子不需要知道世界的绝对坐标
+        landmark_rel = [lm - self.pos[i] for lm in self.landmarks]
+        o = np.concatenate([self.pos[i], self.vel[i],
+                            np.concatenate(others),
+                            np.concatenate(landmark_rel)])
+        obs.append(o)
+    return np.stack(obs).astype(np.float32)</code></pre>
+    <p>解读：观测的构造方式直接决定策略能否被 3 个粒子共享。<strong>（1）</strong>相对坐标 <code>pos[j] - pos[i]</code> 让每个粒子的观测"自我中心化"：在粒子 i 眼里，世界永远以自己为原点。这样同一个网络看到的都是同分布的输入，参数共享才有意义。<strong>（2）</strong>自己位置 <code>self.pos[i]</code> 为何保留绝对坐标？因为边界在 ±1 且位置被 clip，绝对位置是边界感知的唯一来源，去掉它粒子会撞墙而不自知（练习里会让你做这个消融）。<strong>（3）</strong>维度账：4（自身位置速度）+ 4（两个队友）+ 6（三个地标）= 14 维，与 <code>obs_dim</code> 声明一致；地标数变化时该式自动适配，网络输入维度跟着变。<strong>（4）</strong><code>np.stack</code> 把 3 个粒子的观测摞成 (3, 14) 批量，采样时一次前向就能出 3 个动作，这是后面所有多智能体环境共用的"批量结构"。</p>
+
+    <p><strong>片段 3：一步内的动力学与三块奖励</strong></p>
+    <pre class="code"><code>def step(self, actions: np.ndarray):
+    a = np.clip(actions, -1.0, 1.0).astype(np.float32)
+    # 一阶惯性：速度先衰减（×0.6）再叠加动作，最后限幅，保证"刹车"需要提前量
+    self.vel = np.clip(self.friction * self.vel + self.accel * a,
+                       -self.v_max, self.v_max)
+    self.pos = np.clip(self.pos + self.vel, -self.bound, self.bound)
+    self.steps += 1
+
+    # (地标, 粒子) 距离矩阵：一次广播算出 3×3 的两两距离
+    dists = np.linalg.norm(self.pos[None, :, :] - self.landmarks[:, None, :],
+                           axis=-1)
+    min_dists = dists.min(axis=1)                 # 每个地标到"最近粒子"的距离
+    reward = float(-min_dists.mean())             # 稠密势函数：逼近就加分
+    covered = int(np.sum(min_dists &lt; self.cover_radius))
+    reward += 0.2 * covered                       # 稀疏加成：真正占住地标额外 +0.2
+
+    n_collisions = 0
+    for i in range(self.n_agents):
+        for j in range(i + 1, self.n_agents):
+            if np.linalg.norm(self.pos[i] - self.pos[j]) &lt; self.collision_radius:
+                n_collisions += 1
+    reward -= 0.1 * n_collisions                  # 碰撞惩罚：迫使粒子彼此错开
+
+    coverage = covered / self.n_landmarks
+    truncated = self.steps &gt;= self.max_steps
+    info = {"coverage": coverage, "min_dists": min_dists.copy(),
+            "collisions": n_collisions}
+    return self._obs(), reward, False, truncated, info</code></pre>
+    <p>解读：这是整个环境的"心脏"，约 20 行包含了动力学、奖励、指标三种职责。<strong>（1）</strong>动力学两行不解释（与公式一一对应），关键是摩擦 0.6 的后果：动作的含义是"推力"，速度按 0.6 的倍率递推，稳态值只有 0.3；松开动作后还要滑行约 0.45 个单位（覆盖半径的 4 倍多），所以精确停进圈里必须提前减速。<strong>（2）</strong>距离矩阵用广播一次算完 (地标, 粒子) 的 3×3 矩阵，比双重循环干净；<code>min(axis=1)</code> 是关键聚合，每个地标只关心"最近的粒子"，这正是"覆盖"的数学定义，也让奖励对分工敏感：三人挤一个角落时，另外两个地标距离巨大，回报被狠狠拉低。<strong>（3）</strong>三块奖励的数值量级要匹配：距离项在 −1.5～0 之间（三粒子全挤在一角、地标半径取满 0.7 时上限约 −1.52），覆盖加成每块 0.2、最多 0.6，碰撞惩罚每次 0.1；覆盖一块地标约等于把"平均距离"改善 0.2，激励是"先到位、别撞车"，量级算得过来。<strong>（4）</strong><code>info</code> 带着覆盖率与碰撞数返回，供采样器和评估器直接消费；<code>terminated</code> 恒为 False，覆盖任务没有失败状态，只有 50 步的时间边界。</p>
+
+    <p><strong>片段 4：采样器中的回合统计</strong></p>
+    <pre class="code"><code>for _ in range(steps):
+    a, logp, v = net.act_batch(obs, device)          # 一次前向出 3 个粒子的动作
+    next_obs, rew, terminated, truncated, info = env.step(a)
+    obs_buf.append(obs); act_buf.append(a)
+    logp_buf.append(logp); val_buf.append(v)
+    rew_buf.append(rew)
+    done_buf.append(float(terminated))               # 只有截断，恒为 0
+    ep_ret += rew
+    ep_cov += info["coverage"]                        # 覆盖率随回合累计……
+    ep_len += 1
+    ep_col += info["collisions"]
+    if terminated or truncated:
+        ep_stats.append({"return": ep_ret,
+                         "coverage": ep_cov / max(ep_len, 1),
+                         "final_coverage": info["coverage"],
+                         "collisions": ep_col / max(ep_len, 1)})
+        obs = env.reset(rng)
+        ep_ret, ep_cov, ep_len, ep_col = 0.0, 0.0, 0, 0
+    else:
+        obs = next_obs</code></pre>
+    <p>解读：采样器不只是"存数据"，它还是训练期的指标雷达。<strong>（1）</strong><code>ep_cov / max(ep_len, 1)</code> 给的是<strong>平均覆盖率</strong>（包含出发在路上时的低值），<code>final_coverage</code> 是<strong>末态覆盖率</strong>（回合结束时几个地标被占住），前者看过程、后者看结果，两个指标分开累计才能在日志里各自说话（深坑里的"只看回报"正是靠它们来避开的）。<strong>（2）</strong><code>max(ep_len, 1)</code> 防除零，虽然 50 步回合不会为零，但接口层的防御是习惯。<strong>（3）</strong>回合边界处重置 <code>obs</code> 与四个累计器，<code>done_buf</code> 只记 <code>terminated</code>（恒 0），这两个约定合起来保证了 GAE 在截断处继续 bootstrap。<strong>（4）</strong>注意统计用的是环境返回的 <code>info["coverage"]</code>：口径锁定在环境内部，训练日志与最终评估报告的是同一种覆盖率，避免"看起来学会了其实是统计口径宽了"。</p>
+
+    <p>完整可运行脚本（附录）：<a href="../code/ch087.py" download>code/ch087.py</a></p>
+    <pre class="sh"><code>python code/ch087.py          # 完整训练：CPU 约 3–6 分钟
+python code/ch087.py --quick  # 快速跑通：约 30–60 秒</code></pre>
+    <p>日志每 1 万步打印回报、平均覆盖率、末态覆盖率、碰撞/步与 KL。<strong>预期（以实跑为准）：末态覆盖率从 0.33 左右提升到 0.8～1.0，碰撞/步从 0.4 附近降到 0.1 以下</strong>；平均覆盖率提升更平缓（含"在路上"阶段）。若回报涨而覆盖率不涨，多半是粒子挤在质心吃距离分。跑 3 个种子看中位数比单次跑到 1.0 更有说服力。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>把覆盖半径设得和世界一样大</strong>：半径 0.1 是硬要求；若设成 0.5，粒子随便一站就"覆盖"，任务退化成无意义的奖励爬坡，覆盖率永远接近 1。</li>
+      <li><strong>观测里放入绝对坐标又做参数共享</strong>：绝对坐标 + 共享策略会让"粒子 0"与"粒子 2"的输入分布截然不同，一个网络很难同时拟合三个角色。要么用相对观测，要么给每个粒子显式编号（那就不再是参数共享）。</li>
+      <li><strong>碰撞判定用平方距离比较忘了平方</strong>：<code>np.linalg.norm</code> 返回真实距离，与半径直接比较；若换成 <code>np.sum((pi−pj)**2)</code>，阈值必须写成 r²，否则判定完全失效还很难查。</li>
+      <li><strong>把截断回合当终止</strong>：覆盖任务没有失败终止，全部是 50 步截断。GAE 里若把 truncated 当 terminated 切断 bootstrap，价值函数会低估"多走几步还能多覆盖一个地标"的收益。</li>
+      <li><strong>覆盖率除数用错</strong>：<code>covered / n_landmarks</code> 才是比例；写成 <code>/ n_agents</code> 在 3v3 时恰好相等看不出错，一旦改地标数就暴露，这类"默认值巧合"是环境代码最隐蔽的 bug。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把地标数改成 4、粒子数保持 3（同步改 <code>n_landmarks</code>），先算出最优覆盖率的理论上限，再看训练结果是否与之接近。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>观测维度会自动变化（地标相对坐标按列表拼接），网络输入自动适配。3 个粒子最多覆盖 3 个地标，上限是 0.75，观察策略会把哪个地标"放弃"。</div></details>
+      </li>
+      <li>把碰撞惩罚从 −0.1 调到 −1.0，先预测覆盖率会升还是降，再实测碰撞/步与覆盖率的变化。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>改 <code>step</code> 里 <code>reward -= 0.1 * n_collisions</code> 的系数。如果粒子为了躲碰撞而刻意远离地标，覆盖率会跟着下降，惩罚过重会把策略变得"胆小"。</div></details>
+      </li>
+      <li>去掉覆盖加成（0.2×covered 那一项），只用距离势函数 + 碰撞惩罚训练，解释为什么末态覆盖率会明显变差。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>建议配 <code>--ent-coef 0.02</code> 的对照跑，因为去掉稀疏信号后探索更依赖熵。观察末态覆盖率停留的水平：势函数给出的是"靠近"的平滑梯度，"压进 0.1 圈"的锐利激励来自被去掉的那一项。</div></details>
+      </li>
+      <li>把观测里自己的绝对位置去掉（只留速度、队友与地标相对量），先推导哪些行为会受损，再训练验证。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>改 <code>_obs</code> 里 <code>self.pos[i]</code> 那一项，obs_dim 从 14 变 12。理论上相对量足够完成任务，但位置被 clip 后绝对坐标还承担"我发现自己在边界"的信息，看混剪结果差多少。</div></details>
+      </li>
+      <li>实现一个贪心基线：每个粒子认领最近且未被认领的地标（3×3 全枚举即可），再朝它移动，与学到的策略比较末态覆盖率与碰撞率。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>只有 6 种排列，枚举最省事（不引入 scipy 依赖）。基线的问题在于：它需要绝对的地标分配信息，而策略只有相对观测，对比时想清楚两者信息条件其实不同。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>粒子环境的最小要素：二维速度控制动力学（带惯性）、纯相对观测、基于最小距离的团队势函数奖励、覆盖率统计。</li>
+      <li>三块奖励各司其职：距离势函数提供稠密梯度、覆盖加成给出任务信号、碰撞惩罚约束局部行为；量级要互相匹配。</li>
+      <li>纯相对观测 + 参数共享让 3 个粒子共用一个网络，样本效率 ×3，策略天然具备平移对称性。</li>
+      <li>评估要分开看"优化指标"（回报、KL）与"任务指标"（覆盖率、碰撞率），完整信息在环境 <code>info</code> 里回流。</li>
+      <li>下一章把合作压力升级：多个捕食者在网格里围追会逃跑的猎物，用独立 Q 学习训练，看捕获率如何随训练上升。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch086.html">← 第 086 章：多智能体SAC的分布式训练</a>
+    <a class="next" href="ch088.html">第 088 章：多智能体环境：捕食者-猎物 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

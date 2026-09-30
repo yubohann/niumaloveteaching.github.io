@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第001章 PPO在CartPole上的首次实现 | 深度强化学习课程 · PPO、SAC 与多智能体系统</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · 策略梯度与 PPO</span>
+    <span class="sep">/</span>
+    <span>第 001 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · 策略梯度与 PPO</div>
+    <h1>第 001 章：PPO在CartPole上的首次实现</h1>
+    <p class="lead">从零理解并落地一个完整的 PPO：采样一批经验、用 GAE 估计优势、以裁剪目标做多轮小批量更新，让只活 20 步的小车学会把杆子立稳 500 步。</p>
+    <ul class="meta">
+      <li>主题：PPO 基础闭环 / on-policy 训练</li>
+      <li>关键公式：L<sup>CLIP</sup> = 𝔼[min(r·Â, clip(r,1−ε,1+ε)·Â)]</li>
+      <li>预计学时：50 分钟</li>
+      <li>前置章节：无（本课程从这里开始）</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解 on-policy 强化学习的"采样 → 估计优势 → 更新 → 丢弃数据"闭环，以及 PPO 在这条链路中的位置。</li>
+      <li>掌握策略梯度、重要性采样比率与裁剪目标的数学形式与直觉。</li>
+      <li>看懂 Actor-Critic 网络、GAE 优势估计与 PPO 裁剪损失的关键实现片段，不仅知道怎么写，还知道为什么这样写。</li>
+      <li>在 <code>CartPole-v1</code> 上把随机策略训练到 100 回合滑窗平均回报 ≥ 475（满分 500）。</li>
+      <li>学会读训练日志：KL、裁剪比例、熵、滑窗回报各自意味着什么。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>策略梯度方法直接优化策略本身：好的动作提高概率，坏的动作降低概率。想法简单，但工程上一直有个痛点，<strong>更新步长难以控制</strong>。一次更新走得太远，策略可能直接崩溃成"永远只输出同一个动作"的傻子，而且很难恢复。</p>
+    <p>TRPO 用二阶优化加"信任域"约束解决这个问题，但需要计算 Fisher 信息矩阵、做共轭梯度，实现复杂、每一步都很贵。PPO（Proximal Policy Optimization，2017）换了个思路：<strong>用一次裁剪（clip）就近似实现了信任域</strong>，当新旧策略的概率比超出设定范围时，直接掐掉梯度。实现只有几行代码，效果却足够好，因此它成了实际项目里默认的 RL 算法：从机器人控制到 RLHF 微调语言模型，到处都有 PPO 的身影。</p>
+    <p>为什么从 CartPole 开始？它是验证实现正确性的最小闭环：状态 4 维、动作 2 个、回合上限 500 步、奖励就是存活步数。学习曲线对不对、基线搭得稳不稳，几十个回合的滑窗均值就能给出答案。本章的目标是<strong>把 PPO 的每个机制讲透、看到它在代码里长什么样</strong>，并不以刷分为目的，后面 29 章都在这个骨架上做单点改动。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 策略梯度与优势函数</h3>
+    <p>设策略为 π<sub>θ</sub>，目标函数是期望折扣回报 J(θ)。策略梯度定理告诉我们，梯度可以写成：</p>
+    <div class="formula">
+      ∇<sub>θ</sub>J(θ) ≈ 𝔼<sub>t</sub>[ ∇<sub>θ</sub>log π<sub>θ</sub>(a<sub>t</sub>|s<sub>t</sub>) · Â<sub>t</sub> ]
+    </div>
+    <p>其中 Â<sub>t</sub> 是<strong>优势函数</strong>：在状态 s<sub>t</sub> 下执行 a<sub>t</sub>，比"按当前策略平均表现"好多少。这里乘的是优势 Â<sub>t</sub>，它减掉了状态本身的"基准分"，方差比回报 G<sub>t</sub> 小得多，梯度估计更稳。优势的估计方式（GAE）是本章和下一章的核心，这里先给出标准形式 GAE(γ, λ)：</p>
+    <div class="formula">
+      δ<sub>t</sub> = r<sub>t</sub> + γV(s<sub>t+1</sub>) − V(s<sub>t</sub>)<br>
+      Â<sub>t</sub> = Σ<sub>l=0</sub><sup>∞</sup> (γλ)<sup>l</sup> δ<sub>t+l</sub>
+    </div>
+    <p>δ<sub>t</sub> 是"时序差分残差"，衡量这一步实际发生的事比你预期的价值好多少；λ 在偏差与方差之间插值：λ=0 退化为单步 TD（低方差、有偏差），λ=1 接近蒙特卡洛（高方差、低偏差）。第 002、009 章会专门做这两类实验。</p>
+
+    <div class="box key">
+      <span class="box-title">数值例子：手算一次 GAE</span>
+      <p>设 γ=0.99、λ=0.95，一段 3 步的轨迹在第 3 步真终止（杆子倒下）。奖励 r<sub>0</sub>=r<sub>1</sub>=r<sub>2</sub>=1，价值估计 V(s<sub>0</sub>)=10、V(s<sub>1</sub>)=11、V(s<sub>2</sub>)=12，终止后未来价值为 0。先算每步的 TD 残差：</p>
+      <p>δ<sub>2</sub> = 1 + 0.99×0 − 12 = −11；δ<sub>1</sub> = 1 + 0.99×12 − 11 = 1.88；δ<sub>0</sub> = 1 + 0.99×11 − 10 = 1.89。</p>
+      <p>再按 γλ = 0.99×0.95 = 0.9405 从后向前累加：Â<sub>2</sub> = δ<sub>2</sub> = −11；Â<sub>1</sub> = 1.88 + 0.9405×(−11) ≈ −8.47；Â<sub>0</sub> = 1.89 + 0.9405×(−8.47) ≈ −6.07。</p>
+      <p>对应价值回归目标 R<sub>t</sub> = Â<sub>t</sub> + V(s<sub>t</sub>)：R<sub>0</sub> ≈ 3.93、R<sub>1</sub> ≈ 2.53、R<sub>2</sub> = 1。解读：第 2 步的 −11 表示价值网络高估了该状态（预测 12，实际只拿到 1 的回报），这条修正信息向前的传播距离由 λ 控制：λ=0 时 Â<sub>0</sub> 只有 1.89，看不出后面要崩；λ=0.95 时 Â<sub>0</sub> ≈ −6.07，提前给这条轨迹整体降权。这就是 GAE 的核心作用：<strong>把未来的预测误差按 (γλ) 的幂次回溯，λ 越大回溯越远、偏差越小、方差越大</strong>。</p>
+    </div>
+
+    <h3>2. 重要性采样比率：让一批数据被多次使用</h3>
+    <p>原始策略梯度是 on-policy 的：数据必须来自当前策略。PPO 想对同一批数据更新多个 epoch，就必须衡量"新旧策略对同一动作的评价差了多少"：</p>
+    <div class="formula">
+      r<sub>t</sub>(θ) = π<sub>θ</sub>(a<sub>t</sub>|s<sub>t</sub>) / π<sub>θ_old</sub>(a<sub>t</sub>|s<sub>t</sub>)
+    </div>
+    <p>r<sub>t</sub> &gt; 1 表示新策略更倾向于这个动作，r<sub>t</sub> &lt; 1 表示更不倾向。没有它，多次更新就等于用过期数据"想当然"地优化，更新方向会错。</p>
+
+    <h3>3. PPO 的裁剪目标</h3>
+    <p>PPO 的目标函数实现了"谁越界谁没有梯度"：</p>
+    <div class="formula">
+      L<sup>CLIP</sup>(θ) = 𝔼<sub>t</sub>[ min( r<sub>t</sub> Â<sub>t</sub>, clip(r<sub>t</sub>, 1−ε, 1+ε) Â<sub>t</sub> ) ]
+      <span class="note">ε 是裁剪范围，默认 0.2，即比率被限制在 [0.8, 1.2] 内</span>
+    </div>
+    <p>拆开看更直观（以 Â<sub>t</sub> &gt; 0 的好动作为例）：</p>
+    <ul>
+      <li>r<sub>t</sub> 在 [0.8, 1.2] 内：不裁剪，正常提升这个动作的概率；</li>
+      <li>r<sub>t</sub> &gt; 1.2：clip 项封顶在 1.2·Â<sub>t</sub>，min 选择它，<strong>梯度变成 0</strong>，"这个动作已经提升够多了，先停"。避免一步更新过猛把策略带偏。</li>
+    </ul>
+    <p>对 Â<sub>t</sub> &lt; 0 的坏动作镜像成立。所以 PPO 的更新是"有则改进、越界即停"的保守更新，这就是它不需要二阶优化也能稳定的原因。</p>
+    <p>把 min 对比率求导，可以看清裁剪其实<strong>只在"还想继续改进"的那一侧掐掉梯度</strong>。对 r<sub>t</sub> 求导分四种情形（ε=0.2）：</p>
+    <table>
+      <tr><th>优势符号</th><th>比率位置</th><th>min 选中的项</th><th>对比率的梯度</th><th>行为</th></tr>
+      <tr><td>Â &gt; 0</td><td>r &lt; 1+ε</td><td>r·Â</td><td>Â</td><td>正常提升该动作的概率</td></tr>
+      <tr><td>Â &gt; 0</td><td>r &gt; 1+ε</td><td>(1+ε)·Â（常数）</td><td>0</td><td>停止继续提升</td></tr>
+      <tr><td>Â &lt; 0</td><td>r &gt; 1−ε</td><td>r·Â</td><td>Â</td><td>正常压低该动作的概率</td></tr>
+      <tr><td>Â &lt; 0</td><td>r &lt; 1−ε</td><td>(1−ε)·Â（常数）</td><td>0</td><td>停止继续压低</td></tr>
+    </table>
+    <p>代入数字验证四行：Â=+2、r=1.5 时，未裁剪项 3.0、裁剪项 1.2×2=2.4，min 取 2.4 这个常数，梯度为 0；Â=+2、r=1.1 时两项都是 2.2，min 取 r·Â，梯度为 2。负优势一侧对称：Â=−2、r=0.5 时，未裁剪项 −1.0、裁剪项 0.8×(−2)=−1.6，min 取 −1.6 常数，梯度为 0；Â=−2、r=1.3 时，未裁剪项 −2.6、裁剪项 −2.4，min 取 −2.6，梯度为 −2。</p>
+    <p>裁剪窗口换算到对数空间更便于和其他诊断量对照：r &gt; 1.2 等价于"新策略对该动作的对数概率比旧策略高出 ln 1.2 ≈ 0.182 以上"，r &lt; 0.8 等价于对数概率位移低于 ln 0.8 ≈ −0.223。也就是说，单个样本的位移要越过约 0.2 个 nats（自然对数单位，1 nat ≈ 1.4427 bit）才有机会被裁剪。注意这是<strong>单样本</strong>口径：第 003 章的近似 KL 是整批平均，健康区间 0.005～0.02 比这个单样本阈值小一个数量级，两者并不矛盾；批次里通常只有 5%～20% 的样本越界，日志中的裁剪比例就是这件事的读数。</p>
+    <p>这张表纠正两个常见误读。第一，裁剪是<strong>单侧</strong>的：负优势样本的比率远大于 1 时（该动作概率已经偏高），梯度照样存在，PPO 不会"手下留情"，惩罚只会在比率被压到 1−ε 以下时才停止。第二，裁剪并不把比率钳制在 [1−ε, 1+ε] 区间内，它只是让越界样本不再贡献有利方向的梯度；日志里出现 r 达到 3、5 的样本是正常的。<strong>失效模式</strong>是另一种极端：一批数据里绝大多数正优势样本都落在 r &gt; 1+ε，此时策略项的有效梯度接近 0，回报曲线呈现"高原"，KL 却在涨，看到这个签名应当降学习率或缩短 epoch 数；加大训练预算只会让高原延续更久。</p>
+
+    <h3>4. 总损失：策略 + 价值 + 熵</h3>
+    <div class="formula">
+      L(θ) = −L<sup>CLIP</sup>(θ) + c<sub>vf</sub> · 𝔼[(V<sub>θ</sub>(s) − R<sub>t</sub>)<sup>2</sup>] − c<sub>ent</sub> · H(π<sub>θ</sub>(·|s))
+    </div>
+    <p>三项分别对应：让好动作更可能（策略项）；让价值函数预测更准（价值项，为优势估计服务）；保持一定的随机性防止过早收敛（熵项）。典型权重：c<sub>vf</sub>=0.5、c<sub>ent</sub>=0.01。</p>
+
+    <h3>5. 与相邻方法的对比</h3>
+    <p>把 PPO 放回方法谱系里，才能看清它的取舍。三种方法的共同点是都沿策略梯度方向更新参数，差别在"一次更新允许走多远"这一约束上：</p>
+    <table>
+      <tr><th>方法</th><th>约束方式</th><th>单次更新成本</th><th>实现复杂度</th><th>实践中稳定性</th></tr>
+      <tr><td>REINFORCE（朴素策略梯度）</td><td>无显式约束，靠学习率控制步长</td><td>低，数据用一遍即丢</td><td>最低</td><td>差，步长稍大即崩溃</td></tr>
+      <tr><td>TRPO</td><td>显式 KL 散度约束 + 信赖域</td><td>高，需 Fisher 向量积与共轭梯度</td><td>高</td><td>好，但调参余地小</td></tr>
+      <tr><td>PPO</td><td>裁剪目标近似信任域</td><td>低，同一批数据可迭代多个 epoch</td><td>低，约 20 行核心代码</td><td>好，超参数鲁棒</td></tr>
+    </table>
+    <p>这张表解释了 PPO 的定位：它用"裁剪"这一一阶近似换掉了 TRPO 的二阶运算，牺牲一点理论保证，换来实现成本的大幅下降和调参友好度。样本利用率上的差距可以用具体数字感受：同一批 2048 步数据，REINFORCE 只更新 1 次就丢弃；PPO 做 10 epochs × 32 个 minibatch，等于从同一批数据里提取 320 次梯度更新。本课程后续所有算法都会以本章的闭环为基础做单点替换，因此把这条数据流走通比追高分更重要。</p>
+    <p>PPO 的适用边界同样要提前说清：其一，它是 on-policy 方法，每条样本的复用次数被 epochs 卡死在个位数，奖励稀疏、每步交互昂贵的任务（例如真实机器人）样本效率不足，这是第二篇转向 SAC 的动机；其二，裁剪约束的是概率比率，不是参数距离，策略只在"这一批数据的动作"上有约束，分布外状态的脆弱性要靠第 014 章的对抗评估来暴露；其三，优势估计依赖价值网络，当价值函数严重失准时（奖励尺度失衡、长时程信用分配），裁剪再稳也救不了方向错误的梯度，第 007、009 章分别处理这两类问题。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+
+    <h3>模块划分</h3>
+    <table>
+      <tr><th>组件</th><th>职责</th><th>关键点</th></tr>
+      <tr><td><code>ActorCritic</code></td><td>共享躯干的 MLP，策略头输出动作 logits，价值头输出 V(s)</td><td>共享躯干让同一条特征同时服务策略与价值，参数少、训练快</td></tr>
+      <tr><td><code>collect_rollout</code></td><td>与环境交互 <code>steps_per_update</code> 步，收集 obs/act/logp/reward/value/done</td><td>记录 <em>采样时刻</em> 的 logp（这是比率的分母）；回合截断时用 bootstrap</td></tr>
+      <tr><td><code>compute_gae</code></td><td>从后向前递推优势与回报目标</td><td>终止标志要区分"真终止"和"时间截断"</td></tr>
+      <tr><td><code>ppo_update</code></td><td>标准化优势，做 epochs × minibatch 的裁剪损失更新</td><td>每轮重新打乱；统计 KL 与裁剪比例做诊断</td></tr>
+      <tr><td><code>evaluate</code></td><td>用贪婪（argmax）策略评估</td><td>评估必须关掉采样随机性，否则曲线噪声大</td></tr>
+      <tr><td><code>main</code></td><td>训练循环、日志、早停、保存模型</td><td>训练预算按<strong>环境步数</strong>控制，别按回合数</td></tr>
+    </table>
+
+    <h3>关键超参数</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用与取值理由</th></tr>
+      <tr><td><code>steps_per_update</code></td><td>2048</td><td>每次更新前采样的步数；太小梯度噪声大，太大更新次数少</td></tr>
+      <tr><td><code>epochs</code></td><td>10</td><td>同一批数据的更新轮数；配合裁剪防止过拟合这批数据</td></tr>
+      <tr><td><code>batch_size</code></td><td>64</td><td>小批量大小，2048/64 = 32 个 minibatch/epoch</td></tr>
+      <tr><td><code>lr</code></td><td>3e-4</td><td>Adam 学习率，PPO 的常用起点</td></tr>
+      <tr><td><code>gamma</code> / <code>lam</code></td><td>0.99 / 0.95</td><td>折扣因子与 GAE 的 λ</td></tr>
+      <tr><td><code>clip</code></td><td>0.2</td><td>裁剪范围，PPO 的灵魂参数</td></tr>
+      <tr><td><code>ent_coef</code><br><code>max_steps</code></td><td>0.01<br>400000</td><td>熵正则系数，维持探索；环境步数上限（按环境步数计费）</td></tr>
+    </table>
+
+    <h3>数据流</h3>
+    <p>每个更新周期：<strong>采样 2048 步</strong>（大约 4～20 个完整回合）→ <strong>计算 GAE</strong> 得到每个时刻的优势与回报目标 → <strong>优势标准化</strong> → 打乱后做 <strong>10 epochs × 32 个 minibatch</strong> 的梯度更新 → <strong>整批数据丢弃</strong>（on-policy 的代价：数据不能反复用）。</p>
+
+    <div class="box key">
+      <span class="box-title">预算对账：一次完整训练的四个数字</span>
+      <p>把默认参数整条链算一遍，训练规模就不再是模糊印象：<strong>更新次数</strong> = ⌈400000 / 2048⌉ = 196（最后一次不足 2048 步）；<strong>每次更新的 minibatch 数</strong> = 2048 / 64 = 32；<strong>梯度步总数</strong> = 196 × 10 × 32 = 62720；<strong>数据复用系数</strong> = epochs = 10，即每条转移被用于 10 次梯度计算。这四个数字互相咬合：想让曲线更平滑就加大 epochs 或采样批量（复用系数与单批信息量上升），想缩短墙钟时间就减小其中一个（每个环境步的算力开销下降）。</p>
+      <p>另一个要对账的是 GAE 的回看长度：γλ = 0.9405，有效回看约 1/(1−γλ) ≈ 16.8 步，而单批 2048 步相当于它的 122 倍，优势估计用不到的信息都在批次内，这是批量不能太小的一个定量依据。反过来，若把 steps_per_update 降到 128（小于早期回合长度），批次边界会频繁截断序列，末端优势全靠 V(s) 自举，价值网络一旦不准，更新方向就会系统性偏移。<strong>取值参考：采样批量至少覆盖 2 个完整回合，CartPole 早期约 20 步、后期 500 步，所以 1024～4096 都是合理区间。</strong></p>
+    </div>
+
+    <div class="box key">
+      <span class="box-title">两个容易忽略的实现细节</span>
+      <p>1) <strong>终止 vs 截断</strong>：杆子倒了是 <code>terminated=True</code>，此时未来价值应视为 0；而 CartPole 达到 500 步上限是 <code>truncated=True</code>，环境只是被时间限制打断，它的价值要用 V(s) 继续估计（bootstrap）。混为一谈会让价值函数系统性低估长回合。</p>
+      <p>2) <strong>训练预算按步数</strong>：CartPole 达标大约需要 10 万～30 万环境步，只用"回合数"做上限很容易训练不足，第 400 个回合时可能才走了 4 万步。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：Actor-Critic 网络与动作采样</strong></p>
+    <pre class="code"><code>class ActorCritic(nn.Module):
+    def __init__(self, obs_dim: int, act_dim: int, hidden: int = 64):
+        super().__init__()
+        self.body = nn.Sequential(                  # 共享躯干：策略与价值共用一个特征提取器
+            nn.Linear(obs_dim, hidden), nn.Tanh(),
+            nn.Linear(hidden, hidden), nn.Tanh(),
+        )
+        self.actor = nn.Linear(hidden, act_dim)     # 策略头：输出离散动作的 logits
+        self.critic = nn.Linear(hidden, 1)          # 价值头：输出状态价值 V(s)
+
+    @torch.no_grad()
+    def act(self, obs):
+        """采样动作，同时返回采样时刻的 log 概率与状态价值。"""
+        logits, value = self.forward(obs)
+        dist = Categorical(logits=logits)           # 离散动作用分类分布
+        action = dist.sample()                      # 按概率采样（探索的来源）
+        return action.item(), dist.log_prob(action).item(), value.item()</code></pre>
+    <p>解读：三个设计点值得记住。<strong>（1）</strong>共享躯干：CartPole 的观测只有 4 维，两个 64 宽的隐层已经足够；共享让策略与价值互相"借力"，也减少参数量。<strong>（2）</strong><code>act()</code> 里 <code>log_prob(action)</code> 是<strong>采样时刻</strong>的对数概率，它会被存进 rollout，充当 PPO 比率的分母。这是整个数据流里最不能出错的一环。<strong>（3）</strong><code>@torch.no_grad()</code>：采样本不需要梯度，加上它既省显存又防止计算图泄漏。</p>
+
+    <p><strong>片段 2：GAE 的后向递推</strong></p>
+    <pre class="code"><code>def compute_gae(rewards, values, terminateds, last_value, gamma, lam):
+    """从后向前递推 GAE。terminateds 只记"真终止"，截断回合不置零。"""
+    T = len(rewards)
+    advantages = np.zeros(T, dtype=np.float32)
+    last_gae = 0.0
+    for t in reversed(range(T)):
+        next_value = last_value if t == T - 1 else values[t + 1]
+        non_terminal = 1.0 - terminateds[t]         # 真终止→未来价值为 0；截断→保留
+        delta = rewards[t] + gamma * next_value * non_terminal - values[t]
+        last_gae = delta + gamma * lam * non_terminal * last_gae
+        advantages[t] = last_gae
+    returns = advantages + np.asarray(values, dtype=np.float32)
+    return advantages, returns</code></pre>
+    <p>解读：逆序循环里每一轮做两件事，先算 TD 残差 δ（实际比预期好多少），再把"当前残差 + 衰减后的未来优势"累加成 Â<sub>t</sub>。<code>non_terminal</code> 掩码是两个分支的开关：真终止时未来项归零（后面没有未来了）；时间截断时不归零，因为环境其实"还能继续"，只是被时间限制打断。<code>returns = advantages + values</code> 是价值网络的回归目标，<strong>用 GAE 的优势反推回报</strong>，比直接用蒙特卡洛回报方差小得多。</p>
+
+    <p><strong>片段 3：PPO 更新的核心循环</strong></p>
+    <pre class="code"><code>for _ in range(args.epochs):                        # 同一批数据反复利用（epochs 轮）
+    idx = torch.randperm(N, device=obs.device)      # 每轮重新打乱：避免顺序偏置
+    for start in range(0, N, args.batch_size):
+        mb = idx[start:start + args.batch_size]
+        logits, value = net(obs[mb])
+        dist = Categorical(logits=logits)
+        logp = dist.log_prob(act[mb])               # 新策略对数概率
+
+        ratio = torch.exp(logp - logp_old[mb])      # 对数差算比率：数值上比相除更稳
+        surr1 = ratio * adv[mb]                     # 未裁剪目标
+        surr2 = torch.clamp(ratio, 1.0 - args.clip,
+                            1.0 + args.clip) * adv[mb]   # 裁剪目标
+        policy_loss = -torch.min(surr1, surr2).mean()    # min=悲观下界，越界梯度归零
+
+        value_loss = F.mse_loss(value, ret[mb])     # 价值回归：对齐 GAE 反推的回报
+        entropy = dist.entropy().mean()             # 熵：鼓励保持探索
+        loss = policy_loss + args.vf_coef * value_loss - args.ent_coef * entropy
+
+        optimizer.zero_grad()
+        loss.backward()
+        nn.utils.clip_grad_norm_(net.parameters(), 0.5)  # 梯度裁剪，防偶发大步
+        optimizer.step()</code></pre>
+    <p>解读：这段 20 行左右是整个 PPO 的心脏，逐行都值得展开。<strong>（1）</strong><code>ratio = exp(logp − logp_old)</code>：用对数差再取指数，避免两个概率直接相除时的数值问题（小概率相除可能溢出/下溢）。<strong>（2）</strong><code>min(surr1, surr2)</code>：这是"悲观下界"，当比率跑出 [1−ε, 1+ε]，clip 项变成常数，梯度只剩它，于是<strong>越界方向的梯度恰好归零</strong>。<strong>（3）</strong>优势 <code>adv</code> 在进入循环前做过标准化（减均值除标准差），让不同量级的批次都能用同一学习率。<strong>（4）</strong>总损失的符号：策略项和价值项是"要最小化"的损失；熵奖励是"越大越好"，所以带负号。<strong>（5）</strong>梯度裁剪 0.5 是保险丝，正常训练几乎不触发；一旦频繁触发，先去检查学习率和 KL。</p>
+
+    <p>完整可运行脚本（附录）：<a href="../code/ch001.py" download>code/ch001.py</a></p>
+    <pre class="sh"><code>python code/ch001.py            # 完整训练：CPU 约 2–5 分钟，通常 10 万～30 万步内达标
+python code/ch001.py --quick    # 快速跑通：20–40 秒，只验证流程不保证达标</code></pre>
+    <p>训练日志每轮打印近 20 回合均值和两个诊断量：<strong>KL</strong> 0.005～0.02 属于健康区间；<strong>裁剪比例</strong> 5%～20% 正常，长期贴近 0 说明学习率偏小；<strong>熵</strong>从 0.69（均匀分布）缓慢下降。以实跑为准，不同种子会有波动。三个诊断量的判读方法汇总如下：</p>
+    <table>
+      <tr><th>诊断量</th><th>健康范围</th><th>偏高时的含义与处理</th><th>偏低时的含义与处理</th></tr>
+      <tr><td>近似 KL</td><td>0.005～0.02</td><td>更新步长过大：降低学习率或提前结束 epoch</td><td>几乎不学习：可适当提高学习率</td></tr>
+      <tr><td>裁剪比例</td><td>5%～20%</td><td>大量样本被裁剪：策略变化剧烈，检查优势尺度与学习率</td><td>长期接近 0：ε 太宽或学习率太小，PPO 接近普通策略梯度</td></tr>
+      <tr><td>策略熵</td><td>0.2～0.5 之间缓慢下降</td><td>探索过剩：回报上不去，检查是否奖励信号被熵项淹没</td><td>过早起降：可能过早确定动作，必要时提高 c<sub>ent</sub></td></tr>
+      <tr><td>价值损失</td><td>随回报上升同步变化</td><td>价值网络跟不上策略：检查学习率与网络容量</td><td>接近 0 且回报停滞：优势估计失去区分度，检查回报目标</td></tr>
+    </table>
+    <p>把这张表当作训练时的仪表盘：先看回报是否上升，再看 KL 与裁剪比例是否在健康区间，最后看熵与价值损失是否同步演化。出现异常时按"学习率 → 批次大小 → 熵系数"的顺序逐项排查，每次只改一个变量，才能把因果关系分离清楚。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>用更新后的策略重新算旧 logp</strong>：比率的分子分母必须是"同一时刻的两次前向"。<code>logp_old</code> 只能在采样时算一次并存下来；训练里再算的就变成新策略概率，比率恒为 1，PPO 退化成普通策略梯度。</li>
+      <li><strong>把 truncated 当 terminated</strong>：CartPole 的 500 步上限是时间截断。如果这里切断 bootstrap，价值函数永远学不到"回合末端还值点分"，长回合任务会系统性低估价值。</li>
+      <li><strong>用回合数当训练预算</strong>：早期回合只有 20 步，400 个回合才 8000 步，什么都学不出来。预算必须按环境步数算，本章默认 40 万步上限。</li>
+      <li><strong>评估时还在采样动作</strong>：评估用 <code>argmax</code>（贪婪）。如果评估也用随机采样，看到 300 分别慌，那可能只是没撒到好轨迹。</li>
+      <li><strong>优势标准化泄漏到批次之外</strong>：标准化必须每次更新在当批数据内部做；跨批复用统计量会让不同批次的数据口径不一致，梯度方向被系统性扭曲。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把 <code>--clip</code> 分别改成 <code>0.05</code> 和 <code>0.5</code> 各跑一次，对比 KL 与裁剪比例的变化，解释为什么 ε 越小更新越保守。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>只换命令行参数、观察日志即可。关注"裁剪比例"到达稳定值的时间和近20均曲线的陡峭程度：ε 小 → 更多样本被裁剪 → 单次更新更保守。</div></details>
+      </li>
+      <li>把 GAE 的 <code>--lam</code> 分别设为 <code>0</code> 和 <code>1.0</code>，解释单步 TD 与蒙特卡洛两种极端下训练曲线方差的变化。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>λ=0：优势只剩单步残差（偏差大、方差小）；λ=1：接近蒙特卡洛（方差大）。多跑几个种子对比，别只看单次曲线。</div></details>
+      </li>
+      <li>注释掉优势标准化（把 <code>adv = (adv - adv.mean()) / (adv.std() + 1e-8)</code> 改成直接使用 <code>adv</code>），训练还稳吗？结合裁剪比例与 KL 的变化解释原因。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>CartPole 早期优势尺度在 ±10 以内，去掉标准化通常还能跑；后期优势变小后梯度尺度失衡。对比 5 万步处两条曲线的波动幅度。</div></details>
+      </li>
+      <li>把默认训练预算改成 <code>--max-steps 40000</code> 跑一次，记录 4 万步时的滑窗均值，对比完整训练的日志。这个实验说明什么？<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>答案与"训练预算按环境步数计量"有关，第 400 个回合和 4 万步根本不是一回事。把两条日志按"环境步数"对齐再比较。</div></details>
+      </li>
+      <li>设计实验：实现"KL 早停"，若某个 epoch 后的近似 KL 超过 0.03 就提前结束本轮更新。写出你会改哪几行、观察哪些指标，并预测训练曲线怎么变。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>在 <code>ppo_update</code> 的 epoch 循环里，每完成一个 epoch 计算一次平均 KL；超阈值即 break。预期：KL 峰值被压平，样本效率略降但稳定性上升，这正是 TRPO 思想以启发式形式的回归。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>PPO 的完整闭环是：采样一批经验 → GAE 估计优势 → 裁剪目标做多轮小批量更新 → 丢弃数据。</li>
+      <li>裁剪的直觉是"有则改进、越界即停"：比率跑出 [1−ε, 1+ε] 后梯度归零，用一阶方法近似实现了信任域。</li>
+      <li>实现上两个关键细节：<code>logp_old</code> 要存快照；<code>terminated</code> 与 <code>truncated</code> 的 bootstrap 处理不同。</li>
+      <li>训练预算按环境步数衡量，CartPole 达标约需 10 万～30 万步；日志中的 KL、裁剪比例、熵是健康度仪表盘。</li>
+      <li>下一章把 GAE 单独拆出来做实验：不同 λ、TD 与蒙特卡洛的偏差-方差权衡，以及优势估计如何影响 PPO 的样本效率。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="../index.html">← 返回课程目录</a>
+    <a class="next" href="ch002.html">第 002 章：PPO的广义优势估计（GAE）实现 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

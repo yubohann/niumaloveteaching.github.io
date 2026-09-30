@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第021章 RLlib自定义环境与奖励设计 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · RLlib 核心接口与训练</span>
+    <span class="sep">/</span>
+    <span>第 021 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · RLlib 核心接口与训练</div>
+    <h1>第 021 章：RLlib自定义环境与奖励设计</h1>
+    <p class="lead">训练效果的上限由环境定义决定。本章讲清 RLlib 的环境接口契约、观测与动作空间（spaces）声明、终止与截断的语义差别，以及奖励塑形（reward shaping）为什么能加速学习且不改变最优策略。</p>
+    <ul class="meta">
+      <li>主题：RLlib 训练 / 自定义环境与奖励设计</li>
+      <li>关键机制：环境接口契约、空间声明、终止语义、势函数塑形、env_config 注入</li>
+      <li>预计学时：50 分钟</li>
+      <li>前置章节：第 020 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解环境接口契约与马尔可夫决策过程（Markov Decision Process, MDP）的对应关系，能写出可被正确采样的 reset 与 step。</li>
+      <li>掌握空间声明要求，理解空间如何决定策略网络的输入编码与动作分布头（action distribution head）。</li>
+      <li>理解终止（terminated）与截断（truncated）的语义差异及其对价值自举（bootstrapping）的不同影响。</li>
+      <li>掌握基于势函数（potential function）的奖励塑形，理解最优策略不变的条件与塑形系数的量级依据。</li>
+      <li>会通过 env_config 注入环境参数，使多进程环境副本的行为可控、可复现。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>RLlib 的采样流程对环境有一组明确假设：环境以类或注册标识的形式进入配置，每个采样工作进程（rollout worker）各自实例化一份副本，按固定顺序调用 reset 与 step，并把观测、奖励、终止标志整理为训练数据。<strong>接口任何一处与假设不符，后续算法层的全部配置都无从发挥作用。</strong></p>
+    <p>自定义环境的高频问题集中在三处：空间声明与返回值不一致，启动即失败；终止与截断混用，价值目标出现系统性偏差；奖励设计失衡，学习效率低下。上一章改变训练的组织方式，本章处理数据来源本身。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p>环境是强化学习数据流的起点，接口契约、空间语义与奖励设计共同决定训练信号的质量。</p>
+
+    <h3>1. 接口契约与 MDP 五元组</h3>
+    <p>任务形式化为五元组（S, A, P, R, γ）：状态、动作、转移概率、奖励与折扣因子。环境的职责是实现这个五元组的一次具体采样：reset 决定初始状态分布，step 完成一次状态转移并给出即时奖励。RLlib 期望的契约为：reset 返回二元组 <code>(观测, info)</code>，step 返回五元组 <code>(观测, 奖励, terminated, truncated, info)</code>（接口随版本演进，以对应 Ray 版本的官方文档为准）。</p>
+    <p>观测与动作的取值集合由空间对象声明，而空间是策略网络的形状合同：观测空间决定编码器输入维度，动作空间决定输出头类型。Discrete 对应分类分布（Categorical），连续 Box 对应对角高斯分布（DiagGaussian）。<strong>空间写错，网络在构造期就会因形状不匹配而失败。</strong></p>
+    <div class="formula">
+      G<sub>t</sub> = r<sub>t</sub> + γr<sub>t+1</sub> + γ<sup>2</sup>r<sub>t+2</sub> + …
+      <span class="note">价值函数尺度上界约为 R<sub>max</sub>/(1−γ)；γ 取 0.99 时约为单步奖励上限的 100 倍，奖励量纲直接影响价值网络的拟合难度</span>
+    </div>
+
+    <h3>2. 终止与截断：两种不同事件</h3>
+    <p>终止（terminated）表示系统进入吸收态，价值目标应屏蔽自举；截断（truncated）表示因外部限制中止本轮采样，系统仍在运行，价值目标应保留自举以正确估计后续回报。<strong>把步数上限误写成 terminated，价值估计会系统性偏低；把真实终止写成 truncated，吸收态之后的零价值会被错误传播回来。</strong></p>
+
+    <h3>3. 奖励设计：信号密度与势函数塑形</h3>
+    <p>稀疏奖励（sparse reward）只在任务完成时给出信号，随机策略命中目标的概率随任务长度指数衰减。常见对策是把过程信息编码进奖励，例如与目标的距离、能量消耗。这类代理指标与任务目标之间只有经验相关性，使用时需要校准。</p>
+    <p>势函数塑形（potential-based reward shaping）给出了有理论保证的形式。设 Φ 为状态势函数，在转移 s → s′ 上增加塑形项：</p>
+    <div class="formula">
+      F(s, s′) = γΦ(s′) − Φ(s)
+      <span class="note">塑形项沿轨迹求和后只剩首尾两端（望远镜相消），所有策略的回报排序保持不变，最优策略与不加塑形时相同</span>
+    </div>
+    <p><strong>结论：势函数塑形是安全的加速手段，改变信号的密度，不改变任务目标；系数量级仍须与原始奖励匹配，否则代理项主导优化方向。</strong></p>
+
+    <h3>3.1 望远镜相消的推导与数值验证</h3>
+    <p>把塑形后的折扣回报按转移展开。设轨迹长度为 T，状态序列从 s<sub>0</sub> 到 s<sub>T</sub>，塑形回报的总增量为：</p>
+    <div class="formula">
+      Σ<sub>k=0</sub><sup>T−1</sup> γ<sup>k</sup>(γΦ(s<sub>k+1</sub>) − Φ(s<sub>k</sub>)) = γ<sup>T</sup>Φ(s<sub>T</sub>) − Φ(s<sub>0</sub>)
+      <span class="note">展开后中间项 γΦ(s<sub>1</sub>) 与 −γΦ(s<sub>1</sub>) 等逐对消去，只剩末项与首项；该增量与策略无关，策略之间的回报排序保持不变</span>
+    </div>
+    <p>代入具体数字检验。取 γ = 0.99，势函数 Φ(s) = −|goal − pos|，一条轨迹的位置序列为 −0.8 → −0.3 → 0.4 → 0.9，终点距目标 0.1。三次转移的塑形项依次为 0.99×(−1.3) − (−1.8) = 0.513、0.99×(−0.6) − (−1.3) = 0.706、0.99×(−0.1) − (−0.6) = 0.501，按折扣系数 1、0.99、0.9801 加权求和约为 1.703。端点公式给出 γ<sup>3</sup>Φ(s<sub>3</sub>) − Φ(s<sub>0</sub>) = 0.9703×(−0.1) − (−1.8) ≈ 1.703，两种算法结果一致。<strong>额外回报只由起点与终点决定，任何策略共享相同的首末位置时获得相同的增量，这就是最优策略不变的来源。</strong>终止状态约定势为零时，增量退化为常数 −Φ(s<sub>0</sub>)，此时塑形等价于给初始状态加一个常数，连回报的数值口径都保持一致。</p>
+
+    <h3>3.2 三类奖励方案的对比</h3>
+    <table>
+      <tr><th>方案</th><th>信号密度</th><th>是否改变最优策略</th><th>调参负担</th><th>适用情形</th></tr>
+      <tr><td>稀疏原始奖励</td><td>极低（仅完成时非零）</td><td>否（作为基准）</td><td>低</td><td>能承受大量采样、回合较短的探索型任务</td></tr>
+      <tr><td>稠密代理奖励（负距离等）</td><td>高（每步非零）</td><td>可能（代理与任务目标不重合时）</td><td>中，需要校准</td><td>代理指标与任务目标对齐良好且经过评估验证</td></tr>
+      <tr><td>势函数塑形</td><td>高（每步非零）</td><td>否（有理论保证）</td><td>中（势函数与系数）</td><td>回合较长、原始信号稀疏时的默认起点</td></tr>
+    </table>
+    <p>选择依据：回合长度超过数十步且原始信号稀疏时，势函数塑形是默认起点；代理指标与任务目标充分对齐且经过校准后，可直接把代理指标作为主奖励；信号本来稠密的任务保持原始奖励，避免引入额外超参数。三类方案都要求奖励量纲与价值网络的学习率配合，量纲放大的同时学习率应向小量级移动。</p>
+
+    <h3>3.3 观测设计的两个实用要求</h3>
+    <p>观测的数值尺度直接影响首层网络的梯度条件。连续量观测建议按物理范围归一化到对称区间，幅值控制在个位量级，避免不同量纲的特征在共享全连接层上相互挤压；箱式空间的 low 与 high 按真实可达范围填写，网络与价值函数都依赖这份边界信息做输入处理。图像类观测须在空间声明中写明形状为（通道，高度，宽度）三维布局，环境按同一布局返回；通道顺序错位会让卷积核对错误的维度做空间卷积，症状是学习曲线明显劣化且没有任何报错信息。观测中若含离散档位与连续值混合的字段，应拆分为独立键或以独热编码展开，混合量纲的平铺数组会让归一化失去统一的缩放依据。</p>
+
+    <h3>4. 环境实例化的生命周期</h3>
+    <p>RLlib 在每个采样工作进程内实例化环境副本，env_config 随配置序列化分发，副本之间不共享内存。<strong>由此得到三条约束：</strong>环境参数必须可序列化；模块顶层不能持有可变全局状态；随机性必须来自显式传入的 seed，不依赖进程级随机源，这三点直接决定并行轨迹的多样性与可复现性。</p>
+
+    <h3>5. 稀疏奖励命中率与两类偏差的数值核算</h3>
+    <p>把稠密奖励替换为"仅到达目标给 +1"的稀疏版本，先估探索难度。在本章环境的同构实现上让随机策略跑 2 万个回合（每回合上限 120 步），判定窗口从 ±0.01 放宽到 ±0.02、±0.1 时，单回合命中率约为 0.17、0.28、0.59。<strong>窗口翻倍只把命中率从 0.17 提到 0.28，</strong>增量来自长回合内的多次穿越机会；窗口继续放宽后增速放缓，因为回合时长固定、往返次数有限。随机策略不足两成的命中率意味着稀疏信号下每命中一次要消耗多个回合的采样，同等任务所需的训练样本量比稠密版本高一个量级；势函数塑形与增大并行采样规模正是针对这项的直接手段。</p>
+    <table>
+      <tr><th>判定窗口</th><th>随机策略单回合命中率</th><th>正信号的到达频率</th></tr>
+      <tr><td>±0.01</td><td>约 0.17</td><td>平均每 6 个回合一次</td></tr>
+      <tr><td>±0.02</td><td>约 0.28</td><td>平均每 3 至 4 个回合一次</td></tr>
+      <tr><td>±0.1</td><td>约 0.59</td><td>平均每 2 个回合一次</td></tr>
+    </table>
+    <p>第二笔核算是终止掩码的偏差量级。把步数上限误写成 terminated 时，回合末端每个转移的价值目标都丢掉 γV(s′) 项；若截断点的价值估计为 −20、γ = 0.99，末步目标偏低约 19.8，与截断点的价值本身同量级。<strong>折现把漏洞按步数放大：越靠近回合末端丢失的补偿越大，价值估计在末段整体偏低，策略读到的"继续前进的收益"被抹掉，症状表现为学到接近上限就放弃。</strong>第三笔核算是塑形系数的支配性：示例轨迹上单步塑形项 F = γΦ(s′) − Φ(s) 的绝对值约 0.5，系数 0.1 时约 0.05，占每步原始奖励（0.1 至 0.5）的一到五成；系数取 2.0 时约 1.0，普遍超过原始奖励幅度，代理项在损失中占据主导，训练回报被抬高而评估成功率停滞。系数区间 0.05 至 0.5 是这三笔账共同给出的起步范围。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>接入流程分六步：先保证单副本正确，再考虑向量化与并行。</p>
+    <ol>
+      <li><strong>声明空间</strong>：观测数组统一使用 float32，精度与网络参数一致；动作边界覆盖策略实际输出范围。</li>
+      <li><strong>编写 reset 与 step</strong>：严格按二元组与五元组返回；终止与截断按语义拆分。</li>
+      <li><strong>参数化</strong>：回合长度、难度、奖励系数全部进 env_config，不写死在类内部。</li>
+      <li><strong>注入配置</strong>：以类对象传入环境配置项，由 RLlib 在采样进程内实例化。</li>
+      <li><strong>冒烟验证</strong>：单采样进程、单环境副本、小训练批次先跑通一轮。</li>
+      <li><strong>奖励校准</strong>：与无塑形基线对照，确认塑形后奖励量级仍在同一数量级。</li>
+    </ol>
+    <h3>环境参数表（示例取值）</h3>
+    <table>
+      <tr><th>参数</th><th>示例值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td><code>horizon</code></td><td>120</td><td>单回合步数上限，触发截断</td><td>熟练策略完成步数的 1.5 至 2 倍</td></tr>
+      <tr><td><code>goal</code></td><td>1.0</td><td>目标位置</td><td>任务定义常量</td></tr>
+      <tr><td><code>shape_coeff</code></td><td>0.1</td><td>势函数塑形系数</td><td>原始奖励量级的百分之十起步，逐步放大并对照评估回报</td></tr>
+      <tr><td><code>train_batch_size</code></td><td>2000</td><td>每轮训练消耗的环境步数</td><td>冒烟期取小值，稳定后按采样吞吐放大</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：为什么观测 dtype 必须与网络参数一致？</span>
+      <p>策略网络参数默认为 float32。若环境返回 float64 观测，打包批次时会产生隐式类型转换，每个环境步多付出一次数组拷贝；在每秒数万步的吞吐下明显拖慢进度，部分版本还会因空间声明与数据 dtype 不一致直接报错。统一为 float32 是最低成本的一致性措施。</p>
+    </div>
+    <p>观测布局需要三项启动期校验：形状与空间声明一致，dtype 为 float32，数值范围落在 low 与 high 之间。校验方式是对 reset 与若干随机 step 的返回值逐项断言，把形状与类型问题暴露在训练启动之前。采样中途出现的形状错位会让采样进程直接退出，排查需要逐层核对数据流；启动期断言把同类问题限制在环境文件自身范围内，定位代价低一个量级。断言脚本同时检查终止与截断两个标志的类型，布尔值与整数混用会让批次掩码计算出错。</p>
+    <p><strong>奖励校准流程按四步执行：</strong>固定其他配置，先跑无塑形基线并记录评估回报；加入系数量级为 0.1 的塑形项，对比训练回报与评估回报的差值；若训练回报上升而评估回报停滞，说明代理项偏离任务目标，回退系数或更换势函数；在 0.05 至 0.5 区间做粗网格搜索，以评估回报为模型选择依据，训练回报仅作诊断参考。校准期间保持 horizon、随机种子与评估频率不变，否则两组曲线没有可比性。</p>
+    <p>与上一章差异：第 020 章改变训练的组织方式，本章替换数据来源本身。采样器（第 023 章）、评估流程（第 026 章）与并行配置（第 024 章）都围绕环境接口展开，下一章先处理向量化。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：符合 RLlib 契约的环境骨架</strong></p>
+    <pre class="code"><code>import numpy as np
+from gymnasium.spaces import Box
+
+class LineGoalEnv:
+    """一维直线行走任务：智能体从负半轴随机位置出发，走向目标点。"""
+
+    def __init__(self, env_config=None):
+        # 参数全部经 env_config 传入；RLlib 在每个采样工作进程内各建一份副本，
+        # 参数随配置序列化分发，模块内不保留可变全局状态
+        cfg = env_config or {}
+        self.horizon = int(cfg.get("horizon", 120))   # 回合步数上限，决定截断时机
+        self.goal = float(cfg.get("goal", 1.0))       # 目标位置，属于任务定义
+        # 空间在 __init__ 中一次性声明：RLlib 依据它构造策略网络；
+        # 观测为[位置, 速度]两维 float32，与网络参数默认精度一致
+        self.observation_space = Box(low=-np.inf, high=np.inf,
+                                     shape=(2,), dtype=np.float32)
+        # 动作为范围[-1, 1]的连续加速度，对应连续控制输出的高斯头
+        self.action_space = Box(low=-1.0, high=1.0,
+                                shape=(1,), dtype=np.float32)
+
+    def reset(self, *, seed=None, options=None):
+        # 每个副本建立自己的随机数发生器：共用全局 np.random 会让
+        # 并行采样的轨迹高度相关，探索覆盖面明显下降
+        self.rng = np.random.default_rng(seed)
+        self.pos = float(self.rng.uniform(-1.0, 0.0))  # 起点随机化，防止记住单一起点
+        self.vel = 0.0
+        self.steps = 0
+        return np.array([self.pos, self.vel], dtype=np.float32), {}
+
+    def step(self, action):
+        # 一阶积分推进物理状态：动作以加速度形式作用在速度上
+        self.vel = 0.9 * self.vel + 0.1 * float(action[0])
+        self.pos += self.vel
+        self.steps += 1
+        reward = -abs(self.goal - self.pos)            # 稠密奖励：与目标的负距离
+        terminated = bool(abs(self.goal - self.pos) &lt; 0.02)   # 吸收态：屏蔽自举
+        truncated = bool(self.steps &gt;= self.horizon)          # 时间截断：保留自举
+        obs = np.array([self.pos, self.vel], dtype=np.float32)
+        return obs, reward, terminated, truncated, {}</code></pre>
+    <p>解读：骨架浓缩了三条契约。<strong>其一，</strong>空间在构造函数中声明一次，RLlib 依赖它在建网络前确定输入输出形状。<strong>其二，</strong>reset 接收 seed 并建立副本私有随机源，这是并行采样下轨迹多样性的来源。<strong>其三，</strong>terminated 与 truncated 分开计算，为价值自举提供正确的掩码语义。</p>
+
+    <p><strong>片段 2：以类对象注入配置并完成冒烟验证</strong></p>
+    <pre class="code"><code>from ray.rllib.algorithms.ppo import PPOConfig
+
+# 环境以"类"传入，不传已构造的实例：实例跨进程分发需要自行实现
+# 序列化，类对象的分发由 RLlib 兜底处理
+config = (
+    PPOConfig()
+    .environment(
+        env=LineGoalEnv,                # 采样进程在本地实例化，副本互不干扰
+        env_config={
+            "horizon": 120,             # 与环境内部默认值一致，便于对照实验
+            "goal": 1.0,
+            "shape_coeff": 0.1,         # 塑形系数，由 step 内的塑形项使用
+        },
+    )
+    .env_runners(num_env_runners=1,     # 冒烟期只用单采样进程，先排除并行干扰
+                 num_envs_per_env_runner=1)
+    .resources(num_gpus=0)
+    .training(train_batch_size=2000)    # 小批量仅用于验证接口链路是否连通
+)
+algo = config.build_algo()
+result = algo.train()                   # 跑通一轮：采样与学习各阶段无形状错误
+print(result["episode_return_mean"])    # 奖励量级应稳定在数十的负值附近</code></pre>
+    <p>解读：全部可变参数收进 env_config，切换 horizon 或塑形系数只需改字典，不必改动环境源码，这是可对照实验的前提。<strong>冒烟阶段刻意把采样进程数与单进程环境数压到 1，</strong>把"环境接口"与"并行调度"两类问题解耦：失败必然出在接口或空间上。链式 API 的命名随版本演进，旧版写法使用 <code>config["env"]</code> 等字典键，语义一一对应。</p>
+
+    <p><strong>片段 3：势函数塑形项的实现</strong></p>
+    <pre class="code"><code>def potential_shaping(prev_pos, pos, gamma, coeff):
+    """计算转移上的塑形项 F = gamma*Phi(s') - Phi(s)。
+
+    Phi 取负距离：越接近目标势越高；望远镜相消保证策略排序不变，
+    塑形只改变信号密度，不改变最优策略。
+    """
+    phi_prev = -abs(1.0 - prev_pos)      # Phi(s)：与原始奖励同量纲
+    phi_now = -abs(1.0 - pos)            # Phi(s')
+    return coeff * (gamma * phi_now - phi_prev)
+
+
+def step_with_shaping(self, action):
+    # 塑形按转移计算，需要同时访问转移前后的位置
+    prev_pos = self.pos
+    self.vel = 0.9 * self.vel + 0.1 * float(action[0])
+    self.pos += self.vel
+    # 总奖励 = 原始奖励 + 塑形项；coeff 只调节信号的稠密度
+    reward = -abs(self.goal - self.pos) + potential_shaping(
+        prev_pos, self.pos, gamma=0.99, coeff=self.shape_coeff)
+    # 终止与截断语义保持原样，塑形不触碰回合边界判断
+    terminated = bool(abs(self.goal - self.pos) &lt; 0.02)
+    truncated = bool(self.steps + 1 &gt;= self.horizon)
+    self.steps += 1
+    obs = np.array([self.pos, self.vel], dtype=np.float32)
+    return obs, reward, terminated, truncated, {}</code></pre>
+    <p>解读：系数 coeff 是唯一调节旋钮：取 0 时退化为原始奖励，取过大时塑形项主导总奖励，策略可能沿势函数爬坡而忽略任务目标。<strong>工程上把 coeff 当作超参数对待，以评估回报为判断依据；</strong>训练回报会因塑形项抬高数值口径，不适合做模型选择的唯一标准。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>空间 dtype 与返回值不一致</strong>：空间声明 float32，reset 与 step 返回 float64。症状是启动报错，或每步隐式转换拖慢吞吐。修复：统一以 float32 构造观测数组。</li>
+      <li><strong>把步数上限写成 terminated</strong>：截断被误标为终止，回合末尾的自举被屏蔽。症状是价值估计偏低，策略学到接近上限就放弃。修复：按语义拆分两个标志。</li>
+      <li><strong>reset 返回旧版单值</strong>：沿用旧 Gym 协议只返回观测。症状是采样进程解析返回值时报错。修复：返回 <code>(观测, info)</code> 二元组，info 可为空字典。</li>
+      <li><strong>随机性来自进程级全局源</strong>：所有副本共用同一全局随机数发生器。症状是并行轨迹高度相似，探索效率低于预期。修复：reset 内按 seed 建立副本私有随机数发生器。</li>
+      <li><strong>塑形系数远超原始奖励量级</strong>：代理项主导总奖励。症状是训练回报漂亮但评估成功率不涨。修复：系数从百分之十量级起步，用评估回报做模型选择。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把 horizon 从 120 改为 60，预测评估回报均值与任务成功率的变化方向，并说明截断样本的价值自举在其中起的作用。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>截断提前使单回合累积负距离更少，回报均值可能上升；可用步数减少，到达比例可能下降，两个口径同时观察。</div></details>
+      </li>
+      <li>为环境补一个离散动作版本（Discrete(3)：左、停、右），说明动作空间类型变化后策略网络输出头的变化。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>连续 Box 对应对角高斯头；Discrete(3) 对应分类头，输出 3 个 logits。空间类型直接决定默认模型最后一层构造。</div></details>
+      </li>
+      <li>推导势函数塑形在折扣回报下的望远镜相消过程，说明最优策略不变需要满足的条件。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>展开 Σγ<sup>k</sup>(γΦ(s<sub>k+1</sub>) − Φ(s<sub>k</sub>))，相邻项成对消去只剩首项与末端余项；终止状态势约定为零时，额外回报与策略无关。</div></details>
+      </li>
+      <li>设计稀疏奖励版本（仅到达目标给 +1），估算随机策略平均需要多少回合命中目标，并给出两种缓解手段。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>命中概率与判定区间宽度相关，可按宽度比估算量级；缓解手段包括增大并行采样规模、势函数塑形或课程学习。</div></details>
+      </li>
+      <li>设计奖励量纲实验：把全部奖励乘以 10，预测最优学习率的变化方向，并给出对照实验的搜索空间、停止条件与评估指标。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>奖励放大后梯度尺度同向放大，最优学习率应向小量级移动；学习率取对数网格搜索，停止条件用训练迭代数，指标用评估回报。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>环境契约与 MDP 五元组对应：reset 给出初始状态，step 完成转移与奖励，返回二元组与五元组。</li>
+      <li>空间是网络的形状合同：观测空间决定编码器输入，动作空间决定输出头类型，dtype 统一 float32。</li>
+      <li>终止屏蔽自举、截断保留自举，掩码语义是价值估计正确性的前提。</li>
+      <li>势函数塑形 F = γΦ(s′) − Φ(s) 不改变最优策略；系数量级与原始奖励匹配，用评估回报做选择。</li>
+      <li>环境参数经 env_config 注入，每个采样进程实例化私有副本，随机源随 seed 建立。</li>
+      <li>下一章进入向量化环境（Vectorized Environment）：在单个采样进程内承载多个环境副本，提升采样吞吐。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch020.html">← 第 020 章：RLlib自定义训练器</a>
+    <a class="next" href="ch022.html">第 022 章：RLlib与环境向量化 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

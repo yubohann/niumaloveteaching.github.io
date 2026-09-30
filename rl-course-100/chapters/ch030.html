@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第030章 PPO的连续控制基准测试 | 深度强化学习课程 · PPO、SAC 与多智能体系统</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · 策略梯度与 PPO</span>
+    <span class="sep">/</span>
+    <span>第 030 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · 策略梯度与 PPO</div>
+    <h1>第 030 章：PPO的连续控制基准测试</h1>
+    <p class="lead">把 PPO 扩展成"离散 + 连续"双策略，在 CartPole、Acrobot、Pendulum、MountainCarContinuous 四个任务上跑统一基准：同网络、同超参、带随机基线，问清楚 PPO 的连续控制能力边界在哪、为什么下一步要换 SAC。</p>
+    <ul class="meta">
+      <li>主题：连续动作策略 / 跨环境基准</li>
+      <li>关键公式：a = shift + scale·tanh(u)，u ~ N(μ, σ<sup>2</sup>)；比率在 u 上计算</li>
+      <li>预计学时：70 分钟</li>
+      <li>前置章节：第 029 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>实现 tanh 压缩的连续高斯策略，理解为什么 PPO 的比率可以直接在原始高斯变量上计算。</li>
+      <li>把离散/连续两条策略通道统一进同一套采样与更新管道。</li>
+      <li>建立公平的基准测试协议：统一超参、随机基线、确定性评估、按环境设定达标线。</li>
+      <li>用实验数据描述 PPO 在四类控制任务上的能力画像与样本效率差异。</li>
+      <li>理解 on-policy 方法在连续控制上的结构性短板，为第 031 章切换到 SAC 建立动机。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>前面 29 章几乎都围绕 CartPole 展开。它不是终点，真实控制问题（机械臂、无人机、过程控制）的动作是<strong>连续量</strong>。PPO 当然能处理连续动作：把 softmax 换成高斯分布即可。但"能处理"和"处理得好"是两回事：连续任务的状态-动作空间更大、奖励结构更苛刻，on-policy 的样本消耗会暴露得非常彻底。</p>
+    <p>本章做一次系统的能力盘点：同一份 PPO，在四个经典任务上从零训练，每个环境先跑随机策略基线，再看 6 万步能到哪。这既是对第一篇技术积累的检验，也是<strong>为第二篇 SAC 立靶子</strong>：你会亲眼看到 Pendulum 上 PPO 磨蹭到中等水平，MountainCarContinuous 上整轮见不到成功回合，同样的任务，下一章开始的 SAC 会用更少的样本量给出更好的答案。它反映的是两类算法使用数据方式的本质差异，与 PPO 本身的优劣无关。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 连续策略：从 softmax 到高斯</h3>
+    <p>离散动作输出 logits 再 softmax；连续动作输出一个分布的两个参数：均值 μ(s) 与标准差 σ（本章用与状态无关的可学习参数 log_std）：</p>
+    <div class="formula">
+      π(a|s) = N(a; μ<sub>θ</sub>(s), σ<sup>2</sup>)<br>
+      log π(a|s) = −(a−μ)<sup>2</sup>/(2σ<sup>2</sup>) − log σ − ½log(2π)
+    </div>
+    <p>σ 决定探索强度：σ 大则动作分散（探索），σ 小则贴近 μ（利用）。让 σ 可学，等于让算法自己决定探索尺度，但要夹紧取值范围（本章 log_std ∈ [−4, 1]，即 σ ∈ [0.018, 2.7]），否则容易方差爆炸或坍缩到零。</p>
+
+    <h3>2. tanh 压缩与"雅可比相消"</h3>
+    <p>环境动作区间是有限的（Pendulum ±2、MCC ±1）。标准做法是采样原始变量 u，再用 tanh 压缩并仿射到区间：</p>
+    <div class="formula">
+      a = shift + scale · tanh(u)，&nbsp; u ~ N(μ, σ<sup>2</sup>)<br>
+      log π(a) = log N(u) − log|da/du|，&nbsp; log|da/du| = log( scale·(1−tanh<sup>2</sup>(u)) )
+    </div>
+    <p>关键工程技巧：<strong>采样时存原始变量 u，PPO 的比率直接在 u 的高斯密度上计算</strong>。因为压缩映射 a = f(u) 与 θ 无关，比率为 r = π<sub>new</sub>(a)/π<sub>old</sub>(a) = N<sub>new</sub>(u)/N<sub>old</sub>(u)，雅可比项在除法中整体相消。实现上既不用做 log 概率的反向修正，也不引入"边界样本梯度有偏"的问题。熵项则用基础高斯熵做近似（tanh 压缩后的熵没有闭式解），作为探索奖励足够用。</p>
+
+    <h3>3. 四个环境的能力画像</h3>
+    <ul>
+      <li><strong>CartPole-v1</strong>：离散、稠密奖励、500 步上限，PPO 的主场，一直稳；</li>
+      <li><strong>Acrobot-v1</strong>：离散、每步 −1、成功判定是摆过头顶（约 −100 分内完成），探索难度中等；</li>
+      <li><strong>Pendulum-v1</strong>：连续、每步负的"角度²+角速度²+力矩²"、优秀策略约 −200～−150，奖励稠密但精度要求高；</li>
+      <li><strong>MountainCarContinuous-v0</strong>：连续、只有到达目标才给 +100，其余是 −0.1·a²，稀疏成功信号 + 需要蓄力摆动，是 on-policy 方法的著名苦手。</li>
+    </ul>
+
+    <h3>4. 基准协议与读表方式</h3>
+    <p>四类任务的回报量纲完全不同，<strong>不能直接横向比较分数</strong>。本章协议：① 每环境先用随机策略跑基线（回答"任务从零开始有多难"）；② 统一网络规模与超参数；③ 达标线按任务设定（CartPole 475 / Acrobot −110 / Pendulum −300 / MCC 90）；④ 评估用确定性动作（离散 argmax、连续 tanh(μ)）。看表时关注三件事：相对随机基线的提升幅度、首达达标线的步数、以及"整轮未达标"的任务，第三项最有信息量。</p>
+
+    <h3>5. 数值算例：比率算在 u 上还是 a 上</h3>
+    <p>设动作 1 维、scale=2（对应 Pendulum 的力矩区间 ±2），行为策略标准差 σ=0.5（log_std≈−0.693），均值从旧策略的 μ<sub>old</sub>=0.3 更新到新策略的 μ<sub>new</sub>=0.6。一次采样得到两个候选原始变量 u=1.0 与 u=2.0。高斯对数密度为 −(x−μ)<sup>2</sup>/(2σ<sup>2</sup>) − log σ − ½log 2π，其中常数项 ½log 2π≈0.9189，log 0.5≈−0.6931。逐项代入，得到两种实现的对数概率与比率：</p>
+    <table>
+      <tr><th>采样 u</th><th>压缩动作 a=tanh(u)</th><th>logN(u)，μ=0.3</th><th>logN(u)，μ=0.6</th><th>正确比率 N<sub>new</sub>(u)/N<sub>old</sub>(u)</th><th>错误比率 N<sub>new</sub>(a)/N<sub>old</sub>(a)</th><th>比率相对误差</th></tr>
+      <tr><td>1.0</td><td>0.7616</td><td>−1.2058</td><td>−0.5458</td><td>1.9348</td><td>1.4534</td><td>24.9%</td></tr>
+      <tr><td>2.0</td><td>0.9640</td><td>−6.0058</td><td>−4.1458</td><td>6.4237</td><td>1.8531</td><td>71.2%</td></tr>
+    </table>
+    <p>读表得到两条结论。<strong>（1）</strong>把压缩后的 a 直接喂给以 μ、σ 为参数的高斯密度，等于把 tanh 的输出当作原始变量来评估，log 概率整体偏移：u=1.0 时比率被低估 24.9%，u=2.0 时低估 71.2%。<strong>（2）</strong>误差随 |u| 增大而放大，因为 tanh 在尾部压得最狠：u 从 1.0 翻倍到 2.0，a 只从 0.7616 挪到 0.9640；越靠近动作边界的样本，两种实现的评估点错位越明显。Pendulum 里接近 ±2 的饱和力矩恰是决定摆能否稳定在顶部的关键动作，而这类样本正是错误实现歪曲得最严重的一批；裁剪系数 0.2 又把这些失真比率大部分挡在区间之外，真实更新方向被进一步覆盖。这就是本章坚持"buffer 存 u、比率算 u"的定量理由。</p>
+
+    <h3>6. 参数边界：log_std 夹在 [−4, 1] 会发生什么</h3>
+    <p>夹紧后的标准差活动范围是 [e<sup>−4</sup>, e<sup>1</sup>]≈[0.0183, 2.7183]，两端各对应一种失效姿态。<strong>下端 σ=0.0183</strong>：采样噪声幅度约 0.018×2≈0.037（力矩单位），探索事实上停止；若策略此时陷入局部行为（Pendulum 里常见的"在某侧来回晃动"），熵正则系数 0.01 给出的推力不足以让它重新铺开，最终评估停在 −400 一线。<strong>上端 σ=2.7183</strong>：u 的采样几乎必然落在 |u|&gt;2，经 tanh 后动作长期贴住 ±2 边界，策略退化成"左右满力矩"的开关式控制；tanh 在 |u|=2 处的斜率只有 1−0.9640<sup>2</sup>≈0.0707，比中段的 1 小一个数量级，再乘 scale=2，有效梯度乘子约 0.141，学习信号被压得很弱。</p>
+    <p>还有一处实现细节值得记住：夹紧作用在构造分布的那一刻，log_std 参数本身可以漂到区间外且没有直接惩罚，梯度在边界外为零，等价于一堵软墙，参数只会停住、不会被弹回。日志里可以据此做健康检查：基础高斯熵为 log σ + 1.4189，初始化 σ=1 时约 1.419；若熵长期贴着这个值不动，先看 log_std 是否已经顶到 [−4, 1] 的两端。</p>
+
+    <h3>7. 达标线的物理含义：两个连续任务的数值拆解</h3>
+    <p><strong>Pendulum</strong> 单步奖励为 −(θ<sup>2</sup> + 0.1θ̇<sup>2</sup> + 0.001u<sup>2</sup>)，其中 θ 是偏离竖直的夹角（弧度）、θ̇ 是角速度、u 是力矩。最坏情形 θ=π、θ̇=8、u=2 时单步约 −16.27；每回合固定 200 步。把达标线 −300 折算到每步是 −1.5；若角速度与力矩接近零，等价于长期保持 |θ|≤√1.5≈1.22 弧度（约 70°）。优秀策略的 −150 对应每步 −0.75，即平均偏差约 50°。这说明 Pendulum 的成绩提升主要来自"把大幅摆动压下去"，末段几十度的高精度稳定才是真正难的部分，也解释了为什么学到 −300 附近的策略再进一步会非常缓慢。</p>
+    <p><strong>MountainCarContinuous</strong> 的成功回合奖励为 100 − 0.1Σa<sup>2</sup>，要拿到 90 分，全回合油门平方和必须不超过 100。若某策略平均油门平方为 0.4，则必须在 250 步内把车送上目标；随机动作的平均油门平方约 1/3（均匀分布下 E[a<sup>2</sup>]=1/3），999 步截断的随机基线约 −33.3，与实测约 −35 的量级一致。达标 90 与随机 −35 之间不是分数上的差距，属于"会不会做任务"的定性差距：成功需要掌握"先反向蓄力、再借势冲坡"的节奏，而 +100 的信号只在最后一步出现，信用分配要跨过数百步。on-policy 每批数据只过一次，在这种长链条稀疏任务上吃亏最重。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+
+    <h3>模块划分</h3>
+    <table>
+      <tr><th>组件</th><th>职责</th><th>与第 029 章的关系</th></tr>
+      <tr><td><code>ENV_SPECS</code></td><td>四环境的动作类型、达标线、回报说明</td><td><strong>新增</strong>：基准测试的元数据</td></tr>
+      <tr><td><code>DiscreteActorCritic</code></td><td>原离散策略（softmax）+ 确定性 argmax</td><td>沿用并统一接口</td></tr>
+      <tr><td><code>ContinuousActorCritic</code></td><td>高斯策略 + tanh 压缩 + log_std 参数 + 确定性 tanh(μ)</td><td><strong>新增</strong>：连续控制核心</td></tr>
+      <tr><td><code>build_net</code></td><td>按 <code>action_space</code> 类型创建网络</td><td><strong>新增</strong>：策略分派</td></tr>
+      <tr><td><code>collect_rollout</code></td><td>统一缓存"采样值"（离散 id / 连续原始 u）</td><td><strong>改造</strong>：连续分支</td></tr>
+      <tr><td><code>ppo_update</code></td><td>离散用 Categorical、连续用 Normal(u) 计算比率与熵</td><td><strong>扩展</strong>：双分支</td></tr>
+      <tr><td><code>random_baseline</code></td><td>随机策略的独立基线测分</td><td><strong>新增</strong>：公平参照系</td></tr>
+      <tr><td><code>run_env</code></td><td>单环境完整流程与基准条目</td><td><strong>改造</strong>：从"臂"到"环境条目"</td></tr>
+    </table>
+
+    <h3>关键超参数</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用与取值理由</th></tr>
+      <tr><td><code>--envs</code></td><td>四个环境全跑</td><td>覆盖离散→连续的难度梯度</td></tr>
+      <tr><td><code>--max-steps</code></td><td>60000（每环境）</td><td>统一预算；CartPole 会提前停，未达标的任务跑满</td></tr>
+      <tr><td><code>--hidden</code></td><td>64</td><td>与前文一致的小网络，保证跨环境公平</td></tr>
+      <tr><td>log_std 夹紧</td><td>[−4, 1]</td><td>σ ∈ [0.018, 2.7]，防止方差爆炸/坍缩</td></tr>
+      <tr><td>达标线</td><td>475 / −110 / −300 / 90</td><td>按任务设定，"未达标"也是结论</td></tr>
+      <tr><td><code>--random-episodes</code></td><td>5</td><td>基线用少量回合即可，评分主要看数量级</td></tr>
+    </table>
+
+    <h3>数据流</h3>
+    <p>每个环境：<strong>随机基线</strong>（独立环境、随机动作）→ <strong>建网络</strong>（按动作空间类型分派）→ <strong>训练循环</strong>：采样（连续分支存 u、离散分支存 id）→ PPO 更新（双分支算 logp 与熵）→ 达标早停 → <strong>确定性评估</strong>。四个环境跑完汇总成一张基准表；"未达成"的行恰好构成切换到 SAC 的直接论据。</p>
+
+    <h3>预算折算与早停口径</h3>
+    <p>默认预算 6 万步按固定节奏切分：每轮先采样 <code>steps-per-update</code>=2048 步，再跑 10 个 epoch，每 epoch 把 2048 条数据切成 32 个大小 64 的小批量。折算下来每轮更新做 320 次梯度下降，6 万步约 29 轮采样-更新循环（29×2048=59392，尾数不足一轮），全实验梯度下降次数在 9300 次左右。日志每 10 轮打印一行，即大约在 2048、20480、40960、59392 步处能看到四行；如果某环境没到四行就结束，说明提前达标或步数用完。</p>
+    <p>早停条件是"已完成至少 100 个回合，且最近 100 回合均值不低于达标线"。100 回合这个下限决定了达标的最短路径：CartPole 单回合上限 500 步，最理想情形要 5 万步左右才凑满窗口，而早期回合很短（随机策略活不过二三十步），窗口凑满的步数会明显小于 5 万步，这也解释了实测中 3 到 5 万步达标的原因。Pendulum 单回合固定 200 步，6 万步约 300 个回合；MountainCarContinuous 单回合上限 999 步，多数回合因能量不足被截断，窗口攒得慢且均值离 90 很远，整轮实验最容易停在"未达成"。</p>
+
+    <h3>与第 029 章的差异点</h3>
+    <ul>
+      <li><strong>策略维度</strong>：从单一离散策略扩展到离散/连续双通道，接口统一为 <code>act()</code>。</li>
+      <li><strong>存储约定变化</strong>：连续任务存"原始 u"（不存压缩后的动作），让比率计算保持无偏。</li>
+      <li><strong>实验单元变化</strong>：从"同一任务的配置对比"变成"跨任务的能力盘点"，多了随机基线与每环境达标线。</li>
+      <li><strong>结论指向</strong>：第一次把"on-policy 样本效率"从口号变成四行数据。</li>
+    </ul>
+
+    <div class="box key">
+      <span class="box-title">比率到底算在哪个变量上</span>
+      <p>连续策略的 PPO 实现里，最核心的约定是：<strong>buffer 里存的是原始高斯变量 u，不是压缩后的动作 a</strong>。更新时用同一组 μ、σ 对 u 重算 log 概率，比率天然无偏；如果把 a 存进 buffer 再算 <code>Normal(μ,σ).log_prob(a)</code>，就漏掉了 tanh 的雅可比修正，|a| 接近边界的样本梯度会系统性失真，这是连续控制实现里最经典的一个坑。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：连续网络，分布、压缩与采样</strong></p>
+    <pre class="code"><code>    def distribution(self, obs: torch.Tensor) -&gt; Normal:
+        """基础高斯分布；log_std 夹在 [-4, 1]，避免方差坍缩或爆炸。"""
+        mu, _ = self.forward(obs)
+        # 夹紧放在"构造分布"这一步：参数本身可自由漂移，梯度在边界外自然为零
+        std = torch.exp(self.log_std.clamp(-4.0, 1.0)).expand_as(mu)
+        return Normal(mu, std)
+
+    def to_action(self, u: torch.Tensor) -&gt; torch.Tensor:
+        """把原始高斯变量 u 压缩到动作区间。"""
+        return self.act_shift + self.act_scale * torch.tanh(u)
+
+    @torch.no_grad()
+    def act(self, obs_t):
+        """返回 (原始 u, 环境动作, logp, 价值)；u 进 buffer，动作进环境。"""
+        dist = self.distribution(obs_t)
+        u = dist.sample()
+        logp = dist.log_prob(u).sum(-1)       # 对多维动作的联合 log 概率求和
+        action = self.to_action(u)
+        action_np = action.squeeze(0).cpu().numpy().astype(np.float32)
+        return u.item(), action_np, logp.item(), 0.0</code></pre>
+    <p>解读：三个方法拼出连续策略的完整采样路径。<strong>（1）</strong><code>distribution()</code> 里 <code>clamp(-4.0, 1.0)</code> 的位置很有讲究：夹紧作用在<strong>构造 std 的那一刻</strong>，而 <code>log_std</code> 参数本身可以自由漂移，漂到界外时梯度自然为零，等价于"软墙"。<strong>（2）</strong><code>to_action</code> 是确定性的仿射+tanh 映射，<code>act_shift / act_scale</code> 由动作空间边界算出并注册为 buffer（跟着模型保存、不参与训练）。<strong>（3）</strong><code>act()</code> 的返回值是本章最重要的接口设计：第一个元素返回<strong>原始 u</strong>，压缩后的动作走第二个返回值；buffer 存 u 是"雅可比相消"成立的前提；多维动作时 logp 用 <code>.sum(-1)</code> 合成联合密度。</p>
+
+    <p><strong>片段 2：collect_rollout，两种策略共用一条通道</strong></p>
+    <pre class="code"><code>    for _ in range(steps):
+        sample, action, logp, v = net.act(obs_t)     # 离散=动作id，连续=原始u
+        next_obs, r, terminated, truncated, _ = env.step(action)
+
+        obs_buf.append(obs_t.squeeze(0).cpu().numpy())
+        act_buf.append(sample)          # 离散：动作 id；连续：原始 u（比率基准）
+        logp_buf.append(logp)
+        rew_buf.append(r)
+        val_buf.append(v)
+        term_buf.append(float(terminated))   # 只有真终止切断 bootstrap
+
+        ep_ret += r
+        obs_t = to_tensor(next_obs, device)
+        obs_after = obs_t
+        if terminated or truncated:
+            ep_returns.append(ep_ret)
+            ep_ret = 0.0
+            reset_obs, _ = env.reset()
+            obs_t = to_tensor(reset_obs, device)
+
+    last_value = net.value(obs_after)
+    advantages, returns = compute_gae(rew_buf, val_buf, term_buf, last_value, gamma, lam)
+
+    act_dtype = torch.long if discrete else torch.float32   # 离散存长整型、连续存浮点
+    batch = {
+        "obs": torch.as_tensor(np.asarray(obs_buf), dtype=torch.float32, device=device),
+        "act": torch.as_tensor(np.asarray(act_buf), dtype=act_dtype, device=device),
+        "logp_old": torch.as_tensor(np.asarray(logp_buf), dtype=torch.float32, device=device),
+        "adv": torch.as_tensor(advantages, dtype=torch.float32, device=device),
+        "ret": torch.as_tensor(returns, dtype=torch.float32, device=device),
+    }</code></pre>
+    <p>解读：采样循环与之前章节几乎相同，差异全部被吸收进"元组语义"和数据类型两处。<strong>（1）</strong><code>sample, action, logp, v = net.act(obs_t)</code>：第一个返回值是"进 buffer 的采样值"，第二个是"进环境的动作"，离散任务两者相同，连续任务前者是 u 后者是压缩动作。采样函数把差异隔离干净，<code>collect_rollout</code> 本体无需分支。<strong>（2）</strong><code>act_dtype</code> 一行让同一份 batch 组装代码服务两种策略：离散动作需要 <code>torch.long</code>（Categorical 索引），连续 u 需要浮点。写错 dtype 的报错通常很隐蔽，这行是必要的护栏。<strong>（3）</strong>GAE 与 bootstrap 逻辑原样保留：段尾用当前网络估值、<code>terminated</code> 才切断，连续任务里截断同样要 bootstrap。</p>
+
+    <p><strong>片段 3：ppo_update，双分支更新</strong></p>
+    <pre class="code"><code>        for start in range(0, N, args.batch_size):
+            mb = idx[start:start + args.batch_size]
+            if discrete:
+                logits, value = net(obs[mb])
+                dist = Categorical(logits=logits)
+                logp = dist.log_prob(act[mb])
+                entropy = dist.entropy().mean()
+            else:
+                dist = net.distribution(obs[mb])
+                _, value = net(obs[mb])
+                logp = dist.log_prob(act[mb]).sum(-1)   # act 里是原始 u
+                entropy = dist.entropy().sum(-1).mean() # 基础高斯熵（近似）
+
+            ratio = torch.exp(logp - logp_old[mb])
+            surr1 = ratio * adv[mb]
+            surr2 = torch.clamp(ratio, 1.0 - args.clip, 1.0 + args.clip) * adv[mb]
+            policy_loss = -torch.min(surr1, surr2).mean()
+            value_loss = F.mse_loss(value, ret[mb])
+            loss = policy_loss + args.vf_coef * value_loss - args.ent_coef * entropy
+
+            optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(net.parameters(), 0.5)
+            optimizer.step()</code></pre>
+    <p>解读：更新的骨架与 001 章完全一致，只有分布构造分了两条路。<strong>（1）</strong>连续分支用 <code>net.distribution(obs[mb])</code> 重新构造当前策略的 Normal，再用 buffer 里存的 u 计算 <code>log_prob</code>，比率 r = N_new(u)/N_old(u)，雅可比项在除法中相消，无需任何修正。<strong>（2）</strong>熵用<strong>基础高斯熵</strong>（未压缩版本）的近似：tanh 压缩后的熵没有闭式解，用基础高斯熵当探索奖励在工程上足够，且量纲稳定。<strong>（3）</strong>多维动作的 logp 与熵都要 <code>.sum(-1)</code>：把各维的联合密度合成一个标量，才能与优势相乘。<strong>（4）</strong>其余部分，裁剪、价值回归、梯度裁剪，一字未改，证明"连续扩展"只是一次策略层的局部手术。</p>
+
+    <p><strong>片段 4：random_baseline，先知道"从零有多难"</strong></p>
+    <pre class="code"><code>def random_baseline(env, episodes):
+    """随机策略基线：回答"一个什么都不学的智能体能拿多少分"。"""
+    returns = []
+    for _ in range(episodes):
+        obs, _ = env.reset()
+        done = False
+        ep_ret = 0.0
+        while not done:
+            action = env.action_space.sample()    # 均匀随机动作（离散/连续通用）
+            obs, r, terminated, truncated, _ = env.step(action)
+            ep_ret += r
+            done = terminated or truncated
+        returns.append(ep_ret)
+    return float(np.mean(returns))</code></pre>
+    <p>解读：基线函数很短，但它是整张基准表可读性的前提。<strong>（1）</strong><code>env.action_space.sample()</code> 对离散与连续动作空间都适用（Discrete 均匀抽整数、Box 均匀抽区间浮点），一行覆盖两类任务。<strong>（2）</strong>基线用<strong>独立的环境实例</strong>测量（<code>run_env</code> 里新建 <code>base_env</code>）：随机交互几百步会把环境状态搅乱，绝不能污染随后训练的正式环境。<strong>（3）</strong>它在实验里的作用不是"必须超过"，MountainCarContinuous 的随机基线约 −35，而达标线是 90，这意味着"看起来比随机好很多的 −25 分"其实离任务目标十万八千里。没有基线，你会被回报数字的相对大小欺骗；有了它，<strong>"相对提升"与"绝对达标"两种口径的差距</strong>就暴露在表里，这正是 PPO 在 MCC 上彻底失手（相对提升巨大、绝对达标为零）的直接证据。</p>
+
+    <p>完整可运行脚本（附录）：<a href="../code/ch030.py" download>code/ch030.py</a></p>
+    <pre class="sh"><code>python code/ch030.py            # 四环境各 6 万步：CPU 约 4–8 分钟
+python code/ch030.py --quick    # 快速跑通：40–80 秒
+python code/ch030.py --envs Pendulum-v1 --max-steps 150000   # 单独把 Pendulum 跑久一点</code></pre>
+    <p>以实跑为准：<strong>CartPole 每次都能在 3～5 万步内达标（评估 480+）</strong>；<strong>Acrobot 6 万步大多摸到 −120 一线但滑窗达标要碰运气</strong>；<strong>Pendulum 大多停在 −300～−180，整轮难稳定越过达标线</strong>；<strong>MountainCarContinuous 通常整轮跑不出成功回合</strong>（近 100 均值在 −40～0 徘徊）。这四条画像就是切换到 SAC 的直接动机。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>对压缩后的动作直接算 log 概率</strong>：漏掉 tanh 的雅可比项，靠近边界的样本梯度有偏。<strong>修复</strong>：比率在原始高斯变量 u 上计算、雅可比整体相消。</li>
+      <li><strong>log_std 不夹紧</strong>：作为可学习参数，它会朝极端漂移，σ→0 时策略失去探索、σ 巨大时梯度被噪声淹没。<strong>修复</strong>：在分布构造处 clamp（本章 [−4, 1]）。</li>
+      <li><strong>评估时仍采样动作</strong>：连续任务评估必须用 tanh(μ) 的确定性动作，否则评估方差大、分数偏低，误判"学得差"。</li>
+      <li><strong>跨环境直接比较原始回报</strong>：−200 分在 Pendulum 是及格线，在 CartPole 是不可想象的灾难。<strong>修复</strong>：比较用"相对随机基线的提升"或"是否达成本任务的标线"。</li>
+      <li><strong>基线环境与训练环境共用实例</strong>：随机若干回合后环境状态与统计都被打乱，训练起点不再干净。<strong>修复</strong>：基线和训练各用独立实例。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把 <code>log_std</code> 的初始化从 0（σ=1）改成 −1（σ≈0.37）与 0.5（σ≈1.65）各跑一次 Pendulum，观察早期探索与最终评估的变化。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>改 <code>ContinuousActorCritic</code> 里 <code>nn.Parameter(torch.zeros(act_dim))</code> 的初始值（或加 <code>--init-log-std</code> 参数）。σ 太小早期几乎不探索，σ 太大力矩全是噪声。</div></details>
+      </li>
+      <li>在 Pendulum 上把 <code>--gamma</code> 分别设为 0.9 / 0.99 / 0.995，解释折扣因子如何影响连续控制的学习难度与偏置。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>Pendulum 是"尽快到达竖直向上并保持"的问题；γ 太小会让价值低估长期摆动的收益，评估回报明显变差。</div></details>
+      </li>
+      <li>实现"错误版本"的连续 logp 对照：采样时把压缩后的动作 a 存起来，更新时直接用 <code>Normal(μ, σ).log_prob(a)</code> 计算比率（不加雅可比修正），与当前实现在 Pendulum 上各跑 3 万步，对比 KL、裁剪比例与回报。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>改动点：<code>collect_rollout</code> 保存 <code>action</code>（替换当前的 <code>u</code>）；更新时 logp 用动作值算。思考为什么在 |a| 接近边界时这个比率会失真。</div></details>
+      </li>
+      <li>给 Acrobot 和 Pendulum 做一次"效率对照"：分别记录达到各自最优水平的 80%（Acrobot −160、Pendulum −350）所需的步数，用第 027 章的口径写进表格，说明两种任务对 PPO 的难度差。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>在 <code>run_env</code> 里记录滑窗首次跨过阈值的步数；注意两个阈值都是"中途水平"，作为相对难度的代理指标。</div></details>
+      </li>
+      <li>把 MountainCarContinuous 的奖励改造一下：额外加"离目标越近奖励越多"的塑形项（如 <code>−0.1×(goal_pos − position)</code>），重跑并观察 PPO 是否能成功。讨论塑形奖励的收益与风险。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>用 <code>gym.make</code> 传入 <code>max_episode_steps=999</code> 后通过 <code>env.unwrapped</code> 读位置，或直接包装 <code>step</code> 改写奖励。回忆第 020 章的稀疏奖励处理：塑形是双刃剑，可能改变最优策略。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>连续策略 = 高斯输出 + tanh 压缩；把比率算在原始高斯变量 u 上，雅可比项相消，实现简单且无偏。</li>
+      <li>公平基准 = 统一网络与超参 + 随机基线 + 确定性评估 + 每任务达标线；原始回报不可跨任务比较。</li>
+      <li>PPO 四任务画像：CartPole 轻松达标、Acrobot 接近达标、Pendulum 勉强中等、MountainCarContinuous 基本无所作为。</li>
+      <li>连续控制上的短板来自 on-policy 的结构性问题：每份数据只用一遍；任务本身可以学会，但样本效率瓶颈靠调参无法根治。</li>
+      <li>PPO 篇到此收束。下一章开始第二篇：SAC 在 Pendulum 上的首次实现，离策略、经验回放、双 Q 与自动温度，用同一块试验田对比两种范式的样本效率。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch029.html">← 第 029 章：PPO的自动超参数搜索</a>
+    <a class="next" href="ch031.html">第 031 章：SAC在Pendulum上的首次实现 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

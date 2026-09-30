@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第076章 实现策略蒸馏 | 机器人仿真学习课程 · Isaac Sim 强化学习训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第四篇 · 控制与优化</span>
+    <span class="sep">/</span>
+    <span>第 076 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第四篇 · 控制与优化</div>
+    <h1>第 076 章：实现策略蒸馏</h1>
+    <p class="lead">把"看得见地形图的大老师"压成"只有本体感觉的小学生"：本章讲清特权学习、KL 蒸馏与 DAgger 式状态聚合，训出能上真机的小策略。</p>
+    <ul class="meta">
+      <li>主题：策略压缩 / 师生蒸馏</li>
+      <li>相关组件：Isaac Sim / Isaac Lab / PyTorch / TorchScript 导出</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 075 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>说清策略蒸馏的三类动机：算力压缩、观测不对称（特权信息）、多策略统一，并区分"同构蒸馏"与"特权蒸馏"。</li>
+      <li>理解 KL 蒸馏的损失与温度的作用（软标签里的"暗知识"），并能对确定性教师退化为 MSE。</li>
+      <li>掌握特权学习范式：教师看地形/摩擦/接触力，学生只看可部署传感器，学生用"行为"感知世界。</li>
+      <li>会实现 DAgger 式循环：学生跑轨迹 → 教师贴标签 → 聚合训练，解决分布偏移。</li>
+      <li>会导出 TorchScript/ONNX 并量化评估：与教师的性能差、推理延迟下降幅度。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>前十四章你已经能训练出很强的策略。但"很强"和"能上机"是两件事：步行策略的教师常被设计成<strong>看得见特权信息</strong>的，地形高度扫描、地面摩擦系数、接触力真值，这些在真机上要么没有、要么很贵。另一个常见场景是算力：教师是 4096 环境里训练出来的多头集成大网络，真机上的工控机要求单次推理 2 ms 以内。</p>
+    <p>策略蒸馏（policy distillation）把知识从"大/特权"迁移到"小/可部署"：学生网络的输入只有真机可得的观测，输出逼近教师的动作分布。最容易被低估的难点是<strong>分布偏移</strong>：学生在自己的状态下会犯教师没教过的错误，误差像第 075 章 BC 一样复合增长。因此标准解法是 DAgger 式闭环：让学生跑、让教师在其状态上纠正。本章把 Matlab 都不用打开的朴素版本和工程改良版本都讲清楚，最后落一条"教师训练 → 学生蒸馏 → 导出验证"的完整流水线。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 蒸馏的三种动机与两种模式</h3>
+    <table>
+      <tr><th>动机</th><th>教师</th><th>学生</th></tr>
+      <tr><td>算力压缩</td><td>大网络/集成</td><td>小 MLP，推理 &lt;2 ms</td></tr>
+      <tr><td>观测不对称（特权蒸馏）</td><td>本体 + 扫描/摩擦/接触力</td><td>仅本体（+历史）</td></tr>
+      <tr><td>多策略统一</td><td>每任务一个专家</td><td>一个网络全任务</td></tr>
+    </table>
+    <p>同构蒸馏（输入相同、压缩容量）主要是拟合问题；<strong>特权蒸馏</strong>才是机器人领域的重头戏：教师借助特权信息成为了"先知"，学生必须从本体感觉的时序里推断出教师已知的东西，例如从关节的受力历史推断地形坡度，形成"以行为感知"（proprioceptive terrain perception）的能力。</p>
+
+    <h3>2. KL 蒸馏与温度：软标签为什么更值钱</h3>
+    <p>对随机策略教师，经典蒸馏损失是学生对教师分布的 KL 散度（或在状态分布上的期望）：</p>
+    <div class="formula">
+      L = E<sub>s~D</sub> [ Σ<sub>a</sub> π<sub>T</sub>(a|s) · log( π<sub>T</sub>(a|s) / π<sub>S</sub>(a|s) ) ] = E<sub>s</sub>[ KL( π<sub>T</sub> ‖ π<sub>S</sub> ) ]
+      <span class="note">等价于最小化交叉熵 E[−log π_S(a|s)]，目标动作按 π_T 加权（软标签）</span>
+    </div>
+    <p>为什么要用完整的动作分布？因为分布本身携带"暗知识"：教师在某状态下对向左 0.4、向右 0.6 的犹豫，学生若只知道"教师选了右"，就丢失了"两者接近"的信息，而这恰恰是稳健性来源。对<strong>确定性教师</strong>（输出均值、方差固定很小），KL 退化为动作上的加权 MSE，这是机器人实践里最常用的形式；温度 T 对连续动作的软化作用有限，本章以 MSE 型为主、分布型作为进阶选项。</p>
+
+    <h3>3. 分布偏移：学生在教师没走过的状态上提问</h3>
+    <p>朴素蒸馏的流程是：收集教师状态 → 监督训练学生。问题同 BC：学生自己的状态分布与教师的不同，一旦偏离，学生错误会在自身上被放大（第 075 章的复合误差，O(εT²)）。<strong>DAgger 的解药：数据集要包含学生自己访问的状态</strong>。循环变成：</p>
+    <div class="formula">
+      D ← D ∪ { (s, π<sub>T</sub>(s)) | s ~ 学生轨迹 }　（学生跑、教师标注）
+    </div>
+    <p>这保证了数据集覆盖"学生实际会到达的状态"，学生在这里接受纠正；理论上把复合误差压回线性量级。工程实现上还有两个细节：<strong>教师标签要在学生状态上问</strong>（教师对任何输入都能输出，这正是它的价值）；<strong>闭环可以迭代多轮</strong>，每轮用新的学生重新采样。典型 3–5 轮后收益饱和。</p>
+
+    <h3>4. 容量落差的处理</h3>
+    <p>学生比教师小，天然存在<strong>容量落差</strong>：即使有无限数据，学生也未必能完美复现教师。处理方式有三：<strong>一，允许学生超越教师</strong>，蒸馏后期（或混合训练中）加入少量任务奖励的 RL 微调，让学生的目标从"像教师"变成"做好任务"，避免学生被别人能力的上限锁死；<strong>二，聚焦关键状态</strong>，对任务成功率影响大的状态加权（如接触瞬间），把有限容量用在刀刃上；<strong>三，别选过小的学生</strong>，容量与加速度、内存的账要算：159k 参数的 MLP 在工控机上推理 0.3 ms，再压到 10k 参数只省 0.2 ms，却可能损失 10% 性能，不划算。经验法则：学生参数量取教师可部署约束下的上限，不要压到下限。</p>
+
+    <h3>5. 评估：三组对照 + 延迟实测</h3>
+    <p>验收必须有两组对照和一项实测：<strong>教师性能</strong>（蒸馏的参照系）、<strong>学生性能</strong>（在同样的评测协议下）、<strong>纯模仿学生</strong>（不做 DAgger/微调，用它证明增量手段的贡献）；以及<strong>延迟实测</strong>（学生推理 P95 值、占用显存/内存、目标设备上的真实吞吐）。性能差距的验收线因任务而异：步态类任务学生掉 5–10% 常可接受，精细操作类要求 &lt;5%。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>以四足机器人为例：教师看 48 维本体 + 187 维地形扫描 + 3 维接触状态；学生只用 48 维本体 + 最近 10 帧历史（480 维），用"历史"补"感受"。流程五步：</p>
+    <ol>
+      <li><strong>训练教师</strong>：PPO 在随机地形上训练，观测含特权信息；教师保存为确定性均值网络 + 可学习 log_std（蒸馏时只取均值）。</li>
+      <li><strong>第一轮采样</strong>：教师策略跑 2000 条轨迹（覆盖随机地形与推挤），存 (s<sub>student_可部署obs</sub>, a<sub>teacher</sub>)。注意：存<strong>学生侧的观测</strong>（含历史）；教师侧的特权观测不进这份数据。</li>
+      <li><strong>监督训练学生</strong>：MSE(a<sub>S</sub>, a<sub>T</sub>)，Adam 3e-4，早停在留出轨迹上；学生结构 MLP 3×256（历史输入用 1D 卷积或直接展平，视延迟预算定）。</li>
+      <li><strong>DAgger 循环 ×3</strong>：学生跑 2000 条轨迹 → 教师对学生状态逐帧标注 → 新数据并入训练集 → 重训学生；每轮报告学生在"学生轨迹集"上的 MSE 与成功率。</li>
+      <li><strong>混合微调（可选）</strong>：加 10% 权重的 RL 微调，让学生在同任务上超越纯模仿曲线；导出 TorchScript，测延迟与内存，最后上机做第 065 章的接口对齐检查。</li>
+    </ol>
+    <div class="box key">
+      <span class="box-title">设计思维：学生输入里的"历史帧"为什么有效？</span>
+      <p>地形坡度、载荷重量这类信息会通过关节角与速度的时序留下特征标识：上坡时髋部角速度的均值偏移、打滑时足端速度与预期不符。给学生的历史窗口就是让网络学习这些特征标识，本质是让"本体感觉的过去"充当"外部感知的替代品"。历史长度 0.3–0.5 s（18–30 帧 @60 Hz）是常见选择：太短学不出趋势，太长既增加延迟（历史本身有陈旧问题）又增加输入维度。第 062 章 Transformer 在这里正好是大杀器：对 20 帧历史做注意力编码，比 MLP 展平更适合抽取这类时序特征。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：蒸馏损失，KL 与确定性 MSE 的统一</strong></p>
+    <pre class="code"><code>import torch
+import torch.nn.functional as F
+
+def distillation_loss(student_out, teacher_out, mode="mse", temperature=1.0):
+    """学生蒸馏损失：随机教师用 KL，确定性教师用 MSE；连续动作的默认选择。"""
+    if mode == "mse":
+        mu_s = student_out["mu"]
+        mu_t = teacher_out["mu"].detach()      # 教师只做目标：梯度绝不回流到教师
+        return F.mse_loss(mu_s, mu_t)
+    # KL 模式（随机教师）：把策略切到 eval 之外，温度作用在 logits 上
+    logp_s = F.log_softmax(student_out["logits"] / temperature, dim=-1)
+    logp_t = F.log_softmax(teacher_out["logits"] / temperature, dim=-1)
+    kl = (logp_t.exp() * (logp_t - logp_s)).sum(dim=-1).mean()
+    return kl * (temperature ** 2)             # 温度平方缩放：让梯度尺度不随 T 漂移
+
+
+def dagger_batch_loss(student, teacher, obs_student, agg_weight=None):
+    """DAgger 单批损失：学生自己的状态 + 教师标签；可选按状态重要性加权。"""
+    s_out = student(obs_student)
+    with torch.no_grad():
+        t_out = teacher(obs_student)           # 教师"远程批改"：对学生到达的状态打分
+    loss = distillation_loss(s_out, t_out, mode="mse")
+    if agg_weight is not None:                 # 关键状态（如接触瞬间）加权
+        loss = (loss * agg_weight).mean() if loss.dim() == 0 else loss.mean()
+    return loss</code></pre>
+    <p>解读：<strong><code>teacher_out["mu"].detach()</code></strong> 是两行里最重要的保险：蒸馏里教师是被学习对象，不能进入被优化的参数集；忘了 detach 会把梯度写进教师（当两者共享模块时静默生效，非常难查）。KL 模式的温度平方项是标准做法（Hinton 蒸馏）：它让损失对 logits 的梯度尺度不随 T 变化，方便跨温度复用学习率。MSE 对连续动作是有道理的简化，当教师方差很小、动作维度又高时，分布型 KL 的大部分信息在均值上，MSE 的稳定性更好、实现更少出错；只在教师确实随机（多模态动作）时才用分布型。<code>dagger_batch_loss</code> 的 <code>agg_weight</code> 参数给重要状态加权留了接口：实践中对"教师动作方差大"的状态（如在悬崖边）加权，学生能更聚焦危险态的纠错。</p>
+
+    <p><strong>片段 2：DAgger 状态聚合循环</strong></p>
+    <pre class="code"><code>import numpy as np
+import torch
+
+class DaggerAggregator:
+    """学生跑轨迹 → 教师标注 → 数据集增长；按学生状态分布覆盖训练。"""
+    def __init__(self, capacity=2_000_000):
+        self.obs = np.zeros((capacity, 480), dtype=np.float32)   # 学生侧历史观测
+        self.label = np.zeros((capacity, 12), dtype=np.float32)  # 教师动作标签
+        self.n = 0
+
+    def add_rollouts(self, env, student, teacher, n_episodes, student_obs_fn):
+        """一轮聚合：学生驱动环境，教师对学生所到状态逐帧贴标签。"""
+        added = 0
+        for _ in range(n_episodes):
+            obs = env.reset()
+            hist = student_obs_fn.reset(obs)      # 学生的历史缓冲（去程时同步维护）
+            done = False
+            while not done:
+                s_student = hist.get()            # 学生实际看到的（含历史）
+                a_teacher = teacher.act_mean(s_student)   # 教师在学生状态上给标签
+                self.obs[self.n] = s_student
+                self.label[self.n] = a_teacher
+                self.n += 1; added += 1
+                a_student = student.act_mean(s_student)   # 动作由【学生】执行
+                obs, _, done, _ = env.step(a_student)     # 数据分布 = 学生分布
+                hist.push(obs)
+        return added
+
+
+def train_on_aggregate(student, data, epochs=20, batch=1024, lr=3e-4):
+    """聚合数据上的监督训练：每轮 DAgger 后重新拟合学生。"""
+    opt = torch.optim.Adam(student.parameters(), lr=lr)
+    for epoch in range(epochs):
+        perm = np.random.permutation(data.n)
+        for i in range(0, data.n, batch):
+            idx = perm[i:i + batch]
+            o = torch.as_tensor(data.obs[idx], device=student.device)
+            a = torch.as_tensor(data.label[idx], device=student.device)
+            loss = torch.nn.functional.mse_loss(student.act_mean(o), a)
+            opt.zero_grad(); loss.backward(); opt.step()
+    return loss.item()</code></pre>
+    <p>解读：循环里最容易被写错的是<strong>分工</strong>：<code>a_teacher</code> 只用于生成标签（不进环境），<code>a_student</code> 才驱动环境，这样产生的状态分布才是学生自己的，DAgger 的修复目标才成立。很多实现图省事让学生只在教师轨迹附近微调（"在演示上再训几轮"），分布偏移并没有被解决，闭环验证时依然掉链子。历史缓冲 <code>hist</code> 必须在"学生执行动作"的节奏上维护：标签与学生观测必须来自同一时刻同一构造过程，任何一步错位都会让数据"看起来像但对不上"。聚合数据 200 万帧 × (480+12) 个 float32 约 3.9 GB，容量到顶时按"旧数据稀疏采样"的方式淘汰，不要把最近一轮的分布丢掉：分布随时间变化，最近的数据最接近当前学生。</p>
+
+    <p><strong>片段 3：导出与延迟实测</strong></p>
+    <pre class="code"><code>import time
+import torch
+
+def export_student(student, example_obs, path="student_ts.pt"):
+    """导出 TorchScript 并校验数值一致性；例：输入 [1, 480] → 动作 [1, 12]。"""
+    student.eval()
+    with torch.no_grad():
+        ref = student.act_mean(example_obs)
+        traced = torch.jit.trace(student.act_mean, example_obs)  # 静态图：部署无 Python
+        traced.save(path)
+        out = traced(example_obs)
+    err = (out - ref).abs().max().item()
+    assert err &lt; 1e-5, f"导出前后不一致：{err}"
+    return path
+
+
+def measure_latency(model, example_obs, n=200, warmup=20, device="cuda"):
+    """延迟实测：必须连同步计时、报告 P95。"""
+    for _ in range(warmup):                    # 预热显存分配与 kernel 编译
+        model(example_obs)
+    if device == "cuda":
+        torch.cuda.synchronize()
+    times = []
+    for _ in range(n):
+        t0 = time.perf_counter()
+        model(example_obs)
+        if device == "cuda":
+            torch.cuda.synchronize()           # GPU 是异步的：不同步计的是"发射时间"
+        times.append((time.perf_counter() - t0) * 1000.0)
+    times.sort()
+    return {"p50_ms": times[n // 2], "p95_ms": times[int(n * 0.95)], "max_ms": times[-1]}</code></pre>
+    <p>解读：部署侧的三个工程点。<strong>数值一致性断言</strong>：TorchScript 的 trace 对动态控制流会静默丢失分支，一致性检查能立刻抓住（同一批输入、输出差应在 1e-5 内）；这是第 065 章同一纪律的复用。<strong>延迟测量必须同步</strong>：GPU 调用是异步的，不同步的 perf_counter 量的是"命令入队时间"（可能只有 0.05 ms），完全不反映真实推理耗时。<strong>看 P95 值</strong>：控制循环按最坏情况设计，P50 0.8 ms、P95 4 ms 的网络在 10 ms 周期里会周期性地迟到。报告表建议同时给出参数量、内存占用与目标工控机上的实测值，仿真机的 GPU 比真机强得多，别用仿真机数字写验收报告。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>教师未 detach 或被连带更新</strong>：蒸馏几轮后教师"退化"，学生也在退化，曲线一起向下。症状是控制台指标诡异地双双下降。修复：教师全部前向用 <code>no_grad</code> + 标签 detach；训练前冻结教师参数并断言。</li>
+      <li><strong>只用教师轨迹训练</strong>：无 DAgger，学生在自己的状态上问不到老师。症状是离线 MSE 很低、闭环成功率只有教师的一半。修复：持续用学生轨迹做每轮聚合，报告"学生轨迹集上的 MSE"；教师轨迹集上的数字会偏乐观。</li>
+      <li><strong>观测口径不一致</strong>：学生输入 480 维（历史）但标签生成时教师看的是教师的观测（无历史、有特权），学生"对不上题目"。修复：标签生成与训练都用学生口径的观测；特权信息只出现在教师训练阶段，永不进入蒸馏的数据接口。</li>
+      <li><strong>容量过小追求"极致轻量"</strong>：学生小到没法编码地形特征，MSE 卡在一个高于验收线的平台。症状是加数据没用、换课程没用。修复：按延迟预算上限选容量，先跑通再压缩；压缩时逐级评估性能-延迟曲线。</li>
+      <li><strong>评测复用教师状态集</strong>：在教师轨迹上评学生，数字好看但闭环性能差。症状是离线指标与上线表现脱节。修复：闭环评测必须由学生驱动环境，且评测协议（地形、随机种子）固定。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>做对照实验：朴素蒸馏（只有教师数据）vs DAgger 三轮，报告各自在闭环成功率上的差距，并解释分布偏移的量级。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>朴素版本的离线 MSE 通常不低于 DAgger 版，但闭环成功率差距明显，这就是"在谁的分布上学习"的差别。</div></details>
+      </li>
+      <li>把学生的历史长度从 0 帧（无历史）增加到 30 帧，观察学生能否补上教师的地形特权信息，找出收益饱和点。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>0 帧时学生应该明显失分；10–20 帧收益陡增；超过 30 帧后增益变小且输入维度负担上升。</div></details>
+      </li>
+      <li>给学生加 10% 权重的 RL 微调（奖励用任务奖励），比较"纯蒸馏学生"与"蒸馏+微调学生"的最终成功率，讨论什么时候不该加。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>微调能突破教师上限，但也会引入 RL 的不稳定性与安全风险；安全关键场合先评估奖励是否可信。</div></details>
+      </li>
+      <li>把教师从"确定性均值"改成"采样动作"做标签，比较两种标签下学生的平滑度与成功率，解释方差噪声如何影响学生。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>采样标签把教师方差带进监督目标，学生学到"抖动"；这也是连续动作默认用 MSE 对均值的原因。</div></details>
+      </li>
+      <li>设计容量-延迟曲线实验：学生参数量 10k/50k/160k/500k 四档，各测 P95 延迟与闭环成功率，选出你的验收点并说明取舍。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>画双轴图：延迟几乎线性于参数，成功率曲线先陡后平；选"成功率平台起点"对应的最小容量。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>蒸馏解决三类问题：压缩算力、传递特权信息、统一多策略；机器人里特权蒸馏（教师看地形/摩擦、学生靠本体历史"感知"）最有价值。</li>
+      <li>损失：随机教师用 KL（温度平方缩放）、确定性教师用 MSE；教师一侧永远 detach + no_grad。</li>
+      <li>分布偏移是蒸馏的敌人：DAgger 让学生跑、教师贴标签、数据聚合迭代（3–5 轮），把复合误差压回线性。</li>
+      <li>容量落差允许学生"超越教师"：适度 RL 微调 + 关键状态加权；容量选在延迟约束的上限。</li>
+      <li>导出纪律：TorchScript 一致性断言、同步计时、P95 延迟；闭环评测必须由学生驱动。</li>
+      <li>下一章换一种完全不同的控制哲学：不靠神经网络，改为滚动求解一个优化问题，模型预测控制（MPC）。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch075.html">← 第 075 章：实现演示引导的强化学习</a>
+    <a class="next" href="ch077.html">第 077 章：实现模型预测控制 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第027章 PPO的样本效率分析 | 深度强化学习课程 · PPO、SAC 与多智能体系统</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · 策略梯度与 PPO</span>
+    <span class="sep">/</span>
+    <span>第 027 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · 策略梯度与 PPO</div>
+    <h1>第 027 章：PPO的样本效率分析</h1>
+    <p class="lead">给 PPO 建一本"样本效率账本"：五种数据使用策略（1/5/20 个 epoch、小步快跑、大步慢跑）同预算对比，用学习曲线 AUC、首达步数、梯度步数三条轴衡量每步数据到底买到了什么。</p>
+    <ul class="meta">
+      <li>主题：数据复用 / 样本效率核算</li>
+      <li>关键公式：AUC = ∫ 滑窗回报 d(环境步) / 总步数；梯度步/环境步 = epochs / batch_size</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 026 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解样本效率与计算效率的区别，会读"每环境步的回报"与"每环境步的梯度步数"两条轴。</li>
+      <li>实现学习曲线 AUC 的统计口径，并解释滑窗均值、归一化方式对结论的影响。</li>
+      <li>用"首轮 KL vs 末轮 KL"量化数据复用带来的 off-policy 漂移。</li>
+      <li>对比 epochs ∈ {1, 5, 20} 与 steps_per_update ∈ {512, 2048, 4096} 五档配置的账本。</li>
+      <li>形成自己的工程判断：什么时候该舍弃多余 epoch、什么时候该缩小采样批。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>PPO 是 on-policy 算法，数据用完即弃，这句话前面说了很多遍，但一直没量化：<strong>多复用几轮到底亏不亏？采样批开大点还是开小点？</strong>很多人调参时凭手感，结果在两个坑之间反复横跳：epochs=1 时抱怨"数据利用率太低、学得慢"；epochs=50 时抱怨"每一步采样之后算半天、回报还不涨"。</p>
+    <p>本章把这个问题变成一个可核算的实验：固定 5 万环境步的预算，跑五种数据使用策略，每一档都统计<strong>学习曲线 AUC</strong>（每步数据买到多少回报）、<strong>梯度步数</strong>（花了多少计算）与 <strong>KL 漂移</strong>（同一批数据到第几轮就"变质"了）。做完你会得到一条很实用的结论：PPO 的甜蜜区通常落在 5～10 个 epoch 之间，再往上堆轮数，先到的是漂移，后到的是收益。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 样本效率的三种度量</h3>
+    <p>样本效率（sample efficiency）回答"每单位环境交互买到多少学习进展"。工程上有三种常用口径：</p>
+    <div class="formula">
+      ① 首达步数：达到目标回报所需的环境步（越小越好）<br>
+      ② 曲线 AUC：∫ 滑窗回报 d(环境步) / 总步数（越大越好）<br>
+      ③ 回报/梯度步：把"计算量"也放进分母，衡量综合成本
+    </div>
+    <p>本章三种都记。AUC 的手工梯形积分实现见 <code>curve_auc</code>：对逐次更新的（环境步, 近 100 回合均值）采样点做梯形求和再除以总步数，量纲与"平均回报"一致，方便横向比较，AUC=350 的直观含义是"整个训练过程中的平均滑窗回报约 350 分"。</p>
+    <p>把五档配置的梯度成本逐档算出（batch_size=64、预算 5 万步）：</p>
+    <table>
+      <tr><th>配置（spu:epochs）</th><th>梯度步/环境步</th><th>总梯度步（5 万步预算）</th><th>更新次数</th></tr>
+      <tr><td>2048:1</td><td>0.0156</td><td>约 781</td><td>24</td></tr>
+      <tr><td>2048:5</td><td>0.0781</td><td>约 3906</td><td>24</td></tr>
+      <tr><td>2048:20</td><td>0.3125</td><td>约 15625</td><td>24</td></tr>
+      <tr><td>512:10</td><td>0.1562</td><td>约 7812</td><td>98</td></tr>
+      <tr><td>4096:10</td><td>0.1562</td><td>约 7812</td><td>12</td></tr>
+    </table>
+    <p>三个读数立刻可比：20 epochs 的梯度成本是 5 epochs 的 4 倍；512:10 与 4096:10 的梯度成本完全相同，但更新次数差 8 倍（98 对 12），这就是"反馈频率"差异的全部来源。账本表里每个数字都能追到这张表上，不存在"感觉训练变重了"的空间。</p>
+    <p>梯形积分本身也走一遍小例子：若某配置的采样点是 (2048, 100)、(4096, 200)、(6144, 300)，则面积 = 0.5×(100+200)×2048 + 0.5×(200+300)×2048 = 307200 + 512000 = 819200，除以 5 万预算得 AUC ≈ 16.4。三个点的算术说明 AUC 的两个性质：它对曲线形状敏感（同样终点、爬得早的曲线面积大），并且早期点权重不小（第一段贡献了近 38% 的面积）。所以"AUC 高"翻译成业务语言是"学习过程整体更早进入高回报状态"；它与"最终分数更高"是两个口径，需要分开评估。</p>
+
+    <h3>2. 数据复用的收益与变质</h3>
+    <p>同一批数据被更新 k 轮后，策略已经从 π<sub>0</sub>（采样时刻）漂到 π<sub>k</sub>。比率 r<sub>t</sub> = π<sub>k</sub>/π<sub>0</sub> 的分布随 k 变宽，落到裁剪区外的样本比例上升，梯度信号被大量浪费：</p>
+    <div class="formula">
+      KL(π<sub>0</sub>‖π<sub>k</sub>) ≈ 随 k 单调递增（k 越大，数据越旧）<br>
+      漂移比 = KL(末轮) / KL(首轮)，本章用它当"复用是否过头"的警报器
+    </div>
+    <p>PPO 的裁剪限制的是<strong>单次梯度步</strong>的比率变化，但阻止不了多轮更新在同一个方向上的累积。经验上：首轮 KL 很小、末轮 KL 飙到首轮的 3～10 倍时，靠后的 epoch 基本在白烧计算。</p>
+    <p>给一组具体的漂移读数：某批数据逐轮 KL 为 0.004、0.007、0.011、0.016，首末比 4.0，正好落在"该考虑砍 epochs"的阈值上，第 4 轮相对第 1 轮携带的边际信息已经很小；反过来，首末比只有 1.5～2 说明数据还有余量，加一两个 epoch 可能划算。漂移比之所以比单看末轮 KL 更可靠，是因为它自动扣掉了任务与批量的尺度差异：不同配置的绝对 KL 水平不同，但"一批数据从新鲜到变质的速度"可以直接横向比较。</p>
+
+    <h3>3. 更新频率：小步快跑 vs 大步慢跑</h3>
+    <p>每次更新的采样量 s（steps_per_update）决定了两个相反效应：s 越小，数据越新鲜、更新越频繁，但每批样本少、梯度噪声大；s 越大，批内状态分布更丰富、更新更稳，但反馈周期变长。当 s 能被 batch_size 整除时，单位环境步的梯度步数为：</p>
+    <div class="formula">
+      grad_steps / env_steps = epochs / batch_size
+      <span class="note">该比值只由 epochs 与 batch_size 决定，与 s 无关，这解释了为什么"小步快跑"不等于"更贵的训练"</span>
+    </div>
+    <p>本章的账本把这条式子变成实测两列：<code>梯度步/环境步</code>与<code>梯度步总数</code>，避免"感觉训练变重了"式的瞎猜。小步快跑（512:10）与大步慢跑（4096:10）的比值完全相同（10/64≈0.156），前者买到的是反馈速度，不是额外计算。</p>
+    <p>反馈频率的收益也能量化：512:10 在 5 万步里更新约 98 次、4096:10 只有 12 次，梯度成本相同，但前者每 512 步就能把新数据喂进策略，后者要等 4096 步。训练早期策略变化最快，更新间隔直接决定"错误被纠正的速度"，这就是小步快跑在 AUC 上占优的机制。代价是每批 512 步覆盖的回合数少（早期约 1～3 个回合），滑窗均值与优势估计的噪声更大，所以它在高方差任务上未必总赢。</p>
+    <p>滑窗口径的影响同样要记账：本章用"近 100 回合"的均值当纵轴，这个窗口在时间上的跨度随训练剧烈变化。早期每回合约 20 步，100 回合只覆盖约 2000 步（约一个更新周期的历史），读数几乎贴着当前策略；后期每回合约 500 步，100 回合覆盖 5 万步，相当于把整段预算都平均了进去，读数平滑但严重滞后。含义有两条：其一，跨配置比较 AUC 时窗口必须一致（本章统一 100）；其二，训练末期的滑窗均值反应慢，判断"最近是否退化"要看更短的窗口或贪婪评估，两者别混用。</p>
+    <p>把两类成本分开记账更清楚：设每个梯度步约 0.8 ms、每个环境步约 0.05 ms，5 万步预算下采样成本固定约 2.5 s；2048:5 的更新成本约 3.1 s，2048:20 约 12.5 s，整机总耗时从约 5.6 s 涨到 15 s，约 2.7 倍。这就是"epochs 堆到 20"在墙钟上的真实价格：AUC 可能只多几个点，时间多一大截。</p>
+
+    <h3>4. 为什么不能只看最终回报</h3>
+    <p>五档配置最终评估可能都落在 480～500，CartPole 的天花板效应会把差异吃掉。真正的差别写在<strong>曲线形状</strong>里：谁在 2 万步就过半、谁 4 万步还在爬坡，AUC 会把这部分差异累计出来。评估口径也必须统一：本章所有 AUC 都基于"训练滑窗回报"，最终对比再附上贪婪评估，两者不要混着算。</p>
+    <p>AUC 还有一个口径陷阱要主动交代：提前达标的配置在达标后停止记录，若分母用总预算、分子只积到达标点，达标后的高回报平台没有进分子，<strong>学得快的配置会被系统性低估</strong>。极端例子：A 在 1 万步冲到 480 后停下，积分约 300 万、除以 5 万得 60；B 慢爬到 4 万步，积分约 1000 万、除以 5 万得 200；两相比较，A 的 AUC 输给了 B。严谨做法是把曲线延伸到预算末端（用最后一个滑窗值补平台）再积分：A 补上 4 万步×480 后 AUC 约 444，方向立刻纠正。本章脚本按"截止即止"口径统计，读账本时要意识到这层偏差，跨配置比较时把首达步数一并看。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+
+    <h3>模块划分</h3>
+    <table>
+      <tr><th>组件</th><th>职责</th><th>与第 026 章的关系</th></tr>
+      <tr><td><code>curve_auc</code></td><td>梯形积分 / 步数上限，得到归一化 AUC</td><td><strong>新增</strong>：样本效率主指标</td></tr>
+      <tr><td><code>ppo_update</code></td><td>返回梯度步数与逐 epoch 的 KL 序列</td><td><strong>扩展</strong>：从"单值 KL"到"逐轮 KL"</td></tr>
+      <tr><td><code>run_config</code></td><td>单配置循环：记录 (步数, 滑窗均值) 采样点与 KL 漂移</td><td><strong>改造</strong>：实验单元从"臂"变成"配置"</td></tr>
+      <tr><td>配置解析</td><td><code>采样步数:epochs</code> 参数组，如 <code>512:10</code></td><td><strong>新增</strong>：一条命令行扫五档</td></tr>
+      <tr><td>账本汇总</td><td>更新数、梯度步、GUF、KL 漂移、AUC、首达、评估</td><td><strong>新增</strong>：8 列对比表</td></tr>
+    </table>
+
+    <h3>关键超参数</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用与取值理由</th></tr>
+      <tr><td><code>--configs</code></td><td>2048:1, 2048:5, 2048:20, 512:10, 4096:10</td><td>五档覆盖"少复用 / 常用 / 过度复用 / 快 / 慢"</td></tr>
+      <tr><td><code>--max-steps</code></td><td>50000（每配置）</td><td>五档同预算，AUC 才可比</td></tr>
+      <tr><td><code>--batch-size</code></td><td>64</td><td>决定 GUF 的分母；练习中会改动它</td></tr>
+      <tr><td><code>--log-every</code></td><td>10</td><td>512 档更新频繁，日志间隔放宽</td></tr>
+      <tr><td>AUC 采样点</td><td>每次更新一个</td><td>近 100 回合滑窗；不足 100 回合时用现有全部</td></tr>
+    </table>
+
+    <h3>数据流</h3>
+    <p>每个配置：<strong>采样 spu 步</strong> → <strong>PPO 更新 epochs 轮</strong>（同时记录本轮每个 epoch 的平均 KL 与梯度步数）→ 追加学习曲线采样点 <code>(total_steps, 近100均值)</code> → 累计首轮/末轮 KL → 达标或预算耗尽。训练结束计算 AUC、漂移比、GUF，连同首达、评估一起进账本表；五档对比后再用同一种子重跑是验证结论的标准动作。</p>
+
+    <h3>与第 026 章的差异点</h3>
+    <ul>
+      <li><strong>关注对象</strong>：026 看"更新是否越界"；本章看"数据用了几遍、值不值"。</li>
+      <li><strong>实验变量</strong>：从裁剪半径换成 <code>(steps_per_update, epochs)</code> 组合。</li>
+      <li><strong>新增统计</strong>：逐 epoch KL 序列（漂移比）、梯度步计数器、AUC 积分。</li>
+      <li><strong>去掉可视化</strong>：不再画图，节省的时间用在五档配置上；曲线差异用 AUC 数字表达。</li>
+    </ul>
+
+    <div class="box key">
+      <span class="box-title">账本的三条轴要一起读</span>
+      <p><strong>AUC</strong> 是"学得有多好"（按环境步归一）；<strong>梯度步/环境步</strong>是"花了多少钱"；<strong>漂移比</strong>是"数据有没有被用到变质"。只报其中任何一个都会得出片面结论：只看 AUC 会低估 20 epochs 的计算代价，只看梯度步会以为 1 epoch 最划算，实际上它信息没榨干、学得最慢。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：curve_auc，手工梯形积分</strong></p>
+    <pre class="code"><code>def curve_auc(xs, ys, x_max):
+    """学习曲线的梯形积分 / x 总长度（手工实现，避免 numpy 版本差异）。"""
+    if len(xs) &lt; 2:                      # 不足两个点无法构成梯形
+        return 0.0
+    area = 0.0
+    for i in range(1, len(xs)):
+        # 相邻两点的梯形面积：平均高度 × 底边宽（即两次更新间的环境步差）
+        area += 0.5 * (ys[i] + ys[i - 1]) * (xs[i] - xs[i - 1])
+    return area / max(x_max, 1e-9)       # 按总预算归一，量纲=平均回报</code></pre>
+    <p>解读：AUC 是本账本的主指标，实现只有六行，但三个设计点都要说清。<strong>（1）</strong>为什么手工写循环而不用 <code>np.trapz</code>？一是避免不同 numpy 版本的行为差异，二是积分公式在代码里显式可见，它就是"相邻采样点的平均高度 × 底边宽"逐段累加，没有黑箱。<strong>（2）</strong>除以 <code>x_max</code>（总环境步预算）：五档配置若各自提前达标截断，不归一的话"跑得短的配置"会显得占便宜；统一除以预算，AUC 才能跨配置比较。<strong>（3）</strong><code>1e-9</code> 兜底防止除零。注意 AUC 的口径绑定"滑窗回报"这件事本身，换口径（比如用贪婪评估回报）整张表都必须重跑。</p>
+
+    <p><strong>片段 2：逐 epoch KL，把数据"变质速度"记下来</strong></p>
+    <pre class="code"><code>    for _ in range(epochs):
+        epoch_kl, epoch_mb = 0.0, 0            # 本轮的 KL 累加器与 minibatch 计数
+        idx = torch.randperm(N, device=obs.device)
+        for start in range(0, N, args.batch_size):
+            mb = idx[start:start + args.batch_size]
+            logits, value = net(obs[mb])
+            dist = Categorical(logits=logits)
+            logp = dist.log_prob(act[mb])
+
+            ratio = torch.exp(logp - logp_old[mb])
+            surr1 = ratio * adv[mb]
+            surr2 = torch.clamp(ratio, 1.0 - args.clip, 1.0 + args.clip) * adv[mb]
+            policy_loss = -torch.min(surr1, surr2).mean()
+            loss = policy_loss + args.vf_coef * F.mse_loss(value, ret[mb]) \
+                - args.ent_coef * dist.entropy().mean()
+
+            optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(net.parameters(), 0.5)
+            optimizer.step()
+
+            with torch.no_grad():
+                approx_kl = (logp_old[mb] - logp).mean().item()
+            epoch_kl += approx_kl              # 本轮所有 minibatch 的 KL 之和
+            epoch_mb += 1
+            n_mb += 1                          # 总梯度步数（成本轴的计量单位）
+        epoch_kls.append(epoch_kl / max(epoch_mb, 1))   # 每轮一条记录</code></pre>
+    <p>解读：与标准 PPO 更新相比，这段只多了两个累加器，却产出了本章最有信息量的数据。<strong>（1）</strong><code>epoch_kls</code> 列表的第 0 项是"数据刚采完、最干净"时的 KL，最后一项是"被榨到最后一轮"的 KL；两者之比就是漂移比。<strong>（2）</strong>KL 的统计在 <code>no_grad</code> 下完成，<code>logp_old</code> 是采样快照，因此每一项都是"当前策略相对数据出生策略"的真实距离。<strong>（3）</strong><code>n_mb</code> 每跑一个 minibatch 加一，训练结束后它就是实际的梯度步数，注意它可能小于理论值 <code>epochs × ceil(N/batch)</code>，因为若采样量不整除、最后一个 minibatch 会偏小。账本里的 GUF 用实测值，正是为了防止这类细节造成偏差。</p>
+
+    <p><strong>片段 3：单配置循环，学习曲线采样点与首末轮 KL</strong></p>
+    <pre class="code"><code>    while total_steps &lt; args.max_steps and solved_at is None:
+        batch, ep_returns, obs_t = collect_rollout(
+            env, net, spu, obs_t, device, args.gamma, args.lam)
+        total_steps += spu
+        all_returns.extend(ep_returns)
+
+        stats = ppo_update(net, optimizer, batch, args, epochs)
+        total_grad_steps += stats["grad_steps"]
+        update_idx += 1
+
+        # 学习曲线采样点：横轴=环境步，纵轴=近 100 回合滑窗均值
+        window = all_returns[-100:] if all_returns else [0.0]
+        xs.append(total_steps)
+        ys.append(float(np.mean(window)))
+        if len(stats["epoch_kls"]) &gt;= 1:
+            kl_first.append(stats["epoch_kls"][0])    # 首轮 KL：数据最新鲜时
+            kl_last.append(stats["epoch_kls"][-1])    # 末轮 KL：数据最旧时</code></pre>
+    <p>解读：循环体是"账本"的记账入口，三个动作各有讲究。<strong>（1）</strong><code>xs</code> 记的是累计环境步（不用更新序号），横轴口径统一，五档配置才能叠加在一张账上；<code>ys</code> 用近 100 回合滑窗，比单回合回报平滑得多，适合积分。<strong>（2）</strong><code>total_grad_steps</code> 逐轮累加实测值，与 <code>total_steps</code> 相除得到 GUF 列。理论上它等于 <code>epochs/batch_size</code>，但实测值能顺带暴露整除问题。<strong>（3）</strong>首轮 KL 与末轮 KL 分别追加：有时候要看的是"同一批数据内部的漂移轨迹"，单次更新的平均 KL 只是一个汇总数，<code>kl_drift</code> 会在训练结束后由这两个列表的均值算出。<strong>（4）</strong>更新频率差异极大的配置（512 档更新近百次、4096 档十几次）都走这段代码，口径完全一致。</p>
+
+    <p><strong>片段 4：账本字段，AUC、漂移比与 GUF</strong></p>
+    <pre class="code"><code>    auc = curve_auc(xs, ys, args.max_steps)          # 按预算归一的学习曲线面积
+    last100 = float(np.mean(all_returns[-100:])) if all_returns else 0.0
+    k1 = float(np.mean(kl_first)) if kl_first else 0.0
+    k2 = float(np.mean(kl_last)) if kl_last else 0.0
+    result = {
+        "tag": tag, "spu": spu, "epochs": epochs,
+        "updates": update_idx, "grad_steps": total_grad_steps,
+        "grad_per_step": total_grad_steps / max(total_steps, 1),   # GUF 实测值
+        "kl_first": k1, "kl_last": k2,
+        "kl_drift": k2 / max(k1, 1e-9),              # 漂移比：末轮/首轮
+        "auc": auc, "solved_at": solved_at, "last100": last100,
+        "eval_mean": float(np.mean(eval_returns)), "time": elapsed,
+    }</code></pre>
+    <p>解读：<code>result</code> 字典就是"一页账本"，逐字段看。<strong>（1）</strong><code>kl_drift = k2 / max(k1, 1e-9)</code>：首轮 KL 若接近零会放大倍数，<code>1e-9</code> 兜底防止除零爆表；健康配置的漂移比多在 2～4 之间，超过 4 就该考虑砍 epochs。<strong>（2）</strong><code>grad_per_step</code> 的值可以直接与理论式 <code>epochs/64</code> 对照验证实现正确性，2048:10 应约 0.156。<strong>（3）</strong><code>auc</code> 与 <code>solved_at</code> 回答两个不同问题：前者是"整段旅程的平均体验"，后者是"多久摸到门槛"；一个配置可能 AUC 高但首达晚（前期爬得慢、后期稳），账本让你同时看到两面。</p>
+
+    <p>完整可运行脚本（附录）：<a href="../code/ch027.py" download>code/ch027.py</a></p>
+    <pre class="sh"><code>python code/ch027.py            # 五档配置各 5 万步：CPU 约 3–6 分钟
+python code/ch027.py --quick    # 快速跑通：40–80 秒
+python code/ch027.py --configs 2048:1,2048:5,2048:20   # 只对比数据复用</code></pre>
+    <p>以实跑为准：<strong>1 epoch 账本最差</strong>（AUC 低、首达最晚）；<strong>5→20 epochs 的 AUC 提升有限，但梯度步翻 4 倍、漂移比升到 3～6 倍</strong>，靠后的 epoch 越来越"白烧"；<strong>小步快跑（512:10）通常 AUC 最高</strong>（反馈周期短、GUF 与大步慢跑相同）；<strong>大步慢跑（4096:10）早期爬坡最慢但曲线平稳</strong>。所有配置最终评估通常在 480～495 之间，差异要从 AUC 与首达列里读。</p>
+    <p>把"边际收益崩塌"算成一条具体的算式。设一次运行给出 AUC 300（1 轮）、360（5 轮）、372（20 轮），梯度步分别是 781、3906、15625：从 1 轮到 5 轮，每多一个梯度步买到 (360−300)/(3906−781) ≈ 0.019 点 AUC；从 5 轮到 20 轮，同一口径只剩 (372−360)/(15625−3906) ≈ 0.0010，<strong>相差约 19 倍</strong>。换句话说，第 6 到第 20 轮一共只买到 12 点 AUC，却花掉约 11700 个梯度步。这条算术就是"复用到头"的定量形态，也是账本存在的意义：它把'要不要再榨一轮'从感觉变成除法。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>用回合数当横轴</strong>：训练早期每个回合只有二十来步，回合数轴会把"频繁更新"的配置画得过分好看。<strong>修复</strong>：样本效率的横轴只有一个，环境步数。</li>
+      <li><strong>AUC 口径不一致</strong>：滑窗回报、单回合回报、贪婪评估回报的 AUC 不能混着比。<strong>修复</strong>：统一用"近 100 回合滑窗"，改动口径要整表重跑。</li>
+      <li><strong>把"epochs 多"直接等同于"样本效率高"</strong>：账本要同时读 AUC 与梯度步。20 epochs 的 AUC 往往只比 5 epochs 高个位数，但计算量翻 4 倍、漂移比翻倍，综合看它是亏的。</li>
+      <li><strong>采样步数小于 batch_size</strong>：会把一个不完整的 minibatch 喂给优化器（代码里已自动提升到 batch_size）。<strong>修复</strong>：跨配置比较时确认每个配置的 minibatch 都是满的。</li>
+      <li><strong>拿单次运行的 AUC 排名当结论</strong>：配置间差距小于 5% 时基本是种子噪声。<strong>修复</strong>：关键结论用 3 个以上种子重复，或只在"漂移比、GUF"这类结构性差异上下判断。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>用账本里的三档（2048:1 / 2048:5 / 2048:20）计算"每多花 1 个单位梯度步，AUC 多涨多少"，指出边际收益在哪一档开始崩塌。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>用 (AUC_5 − AUC_1)/(梯度步_5 − 梯度步_1) 与 20 档的同式做差对比。若 20 档的边际 AUC 明显小于 5 档，说明复用到头了。</div></details>
+      </li>
+      <li>把 <code>--batch-size</code> 依次设为 32 / 64 / 128（配置固定 2048:10），核对"梯度步/环境步 = epochs/batch_size"是否成立，并观察 AUC 的敏感度。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>32 → 0.3125，128 → 0.0781。小 batch 梯度噪声大但更新多，看 AUC 与首达哪一列先变化。</div></details>
+      </li>
+      <li>实现"分段采样量"：前 1/3 预算用 512 步采样、中间用 2048、最后用 4096（提示：在训练循环里按进度切换 <code>spu</code>），与固定 2048:10 比 AUC 和首达。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>把 <code>spu</code> 从函数参数改成循环内的变量，按 <code>total_steps / max_steps</code> 查表切换；注意日志里的配置名要加上"分段"标记。</div></details>
+      </li>
+      <li>把 AUC 改成"部分 AUC"：只积分到首次达到 400 分为止的区间，再除以达成步数。比较五档配置在新口径下的排名是否变化，并解释原因。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>在 <code>run_config</code> 里记录首次达到 400 时的采样点索引，截断 xs/ys 再调用 <code>curve_auc</code>。早期学得快的配置在部分 AUC 下会更占优。</div></details>
+      </li>
+      <li>把整本账本搬到 MountainCar-v0（稀疏奖励，成功判定用 terminated）：先改环境与成功条件，再加一个"首次成功步数"列。讨论稀疏任务里数据复用是否更值钱，以及 20 epochs 是否会拖后腿。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>MountainCar 回合上限 200 步，滑窗口径要相应调整（改用 20 回合）；奖励恒为 −1，AUC 会全为负数，可先给回报加 200 的平移再积分。思考：稀疏任务里"重复榨取同一批失败数据"风险更大还是更小？</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>样本效率有三个口径：首达步数、曲线 AUC、回报/梯度步；只报最终回报会漏掉全部过程信息。</li>
+      <li>数据复用的甜蜜区在 5～10 个 epoch：1 个 epoch 信息没榨干，20 个 epoch 计算翻几倍而 AUC 增益有限，漂移比 4+ 就是警报。</li>
+      <li>单位环境步的梯度成本 = epochs / batch_size，与采样步数无关，小步快跑买到的是反馈速度，不是额外计算。</li>
+      <li>小步快跑首达更快、AUC 通常更高；大步慢跑曲线更稳，适合噪声敏感的任务。</li>
+      <li>下一章给训练加上"仪表盘"：把 KL、裁剪比例、熵、解释方差等指标组织成健康检查，让稳定性问题在回报崩掉之前就被发现。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch026.html">← 第 026 章：PPO的信任域约束可视化</a>
+    <a class="next" href="ch028.html">第 028 章：PPO的稳定性指标监控 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第093章 端到端实践：连续控制任务训练流水线 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第五篇 · 训练工程与系统进阶</span>
+    <span class="sep">/</span>
+    <span>第 093 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第五篇 · 训练工程与系统进阶</div>
+    <h1>第 093 章：端到端实践：连续控制任务训练流水线</h1>
+    <p class="lead">一句话：本章组装连续控制任务的完整流水线：动作分布的边界处理、观测与奖励归一化、离策略回放配置、以及固定口径的评估与搜索。</p>
+    <ul class="meta">
+      <li>主题：端到端实践 / 连续控制</li>
+      <li>关键机制：动作压缩（Squashing）、归一化统计、目标平滑、确定性评估</li>
+      <li>预计学时：65 分钟</li>
+      <li>前置章节：第 092 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解连续动作分布的构造：均值与标准差输出、截断正态到有界动作的压缩变换及其对数概率修正。</li>
+      <li>掌握观测与奖励归一化的作用机制，以及统计量随检查点保存的必要性。</li>
+      <li>会配置离策略算法（SAC 类）的关键参数：回放容量、开始学习步数、目标平滑系数与自动温度调节。</li>
+      <li>掌握连续控制的评估协议：确定性动作、固定初始状态集、回合统计口径。</li>
+      <li>会围绕学习率、目标平滑与温度参数组织搜索，并处理评估噪声。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>连续控制任务（关节力矩、执行器指令、连续油门与转向）与前一章的游戏任务形成鲜明对照：观测低维、动作连续、奖励尺度多样、每步计算昂贵。<strong>这些特征把设计重心从"预处理与吞吐"转向"数值稳定性与样本效率"：动作边界处理不当、观测尺度失配、奖励量级失控，任何一种都会让价值估计发散或策略退化，且症状往往延迟出现。</strong></p>
+    <p>另一处与图像任务的分野在算法族：连续控制任务的仿真步常较昂贵，离策略方法以更高的样本效率成为默认选择；离策略又引入回放缓冲、目标网络与行为策略偏差等一整套配置面。本章把这些配置按"先数值、再结构、后评估"的顺序组织成流水线，使每一步的稳定性都建立在已固定的基础上。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p><strong>连续控制流水线的核心是让所有进入网络与损失的量处在受控的量级上：动作有界、观测标准化、奖励缩放、价值目标平滑。</strong>本节按动作、观测、奖励、离策略配置与评估依次展开。</p>
+
+    <h3>1. 动作分布的构造与边界</h3>
+    <p>连续策略通常输出高斯分布的均值 μ 与标准差 σ，再经压缩变换映射到动作区间 [a<sub>lo</sub>, a<sub>hi</sub>]：</p>
+    <div class="formula">
+      a = a<sub>lo</sub> + (a<sub>hi</sub> − a<sub>lo</sub>) · ( tanh(z) + 1 ) / 2，z ~ N(μ, σ²)
+      <span class="note">压缩变换改变概率密度，对数概率需加雅可比修正项，损失函数用修正后的对数概率</span>
+    </div>
+    <p>压缩变换的两个作用：保证动作严格落在物理边界内，避免"越界后裁剪"造成的梯度断层；把不同量纲的动作统一到归一化区间处理。雅可比修正项容易被忽略，<strong>缺失修正时熵项与重要性比率都会系统性偏差，表现为探索参数失效与剪裁异常</strong>。动作输出层还应检查标准差的下界约束：σ 趋近零使对数概率无界，训练后期需要下限保护。</p>
+
+    <h3>2. 观测归一化</h3>
+    <p>连续控制任务的观测各维量纲差异可达数个量级（角度在弧度、速度在米每秒、接触力在牛顿）。<strong>不做归一化时，网络的第一层权重需要同时适配不同尺度，有效学习率被最大尺度的维度牵制。</strong>标准做法是维护运行均值与方差（Running Mean and Standard Deviation），对观测做标准化，并把统计量作为策略状态的一部分：随检查点保存、随导出清单发布、评估端复用。统计量的更新只发生在训练期，评估期冻结，否则评估结果会依赖评估顺序。</p>
+
+    <h3>3. 奖励缩放与价值量级</h3>
+    <p>奖励的绝对量级直接进入价值目标：奖励在 0 到 1000 量级时，Q 值同样在千级，平方误差损失把学习率实际放大几个量级。处理方式有两种：<strong>显式缩放</strong>，奖励乘以固定系数使回合回报落在 10<sup>2</sup> 以内；<strong>价值归一化</strong>，对价值目标做标准化并使用逆变换还原。两者都必须在评估时还原到原始尺度，否则不同配置的回报不可比。自动温度调节（Automatic Entropy Tuning）与奖励尺度有耦合：奖励放大 k 倍时，最优温度也随之偏移，<strong>改奖励尺度后应重新标定温度目标</strong>。</p>
+
+    <h3>4. 离策略配置的结构</h3>
+    <p>SAC 类算法的配置面按数据流顺序排列：回放容量决定数据窗口；开始学习步数为冷启动；每次更新的批大小决定梯度噪声；目标平滑系数 τ 决定目标网络跟随速度；温度参数决定探索强度。设计要点：<strong>容量按第 084 章估算后取"覆盖数个最新策略世代"的量级</strong>；开始学习步数覆盖一个完整回报周期；τ 在 0.001 至 0.01 区间，取值越小目标越稳定、价值传播越慢，与更新密度联动；温度用自动调节（目标熵取动作维度的负值量级）减少一个搜索维度。离策略的复用比与目标平滑的耦合在第 082、087 章已有结论：更新越密，目标越应稳定。</p>
+
+    <h3>5. 评估协议</h3>
+    <p>连续控制的评估采用确定性动作（取分布均值），依据是：评估要回答"策略在最优意图下的能力"，随机探索的方差会掩盖配置差异。三个固定量：<strong>初始状态集</strong>（固定种子的若干回合序列，跨配置可比）；<strong>回合数与统计</strong>（3 至 10 回合，报均值与标准差）；<strong>评估频率</strong>（按训练步，与搜索的样本预算口径一致）。评估前冻结归一化统计量，评估后恢复训练态更新。<strong>确定性评估的回报与训练回报之间存在系统性差距（探索噪声），报告中两者分列，不做平均。</strong></p>
+
+    <h3>6. 搜索组织</h3>
+    <p>敏感超参按敏感度排序：学习率（对数 10<sup>-4</sup> 至 10<sup>-3</sup>）、目标平滑 τ（{0.001, 0.005, 0.01}）、批大小（{128, 256, 512}）、温度目标（自动调节时固定，手动时对数搜索）。<strong>搜索的固定项应包括归一化策略与奖励缩放系数</strong>，它们属于表征层，变化会改变整个搜索空间的含义。排序指标用评估回报的滑动均值；连续控制任务的回合回报方差小于游戏任务，3 回合评估通常足够区分配置，复核用多种子确认。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>流水线组装按六步推进，先数值后结构，每步都以"前一步已固定"为前提。</p>
+    <ol>
+      <li><strong>观测洞查</strong>：统计各维的量纲范围，确认归一化方案与是否需要对数变换（跨越多个数量级的维度）。</li>
+      <li><strong>动作边界</strong>：确认动作接口的物理边界与内部归一化区间的映射，写入配置并加断言。</li>
+      <li><strong>奖励尺度</strong>：按回合回报量级选择缩放系数，记录折算关系供评估还原。</li>
+      <li><strong>算法与回放</strong>：容量、开始学习步数、批大小、τ、温度，按第 4 点的联动关系配置。</li>
+      <li><strong>评估与检查点</strong>：确定性评估协议；检查点包含归一化统计量与调度状态（第 090 章）。</li>
+      <li><strong>搜索接入</strong>：开放学习率与 τ，固定表征层配置，ASHA 提前终止，滑动均值排序。</li>
+    </ol>
+    <h3>基线配置表</h3>
+    <table>
+      <tr><th>参数</th><th>基线值</th><th>依据</th></tr>
+      <tr><td>观测处理</td><td>运行均值方差标准化</td><td>量纲差异大，必须归一化</td></tr>
+      <tr><td>奖励缩放</td><td>回合回报压到 10<sup>2</sup> 以内</td><td>控制价值量级与有效学习率</td></tr>
+      <tr><td>学习率</td><td>3×10<sup>-4</sup></td><td>离策略连续控制的标准中点</td></tr>
+      <tr><td>回放容量</td><td>10<sup>6</sup> 条量级（按内存修正）</td><td>覆盖多个策略世代</td></tr>
+      <tr><td>开始学习步数</td><td>10<sup>4</sup> 步量级</td><td>覆盖一个回报周期</td></tr>
+      <tr><td>批大小</td><td>256</td><td>梯度噪声与显存的折中</td></tr>
+      <tr><td>目标平滑 τ</td><td>0.005</td><td>目标稳定性与传播速度的折中</td></tr>
+      <tr><td>温度</td><td>自动调节，目标熵取 −dim(A)</td><td>少一个搜索维度</td></tr>
+    </table>
+    <div class="box warn">
+      <span class="box-title">与上一章的差异</span>
+      <p>第 092 章的瓶颈在观测吞吐与预处理，本章的瓶颈在数值稳定性与回放结构。相同点是评估协议的重要性：图像任务靠固定场景集抵抗方差，连续控制靠确定性动作与固定初始状态集抵抗方差，两者都把"评估可比性"当作流水线的硬约束。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>以下片段基于 Ray 2.x 时期的通用写法，接口随版本演进，以对应版本的官方文档为准。</p>
+
+    <p><strong>片段 1：随模型保存的观测归一化包装器</strong></p>
+    <pre class="code"><code>import numpy as np
+
+class RunningNormalize:
+    """运行均值方差标准化：统计量属于策略状态，必须随检查点导出。
+    训练期更新统计，评估期冻结：否则评估结果依赖评估顺序。"""
+    def __init__(self, dim, clip=10.0):
+        self.mean = np.zeros(dim, dtype=np.float64)
+        self.var = np.ones(dim, dtype=np.float64)
+        self.count = 1e-4                        # 平滑初值，避免首步除零
+        self.clip = clip                         # 标准化后截断，抵抗离群观测
+
+    def update(self, obs):
+        # 在线更新均值与方差：Welford 风格的增量形式，单步复杂度 O(dim)
+        self.count += 1
+        delta = obs - self.mean
+        self.mean += delta / self.count
+        self.var += delta * (obs - self.mean)
+
+    def normalize(self, obs, training=True):
+        if training:
+            self.update(obs)
+        std = np.sqrt(self.var / self.count + 1e-8)
+        # 截断标准化结果：离群观测不把激活推到极端区域
+        return np.clip((obs - self.mean) / std, -self.clip, self.clip)
+
+def state_dict(wrapper):
+    """导出统计量：与网络参数同批写入检查点与部署清单。"""
+    return {"mean": wrapper.mean.tolist(), "var": wrapper.var.tolist(),
+            "count": wrapper.count}</code></pre>
+    <p>解读：这个包装器承担观测通道的数值治理。<strong>（1）</strong>统计量用增量更新适应在线到达的观测流，批统计要等观测齐备才能更新；计数初值取小量使最初几个观测平滑纳入。<strong>（2）</strong>标准化结果截断在 ±10 个标准差内，接触类物理量偶发的尖峰不会把网络激活推入饱和区。<strong>（3）</strong><code>state_dict</code> 是纪律的落点：统计量与参数同批导出，第 091 章的部署清单直接引用它，评估端加载后冻结，三处口径同源。</p>
+
+    <p><strong>片段 2：SAC 类配置与联动注释</strong></p>
+    <pre class="code"><code>from ray.rllib.algorithms.sac import SACConfig
+
+config = (
+    SACConfig()
+    .environment("HalfCheetah-v4")
+    .training(
+        # 回放容量：按内存估算后取覆盖多个策略世代的量级
+        replay_buffer_config={"type": "PrioritizedReplayBuffer",
+                              "capacity": 500000, "alpha": 0.6, "beta": 0.4},
+        learning_starts=10000,           # 覆盖一个回报周期的冷启动
+        train_batch_size=256,            # 每次更新的批：梯度噪声与显存折中
+        # 目标平滑系数：与更新密度联动，更新越密目标越应稳定
+        tau=0.005,
+        # 自动温度：目标熵取动作维度负值量级，省去一个搜索维度
+        target_entropy="auto",
+        lr=3e-4,                         # 搜索区间 1e-4 至 1e-3 的中点
+    )
+    # 注意：奖励缩放与观测归一化属于表征层配置，在环境包装中实现，
+    # 它们不放这里搜索；变化表征层等于改变整个搜索空间的语义
+)</code></pre>
+    <p>解读：配置中的每个数值都对应前面的原理条目。<strong>（1）</strong>容量 50 万条在低维观测下为百 MB 量级，若观测含图像须按第 084 章重估。<strong>（2）</strong>优先缓冲配置与第 087 章的机制直接衔接：α 控制抽样偏向、β 控制无偏修正，退火计划由算法实现维护。<strong>（3）</strong>注释固定了搜索边界：表征层（归一化与奖励缩放）不进搜索空间，其理由在"改一处、全局含义漂移"的量纲耦合上，这比任何调参技巧都更影响实验可比性。</p>
+
+    <p><strong>片段 3：确定性评估与搜索上报</strong></p>
+    <pre class="code"><code>import numpy as np
+from ray import tune
+
+def evaluate_deterministic(algo, env, normalizer, episodes=3, base_seed=7000):
+    """连续控制的评估协议：确定性动作、固定初始状态集、统计量冻结。
+    与训练回报分列上报：探索噪声使两者存在系统性差距。"""
+    returns = []
+    for i in range(episodes):
+        obs, _ = env.reset(seed=base_seed + i)          # 跨配置相同的场景集
+        done, total = False, 0.0
+        while not done:
+            # 评估期冻结统计量：不更新、只变换
+            normed = normalizer.normalize(obs, training=False)
+            action = algo.compute_single_action(normed, explore=False)
+            obs, reward, terminated, truncated, _ = env.step(action)
+            done = terminated or truncated
+            total += float(reward)
+        returns.append(total / 100.0)                   # 按训练期缩放系数还原量纲
+    mean_r = float(np.mean(returns))
+    std_r = float(np.std(returns))
+    # 均值与标准差同时上报：标准差大说明配置在不同场景下不稳定
+    tune.report(eval_return_mean=mean_r, eval_return_std=std_r)
+
+def smooth(history, window=5):
+    recent = history[-window:]
+    return sum(recent) / len(recent)</code></pre>
+    <p>解读：评估函数落实了三条协议纪律。<strong>（1）</strong>固定初始状态集使配置之间的差异不混入场景抽样；回合数 3 在连续控制任务上是方差与成本的平衡点。<strong>（2）</strong>评估期冻结归一化统计量，保证同一策略的评估结果只依赖评估本身，与评估时序无关。<strong>（3）</strong>回报还原训练缩放系数后上报，均值与标准差同列；排序仍用滑动均值，标准差作为稳定性诊断保留在实验记录中。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>跳过观测归一化</strong>：量纲差异使有效学习率失配，价值估计收敛慢或振荡。修复：标准化包装器加统计量导出，评估期冻结。</li>
+      <li><strong>奖励量级失控</strong>：回合回报在千级时 Q 值迅速膨胀，损失发散。修复：显式缩放奖励并在评估时还原，改缩放后重标定温度目标。</li>
+      <li><strong>压缩变换遗漏对数概率修正</strong>：熵项与比率计算系统性偏差，探索失效或裁剪异常。修复：使用实现内的修正对数概率接口，或在自定义策略中显式加入雅可比项。</li>
+      <li><strong>评估用随机动作</strong>：评估方差过大，配置差异被探索噪声淹没。修复：评估固定确定性动作，与训练回报分列记录。</li>
+      <li><strong>回放容量按直觉设置</strong>：容量过小导致样本高度相关，容量过大使陈旧样本占比高。修复：按内存估算与策略世代数两个约束共同确定，用样本年龄与 ESS 验证。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>计算题：动作维度 3，动作区间 [−1, 1]，网络输出均值 0.3、标准差 0.5。写出 tanh 压缩后的动作值（z 取均值），并说明标准差下界保护的必要性。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>tanh(0.3)≈0.291，映射后 a≈0.291；σ→0 时对数概率趋于无界，需设下界如 1e-3。</div></details>
+      </li>
+      <li>预测题：把奖励缩放系数从 0.01 改为 1、其余不变。预测 Q 值曲线、策略熵与评估回报的变化方向。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>Q 值量级抬高约百倍，有效学习率放大；熵因温度相对失配而变化；评估回报短期可能异常后走向发散。</div></details>
+      </li>
+      <li>设计题：为"动作维度 6、观测含接触力尖峰、仿真步昂贵"的任务设计流水线：归一化方案、奖励处理、回放配置、温度策略与评估协议。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>接触力维度考虑对数变换再由标准化截断；奖励压到百级；容量偏大配样本年龄监控；温度自动调节；评估 5 回合确定性。</div></details>
+      </li>
+      <li>分析题：推导 tanh 压缩变换下对数概率的雅可比修正项形式，并说明修正项在动作接近边界时的影响。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>修正项为 log(1 − tanh²(z)) 的累加（按维度求和）；动作接近边界时 tanh 接近 ±1，修正项趋于负无穷，概率密度被压缩，需配合数值下界。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>连续控制以数值稳定性为先：动作压缩变换保证边界，对数概率修正保证熵与比率的正确性。</li>
+      <li>观测标准化与奖励缩放属于表征层，统计量必须随检查点与部署清单同源导出，评估期冻结。</li>
+      <li>离策略配置按回放容量、冷启动、批、目标平滑与温度的联动关系确定；改奖励尺度需重标定温度。</li>
+      <li>评估用确定性动作与固定初始状态集，均值与标准差同列，与训练回报分列。</li>
+      <li>下一章进入多智能体任务：策略映射、参数共享与集中式信息成为新的设计变量。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch092.html">← 第 092 章：端到端实践：Atari风格任务训练流水线</a>
+    <a class="next" href="ch094.html">第 094 章：端到端实践：多智能体任务训练流水线 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

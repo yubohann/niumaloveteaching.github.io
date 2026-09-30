@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第060章 实现注意力机制 | 机器人仿真学习课程 · Isaac Sim 强化学习训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第三篇 · 高级强化学习专题</span>
+    <span class="sep">/</span>
+    <span>第 060 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第三篇 · 高级强化学习专题</div>
+    <h1>第 060 章：实现注意力机制</h1>
+    <p class="lead">当环境里的实体数量可变、关系复杂：本章用实体 token 化 + 缩放点积注意力替换"观测拼接"，让策略学会"此刻该关注谁"，并给出掩码池化的完整实现。</p>
+    <ul class="meta">
+      <li>主题：高级专题 / 注意力与关系推理</li>
+      <li>相关组件：Isaac Sim / Isaac Lab / PyTorch</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 059 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>能说清"固定拼接观测"的三个局限：实体数量固定、顺序敏感、看不清两两关系。</li>
+      <li>掌握缩放点积注意力的公式与逐项含义：打分、缩放因子 √d<sub>k</sub>、softmax 归一化、加权聚合。</li>
+      <li>会设计实体 token：相对位置、相对速度、类型嵌入，以及 padding 掩码的处理。</li>
+      <li>能实现单头注意力函数与掩码池化策略头，并解释 query 为什么来自"自身"。</li>
+      <li>知道注意力在 Isaac Sim 场景中的三个典型用例：多障碍导航、多智能体、多物体操作。</li>
+      <li>能判断"该不该上注意力"：实体少且固定时，MLP 拼接更便宜；实体多且可变时，注意力收益显著。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 059 章的集中 critic 输入是"所有智能体观测的固定顺序拼接"。这个做法有两个隐含前提：智能体数量固定、每个智能体的身份由位置顺序定义。一旦世界更自由，走廊里障碍物从 3 个到 10 个不定、桌面上待整理的物体数量随机、协作机器人有时两台有时三台，拼接式观测就会崩溃：网络输入维度无法固定，即使补零硬凑，多出来的零也会稀释信号、破坏泛化。</p>
+    <p>注意力机制（attention）给出的解法是：<strong>把每个实体编码成一条"token"，让策略自己去决定关注哪些 token、关注到什么程度</strong>。它对实体数量与顺序天然免疫（置换不变），还能显式建模"我—它"之间的关系。本章从公式到代码把这条路走一遍，它是第 062 章 Transformer 策略的前置，也是 063 章图神经网络思想的近亲。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 固定拼接观测的三个局限</h3>
+    <table>
+      <tr><th>局限</th><th>症状</th><th>注意力的对应优势</th></tr>
+      <tr><td>数量固定</td><td>障碍从 5 个变 8 个，输入维度不匹配</td><td>token 序列长度可变，天然支持</td></tr>
+      <tr><td>顺序敏感</td><td>交换两个障碍的拼接顺序，输出无意义地改变</td><td>置换不变（与顺序无关）</td></tr>
+      <tr><td>无关系结构</td><td>"障碍 A 在左、障碍 B 在右"与"A 在右、B 在左"对 MLP 是两个完全不同的输入，但物理上对称</td><td>两两交互通过打分显式建模</td></tr>
+    </table>
+    <p>判断标准很简单：如果你的环境里"参与交互的实体"数量固定（比如 Franka 单手 + 一个工件 = 两个），MLP 拼接足够、别过度设计；数量超过 3 且会变，注意力的性价比开始显现；数量到 10 以上（多障碍、多机器人），基本是必选项。</p>
+
+    <h3>2. 缩放点积注意力：公式逐项读</h3>
+    <p>注意力的标准形式为：</p>
+    <div class="formula">
+      Attention(Q, K, V) = softmax( Q K<sup>T</sup> / √d<sub>k</sub> ) V
+      <span class="note">Q = 查询（我想找什么），K = 键（每个实体的"标签"），V = 值（实体的信息内容）</span>
+    </div>
+    <p>逐项解释。<strong>打分</strong> QK<sup>T</sup>：query 与每个 key 的内积，衡量"这个实体与我的当前需求有多相关"。<strong>缩放</strong>除以 √d<sub>k</sub>：当维度 d<sub>k</sub> 增大时，内积的方差随之线性增长，softmax 会被推向饱和（一个分量接近 1、其余接近 0），梯度消失；除以 √d<sub>k</sub> 把方差拉回常数，这是"numerically 能训练"的关键小手术。<strong>softmax</strong>：把分数变成和为 1 的权重分布，"注意力分配"。<strong>加权聚合</strong>乘 V：按权重要素加权求和，得到"我最需要的那部分信息"。</p>
+    <p>在 RL 里最常用的配置是<strong>单 query 注意力</strong>：query 来自"自身状态"（机器人自己的 token），key/value 是环境实体（障碍、队友、目标物）。这是"我看向世界"的单向读取，与自注意力（self-attention，token 之间互相看）不同，计算量从 O(E²) 降到 O(E)，又保留了置换不变与变长能力。多头的做法（同时学多套 Q/K/V，拼接输出）在实体很多、关系类型多样时有用，本章先用单头把机制讲透。</p>
+
+    <h3>3. 实体 token 化：把世界翻译成向量</h3>
+    <p>每条 token 应包含"我在哪、我怎么动、我是什么"三块：</p>
+    <div class="formula">
+      token<sub>e</sub> = [ 相对位置(2), 相对速度(2), 类型嵌入(4) ]
+      <span class="note">相对位置 = R(θ<sup>robot</sup>)<sup>T</sup>(p<sub>e</sub> − p<sub>robot</sub>)，归一化到量程 [-1, 1]</span>
+    </div>
+    <p>为什么用相对位置？与 043 章的目标观测同理：机器人走到哪、朝向如何，token 的数值语义不变，网络学到的"前方 1 m 有个障碍"在任何世界里通用。类型嵌入是一张小的查找表（障碍=1、队友=2、目标=3、无关物=4），让同一种 token 结构表达不同实体，这是"参数共享"在实体维度的体现：处理障碍的注意力参数与处理队友的相同（都由同一组 Q/K/V 投影生成），但类型嵌入让它们可区分。</p>
+
+    <h3>4. 掩码：处理变长与"不存在的实体"</h3>
+    <p>变长序列的工程实现是"补零 + 掩码"：token 数组固定长度 E<sub>max</sub>（比如 8），实际实体少的槽位填零，同时提供掩码 mask（1 = 真实、0 = 填充）。掩码有两个作用点：打分阶段把填充位置的 logits 置为 −∞（softmax 后权重为 0），聚合阶段天然跳过。为什么不能只靠补零？因为全零 token 经过 K/V 投影后不是零，它会分走一部分注意力权重；因此掩码是必需品。另一个细节：评估时若实体数量超过 E<sub>max</sub>，要么截断（保留最近的几个），要么按距离排序后取前 E<sub>max</sub>，后者更合理，因为最近的实体才最影响决策。</p>
+
+    <h3>5. 成本与收益：什么时候别用</h3>
+    <p>注意力的计算成本是 O(E·d)（单 query 版），显存占用随 E 线性增长，一般不是瓶颈；真正的问题是<strong>样本效率</strong>：网络参数变多、结构变复杂，在简单任务上反而学得比 MLP 慢。经验判断顺序：（1）实体数 ≤ 2 且固定：拼接 MLP；（2）实体数 3–5 且固定：拼接 MLP 加一层"实体独立编码"（每个实体先过共享 MLP 再拼接）通常够用；（3）数量可变 ≥ 3 或明确需要关系推理：上注意力。第（2）步是廉价的平替，共享实体编码已经给了置换不变性的大部分好处，只是对两两关系仍然盲。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>用"移动机器人穿越多障碍到达目标"任务落地注意力策略：</p>
+    <ol>
+      <li><strong>任务</strong>：沿用 043 章地图，但障碍数量每回合 3–10 个随机，且训练集与评估集的密集程度不同，考察变长泛化。</li>
+      <li><strong>观测切分</strong>：自身观测（约 14 维：速度、朝向、目标相对位姿、上一动作）走独立 MLP；实体 token（每个障碍 2+2+4 = 8 维）走注意力；两类特征在策略头拼接。</li>
+      <li><strong>实体顺序</strong>：按"与机器人距离"排序后取前 8 个，排序让截断有物理意义，也让同样实体集在不同帧之间的 token 顺序稳定（减少无效变化）。</li>
+      <li><strong>网络</strong>：自身编码 MLP 64 维；单头注意力（d=64）；聚合向量与自身特征拼接后接 256×2 MLP；输出 (v, ω) 二维动作。</li>
+      <li><strong>掩码与归一化</strong>：token 内所有量按量程归一化（位置 /5 m、速度 /2 m/s）；mask 与 token 一起进网络。</li>
+      <li><strong>对照</strong>：同任务跑"36 束激光 + MLP"（043 章基线）与"注意力实体观测"两版，比较：训练样本量、变长泛化（训练 3–10 个，评估 12–15 个）、以及注意力权重的可解释性。</li>
+      <li><strong>评估</strong>：成功率、碰撞率、以及"注意力最集中的实体"与"最近障碍"的重合率，后者是关系推理是否学到的直观指标。</li>
+    </ol>
+    <table>
+      <tr><th>方案</th><th>变长支持</th><th>置换不变</th><th>学习速度（本任务）</th></tr>
+      <tr><td>激光拼接 MLP</td><td>勉强（固定 36 束）</td><td>否</td><td>快（但泛化到密集场景差）</td></tr>
+      <tr><td>实体独立编码拼接</td><td>需固定 E<sub>max</sub></td><td>是（共享编码）</td><td>中</td></tr>
+      <tr><td>单 query 注意力</td><td>是（掩码）</td><td>是</td><td>中（关注关系后更好）</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计思维：注意力权重不只是"可解释性装饰"</span>
+      <p>训练里可以监控两件事：注意力熵（所有实体平分 = 还没学会区分）与"注意力—最近实体重合率"。它们既是调试工具（如果策略失败时注意力集中在无关实体上，说明实体特征或投影头有问题），也是安全工具（真机上可以规定"最危险实体必须在注意力前两位"作为运行时检查）。这是少数能在 RL 里获得"白盒信号"的架构之一，用它。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：实体 token 化（相对位置 + 类型嵌入 + 掩码）</strong></p>
+    <pre class="code"><code>import numpy as np
+
+def build_entity_tokens(robot_pos, robot_vel, robot_yaw, entities, max_entities=8):
+    # entities: list[dict]，每个实体含 pos(2)、vel(2)、type_emb(4)
+    # token 结构：[相对位置(2), 相对速度(2), 类型嵌入(4)] = 8 维
+    tokens = np.zeros((max_entities, 8), dtype=np.float32)
+    mask = np.zeros((max_entities,), dtype=np.float32)       # 1=真实实体 0=填充
+    c, s = np.cos(robot_yaw), np.sin(robot_yaw)
+    # 按距离排序后取前 max_entities 个：截断时保留最相关的实体
+    items = sorted(entities, key=lambda e: np.linalg.norm(e["pos"] - robot_pos))[:max_entities]
+    for i, e in enumerate(items):
+        d = e["pos"] - robot_pos[:2]
+        # 相对位置在本体系下表达，再除以 5 m 量程归一化：不同世界里语义一致
+        rel = np.array([c * d[0] + s * d[1], -s * d[0] + c * d[1]], dtype=np.float32) / 5.0
+        rv = (e["vel"] - robot_vel) / 2.0                    # 相对速度，量程 2 m/s
+        tokens[i] = np.concatenate([rel, rv, e["type_emb"]])
+        mask[i] = 1.0
+    return tokens, mask</code></pre>
+    <p>解读：这段代码的四行核心动作分别解决四个问题。<strong>排序后截断</strong>：实体多于 8 个时保留最近的，物理上合理（远处障碍对 0.5 s 决策影响小），排序也让实体集不变时 token 顺序稳定。如果想进一步减少顺序抖动，可以在排序键里加一点时间平滑。<strong>相对位置</strong>：本体系投影（与 043 章的 R(θ)<sup>T</sup> 同一套公式）让"前方障碍"的表示与机器人朝向解耦。<strong>类型嵌入</strong>：这里假设调用方传入 4 维 one-hot/embedding 向量；把类型和几何拼在同一个 token 里，注意力机制便能泛化到新实体类型（类型维度变化时只需扩投影层）。<strong>掩码</strong>：注意 mask 在 token 之后返回、且长度与 max_entities 一致，网络靠它知道"哪些槽位是虚构的零"。一个高频 bug 提醒：如果实体数量少于 max_entities 时忘记把多余 token 保持在零（比如复用了上一个回合的 buffer），填充位会携带虚假实体信息；每次构建都从零数组开始（如本实现）最稳。</p>
+
+    <p><strong>片段 2：缩放点积注意力（含掩码）</strong></p>
+    <pre class="code"><code>import math
+import torch
+
+def scaled_dot_product_attention(q, k, v, mask=None):
+    # q:     (B, d_k)      自身 token 的查询向量（"我想关注什么"）
+    # k, v:  (B, E, d_k)   实体键与值（E 为最大实体数，含填充位）
+    d_k = q.shape[-1]
+    # 1) 打分：query 与每个实体 key 的内积相似度
+    logits = torch.einsum("bd,bed-&gt;be", q, k)
+    # 2) 缩放：除以 sqrt(d_k)，防止维度增大时内积方差膨胀、softmax 饱和
+    logits = logits / math.sqrt(d_k)
+    # 3) 掩码：填充位置的分数置为极小值，softmax 后权重精确为 0
+    if mask is not None:
+        logits = logits.masked_fill(mask == 0, -1e9)
+    # 4) 归一化：把分数变成"注意力分布"（非负、和为 1）
+    weights = torch.softmax(logits, dim=-1)
+    # 5) 加权聚合：得到"按需求筛选后的实体信息"
+    context = torch.einsum("be,bed-&gt;bd", weights, v)
+    return context, weights     # weights 回传，用于监控与可解释性分析</code></pre>
+    <p>解读：五行公式对应五个工程决定。打分用 einsum 表达"批量内每个样本的 query 和 E 个实体做点积"，避免显式循环。<strong>缩放因子 √d_k 不是可选项</strong>：d_k = 64 时，标准正态输入的内积标准差约 √64 = 8，softmax 在 8 的尺度上已经接近 one-hot，梯度几乎为零，训练会莫名其妙地"卡在第一轮"，function 输出恒定。掩码用 <code>-1e9</code> 这个有限大负数：真实训练中 −inf 可能带来 NaN（尤其混合精度），−1e9 经 softmax 后数值为 0 且安全。<code>mask == 0</code> 的约定要与片段 1 的输出对齐（1 = 真实），写反会让策略只盯着填充位，症状是注意力权重分布几乎均匀、且性能随 E<sub>max</sub> 增大而恶化。返回值把 <code>weights</code> 一并给出：训练日志里记录它的熵（衡量"选择性"）与 argmax（看关注对象是否合理），是这种架构最廉价的调试通道。</p>
+
+    <p><strong>片段 3：注意力策略网络（单 query + 池化 + 决策头）</strong></p>
+    <pre class="code"><code>import torch
+import torch.nn as nn
+
+class AttentionPolicy(nn.Module):
+    # 结构：自身编码（MLP） + 注意力读取（对实体） + 融合决策
+    def __init__(self, self_dim=14, token_dim=8, hidden=64, act_dim=2):
+        super().__init__()
+        self.self_enc = nn.Sequential(nn.Linear(self_dim, hidden), nn.Tanh())
+        # Q/K/V 三组投影：同一组参数处理所有实体（参数共享 = 置换不变的基础）
+        self.q_proj = nn.Linear(hidden, hidden)
+        self.k_proj = nn.Linear(token_dim, hidden)
+        self.v_proj = nn.Linear(token_dim, hidden)
+        self.head = nn.Sequential(
+            nn.Linear(hidden * 2, 256), nn.Tanh(),
+            nn.Linear(256, 256), nn.Tanh(),
+            nn.Linear(256, act_dim),
+        )
+
+    def forward(self, self_obs, tokens, mask):
+        # self_obs: (B, self_dim)；tokens: (B, E, token_dim)；mask: (B, E)
+        h = self.self_enc(self_obs)
+        q = self.q_proj(h)                       # 查询来自"我"
+        k = self.k_proj(tokens)                  # 键来自实体
+        v = self.v_proj(tokens)                  # 值来自实体
+        context, weights = scaled_dot_product_attention(
+            q, k, v, mask=mask.unsqueeze(1).float())     # 复用片段 2 的函数
+        z = torch.cat([h, context], dim=-1)              # 自身信息 + 世界信息
+        action = torch.tanh(self.head(z))                # 动作限幅到 [-1, 1]
+        return action, weights</code></pre>
+    <p>解读：这个网络的精髓在"两条信息流汇合"的布局。自身编码走一条独立 MLP：机器人的速度、目标相对位姿这些"与我有关但不属于任何实体"的信息不需要经过注意力，把它们塞成"一个特殊实体"会让 token 语义混乱（实践中很常见，效果也差）。Q/K/V 投影：query 的输入维度是 hidden（来自自身），key/value 的输入是 token_dim（原始实体特征），两者维度不同没问题，只要投影后统一到 hidden，注意力的匹配发生在投影后的空间里。<code>mask.unsqueeze(1)</code>：mask 是 (B, E)，而打分 logits 是 (B, E)，这里保留一个广播维度是为了兼容多头形状（header 数作为中间维），单头时等价于直接传。<code>weights</code> 从策略里透出用于监控（白盒思想见设计部分）。融合头把两路特征拼接后进 MLP：这是"决策时既看自己、又看世界"的最小实现；更复杂的融合（GitHub 上常见的 cross-attention 堆叠两层）在实体非常多时才值得。最后提醒维度预算：hidden=64 加 256×2 MLP 的参数量约 15 万，与 043 章激光版相当，注意力的代价不在参数，而在实现与调试复杂度。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>忘记掩码</strong>：填充 token 分走注意力，E<sub>max</sub> 越大性能越差。症状是"实体少的回合反而更容易失败"。修复：masked_fill 置极小；并在打分层写单测，含填充位的样本中填充位注意力权重应为 0。</li>
+      <li><strong>mask 语义写反</strong>：1 = 填充、0 = 真实，与代码里的 <code>mask == 0</code> 约定冲突。修复：全流程统一"1 = 有效"约定，并在实体构建函数里加断言（mask.sum() 应等于实体数量）。</li>
+      <li><strong>缩放项缺失</strong>：不除以 √d<sub>k</sub>，dim 越大 softmax 越饱和；症状是训练一开始损失就不动。修复：缩放写死在注意力函数内部，不交给调用方选择。</li>
+      <li><strong>实体特征量纲不统一</strong>：位置（米）与类型（0/1）混在一起且不归一化，评分被大数量级维度主导。修复：逐通道归一化到相近量程（位置 /5、速度 /2），类型嵌入用训练好的小向量（或 one-hot 乘 1.0）。</li>
+      <li><strong>顺序抖动</strong>：实体按实例遍历的天然顺序排列，同一局面每帧顺序可能不同，注意力权重与网络层间的不变性被稀释。修复：按距离或 ID 稳定排序，并对排序本身做时间平滑（迟滞排序）。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>让评估集的障碍数超过训练时的最大值（训练 3–10，评估 12–15），对比注意力策略与实体拼接策略的到达率衰减。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>拼接策略在超过 E<sub>max</sub> 后必然截断信息；注意力策略的衰减更平缓。看两条曲线的交叉点，它告诉你 E<sub>max</sub> 该设多大。</div></details>
+      </li>
+      <li>把注意力权重（weights）输出为日志：计算熵与 argmax，验证"距离最近的障碍"占了多少比例的注意力权重。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>未训练时熵接近 ln(E)；训练后熵下降、argmax 与最近障碍一致率上升。如果熵始终不降，检查 k/v 投影是否被冻结或学习率过低。</div></details>
+      </li>
+      <li>把类型嵌入去掉（所有实体共享一类），预测并验证"障碍与队友混淆"的行为。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>没有类型区分时，策略对"队友动态"与"静态障碍"一视同仁；观察它在队友靠近时是否表现出过度避让或干脆对撞。</div></details>
+      </li>
+      <li>把单头注意力换成 2 头并拼接，对比参数量、推理耗时与样本效率。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>多头在实体类型多样时有收益（不同头关注不同关系）；本任务实体同质，收益可能很小，正好演示"结构复杂度要匹配任务复杂度"。</div></details>
+      </li>
+      <li>设计一个"注意力可解释性"的运行时检查：写出你会在真机上监控的三个量（权重排序、熵、与最近实体的重合率），并给出各自的报警阈值与处置动作。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>常用组合：最危险实体未进前二报警（降速）、注意力熵突然升高报警（分布异常/传感器异常）、重合率长期低于 0.5 报警（特征或训练问题）。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>固定拼接观测受三个限制：数量固定、顺序敏感、无关系结构；注意力以可变长、置换不变、显式两两交互回应。</li>
+      <li>缩放点积注意力五步曲：QK<sup>T</sup> 打分、除 √d<sub>k</sub> 控制方差、掩码屏蔽填充、softmax 归一化、加权聚合 V。</li>
+      <li>RL 常用单 query 形态：自身状态作 query，实体作 key/value；相对位置 + 类型嵌入构成实体 token；padding 用掩码处理。</li>
+      <li>注意力权重是免费的白盒信号：熵与"最危险实体占注意力"可作为调试与运行时安全检查。</li>
+      <li>选型原则：实体 ≤ 2 固定用拼接；3–5 固定用共享编码拼接；可变长/关系复杂再上注意力，结构复杂度要匹配任务复杂度。</li>
+      <li>下一章进入时序结构：<strong>循环神经网络策略</strong>，把帧堆叠与注意力之外的第三把记忆钥匙讲透，并与 052 章的 POMDP 主线汇合。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch059.html">← 第 059 章：实现多智能体强化学习</a>
+    <a class="next" href="ch061.html">第 061 章：实现循环神经网络策略 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

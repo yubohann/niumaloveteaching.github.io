@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第061章 联合训练中的异步更新 | 具身智能学习课程 · VLA 与世界模型联合训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第四篇 · 训练机制与应用集成</span>
+    <span class="sep">/</span>
+    <span>第 061 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第四篇 · 训练机制与应用集成</div>
+    <h1>第 061 章：联合训练中的异步更新</h1>
+    <p class="lead">本章讲分布式联合训练中的异步更新（Asynchronous Update）机制：梯度为什么会陈旧、陈旧梯度带来多大偏差、怎样用版本号、陈旧度感知学习率与重要性采样把偏差控制在可收敛范围。</p>
+    <ul class="meta">
+      <li>主题：训练机制 / 分布式异步优化</li>
+      <li>关键公式：θ<sub>t+1</sub> = θ<sub>t</sub> − η<sub>t</sub> · g(θ<sub>t−τ</sub>)</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 060 章：世界模型的任务泛化</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解异步更新（Asynchronous Update）在 VLA（Vision-Language-Action）与世界模型（World Model）联合训练中的定位：用并发换吞吐，用偏差换取消同步屏障。</li>
+      <li>掌握陈旧梯度（Stale Gradient）的数学形式，理解偏差与 Hessian 矩阵、参数位移的关系，能解释有界延迟（Bounded Delay）下的收敛条件。</li>
+      <li>掌握陈旧度阈值同步（Stale Synchronous Parallel, SSP）与截断重要性采样（Truncated Importance Sampling）两类修正手段的适用位置。</li>
+      <li>能实现带版本号的梯度提交、陈旧度感知学习率与双缓冲（Double Buffering）参数快照，避免参数撕裂（Torn Read）。</li>
+      <li>会诊断异步训练中的发散与吞吐长尾问题，能设计同步（BSP）、异步（ASP）、SSP 三者对照实验。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>本节说明异步更新针对的训练瓶颈：联合训练中两类网络的算力需求并不一致。世界模型的重建损失可在密集帧数据上大批量快速计算；VLA 策略的动作损失依赖轨迹级 rollout，单步代价高、方差大。若每个训练步都等待最慢的工作进程，加速器利用率受长尾支配。异步更新去掉同步屏障：工作进程读取当前参数、本地计算梯度、立即提交。代价是梯度可能基于旧版本参数，方向不再是当前点的下降方向。本章回答三个问题：偏差能否被界定、修正项写在哪里、工程上怎样避免读写不一致。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 异步随机梯度下降的形式与陈旧度</h3>
+    <p>异步随机梯度下降（Asynchronous Stochastic Gradient Descent, ASGD）的更新式与同步版本只差一个下标。设参数服务器（Parameter Server）维护全局参数 θ，第 t 步合并的梯度来自在版本 t−τ<sub>t</sub> 读取参数的工作进程，则</p>
+    <div class="formula">
+      θ<sub>t+1</sub> = θ<sub>t</sub> − η<sub>t</sub> · g(θ<sub>t−τ<sub>t</sub></sub>)
+      <span class="note">τ<sub>t</sub> ≥ 0 为陈旧度（Staleness），单位是更新步数；τ<sub>t</sub> = 0 退化为同步更新</span>
+    </div>
+    <p>关键结论：<strong>异步更新的偏差等于旧点梯度与当前点梯度之差。</strong>对平滑损失做二阶泰勒展开可得 g(θ<sub>t−τ</sub>) ≈ ∇L(θ<sub>t</sub>) − H<sub>t</sub>Δ，其中 H<sub>t</sub> 为 Hessian 矩阵（二阶偏导矩阵），Δ 为参数位移。曲率越大、位移越大，偏差越显著：在动作头输出层这类高曲率方向，旧梯度持续把参数推离下降方向，表现为损失尖刺。</p>
+
+    <h3>2. 数值算例：偏差与陈旧度、位移的定量关系</h3>
+    <p>取一维二次损失 L(θ) = (c/2)θ<sup>2</sup>，曲率 c = 10，工作点在 θ<sub>t</sub> = 1.0，当前梯度 ∇L(θ<sub>t</sub>) = cθ<sub>t</sub> = 10。学习率 η = 1×10<sup>−3</sup> 时每步参数位移约 η·10 = 0.01，陈旧度 τ 对应的累计位移近似 Δ ≈ τ × 0.01。代入二阶展开 g(θ<sub>t−τ</sub>) ≈ ∇L(θ<sub>t</sub>) − cΔ，得到偏差随 τ 的变化：τ = 2 时 Δ = 0.02、偏差 0.2，占比 2%；τ = 10 时 Δ = 0.1、偏差 1.0，占比 10%；τ = 100 时 Δ = 1.0、偏差 10.0，与真实梯度等大且方向相反。把偏差代回原式可得一条紧凑的结论：</p>
+    <div class="formula">
+      g(θ<sub>t−τ</sub>) ≈ (1 − c τ η) · ∇L(θ<sub>t</sub>)
+      <span class="note">当 cτη &lt; 1 时旧梯度只是被缩放；当 cτη &gt; 1 时方向发生翻转，参数被推向上升方向</span>
+    </div>
+    <p>该式子把发散条件归结为一个乘积：曲率 c、陈旧度 τ、学习率 η 三者共同决定稳定性。曲率 10 与学习率 1×10<sup>−3</sup> 下，临界陈旧度约为 100 步；把学习率提高到 1×10<sup>−2</sup>，临界值降到 10 步；若陈旧度上限设为 4，则学习率必须低于 2.5×10<sup>−2</sup>。数值算例给出了两条实践规则：<strong>偏差占比超过约 10% 后旧梯度的方向不再可信，应收缩步长或丢弃该梯度；提高学习率与放宽陈旧度预算不可同时进行。</strong>这正是有界延迟加步长收缩组合的定量来源。</p>
+
+    <h3>3. 两处修正：学习率缩放与重要性采样</h3>
+    <p>修正手段按损失项的性质分成两类，这是本节最重要的区分。第一类作用在学习率上：步长随 τ 收缩，常用幂律衰减</p>
+    <div class="formula">
+      η<sub>t</sub> = η<sub>0</sub> / (1 + κ · τ<sub>t</sub><sup>1.5</sup>)
+      <span class="note">κ 为衰减系数；幂指数 1.5 使 τ = 1 时几乎不惩罚、τ 较大时快速收缩</span>
+    </div>
+    <p>第二类作用在数据分布上：回放缓冲区（Replay Buffer）中的样本由旧策略 π<sub>old</sub> 产生，涉及策略概率的项（策略梯度、优势加权回归等）需乘以截断重要性比 ρ = min(ρ̄, π<sub>θ</sub>(a|s)/π<sub>old</sub>(a|s))，上截断 ρ̄ 把差异过大样本的权重压回可控范围。行为克隆（Behavior Cloning, BC）类项的回归目标不依赖 θ，重加权意义有限，通常只修正策略梯度项。<strong>把修正写在正确的损失项上比加大修正力度更重要。</strong>在 actor-learner 架构中，V-trace 对时序差分残差（Temporal-Difference Residual）做逐级截断，属于价值估计侧的标准修正。</p>
+
+    <h3>4. 读到一半的参数：内存一致性</h3>
+    <p>异步系统的第二个问题在内存层。若工作进程在参数服务器写入张量的过程中读取，可能得到一半新值一半旧值的参数，称为参数撕裂（Torn Read）。撕裂参数既不属于任何历史版本，也没有对应的修正理论。工程解是版本化快照：写端在后台缓冲区累积更新，读端只看到完整提交的前台快照，提交以整字典级别的指针交换完成。<strong>读写协议的正确性优先于学习率调参。</strong></p>
+
+    <h3>5. 有界延迟下的收敛直觉</h3>
+    <p>设损失为 L-平滑（梯度 Lipschitz 常数为 L），全部梯度满足最大陈旧度 τ<sub>max</sub>，一个保守的步长上界是 η ≤ 1 / (L(1 + τ<sub>max</sub>))。直觉解释：每步的有效下降窗口被延迟占去一部分，步长按最坏延迟打折才能满足充分下降条件（Sufficient Decrease Condition）。该界过于保守，仅作安全上限使用：先按上界的十分之一量级设基准学习率，再依赖 SSP 控制最坏 τ。<strong>无界延迟、无步长收缩、无一致性协议三者同时缺失时，异步训练才会发散。</strong></p>
+
+    <h3>6. 三种同步模式的对照</h3>
+    <p>同步屏障（Bulk Synchronous Parallel, BSP）、纯异步（Asynchronous Parallel, ASP）与有界陈旧同步（Stale Synchronous Parallel, SSP）构成训练机制的三点选择。BSP 每步等待全部进程，无陈旧偏差但被最慢进程拖累；ASP 完全不等待，吞吐最高但陈旧度无上界；SSP 设定延迟预算 τ<sub>max</sub>，只让超预算的快速进程等待，把偏差控制在可修正范围内。三者的工程特性对照如下：</p>
+    <table>
+      <tr><th>维度</th><th>BSP 同步</th><th>ASP 纯异步</th><th>SSP 有界陈旧</th></tr>
+      <tr><td>同步屏障</td><td>每步全体等待</td><td>无</td><td>仅超预算进程等待</td></tr>
+      <tr><td>最坏陈旧度</td><td>恒为 0</td><td>无上界，随集群抖动放大</td><td>不超过 τ<sub>max</sub></td></tr>
+      <tr><td>吞吐</td><td>受最慢进程支配</td><td>接近硬件上限</td><td>介于两者之间，τ<sub>max</sub> = 4 时接近 ASP</td></tr>
+      <tr><td>偏差控制</td><td>不需要修正</td><td>需要步长收缩与重要性比</td><td>小 τ 可用轻微收缩，大 τ 丢弃</td></tr>
+      <tr><td>复现性</td><td>高，位级可复现</td><td>低，结果依赖执行序</td><td>中等，受预算约束</td></tr>
+      <tr><td>适用场景</td><td>小规模、调试阶段</td><td>进程速度均匀且同质</td><td>异质负载的联合训练</td></tr>
+    </table>
+    <p>联合训练的负载异质性来自两处：工作进程的 rollout 长度随任务阶段波动；两类网络的提交频率不同。SSP 用延迟预算把长尾抖动挡在预算之外，是三类模式中与联合训练最匹配的机制。<strong>选择顺序建议为：先用 BSP 建立正确性基线，再切 SSP 观察吞吐收益，ASP 仅在前者收益到顶且进程同质时尝试。</strong></p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>本节给出可落地的异步架构：8 个工作进程（Worker）并行采样与反向，2 个学习者（Learner）消费回放数据训练世界模型，参数服务器统一维护两套参数并按模块分桶提交。数据流为：Worker 拉取快照，本地 rollout 与联合损失反向，按模块提交梯度（附版本号与样本数），服务器判定陈旧度并合并，更新版本号。与第 060 章的差异点：模型结构与损失公式不变，改动全部集中在训练机制层。</p>
+    <table>
+      <tr><th>超参数</th><th>默认值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>工作进程数</td><td>8</td><td>并行采样与反向</td><td>与加速器数量匹配</td></tr>
+      <tr><td>陈旧度上限 τ<sub>max</sub></td><td>4</td><td>SSP 的延迟预算</td><td>吞吐增益在 τ ≤ 4 后趋平</td></tr>
+      <tr><td>基准学习率 η<sub>0</sub></td><td>2×10<sup>−4</sup></td><td>Adam 基准步长</td><td>步长上界的十分之一量级</td></tr>
+      <tr><td>幂律系数 κ</td><td>0.5</td><td>陈旧度衰减强度</td><td>τ = 4 时步长收缩至约 1/5</td></tr>
+      <tr><td>重要性比截断 ρ̄</td><td>2.0</td><td>限制重加权方差</td><td>过大会使方差显著上升</td></tr>
+      <tr><td>快照提交间隔</td><td>50 步</td><td>版本粒度与通信量权衡</td><td>粒度越小陈旧度越精细</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：世界模型与 VLA 为什么分开提交梯度</span>
+      <p>两套参数的最优更新频率不同：世界模型在帧级数据上高频更新，VLA 动作损失依赖轨迹 rollout，天然低频。捆成一次提交会让快的一侧被拖到同一陈旧度。按模块分桶提交后，每个模块维护独立的逻辑时钟，跨模块耦合项（VLA 损失含世界模型前向，世界模型目标含动作条件）的陈旧度由两侧时钟的较大值决定。</p>
+    </div>
+    <h3>SSP 调度的实现要点</h3>
+    <ul>
+      <li><strong>提交队列与条件变量。</strong>服务器为每个工作进程维护待合并队列，合并线程按到达顺序处理；当最快进程的出生版本与最慢进程已合并版本之差达到 τ<sub>max</sub> 时，暂停合并该进程的提交并向其发送等待信号。</li>
+      <li><strong>以逻辑时钟计时。</strong>版本号由服务器在合并后递增，进程之间的进度比较全部基于版本号；用墙钟近似会把通信抖动误判为计算落后。</li>
+      <li><strong>超预算梯度丢弃策略。</strong>版本差超过 τ<sub>max</sub> 的提交直接丢弃，进程收到重拉快照的指令；保留超龄梯度只会让偏差继续累积，丢弃后重新计算的成本低于失控偏差的代价。</li>
+      <li><strong>桶级合并。</strong>梯度按模块与层分组装入缓冲桶，同一桶内的提交按样本数加权平均后再统一应用；桶粒度兼顾通信次数与内存占用，典型取每 10 到 40 个张量一桶。</li>
+      <li><strong>长尾监控。</strong>记录每个进程提交延迟的 P50、P95、P99 分位数，P99 与 P50 的比值超过 3 时说明负载严重不均，需要调整分片策略；调大 τ<sub>max</sub> 只会把不均推迟暴露。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>以下片段以参数服务器式训练框架的公开设计为参照，接口随版本演进。三个片段分别覆盖提交协议、陈旧度修正与读写一致性。</p>
+
+    <p><strong>片段 1：带版本戳的工作进程迭代</strong></p>
+    <pre class="code"><code>import torch
+
+class AsyncWorker:
+    def __init__(self, server, model, worker_id, base_lr=2e-4):
+        self.server = server      # 参数服务器句柄：pull / push 两个原语
+        self.model = model        # 本地副本，承载某一时刻的参数快照
+        self.wid = worker_id      # 工作进程编号：用于给随机种子加偏移
+        self.base_lr = base_lr
+
+    def iteration(self, batch):
+        # pull 返回（参数字典, 版本号）。版本号是陈旧度计算的唯一依据，
+        # 用墙钟时间近似会把通信抖动误算成策略落后
+        params, version = self.server.pull()
+        self.model.load_state_dict(params)
+        # 联合损失：世界模型重建项 + VLA 动作项，本地一次反向
+        loss = self.model.joint_loss(batch)
+        loss.backward()
+        grads = {k: p.grad.detach().clone()
+                 for k, p in self.model.named_parameters() if p.grad is not None}
+        # 提交时附带版本号与样本数：服务器据此判定陈旧度并做加权合并
+        self.server.push(grads, version=version, n_samples=len(batch))
+        return float(loss.detach())</code></pre>
+    <p>解读：<strong>（1）</strong>版本号在 pull 时捕获、push 时原样带回，构成梯度的出生证明；服务器逻辑时钟只在合并后递增，版本差即陈旧度。<strong>（2）</strong>梯度先克隆再提交，否则本地模型被下一次 pull 覆盖时张量已被改写。<strong>（3）</strong>样本数随梯度上传，合并时按样本数加权，避免不同批规模的梯度尺度不可比。</p>
+
+    <p><strong>片段 2：陈旧度感知步长与截断重要性比</strong></p>
+    <pre class="code"><code>def stale_lr_scale(version, server_clock, base_lr=2e-4,
+                   kappa=0.5, max_stale=4):
+    """按陈旧度收缩步长；超过预算的梯度直接丢弃。"""
+    tau = max(0, server_clock - version)      # 已合并更新数减去出生版本
+    if tau &gt; max_stale:
+        return 0.0                            # 交给 SSP 逻辑：等下一轮快照
+    # 幂律比线性更贴合经验曲线：小陈旧度几乎无损，大陈旧度快速保守
+    return base_lr / (1.0 + kappa * tau ** 1.5)
+
+def truncated_is_ratio(logp_cur, logp_old, clip=2.0):
+    """截断重要性比：只用于损失里依赖策略概率的项。"""
+    ratio = torch.exp(logp_cur - logp_old)    # ρ = π_θ(a|s) / π_old(a|s)
+    # 采用上截断：压低极大权重控制方差，保留小于 1 的收缩信息
+    return torch.clamp(ratio, max=clip).detach()</code></pre>
+    <p>解读：<strong>（1）</strong>步长缩放把偏差控制从损失侧搬到优化器侧，通用但无法区分损失项。<strong>（2）</strong>重要性比 detach 后使用，避免引入对旧策略概率的额外梯度路径。<strong>（3）</strong>只做上截断：比值小于 1 时保留以便自然降权。</p>
+
+    <p><strong>片段 3：双缓冲快照消除参数撕裂</strong></p>
+    <pre class="code"><code>import threading
+
+class DoubleBufferedParams:
+    """写端在后台缓冲累积更新，读端永远只看到完整提交过的快照。"""
+    def __init__(self, params):
+        self._front = dict(params)                     # 读端稳定视图
+        self._back = {k: v.clone() for k, v in params.items()}
+        self._lock = threading.Lock()                  # 只保护交换动作
+
+    def apply(self, grads, lr, version):
+        # 学习者在本模块的时钟与全局时钟一致时，才在后台缓冲执行合并
+        for k, g in grads.items():
+            self._back[k] -= lr * g
+
+    def commit(self):
+        # 交换整字典引用，避免逐张量拷贝：交换瞬间完成，读端零等待
+        with self._lock:
+            self._front, self._back = self._back, self._front
+
+    def snapshot(self):
+        # 工作进程拉取引用即可；后续对 _back 的写入不影响已发出的快照
+        return {k: v for k, v in self._front.items()}</code></pre>
+    <p>解读：<strong>（1）</strong>双缓冲把一致性与并发度解耦：读操作无锁，临界区只有一次指针交换。<strong>（2）</strong>snapshot 返回浅拷贝，写端只在后台缓冲上原地更新，读端视图始终自洽。<strong>（3）</strong>该模式同样适用于回放缓冲区与目标网络（Target Network）。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>陈旧度过大导致发散</strong>：症状为损失尖刺、参数范数持续增长。修复：设定 SSP 上限，超过预算的梯度丢弃并要求该进程重新拉取快照。</li>
+      <li><strong>无锁读写导致参数撕裂</strong>：验证损失随机突变且无法复现，单进程复跑正常。修复：双缓冲快照，禁止在发布中的张量上原地写入。</li>
+      <li><strong>旧策略数据不做分布修正</strong>：策略梯度项等价于对已不正确的分布求梯度，策略熵异常下降。修复：随样本存版本号，按 ρ 截断重加权，并为缓冲区设版本窗口。</li>
+      <li><strong>各进程数据顺序高度相关</strong>：使用同一全局种子与同一分片，梯度方差被系统性低估。修复：每进程种子加固定偏移，分片轮转错开。</li>
+      <li><strong>只看平均吞吐忽略长尾</strong>：个别进程提交延迟长，实际陈旧度远超设定上限。修复：监控提交延迟的高分位数，纳入预算核算。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>数值验证：设 L = 50、τ<sub>max</sub> = 4，计算步长上界 1/(L(1+τ<sub>max</sub>))，并与基准 2×10<sup>−4</sup> 比较。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>上界约为 4×10<sup>−3</sup>，基准值约为其 1/20。该上界按最坏延迟推导，极端保守，仅作参考。</div></details>
+      </li>
+      <li>把片段 2 的幂律衰减改为线性 η<sub>0</sub>/(1 + κτ)，κ = 0.5 时计算 τ = 4 与 τ = 6 的收缩系数，预测哪种衰减在延迟突增时更稳健。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>线性版收缩至 1/3 与 1/4，幂律版约为 1/5 与 1/8。幂律对大延迟惩罚更快，抗突增更稳健。</div></details>
+      </li>
+      <li>推导题：对损失 L(θ) 在 θ<sub>t</sub> 处做二阶泰勒展开，证明 E[g(θ<sub>t−τ</sub>)] − ∇L(θ<sub>t</sub>) ≈ −H<sub>t</sub>Δ，并说明为什么曲率大的方向上陈旧偏差才显著。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>对 ∇L(θ<sub>t</sub> − Δ) 展开得 ∇L(θ<sub>t</sub>) − H<sub>t</sub>Δ。H 在平坦方向特征值接近零，偏差可忽略；在陡峭方向偏差按曲率放大。</div></details>
+      </li>
+      <li>实验设计：固定 8 个工作进程，比较 BSP、无修正 ASP、SSP（τ<sub>max</sub> = 4）三种模式，绘制样本量与验证损失的关系曲线并记录参数服务器头部阻塞时间。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>以同一样本量对齐横轴才能公平比较：BSP 样本效率高但吞吐低，ASP 吞吐高可能后期劣化，SSP 居中且最坏延迟受控。</div></details>
+      </li>
+      <li>设计题：世界模型与 VLA 以 2:1 的提交频率异步更新，且 VLA 损失含世界模型前向项。设计跨模块版本协议：如何定义逻辑时钟、交叉项陈旧度取什么值、样本如何标注版本。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>模块独立时钟，交叉项陈旧度取两侧时钟差的最大值；样本同时标注两模块版本；世界模型提交后使 VLA 的缓存特征失效。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>异步更新用陈旧梯度换吞吐，偏差约等于 −HΔ，由曲率与参数位移共同决定。</li>
+      <li>修正分两层：学习率侧按 τ 幂律收缩，分布侧对策略概率项做截断重要性比修正。</li>
+      <li>正确性优先：双缓冲快照消除参数撕裂，版本号是陈旧度与回放样本一致性的共同锚点。</li>
+      <li>有界延迟与步长收缩共同保证收敛直觉：η ≤ 1/(L(1+τ<sub>max</sub>))，实践中取其上界的十分之一量级。</li>
+      <li>下一章从进程维度转向模型内部：<strong>VLA 策略的贝叶斯推断</strong>，在动作输出上维护后验分布并驱动不确定性感知的决策。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch060.html">← 第 060 章：世界模型的任务泛化</a>
+    <a class="next" href="ch062.html">第 062 章：VLA策略的贝叶斯推断 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

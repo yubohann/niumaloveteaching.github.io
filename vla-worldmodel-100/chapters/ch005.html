@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第005章 联合训练中的损失函数设计 | 具身智能学习课程 · VLA 与世界模型联合训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · 基础框架与联合训练</span>
+    <span class="sep">/</span>
+    <span>第 005 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · 基础框架与联合训练</div>
+    <h1>第 005 章：联合训练中的损失函数设计</h1>
+    <p class="lead">本章把 001 章的单一权重深化为一套损失设计方法：量纲归一化、不确定性自适应加权、多步预测的时域折扣、变长数据的掩码，以及两路损失必须分项监控的工程纪律。</p>
+    <ul class="meta">
+      <li>主题：联合训练 / 损失设计</li>
+      <li>关键公式：L = Σ<sub>i</sub> [ (1/2σ<sub>i</sub><sup>2</sup>)·L<sub>i</sub> + log σ<sub>i</sub> ]</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 004 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解联合训练中两路损失在量纲、曲率、有效梯度上的异质性，明确单一固定权重的失效边界。</li>
+      <li>掌握运行统计归一化（Running Normalization）让权重可解释的方法。</li>
+      <li>掌握不确定性加权（Uncertainty Weighting）的目标函数与推导直觉，理解其坍缩风险与防护手段。</li>
+      <li>掌握多步预测损失的时域折扣设计，能给折扣系数选择提供量化依据。</li>
+      <li>能正确实现变长数据的掩码损失，并完成至少一次两路损失的分项监控实验。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>001 章给出了 L<sub>joint</sub> = L<sub>wm</sub> + λ·L<sub>policy</sub> 的形式，并指出第一调控旋钮是两路损失的相对尺度。本章回答“尺度具体怎么调”。<strong>两路损失的数值量级、梯度曲率、有效样本数都不相同，用单一常数权重覆盖整个训练过程，等价于把平衡问题全部推给手工搜索。</strong></p>
+    <p>典型失配场景：像素预测损失以归一化像素为单位，动作损失以归一化动作为单位，早期两者量级相差可达十倍；训练中期预测任务先收敛，其梯度自动衰减，动作任务开始主导，固定 λ 在前后两个阶段各自失衡。损失设计的任务是把“相对尺度”变成可估计、可自适应、可监控的量。</p>
+    <p>本章是后续机制的公共底座：006–008 章为生成数据加置信度权重，015 章为内在奖励留接口，037 章容纳价值项。<strong>先把损失工具箱建完整，后续章节只做增项。</strong></p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 两路损失的异质性</h3>
+    <p>预测损失与策略损失至少在三个维度上不可比：量纲（像素误差与动作误差）、曲率（L1 的常数梯度与 Huber 的分段梯度）、有效样本（每个窗口的预测目标有 H·m 个像素块，动作目标只有 H·d<sub>a</sub> 个标量）。<strong>参数量级的差异会让共享主干在早期偏向某一路，收敛后偏向另一路，固定权重无法同时满足两个阶段。</strong></p>
+    <div class="formula">
+      L<sub>joint</sub> = λ<sub>wm</sub>·L<sub>wm</sub> + λ<sub>pol</sub>·L<sub>policy</sub>
+      <span class="note">本章把单一 λ 展开为每路一个系数；下一节的归一化与自适应方法都作用在这组系数上</span>
+    </div>
+
+    <h3>2. 运行统计归一化</h3>
+    <p>最简单的可控方案是先把每项损失除以自身的滑动平均量级：</p>
+    <div class="formula">
+      L̃<sub>i</sub> = L<sub>i</sub> / (EMA(L<sub>i</sub>) + ε)
+      <span class="note">EMA 为指数滑动平均（动量 0.99）；ε 取 1e-8 防除零</span>
+    </div>
+    <p>归一化后所有损失项处在“相对自身近期水平”的同一尺度，λ 从“量纲换算系数”变成“纯相对权重”，可以跨任务、跨数据规模迁移。注意两点：<strong>其一，归一化移除了损失量级信息，梯度裁剪仍需保留；其二，滑动统计要用 detach 后的数值，避免统计量本身携带梯度形成反馈回路。</strong></p>
+
+    <h3>3. 不确定性加权</h3>
+    <p>更进一步的方案让权重自身成为可学习参数。把第 i 项损失视为一个高斯似然的负对数，噪声标准差 σ<sub>i</sub> 未知：</p>
+    <div class="formula">
+      L = Σ<sub>i</sub> [ (1/2σ<sub>i</sub><sup>2</sup>)·L<sub>i</sub> + log σ<sub>i</sub> ]
+      <span class="note">实现时常令 s<sub>i</sub> = log σ<sub>i</sub><sup>2</sup>，损失写作 0.5·exp(-s<sub>i</sub>)·L<sub>i</sub> + 0.5·s<sub>i</sub></span>
+    </div>
+    <p>两项的作用方向相反：第一项让损失大的任务获得小权重（精度项 exp(-s<sub>i</sub>) 随 s<sub>i</sub> 增大而减小），第二项 log σ<sub>i</sub> 惩罚权重过小（σ<sub>i</sub> 过大）。平衡点是 σ<sub>i</sub><sup>2</sup> ≈ L<sub>i</sub>，即权重自动校准到损失的当前量级，与手工归一化殊途同归，但过渡由梯度驱动且逐样本自适应。<strong>主要风险是坍缩：某一任务的 σ 持续增大、梯度贡献趋零，模型实质放弃该任务。</strong>防护手段是对 s<sub>i</sub> 设上界（如 log 20），并在监控中强制检查每路损失是否仍在下降。</p>
+
+    <h3>4. 多步预测的时域折扣</h3>
+    <p>世界模型在 m 步展开上求和时，远端步骤的监督信噪比更低：误差累积使 ô<sub>t+k</sub> 的梯度经过 k 次动力学 Jacobian 连乘，方差随之放大。时域折扣给远端项降权：</p>
+    <div class="formula">
+      L<sub>wm</sub> = Σ<sub>k=1..m</sub> γ<sup>k-1</sup> · ℓ(ô<sub>t+k</sub>, o<sub>t+k</sub>)
+      <span class="note">γ 取 0.9 起步，即第 m=8 步权重约为首步的 0.48；γ 过低会退化为短视模型</span>
+    </div>
+    <p>折扣的边界由任务决定：需要长程规划的任务（014、089 章）要求 γ 不低于 0.8；只做短程预测的任务可以下调以稳定训练。<strong>替代方案是先单步后多步的课程式调度，让训练阶段逐段放开时域范围</strong>，它与常数折扣手段正交，可以叠加使用。</p>
+
+    <h3>5. 掩码与逐项监控</h3>
+    <p>变长 episode 的补齐步、无效的夹爪通道、被裁剪的预测超界位置都属于无效监督，必须用掩码剔除，否则模型会拟合人为构造的零值。工程上有两条纪律与损失设计同等重要：<strong>其一，损失函数始终返回分项字典，任何训练日志都能回答“此刻哪一路在主导”；其二，权重参数（λ 或 s<sub>i</sub>）的变化曲线与损失曲线同时展示，用于分辨“任务收敛导致的权重漂移”与“权重漂移掩盖的任务停滞”。</strong></p>
+
+    <h3>6. 推导：不确定性加权的闭式平衡点</h3>
+    <p>把第 3 节的公式推导补完整。设单样本输出服从 N(f(x), σ<sup>2</sup>)，负对数似然为：</p>
+    <div class="formula">
+      -log p(y|x) = (y - f(x))<sup>2</sup>/(2σ<sup>2</sup>) + log σ + (1/2)·log(2π)
+      <span class="note">前两项依赖 σ，末项为与 σ 无关的常数；对全数据取期望时把 (y-f)<sup>2</sup> 的均值记作 L<sub>i</sub></span>
+    </div>
+    <p>对期望损失 L<sub>i</sub>/(2σ<sup>2</sup>) + log σ + C 关于 σ 求导得 -L<sub>i</sub>/σ<sup>3</sup> + 1/σ = 0，解得 σ<sup>2</sup> = L<sub>i</sub>。平衡点处该任务的似然项取 1/2 + (1/2)·log L<sub>i</sub>，权重自动校准到损失量级。令 s = log σ<sup>2</sup> 改写为目标 0.5·e<sup>-s</sup>L<sub>i</sub> + 0.5·s，其梯度 -0.5·e<sup>-s</sup>L<sub>i</sub> + 0.5 = 0 给出同一平衡点，两种写法等价。</p>
+    <p>用数值验证这组公式。取 L<sub>i</sub> = 2.0：σ<sup>2</sup> = 2 时目标值 0.8466；σ<sup>2</sup> = 1 时为 1.0，σ<sup>2</sup> = 4 时为 0.9431，平衡点两侧的目标值都升高，位置与理论解一致。上界防护的数字在此看清：s<sub>i</sub> 取上限 log 20 时 σ<sup>2</sup> = 20，精度权重 e<sup>-s</sup>/2 降到 1/40，该路损失只按 2.5% 的强度参与合计；继续增大 s 收益极小，任务被实质搁置，上界把这种行为限制在可查可测的状态。</p>
+
+    <h3>7. 数值算例：折扣档位与滑动窗口</h3>
+    <table>
+      <tr><th>γ</th><th>第 8 步权重</th><th>八步权重和</th><th>有效视界 1/(1-γ)</th></tr>
+      <tr><td>0.8</td><td>0.210</td><td>4.16</td><td>5 步</td></tr>
+      <tr><td>0.9（默认）</td><td>0.478</td><td>5.70</td><td>10 步</td></tr>
+      <tr><td>0.95</td><td>0.698</td><td>6.73</td><td>20 步</td></tr>
+      <tr><td>0.99</td><td>0.932</td><td>7.73</td><td>100 步</td></tr>
+    </table>
+    <p>读法：γ=0.8 时第 8 步权重只有首步的 21%，监督重心贴近近端，较长结构不参与塑造；γ=0.99 时第 8 步仍有 93% 权重，各步接近等权，远端梯度方差几乎没有衰减。默认值 0.9 在 m=8 下的权重和为 5.70，等效于把八步监督折算成约 5.7 步等权监督，误差放大与信息密度大致成对。</p>
+    <p>运行归一化的时间常数同样可算。动量 0.99 的滑动平均在第 n 步后残留 0.99<sup>n</sup>：69 步后传导一半，100 步后残留约 0.366，230 步后残留约 0.1，与正文所述“约百步窗口”一致。时间常数过短会让归一化尺度随小批量抖动，每次都在噪声上重标定权重；过长时量级变化滞后一个阶段，早该降权的项仍在主导合计。</p>
+    <p>折扣的时间尺度用半衰期表述更直观：权重每步乘以 γ，半衰期为 log 2 / log(1/γ)。γ=0.8 时约 3.1 步，γ=0.9 时约 6.6 步，γ=0.95 时约 13.5 步。把展开从 8 步延长到 15 步时，γ=0.9 的权重和从 5.70 升到 7.94，新增部分占 39.4%，几乎全部集中在第 9 到 15 步。这组数字解释了一个常见困惑：延长视界带来的监督增量不低，但新增步骤的梯度经过更多次动力学放大，收益与风险同时上升。工程上把 γ 与 m 登记为成对超参数并同表调参，单独改动其中一项都会改变远端信噪比，可能让此前标定的权重失效。</p>
+
+    <h3>9. 三路权重合成的数值形态</h3>
+    <p>005 章的设施会在后续章节与来源权重、置信度权重叠加。提前核对一次三路合成：优先采样修正权重 0.8、想象来源标记权重 0.2、预测置信度 0.6，三者相乘得到单样本总权重 0.096，四舍五入约 0.1。相乘的语义是“任何一路低都压低该样本贡献”，与取最小值的效果接近而更平滑。注意权重的尺度还要经批次内归一化（除以权重和），否则总权重整体缩小会等效降低学习率，与优化器配置纠缠。</p>
+    <p>先用固定权重加运行归一化跑基线时，可以对照两组数字确认归一化的作用：原始损失 L<sub>wm</sub> = 2.0、L<sub>policy</sub> = 0.2 时，未经归一化的 λ=0.5 让策略只占合计的 4.8%（001 章算例）；各自除以自身滑动平均后两路同在 1 附近，λ=0.5 对应的贡献比例为 1 : 0.5，策略占比 33.3%。<strong>同一套权重参数，在归一化前后对应完全不同的训练动态，实验记录中必须注明是否启用归一化。</strong></p>
+    <p>掩码与梯度噪声的关系给出最后一组数字：批量 128、有效掩码比例 0.7 时，单批贡献梯度的样本约 90 个，梯度方差按 1/90 缩放；有效比例长期低于 0.5 时等效批量折半，梯度方差翻倍，标准差约 1.41 倍，学习率的标定条件随之改变。工程处理是让组批阶段按有效长度分桶、把掩码比例稳定在高位，省去在损失层反复调参补偿的需要。</p>
+
+    <h3>10. 边界与失效模式</h3>
+    <ul>
+      <li><strong>平衡点假设被破坏</strong>：σ<sup>2</sup> = L<sub>i</sub> 的推导假设损失是对数似然，Huber 与感知损失不是概率量，平衡点只有相对意义。修复：非似然损失先归一化再接自适应当前方法，或直接改用固定权重加归一化。</li>
+      <li><strong>双路同时收缩</strong>：不确定性加权允许两路都放大 σ，若两路都接近上界，总损失被常量项主导，参数更新几乎停止。监控手段是同时观察两路 s 值，两路同贴上限即回退固定权重。</li>
+      <li><strong>空掩码批次</strong>：变长数据中偶尔整批没有可训练位置，损失分母为零。代码层已用 clamp 兜底，训练层还需要跳过空批次并计数，计数升高说明窗口设置与数据长度不匹配。</li>
+      <li><strong>课程调度与固定折扣叠加</strong>：先单步后多步的课程与固定折扣同时启用时，早期两套机制都在压缩远端权重，多步能力形成滞后。修复：两者只启用一个，或把课程时间表与 m 的增长显式绑定。</li>
+      <li><strong>权重记录口径不一致</strong>：监控记录归一化后的权重，历史实验按原始损失标定过权重，跨实验比较时结论互相矛盾。修复：日志同时保留原始损失、归一化损失与最终权重三列，任何对比先在损失口径上对齐。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>落地顺序：先用固定权重加运行归一化跑通基线，两路损失明显此消彼长时再切不确定性加权；多步折扣先取 0.9 再按分项指标微调。方案对比如下表。</p>
+    <table>
+      <tr><th>方案</th><th>参数量</th><th>优点</th><th>风险</th></tr>
+      <tr><td>固定权重</td><td>0</td><td>简单可复现</td><td>跨阶段失衡，需手工搜索</td></tr>
+      <tr><td>运行归一化</td><td>0</td><td>权重可解释、迁移性好</td><td>需维护滑动统计</td></tr>
+      <tr><td>不确定性加权</td><td>每路 1 个</td><td>逐样本自适应</td><td>坍缩风险，需上界防护</td></tr>
+      <tr><td>课程式调度</td><td>0</td><td>阶段性目标清晰</td><td>调度表依赖实验</td></tr>
+    </table>
+    <h3>关键参数起点</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>初始权重 λ</td><td>0.5</td><td>策略损失相对权重</td><td>与 001 章一致，归一化后可迁移</td></tr>
+      <tr><td>折扣系数 γ</td><td>0.9</td><td>预测时域折扣</td><td>m=8 时末步权重约 0.48</td></tr>
+      <tr><td>EMA 动量</td><td>0.99</td><td>量级统计平滑度</td><td>覆盖约百步窗口，兼顾灵敏与稳定</td></tr>
+      <tr><td>s<sub>i</sub> 上界</td><td>log 20</td><td>防权重坍缩</td><td>等效最小权重约 1/20</td></tr>
+      <tr><td>预测步长 m</td><td>8</td><td>多步监督长度</td><td>与全课程约定一致</td></tr>
+      <tr><td>批量大小</td><td>128</td><td>梯度估计方差</td><td>损失量级统计的稳定前提</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：自适应加权建立在分项监控之上</span>
+      <p>自适应方法的输出是权重轨迹，没有分项监控无法判断其合理性。工程顺序必须是“先加监控、再开自适应”，并保留切回固定权重的开关供对照。该纪律适用于本章全部方案。</p>
+    </div>
+    <p>衔接与差异：001 章只给出两项相加的形态；本章补齐归一化、自适应与折扣；009 章从梯度视角解释这些权重为何有效；008 章会为想象数据新增置信度加权项，直接复用本章的归一化设施。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>片段以公开的多任务学习与不确定性加权实现为参照，接口随版本演进。第 1 段给出运行统计归一化。</p>
+
+    <p><strong>片段 1：运行统计归一化</strong></p>
+    <pre class="code"><code>class LossNormalizer:
+    """按运行时滑动统计归一化各损失项，让权重与损失量纲解耦。"""
+    def __init__(self, momentum=0.99, eps=1e-8):
+        self.momentum, self.eps = momentum, eps
+        self.scale = {}                       # 每项维护独立的滑动尺度
+
+    def __call__(self, name, loss):
+        # 用指数滑动平均跟踪量级；detach 切断统计量与损失图的梯度联系
+        s = self.scale.get(name, 0.0)
+        s = self.momentum * s + (1 - self.momentum) * float(loss.detach())
+        self.scale[name] = s
+        # 除以自身近期量级：所有项回到同一尺度，权重参数可跨任务迁移
+        return loss / (s + self.eps)</code></pre>
+    <p>解读：<strong>（1）</strong>统计量用 Python 浮点保存，能避免占显存，也让归一化系数不参与反向传播。<strong>（2）</strong>动量 0.99 对应约百步的有效窗口：窗口过短会让权重随小批量波动跳变，过长则跟不上训练阶段的切换。<strong>（3）</strong>归一化不改变损失的相对趋势，只压缩量级；调试时同时打印原始值与归一化值，防止“除以零附近的稳定性假象”。</p>
+
+    <p><strong>片段 2：不确定性加权模块</strong></p>
+    <pre class="code"><code>import torch
+import torch.nn as nn
+
+class UncertaintyWeighting(nn.Module):
+    """不确定性加权：每项损失配对可学习对数方差，自动平衡尺度。"""
+    def __init__(self, names=("world", "policy"), s_max=3.0):
+        super().__init__()
+        self.s_max = s_max                    # s 上界约 log 20，防权重坍缩
+        # 零初始化等价于初始每路权重为 1：起步行为与等权基线一致，便于对照
+        self.log_sigma = nn.ParameterDict(
+            {n: nn.Parameter(torch.zeros(())) for n in names})
+
+    def forward(self, losses):
+        total = torch.zeros((), device=next(self.parameters()).device)
+        parts = {}
+        for name, loss in losses.items():
+            # 上界截断在梯度路径上生效：越界后该路权重不再继续缩小
+            s = torch.clamp(self.log_sigma[name], max=self.s_max)
+            # 高斯负对数似然：精度项压低大损失权重，对数项防止 σ 无限放大
+            total = total + 0.5 * torch.exp(-s) * loss + 0.5 * s
+            parts[name] = float(loss.detach())
+            parts[f"s_{name}"] = float(s.detach())
+        return total, parts</code></pre>
+    <p>解读：<strong>（1）</strong>上界用 clamp 直接实现，任何时刻权重都在安全区间，训练曲线可解释。<strong>（2）</strong>s 的值一并返回监控，与损失曲线联合观察即可识别坍缩征兆：某路 s 贴到上界且损失不再下降。<strong>（3）</strong>ParameterDict 的参数量极小（每路 1 个），不构成对主干容量的挤占；优化器需为它配置与主干同量级的学习率。</p>
+
+    <p><strong>片段 3：多步折扣与掩码的组合损失</strong></p>
+    <pre class="code"><code>def joint_loss_v2(act_pred, act_gt, frame_preds, frames_gt, mask,
+                  weighting, gamma=0.9):
+    """多步预测按时域折扣求和，策略损失按有效步掩码加权。"""
+    # 世界模型损失：预测越远信噪比越低，用 γ 的幂次压缩远期项权重
+    l_wm = frame_preds.new_zeros(())
+    for k, (pred, gt) in enumerate(zip(frame_preds, frames_gt), start=1):
+        l_wm = l_wm + (gamma ** (k - 1)) * nn.functional.l1_loss(pred, gt)
+    # 策略损失：变长 episode 的补齐步不贡献梯度，用掩码逐样本剔除
+    per_step = nn.functional.huber_loss(act_pred, act_gt, reduction="none").mean(-1)
+    l_pol = (per_step * mask).sum() / mask.sum().clamp(min=1.0)
+    # 两路经归一化或自适应加权合成；分项字典贯穿整个训练日志
+    total, parts = weighting({"world": l_wm, "policy": l_pol})
+    return total, parts</code></pre>
+    <p>解读：<strong>（1）</strong>折扣系数以闭式幂次施加在每一项上，避免在外层对整体求和后再缩放，保证每步的贡献可单独审计。<strong>（2）</strong>掩码分母用 clamp 兜底，空掩码批次不产生除零异常。<strong>（3）</strong>weighting 既可以是固定权重字典，也可以传入片段 2 的模块，接口统一使消融实验只改一处配置。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>自适应权重坍缩</strong>：某一路的 s 贴住上界、损失曲线走平。修复：收紧上界、给该路加最小权重下限，或在训练早期先冻结权重参数。</li>
+      <li><strong>归一化掩盖异常</strong>：损失爆炸被滑动统计同步放大后归一化值看似平稳，日志失去报警能力。修复：原始值与归一化值成对打印，告警逻辑挂在原始值上。</li>
+      <li><strong>掩码方向写反</strong>：有效步被剔除、补齐步参与训练，损失曲线异常平滑而验证失败。修复：用“掩码全一”的单元测试对比总损失，等价性通过后再接入真实掩码。</li>
+      <li><strong>折扣过强导致短视</strong>：γ 调到 0.5 以下，远端步骤梯度可忽略，多步预测能力退化。修复：按任务规划长度设定 γ 下界（长程任务不低于 0.8）。</li>
+      <li><strong>权重与学习率耦合误调</strong>：放大权重等效放大该路学习率，与主干学习率调节叠加产生震荡。修复：一次只调一个旋钮，把权重变化与学习率变化记录在实验配置中。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>设初期预测损失为 2.0、动作损失为 0.2，先做归一化再乘权重 0.5，计算两路归一化后的等效比例，并与不做归一化的原比例对比。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>归一化后两路都归到 1 附近，比例约 1:0.5；原比例 10:1 使预测主导，差异即量纲问题所在。</div></details>
+      </li>
+      <li>把 γ 从 0.9 改为 0.99，预测侧远期监督强度与训练稳定性各会怎样变化，给出验证指标建议。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>远期权重几乎不衰减，长程指标或改善，但远端梯度方差增大、损失更抖；用第 8 步误差与损失方差评估。</div></details>
+      </li>
+      <li>推导：由高斯似然 N(y; f(x), σ<sup>2</sup>) 出发，说明不确定性加权公式中两项系数 1/2 与正负号的来源。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>负对数似然 = (y-f)<sup>2</sup>/(2σ<sup>2</sup>) + log σ + 常数；把 (y-f)<sup>2</sup> 的期望记作 L<sub>i</sub>，令 s=log σ<sup>2</sup>，即得 0.5·e<sup>-s</sup>L<sub>i</sub>+0.5·s。</div></details>
+      </li>
+      <li>设计实验：在固定 λ、运行归一化、不确定性加权三种配置下训练到相同步数，给出对比指标与判定“某方案更优”的量化标准。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>指标：两路验证损失、下游成功率与训练曲线的稳定区间。更优标准需写成阈值，例如两路验证损失均不劣于基线 2% 且成功率提升 3 个百分点。</div></details>
+      </li>
+      <li>构造掩码错误的复现实验：故意将掩码取反，记录训练损失与验证指标的分歧模式，总结一条用于日常检查的断言。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>取反后训练损失略降、验证显著变差，且补齐步占比越高分歧越大。断言：随机抽取批次，验证掩码为 1 的步数与 episode 实际长度一致。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>两路损失在量纲、曲率、有效样本上不可比，固定权重需要被更系统的机制替代。</li>
+      <li>运行归一化把权重变成可解释、可迁移的相对系数，统计量必须 detach 并保留梯度裁剪。</li>
+      <li>不确定性加权让权重逐样本自适应，理论平衡点为 σ<sup>2</sup> ≈ L，必须设置上界防坍缩。</li>
+      <li>多步预测按时域折扣加权，γ 默认 0.9，长程任务设 0.8 下界。</li>
+      <li>掩码与分项监控是损失设计的组成部分，<strong>先监控、再自适应</strong>是工程纪律。</li>
+      <li>下一章开始使用这套损失设施：用世界模型生成想象轨迹。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch004.html">← 第 004 章：VLA策略网络生成动作指令</a>
+    <a class="next" href="ch006.html">第 006 章：使用世界模型生成想象轨迹 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

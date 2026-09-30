@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第013章 联合训练中的经验回放机制 | 具身智能学习课程 · VLA 与世界模型联合训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · 基础框架与联合训练</span>
+    <span class="sep">/</span>
+    <span>第 013 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · 基础框架与联合训练</div>
+    <h1>第 013 章：联合训练中的经验回放机制</h1>
+    <p class="lead">本章实现训练数据的存取系统：环形缓冲的存储格式与容量规划、优先采样与重要性修正、多来源分层混合，以及窗口切片的 episode 边界保护。</p>
+    <ul class="meta">
+      <li>主题：联合训练 / 经验回放</li>
+      <li>关键公式：w<sub>i</sub> = (N·P(i))<sup>-β</sup> 优先级修正</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 012 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解经验回放（Experience Replay）在联合训练中的三类职能：来源混合、取样控制、遗忘抑制。</li>
+      <li>掌握环形缓冲（Ring Buffer）的存储格式设计，理解压缩存储与潜变量存储的空间量级差异。</li>
+      <li>掌握优先采样（Prioritized Sampling）的优先级定义与重要性采样（Importance Sampling）修正。</li>
+      <li>会实现多来源分层混合与新旧数据配比，并监控缓冲内的数据构成。</li>
+      <li>能诊断窗口跨界、存储爆炸、优先级偏差三类问题并给出修复。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>008 章管理想象数据的加权消费，本章管理另一侧：真实经验与多来源数据的存取系统。<strong>联合训练的样本需求是多样的：世界模型要长窗口（k+H+m），策略要动作块，新任务要覆盖，旧任务要防遗忘，单一顺序读取数据无法同时满足。</strong>回放机制把这些需求统一到缓冲区与采样器两个组件上。</p>
+    <p>机器人数据的存储成本是硬约束：一帧 224×224 的三通道浮点图像约 0.6 MB，一万条百步轨迹直接落盘就是数百 GB 量级。存储格式的选择（浮点原始帧、压缩编码、潜变量）决定缓冲区能装多少经验，也决定采样带宽。<strong>本章的容量规划与格式选择先于采样策略，因为容量不足时再好的采样策略也没有回旋空间。</strong></p>
+    <p>与相邻章节的分工：002 章是离线数据的静态管线，本章是在线训练期间的数据管理系统；008 章的生成数据以来源标记进入同一缓冲；015 章的探索产生的新经验在此存取；018 章的课程学习通过采样比例调节实现。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 回放的三类职能</h3>
+    <p><strong>来源混合</strong>：把演示数据、在线采集数据、想象数据按比例混合，使批次构成可控且可复现；<strong>取样控制</strong>：从大量历史经验中挑选对当前训练最有价值的样本（高损失样本、稀有状态、新任务样本）；<strong>遗忘抑制</strong>：微调新任务时保留旧任务样本，防止分布漂移导致的灾难性遗忘（Catastrophic Forgetting）。三类职能都由“缓冲区加采样器”的结构承载，区别只在优先级与比例的配置。</p>
+    <p>三类职能与接口一一对应：来源混合对应配额参数，取样控制对应优先级函数，遗忘抑制对应基于时间戳的新旧配比。三项共用同一条采样路径，独立配置，修改任一项不触碰另外两项的实现。优先级自身的刷新也按两级频率执行：被采样样本在批次组装后就地更新（即时性），未采样样本每 5000 步批量刷新一次（控制全表重算开销），两级刷新共同保证优先级的时效性与成本可控。</p>
+
+    <h3>2. 存储格式与容量规划</h3>
+    <p>存储格式按空间量级排列：浮点原始帧（约 0.6 MB/帧）、八位量化图像（约 0.15 MB/帧）、压缩编码（约 0.02 MB/帧）、潜变量（约 1 KB/帧）。</p>
+    <div class="formula">
+      S = N<sub>ep</sub> · T̄ · (s<sub>obs</sub> + s<sub>act</sub>)
+      <span class="note">S 为缓冲容量；N<sub>ep</sub> 为轨迹条数，T̄ 为平均长度，s 为单步字节数</span>
+    </div>
+    <p>把 50 万步的容量代入四种格式，差距立刻展开：224×224×3 的帧在 uint8 下是 150528 字节，float32 是 4 倍即 0.6 MB，两者分别占约 73 GB 与 293 GB；JPEG 级压缩按约 7.5 倍压缩率降到 0.02 MB，占用约 10 GB；潜变量按 8×8 网格 8 通道 fp16 计为 1 KB，占用约 0.5 GB。格式对照见下表。</p>
+    <table>
+      <tr><th>格式</th><th>单帧字节</th><th>50 万步占用</th><th>采样侧成本</th><th>主要风险</th></tr>
+      <tr><td>float32 原始帧</td><td>约 0.6 MB</td><td>约 293 GB</td><td>无解码</td><td>容量不可行</td></tr>
+      <tr><td>uint8 量化</td><td>约 0.15 MB</td><td>约 73 GB</td><td>仅反量化</td><td>精度损失</td></tr>
+      <tr><td>压缩编码</td><td>约 0.02 MB</td><td>约 10 GB</td><td>解码集中在采样侧</td><td>解码抖动、格式耦合</td></tr>
+      <tr><td>潜变量 fp16</td><td>约 1 KB</td><td>约 0.5 GB</td><td>无图像解码</td><td>绑定编码器版本</td></tr>
+    </table>
+    <p>选择依据是采样带宽与解码成本的折中：<strong>潜变量存储最省空间但依赖编码器版本，跨模型迭代失效；压缩图像通用性好，解码成本集中在采样侧；原始帧只在调试期使用。</strong>常见组合是“压缩图像存原始观测 + 潜变量做训练快路径”，索引一次写入、两种视图共享。潜变量视图的版本风险用元数据管理：每条轨迹记录编码器版本号，编码器升级后旧潜变量标记为不可训练快路径、只保留追溯用途，避免新旧版本混用进入同一批次。</p>
+    <p>采样吞吐的瓶颈常在解码环节：压缩图像的解码是 CPU 侧工作，训练进程若同步等待，吞吐随缓冲读取比例下降。工程措施是独立的预取线程与最近帧缓存，缓存工作集按“一个批次窗口涉及的帧数乘以并发批次数”估算；潜变量视图绕开解码，正适合作为高吞吐训练快路径，压缩图像只在需要可视复核与重放时读取。</p>
+
+    <h3>3. 优先采样与重要性修正</h3>
+    <p>均匀采样对历史与信息量不加区分，稀有但关键的样本（成功抓取的接触瞬间）在批次中被稀释。优先采样按优先级 p<sub>i</sub> 取样的概率提升，优先级常用最近一次损失值或预测误差：</p>
+    <div class="formula">
+      P(i) = p<sub>i</sub><sup>α<sub>p</sub></sup> / Σ<sub>j</sub> p<sub>j</sub><sup>α<sub>p</sub></sup> ；w<sub>i</sub> = (N·P(i))<sup>-β<sub>p</sub></sup>
+      <span class="note">α<sub>p</sub> 取 0.6 控制优先级强度；β<sub>p</sub> 从 0.4 缓升到 1.0，修正采样偏差</span>
+    </div>
+    <p>非均匀采样会改变损失期望，偏差需要重要性权重修正：β<sub>p</sub> 从低于 1 的起点缓升到 1，实现“早期多利用优先级、后期回归无偏”。<strong>优先级必须来自可控的统计量</strong>：用最近损失会奖励异常样本，需要裁剪上界；用预测误差则需要固定参考模型，避免优先级随模型漂移自激。</p>
+    <p>五个样本的算例把机制走通：优先级取 [1, 1, 1, 1, 9]，α<sub>p</sub>=0.6 时 9<sup>0.6</sup> ≈ 3.74，采样概率为四个普通样本各 12.9%、稀有样本 48.3%（均匀采样下各为 20%）。重要性权重 (N·P)<sup>-β</sup> 随 β 变化：β=0.4 时稀有样本权重 0.702、普通样本 1.19，权重期望 0.954，残余偏差约 4.6%；β=1.0 时稀有样本 0.414、普通样本 1.548，权重期望恰好为 1，估计无偏。这组数字说明 β 的缓升是“先受益、后还债”：越接近 1，稀有样本的重复采样被权重抵消得越彻底，训练后期回归均匀采样的统计性质。降优先级策略同样必要：样本每次被采样后按新误差重算优先级，长期未被触达的样本按系数 0.995 每千步衰减一次，防止早期的高分样本永久垄断抽样。</p>
+    <p>裁剪的力度用分布算例校准：990 个优先级 1 的样本配 10 个优先级 1000 的异常样本时，99% 分位约 10.99；不裁剪时异常样本合计拿走 38.9% 的采样质量，裁剪后降到 4.1%，与它们 1% 的样本占比同量级。分位阈值等价于“允许异常样本的优先级优势上限”；异常本身占比超过 5% 时裁剪已无约束作用，应先排查优先级统计里的异常来源，再谈采样修正。</p>
+
+    <h3>4. 来源分层与新旧配比</h3>
+    <p>缓冲内数据带来源标签（演示、在线、想象）与时间戳。采样器按两层逻辑工作：先按来源配额分层抽取，再在层内按优先级采样。新旧配比控制时间维度：全部旧数据会让模型跟不上新任务分布，全部新数据会遗忘旧分布，<strong>常规配比是“新数据主、旧数据辅”，辅比从 0.1 起步按遗忘监控上调</strong>。遗忘的监控指标是旧任务验证集的表现，一旦连续下滑即提高旧数据配额。</p>
+    <p>配额的取整必须核对：批量 128、配额 0.6/0.3/0.1 时三层名额为 76.8、38.4、12.8，四舍五入后为 77、38、13，合计恰为 128；换成三等分 1/3 的配额时三名额为 42.67、42.67、42.67，取整合计 129 或 128 取决于规则，实现要把尾数并入最大层，保证总数恒定。长期运行还要核对层出的实际构成：层内优先级采样会让高优先级来源的实际占比偏离配额，监控指标是“每千批次中各来源的实际样本占比”，偏离配额超过两个百分点即检查优先级分布是否被单一来源垄断。</p>
+
+    <h3>5. 窗口切片的边界保护</h3>
+    <p>联合训练的窗口长度 k+H+m 意味着采样单元按“轨迹内区间”划分，粒度高于单步。切片必须保证整个窗口落在同一条 episode 内，<strong>跨界窗口会把不同轨迹的观测与动作拼接，产生的伪样本在损失上无异常但训练出错误的时序依赖</strong>。实现上在入队时预计算每条轨迹的合法锚点区间，出队采样时只在区间内取点。</p>
+    <p>锚点数量与轨迹长度成线性关系，代入片段 1 的公式算三个点：窗口总长 26 时合法锚点数为 n-25。长度不足 26 步的轨迹被直接拒绝，恰好 26 步的轨迹只有 1 个锚点，200 步的轨迹有 175 个锚点。<strong>短轨迹的样本产出密度极低</strong>，而机器人示教中大量轨迹长度集中在 30 到 60 步，这意味着“大部分数据装不进缓冲”是常态。对策有两条：其一，按窗口需求裁剪数据采集规范，让新采集轨迹长度有下界；其二，对短轨迹提供替代消费路径（单步动作监督不要求完整窗口），在缓冲之外单独成批，不与窗口采样混用配额。</p>
+    <p>三类采样模式的偏差与代价可以并列对照，见下表。均匀采样无偏但稀有样本利用率低；优先级加修正在前中期有偏换取利用率，后期趋于无偏；分层加优先级把配额的偏置设计显式化，来源比例可控，层内仍依赖修正权重。选择依据是训练阶段与数据构成，监控口径统一为“实际来源占比加权重期望”两个数。</p>
+    <table>
+      <tr><th>采样模式</th><th>偏差</th><th>稀有样本利用率</th><th>实现代价</th></tr>
+      <tr><td>均匀采样</td><td>无</td><td>低</td><td>无</td></tr>
+      <tr><td>优先级加修正</td><td>前期有偏，β<sub>p</sub> 到 1 后无偏</td><td>高</td><td>优先级维护与权重计算</td></tr>
+      <tr><td>分层加优先级</td><td>配额偏置显式、可控</td><td>高（层内）</td><td>两层实现与取整核对</td></tr>
+    </table>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>缓冲与采样器分工：缓冲负责存储、淘汰与索引（每条轨迹预计算合法窗口区间）；采样器负责来源配额、优先级与修正权重；批次组装器把窗口字段整理成训练张量。三者接口固定，策略与世界模型共享同一缓冲、不同窗口长度。</p>
+    <p>环形覆盖与索引表的一致性是隐蔽错误的温床：覆盖写入时必须同步删除该槽位的优先级记录与来源索引，遗漏时采样到的陈旧优先级会作用到错误样本，权重体系整体失真且表现随机。校验方式是一条不变式：优先级表条目数恒等于当前轨迹数，每次覆盖写入后断言成立，成本一次计数。</p>
+    <h3>关键参数起点</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>缓冲容量</td><td>50 万步</td><td>经验池规模</td><td>按压缩图像存储约百 GB 量级以内</td></tr>
+      <tr><td>存储格式</td><td>压缩图像 + 潜变量</td><td>空间与带宽折中</td><td>潜变量供训练快路径，压缩图像供回溯</td></tr>
+      <tr><td>优先级强度 α<sub>p</sub></td><td>0.6</td><td>采样集中度</td><td>过高会过采样异常样本</td></tr>
+      <tr><td>修正系数 β<sub>p</sub></td><td>0.4 → 1.0</td><td>无偏化进度</td><td>随训练步数线性上调</td></tr>
+      <tr><td>旧数据配额</td><td>0.1</td><td>遗忘抑制</td><td>按旧任务验证表现动态上调</td></tr>
+      <tr><td>淘汰策略</td><td>环形覆盖 + 关键样本保留</td><td>容量管理</td><td>成功轨迹与稀有状态标记为不可淘汰</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：优先级取预测误差</span>
+      <p>动作损失大的样本可能只是动作幅度大，信息量未必高；预测误差大的样本通常对应世界模型未见过的动态，对联合训练更有价值。两类优先级可分别配置给不同阶段：预热期用预测误差，策略期用动作损失与预测误差的加权。优先级来源需要与 005 章的损失分量监控对齐，避免两套统计口径。</p>
+    </div>
+    <p>衔接与差异：002 章的静态管线把数据交给训练循环，本章把数据管理权收进缓冲；008 章的想象样本以来源标记入队；018 章将把来源配额改造成课程式调度，接口不变。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>片段以深度强化学习与机器人数据系统（Replay 机制、RLDS 风格存储）的公开设计为参照，接口随版本演进。第 1 段给出环形缓冲与窗口索引。</p>
+
+    <p><strong>片段 1：环形缓冲与窗口索引</strong></p>
+    <pre class="code"><code>import numpy as np
+
+class RingBuffer:
+    """环形经验缓冲：按轨迹存储，容量满后覆盖最旧轨迹，关键轨迹豁免。"""
+    def __init__(self, capacity=500_000, k_plus=26):
+        self.capacity = capacity
+        self.episodes = []                     # 每条含压缩观测、动作、来源、窗口区间
+        self.total_steps = 0
+        self.cursor = 0                        # 环形写入位置
+        # k_plus 即 k+H+m：窗口总长，入队时用于预计算合法锚点区间
+        self.k_plus = k_plus
+
+    def push(self, episode, critical=False):
+        # 窗口总长决定合法锚点区间：预计算避免采样期跨轨迹切片
+        n = len(episode["action"])
+        # 锚点左侧留 k=2 帧上下文，右侧留 H+m=24 步动作与未来观测
+        lo, hi = 2, n - self.k_plus + 2
+        # 区间无效的短轨迹直接拒绝：它连一个完整窗口都撑不起
+        if hi &lt; lo:
+            return False
+        episode["anchors"] = (lo, hi)
+        episode["critical"] = critical          # 关键轨迹标记为不可淘汰
+        if len(self.episodes) &lt; self.capacity:
+            self.episodes.append(episode)
+        else:
+            # 环形覆盖：跳过关键轨迹，避免成功案例与稀有状态被冲掉
+            while self.episodes[self.cursor].get("critical", False):
+                self.cursor = (self.cursor + 1) % len(self.episodes)
+            self.episodes[self.cursor] = episode
+            self.cursor = (self.cursor + 1) % len(self.episodes)
+        self.total_steps += np.prod(episode["action"].shape[:1])
+        return True</code></pre>
+    <p>解读：<strong>（1）</strong>锚点区间在入队时计算，采样期只做区间内随机取点，杜绝跨界窗口。<strong>（2）</strong>短路轨迹的拒绝是容量治理的一部分：不足一个窗口的轨迹进入缓冲只会占位不产出样本。<strong>（3）</strong>关键轨迹豁免覆盖，代价是缓冲区实际容量略低于标称值，配置容量时预留余量。</p>
+
+    <p><strong>片段 2：优先采样与重要性修正</strong></p>
+    <pre class="code"><code>import torch
+
+class PrioritizedSampler:
+    """优先采样：按损失派生的优先级采样，并用重要性权重修正偏差。"""
+    def __init__(self, alpha_p=0.6, beta_start=0.4, beta_end=1.0, steps=200_000):
+        self.alpha_p, self.beta_start = alpha_p, beta_start
+        self.beta_end, self.steps = beta_end, steps
+
+    def beta_at(self, step):
+        # 修正系数随训练推进线性升到 1：后期回归无偏，前期保留优先级收益
+        ratio = min(1.0, step / float(self.steps))
+        return self.beta_start + (self.beta_end - self.beta_start) * ratio
+
+    def sample(self, priorities, n, step):
+        p = np.asarray(priorities, dtype=np.float64).clip(1e-6, None)
+        # 优先级上界裁剪：防止个别异常样本垄断采样
+        p = np.minimum(p, np.quantile(p, 0.99))
+        prob = p ** self.alpha_p
+        prob = prob / prob.sum()
+        idx = np.random.choice(len(p), size=n, replace=True, p=prob)
+        # 重要性权重：采样概率越低权重越大，除以最大值归一化稳定尺度
+        beta = self.beta_at(step)
+        w = (len(p) * prob[idx]) ** (-beta)
+        w = w / w.max()
+        return idx, torch.as_tensor(w, dtype=torch.float32)</code></pre>
+    <p>解读：<strong>（1）</strong>概率索引用 NumPy 完成（采样发生在张量组装之前），权重转回张量随批次进入损失。<strong>（2）</strong>上界用 99% 分位裁剪，处理长尾优先级；裁剪与 α<sub>p</sub> 共同决定采样集中度，两者需要一起观察。<strong>（3）</strong>权重归一化到最大值为 1，避免全局尺度影响学习率，与 005 章的归一化设施同思路。</p>
+
+    <p><strong>片段 3：来源分层混合</strong></p>
+    <pre class="code"><code>def stratified_batch(buffer, sampler, n_batch=128, quota=None, step=0):
+    """分层采样：先按来源配额分配名额，再在层内按优先级取样本。"""
+    quota = quota or {"real": 0.6, "online": 0.3, "imagined": 0.1}
+    picks = []
+    for source, frac in quota.items():
+        pool = buffer.indices_by_source(source)      # 预建的来源索引
+        n_take = int(round(frac * n_batch))
+        if not pool or n_take == 0:
+            continue
+        idx, w = sampler.sample(buffer.priorities(pool), n_take, step)
+        picks.append((source, [pool[i] for i in idx], w))
+    # 合并时把权重随样本走：不同来源的修正权重在损失端相乘（008 章来源权重）
+    return picks</code></pre>
+    <p>解读：<strong>（1）</strong>配额先于优先级：来源比例由训练设计决定，优先级只在层内竞争，两层职责分离。<strong>（2）</strong>来源索引在入队时维护，采样期不做全缓冲扫描，这是大缓冲下保持吞吐的关键。<strong>（3）</strong>权重随样本一起传递，确保 008 章来源权重与本章修正权重在损失端以同一条路径相乘，避免重复或遗漏。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>原始帧直接入缓冲</strong>：浮点图像使容量需求放大到不可行，训练因内存不足中断。修复：压缩或潜变量存储，容量按公式估算后再配置。</li>
+      <li><strong>优先级无修正</strong>：长期过采样高损失样本，损失分布偏移，验证指标虚高。修复：重要性与权重必须成对启用，β<sub>p</sub> 按步数升到 1。</li>
+      <li><strong>窗口跨轨迹边界</strong>：跨界样本把两条轨迹拼接，训练出错误的时序依赖且损失无异常。修复：锚点区间入队时预计算，采样只在区间内取点。</li>
+      <li><strong>陈旧数据主导</strong>：缓冲被旧分布占满，新任务学习速率下降。修复：监控来源与时间的构成比例，提高新数据配额，必要时缩短保留窗口。</li>
+      <li><strong>验证集混入缓冲</strong>：把验证轨迹入队参与训练，指标失真。修复：缓冲按数据集划分实例化，入口校验来源编号集合。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>按容量 50 万步、单步压缩图像 0.02 MB 计算缓冲占用，再换算原始浮点格式的占用倍数。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>压缩存储约 10 GB 量级；原始浮点约 0.6 MB/步，放大 30 倍到 300 GB 量级，容量不可行。</div></details>
+      </li>
+      <li>把 α<sub>p</sub> 从 0.6 提到 1.0，预测采样集中度、训练稳定性与稀有样本占比的变化。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>集中度显著上升，高优先级样本重复率高，训练方差增大；稀有样本更易被反复采样，但异常样本的破坏力同步放大。</div></details>
+      </li>
+      <li>推导：说明重要性权重 (N·P)<sup>-β</sup> 如何抵消非均匀采样的期望偏差，并解释 β 从 0.4 升到 1 的意义。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>乘以 1/P 的幂使期望恢复为均匀期望；β 小于 1 时保留部分优先级收益但仍有偏，升到 1 时完全无偏。</div></details>
+      </li>
+      <li>设计遗忘监控方案：旧任务采样评估频率、告警阈值与配额调整策略，写出闭环的触发条件。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>每 5000 步在旧任务保留集评估一次；连续两次下滑超 3 个百分点即上调旧数据配额，回升后缓降配额。</div></details>
+      </li>
+      <li>构造实验：在缓冲中故意保留短于窗口长度的轨迹，观察采样器行为并设计拒绝规则的有效性验证。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>拒绝规则应使短轨迹不产生任何锚点；验证方法是统计每条轨迹的锚点数与长度关系曲线，确认短轨迹锚点数为零。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>回放机制承担来源混合、取样控制、遗忘抑制三类职能。</li>
+      <li>存储格式按空间量级选择，压缩图像加潜变量是常用组合；容量按公式先行估算。</li>
+      <li>优先采样提升稀有样本利用率，重要性权重抑制采样偏差，β<sub>p</sub> 升到 1 实现无偏化。</li>
+      <li>来源配额约束比例，层内优先级竞争，权重随样本传递到损失端。</li>
+      <li>窗口锚点在入队时预计算，<strong>跨轨迹切片是最隐蔽的数据缺陷</strong>。</li>
+      <li>下一章把回放与世界模型接在一起：基于世界模型的规划与 VLA 策略结合。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch012.html">← 第 012 章：VLA策略中的语言指令编码器</a>
+    <a class="next" href="ch014.html">第 014 章：基于世界模型的规划与VLA策略结合 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

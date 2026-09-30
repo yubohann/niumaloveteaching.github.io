@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第043章 实现移动机器人导航 | 机器人仿真学习课程 · Isaac Sim 强化学习训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 任务与技能实现</span>
+    <span class="sep">/</span>
+    <span>第 043 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 任务与技能实现</div>
+    <h1>第 043 章：实现移动机器人导航</h1>
+    <p class="lead">从接触丰富的装配转向轮式移动机器人：理解不可侧移的运动学约束，用激光扫描 + 目标相对位姿构造观测，用势函数塑形引导策略学会"又快又稳地绕过障碍到达目标"。</p>
+    <ul class="meta">
+      <li>主题：任务实现 / 移动导航与避障</li>
+      <li>相关组件：Isaac Sim / Isaac Lab / Stable-Baselines3（PPO）</li>
+      <li>预计学时：50 分钟</li>
+      <li>前置章节：第 042 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>写出差速底盘的完整运动学方程，解释"非完整约束"（nonholonomic）为什么意味着机器人永远不能侧向平移。</li>
+      <li>会把 360 束激光扫描降维成 36 束观测，并说清必须用 min 池化的道理（保留最坏情况）。</li>
+      <li>掌握本体坐标系下的目标表示 (r, φ)，解释它带来的平移/旋转泛化性。</li>
+      <li>会用势函数差分设计前进奖励，说清"距离奖励导致贴墙徘徊"的原因与修复手段。</li>
+      <li>能为导航任务设计障碍密度课程，并用到达率、碰撞率、平均耗时三项指标评估策略。</li>
+      <li>理解端到端 RL 导航与 A*/DWA 等经典规划方案各自适合的场合。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>移动导航是移动机器人最基础的能力：从仓库 AGV 到扫地机，都要求"观测—决策—运动"闭环在动态、未知的环境里持续运行。经典方案是全局规划加局部避障：A* 用已知地图算一条折线路径，DWA（dynamic window approach，动态窗口法）在局部速度空间里搜索可行控制。这套组合成熟可靠，但依赖定位与地图、对动态障碍和未建模动力学反应生硬，参数还很难调。</p>
+    <p>强化学习提出另一种可能：把激光扫描直接映射成轮速指令，让策略在成千上万个随机地图里自己撞出经验。本章的任务就是这个：搭一个带障碍的导航环境，设计观测（扫描 + 目标）、动作（线速度 + 角速度）、奖励（前进 + 对齐 + 安全），并理解为什么这些设计能训出"不贴墙、不原地打转"的行为。它也是后续多智能体（049/059）、注意力（060）等章节的移动平台。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 差速运动学与非完整约束</h3>
+    <p>差速底盘用左右两个驱动轮的速度差实现转向。定义机器人位姿 (x, y, θ)，前向速度 v、角速度 ω，则运动学为：</p>
+    <div class="formula">
+      ẋ = v·cosθ, &nbsp; ẏ = v·sinθ, &nbsp; θ̇ = ω
+      <span class="note">状态 3 维，控制只有 (v, ω) 2 维，欠驱动</span>
+    </div>
+    <p>这组方程隐含一个约束：速度向量永远沿着车头方向，<strong>机器人不能横向平移</strong>。这就是非完整约束（nonholonomic constraint），它不限制能到达哪些位姿，但限制到达的方式。直接后果：想从 A 点到 B 点，不能直线侧移过去，必须先转向。若把车看成绕某点画圆，该点称为瞬时旋转中心（ICR），最小转弯半径 r<sub>min</sub> = v/ω，ω = 0 时退化为直线。</p>
+    <p>这个约束直接决定了奖励设计的后果：如果只奖励"离目标更近"，策略会产生一个看似聪明实则糟糕的行为，<strong>原地旋转</strong>。因为旋转不改变位置、代价极小，却总能"对准"目标方向，让距离塑形项不再下降。修复方法有两条：一是时间罚（每步 −0.002，逼它动起来），二是把朝向对齐做成奖励项（cos φ，面向目标才得分）。</p>
+
+    <h3>2. 观测设计之一：扫描的 min 池化降维</h3>
+    <p>单线激光雷达给 360 个距离值（每度一束）。直接喂给 MLP 不是不可以，但输入维度过高会拖慢训练、也放大对噪声的敏感。常见做法是下采样到 36（或 24）束。关键在下采样算子：</p>
+    <div class="formula">
+      scan_agg[k] = min<sub>i∈group(k)</sub> scan[i]
+      <span class="note">每 10 束取最小值：保留最坏情况的语义</span>
+    </div>
+    <p>平均会把一根细杆障碍"稀释"掉，10 束里 9 束看到 8 m、1 束看到 0.4 m，平均后还有 7.2 m，策略以为前方空旷。min 保留最坏情况，等价于"这一扇区里最近障碍有多近"，安全上是保守的。这也是安全监控里常见的思想：聚合必须偏悲观。</p>
+
+    <h3>3. 观测设计之二：目标为什么放在本体坐标系</h3>
+    <p>把目标相对位置从世界系旋转到机器人本体系：</p>
+    <div class="formula">
+      g<sub>body</sub> = R(θ)<sup>T</sup>(g − p), &nbsp; 输出 (r, φ) = (‖g<sub>body</sub>‖, atan2(g<sub>body,y</sub>, g<sub>body,x</sub>))
+    </div>
+    <p>采样一组数字体会一下：机器人朝东（θ=0），目标在其正北 3 m（世界系 Δ=(0, 3)），本体系里就是 (0, 3)，φ = 90°，朝左看。若机器人先转了 90°，世界系差没变，但本体系里变成 (3, 0)，φ = 0°。也就是说，<strong>本体系观测下"目标的方向"直接就是转弯指令，策略只需学一个与朝向无关的映射</strong>；换成世界坐标，策略得先学会三角函数才能理解自己的朝向。工程经验：同一接口下，本体系观测的样本效率通常高一倍以上。</p>
+
+    <h3>4. 奖励：势函数差分 + 对齐 + 安全 + 时间</h3>
+    <p>把 Φ(s) = −d(s)（负的目标距离）代入势函数塑形公式，得到前进奖励：</p>
+    <div class="formula">
+      r<sub>progress</sub> = γ·Φ(s′) − Φ(s) = d<sub>t</sub> − γ·(d<sub>t+1</sub>) ≈ 本步缩短的距离
+    </div>
+    <p>它有一个好性质：沿一条轨迹累计等于总路程缩短量，绕路会自然扣分；而且因为势函数差分不改变最优策略，它不会像"每步给 −d"那样诱导出"停在目标附近磨蹭"的行为。完整奖励是四项之和：前进 2.0×progress、朝向 0.1×cosφ、时间罚 −0.002、角速度变化罚 −0.05×|Δω|，另加碰撞 −10（终止）与到达 +100。数值关系要记住一条：<strong>到达奖励要显著大于整条路径上的塑形总和</strong>，否则策略会"在路上刷分"。</p>
+    <p>把这句量级主张核算成数字：前进项 2.0 乘"本步缩短的距离"，1.2 m/s、10 Hz 时每步最多缩短 0.12 m，单步上限 0.24；一条 11 m 的绕行路径的塑形累计约 2×11 = 22，到达 +100 是它的约 4.5 倍，<b>"终局奖励压倒沿途塑形总和"在数量意义上成立</b>。碰撞 −10 与到达 +100 的 1:10 比例决定风险偏好：把碰撞罚调到 −20，策略对"抄近路"的期望收益核算整体收紧、行为更保守，但绕行变长可能压低到达率，评估时必须两轴一起看。对齐项 0.1、时间罚 0.002、抖动罚 0.05 量级都远小于前进项，它们是"破对称、促速度、保平滑"的微调项；任何一项被放大到与前进项相当（例如抖动罚乘 10），都会改变任务本质，策略会近乎直线行驶、拒绝转向。</p>
+
+    <h3>5. 局部最优：一个无法完全消灭的问题</h3>
+    <p>当目标正后方矗立着一根圆柱，直接朝目标走会被挡住，而"绕过障碍"的中间步骤每一刻都在增加距离，势函数差分是负的。这就是避障任务里的局部最优（类似人工势场法的经典死锁）。工程上的做法是把局部最优压到可接受的水平：随机化障碍布局（每回合重采样，任何局部最优只出现在少量回合）、随机化目标（换一个目标，死锁消失）、以及足够长的训练让策略学会先绕后进。经验上，障碍密度每平方米超过 0.3 个之后，到达率随密度近似线性下降，这条曲线就是评估策略好坏的标准尺子。</p>
+
+    <h3>6. 数值算例：细杆的可见度与转向预算</h3>
+    <p>下采样会不会"丢"障碍，可以用角度算出来。0.05 m 的细杆在 2 m 处张角 2·atan(0.025/2) ≈ 1.4°，在 4 m 处张角 0.72°。36 束扫描每束 10°，按每 10 束取 min 的分组，只要有 1–2 条被击中的光束，整组的 min 就能反映细杆；若换成平均，一组里 9 束读到 8 m、1 束读到 0.4 m，平均是 7.24 m，细杆在观测里几乎消失，而最小池化给出 0.4 m，保留了"这个扇区里有近物"的事实。<b>这是聚合语义的差别：min 回答"最坏情况有多近"，平均回答"平均有多远"，安全决策需要前者。</b>细杆可见度的下界同样清楚：杆在 20 m 处张角 0.14°，不足单束的八分之一，任何一维扫描都会漏检，而 8 m 房间把最远距离限制在 11.3 m 的对角线内，本章的 10 m 量程没有触碰这条边界。</p>
+    <p>转向预算接着算，它决定"绕障的时间成本"。最小转弯半径 r<sub>min</sub> = v/ω：v = 1.2 m/s、ω = 2.5 rad/s 时 r<sub>min</sub> = 0.48 m，调头（转过 180°）至少要走 π×0.48 ≈ 1.5 m 的弧线，耗时 π/ω ≈ 1.26 s；低速侧 v = 0.3 m/s 时 r<sub>min</sub> = 0.12 m，调头半径缩到 12 cm，代价是直线段速度低。把房间量级接上：8 m×8 m 的对角线约 11.3 m，按 1.2 m/s 巡线需要约 9.4 s，计入两次转向与减速，路径长度比取 1.2 时整局约 11 s，<b>30 s 的回合上限对这一任务有约 3 倍余量，说明超时主要出现在训练早期或局部最优回合，稳态段的平均耗时指标才反映真实能力</b>。另一条边界：走廊宽度小于 2r<sub>min</sub> 时，一次调头需要倒车配合，动作空间里保留负速度通道（−0.3 m/s）正是为这种狭窄场景留的余地。</p>
+    <p>最后核对观测量纲的一个采样点：目标在前方 5 m、偏左 30°，则 (r, φ) = (5 m, 0.524 rad)，归一化后为 (0.5, 0.167)；36 束扫描按 10 m 量程压到 [0, 1]，无回波统一记 1.0（按"远"处理）。<b>扫描、目标、速度三类特征都落在 O(1) 附近后，第一层网络不需要先学量纲再学任务</b>；漏掉角度归一化时，φ 的取值范围是 ±3.14，是其余通道的三倍以上，策略会把大部分输入敏感度分给角度，扫描通道的细障碍特征被相对压低，这属于"训练能跑但慢一倍"的隐性成本。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>导航环境的搭建与配置决策：</p>
+    <ol>
+      <li><strong>机器人建模</strong>：差速底盘（两驱动轮 + 前后万向轮），轮半径 5 cm、轮距 35 cm。质量与惯性按真机填写，轮式平台的接触相对简单，域随机化重点放在轮子摩擦系数（0.5–1.2）上。</li>
+      <li><strong>动作</strong>：策略输出 2 维 [−1, 1]，映射到 v ∈ [−0.3, 1.2] m/s、ω ∈ [−2.5, 2.5] rad/s。后向速度限到 0.3 m/s：导航中倒退极少是优解，限幅能减少无意义行为。角速度上限由转弯半径决定：v=1.2、ω=2.5 时 r<sub>min</sub> ≈ 0.48 m，小于常见走廊宽度。</li>
+      <li><strong>控制频率</strong>：策略 10 Hz（decimation=6，物理 60 Hz）。轮式动力学响应慢，10 Hz 足够；更快的控制频率主要增加计算量而收益有限。</li>
+      <li><strong>观测</strong>：36 束扫描（10 m 量程归一化）+ 目标 (r, φ) + 当前 v、ω + 上一动作，共 42 维。加入上一动作的理由与装配一致：让策略感知指令的真实执行情况。</li>
+      <li><strong>任务与终止</strong>：目标在 8 m×8 m 房间内随机采样（过滤掉落在障碍内、距起点 &lt; 1.5 m 的点）；到达半径 0.35 m 判成功 +100；碰撞 −10 终止；每回合 30 s（300 控制步）超时终止。</li>
+      <li><strong>课程学习</strong>：障碍数量 0 → 5 → 12 → 20 → 30 逐步增加，每次晋级前用近 100 回合到达率（窗口内到达比例 &gt; 0.75）作为门槛。理由：无阶段先学会"追点"，再加干扰，避免一开始就陷入局部最优区域。</li>
+      <li><strong>评估指标</strong>：到达率、碰撞率、平均到达耗时、平均路径长度比（实际路径/直线距离）。四项一起看，防止"到达率涨了但全在绕远路"的假进步。</li>
+    </ol>
+    <table>
+      <tr><th>奖励项</th><th>权重</th><th>作用</th><th>设计理由</th></tr>
+      <tr><td>势函数前进</td><td>2.0</td><td>主梯度</td><td>差分形式，绕路自扣分，不改变最优策略</td></tr>
+      <tr><td>朝向对齐 cosφ</td><td>0.1</td><td>破对称</td><td>对抗"原地旋转"局部最优</td></tr>
+      <tr><td>时间罚</td><td>−0.002/步</td><td>提速</td><td>量级远小于前进项，只做微调</td></tr>
+      <tr><td>角速度变化</td><td>−0.05·|Δω|</td><td>平滑</td><td>抑制抖动式转向，便于真机执行</td></tr>
+      <tr><td>碰撞 / 到达</td><td>−10 / +100</td><td>终局</td><td>终局奖励必须压倒沿途塑形总和</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计思维：为什么不用"离墙越远越好"做奖励？</span>
+      <p>看着合理，实际危险：这一项会奖励"待在房间中央"，与"到达目标"直接冲突，策略学会在空旷处兜圈子。安全不应该用连续奖励表达，而应该用<strong>碰撞终止 + 末端安全罚</strong>（小于 0.25 m 时线性增加惩罚）。连续项负责导航，门槛项负责安全，这是跨任务的通用分工。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：动作到轮速的差速运动学逆解</strong></p>
+    <pre class="code"><code>import numpy as np
+
+WHEEL_BASE = 0.35      # 左右轮距 0.35 m：差速底盘的几何常数，测错它转向就会偏
+WHEEL_RADIUS = 0.05    # 轮半径 5 cm
+MAX_LINEAR = 1.2       # 前向最大速度 m/s
+MAX_ANGULAR = 2.5      # 最大角速度 rad/s，与 v 共同决定最小转弯半径
+
+def differential_drive(action):
+    # 策略输出两维 [-1,1]，先映射成 (v, omega) 再解析到左右轮速：
+    # (v, omega) 空间里"向前"和"转向"解耦，网络只需学习两个语义清晰的量
+    v = float(np.clip(action[0], -1.0, 1.0)) * MAX_LINEAR
+    w = float(np.clip(action[1], -1.0, 1.0)) * MAX_ANGULAR
+    # 差速逆解：绕 ICR 旋转时，内侧轮慢、外侧轮快，速度差等于 w * 轮距
+    v_left = (v - w * WHEEL_BASE / 2.0) / WHEEL_RADIUS    # 线速度除以半径得轮角速度
+    v_right = (v + w * WHEEL_BASE / 2.0) / WHEEL_RADIUS
+    return np.array([v_left, v_right], dtype=np.float32), v, w</code></pre>
+    <p>解读：这段代码有三个值得注意的点。第一，动作抽象层级，策略学的是 (v, ω) 这一层，左右轮速由逆解解析。两种做法在数学上等价，但学习难度不同：(v, ω) 下"直行"是 (1, 0)、"左转"是 (0.5, 1) 这类简单组合，而轮速空间里"直行"是 (v/r, v/r) 这种两个维度同步的动作，探索更容易失衡。第二，逆解公式里的 ±ω·L/2 是刚体绕 ICR 旋转的几何结果，内轮速度恒小于外轮，做半径 0.5 m 的圆弧时，v=1.0、ω=2.0，内外轮线速度比为 1.35/0.65，这个差异如果建错（比如符号写反），机器人会朝反方向转。第三，返回的 v、ω 原值要留在状态里给观测与奖励用，奖励的朝向项需要 φ，而 φ 与 ω 的符号是一致的。</p>
+
+    <p><strong>片段 2：扫描下采样与本体系目标观测</strong></p>
+    <pre class="code"><code>def navigation_obs(scan_360, robot_pose, goal_xy):
+    # 360 束 -> 36 束：每 10 束取 min（保留最坏情况）
+    # 平均会把细杆障碍"抹平"（9 束远 + 1 束近，平均后仍然很远），min 保留最坏情况
+    beams = np.asarray(scan_360, dtype=np.float32).reshape(36, 10)
+    scan_ds = beams.min(axis=1)
+    scan_ds = np.clip(scan_ds / 10.0, 0.0, 1.0)      # 10 m 量程归一化到 [0,1]
+    scan_ds[np.isnan(scan_ds)] = 1.0                 # 无回波按"远"处理，避免 NaN 污染网络
+
+    x, y, theta = robot_pose
+    dx, dy = goal_xy[0] - x, goal_xy[1] - y
+    # 目标转到本体坐标系：策略看到的是"前方多远、偏左多少度"，与自己在世界的朝向无关
+    g_forward = np.cos(theta) * dx + np.sin(theta) * dy
+    g_left = -np.sin(theta) * dx + np.cos(theta) * dy
+    r = float(np.hypot(g_forward, g_left))
+    phi = float(np.arctan2(g_left, g_forward))       # 目标夹角：0 表示正前方
+    return np.concatenate([scan_ds, [r, phi]]).astype(np.float32)</code></pre>
+    <p>解读：这段代码解决两个不同的问题。min 池化处理的是安全语义：聚合算子决定了观测"看见什么"，取 min 等价于"这个扇区里最坏情况有多坏"，与碰撞风险直接挂钩；换成平均，策略会在细障碍前系统性低估风险。坐标变换处理的是学习难度：R(θ)<sup>T</sup> 的两行展开正是把世界向量投影到"前向—左向"基上，得到的 (r, φ) 是机器人说的语言。注意 NaN 处理这一行，仿真的激光偶尔因射线未命中返回无效值，如果不拦住，一个 NaN 会让整个批次的梯度报废，这是排查"训练突然变 NaN"时的高频检查点。另外 φ 用 atan2 求夹角：atan2 保留左右符号，策略才能区分"目标在左"和"在右"。</p>
+
+    <p><strong>片段 3：导航奖励的四项分解</strong></p>
+    <pre class="code"><code>def navigation_reward(state, prev_dist, action, cfg):
+    # 势函数差分的前进项：d_prev - gamma*d_now，等价于本步前进的距离
+    progress = prev_dist - cfg["gamma"] * state["goal_dist"]
+    heading = np.cos(state["goal_angle"])            # 目标在正前方时得 +1
+    r = 2.0 * progress + 0.1 * heading               # 前进为主，对齐为辅
+    r -= 0.002                                       # 时间罚：同距离用时越短越好
+    r -= 0.05 * abs(action[1] - state["prev_omega"]) # 抑制转向抖动，真机上省电又护轮
+    if state["collision"]:
+        return -10.0, True                           # 碰撞一次性重罚并终止回合
+    if state["goal_dist"] &lt; cfg["success_radius"]:
+        return 100.0, True                           # 到达奖励必须大于沿途塑形总和
+    return r, False</code></pre>
+    <p>解读：四项的分工是本章奖励设计的全部秘密。前进项给"往哪走"的梯度，对齐项破旋转死锁，时间罚管速度，抖动罚管平滑。注意前进项里 γ 的位置：写成 d_prev − γ·d_now，当 d 不变时奖励恰好是 (1−γ)·d_prev，为一个很小的正微量，这保证"停在原地不动"只能拿到趋零的奖励，而"朝目标走"拿大奖励，两者不会混淆。反过来如果写成 d_prev − d_now，静止时奖励为 0 尚可，但一旦策略学会"反复横跳在目标附近刷距离差"，塑形项就会变成漏洞；γ 的引入堵住了这个缝。最后再强调一次两个终局奖励的相对比例：−10 与 +100 相差 10 倍，配合 30 s 的回合长度，策略在"冒 10% 碰撞风险抄近路"与"稳妥绕远"之间的权衡是可控的，想让策略更保守，就把碰撞罚调到 −20，不要动到达奖励。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>用平均池化压缩扫描</strong>：细障碍在聚合中被"稀释"，策略学到一半才发现前方有杆。症状是撞细杆率高、粗墙没问题。修复：把聚合算子换成 min，并在随机地图里专门放细杆验证。</li>
+      <li><strong>忽略非完整约束</strong>：动作空间设计成"世界系速度 (vx, vy)"再映射到轮子，物理上无法执行侧向分量，策略学到的"横移绕障"全是幻觉。修复：动作必须落在 (v, ω) 或左右轮速可达空间内。</li>
+      <li><strong>距离塑形诱导原地旋转</strong>：只给"靠近目标"奖励时，策略发现原地转圈几乎不掉分。症状是回合超时率高、轨迹里大量原位转向。修复：加 cosφ 对齐项与时间罚，并检查数据里"零位移步"的比例。</li>
+      <li><strong>目标采样在障碍内部</strong>：到达判定永远为假，这批回合的到达率统计被污染，还会让策略傻站在墙外。修复：采样后做碰撞检查，落在障碍内或离起点过近（&lt; 1.5 m）就重采。</li>
+      <li><strong>真机速度上限比仿真大</strong>：训练时 v<sub>max</sub>=1.2 m/s，真机底盘只有 0.8 m/s，策略发出的指令执行不到位，轨迹全变形。修复：动作上限取真机额定值的 80%，并把轮子摩擦、负载质量做域随机化（第 021、065 章）。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把对齐项权重从 0.1 调到 0，训练后统计"零位移步比例"与超时率，验证"原地旋转"局部最优的存在。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>零位移步 = 相邻两帧位置变化小于 1 mm 的控制步。权重为 0 时这个比例应显著上升，且轨迹中出现长时间螺旋转向。</div></details>
+      </li>
+      <li>把扫描聚合换成平均值（其余不变），在含 0.05 m 细杆的地图里对比碰撞率。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>细杆只占 1–2 束，平均后几乎消失；也可把量程改小放大差异。统计细分"撞细杆/撞粗墙"两类碰撞率。</div></details>
+      </li>
+      <li>设计一个实验，区分"策略学会了绕障"和"策略记住了训练地图"。写出两组对照的评测协议。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>用训练时没出现过的地图与障碍布局做零样本评测；再对比同一策略在"训练布局"上的到达率。差距就是记忆的占比。</div></details>
+      </li>
+      <li>把障碍密度课程从"按数量晋级"改成"按成功率晋级"，预测训练曲线形状变化并验证。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>按数量晋级会在某个密度出现到达率悬崖；按成功率晋级会自动在该处停留更久。比较两种课程下"到达率对训练步数"的曲线平滑度。</div></details>
+      </li>
+      <li>给奖励加一项"与障碍最小距离小于 0.2 m 时每步罚 −0.01"，预测并验证策略的路径长度比与到达率变化，解释连续安全项的风险。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>连续罚会让策略宁可绕大弯；路径长度比会上升。若走廊本来就窄（&lt; 0.5 m），这项罚可能让任务变得不可解。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>差速底盘受非完整约束：只能沿车头方向运动，最小转弯半径 r = v/ω；动作空间必须建在可达速度空间内。</li>
+      <li>扫描聚合必须用 min 池化保留细障碍；目标用本体系 (r, φ) 表示，策略只需学与朝向无关的映射。</li>
+      <li>奖励 = 势函数前进 + 朝向对齐 + 时间罚 + 抖动罚，配碰撞终止与到达奖励；终局奖励要压倒沿途塑形总和。</li>
+      <li>局部最优（贴墙死锁）靠随机化地图/目标与课程压低，不追求消灭；障碍密度—到达率曲线是标准的评估尺子。</li>
+      <li>评估导航策略用四项指标：到达率、碰撞率、平均耗时、路径长度比；只看其中一项都会误判。</li>
+      <li>下一章进入<strong>四足机器人行走</strong>：从平面导航转向全身周期运动，你会遇到全新的概念，步态相位与周期性奖励。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch042.html">← 第 042 章：实现装配任务</a>
+    <a class="next" href="ch044.html">第 044 章：实现四足机器人行走 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

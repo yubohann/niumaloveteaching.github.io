@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第052章 SAC的稀疏奖励处理 | 深度强化学习课程 · PPO、SAC 与多智能体系统</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 离策略方法与 SAC</span>
+    <span class="sep">/</span>
+    <span>第 052 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 离策略方法与 SAC</div>
+    <h1>第 052 章：SAC的稀疏奖励处理</h1>
+    <p class="lead">把 MountainCarContinuous 的奖励改造成"到山顶 +100、其余每步 −1"的纯稀疏版本，对比裸稀疏学习与势函数塑形两条路线，用首个成功回合、滑窗成功率与评估最大位置三个指标量化"塑形到底帮了多少忙"。</p>
+    <ul class="meta">
+      <li>主题：稀疏奖励 / 势函数塑形（potential-based shaping）</li>
+      <li>关键公式：r′ = r + γ·Φ(s′) − Φ(s)，Φ(s) = 50·position</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 051 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解稀疏奖励为什么让时序差分学习变慢：价值信息要靠 bootstrap 从成功点逐步"倒退传播"。</li>
+      <li>掌握势函数塑形的公式与策略不变性，能判断什么塑形是"安全"的。</li>
+      <li>实现一个奖励改造 wrapper：把稠密奖励替换成稀疏奖励，并可开关塑形。</li>
+      <li>用首个成功回合、滑窗成功率、评估最大位置三个指标，定量对比 sparse 与 shaped 两条路线。</li>
+      <li>会为稀疏任务设计"连续进度指标"，避免只看回报误判训练停滞。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>现实任务的奖励往往天然稀疏：机械臂抓住物体、机器人到达目标、药物分子满足性质，成功前只有一片"零反馈"。这种任务对 RL 极其不友好：Q 网络要靠"下一个状态的价值"学习当前状态的价值，而稀疏任务里绝大多数状态的价值都只是"距离成功还很远的负值"，一个回合里可能只有最后一步携带信息。信息像逆流而上一样，要靠成千上万次 bootstrap 才能传播到起点附近。</p>
+    <p>第 051 章的基准测试已经暴露了这个痛点（MountainCarContinuous 两万步难达标），本章正面处理它：<strong>先用 wrapper 把任务"变稀疏"制造困难，再用势函数塑形修复</strong>，量化修复效果。这也是全课程第一次修改奖励结构。可以先用一个粗略的账感受难度：若成功概率约为千分之一，3 万步里期望出现约 30 个成功回合，看似不少，但每个成功样本只能把"成功前一格"的价值抬高一次，信息要倒退到起点附近仍需成百上千次覆盖；而塑形让每一步都携带方向信号，相当于把"千分之一的稀疏事件"变成"每步一次的连续训练样本"。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 稀疏奖励为什么慢</h3>
+    <p>Q 学习的更新是 y = r + γ·Q̄(s′,a′)。在只有终点有正奖励的任务里，成功瞬间的 transition 把 Q 抬高；下一轮，"成功前一格"的状态开始受益……信息每传播一格需要至少一轮完整的数据覆盖。回合长度 T 的任务，价值信息大致需要 O(T) 轮更新才能覆盖全程：</p>
+    <div class="formula">
+      Q(s<sub>t</sub>, a<sub>t</sub>) ← r<sub>t</sub> + γ·Q(s<sub>t+1</sub>, ·) &nbsp;&nbsp;→&nbsp;&nbsp; 成功信息以"每轮倒退一步"的速度扩散
+      <span class="note">MountainCar 回合上限 999 步：信息从山顶倒灌到谷底需要很长的训练轮数</span>
+    </div>
+    <p>而且多数状态长期停留在"Q ≈ 剩余步数的负值"，梯度信号又小又平，这就是稀疏任务的样本效率灾难：学习本身可以发生，但要等成功样本以足够高的频率出现。</p>
+
+    <h3>2. 势函数塑形与策略不变性</h3>
+    <p>给奖励加上一项由势函数 Φ 决定的对齐信号：</p>
+    <div class="formula">
+      r′(s, a, s′) = r(s, a, s′) + γ·Φ(s′) − Φ(s)
+      <span class="note">Φ 是任意状态函数；这个形式的塑形不改变任何策略的排序</span>
+    </div>
+    <p>符号说明：r 是原始奖励，Φ 是势函数（例如 Φ(s)=50·position，位置越高势越大），γ 是折扣因子。直觉：γΦ(s′)−Φ(s) 沿轨迹累加后只剩下的首尾两项（望远镜求和），中间互相抵消，因此"策略排序不变"，换句话说，塑形改变了学习的速度，但不改变最优解的位置。本章取 Φ(s) = 50·position：向山顶移动立刻获得正反馈，成功率信号从"终点一击"变成"全程可学"。</p>
+    <p>望远镜求和的推导一行即可完成：整条轨迹的塑形项之和为</p>
+    <div class="formula">
+      Σ<sub>t=0</sub><sup>T−1</sup> γ<sup>t</sup> · ( γΦ(s<sub>t+1</sub>) − Φ(s<sub>t</sub>) ) = γ<sup>T</sup>·Φ(s<sub>T</sub>) − Φ(s<sub>0</sub>)
+      <span class="note">中间项两两抵消，总塑形量只由起点与终点的势决定，与路径无关</span>
+    </div>
+
+    <div class="box key">
+      <span class="box-title">数值例子：塑形项每步给多少、全回合共给多少</span>
+      <p>取 Φ(s)=50·position，MountainCar 起点位置约 −0.5，山顶约 0.45。单步塑形项展开为 50γ·Δp − (1−γ)·50p；取 γ=0.99、Δp=0.01（向上移动一小格）、p=−0.5：</p>
+      <p><strong>向上移动</strong>：50×0.99×0.01 − 0.01×50×(−0.5) = 0.495 + 0.25 = <strong>+0.745</strong>。</p>
+      <p><strong>原地不动（Δp=0）</strong>：0 + 0.25 = <strong>+0.25</strong>。两者之差 0.495 正是"向上走一步比原地不动多拿的奖励"，量级约为稀疏步代价 −1 的一半，足够让策略"愿意试"。向下移动则相反，差值为负。</p>
+      <p><strong>全回合总账</strong>：设成功回合约 150 步，Φ(s<sub>0</sub>)=50×(−0.5)=−25，Φ(s<sub>T</sub>)=50×0.45=22.5，γ<sup>150</sup>≈0.22。总塑形量 = 0.22×22.5 − (−25) ≈ 4.95 + 25 ≈ <strong>+30</strong>，且无论走哪条路径都是这个数（望远镜性质）。解读：塑形把"何时、从哪里上山"的局部信号铺满全程，却不给任何路径额外的好处；这正是它"只改变学习速度、不改变最优解"的数值体现。</p>
+    </div>
+
+    <h3>2.1 两种模式的预期对照</h3>
+    <table>
+      <tr><th>指标</th><th>sparse（纯稀疏）</th><th>shaped（势函数塑形）</th></tr>
+      <tr><td>首个成功回合</td><td>靠随机撞运气，很多种子 3 万步内不出现</td><td>通常 5000～15000 步内出现</td></tr>
+      <tr><td>滑窗成功率（50% 达标）</td><td>大多达不到，成功偶发且不稳定</td><td>通常在预算内达到 50%</td></tr>
+      <tr><td>最终评估回报</td><td>长期停在 −800 以下</td><td>约 80～98</td></tr>
+      <tr><td>评估最大位置</td><td>长期停在 −0.4 附近</td><td>几千步内升到 −0.1 以上</td></tr>
+      <tr><td>机制解释</td><td>价值信息逐格倒退，慢且依赖运气</td><td>每步都有可学的方向信号，引导稳定</td></tr>
+    </table>
+    <p>对照的意义不只是"塑形更快"，还在于确认塑形没有把问题改掉：两种模式的最终目标（到山顶）完全相同，shaped 的优势全部体现在学习速度上。若 shaped 的成功率反而更低，先检查塑形系数是否过大、以及 <code>_phi_prev</code> 是否在回合边界正确重置。</p>
+
+    <p>势函数怎么选，是塑形实践里唯一需要判断的地方。原则上任意状态函数都满足策略不变性，但"引导的强弱与形状"由它决定。以位置势 Φ=50·position 为例，它把"向上"定义为好方向，小车在谷底来回振荡时，向上的一侧持续得到正反馈，探索自然被引向能积累高度的方向；若改成距离势 Φ=−50·|0.45−position|，则在目标右侧（位置超过 0.45）时继续向上会被"惩罚"，引导形状不同。两者都安全，选择取决于任务结构：单调目标用位置势更简单，需要双向逼近的目标用距离势更直观。系数的大小则是纯粹的工程量：太小引导弱，太大压过原始奖励，本章取 50 使单步塑形项与 −1 的步代价同量级。</p>
+
+    <h3>3. 三个评估指标</h3>
+    <ul>
+      <li><strong>首个成功回合</strong>：第一次到达山顶发生在第几个回合，衡量探索运气与塑形引导速度；</li>
+      <li><strong>滑窗成功率</strong>：最近 20 个回合里成功的比例，衡量策略稳定性；50% 是本章的"初步解决"标志；</li>
+      <li><strong>评估最大位置</strong>：评估回合里小车到过的最高位置，成功前唯一能反映"进步"的连续指标。</li>
+    </ul>
+    <p>注意评估回报仍是稀疏口径（+100/−1），"部分进步"不会体现在回报里，最大位置就是补充的进度温度计：如果它长期停在谷底 −0.4 附近，说明策略真的没动；如果爬到了 −0.1，哪怕仍没成功，学习也在推进。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+
+    <h3>数据流</h3>
+    <p>先说清楚两种模式的差异只有一处：<strong>塑形系数</strong>。训练闭环与前面章节一致（每步更新、每 5000 步评估），但每个回合结束要额外记一类信息：这个回合是否到达山顶（<code>terminated</code> 为真）。评估时同时返回三个量：稀疏回报、成功率、最大位置。滑窗成功率用最近 20 个回合的 <code>terminated</code> 序列计算，首次达到 0.5 的步数记为 <code>solved_at</code>。</p>
+
+    <h3>模块划分</h3>
+    <table>
+      <tr><th>组件</th><th>职责</th><th>关键点</th></tr>
+      <tr><td><code>SparseShapingWrapper</code></td><td>把稠密奖励换成稀疏奖励，可选加势函数塑形</td><td>势值 <code>_phi_prev</code> 存在 wrapper 上，随 <code>step</code> 更新</td></tr>
+      <tr><td><code>make_env(..., shaping)</code></td><td>统一创建训练/评估环境</td><td>shaping=0 即纯稀疏；两种模式共用同一 wrapper</td></tr>
+      <tr><td>成功统计</td><td>训练中记录每个回合的 <code>terminated</code>、首个成功回合</td><td>滑窗成功率与"50% 达标步数"由回合序列计算</td></tr>
+      <tr><td><code>evaluate</code></td><td>返回回报、成功率、最大位置三元组</td><td>最大位置从 <code>env.unwrapped.state[0]</code> 读取</td></tr>
+    </table>
+
+    <h3>关键超参数</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用与取值理由</th></tr>
+      <tr><td><code>--modes</code></td><td>sparse,shaped</td><td>纯稀疏 vs 塑形，同种子对照</td></tr>
+      <tr><td><code>--shaping</code></td><td>50.0</td><td>势函数系数；每步潜在变化量级 ±3.5，与 −1 的步代价同量级</td></tr>
+      <tr><td><code>--start-steps</code></td><td>2000</td><td>更强的随机探索期，给稀疏模式一点发现成功的机会</td></tr>
+      <tr><td><code>--success-window</code></td><td>20</td><td>滑窗成功率窗口；50% 作为初步解决标准</td></tr>
+      <tr><td><code>--max-steps</code></td><td>30000</td><td>每种模式的预算；两种模式合计 6 万步</td></tr>
+    </table>
+
+    <h3>与前一章的差异点</h3>
+    <ul>
+      <li>第 051 章用原生奖励做基准测试；本章<strong>改写奖励函数</strong>，用 wrapper 把稠密任务"变稀疏"，再对比塑形修复。</li>
+      <li>新增 <code>SparseShapingWrapper</code> 与势函数计算；这是全课程第一次修改奖励结构。</li>
+      <li>评估指标从"回报"扩展为"回报 + 成功率 + 最大位置"三元组。</li>
+      <li>训练统计新增回合级成功序列与首个成功记录。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：奖励改造 wrapper，稀疏化与塑形共用一套代码</strong></p>
+    <pre class="code"><code>class SparseShapingWrapper(gym.Wrapper):
+    """把稠密奖励改成"到山顶 +100、其余 -1"，可选势函数塑形。
+
+    塑形使用势函数 phi(s) = shaping * position，步内奖励修正为
+    F = gamma * phi(s') - phi(s)。势存储在 wrapper 上，随环境推进更新。
+    """
+
+    def __init__(self, env, shaping: float = 0.0, gamma: float = 0.99):
+        super().__init__(env)
+        self.shaping = shaping
+        self.gamma = gamma
+        self._phi_prev = 0.0             # 上一个状态的势，必须由 wrapper 自己维护
+
+    def _phi(self, obs) -&gt; float:
+        return self.shaping * float(obs[0])   # 位置越高势能越大
+
+    def step(self, action):
+        obs, _orig_rew, terminated, truncated, info = self.env.step(action)
+        reward = 100.0 if terminated else -1.0   # 丢弃稠密奖励，只保留成败信号
+        if self.shaping &gt; 0.0:
+            phi_next = self._phi(obs)
+            reward += self.gamma * phi_next - self._phi_prev   # 望远镜形式的塑形项
+            self._phi_prev = phi_next
+        return obs, reward, terminated, truncated, info
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        self._phi_prev = self._phi(obs)  # 回合边界重置势，防止跨回合串味
+        return obs, info</code></pre>
+    <p>解读：<strong>（1）</strong>包装器只改奖励：<code>terminated</code> 时才给 +100，时间截断只给 −1，稀疏语义的关键正在这里，截断回合不算成功。<strong>（2）</strong>塑形项严格写成 <code>γΦ(s′) − Φ(s)</code>：只有这个"望远镜形式"才保证策略不变性；写成 <code>Φ(s′)−Φ(s)</code> 或 <code>γΦ(s′)+Φ(s)</code> 都会改变最优策略，策略可能学会"贴着一个好状态打转"。<strong>（3）</strong><code>_phi_prev</code> 是 wrapper 的成员变量，不能塞进 <code>info</code> 传递，<code>step</code> 返回的 info 是新造的，上一回合的势根本流不回来，塑形会静默失效。这是最隐蔽的坑。<strong>（4）</strong><code>reset</code> 必须把 <code>_phi_prev</code> 重新初始化到初始状态的势：否则新回合第一步会带着上一回合末尾的势，凭空产生大额虚假奖励。</p>
+
+    <p><strong>片段 2：评估三元组，回报 + 成功率 + 最大位置</strong></p>
+    <pre class="code"><code>@torch.no_grad()
+def evaluate(agent: SAC, env, episodes: int):
+    """返回 (平均回报, 成功率, 平均最大位置)。"""
+    returns, successes, max_positions = [], [], []
+    for _ in range(episodes):
+        obs, _ = env.reset()
+        done = False
+        ep_ret = 0.0
+        max_pos = -1.2                  # MountainCar 的起点位置下界
+        success = False
+        while not done:
+            action = agent.act(obs, deterministic=True)
+            obs, rew, terminated, truncated, _ = env.step(action)
+            ep_ret += rew
+            max_pos = max(max_pos, float(env.unwrapped.state[0]))   # 穿过 wrapper 读原始状态
+            success = success or terminated
+            done = terminated or truncated
+        returns.append(ep_ret)
+        successes.append(float(success))
+        max_positions.append(max_pos)
+    return float(np.mean(returns)), float(np.mean(successes)), float(np.mean(max_positions))</code></pre>
+    <p>解读：<strong>（1）</strong>评估回报仍走 wrapper 的稀疏口径（要么 +100 附近、要么 −999 附近），所以"部分进步"不会体现在数字里，这正是必须配 <code>max_pos</code> 的原因。<strong>（2）</strong><code>env.unwrapped.state[0]</code> 绕过 wrapper 直接读原始环境内部状态：位置是进度指标，wrapper 不暴露它，就找它的"下家"。<strong>（3）</strong><code>success = success or terminated</code>：只认真终止（到达山顶），截断不算成功。<strong>（4）</strong>三个量各有分工：回报对应最终目标、成功率对应稳定性、最大位置对应"曙光出现没有"，别拿一个指标硬扛所有问题。</p>
+
+    <p><strong>片段 3：训练循环里的成功序列与达标判定</strong></p>
+    <pre class="code"><code>        next_obs, rew, terminated, truncated, _ = env.step(action)
+        buffer.add(obs, action, rew, next_obs, float(terminated))
+        obs = next_obs
+        ep_ret += rew
+        if terminated or truncated:
+            ep_returns.append(ep_ret)
+            successes.append(float(terminated))          # 只认真终止
+            if terminated and first_success_ep is None:
+                first_success_ep = len(successes)        # 回合序号转换为"第几个回合"
+                print(f"[{mode}] 第 {first_success_ep} 个回合首次到达山顶（步数 {step}）")
+            ep_ret = 0.0
+            obs, _ = env.reset()
+
+        if step % args.update_every == 0 and buffer.size &gt;= min(args.start_steps, 1000):
+            agent.update(buffer.sample(args.batch_size), args)
+
+        if step % args.eval_every == 0:
+            eval_ret, eval_succ, eval_pos = evaluate(agent, eval_env, args.eval_episodes)
+            eval_history.append((step, eval_ret, eval_succ, eval_pos))
+            recent = successes[-window:] if len(successes) &gt;= window else successes
+            train_succ = float(np.mean(recent)) if recent else 0.0
+            print(f"[{mode}] 步数 {step:6d} | 近{window}回合成功率 {train_succ:5.2f} | "
+                  f"评估 {eval_ret:8.1f} | 评估成功率 {eval_succ:.2f} | "
+                  f"最大位置 {eval_pos:+.3f}")
+            if solved_at is None and len(successes) &gt;= window and train_succ &gt;= 0.5:
+                solved_at = step
+                print(f"[{mode}] 滑窗成功率首次达到 50%（步数 {step}）")</code></pre>
+    <p>解读：<strong>（1）</strong><code>successes</code> 是与回合数对齐的 0/1 序列：<code>first_success_ep = len(successes)</code> 天然就是"第几个回合成功"，不用另设计数器。<strong>（2）</strong>滑窗用 <code>successes[-window:]</code>，不足窗口时用全部历史，早期样本少也不会除零。<strong>（3）</strong>达标判定加了 <code>len(successes) &gt;= window</code> 的前提：窗口没满时统计不可靠，先别急着宣布解决。<strong>（4）</strong>训练环境用随机策略采样（含探索），评估环境用确定性策略：成功率在两种口径下分别报告，日志里"训练成功率"高而"评估成功率"低的现象通常意味着策略还没收敛稳定。</p>
+
+    <p>完整可运行脚本（附录）：<a href="../code/ch052.py" download>code/ch052.py</a></p>
+    <pre class="sh"><code>python code/ch052.py                 # 两种模式各 30000 步，CPU 约 5–8 分钟
+python code/ch052.py --quick         # 快速跑通：4000 步/模式，约 1 分钟
+python code/ch052.py --shaping 10 --modes shaped    # 换一个塑形系数</code></pre>
+    <p>预期：<strong>shaped 通常在 5000～15000 步内首次成功并达到 50% 滑窗成功率，最终评估 80～98；sparse 的首次成功靠"撞运气"，很多种子 3 万步内达不到 50%</strong>。评估最大位置最早出现差异：shaped 几千步就能把小车带到 −0.1 以上，sparse 长期停在谷底 −0.4 附近。以实跑为准。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>把塑形项写成 γΦ(s′) + Φ(s) 或 Φ(s′)−Φ(s)</strong>：前者放大势能、后者不满足望远镜求和，都会改变最优策略，策略可能学会"贴着一个好状态打转"。必须严格用 <strong>γΦ(s′)−Φ(s)</strong>。</li>
+      <li><strong>势的"上一个值"没跟着回合重置</strong>：回合边界上 <code>_phi_prev</code> 若不更新，下一回合首步的塑形项会带着上一回合末的势，产生虚假的大额奖励。所有势状态都要在 <code>reset</code> 里重初始化。</li>
+      <li><strong>用评估回报判断"有没有进步"</strong>：稀疏口径下，从 −999 到 −600 的进步不会体现在成功率上；必须配合最大位置等连续进度指标，否则会误判训练停滞。</li>
+      <li><strong>塑形后忘记"奖励尺度变了"</strong>：塑形把每步奖励从 −1 扩到 ±3.5 以上，价值尺度随之改变。若发现 Q 损失异常大，先检查塑形系数是否过大。</li>
+      <li><strong>把截断当成功</strong>：<code>truncated</code> 是时间上限，不是到达目标。若 <code>successes.append(float(terminated or truncated))</code>，成功率会被"活到 999 步"的回合污染，指标虚高。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把 <code>--shaping</code> 依次设为 <code>5</code>、<code>50</code>、<code>500</code> 跑 shaped 模式，比较首个成功回合与最终评估。预测系数过大时的现象再验证。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>系数 500 时单步塑形项可达 ±35，远大于 −1 的步代价，策略会优先"往高处冲"而未必稳定停在终点。看评估成功率与最好/最终评估的差距。</div></details>
+      </li>
+      <li>把塑形从"位置势"换成"到山顶距离的势"（Φ(s) = −50·|0.45 − position|），重跑 shaped。两种势函数有本质区别吗？<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>两者在目标右侧的行为不同（距离势把"冲过山顶"也当作好状态）。用望远镜求和的口径分析：只要形如 γΦ(s′)−Φ(s)，策略不变性都成立；区别只在学习引导的强弱与形状。</div></details>
+      </li>
+      <li>给 sparse 模式换上第 045 章的 explore 配置（固定 α=0.5），重跑。更强的探索能大幅提前首次成功吗？<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>探索噪声更大确实增加"撞到山顶"的概率，但也让策略更难稳定利用成功。对比首个成功回合与 50% 达标步数两个指标，别只看前者。</div></details>
+      </li>
+      <li>实现"塑形系数退火"：前 10000 步用 shaping=50，之后线性降到 0。这种安排为什么可能两全其美？<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>把 wrapper 的 shaping 做成可设置的属性，在训练循环里按步数更新。先学结构、再撤掉引导，让最终策略回到原始稀疏目标上。</div></details>
+      </li>
+      <li>给 <code>evaluate</code> 增加"到达山顶前的最小剩余距离"指标，用它比较两种模式在"没成功回合"里的表现差异。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>在评估循环里维护 <code>best_dist = min(best_dist, 0.45 - position)</code>，返回后汇总。这个指标比最大位置更贴近"还差多少成功"。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>稀疏奖励的核心困难是价值信息只能靠 bootstrap"逐格倒退"，回合越长、成功概率越低，学习越慢。</li>
+      <li>势函数塑形 <strong>r′ = r + γΦ(s′) − Φ(s)</strong> 提供稠密引导且不改变最优策略，是处理稀疏奖励的第一把手术刀。</li>
+      <li>本章用奖励改造 wrapper 把 MountainCarContinuous 变成纯稀疏任务：shaped 在首个成功回合、50% 达标步数、评估成功率三项上全面领先。</li>
+      <li>稀疏任务的评估必须带连续进度指标（最大位置/剩余距离），只看回报会严重低估策略进步。</li>
+      <li>塑形项的单步账：γ=0.99、Δp=0.01 时"向上一步"比"原地不动"多拿约 0.495；全回合总塑形量只由首尾势决定（本例约 +30），与路径无关。</li>
+      <li>势函数的形式自由、系数敏感：任意 Φ 都安全，但引导强弱由系数决定；过大时会压过原始奖励，先核对 Q 损失的量级再定档。</li>
+      <li>下一章把"引导"从奖励搬到任务难度上：课程学习，先学简单版本的任务，再逐步过渡到目标任务。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch051.html">← 第 051 章：SAC的连续控制基准测试</a>
+    <a class="next" href="ch053.html">第 053 章：SAC的课程学习 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

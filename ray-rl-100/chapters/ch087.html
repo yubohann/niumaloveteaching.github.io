@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第087章 经验共享与数据复用 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第五篇 · 训练工程与系统进阶</span>
+    <span class="sep">/</span>
+    <span>第 087 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第五篇 · 训练工程与系统进阶</div>
+    <h1>第 087 章：经验共享与数据复用</h1>
+    <p class="lead">一句话：本章讲经验数据在采样单元之间共享、被反复采样的全部机制：缓冲结构、优先级采样、复用比例与数据混合策略。</p>
+    <ul class="meta">
+      <li>主题：训练工程 / 经验共享（Experience Sharing）</li>
+      <li>关键机制：全局回放、优先级采样（Prioritized Sampling）、复用比、数据混合</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 086 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解经验共享的三个层级：单元内复用、跨单元共享、跨任务共享，以及各自的收益来源与风险。</li>
+      <li>掌握优先级采样的数学形式：采样概率、重要性权重（Importance Weight）与退火策略。</li>
+      <li>理解优先级索引的数据结构选择：段树（Segment Tree）支持的对数复杂度操作。</li>
+      <li>会根据复用比（Replay Ratio）与有效样本量评估"反复使用同一批数据"的收益边界。</li>
+      <li>会设计演示数据、离线数据与在线数据的混合比例及其调度方案。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 082 章把复用定义为"同一批数据被过几遍"，第 086 章把数据在异步队列中的停留时间纳入考虑，两者处理的都是短期复用。<strong>经验共享处理的是长期复用：把数据放入持久缓冲，供任意时刻、任意学习步重新抽取。</strong>共享的第一个收益是样本覆盖率：单个采样单元只能看到自己轨迹上的状态，全局缓冲让所有单元的数据汇聚，批内状态分布更接近真实分布。第二个收益是稀有事件的传播：罕见的成功轨迹在局部缓冲里迅速被覆盖，在全局缓冲里可以反复被采样学习。</p>
+    <p>长期复用伴随两类风险。其一是分布偏移：反复采样旧数据使有效训练分布停留的历史分布上，偏离当前策略的访问分布。其二是优先级污染：采样机制若偏向历史高误差样本，未及时更新的旧优先级会持续放大过时样本的权重。本章讨论的全部技术，围绕"如何在扩大共享范围的同时控制这两类风险"展开。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p><strong>经验共享把数据从"消耗品"变成"可检索资产"，机制设计的全部张力在于共享收益与分布偏移之间的平衡。</strong>本节按共享层级、采样概率、存储结构与混合策略依次展开。</p>
+
+    <h3>1. 共享的三个层级</h3>
+    <table>
+      <tr><th>层级</th><th>数据范围</th><th>收益</th><th>风险</th></tr>
+      <tr><td>单元内复用</td><td>单 worker 的片段</td><td>实现简单、延迟为零</td><td>样本高度相关、覆盖窄</td></tr>
+      <tr><td>跨单元共享</td><td>全局回放缓冲</td><td>批内多样性、稀有事件传播</td><td>写入竞争、陈旧样本、内存开销</td></tr>
+      <tr><td>跨任务共享</td><td>外部数据集与演示</td><td>冷启动加速、先验注入</td><td>语义不一致导致负迁移（Negative Transfer）</td></tr>
+    </table>
+    <p>层级选择由数据性质决定：同策略算法的主路径是单元内复用加短窗口共享；离策略算法天然适合全局缓冲；跨任务共享需要严格的数据规范，观测与动作的语义必须一致，否则共享会把无关分布引入训练。<strong>全局缓冲的容量与并行度存在下限约束：容量小于并行度的数倍时，缓冲不断被新数据覆盖，共享退化为延迟传递。</strong></p>
+
+    <h3>2. 优先级采样的数学形式</h3>
+    <p>均匀采样把学习预算均摊到所有样本，与"学习价值不均等"的事实相悖：时序差分误差（Temporal Difference Error, TD Error）大的样本携带更多可学信息。优先级采样按误差设定抽样概率：</p>
+    <div class="formula">
+      P(i) = p<sub>i</sub><sup>α</sup> / Σ<sub>k</sub> p<sub>k</sub><sup>α</sup>，p<sub>i</sub> = |δ<sub>i</sub>| + ε
+      <span class="note">α 控制优先级强度：0 退化为均匀采样，1 为完全按误差比例；ε 防止零误差样本永不入选</span>
+    </div>
+    <p>按非均匀概率抽样改变了数据的分布，需要重要性权重恢复无偏性：</p>
+    <div class="formula">
+      w<sub>i</sub> = ( 1 / (N · P(i)) )<sup>β</sup>，β 从 β<sub>0</sub> 线性退火到 1
+      <span class="note">N 为缓冲容量；β=1 时权重完全校正，β<sub>0</sub> 常取 0.4 至 0.6 以降低早期方差</span>
+    </div>
+    <p>退火策略的原理：训练早期参数未稳，"偏差换方差"更划算，β 取小值；训练后期需要无偏收敛，β 升到 1。<strong>只实施优先级而不退火权重，是长期复用的最常见偏差来源。</strong>评估采样健康度的指标是有效样本量（Effective Sample Size, ESS）：ESS = (Σw<sub>i</sub>)<sup>2</sup> / Σw<sub>i</sub><sup>2</sup>（对一批而言），ESS 远小于批大小时说明少量样本主导了这次更新。</p>
+
+    <h3>3. 存储结构与写入并发</h3>
+    <p>优先级缓冲需要支持三种操作：按优先级分布抽样、按索引更新优先级、按容量淘汰最旧数据。朴素实现的抽样是 O(N) 扫描，容量 10<sup>5</sup> 以上时开销不可接受。<strong>标准解法是段树（Segment Tree）</strong>：叶子节点存样本优先级，内部节点存子树优先级之和；按累积和抽样一次 O(log N)，优先级更新同样 O(log N)。工程实现还有两个细节：误差按比例（Proportional）还是按排名（Rank-based）定义；写入采用"单写多读"约定，把样本追加与优先级更新串行在所有者进程内，避免细粒度锁。</p>
+    <p>分布式共享时缓冲按分片（Shard）存放，抽样跨分片按权重合并；样本用不可变对象传递，接收方按引用读取，<strong>不可变性使共享天然免锁</strong>，这一点在第 088 章的一致性讨论中会再次出现。</p>
+
+    <h3>4. 复用比与训练稳定</h3>
+    <p>复用比定义为每个环境步对应的梯度更新次数。复用比升高时：样本效率的收益先增后减，超过有效上界后训练开始不稳定，回报回落。上界与缓冲质量相关：全局缓冲、退火权重、及时更新优先级都会抬高上界；局部缓冲、固定权重、陈旧优先级则会压低它。监控量建议同时记录：复用比、平均样本年龄（存入到被采样的更新次数）、重要性权重分布与 ESS。<strong>平均样本年龄随复用比上升，它是分布偏移的直接计量。</strong></p>
+
+    <h3>5. 数据混合策略</h3>
+    <p>把演示数据（Demonstrations）、离线数据集与在线数据混合时，每种数据源标注两个属性：规模与质量（用其行为策略与当前策略的接近程度衡量）。混合比例的调度原则有三条：<strong>其一</strong>，离线比例随时间衰减，早期借助先验快速建立价值估计，后期过渡到在线分布；<strong>其二</strong>，离线样本的重要性权重单独计算，行为策略概率未知时用截断常数近似；<strong>其三</strong>，监控离线数据的梯度贡献占比，占比过高意味着在线信号被淹没。演示数据的典型用法是只用于价值预热（Pre-training），策略更新阶段按小比例保留。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>共享缓冲的设计按六步推进，每一步对应一个可验证的决策。</p>
+    <ol>
+      <li><strong>确定共享层级</strong>：按数据性质与算法族选择单元内、全局或跨任务共享；不确定时从单元内起步。</li>
+      <li><strong>估算容量</strong>：按第 084 章的公式估算内存，容量下限取并行度的 4 倍以上。</li>
+      <li><strong>选择采样策略</strong>：均匀或优先级；选优先级则同时配置 α 与 β 退火计划。</li>
+      <li><strong>实现索引结构</strong>：段树或分层桶结构，验证抽样分布与优先级的偏差。</li>
+      <li><strong>设定复用比</strong>：从每步 1 次更新起步，按回报与样本年龄联合调整上界。</li>
+      <li><strong>接入混合调度</strong>：多数据源时定义比例衰减函数，并单独监控各源的梯度贡献。</li>
+    </ol>
+    <h3>参数取值起点表</h3>
+    <table>
+      <tr><th>参数</th><th>常用起点</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>buffer capacity</td><td>10<sup>5</sup> 至 10<sup>6</sup></td><td>共享数据窗口</td><td>并行的 4 倍以上，受内存预算约束</td></tr>
+      <tr><td>α（优先级强度）</td><td>0.4 至 0.6</td><td>抽样偏向误差的程度</td><td>过大会使少数样本主导更新</td></tr>
+      <tr><td>β（权重退火）</td><td>0.4 起步退火至 1.0</td><td>偏差与方差平衡</td><td>按训练进度线性推进</td></tr>
+      <tr><td>replay ratio</td><td>每步 1 次更新起</td><td>复用强度</td><td>按平均样本年龄与回报复核</td></tr>
+      <tr><td>offline ratio</td><td>0.5 起步衰减至 0.1 以下</td><td>离线数据占比</td><td>按梯度贡献占比监控</td></tr>
+    </table>
+    <div class="box warn">
+      <span class="box-title">与上一章的差异</span>
+      <p>第 086 章处理的是"数据在途"的短期滞后，本章处理"数据在库"的长期陈旧；前者的修正机制是样本过滤，后者的修正机制是采样概率与权重重加权。两章的监控量可以合并成一条"样本年龄"时间线。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>以下片段基于 Ray 2.x 时期的通用写法，接口随版本演进，以对应版本的官方文档为准。</p>
+
+    <p><strong>片段 1：优先级段树的核心操作</strong></p>
+    <pre class="code"><code>import numpy as np
+
+class SumTree:
+    """按累积和抽样的段树：叶子存优先级，内部节点存子树之和。
+    抽样与更新均为 O(log N)，是优先级缓冲的标准索引结构。"""
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.tree = np.zeros(2 * capacity, dtype=np.float64)
+        self.data_pointer = 0
+
+    def add(self, priority):
+        # 新样本写入环形位置并回填优先级：自底向上更新祖先节点
+        idx = self.data_pointer + self.capacity
+        self.data_pointer = (self.data_pointer + 1) % self.capacity
+        self.update(idx, priority)
+
+    def update(self, idx, priority):
+        delta = priority - self.tree[idx]
+        self.tree[idx] = priority
+        # 沿路径上溯：每次除以 2 得到父节点，根节点保存总优先级
+        while idx > 1:
+            idx //= 2
+            self.tree[idx] += delta
+
+    def sample(self, total):
+        """在 [0, 总优先级) 内采样一次，返回命中叶子的索引。
+        累积和结构保证命中概率严格正比于叶子优先级。"""
+        idx = 1                                   # 从根节点向下二分
+        while idx &lt; self.capacity:
+            left = 2 * idx
+            idx = left if total &lt;= self.tree[left] else left + 1
+            if idx == left:
+                continue
+            total -= self.tree[left]              # 进入右子树时扣减左子树和
+        return idx - self.capacity</code></pre>
+    <p>解读：段树用数组表示满二叉树，根节点是总优先级。<strong>（1）</strong>抽样从根向下二分：每一步比较剩余累积量与左子树之和，命中概率自动正比于叶子优先级，无需显式归一化。<strong>（2）</strong>更新按差值回填祖先，避免整树重算；复杂度 O(log N) 使容量 10<sup>6</sup> 的缓冲每次抽样仅需约 20 次比较。<strong>（3）</strong>环形写入使"淘汰最旧"零成本：指针回绕即自然覆盖，配合容量约束实现时间窗口。</p>
+
+    <p><strong>片段 2：全局回放与复用比配置</strong></p>
+    <pre class="code"><code>from ray.rllib.algorithms.dqn import DQNConfig
+
+config = (
+    DQNConfig()
+    .environment("CartPole-v1")
+    .training(
+        # 全局缓冲：所有采样单元的数据汇聚到同一窗口，批内多样性最高
+        replay_buffer_config={
+            "type": "PrioritizedReplayBuffer",
+            "capacity": 200000,
+            "alpha": 0.6,           # 优先级强度：0.6 是常见起点
+            "beta": 0.4,            # 重要性权重退火起点，随进度升向 1.0
+        },
+        # 复用比由"每步更新次数"体现：训练批 64 条样本配高采样频率时，
+        # 平均样本年龄会上升，需要以年龄曲线复核复用是否越界
+        train_batch_size=64,
+        # 目标网络间隔需与复用比联动：复用越密，目标越应保持稳定
+        target_network_update_freq=500,
+    )
+)</code></pre>
+    <p>解读：这份配置把共享参数集中在一处，便于与复用比联合调参。<strong>（1）</strong>容量 20 万条在低维观测下约占一百多 MB，按第 084 章公式可复核。<strong>（2）</strong>α 与 β 分开配置体现它们职责不同：α 决定"抽谁"，β 决定"信多少"；只调 α 不调 β 会让偏差固化。<strong>（3）</strong>目标网络间隔与复用比联动的注释重申第 082 章的结论：复用越密，价值目标相对当前网络的距离越远，保持目标稳定是复用成立的前提。</p>
+
+    <p><strong>片段 3：数据源混合比例调度</strong></p>
+    <pre class="code"><code>def offline_ratio(step, total, start=0.5, floor=0.05, warmup=0.1):
+    """离线数据占比的调度：前段借助先验，后段过渡到在线分布。
+    外部演示与离线数据集共用此曲线，按质量微调起点与下限。"""
+    progress = step / max(total, 1)
+    if progress &lt;= warmup:
+        return start                      # 预热期：先验价值最高
+    # 预热后线性衰减到下限，再乘以当前策略容忍度
+    decay = (progress - warmup) / (1.0 - warmup)
+    return max(start * (1.0 - decay), floor)
+
+def effective_sample_size(weights):
+    """批内有效样本量：ESS 远小于批大小时，少数样本主导了本次更新。"""
+    w = np.asarray(weights, dtype=np.float64)
+    return float(w.sum() ** 2 / np.maximum((w ** 2).sum(), 1e-12))
+
+# 调度曲线在训练前预先生成并记入实验配置：
+# 混合比例属于影响训练动力学的参数，不应在运行时临时改动</code></pre>
+    <p>解读：这两个函数分别管理"份额"与"健康度"。<strong>（1）</strong>离线比例的曲线形状由三项决定：起点（先验强度）、预热长度（策略尚未稳定时先验更可信）、下限（始终保留少量先验作正则）。<strong>（2）</strong>参数在实验前预生成，运行时直接读取，保证实验可复现；曲线随实验配置一同存档。<strong>（3）</strong>ESS 提供反馈：若 ESS 持续低于批大小的十分之一，说明重要性权重过陡或优先级过强，应下调 α 或提高 β。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>启用优先级但不退火权重</strong>：训练后期偏差累积，回报与预测误差出现系统性偏移。修复：β 按训练进度升到 1，并在配置中显式写出退火计划。</li>
+      <li><strong>全局缓冲容量过小</strong>：容量接近并行度时，新数据不断覆盖旧数据，共享退化且样本年龄分布剧烈波动。修复：容量下限取并行度的 4 倍，并用年龄曲线验证。</li>
+      <li><strong>优先级长期不刷新</strong>：样本入库时的误差在变化后仍用作抽样依据，过时样本被反复选中。修复：每次采样后按当前误差回写优先级；对未采样样本设置周期性重估。</li>
+      <li><strong>跨任务共享未定义语义规范</strong>：观测维度顺序、归一化口径、动作边界不一致，共享数据成为噪声。修复：共享前定义统一数据规范（顺序、单位、范围），并做小批量兼容性验证。</li>
+      <li><strong>复用比只看回报不看年龄</strong>：回报未立刻恶化时继续提高复用比，样本年龄暗中攀升，随后出现难以归因的性能回落。修复：把平均样本年龄列入常规监控，与回报联合决策。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>计算题：缓冲容量 10<sup>4</sup>，四个样本优先级为 1、2、3、4（α = 1）。求各样本的抽样概率；若 α = 0.5，概率如何变化？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>α=1 时概率正比于优先级，分别为 0.1、0.2、0.3、0.4；α=0.5 时正比于平方根，差距被压缩。</div></details>
+      </li>
+      <li>预测题：β 固定为 0.4 不退火、复用比提高到每步 4 次更新。预测平均样本年龄、ESS 与回报曲线的走向。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>年龄上升、ESS 下降；回报先升后出现平台或回落，回落点即复用上界被越过的位置。</div></details>
+      </li>
+      <li>设计题：为两个结构相同、回报尺度不同的任务设计跨任务经验共享方案：数据规范、共享比例、独立部分与共享部分的划分，以及负迁移的检测指标。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>规范回报尺度与观测顺序；共享观测编码层、保留独立价值头；用两任务回报的相关性检测负迁移。</div></details>
+      </li>
+      <li>推导题：推导重要性权重 w<sub>i</sub> = (1/(N·P(i)))<sup>β</sup> 在 β=1 时的期望无偏性，并解释 β 小于 1 时偏差与方差的走向。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>E<sub>P</sub>[w·f] = Σ P(i)·(1/(N·P(i)))·f = (1/N)Σf，等于均匀期望；β 减小压方差但引入偏差。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>经验共享分单元内、跨单元、跨任务三个层级；层级越高收益与风险同时上升。</li>
+      <li>优先级采样按误差分配抽样概率，必须配重要性权重退火恢复无偏性。</li>
+      <li>段树以 O(log N) 支持抽样与更新，是优先级缓冲的标准索引结构；环形写入使淘汰零成本。</li>
+      <li>复用比的上界由缓冲质量决定；平均样本年龄与有效样本量是越界前的预警指标。</li>
+      <li>下一章把共享与更新放进同一张数据流图，讨论各环节的一致性要求。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch086.html">← 第 086 章：异步更新与同步更新对比</a>
+    <a class="next" href="ch088.html">第 088 章：分布式训练数据流与一致性 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第029章 实现基于力传感器的观察 | 机器人仿真学习课程 · Isaac Sim 强化学习训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · 仿真环境与训练框架</span>
+    <span class="sep">/</span>
+    <span>第 029 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · 仿真环境与训练框架</div>
+    <h1>第 029 章：实现基于力传感器的观察</h1>
+    <p class="lead">给策略安上"触觉"：接触力的三种仿真来源、单位与坐标系、噪声模型与低通滤波，把 1 kHz 的物理事件翻译成 60 Hz 控制回路能用的信号。</p>
+    <ul class="meta">
+      <li>主题：观测设计 / 力觉模态</li>
+      <li>相关组件：Isaac Sim（接触力 / 关节力矩）、PyTorch</li>
+      <li>预计学时：45 分钟</li>
+      <li>前置章节：第 028 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>说清机器人仿真中"力信号"的三条来源：净接触力、关节力矩、力/力矩传感器，各自能测什么、不能测什么。</li>
+      <li>掌握力的单位、坐标系与符号约定；理解为什么"测到的力矩包含重力载荷"。</li>
+      <li>会为训练设计力的噪声模型与低通滤波：高斯噪声、偏置漂移、截止频率的物理含义与参数取值。</li>
+      <li>会把力观测（滤波后、归一化、带限幅）接入策略，并解释为什么直接给原始力几乎不可训。</li>
+      <li>理解力观测在接触丰富任务（插拔、擦拭、装配）中的不可替代性，为第 030 章的接触奖励与第 041 章插拔任务铺路。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>前两章的视觉与几何观测都在回答"东西在哪"，但接触丰富的任务还要回答另一个问题：<strong>"我用了多大力？对方在怎么反抗我？"</strong>插轴入孔时，视觉只能告诉你"对得差不多了"，最后 1 毫米里决定成功的是力的方向与大小；擦桌子、拧瓶盖、装卡扣同理。力信号是这些任务唯一能在接触瞬间提供反馈的通道。</p>
+    <p>仿真里力信号信手可得、真值精确；但把它做成可用的观测有两个坑：<b>一是物理事件是高频的</b>（碰撞的冲击在毫秒级完成，而控制回路 60 Hz，采样会漏掉峰值），<b>二是仿真里的力"太干净"</b>（无噪声、无偏置），直接拿来训练的策略迁移到真机容易被噪声吓到。本章要做的就是在这两者之间架桥：用滤波把高频事件压成控制回路能用的包络，用噪声模型让策略提前适应真实的触觉信号。</p>
+  </section>
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 力的三条来源：从物理引擎里"挖"出触觉</h3>
+    <table>
+      <tr><th>来源</th><th>物理含义</th><th>能测什么</th><th>局限</th></tr>
+      <tr><td>净接触力</td><td>PhysX 对该刚体所有接触点求和的力/力矩（contact report）</td><td>末端与环境的合外力，含碰撞冲击</td><td>无接触点分布；需要开启接触报告，有开销</td></tr>
+      <tr><td>关节力矩</td><td>驱动关节达到目标所需的广义力（可通过关节 effort 读取或由驱动模型反推）</td><td>关节空间的负载，包含重力与惯性项</td><td>混合了重力；单关节测不到横向力</td></tr>
+      <tr><td>F/T 传感器</td><td>安装在腕部/指端的六维力/力矩传感器模型</td><td>最接近真机六维触觉</td><td>版本间 API 差异大，有的需自行建模</td></tr>
+    </table>
+    <p>选择原则：<strong>任务关心"末端受了多大力"用净接触力或 F/T；关心"关节负荷多大"用关节力矩；学习摩擦力与滑移这类接触细节时，力的方向分量比模长更关键。</strong>本课程的操作任务用净接触力 + 关节力矩组合，两者在 Isaac 里都是现成的张量接口，工程成本最低。</p>
+
+    <h3>2. 单位、坐标系与符号：三个必须先确定的约定</h3>
+    <ul>
+      <li><b>单位</b>：力用牛顿（N），力矩用牛顿·米（N·m），绝不要把两者放进同一个向量后不加说明，它们量纲不同、数值尺度也不同（典型操作任务：法向力 5–20 N，力矩 0.1–1 N·m）。</li>
+      <li><b>坐标系</b>：接触报告通常给世界系；F/T 传感器给传感器系。策略的直觉是"工具坐标系下的力"（推墙时 z 向受力、滑动时切向受力），所以在观测组装时统一转到末端/工具系。</li>
+      <li><b>符号</b>：明确"环境作用在机器人上的力"与"机器人作用在环境上的力"互为反号。训练里两种都行，但所有任务必须用同一个约定，否则混合两个来源（接触力 + 力矩）时符号错位。</li>
+    </ul>
+
+    <h3>3. 高频事件与低频控制：滤波的数学与物理</h3>
+    <p>碰撞冲击的频带在几百赫兹以上，控制回路 60 Hz 采样会发生<b>混叠（aliasing）</b>：高频冲击被"折"成低频假信号，策略看到的是无规律的尖刺。解法是采样前做抗混叠低通滤波：</p>
+    <div class="formula">
+      F<sub>t</sub> ← α·F<sub>t</sub> + (1−α)·F<sub>t−1</sub>，  α = Δt / (τ + Δt)
+      <span class="note">一阶低通；τ 为时间常数。控制周期 Δt=1/60 s、截止频率 f<sub>c</sub>=20 Hz 时 τ≈1/(2πf<sub>c</sub>)≈8 ms，α≈0.67</span>
+    </div>
+    <p>截止频率怎么选？<strong>取控制频率的 1/3 以下（20 Hz 对应 60 Hz 控制）</strong>：既能滤掉冲击尖刺，又保留"接触建立、力渐变、松脱"这些几十毫秒级的包络。滤波的代价是延迟：一阶低通在截止频率处相移约 90°，等效延迟 τ；τ=8 ms 远小于控制周期 16.7 ms，可以接受。<b>注意：滤波只应作用于"观测通道"，奖励与终止判断若需要瞬时力（如撞击惩罚），应使用未滤波的原始力</b>，这是"同一物理量、两种用途、两套处理"的典型案例。</p>
+
+    <h3>4. 噪声模型：让仿真信号"像真的"</h3>
+    <p>仿真力是精确值，真机传感器有噪声、偏置与量化。为了让策略学到噪声鲁棒的行为，在观测通道注入一个合理的噪声模型：</p>
+    <div class="formula">
+      F̃ = clamp( F<sub>filtered</sub> + b<sub>t</sub> + ε<sub>t</sub>, −F<sub>max</sub>, +F<sub>max</sub> )，  b<sub>t+1</sub> = b<sub>t</sub> + η<sub>t</sub>，  ε ~ N(0, σ²)
+      <span class="note">ε 为逐帧白噪声（σ≈0.3–0.5 N）；b 为慢漂移偏置（步长 η 很小，模拟温漂）；F<sub>max</sub> 限幅模拟量程</span>
+    </div>
+    <p>三个参数的物理来源：σ 对应传感器的电子噪声底（真机 F/T 传感器典型 0.1–1 N）；偏置 b 模拟零漂（开机要"去皮"的原因）；限幅模拟量程上限。经验：<strong>噪声只注入观测，不要注入物理本身</strong>，给接触力加噪声会让物理求解器行为不一致；观测噪声才是"传感器不完美"的正确抽象。</p>
+
+    <h3>5. 重力载荷：关节力矩观测的隐藏成分</h3>
+    <p>关节力矩观测里，除接触负载外还混着两样东西：重力补偿力矩（随位形变化）与惯性力矩（随加速度变化）。举例：Franka 的肩关节在手臂伸平时受约 25 N·m 的重力矩，而接触载荷可能只有 2 N·m，<strong>不处理的话，策略看到的是"由重力主导"的信号，接触信息被淹没。</strong>两条工程路线：</p>
+    <ul>
+      <li><b>物理消除</b>：用动力学模型计算重力项 G(q)，观测里给 τ<sub>measured</sub> − G(q)。干净但需要精确模型（仿真里恰好有）。</li>
+      <li><b>交给网络</b>：把关节角也放进观测，让网络自己回归出"重力部分是这些角度的函数"。简单、无需模型，但要占用网络容量，且外推到新位形时可能出错。</li>
+    </ul>
+    <p>推荐：<b>仿真里用物理消除（我们有完美模型），同时把 q、q̇ 留在观测里做冗余信息。</b>这能让力观测的"信噪比"立刻上一个台阶。</p>
+
+    <h3>6. 完整算例：阶跃接触的滤波响应与噪声账</h3>
+    <p>接触从"没碰到"到"10 N 稳定接触"是一个阶跃，它能检验滤波器的每一项代价。α=0.67 时滤波输出 F<sub>k</sub> = 10 × [1 − (1−α)<sup>k</sup>]：</p>
+    <table>
+      <tr><th>接触后第 k 个控制步</th><th>滤波输出（N）</th><th>占稳态比例</th></tr>
+      <tr><td>1</td><td>6.70</td><td>67%</td></tr>
+      <tr><td>2</td><td>8.91</td><td>89%</td></tr>
+      <tr><td>3</td><td>9.64</td><td>96%</td></tr>
+    </table>
+    <p>读数：<strong>接触建立后的第一步，观测里的力只有真实值的 67%</strong>，策略基于偏低的值做决策；达到 90% 需要约 2.1 个控制步（35 ms）。若任务控制逻辑里有"力超过 8 N 就退让"这类阈值判断放在观测通道，实际力已经接近 12 N 时观测值才越过阈值，安全余量必须按这个延迟预留。同一组数还能解释"松脱检测"的滞后：接触消失的阶跃衰减同样需要 2 个多控制步才降到 10% 以下。</p>
+    <p>噪声侧的两笔账。第一笔，低通对白噪声的方差压缩系数是 α/(2−α) = 0.504，σ=0.4 N 的白噪声经过滤波后等效 σ≈0.28 N，这是"滤波换来的降噪收益"的定量值。第二笔，偏置漂移按随机游走累积：步长 0.001 N 时，100 步的标准差约 0.01 N，一万步约 0.1 N；在单回合尺度上远小于白噪声，跨回合成千上万步后也仅到白噪声的 1/4 量级，所以"回合重置时重采偏置"比"精细建模温漂"更划算。</p>
+    <p>还有一条冲击的边界必须写清：碰撞冲击在毫秒级完成，60 Hz 观测采样加 20 Hz 滤波的双重作用下，冲击峰值在观测通道里几乎不可见。<strong>因此"超力保护"这类需要瞬态信息的逻辑只能读物理引擎的原始接触力（按物理步记录）</strong>，把它交给观测或滤波后的信号都会漏掉最危险的那一瞬间。</p>
+
+    <h3>7. 失效模式清单</h3>
+    <ul>
+      <li><strong>滤波状态跨回合渗漏</strong>：不复位滤波状态时，上回合的残余力以指数衰减进入新回合的前几步观测。症状：接触前"预知"力的幽灵信号，训练日志里"未接触受力"占比异常。修复：reset 时对结束环境清零。</li>
+      <li><strong>限幅与偏置的叠加饱和</strong>：偏置漂移叠加大接触力后长时间贴住 ±30 N 上限，观测里只剩饱和值，梯度分辨不出力的差异。症状：长回合末段力观测"卡住"。修复：限幅前先减掉当前偏置，或把饱和标志作为一维观测。</li>
+      <li><strong>零速标定的时变性</strong>：用"回合初始静止读零"的方式消偏置，但标定值只对当时位形成立；手臂抬到新位形后重力矩变化没有被消掉，力观测的"零点"漂移。症状：策略在高位姿区间对接触迟钝。修复：用位形相关的正弦近似或动力学 API，标定只作兜底。</li>
+      <li><strong>噪声量级与归一化基准错配</strong>：噪声 σ 或量程缩放与真实部署差一个量级时，策略学到的是"针对仿真噪声的滤波行为"。症状：带噪评估测试里掉点集中。修复：把 σ 与量程写进实验记录，用 021 章的偏移评估思想各扫一档。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p><strong>力观测的管线是"取原始信号 → 坐标变换 → 重力消除（若用关节力矩）→ 低通滤波 → 噪声注入 → 限幅归一化 → 拼接观测"。</strong>顺序不能乱：先变换后滤波（滤波要在一致的坐标系里做）、先物理后传感器效应（噪声是最后一道）。</p>
+    <ol>
+      <li><strong>取信号</strong>：净接触力用刚体视图的批量接口；关节力矩用关节视图的 effort 读回。两者都是 (N, dim) 张量，一次取回。</li>
+      <li><strong>坐标系</strong>：接触力从世界系转到工具系（用末端姿态的旋转矩阵）；关节力矩天然在关节系，无需变换。</li>
+      <li><strong>重力消除</strong>：τ<sub>net</sub> = τ<sub>measured</sub> − G(q)，仿真里 G(q) 可由动力学 API 给出，或按"静止时读零"的近似在线标定。</li>
+      <li><strong>滤波</strong>：一阶低通，τ≈8 ms；保存上一时刻滤波值用于回合重置时清零。</li>
+      <li><strong>噪声</strong>：白噪声 + 慢漂移偏置 + 限幅；参数写进域随机化范围（第 021 章的思想），每个环境独立采样。</li>
+      <li><strong>归一化</strong>：除以期望量程（如力 20 N、力矩 2 N·m）把数值压到 O(1)；这一步和观测归一化（运行时统计）二选一，不要叠加。</li>
+    </ol>
+    <table>
+      <tr><th>设计点</th><th>推荐值</th><th>理由</th></tr>
+      <tr><td>力观测维数</td><td>3（工具系 xyz 力）+ 3（可选力矩）</td><td>指端任务 3 维力足够；腕部 F/T 用 6 维</td></tr>
+      <tr><td>滤波截止</td><td>20 Hz（α≈0.67）</td><td>控制频率的 1/3；保留接触包络、滤掉冲击尖刺</td></tr>
+      <tr><td>白噪声 σ</td><td>0.3–0.5 N / 0.05 N·m</td><td>匹配真机传感器噪声底；过大淹没信号</td></tr>
+      <tr><td>偏置漂移</td><td>每步 ±0.001 N 随机游走</td><td>模拟温漂；回合重置时重新采样偏置</td></tr>
+      <tr><td>限幅</td><td>±30 N / ±5 N·m</td><td>模拟量程；防止策略依赖超量程的精确值</td></tr>
+      <tr><td>是否给历史</td><td>给 1–2 帧滤波值</td><td>力的变化趋势对判断"进入/脱离接触"有用</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计思维：奖励用瞬时力，观测用滤波力</span>
+      <p>一个必须分开处理的陷阱：<strong>如果"过大的接触力"要受罚，判定必须用未滤波的原始力</strong>，滤波会抹平冲击峰值，恰好把最该罚的瞬间"洗白"了。反过来，观测里的力应该是滤波后的包络，让策略在可控时间尺度上决策。同源不同路：物理真值服务奖励与安全，传感器模型服务观测。<b>把这两个用途显式写成两行代码并注释原因，能避免未来 80% 的"训练结果无法解释"问题。</b></p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：净接触力 + 工具系变换 + 低通滤波</strong></p>
+    <pre class="code"><code>import torch
+
+class ForceObserver:
+    """从净接触力到"可训练"的力观测：变换 → 滤波 → 记录历史"""
+    def __init__(self, num_envs, alpha=0.67, device="cuda"):
+        self.alpha = alpha                     # 低通系数：20 Hz 截止，抗混叠
+        self.f_filt = torch.zeros(num_envs, 3, device=device)   # 滤波状态
+        self.f_prev = torch.zeros(num_envs, 3, device=device)   # 上一帧：给策略变化趋势
+        self.last_raw = torch.zeros(num_envs, 3, device=device)  # 原始值：给奖励用
+
+    def reset(self, env_ids):
+        self.f_filt[env_ids] = 0.0             # 回合重置要清零：否则跨回合的力会"渗"进新回合
+        self.f_prev[env_ids] = 0.0
+
+    def update(self, raw_wrench, tool_rot):
+        """raw_wrench: (N, 3) 世界系净接触力；tool_rot: (N, 3, 3) 末端姿态"""
+        self.last_raw = raw_wrench.clone()     # 奖励/终止用原始力：别让滤波掩盖冲击峰值
+        f_tool = torch.einsum("nij,nj-&gt;ni", tool_rot.transpose(1, 2), raw_wrench)
+        # 转到工具系：策略的直觉是"推墙在 z、摩擦在 xy"，世界系的轴向随姿态漂移
+        self.f_prev = self.f_filt.clone()
+        self.f_filt = self.alpha * f_tool + (1 - self.alpha) * self.f_filt
+        return self.f_filt</code></pre>
+    <p>解读：这段代码有两个"位置"值得注意。<b>第一个是 <code>reset</code> 里的清零</b>：滤波状态是跨步的，"哪些环境刚重置"必须和处理动作积分器一样对待，不清零的话，上一个回合的残余力会以指数衰减的形式渗进新回合观测，训练数据里出现"未接触就有力"的幽灵。<b>第二个是 <code>last_raw</code> 与 <code>f_filt</code> 的分身</b>：原始值留给奖励通道（第 030 章会用它做撞击惩罚），滤波值给观测。代码里把两者都存下来，就是给"同源不同用途"留下显式接口。<b>坐标变换为什么放在滤波之前？</b>因为一旦姿态在回合中旋转，世界系的同一物理力在观测里本应变化，先转工具系让力的物理意义稳定，滤波才有意义。用 <code>transpose</code> 把旋转矩阵按行作用于向量，是批处理旋转的标准写法（等价于逐环境 R<sup>T</sup>f）。</p>
+
+    <p><strong>片段 2：关节力矩观测 + 重力消除</strong></p>
+    <pre class="code"><code>class JointTorqueObserver:
+    """关节力矩观测：减去重力项，得到"接触负载"信号"""
+    def __init__(self, robot_view, device="cuda"):
+        self.view = robot_view
+        self.num_dof = robot_view.dof_count         # 7：Franka 手臂自由度
+        # 重力项的轻量近似：把小臂/手爪的等效质量与质心距离折进一个经验系数
+        # 仿真里可用动力学 API 给精确 G(q)；这里演示"无模型"路线
+        self.g_coef = torch.tensor([0.0, 12.0, 8.0, 4.0, 0.8, 0.3, 0.1],
+                                   device=device)    # 单位 N·m/（sin 关节角×kg）
+
+    def update(self, gravity_scale=1.0):
+        q = self.view.get_joint_positions()          # (N, 7)
+        tau = self.view.get_joint_efforts()          # (N, 7)：驱动实际施加的广义力
+        q_grav = q[:, : self.num_dof]
+        tau_grav = self.g_coef * torch.sin(q_grav) * gravity_scale
+        # 重力矩近似 ∝ sin(q)：把观测重心从"位形"移向"接触负载"
+        return tau - tau_grav</code></pre>
+    <p>解读：这段演示的是"无模型重力消除"的近似法，它回答一个现实问题，很多仿真脚本拿不到精确动力学系数，但你还是想让力观测可用。<b><code>g_coef · sin(q)</code> 的物理直觉</b>：重力矩等于重力臂与重力大小的乘积，重力臂随关节角按正弦变化；每个关节的系数折合"下游连杆的等效重量"。它不精确（忽略了多关节耦合），但能把"位形引起的力矩变化"压到主信号的 1/3 以下，这就够策略用了。<b>精确路线怎么写？</b>仿真里用动力学 API（概念上：<code>tau_grav = inverse_dynamics(q, v=0, a=0)</code>），一行顶这段十行，且有完美精度。工程取舍：仿真训练用精确法，若要做 sim-to-real 对比，无模型近似更接近真实机器人上能拿到的信息。<b>另一个细节：effort 读的是"驱动器施加的力"还是"关节净力"？</b>取决于驱动模式：位置控制下读到的 effort 是驱动为对抗负载而输出的力矩，恰好反映接触负载 + 重力；力矩控制模式下它就是指令本身，不能再当"测量值"用，先确认驱动模式（第 003–006 章），再决定这路信号有没有观测价值。</p>
+
+    <p><strong>片段 3：噪声模型与观测组装</strong></p>
+    <pre class="code"><code>class ForceNoiseModel:
+    """传感器效应：白噪声 + 慢漂移 + 限幅。噪声只进观测，不碰物理"""
+    def __init__(self, num_envs, sigma=0.4, drift_std=0.001, f_max=30.0, device="cuda"):
+        self.sigma = sigma                          # 电子噪声底：真机 F/T 的典型量级
+        self.drift_std = drift_std                  # 每步随机游走步长：模拟温漂
+        self.f_max = f_max                          # 量程：超出被截断
+        self.bias = torch.zeros(num_envs, 3, device=device)
+
+    def reset(self, env_ids):
+        self.bias[env_ids] = torch.randn_like(self.bias[env_ids]) * 0.5
+        # 每次重置重采样偏置：对应真机"重新上电后去皮前的零漂"
+
+    def __call__(self, f_clean):
+        self.bias = self.bias + self.drift_std * torch.randn_like(self.bias)
+        noisy = f_clean + self.bias + self.sigma * torch.randn_like(f_clean)
+        return noisy.clamp(-self.f_max, self.f_max)
+
+def build_force_obs(force_obs, noise_model, torque_obs, scale_f=20.0, scale_tau=5.0):
+    f_obs = noise_model(force_obs)                  # 传感器通道：加噪
+    obs = [
+        f_obs / scale_f,                            # 归一化到 O(1)：量纲统一，别让 20 N 主导梯度
+        (f_obs - force_obs) / scale_f,              # 把噪声本身也暴露给策略：学习"不要追噪声"
+        torque_obs / scale_tau,                     # 关节力矩：已完成重力消除
+    ]
+    return torch.cat(obs, dim=-1)                   # (N, 3+3+7)</code></pre>
+    <p>解读：噪声模型的三个组件对应真机三种可测量的传感器缺陷（噪声底、漂移、量程）。<b>把"噪声本身"作为观测的一部分</b>（第二项 <code>f_obs − force_obs</code>）是本章最反直觉的设计：它给了策略一个明确信号，"我的读数里有多少是传感器的错"。真机上这叫"置信度通道"，效果是把鲁棒性从"隐式学习"变成"显式信息"，训练更快、对噪声参数变化更不敏感。<b>归一化采用固定常数（20 N、5 N·m）</b>；运行时统计量在这里不可用：力信号在训练早期几乎恒为零，统计得到接近零的方差，归一化后噪声被放大成主信号，固定量程反倒最稳。这也是"归一化不是万能默认，要看信号的物理范围"的一个具体反例。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>力/力矩混用单位</strong>：把 3 维力（N）与 3 维力矩（N·m）直接拼接后统一缩放，5 N·m 的力矩在数值上被 20 N 的缩放系数压扁成 0.25。症状：策略对腕部受扭完全无感。修复：分通道各自归一化。</li>
+      <li><strong>重力项没消</strong>：关节力矩观测由重力主导（肩关节 25 N·m vs 接触 2 N·m），接触信号被淹没。症状：抬臂到位姿就"读不出"接触。修复：减 G(q) 或用 sin 近似，或至少把 q 放进观测与力信号共同给出。</li>
+      <li><strong>无滤波直接喂</strong>：60 Hz 采样混叠，冲击尖刺随机出现，策略把噪声当接触。症状：成功率随训练波动大、仿真与评估成绩差距大。修复：20 Hz 低通，滤波状态随重置清零。</li>
+      <li><strong>奖励也用滤波力</strong>：撞击惩罚被判在"力已经平滑掉"的时刻，超力事件漏罚。症状：策略学会"快速撞一下就跑"的投机行为。修复：奖励通道保留原始力，观测通道才滤波。</li>
+      <li><strong>噪声注入到物理</strong>：把噪声加在接触求解的输入上（如随机扰动接触刚度），物理行为跨环境不一致、接触求解器频繁重启。症状：训练慢、physx 警告刷屏。修复：噪声只加在观测通道。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>计算题：控制周期 1/60 s，想把力观测的截止频率压到 10 Hz，低通系数 α 应取多少？滤波引入的等效延迟是多少毫秒？它占控制周期的几分之几？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>τ = 1/(2π·10) ≈ 16 ms，α = Δt/(τ+Δt) ≈ 0.5；延迟 16 ms 接近一个控制周期，说明 10 Hz 已接近 60 Hz 控制的滤波下限。</div></details>
+      </li>
+      <li>消融实验：同一任务分别用"无限幅加噪"与"限幅 ±30 N"的观测训练，设计一个能暴露差异的测试场景（提示：让一个重物意外压在末端），解释结果。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>限幅相当于"量程保护"：策略见过饱和信号的行为；无限幅时策略可能学到依赖超量程精确值的脆弱行为。</div></details>
+      </li>
+      <li>把重力消除的近似式改成"静止零标定"（回合开始时静止读一次力矩当零偏），对比两者在"手臂抬起后接触物体"任务上的表现。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>零标定只对"标定时的位形"有效，抬臂后重力矩变化没有被消掉；观察策略是否在某些高度区间失灵。</div></details>
+      </li>
+      <li>设计实验：把噪声 σ 依次设为 0 / 0.4 / 1.5，观察训练成功率与"评估时加 σ=1.0 扰动后的成功率"。哪个设置最鲁棒？什么叫"训练噪声超过部署噪声"？<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>σ=0 训练的策略在带噪评估里通常明显掉点；σ 比部署略大是常用策略（域随机化的单参数版）。但 σ 过大会淹没真实接触信号，成功率本身也会掉。</div></details>
+      </li>
+      <li>思考题：为什么"力观测 + 位置观测"的组合在插孔任务里比任何单一模态都强？请从"状态的可观测性"角度给出一段短论证。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>位置告诉你"在哪"，力告诉你"接触的几何关系"（偏心插入会产生固定的力模式）；两者互补，单独任何一个都留有多义性。</div></details>
+      </li>
+      <li>用 6 节的模型复算：把 α 换成 0.8（按本章 α=Δt/(τ+Δt) 的映射，等效截止频率约 38 Hz），阶跃接触后第一步的观测值是多少、90% 收敛需要几步？再对比 α=0.67 说出"响应快"换来了什么代价。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>α=0.8 时第一步 8.0 N、90% 约 1.4 步；代价是截止频率抬高后冲击尖刺的通过率变大，混叠与噪声也更难压住，用方差压缩系数 α/(2−α) 比较降噪收益。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul>
+      <li>力信号三条来源：净接触力（末端合力）、关节力矩（含重力）、F/T 传感器（六维）；按任务需求与版本可用性选择。</li>
+      <li>单位、坐标系、符号三个约定必须先确定；关节力矩要消重力，否则接触信息被淹没。</li>
+      <li>抗混叠低通（20 Hz，α≈0.67）把高频冲击压成控制回路可用的包络；滤波状态随重置清零。</li>
+      <li>噪声模型（σ≈0.4 N、慢漂移、限幅）只进观测；奖励通道用原始力；两种归一化策略：固定量程优先。</li>
+      <li>下一章把"接触"从观测升级为学习信号：接触检测的实现与基于接触的奖励设计。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch028.html">← 第 028 章：实现基于点云的观察</a>
+    <a class="next" href="ch030.html">第 030 章：实现接触检测与奖励 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

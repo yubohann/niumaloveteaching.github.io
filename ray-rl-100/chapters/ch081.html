@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第081章 超参搜索实战：损失函数组合 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第五篇 · 训练工程与系统进阶</span>
+    <span class="sep">/</span>
+    <span>第 081 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第五篇 · 训练工程与系统进阶</div>
+    <h1>第 081 章：超参搜索实战：损失函数组合</h1>
+    <p class="lead">一句话：本章讲组合损失（Composite Loss）各分量系数的搜索方法，把策略损失、价值损失、熵正则与 KL 约束的权重关系变成可测量、可搜索、可归因的工程对象。</p>
+    <ul class="meta">
+      <li>主题：超参搜索 / 损失函数组合</li>
+      <li>关键机制：分量量纲折算、梯度竞争、系数对数搜索、失衡诊断</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 080 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解组合损失的构成与各分量的量纲差异（Magnitude），明白系数（Coefficient）在数学上承担"折算汇率"的角色。</li>
+      <li>掌握价值损失系数（Value Loss Coefficient）、熵系数（Entropy Coefficient）、KL 系数（KL Coefficient）的作用机制与常用取值范围。</li>
+      <li>会为损失系数设计对数尺度（Log-scale）搜索空间，并用 ASHA 等调度器控制试验成本。</li>
+      <li>会读取分量诊断指标（裁剪比例、近似 KL、熵、价值损失），判断哪一类失衡正在发生。</li>
+      <li>能根据现象区分"系数问题"与"数据问题、优化器问题"，避免错误归因。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>强化学习（Reinforcement Learning, RL）算法几乎都在最小化一个由多个子目标相加而成的<strong>组合损失</strong>：策略梯度项驱动回报提升，价值回归项训练评论家（Critic），熵正则项维持探索。各分量相加时携带各自的系数，系数改变了每个子目标的"发言权"，也改变了共享网络（Shared Trunk）中各梯度之间的竞争关系。前几章分别搜索了学习率、GAE 参数、熵系数与网络结构；当这些单点确定之后，<strong>剩余的大幅波动往往来自分量的组合方式</strong>：价值损失淹没策略梯度、熵项过强导致策略永不收敛、KL 约束过松导致更新越界，症状各不相同，但表现都是"回报曲线异常"。</p>
+    <p>系数搜索的困难在于三点：其一，系数作用在梯度层面，调整结果具有滞后性；其二，系数之间存在交互效应（Interaction Effect），同时调整两个系数会得到无法归因的混合结果；其三，系数量级跨度大，线性网格会浪费绝大多数试验。本章把这三个困难拆开，先讲原理中的量纲与梯度竞争，再给出可操作的对数搜索空间与诊断口径。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p><strong>组合损失的本质是把多个学习目标通过系数折算到同一数值尺度上，系数错了，梯度结构就错了。</strong>本节先给出一般形式与量纲分析，再讨论梯度竞争、熵正则与 KL 约束两种实现，最后总结搜索空间的设计依据。</p>
+
+    <h3>1. 组合损失的一般形式与量纲分析</h3>
+    <p>以带评论家的策略梯度方法为例，一轮小批（Minibatch）上的总损失可写为：</p>
+    <div class="formula">
+      L<sub>total</sub> = L<sub>policy</sub> + c<sub>v</sub> · L<sub>value</sub> + c<sub>e</sub> · L<sub>entropy</sub> + c<sub>kl</sub> · L<sub>KL</sub>
+      <span class="note">c<sub>v</sub> 为价值损失系数，c<sub>e</sub> 为熵系数，c<sub>kl</sub> 为 KL 惩罚权重</span>
+    </div>
+    <p>三个主要分量的量纲完全不同：策略项的数值量级由优势（Advantage）决定，典型范围是 10<sup>-1</sup> 到 10<sup>0</sup>；价值项是均方误差（Mean Squared Error, MSE），量级由回报尺度平方决定，回报取 0 到 100 量级时价值损失可达 10<sup>2</sup> 到 10<sup>4</sup>；熵项是动作分布熵，典型范围是 0 到 log(动作数)，离散动作数为 6 时上界约 1.8。若回报量级较大而系数保持默认，价值项数值会高出策略项两个数量级，梯度随之被价值项主导。<strong>系数的第一条设计依据就是量纲：它要把各分量的数值与梯度拉回同一量级。</strong></p>
+
+    <h3>2. 梯度竞争与有效步长</h3>
+    <p>当策略与价值共享主干网络时，总梯度是各分量梯度的加权和：</p>
+    <div class="formula">
+      ∇L<sub>total</sub> = ∇L<sub>policy</sub> + c<sub>v</sub> · ∇L<sub>value</sub> + c<sub>e</sub> · ∇L<sub>entropy</sub>
+      <span class="note">同一组主干参数同时接收三类梯度，范数之比决定谁主导特征学习</span>
+    </div>
+    <p>优化器看到的只有总梯度，无法分辨来源。若价值梯度范数长期高于策略梯度范数一个数量级以上，主干参数主要在为价值拟合服务，策略改进变慢，表现为回报曲线平台期延长、价值损失持续下降。诊断方法是分别计算各分量对主干参数的梯度范数并取比值；比值在 10<sup>-1</sup> 到 10<sup>1</sup> 之间可以接受，超出这一个区间就需要调整系数或改用独立网络。<strong>系数的第二条设计依据是梯度范数比，它比损失数值比更能反映参数的真实受力。</strong></p>
+    <div class="box key">
+      <span class="box-title">设计决策：共享主干还是独立网络？</span>
+      <p>共享主干参数量小、特征复用率高，适合观测维度低、任务单纯的环境；独立网络消除了梯度竞争，代价是参数量接近翻倍。工程上的折中方案是"部分共享"：浅层共享特征提取，策略头与价值头分离。是否共享应作为与系数联合考虑的决策项，不宜充当默认选项。</p>
+    </div>
+
+    <h3>3. 熵系数：探索预算的连续调节</h3>
+    <p>熵项在损失中以负号出现（最大化熵等价于最小化负熵），系数即"探索预算"。系数取值 0.01 时策略在收敛阶段仍保留少量随机性；取值 0.05 到 0.1 时探索显著增强，收敛变慢但更不易陷入局部最优。熵系数过大的典型症状是熵值长期停在分布上限附近、回报曲线平缓上升甚至不上升；过小的典型症状是熵值在少量迭代内跌落到接近零、回报提前锁死。<strong>监控口径应直接使用策略熵（Entropy）；训练回报的噪声会掩盖熵的变化趋势。</strong></p>
+
+    <h3>4. 价值系数：训练速度与主导风险的双向作用</h3>
+    <p>价值系数的提高让评论家拟合更快，优势估计（Advantage Estimation）的偏差随之减小，早期迭代受益明显。但价值项是平方损失，异常回报会产生很大的梯度，系数过大时价值更新会挤压策略更新。常见做法是给价值损失加裁剪（Clip）或使用归一化回报（Normalized Return），把平方损失的动态范围压缩，再配合中等系数。DQN 系列中价值系数常取 0.5 到 1.0，PPO 中常取 1.0，回报尺度归一化后可取到 0.25。<strong>提高价值系数前应先检查回报是否归一化，两者是配套决策。</strong></p>
+
+    <h3>5. KL 惩罚与裁剪：两种约束实现的关系</h3>
+    <p>PPO 限制单次策略变化的机制有两种实现：裁剪目标（Clipped Objective）与自适应 KL 惩罚（Adaptive KL Penalty）。两者都约束新旧策略之间的 KL 散度，区别在于执行位置：裁剪在目标函数里"掐掉"越界的比率，KL 惩罚在损失里对越界行为加价。当 KL 惩罚系数按目标值自适应调整时，若实际 KL 超过目标值，系数自动上调，反之自动下调。默认建议只启用一种：裁剪机制更稳定，KL 惩罚更接近信赖域（Trust Region）的原意，便于解释。<strong>同时启用会形成两套约束相互干扰，clip 比例与 KL 指标都失去诊断意义。</strong></p>
+
+    <h3>6. 搜索空间的设计依据</h3>
+    <p>损失系数是乘性量，差一个数量级才有明确语义，搜索空间应使用对数分布（Log-uniform）。推荐起点：熵系数搜 10<sup>-4</sup> 到 10<sup>-1</sup>，价值系数搜 0.1 到 2.0，KL 目标搜 0.005 到 0.05。每次搜索的维度控制在 2 到 3 个，因为系数交互强，四维以上搜索需要数百次试验才能覆盖交互面。搜索流程采用"两段式"：第一段用 20 到 40 次试验粗定范围，第二段在胜出区间内细化。<strong>系数搜索的产出不仅是最好的一组值，还包括"哪个系数敏感、哪个系数不敏感"的结构性结论。</strong></p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>损失组合搜索的标准流程分六步，每一步都产出可检查的中间物。</p>
+    <ol>
+      <li><strong>固定评测协议</strong>：确定评估回报的口径（评估环境数、评估间隔、随机还是确定性动作）、训练样本预算（环境步数）与重复种子数。口径不固定，系数比较无效。</li>
+      <li><strong>建立基线</strong>：用默认系数跑满预算，记录回报曲线、熵曲线、价值损失曲线与裁剪比例，形成"现状诊断"。</li>
+      <li><strong>划定量纲与梯度比</strong>：按前述方法检查损失数值比与主干梯度范数比，先修正明显失衡（量级相差超过两个数量级），再进入搜索。</li>
+      <li><strong>设计搜索空间</strong>：对数分布，2 到 3 维，列明每维的下界、上界与选择理由。</li>
+      <li><strong>接入调度器</strong>：用 ASHA 提前终止表现差的试验；评估指标建议用曲线上若干检查点的均值（面积式指标），最终点的噪声影响更大。</li>
+      <li><strong>复核与固化</strong>：胜出配置用多个种子复跑，确认增益超过种子间波动后再固化进默认配置。</li>
+    </ol>
+    <h3>参数取值起点表</h3>
+    <table>
+      <tr><th>参数</th><th>常用起点</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>vf_loss_coeff</td><td>1.0（PPO）/ 0.5（DQN）</td><td>价值项权重</td><td>回报归一化后 0.25 至 1.0；量纲失衡时先调此值</td></tr>
+      <tr><td>entropy_coeff</td><td>0.01；探索期 0.02 至 0.05</td><td>探索预算</td><td>按熵曲线调整，不按回报调整</td></tr>
+      <tr><td>kl_coeff</td><td>0.2（自适应起点）</td><td>KL 惩罚初始权重</td><td>由 kl_target 复核后自动升降</td></tr>
+      <tr><td>kl_target</td><td>0.01（0.005 至 0.05）</td><td>期望 KL 水平</td><td>与学习率联动，学习率大则目标相应放大</td></tr>
+      <tr><td>use_kl_loss</td><td>False</td><td>约束实现方式</td><td>默认用裁剪；研究信赖域行为时切换</td></tr>
+    </table>
+    <div class="box warn">
+      <span class="box-title">与上一章的差异</span>
+      <p>第 080 章搜索的是激活函数与优化器，改变的是"参数怎么走"；本章搜索的系数改变的是"哪些目标在指挥参数走"，作用层次更深、交互更强、可解释性要求更高，因此诊断比搜索本身更重要。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>以下片段基于 Ray 2.x 时期的通用写法（部分参数名随后续版本有调整，例如 <code>num_sgd_iter</code> 更名为 <code>num_epochs</code>），接口随版本演进，以对应版本的官方文档为准。</p>
+
+    <p><strong>片段 1：在配置层面声明损失组合的系数</strong></p>
+    <pre class="code"><code>from ray.rllib.algorithms.ppo import PPOConfig
+
+# 损失组合的所有系数都挂在 training() 上：
+# 搜索对象是各分量的权重，损失函数的结构本身保持不变
+config = (
+    PPOConfig()
+    .environment("CartPole-v1")           # 轻量环境：先确认系数调整的信号是否可见
+    .env_runners(num_env_runners=4, num_envs_per_worker=2)
+    .training(
+        # 价值损失系数：MSE 量纲是回报的平方，1.0 是归一化回报下的常用起点
+        vf_loss_coeff=1.0,
+        # 熵系数：探索预算，0.01 适用于收敛期；探索期可放大到 0.05
+        entropy_coeff=0.01,
+        # KL 约束二选一：默认用裁剪，故 use_kl_loss 保持 False
+        use_kl_loss=False,
+        kl_coeff=0.2,                     # KL 惩罚初始权重（自适应调节的起点）
+        kl_target=0.01,                   # 期望 KL 水平：超出则上调系数，低于则下调
+        # 批与小批的整除关系在设计阶段核对：4096 / 256 = 16，整除成立
+        train_batch_size=4096,
+        sgd_minibatch_size=256,
+        num_sgd_iter=6,
+    )
+)</code></pre>
+    <p>解读：这段配置体现了三层设计意图。<strong>（1）</strong>系数集中声明，实验记录里一眼能看出搜索维度，避免"散落在回调里改系数"的不可追踪写法。<strong>（2）</strong><code>kl_target</code> 与学习率联动：学习率放大后单步策略变化变大，目标 KL 必须相应放宽，否则 KL 惩罚会频繁触发，压制有效更新。<strong>（3）</strong>裁剪与 KL 惩罚互斥使用，保证诊断指标（裁剪比例或 KL）中只有一套约束在起作用，归因链条清晰。</p>
+
+    <p><strong>片段 2：手写组合损失并测量梯度范数比</strong></p>
+    <pre class="code"><code>import torch
+
+def combined_loss(policy_loss, value_loss, entropy, c_v=1.0, c_e=0.01):
+    """组合损失：系数把不同量纲的分量折算到同一尺度。"""
+    # 熵项取负号：最大化熵等价于最小化负熵，与"最小化总损失"方向统一
+    return policy_loss + c_v * value_loss - c_e * entropy
+
+def trunk_grad_ratio(trunk_params, policy_loss, value_loss):
+    """诊断工具：分别求两个分量对共享主干的梯度范数并取比值。
+    比值远离 1 说明某一分量在主导特征学习，需要调整系数或拆分网络。"""
+    # retain_graph=True 允许同一前向图被求导两次，第二次可释放计算图
+    g_p = torch.autograd.grad(policy_loss, trunk_params, retain_graph=True)
+    g_v = torch.autograd.grad(value_loss, trunk_params, retain_graph=True)
+    # 对每个参数张量取 L2 范数再求和，得到分量级别的"发言权"总量
+    n_p = sum(g.norm() for g in g_p if g is not None) + 1e-8
+    n_v = sum(g.norm() for g in g_v if g is not None) + 1e-8
+    # 输出价值梯度与策略梯度的范数比，供系数调整提供量化依据
+    return float(n_v / n_p)</code></pre>
+    <p>解读：这段代码的用途是回答"系数到底该往哪个方向调"，并不替代训练循环。<strong>（1）</strong>把两个分量分别求导再比较，避免了只看损失数值的误导：价值损失数值天然大，但数值大不等于梯度大。<strong>（2）</strong>分母与分子都加小量，防止策略梯度恰好为零时除零；比值是相对量，在不同任务间具有可比性。<strong>（3）</strong>实测时可以每若干迭代记录一次比值曲线，若价值侧持续高出策略侧 10 倍以上，优先下调 <code>c_v</code> 或启用回报归一化；继续搜索学习率解决不了梯度主导问题。</p>
+
+    <p><strong>片段 3：损失系数搜索空间与分量指标上报</strong></p>
+    <pre class="code"><code>from ray import tune
+
+# 系数是乘性量，搜索空间用 loguniform：
+# 在对数尺度上，"差一个数量级"才有明确含义，线性网格会浪费试验
+space = {
+    "entropy_coeff": tune.loguniform(1e-4, 1e-1),
+    "vf_loss_coeff": tune.loguniform(0.1, 2.0),
+    "kl_target": tune.loguniform(0.005, 0.05),
+}
+
+def report_component_diagnostics(learner_info):
+    """把损失分量与失衡指征写进 Tune 指标，供后续归因分析。
+    指标口径固定后，不同试验之间的对比才有意义。"""
+    tune.report({
+        "entropy": learner_info.get("entropy", 0.0),          # 熵：判断探索预算
+        "vf_explained_var": learner_info.get("vf_explained_var", 0.0),
+        "clip_frac": learner_info.get("clip_frac", 0.0),      # 裁剪比例：判断约束强度
+        "mean_kl": learner_info.get("mean_kl", 0.0),          # 近似 KL：判断策略步长
+    })</code></pre>
+    <p>解读：这段代码把"搜索"与"诊断"绑定在一起。<strong>（1）</strong>三个系数的搜索区间都按对数尺度给出，最低值到最高值跨三到四个数量级，与系数实际可能取到的范围匹配。<strong>（2）</strong>上报的四个指标各有分工：熵判探索、解释方差（Explained Variance）判评论家拟合质量、裁剪比例与近似 KL 判约束是否频繁触发。搜索结束后，通过比较不同系数组的指标组合，可以回答"赢在哪一环"，而不只是一个孤立的回报数值。<strong>（3）</strong>诊断指标与搜索解耦的另一个好处是：即使某次试验被调度器提前终止，已上报的指标仍然保留，可以复盘它失败的原因，为后续收窄搜索空间提供依据。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>同时调整多个系数并归因</strong>：一次试验同时改熵系数与价值系数，回报下降时无法判断是哪一个造成。修复：每次只动一个维度做预实验，确认敏感方向后再进入联合搜索。</li>
+      <li><strong>用线性网格搜索系数</strong>：熵系数在 0.001 与 0.1 之间的行为差异远大于 0.09 与 0.1 的差异，线性网格把试验浪费在不敏感区间。修复：改用对数分布，并对照上一次搜索的敏感区间收窄上下界。</li>
+      <li><strong>熵系数与回报联动却误读</strong>：看到回报不升就调大熵系数，结果探索更久、回报更不升。修复：调熵系数只看熵曲线，判定标准是"熵是否按预期衰减"，回报用于整体结论。</li>
+      <li><strong>价值损失未裁剪导致数值爆炸</strong>：异常回合的回报产生超大平方误差，一次更新把评论家推离正常范围。修复：启用价值损失裁剪或回报归一化，再考虑价值系数。</li>
+      <li><strong>同时启用裁剪与 KL 惩罚</strong>：两套约束相互干扰，裁剪比例长期接近零而 KL 指标忽高忽低，诊断信息全部失真。修复：按需二选一，并在实验记录中注明所选机制。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把价值损失系数从 1.0 下调到 0.25，其余不动。预测：价值损失曲线、解释方差、策略回报各会如何变化？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>价值拟合变慢，解释方差下降（评论家更"迟钝"）；若之前存在价值梯度主导，策略回报反而可能改善。关键是看回报曲线是否提前起升。</div></details>
+      </li>
+      <li>把熵系数设为 0。描述两个阶段的现象：训练前期与训练后期，并说明为什么"不报错"是更危险的信号。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>前期探索不足，回报上升慢；后期熵迅速坍缩，策略锁死在局部行为。没有报错是因为熵项只影响梯度方向，不产生异常值。</div></details>
+      </li>
+      <li>推导题：设策略梯度与价值梯度对主干的范数分别为 0.8 与 3.2，当前 c_v=1.0。若希望范数比落在 2 附近，c_v 应调整到什么区间？说明这只是近似计算的理由。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>c_v×3.2/0.8=2 得 c_v=0.5。近似性来自梯度范数随参数位置变化，且把 c_v 乘进损失后梯度刚好线性缩放，实际仍受优化器与裁剪影响。</div></details>
+      </li>
+      <li>设计题：为一个回报范围 0 到 300 的连续控制任务设计损失系数搜索方案，包含：搜索空间（含上下界理由）、试验数、调度器选择、评估指标定义（须抵抗曲线噪声）、复核流程。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>先归一化回报或启用价值裁剪；搜索 2 到 3 维、对数分布；40 到 60 次试验配 ASHA；指标用训练中后段若干评估点的中位数；胜出组合用 3 个种子复跑。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>组合损失通过系数把不同量纲的分量折算到同一尺度，<strong>系数错，梯度结构就错</strong>。</li>
+      <li>诊断优先于搜索：先看损失数值比与主干梯度范数比，再决定调哪个系数。</li>
+      <li>熵系数管理探索预算，只按熵曲线调整；价值系数与回报归一化配套使用；KL 惩罚与裁剪二选一。</li>
+      <li>系数搜索用对数空间、控制在 2 到 3 维、两段式推进，产出敏感度结构而不只是一个最优值。</li>
+      <li>下一章进入采样效率相关参数：每批数据做多少次更新的账，决定达到目标回报需要多少环境步。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch080.html">← 第 080 章：超参搜索实战：激活函数与优化器</a>
+    <a class="next" href="ch082.html">第 082 章：超参搜索实战：采样效率相关参数 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

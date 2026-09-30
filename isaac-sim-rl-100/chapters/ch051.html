@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第051章 实现动态环境适应 | 机器人仿真学习课程 · Isaac Sim 强化学习训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 任务与技能实现</span>
+    <span class="sep">/</span>
+    <span>第 051 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 任务与技能实现</div>
+    <h1>第 051 章：实现动态环境适应</h1>
+    <p class="lead">当传送带变速、载荷变重、障碍物会动：本章给策略装上一只"在线估计的仪表盘"，用历史窗口编码隐藏参数，让同一个策略在环境变化后几十步内恢复性能。</p>
+    <ul class="meta">
+      <li>主题：任务实现 / 时变环境与在线适应</li>
+      <li>相关组件：Isaac Sim / Isaac Lab / Stable-Baselines3 / PyTorch</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 050 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>能把"动态环境"形式化为隐藏参数 z 随时间变化的 MDP，并区分"鲁棒"与"适应"两条路线。</li>
+      <li>理解域随机化（鲁棒）的边界：为什么它在参数变化大时会变得过度保守、平均性能受限。</li>
+      <li>掌握在线系统辨识的框架：用最近若干步的 (状态, 动作) 历史编码出隐变量的估计 ẑ。</li>
+      <li>会写上下文编码器（GRU/MLP）与"特权回归"训练损失，并解释为什么需要批量采样历史窗口。</li>
+      <li>能搭建"变速传送带 + 变质量载荷"的课程，定义恢复时间（recovery time）这一核心指标。</li>
+      <li>理解以 POMDP 的视角看待非平稳：当 z 变化时，记忆与适应是一枚硬币的两面（为 052、061 章铺垫）。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>前面 50 章的环境都有一条隐含假设：环境是稳定的，摩擦系数不跳变、载荷不凭空变重、障碍物按固定规律运动。现实世界没有这么客气：传送带的速度会随负载波动、包裹重量在 0.5–5 kg 间变化、与机器人共处的人行为随机、地面的湿滑程度随位置变化。策略在训练分布上学到的"最优动作"可能依赖一个它看不见的参数，这个参数变了，动作就没用了。</p>
+    <p>本章给出工程上最主流的解法：<strong>让策略学会"快速估计"参数</strong>。策略周期性地从最近几十步的经验里推断"当前世界是什么样"（传送带多快、载荷多重），然后把估计值当作观测的一部分来决策。这与第 052 章的部分可观测环境是同一个数学问题的两面：那里缺的是"状态信息"，这里缺的是"环境参数"；解法同源，给策略记忆。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 形式化：隐藏参数与两类时间尺度</h3>
+    <p>把环境的"变化部分"统一写成隐藏参数 z（context/隐变量），转移概率为 P(s′ | s, a, z)。按 z 的变化频率分两类：</p>
+    <table>
+      <tr><th>类型</th><th>z 的行为</th><th>例子</th><th>适合的方法</th></tr>
+      <tr><td>片内固定</td><td>每回合采样一次，回合内不变</td><td>载荷质量、工具长度</td><td>在线辨识 + 条件化策略</td></tr>
+      <tr><td>片内时变</td><td>回合中途突变或连续漂移</td><td>传送带变速、风扰、地面湿滑</td><td>滑动窗口在线估计 + 快速适应</td></tr>
+    </table>
+    <p>对智能体来说，两类都表现为"观测无法唯一决定状态"：从观测看不出来载荷是 1 kg 还是 3 kg，但动作效果（加速快慢）会泄露信息。这正是部分可观测马尔可夫决策过程（POMDP）的结构：策略需要历史，单帧当前观测不够用。</p>
+
+    <h3>2. 鲁棒路线：域随机化能做什么、不能做什么</h3>
+    <p>最省事的做法是训练时随机化 z（第 021 章域随机化），学一个"对一切 z 都不差"的鲁棒策略。它的数学本质是优化平均性能：</p>
+    <div class="formula">
+      J<sub>robust</sub>(π) = E<sub>z~p(z)</sub>[ J(π, z) ]
+    </div>
+    <p>优点是训练简单、部署省心；代价会随 z 的分布宽度增长：分布越宽，最优鲁棒策略越倾向"保守折中"（比如为防打滑而限制加速度），在每一个具体 z 上都达不到该 z 的最优性能。经验拐点大致是"z 引起的任务难度相差 2–3 倍"以内鲁棒策略够用，超过之后平均性能显著塌陷。判断方法很简单：把 z 固定成一个具体值评估，如果你的策略在"低速传送带"和"高速传送带"上的性能相差很大且都不理想，就该上适应路线了。</p>
+
+    <h3>3. 适应路线：在线系统辨识的形状</h3>
+    <p>适应路线的核心公式非常简洁：</p>
+    <div class="formula">
+      ẑ<sub>t</sub> = E<sub>θ</sub>(s<sub>t−k:t</sub>, a<sub>t−k:t−1</sub>), &nbsp; π<sub>θ</sub>(a | s<sub>t</sub>, ẑ<sub>t</sub>)
+      <span class="note">E 为历史编码器（MLP/GRU），k 为历史窗口长度（10–50 步）</span>
+    </div>
+    <p>编码器的输入是最近的观测-动作序列，输出是对隐藏参数的估计 ẑ（或直接输出一个"有利于决策的低维嵌入"，不必与真实 z 对应）。训练用两种监督：</p>
+    <ul>
+      <li><strong>特权回归（privileged regression）</strong>：仿真里我们其实"知道"真实 z（载荷质量、传送带速度都是我们自己设的），直接让 ẑ 回归 z：L = ‖ẑ − z‖²。简单有效，代表工作是 RMA 框架的第一阶段。</li>
+      <li><strong>自监督预测（self-supervised）</strong>：不依赖真值，让编码器预测"下一步观测"：L = ‖o<sub>t+1</sub> − f(o<sub>t</sub>, a<sub>t</sub>, ẑ<sub>t</sub>)‖²。适用于 z 难以显式定义（比如地面"湿滑感"）。</li>
+    </ul>
+    <p>窗口长度 k 怎么定？它取决于"要多久才能把 z 认出来"：载荷质量的辨识通常 5–10 步就够（加速响应一次就暴露了惯性），传送带速度也是十几步内收敛；k 取 20–50 步即可覆盖，太长只会浪费算力。另一个关键细节：训练时采样历史窗口要<strong>在回合内均匀取 t</strong>；只取回合末的话，编码器学不会"从零开始攒信息"，部署时回合开头就会失灵。</p>
+
+    <h3>4. 恢复时间：适应能力的专属指标</h3>
+    <p>鲁棒策略的评估看平均性能；适应策略的评估必须看<strong>变化后的恢复过程</strong>。定义恢复时间 T<sub>rec</sub> 为"z 突变后，性能回到稳态水平 90% 所需的环境步数"。好的在线辨识把 T<sub>rec</sub> 压到 20–50 步（对应 0.2–0.5 s 决策周期）；如果 T<sub>rec</sub> 与应用要求差距大，优先缩短历史窗口、提高编码器更新频率；继续加训练步数收效甚微。</p>
+
+    <h3>5. 数值算例：辨识信息量与窗口、网络成本</h3>
+    <p>质量辨识为什么是 5–10 步，可以用信噪比核算。施加 2 N 的已知推力：0.5 kg 载荷的加速度是 4.0 m/s²，5 kg 载荷只有 0.4 m/s²，相差 10 倍。加速度观测噪声折算到 0.1 m/s² 时，5 kg 载荷的信噪比是 4:1，单步勉强可辨；取 9 步平均，噪声按 1/√n 收缩到 0.033 m/s²，信噪比升到 12:1，辨识已经稳当。<b>这正是"5–10 步"的来源：信息量与步数的平方根成正比，前几步收益猛涨、之后边际递减。</b>对应地，窗口 K = 30、10 Hz 决策频率时窗口跨度 3 s，比"证据到齐"所需时间富余 3–5 倍，多出来的部分覆盖"任务中段才开始有可分析动作"的场景。突变间隔的约束也一并换算：突变期望间隔至少是辨识步数的 5–10 倍，即 25–100 步；本任务 40–120 步的突变时刻落在这个区间的中上段，属于合理起点，若把突变改到每 10 步一次，编码器将永远处在"证据不足"的中间状态。</p>
+    <p>网络与时间尺度的成本核算：编码器用 GRU（hidden 64）、每步输入 37 维（观测 30 + 动作 7）时，参数约 3×(64×37 + 64×64 + 64×2) ≈ 19.8k，单步推理负担很小，真正的成本是批量采样历史窗口的存储与 BPTT 的显存。恢复时间的折算必须带频率：T<sub>rec</sub> = 20–50 步，在 10 Hz 决策周期下是 2–5 s，在 50 Hz 下是 0.4–1 s。<b>同一个"20–50 步"，在评估报告里不标注决策频率就没有意义</b>，这也提醒报告的读者：谈"控制步"时永远先确认每个控制步多长。若把策略频率从 10 Hz 提到 20 Hz，辨识所需的环境时间不变，但步数翻倍；指标口径的稳定性取决于按"步"还是按"秒"定义 T<sub>rec</sub>，跨系统比较时建议统一用秒。</p>
+    <p>还有一个容易忽视的口径问题：v<sub>belt</sub> 在仿真里本来可以通过传送带纹理速度或表面速度直接看到（设计里也标注了"视觉代理特征，可选"），本章刻意不把它给策略，是为了让"参数辨识"在两种隐藏参数上都成立。<b>工程决策的标准仍然只有一条：这个量在部署时能否直接测到。</b>若真机上装了编码器能读出皮带速度，正确做法是把它放进观测、省掉一半辨识负担，把辨识能力留给真正不可测的质量与摩擦；把"可测的量也拿去学"与"把不可测的量硬塞进观测"属于同一类错误的两面，前者浪费样本，后者制造部署期不会出现的幻觉。这条标准也适用于审查观测清单：逐项问"部署时从哪来"，答不上来源的字段一律不进门。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>用"传送带搬运"任务搭建完整的适应系统：</p>
+    <ol>
+      <li><strong>任务</strong>：机械臂从运动的传送带上抓取包裹。传送带速度 v<sub>belt</sub> ∈ [0, 0.6] m/s（片内 30% 概率突变）、包裹质量 m ∈ [0.5, 5.0] kg、摩擦 0.3–0.8。</li>
+      <li><strong>隐藏参数 z</strong>：(v<sub>belt</sub>, m)。注意 v<sub>belt</sub> 可以部分从观测看见（如果你把传送带速度编码进观测），但 m 永远看不见，本章刻意把两者都不给策略，全部走在线估计。</li>
+      <li><strong>观测</strong>（约 30 维）：末端与包裹相对位姿、末端速度、关节位置/速度采样（选 8 个）、包裹接触力、传送带纹理速度（视觉代理特征，可选）。</li>
+      <li><strong>编码器</strong>：GRU（hidden 64）读最近 30 步的 (观测, 动作) 序列，取最后隐状态映射成 8 维 ẑ；策略网络输入 (当前观测, ẑ)。第一阶段用特权回归训练编码器，第二阶段固定编码器训练策略（也可联合训练，见第 054 章元学习的讨论）。</li>
+      <li><strong>课程</strong>：先固定 m = 1 kg、v<sub>belt</sub> = 0；再放开 m（0.5–5 kg）；再放开 v<sub>belt</sub>；最后开启"片内突变"。每一步只放开一个新变化源，保证性能回退可归因。</li>
+      <li><strong>终止与评估</strong>：抓取失败（包裹滑出）、超时 5 s。评估集分三组：分布内、分布外（m = 8 kg）、突变组（回合中段改 v<sub>belt</sub>），分别报告成功率与 T<sub>rec</sub>。</li>
+      <li><strong>对照基线</strong>：同一任务跑一个纯域随机化的鲁棒策略。没有对照就不知道"适应"到底多赚了性能。</li>
+    </ol>
+    <table>
+      <tr><th>变化源</th><th>怎么观测到</th><th>辨识特征</th><th>典型辨识步数</th></tr>
+      <tr><td>包裹质量 m</td><td>不可直接观测</td><td>相同动作下的加速度/接触力响应</td><td>5–10 步</td></tr>
+      <tr><td>传送带速度 v</td><td>部分可见（纹理/速度线索）</td><td>末端与包裹的相对漂移速率</td><td>10–20 步</td></tr>
+      <tr><td>摩擦系数 μ</td><td>不可观测</td><td>滑移事件的频率</td><td>10–30 步</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计思维：为什么把"环境参数"的口子留在仿真里，而把"适应"留给网络？</span>
+      <p>在仿真里 z 是我们的上帝视角，可以特意在训练时打个洞（特权回归）。这种做法被误解为"作弊"，其实是<strong>课程设计</strong>：第一阶段用特权信息教会编码器"怎么从行为史里认参数"，第二阶段（学生策略）完全不带特权、只用 ẑ 推理。工程上还有一个务实版本：如果某个参数真机上也能量出来（比如电子秤称包裹），就别让网络学，直接进观测。判断标准只有一个：这个量在部署时是否可得。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：动态环境元素的随机化与突变</strong></p>
+    <pre class="code"><code>class DynamicConveyorTask:
+    # 每个回合采样一组隐藏参数；回合内按概率发生突变，模拟真实环境的时变
+    def __init__(self, rng):
+        self.rng = rng
+
+    def sample_z(self):
+        # z = (传送带速度, 包裹质量)。质量对策略完全不可见
+        return {"v_belt": self.rng.uniform(0.0, 0.6),
+                "mass": self.rng.uniform(0.5, 5.0)}
+
+    def on_episode_start(self):
+        self.z = self.sample_z()
+        self.apply_z(self.z)                    # 写入传送带驱动与包裹质量参数
+        # 突变时刻：30% 概率在回合适中段变化一次（模拟有人换了档）
+        self.shift_step = (self.rng.integers(40, 120)
+                           if self.rng.random() &lt; 0.3 else None)
+
+    def maybe_shift(self, step):
+        if self.shift_step is not None and step == self.shift_step:
+            # 突变只改传送带速度，质量保持不变；单变量突变便于评估恢复时间
+            self.z["v_belt"] = self.rng.uniform(0.0, 0.6)
+            self.apply_z(self.z)
+            return True                          # 环境层返回事件，供日志与课程统计
+        return False</code></pre>
+    <p>解读：这个类很小，但包含了"动态环境"实验设计的三条纪律。第一，<strong>变量可控</strong>：隐藏参数就两个，且质量从不主动变化，因为在训练与评测里"变化源越单一，因果归因越清晰"。很多团队的失败在于一上来就让 8 个参数同时随机，性能差了都不知道是谁的锅。第二，<strong>突变时刻随机</strong>：<code>shift_step</code> 在 40–120 步之间均匀采样，意味着恢复时间必须"随时待命"，策略没法押注"变化总在第 80 步出现"。第三，<code>maybe_shift</code> 返回布尔值用于记录"变更事件"到日志：评估时以事件为锚点对齐所有回合，才能把"从零学习"与"变化后适应"分开统计。</p>
+
+    <p><strong>片段 2：上下文编码器 + 条件化策略</strong></p>
+    <pre class="code"><code>import torch
+import torch.nn as nn
+
+class ContextEncoder(nn.Module):
+    # 输入历史窗口 (B, K, obs_dim+act_dim)，输出隐变量估计 (B, latent_dim)
+    # 用 GRU 读时序：参数的"证据"在时间上有先后（先动起来才暴露惯性）
+    def __init__(self, step_dim, latent_dim=8, hidden=64):
+        super().__init__()
+        self.gru = nn.GRU(step_dim, hidden, batch_first=True)
+        self.head = nn.Linear(hidden, latent_dim)
+
+    def forward(self, history):
+        _, h_n = self.gru(history)              # 只取最后时刻的隐状态
+        return self.head(h_n.squeeze(0))        # (B, latent_dim)
+
+class AdaptivePolicy(nn.Module):
+    # 策略 = 本体观测编码 + 隐变量条件化。隐变量是"当前世界是什么样"的压缩
+    def __init__(self, obs_dim, latent_dim=8, act_dim=7, hidden=256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(obs_dim + latent_dim, hidden), nn.Tanh(),
+            nn.Linear(hidden, hidden), nn.Tanh(),
+            nn.Linear(hidden, act_dim),
+        )
+
+    def forward(self, obs, z_hat):
+        # 注意：z_hat 只作为决策上下文，不进任何"记忆"结构；记忆全部在编码器里
+        return torch.tanh(self.net(torch.cat([obs, z_hat], dim=-1)))</code></pre>
+    <p>解读：两段网络的分工是适应式策略的标准形态。ContextEncoder 的关键选择是 GRU 编码：识别质量需要观察一段"动态响应"（任务开始时轻轻推一下，看末端加速多快），这种证据是时序性的，GRU 的隐状态刚好能表达"已看到哪些证据"。输出层隐变量维度故意压到 8 维：z 的真实维度只有 2，但让编码器用稍大的容量表达"不确定程度"（比如隐状态还没收敛时的中间态），比强行回归到 2 维更稳。AdaptivePolicy 的结构要理解一个细节：<strong>z_hat 每步都在更新，但策略本身没有记忆</strong>，所有记忆都被隔离在编码器里，这样编码器可以离线训练（特权回归），策略也可以在不同 z 分布上复用。这种"解耦"让调试简单很多：策略表现差就查策略，适应慢就查编码器，两类问题不会缠在一起。</p>
+
+    <p><strong>片段 3：特权回归训练（第一阶段）</strong></p>
+    <pre class="code"><code>def train_encoder_step(encoder, optimizer, replay, batch_size=256, K=30):
+    # 从回放里采样 (历史窗口, 真实 z) 对：历史是连续 K 步的 (obs, act) 拼接
+    # 关键：t 在回合内均匀采样，"回合开头也要能估"，不只在回合末端取样
+    hist, z_true = replay.sample_windows(batch_size, K)   # hist: (B, K, D), z_true: (B, 2)
+
+    z_hat = encoder(hist)                       # (B, 8)
+    # 只用前 2 维监督：其余 6 维留给编码器自由使用（表达不确定性等）
+    loss = torch.nn.functional.mse_loss(z_hat[:, :2], z_true)
+
+    optimizer.zero_grad()
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(encoder.parameters(), 1.0)  # 时序梯度易爆，剪一下
+    optimizer.step()
+    return float(loss.item())</code></pre>
+    <p>解读：这个训练步骤隐藏着三个容易出错的工程细节。第一，<code>sample_windows</code> 的采样策略：如果把每个回合只在末尾取窗口，编码器会"偷懒"，它总能看满 30 步充分证据，学不会在只有 5 步证据时也给合理估计；均匀采样迫使它处理"证据不足"的工况，这正是部署时的常态。第二，损失只监督 z_hat 的前 2 维，这是有意放水：把 8 维空间的其余 6 维留给编码器自己组织信息（比如部分可观测下的不确定性补偿），强行要求 8 维全部对应物理量会把冲突梯度引入训练。第三，<code>clip_grad_norm_</code> 对 GRU 是必选项：BPTT 的梯度范数随窗口长度指数敏感，一次异常 batch 就能把编码器打坏，日志里表现为 loss 突然变 NaN。入门版的替代方案是把窗口切成 10 步以内，但 30 步的辨识质量通常明显更好，所以还是把梯度剪裁与合理的初始化做扎实。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>把 z 直接放进观测却不进评估</strong>：训练时给策略喂真实传送带速度、真机没有这个信号，评估直接崩。症状是"训练曲线完美、部署一塌糊涂"。修复：区分"特权观测"与"部署观测"两套接口，z 只允许进编码器的训练目标。</li>
+      <li><strong>历史窗口只在回合末采样</strong>：编码器不会估计"证据不足"的情况，回合开头 10–20 步行为失准，抓取失败集中在开头。修复：t 均匀采样 + 训练时随机截断窗口长度（如 5/10/20/30 步混训）。</li>
+      <li><strong>只用鲁棒随机化硬扛</strong>：参数分布越开越宽，策略越来越保守，最后"什么都能干一点，什么都干不好"。症状是分布内性能也持续下降。修复：加对照实验，分布内性能掉了就切适应路线。</li>
+      <li><strong>恢复时间没人量</strong>：团队只报"平均成功率"，看不出适应能力。修复：把"突变事件 → 性能回到 90%"的步数作为一级指标，并画出恢复曲线。</li>
+      <li><strong>突变太频繁</strong>：每 10 步变一次，编码器永远追不上，策略退化成"随机应变"。修复：突变的期望间隔至少是辨识所需步数的 5–10 倍；连续漂移场景改用滑动窗口 + 指数遗忘，重训练编码器的代价过高。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把包裹质量随机范围从 [0.5, 5] kg 扩到 [0.5, 10] kg，分别训练"鲁棒策略"与"适应策略"，对比分布内平均成功率与分布外（8 kg）成功率。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>鲁棒策略的分布内性能会随范围变宽而下降，但分布外相对稳；适应策略的分布内性能几乎不受范围影响，分布外只要在训练内就能得高分。</div></details>
+      </li>
+      <li>把历史窗口 K 从 30 步缩到 5 步与拉到 100 步，测量恢复时间 T<sub>rec</sub> 与单步推理耗时，解释两者的权衡。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>K=5 时证据不足、辨识噪声大，T<sub>rec</sub> 会变长（估错要重估）；K=100 时辨识稳但"适应延迟"被窗口拖长，且 GRU 负担加重。</div></details>
+      </li>
+      <li>把特权回归换成自监督预测（预测下一步观测），比较两者的 T<sub>rec</sub>。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>自监督不需要 z 真值，通用性好，但对"与任务无关的参数"也花容量去拟合，收敛通常更慢。观察两种损失下的隐变量可视化（PCA 降维）。</div></details>
+      </li>
+      <li>设计"三组对照"实验证明适应机制真的在起作用：无随机化、纯随机化、随机化+编码器；写出每组的关键指标与预期结果。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>无随机化：分布内强、突变组崩；纯随机化：分布内中等、突变组缓慢退化；编码器版：分布内接近无随机化基线、突变组恢复快。"突变组性能"是判定适应机制是否生效的特征标识。</div></details>
+      </li>
+      <li>如果传送带速度从突变改为"连续正弦漂移"，编码器与动作的关系会发生什么变化？写出你的假设与验证方案。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>连续漂移下 z 永不静止，编码器输出带有滞后（它总在追），策略的学习目标应从"匹配当前 z"转向"预测下一个 z"。验证：比较不同漂移频率（0.1、0.5、2 Hz）下的相位滞后。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>动态环境的数学形态是"隐藏参数 z 随时间变化"的 MDP；z 片内固定时是静态参数辨识，片内变化时是时变系统跟踪。</li>
+      <li>鲁棒路线（域随机化）优化平均性能、实现简单，但 z 分布变宽后策略趋于保守、平均性能塌陷；此时应切换到适应路线。</li>
+      <li>适应路线的核心是 ẑ<sub>t</sub> = E(s,a 历史)、π(a | s, ẑ<sub>t</sub>)：GRU 编码 10–50 步历史，特权回归或自监督预测训练。</li>
+      <li>训练细节决定成败：窗口起点均匀采样、随机截断窗口长度、梯度剪裁；编码器与策略解耦便于调试。</li>
+      <li>核心评估指标是恢复时间 T<sub>rec</sub>（突变后回到 90% 性能的步数）；单一平均成功率反映不出适应能力，实验必须设鲁棒策略对照。</li>
+      <li>下一章把同一把钥匙插进另一个锁孔：<strong>部分可观测环境</strong>，那里缺少的是状态信息本身，你会看到记忆机制更系统的应用。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch050.html">← 第 050 章：实现人机交互</a>
+    <a class="next" href="ch052.html">第 052 章：实现部分可观测环境 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

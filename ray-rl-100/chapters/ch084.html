@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第084章 超参搜索实战：内存与显存预算 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第五篇 · 训练工程与系统进阶</span>
+    <span class="sep">/</span>
+    <span>第 084 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第五篇 · 训练工程与系统进阶</div>
+    <h1>第 084 章：超参搜索实战：内存与显存预算</h1>
+    <p class="lead">一句话：本章把训练的内存账本逐项拆开，给出回放缓冲、对象存储驻留、模型与优化器状态、激活值的估算方法，并把内存约束写进超参搜索的可行性过滤。</p>
+    <ul class="meta">
+      <li>主题：超参搜索 / 内存与显存预算（Memory Budget）</li>
+      <li>关键机制：容量估算公式、峰值显存测量、可行性过滤、存储精度与分片</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 083 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>掌握回放缓冲（Replay Buffer）内存的估算公式，能按观测形状与容量手算出量级。</li>
+      <li>理解显存的四类占用：参数、梯度、优化器状态（Optimizer States）、激活值（Activations），并能判断哪一类随批大小线性增长。</li>
+      <li>会用工具测量峰值显存与对象存储驻留，验证估算值。</li>
+      <li>掌握降低内存占用的常用手段：存储精度压缩、分片、卸载、小批上限、梯度检查点。</li>
+      <li>会把内存预算转化为搜索空间的可行性过滤条件，避免试验因显存溢出（Out of Memory, OOM）大规模失败。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>前两章的搜索维度（复用次数、并行度、批大小）每一个都在消耗内存：批越大，激活值越多；缓冲越大，常驻内存越多；并行 worker 越多，样本驻留与策略副本的份数越多。<strong>内存是这些参数共同的物理上限，越过它会以进程被杀或显存溢出收场，训练进度全部丢失。</strong>更隐蔽的问题发生在显存临界区：配置尚能运行，但显存碎片与峰值波动使个别迭代越界，表现为训练间歇性崩溃，易于误判为环境或通信故障。</p>
+    <p>把内存纳入搜索流程有两种做法。第一种是事后修补：试验因溢出失败后调小参数重跑，浪费调度资源。第二种是事前预算：按公式估算各组成部分，用实测校准，再把超出预算的组合从搜索空间中过滤掉。本章采用第二种做法，并强调一个工程事实：<strong>内存预算要先于性能目标确定，因为它约束的是可行性；优劣是可行性确定之后才轮到的问题。</strong></p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p><strong>训练内存呈现为四本账：缓冲账、驻留账、优化器账与激活账，各自的增长变量不同，必须分别估算再汇总。</strong>本节按数据形态与增长规律逐项展开。</p>
+
+    <h3>1. 回放缓冲的内存账</h3>
+    <p>离策略与重放类方法把经验存入缓冲，其内存按下式估算：</p>
+    <div class="formula">
+      M<sub>buffer</sub> = capacity × (obs_bytes + meta_bytes)
+      <span class="note">obs_bytes 为单条观测的字节数，图像类观测须乘以帧堆叠（Frame Stack）数与通道字节；meta_bytes 含动作、回报、终止标志等标量，通常为几十字节量级</span>
+    </div>
+    <p>用一组图像观测的数值感受量级：单帧 84×84 的灰度图，按 1 字节每像素存储为 7056 字节，4 帧堆叠后为 28,224 字节（约 27.6 KiB）。容量 100 万条时，仅观测就需要约 26.3 GiB（约 28.2 GB）；若每像素按 4 字节的浮点存储，则膨胀到约 105 GiB，超出单机物理内存。<strong>结论很直接：图像类缓冲必须按 1 字节每像素存储，容量按可用内存的三分之一以内规划。</strong>低维观测的账则完全不同：9 维浮点观测加元数据约 100 字节，100 万条约 100 MB，可以轻松容纳多个缓冲。</p>
+
+    <h3>2. 样本驻留与对象存储</h3>
+    <p>并行采样期间，采到的样本以对象（Object）形式存放在 Ray 对象存储（Object Store）中，等待学习器消费。单轮驻留量约等于一个批的字节数：4000 步图像观测约 113 MB，低维观测不足 1 MB。真正的风险在图像任务上叠加两件事：一是多轮迭代并行推进时对象未及时释放，驻留量成倍累积；二是对象存储本身占用系统内存的固定比例（默认约三成，参数以对应版本为准），大数据批会挤压环境进程的内存空间。<strong>治理手段是控制批对象的大小与生命周期：及时释放已消费批次，避免把整个回合链路长期持有。</strong></p>
+
+    <h3>3. 显存的四类占用</h3>
+    <p>学习器在 GPU 上的显存占用由四部分构成，增长规律各不相同：</p>
+    <table>
+      <tr><th>组成部分</th><th>典型规模</th><th>增长变量</th><th>说明</th></tr>
+      <tr><td>模型参数</td><td>4 字节 × 参数量</td><td>网络宽度与深度</td><td>与批大小无关</td></tr>
+      <tr><td>梯度</td><td>与参数同量级</td><td>网络宽度与深度</td><td>训练期常驻</td></tr>
+      <tr><td>优化器状态</td><td>Adam 约 8 字节 × 参数量</td><td>优化器类型</td><td>一阶与二阶动量各一份</td></tr>
+      <tr><td>激活值</td><td>小批量 × 每样本激活足迹</td><td>小批大小</td><td>反向传播依赖，峰值的主要变量</td></tr>
+    </table>
+    <p>以 500 万参数的卷积网络、Adam 优化器为例：参数与梯度约 40 MB，优化器状态约 40 MB（按每参数 8 字节计），固定部分总计不到 100 MB；而小批 256 的卷积激活在任何合理分辨率下都会达到数百 MB 到数 GB 量级。<strong>结论是显存峰值的调节旋钮通常是批大小与网络深度，参数量本身的影响次之。</strong>此外还有工作区（Workspace）与显存碎片：卷积库为算法选择分配的临时空间、分配器保留的未释放块，通常占总量的 10% 到 20%，估算时应按 1.2 倍冗余计。</p>
+
+    <h3>4. 测量：估算之后必须校准</h3>
+    <p>估算提供数量级与可行性判断，实测提供校准值。显存测量的标准口径是"峰值已分配量"与"峰值保留量"两个计数：已分配量反映张量真实占用，保留量包含分配器缓存；两者差距大说明碎片严重，可通过限制批大小或统一张量形状缓解。测量时要注意三个细节：预热迭代的峰值通常高于稳态（库首次编译与缓存建立），报告应取稳态最小值，首轮的峰值代表性差；峰值出现在反向传播开始前，采样点要覆盖整个迭代，只在损失计算后采样会漏掉反向传播的峰值；多进程共卡时要把所有进程的占用相加。对象存储驻留量可从 Ray 状态接口按对象大小汇总，或在训练循环中记录未释放对象的引用计数。</p>
+
+    <h3>5. 降低占用的技术手段</h3>
+    <p>当估算结果超出预算时，按"先改存储格式、再改结构、最后改精度"的顺序尝试：<strong>存储格式</strong>方面，观测按 1 字节存、训练时在计算图中转换，缓冲内存直接缩小四倍；缓冲按时间窗口分片，近期数据放内存、旧数据落磁盘，命中率与内存各取所需。<strong>结构</strong>方面，降低网络宽度与深度按平方级别削减激活值；减小小批大小按比例削减激活值，是显存紧张时的第一选择。<strong>精度</strong>方面，混合精度训练把前向激活与算子临时量压缩一半，训练循环外另存一份浮点参数副本；梯度检查点（Gradient Checkpointing）用计算时间换显存，重算激活可把激活占用降到平方根量级，代价是迭代时间增加约三成。推理侧可给采样 worker 分配分数 GPU（Fractional GPU），让多个 worker 共享一张卡执行小批量前向。</p>
+
+    <h3>6. 把内存写入搜索流程</h3>
+    <p>搜索空间中的每个候选配置都应先经过一次可行性检查：按公式估算缓冲、批、激活的上限，与预算比较，超限候选直接剔除或降级参数。对显存敏感任务，排序指标除回报外补充"峰值显存"与"溢出次数"两个诊断项，供后续分析。若必须搜索大显存配置，可在空间中加入"小批大小"维度并设置上限，让调度器在安全区域内寻优。<strong>把可行性检查前置到搜索之外，比让调度器反复回收溢出试验更节省总资源。</strong></p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>内存预算的工作流程分五步：估算、测量、设限、过滤、监控。</p>
+    <ol>
+      <li><strong>逐项估算</strong>：按上节公式算出缓冲、驻留、优化器与激活四本账，并汇总峰值。</li>
+      <li><strong>实测校准</strong>：用基线配置跑若干迭代，读取峰值显存与对象存储驻留，与估算比较；差异超过 30% 时修正模型假设（激活足迹、碎片系数）。</li>
+      <li><strong>设定上限</strong>：为显存与内存分别设 80% 的告警线与 90% 的熔断线，预留余量给峰值波动与系统占用。</li>
+      <li><strong>过滤搜索空间</strong>：把超限候选剔除，或给出降级映射（如把小批从 1024 映射到 512）。</li>
+      <li><strong>运行期监控</strong>：逐迭代记录峰值显存，接近告警线时输出提示，便于在溢出前干预。</li>
+    </ol>
+    <h3>参数取值起点表</h3>
+    <table>
+      <tr><th>参数</th><th>常用起点</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>replay capacity</td><td>10<sup>5</sup> 至 10<sup>6</sup> 条</td><td>缓冲规模</td><td>按 1 字节每像素估算后取内存预算的 1/3</td></tr>
+      <tr><td>sgd_minibatch_size</td><td>128 至 512</td><td>激活值上限</td><td>显存紧张时首选的调小对象</td></tr>
+      <tr><td>obs dtype</td><td>uint8（存储）/ float32（计算）</td><td>缓冲存储精度</td><td>图像观测必用；低维观测可选</td></tr>
+      <tr><td>buffer shard</td><td>2 至 4 片</td><td>缓冲分片</td><td>单机放不下时按时间窗口划分</td></tr>
+      <tr><td>num_gpus_per_env_runner</td><td>0 或 0.1 至 0.25</td><td>推理共享显卡</td><td>小批量前向可共享，DRL 采样通常用 CPU</td></tr>
+    </table>
+    <div class="box warn">
+      <span class="box-title">与上一章的差异</span>
+      <p>第 083 章把并行度当作吞吐变量，本章把它当作内存变量重新审视：每个 worker 都有环境副本与策略副本，worker 数与每 worker 环境数的乘积决定进程内存的底数。两章联立才能得到既跑得快又跑得住的配置。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>以下片段基于 Ray 2.x 时期的通用写法，接口随版本演进，以对应版本的官方文档为准。</p>
+
+    <p><strong>片段 1：回放缓冲内存估算器</strong></p>
+    <pre class="code"><code>def buffer_memory(capacity, obs_shape, obs_bytes=1, meta_bytes=64):
+    """估算回放缓冲的常驻内存，单位 GiB。
+    obs_shape 为单帧形状，frames 表示帧堆叠数；元数据按标量组估算。"""
+    frames, h, w = obs_shape
+    per_sample = frames * h * w * obs_bytes + meta_bytes
+    total = capacity * per_sample
+    return total / (1024 ** 3), per_sample
+
+# 图像观测：84x84 灰度、4 帧堆叠、uint8 存储
+gib, per = buffer_memory(1_000_000, (4, 84, 84), obs_bytes=1)
+print(f"每样本 {per} 字节，容量 100 万约 {gib:.1f} GiB")   # 约 27.6 KiB / 26.3 GiB
+# 对照：同样容量按 float32 存储会膨胀到四倍以上，多数机器直接放不下
+gib32, _ = buffer_memory(1_000_000, (4, 84, 84), obs_bytes=4)
+print(f"float32 存储约 {gib32:.1f} GiB")                  # 约 105 GiB</code></pre>
+    <p>解读：这个估算器的价值在于把"容量"这个抽象配置翻译成物理量。<strong>（1）</strong>把字节换算集中在函数内，改变观测量级（分辨率、堆叠数、精度）时可即时重算，无需重新推导。<strong>（2）</strong>元数据取 64 字节的保守值，覆盖动作、回报、终止标志与对齐填充。<strong>（3）</strong>两行对照输出呈现了数量级差异：同样的容量在 4 字节存储下膨胀到四倍，<strong>存储精度是缓冲设计的第一决策</strong>，先选中它再谈容量。</p>
+
+    <p><strong>片段 2：峰值显存测量回调</strong></p>
+    <pre class="code"><code>import torch
+from ray.tune import Callback
+
+class GPUMemoryProbe(Callback):
+    """在每个训练迭代结束时读取显存峰值，写入日志供预算复核。
+    测量口径固定为"已分配峰值"，与缓存保留量区分开。"""
+    def __init__(self, budget_gib):
+        self.budget = budget_gib * (1024 ** 3)
+
+    def on_trial_result(self, iteration, trials, trial, result, **info):
+        if not torch.cuda.is_available():
+            return
+        # 已分配峰值：张量真实占用，不含分配器缓存，避免高估可用余量
+        peak = torch.cuda.max_memory_allocated()
+        ratio = peak / self.budget
+        # 接近 80% 告警线时输出提示，便于在溢出前调整小批大小
+        if ratio > 0.8:
+            print(f"显存峰值 {peak / 2**20:.0f} MiB，占预算 {ratio:.0%}，接近告警线")
+        # 清零峰值计数：下一个迭代重新统计，避免历史峰值掩盖当前趋势
+        torch.cuda.reset_peak_memory_stats()</code></pre>
+    <p>解读：这段回调把显存监控变成迭代级信号。<strong>（1）</strong>读取"已分配峰值"；"保留量"包含分配器缓存，会把可用余量系统性低估，两者比值是判断碎片程度的辅助口径。<strong>（2）</strong>告警线设在预算的 80%，为峰值波动与临时工作区留出余量；熔断线交由训练循环处理（捕获溢出异常并落检查点退出）。<strong>（3）</strong>每个迭代重置峰值统计，使信号反映当前配置；历史最坏值会掩盖当前趋势；日志中同时记录配置快照，便于事后把显存增长归因到具体参数变化。</p>
+
+    <p><strong>片段 3：带内存可行性过滤的搜索空间</strong></p>
+    <pre class="code"><code>from ray import tune
+
+MEMORY_BUDGET_GIB = 24.0          # 单卡预算（GiB）
+ACTIVATION_PER_SAMPLE_MIB = 1.5   # 由基线实测标定的每样本激活足迹
+
+def feasible(minibatch):
+    """可行性过滤：按标定的激活足迹估计峰值，超出预算的候选不进入搜索。
+    过滤发生在搜索之外，避免调度器把资源浪费在必然溢出的试验上。"""
+    fixed = 1000.0                        # 参数、梯度、优化器与工作区（MiB）
+    estimated = fixed + minibatch * ACTIVATION_PER_SAMPLE_MIB
+    return estimated &lt;= MEMORY_BUDGET_GIB * 1024 * 0.8
+
+space = {
+    # 只保留通过可行性检查的小批候选；上限由预算除以足迹推导
+    "sgd_minibatch_size": tune.choice([m for m in (128, 256, 512, 1024) if feasible(m)]),
+    "replay_capacity": tune.choice([100000, 200000, 400000]),
+}</code></pre>
+    <p>解读：这段代码把"内存是可行性约束"落实为一行显式规则。<strong>（1）</strong>每样本激活足迹由基线实测校准，它随网络结构变化，搜索网络结构时应重新标定。<strong>（2）</strong>0.8 的安全系数为碎片与工作区留余量，避免临界配置在个别迭代上越界。<strong>（3）</strong>缓冲容量与批大小分属内存与显存两个预算，同一次搜索中同时开放两维时，应分别过滤，再检查组合后的系统内存是否满足要求。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>图像观测按浮点存储</strong>：缓冲内存膨胀四倍，容量被迫砍到设计值以下。修复：存储用 1 字节每像素，计算前在图内转为浮点并除以 255。</li>
+      <li><strong>忘记优化器状态</strong>：只按参数量估算显存，漏掉动量项后实际占用翻倍以上。修复：按参数、梯度、优化器状态常驻三项估算固定部分。</li>
+      <li><strong>对象存储挤压环境内存</strong>：图像批对象驻留量攀升，环境进程因内存不足被系统终止。修复：控制批对象大小与释放时机，必要时下调对象存储配额。</li>
+      <li><strong>把峰值测量放在错误位置</strong>：只在损失计算后采样，漏掉反向传播的峰值；或报告首轮数值，包含库初始化开销。修复：测量覆盖完整迭代并取稳态值。</li>
+      <li><strong>每 worker 环境副本叠加未计入</strong>：把每 worker 环境数从 2 提到 8 后，进程内存按倍数上升，触发系统级内存回收。修复：把并行度乘数显式计入内存预算，平台化环境按第 089 章的容量模型统一规划。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>计算题：观测为 84×84 灰度、4 帧堆叠、1 字节存储，缓冲容量 50 万条。估算缓冲内存。若改用 2 帧堆叠并把容量减半，节省多少？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>每样本约 27.6 KiB，50 万条约 13.2 GiB；2 帧并减半后约 3.3 GiB，节省约四分之三。</div></details>
+      </li>
+      <li>预测题：小批大小从 256 提高到 1024，模型与优化器状态不变。预测显存峰值的变化比例与训练稳定性变化。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>激活值约占四倍，若其为峰值主导则总峰值显著上升；梯度噪声下降使更新更稳，但每轮更新次数减少，需复核复用预算。</div></details>
+      </li>
+      <li>设计题：为"单卡 24 GiB、图像观测、需 100 万条缓冲"的任务设计内存方案：缓冲是否分片、存储格式、批与小批上限、是否需要梯度检查点，并给出验证步骤。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>缓冲按 1 字节存并规划 3 片左右的时间窗口；激活预算留给小批 128 至 256；先用实测标定足迹再决定是否需要检查点。</div></details>
+      </li>
+      <li>推导题：设激活值近似随小批线性增长、固定部分为 F，写出"预算约束下最大小批"的表达式，并讨论安全系数 k 的作用与取值依据。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>m ≤ (k·B − F)/a，a 为每样本激活足迹，B 为显存预算；k 覆盖碎片与工作区，0.8 是常见起点。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>内存四本账：缓冲、驻留、优化器状态与激活；前三者按配置常量增长，激活随小批线性增长。</li>
+      <li>图像缓冲必须按 1 字节每像素存储；容量按内存预算的三分之一以内规划。</li>
+      <li>显存峰值的调节旋钮是小批大小与网络深度；碎片与工作区按 1.2 倍冗余估算。</li>
+      <li>估算、实测、设限、过滤、监控五步把内存约束前置进搜索流程，避免溢出试验浪费调度资源。</li>
+      <li>下一章把采样、学习与开销的时间账合并，给出训练吞吐与采样效率的分析方法。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch083.html">← 第 083 章：超参搜索实战：并行环境数</a>
+    <a class="next" href="ch085.html">第 085 章：训练吞吐与采样效率分析 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

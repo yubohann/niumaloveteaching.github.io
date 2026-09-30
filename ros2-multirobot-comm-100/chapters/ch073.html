@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第073章 多机器人安全通信 | 多机器人协同学习课程 · ROS2 通信与系统集成</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第四篇 · 系统集成与工程化</span>
+    <span class="sep">/</span>
+    <span>第 073 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第四篇 · 系统集成与工程化</div>
+    <h1>第 073 章：多机器人安全通信</h1>
+    <p class="lead">默认的 ROS2 是"人人可发言"的开放网络：任何接入者都能伪造机器人发指令。用 SROS2 与 DDS Security 建立信任链，认证身份、加密数据、按主题授权，并算清安全带来的性能开销。</p>
+    <ul class="meta">
+      <li>主题：系统集成 / 通信安全</li>
+      <li>关键机制：证书信任链、enclave、治理策略（governance）、访问控制（permissions）</li>
+      <li>预计学时：65 分钟</li>
+      <li>前置章节：第 072 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>建立多机器人系统的威胁模型：窃听、伪造、篡改、重放四类攻击在 ROS2 默认配置下为什么都成立。</li>
+      <li>理解 SROS2 的信任链：CA → 节点证书 → enclave，以及治理文件与权限文件各自管什么。</li>
+      <li>会为一个车队设计 enclave 结构与权限表，掌握"默认拒绝"原则与最小授权。</li>
+      <li>知道加密/签名的性能代价量级与部署约束（时钟、证书轮换、RMW 实现差异）。</li>
+      <li>能用 CLI 生成密钥库与安全工件，并在 launch 里让节点以安全身份运行。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>前面的 QoS、调度、保障都在讨论"让系统跑得对"，本章讨论"防止别人让它跑错"。ROS2 的默认行为对新手是友好的：无认证、无加密，同一域内任何进程都能订阅一切、发布一切。把这条特性放进真实世界就成了漏洞，<strong>园区里任何能连上 WiFi 的设备都可以发布 <code>/robot3/cmd_vel</code> 操纵机器人</strong>，或者伪装成调度器下发恶意任务；日志、地图、视频可以被任意监听。</p>
+    <p>商用多机器人系统（物流、安保、工业）一旦联网进场，安全就是硬门槛：合规审计要求通信加密、事故追责要求消息可鉴权。SROS2 是 ROS2 社区的标准答案，基于 DDS Security 规范，为每个节点发证书、按策略授权。本章讲透它的信任链与工程细节，并如实给出性能代价：<strong>安全不是免费的，但可以量化后再决策</strong>。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 威胁模型：默认配置下的四类攻击</h3>
+    <table>
+      <tr><th>攻击</th><th>手法</th><th>后果示例</th><th>防线</th></tr>
+      <tr><td>窃听</td><td>同域订阅敏感话题，被动收包</td><td>地图、视频、调度信息泄露</td><td>加密（ENCRYPT）</td></tr>
+      <tr><td>伪造</td><td>以机器人身份发布 cmd_vel / 任务</td><td>机器人被他人操纵</td><td>认证（证书）+ 访问控制</td></tr>
+      <tr><td>篡改</td><td>中间人改写消息内容</td><td>坐标被改，任务送错地点</td><td>签名（SIGN）</td></tr>
+      <tr><td>重放</td><td>录制合法消息稍后重发</td><td>陈旧的"开门"指令被执行</td><td>签名（含序列号/时间）+ LIFESPAN</td></tr>
+    </table>
+    <p>注意重放攻击与第 072 章 LIFESPAN 的关系：LIFESPAN 防的是"自己系统积压的旧消息"，重放防的是"攻击者刻意回放的旧消息"，两者的时间校验同源，但攻击者可以伪造时间戳，只有签名（绑定身份）才真正拦住重放。<strong>安全机制与保障机制在这里交汇：先认证身份，时间校验才有意义。</strong></p>
+
+    <h3>2. 信任链：CA → 节点证书 → enclave</h3>
+    <p>SROS2 的信任模型与 HTTPS 相同：一个<strong>证书颁发机构（CA）</strong>是信任根，它为车队中每个节点签发密钥对与证书。运作流程：</p>
+    <ol>
+      <li>管理员在安全环境执行 <code>ros2 security create_keystore</code> 建立密钥库（keystore），其中包含 CA 的私钥与自签证书，<strong>CA 私钥永远不离开管理机</strong>。</li>
+      <li>为每个节点（或每组同类节点）建立 <strong>enclave（安全区）</strong>：一个目录，代表一个安全身份边界。同一 enclave 内的节点共享身份，所以"每台机器人一个 enclave"是多机器人车队的最小合理粒度。</li>
+      <li>为 enclave 生成安全工件：节点证书 + 私钥 + 治理文件 + 权限文件 + CA 证书。这台机器人的 keystore 里<strong>只应该有它自己的私钥</strong>。</li>
+      <li>节点启动时通过环境变量指向 keystore 与 enclave 路径，DDS Security 插件自动完成握手、认证、加密。</li>
+    </ol>
+    <div class="formula">
+      发现握手成本 ≈ 数十毫秒 / 参与者对（首次），消息加密 ≈ AES-GCM 每块开销
+      <span class="note">20 台机器人、每台 30 端点：启动阶段握手负载明显上升，发现时间从秒级升到十秒级；稳态吞吐在小消息上可能降 10–30%</span>
+    </div>
+    <p>还有一个关键性质：<strong>安全启动是"全有或全无"</strong>。开启访问控制后，未携带有效证书的参与者无法完成发现，想限制通信范围、又允许混入非安全节点，是不存在的。上线安全要么全队一起切，要么划域分批切（第 001 章的域隔离在这里复用）。</p>
+
+    <h3>3. 治理与权限：策略落到文件</h3>
+    <p>两个 XML 文件定义"允许做什么"：</p>
+    <ul>
+      <li><strong>治理文件（governance）</strong>：域级策略，声明各通信类型是否需要保护及保护级别：发现流量、liveliness、RTPS 元数据可选 NONE / SIGN / ENCRYPT；并声明"允许未认证参与者"必须为 false。</li>
+      <li><strong>权限文件（permissions）</strong>：每个 enclave 一份，列出该身份可以<strong>发布/订阅哪些话题、提供/调用哪些服务、使用哪些动作接口</strong>。遵循默认拒绝：没写的全禁。</li>
+    </ul>
+    <p>设计权限表的三条纪律：<strong>（1）最小授权</strong>，巡逻机器人不需要订阅 <code>/fleet/map</code> 就不给；<strong>（2）按角色分组</strong>，同型号机器人共享一份模板，避免 20 份文件各自漂移；<strong>（3）变更走评审</strong>，新增话题时权限文件的更新与代码一起提交，CI 校验"权限表 vs 实际话题名"一致性，防止上线后某个功能因权限缺失"静默不通信"。</p>
+
+    <h3>4. 性能与运维约束</h3>
+    <p>安全开销分两块：<strong>发现期</strong>的证书握手（一次性，主要影响启动时间）与<strong>稳态期</strong>的逐消息加密/签名（影响 CPU 与吞吐）。量级感：512 字节以下的小消息，签名/加密开销占比可观（高者可达 20–30% 吞吐下降）；大消息（图像）相对开销小。嵌入式 SBC 上要先做基准（第 076 章方法）再全量上线。</p>
+    <p>运维约束同样要提前布局：<strong>（1）时钟</strong>，证书有效期依赖准确的 UTC 时间，时钟错到证书有效期外直接无法通信，NTP/时间同步从"好习惯"变成硬依赖；<strong>（2）轮换</strong>，证书有有效期，车队规模 &gt; 20 台时手工轮换不现实，需要脚本化 provisioning；<strong>（3）私钥保护</strong>，每台机器人私钥唯一且只存本机（用只读分区或 TPM 更佳），多机共享同一身份等于没有身份。</p>
+
+    <h3>5. 数值算例：握手与逐消息开销的账</h3>
+    <p>先算发现期的规模。20 台机器人、每台约 30 个端点（发布者 + 订阅者 + 服务），全队约 600 个端点；安全握手发生在"需要互见"的端点对之间，即使只按写者与读者各半估算，潜在配对约 300 × 300 = 90000 对。每对配对需要一次基于证书的密钥协商，单次即使只要 0.5–1 ms，串行处理也要 45–90 s；实现会用多线程与批量协商把实际时间压到秒级到十秒级，这正是"20 台规模启动时间从秒级升到十秒级、发现期预算按 3 倍上浮"的来源。结论很明确：安全模式的第一痛点通常落在<strong>启动阶段</strong>，稳态吞吐的下降相对可控，压测与验收要单独测"全队冷启动到全部就绪"的时长，并把它写进部署手册。</p>
+    <p>再算稳态期的逐消息账。设某小型计算单元上 1 KB 消息加密约 40 μs、签名约 25 μs，合计 65 μs；单机每秒收发 400 条消息时，安全处理占用 400 × 65 μs = 26 ms/s，约单核的 2.6%，可以忽略；同样的小机器如果每秒要处理数千条小消息（传感器族、心跳族），占比就会升到 20% 以上，此时先做基准再上线，必要时减少冗余小消息（合并状态、降频）比换硬件更快见效。带宽方面，加密与签名带来的协议头增量在每条消息几十字节量级，对 1 KB 消息约占 4%，对 64 KB 图像消息低于 0.1%，所以"安全拖垮网络"的担忧在合理配置下不成立，真正需要盯的是小机器 CPU 与启动时延。</p>
+
+    <h3>6. 三种保护级别的取舍</h3>
+    <table>
+      <tr><th>级别</th><th>防护能力</th><th>每消息开销</th><th>适用场景</th></tr>
+      <tr><td>NONE</td><td>无认证、无加密</td><td>零</td><td>完全隔离的调试域（生产环境不推荐）</td></tr>
+      <tr><td>SIGN</td><td>认证与完整性（防伪造、防篡改）</td><td>每消息签名计算 + 约 64 字节</td><td>数据可公开但命令必须可信的场合</td></tr>
+      <tr><td>ENCRYPT</td><td>加密 + 完整性（含防窃听）</td><td>加密计算 + 约 44 字节头</td><td>无线多机器人、含地图与视频等敏感数据</td></tr>
+    </table>
+    <p>取舍的原则按"暴露面"走：机器人通过无线网络工作时，窃听是低成本攻击，ENCRYPT 是默认档；内网有线、数据本身不敏感的调试链路可以只开 SIGN 换取一点 CPU；NONE 只应出现在物理隔离、生命周期极短的测试域，并且要有人在清单上签字确认它不会被带进生产。选档之后治理文件与权限文件要成对更新，性能数据用第 076 章的基准方法测，把"档位 → 开销 → 验收线"写成一张表随部署归档。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>安全上线分四步，建议在项目的仿真阶段就完成前三步：</p>
+    <ol>
+      <li><strong>划分身份边界</strong>：车队级 enclave（调度器、监控）、每机器人一个 enclave（robot1…robotN）、地面站 enclave。同构机器人用同一份权限模板参数化生成。</li>
+      <li><strong>定义通信矩阵</strong>：列出"谁发/谁收"表格（第 001 章的计算图是输入），转换成权限条目；每个条目旁注明对应的代码模块，双向可追溯。</li>
+      <li><strong>生成与分发工件</strong>：管理机生成 keystore 与 enclave 工件，按机器人分发到 <code>/etc/ros2/security/</code> 类路径；分发过程本身要安全（离线介质或已认证通道）。</li>
+      <li><strong>端到端演练</strong>：全队开安全模式跑一次协同任务，重点验证"未授权节点确实进不来"与"启动时长可接受"；把结果写进部署手册。</li>
+    </ol>
+    <h3>部署参数与检查项</h3>
+    <table>
+      <tr><th>项</th><th>建议</th><th>说明</th></tr>
+      <tr><td>enclave 粒度</td><td>1 机器人 / 1 enclave</td><td>同机节点共享身份；机内再分角色可按需细化</td></tr>
+      <tr><td>治理保护级别</td><td>发现与 RTPS 均 ENCRYPT</td><td>仅 SIGN 会泄露拓扑与内容元数据，多机场景不可取</td></tr>
+      <tr><td>证书有效期</td><td>90–365 天 + 轮换脚本</td><td>太短增加运维负担，太长削弱吊销能力</td></tr>
+      <tr><td>时钟偏差容忍</td><td>绝对值 &lt; 1 min</td><td>证书校验有容差窗；上线前纳入开机自检</td></tr>
+      <tr><td>发现期预算</td><td>启动时间上浮 ≤ 3 倍</td><td>20 台规模实测经验值；超标先查握手风暴</td></tr>
+    </table>
+    <div class="box warn">
+      <span class="box-title">注意：安全模式上线必须在开发早期，不能留到"最后再开"</span>
+      <p>后期开启安全会遇到三类连锁故障：QoS 与安全插件组合问题（某些 RMW 实现对特定 QoS 组合的加密路径有额外限制）、权限文件的遗漏（某个监控话题没授权，现象是"静默收不到"）、时间源问题（证书校验失败导致整个系统无法启动）。这些问题单发都难查，叠在一起上线即"事故现场"。<strong>安全是贯穿开发周期的约束，把它当成"最后再开的功能开关"会付出连锁故障的代价。</strong></p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：生成密钥库与节点安全工件（CLI）</strong></p>
+    <pre class="code"><code># 在安全的管理机上建立车队密钥库（CA 私钥自此只存于这里）
+ros2 security create_keystore /opt/fleet_keystore
+
+# 为每台机器人创建独立 enclave（身份边界）
+ros2 security create_enclave /opt/fleet_keystore /robot1
+ros2 security create_enclave /opt/fleet_keystore /robot2
+
+# 生成工件：证书、私钥、治理与权限文件、CA 证书
+ros2 security generate_artifacts -k /opt/fleet_keystore
+
+# 分发到目标机（示例：机器人 1 只拿自己的 enclave 目录）
+# rsync -a /opt/fleet_keystore/enclaves/robot1/ robot1:/etc/ros2/security/enclaves/robot1/
+# rsync -a /opt/fleet_keystore/ca.cert.pem     robot1:/etc/ros2/security/</code></pre>
+    <p>解读：这四条命令是 SROS2 工作流的骨架（具体子命令与参数以对应发行版文档为准，Humble 与 Jazzy 间有细微差异）。三个最要紧的理解：<strong>（1）</strong><code>create_keystore</code> 产出的 CA 私钥是整个车队的信任根，管理机一旦失守所有身份可被重签，密钥库要离线保存、权限最小化；<strong>（2）</strong>每台机器人只分发自己的 enclave 目录 + CA 公钥证书，<strong>绝不把其他机器人的私钥或 CA 私钥发到机器人上</strong>（很多事故源于图省事整包拷贝）；<strong>（3）</strong>工件生成后权限文件默认模板只放行基础通信，必须按你的通信矩阵逐项补全，默认模板能让节点"启动起来、发现彼此"，但应用话题往往被拦，现象是"节点在、图在、数据不通"。</p>
+
+    <p><strong>片段 2：治理文件，域级保护策略（XML）</strong></p>
+    <pre class="code"><code>&lt;dds xmlns="http://www.omg.org/dds/1.0"&gt;
+  &lt;domain_access_rules&gt;
+    &lt;domain_rule&gt;
+      &lt;domains&gt;&lt;id_range&gt;&lt;min&gt;42&lt;/min&gt;&lt;max&gt;42&lt;/max&gt;&lt;/id_range&gt;&lt;/domains&gt;
+      &lt;allow_unauthenticated_participants&gt;false&lt;/allow_unauthenticated_participants&gt;
+      &lt;enable_join_access_control&gt;true&lt;/enable_join_access_control&gt;
+      &lt;discovery_protection_kind&gt;ENCRYPT&lt;/discovery_protection_kind&gt;
+      &lt;liveliness_protection_kind&gt;ENCRYPT&lt;/liveliness_protection_kind&gt;
+      &lt;rtps_protection_kind&gt;ENCRYPT&lt;/rtps_protection_kind&gt;
+      &lt;topic_access_rules&gt;
+        &lt;topic_rule&gt;
+          &lt;topic_expression&gt;/fleet/*&lt;/topic_expression&gt;
+          &lt;enable_discovery_protection&gt;true&lt;/enable_discovery_protection&gt;
+          &lt;enable_liveliness_protection&gt;true&lt;/enable_liveliness_protection&gt;
+          &lt;enable_read_access_control&gt;true&lt;/enable_read_access_control&gt;
+          &lt;enable_write_access_control&gt;true&lt;/enable_write_access_control&gt;
+          &lt;metadata_protection_kind&gt;ENCRYPT&lt;/metadata_protection_kind&gt;
+          &lt;data_protection_kind&gt;ENCRYPT&lt;/data_protection_kind&gt;
+        &lt;/topic_rule&gt;
+      &lt;/topic_access_rules&gt;
+    &lt;/domain_rule&gt;
+  &lt;/domain_access_rules&gt;
+&lt;/dds&gt;</code></pre>
+    <p>解读：治理文件回答两个问题：<strong>"允不允许未认证者进来"</strong>（<code>false</code>，即全队必须带证书）与<strong>"各层通信怎么保护"</strong>。三处保护级别的选择逻辑：<code>discovery_protection_kind</code> 保护的是"谁在和谁说话"的发现元数据，若设为 NONE，攻击者虽进不来，但能测绘出你的拓扑；<code>rtps_protection_kind</code> 保护传输层心跳与确认帧；<code>data_protection_kind</code> 保护业务数据本身。演示/内网可只 SIGN 省 CPU，<strong>无线多机器人场景建议一律 ENCRYPT</strong>。<code>topic_expression</code> 支持通配符，用 <code>/fleet/*</code> 给公共话题建统一规则、给每台机器人前缀单独建规则，是保持文件简短的关键。注意域号要写对（第 001 章的规划在这里再次兑现）：治理文件管错域等于没管。</p>
+
+    <p><strong>片段 3：权限文件，机器人 1 的最小授权（XML）</strong></p>
+    <pre class="code"><code>&lt;permissions xmlns="http://www.omg.org/dds/1.0"&gt;
+  &lt;grant name="robot1_permissions"&gt;
+    &lt;allow_rule&gt;
+      &lt;domains&gt;&lt;id_range&gt;&lt;min&gt;42&lt;/min&gt;&lt;max&gt;42&lt;/max&gt;&lt;/id_range&gt;&lt;/domains&gt;
+      &lt;!-- 只允许发自己的话题；收车队广播；其余一律默认拒绝 --&gt;
+      &lt;publish&gt;
+        &lt;topics&gt;
+          &lt;topic&gt;/robot1/odom&lt;/topic&gt;
+          &lt;topic&gt;/robot1/status&lt;/topic&gt;
+          &lt;topic&gt;/robot1/task_event&lt;/topic&gt;
+        &lt;/topics&gt;
+      &lt;/publish&gt;
+      &lt;subscribe&gt;
+        &lt;topics&gt;
+          &lt;topic&gt;/fleet/*&lt;/topic&gt;
+          &lt;topic&gt;/robot1/cmd_vel&lt;/topic&gt;
+        &lt;/topics&gt;
+      &lt;/subscribe&gt;
+      &lt;!-- 服务方向相反：提供服务=被调用；请求服务=去调用 --&gt;
+      &lt;offer&gt;
+        &lt;services&gt;
+          &lt;service&gt;execute_task&lt;/service&gt;
+        &lt;/services&gt;
+      &lt;/offer&gt;
+      &lt;request&gt;
+        &lt;services&gt;
+          &lt;service&gt;/fleet/query_status&lt;/service&gt;
+        &lt;/services&gt;
+      &lt;/request&gt;
+    &lt;/allow_rule&gt;
+  &lt;/grant&gt;
+&lt;/permissions&gt;</code></pre>
+    <p>解读：这份文件是"最小授权"的具象化：机器人 1 能发自己的三个话题、收车队广播与自己的指令、被调度器调用 <code>execute_task</code>、调用车队查询服务。<strong>新增任何话题都必须同步更新这份文件</strong>，权限缺失的行为是"静默不通信"，表现为诡异的超时与空数据，是本机制最典型的运维坑。几个易错点：<code>publish</code>/<code>subscribe</code> 的方向要从本节点视角写（自己发才叫 publish）；服务里 <code>offer</code> 是"我提供"、<code>request</code> 是"我调用"；<code>/fleet/*</code> 的通配订阅要让权限面保持窄，生产系统里应细化到具体话题列表，通配符越多，一次泄露的影响面越大。最后：权限文件与治理文件在 DDS Security 实现间的标签名可能小有差异（Fast DDS 与 Cyclone DDS 的安全插件版本），以所选 RMW 实现文档为准。</p>
+
+    <p><strong>片段 4：launch 里以安全身份启动节点</strong></p>
+    <pre class="code"><code>from launch import LaunchDescription
+from launch.actions import SetEnvironmentVariable
+from launch_ros.actions import Node
+import os
+
+def generate_launch_description():
+    # 指向本机密钥库；每个机器人用 --ros-args 里的路径参数也可以，
+    # 但环境变量方式对“所有子进程”统一生效，最省心。
+    env = [
+        SetEnvironmentVariable("ROS_SECURITY_ENABLE", "true"),
+        SetEnvironmentVariable("ROS_SECURITY_STRATEGY", "Enforce"),
+        SetEnvironmentVariable("ROS_SECURITY_KEYSTORE",
+                               "/etc/ros2/security"),
+    ]
+    robot1 = Node(
+        package="fleet_app", executable="patrol_node",
+        namespace="robot1",
+        env={"ROS_SECURITY_ENCLAVE_OVERRIDE": "/robot1"},   # 选本机身份
+    )
+    # 其他节点不指定 enclave：使用默认 enclave（keystore 根）
+    monitor = Node(package="fleet_ops", executable="health_monitor")
+    return LaunchDescription(env + [robot1, monitor])</code></pre>
+    <p>解读：安全身份的选择通过环境变量注入，其中 <code>ROS_SECURITY_STRATEGY</code> 设 <code>Enforce</code>（强制）还是 <code>Permissive</code>（告警但不阻止）是上线节奏的抓手：<strong>先 Permissive 收集"哪些文档缺权限"的日志，再切 Enforce</strong>，可以避免上线当日全队静默。enclave 覆盖变量让同一份 launch 在不同机器人上以不同身份运行（搭配 namespace 参数化，复用第 001 章的实例化模式）。最后提醒：授权的判定发生在<span>通信层</span>，应用代码里看不到任何报错，灰度期间务必用"话题连通性自检脚本"（001 章的自检思路）验证每条关键边真的通了。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>私钥复制到多台机器人</strong>：为省事把同一 enclave 拷贝给所有机器人，冒充者与真身在协议层无法区分，安全形同虚设。修复：一机一私钥，分发脚本自动化；定期抽查身份唯一性。</li>
+      <li><strong>权限文件漏项，静默不通信</strong>：新加话题没授权，节点正常启动但数据永远收不到，也几乎没有报错。修复：CI 校验"代码话题清单 ⊆ 权限文件"；灰度期用连通性自检脚本。</li>
+      <li><strong>时钟漂移导致证书校验失败</strong>：机器人离线数天时钟失准，上线后握手直接失败，整个域启动不了。修复：开机先同步 NTP/时间源再做自检；把握手失败明确记入启动日志第一屏。</li>
+      <li><strong>治理文件管错域号</strong>：系统跑在域 42，治理文件写的是 0，安全策略根本没生效（且通常无感）。修复：域号单点定义（配置文件生成治理文件与 launch），杜绝手写两处。</li>
+      <li><strong>只在"最后阶段"开安全</strong>：临上线才发现握手风暴让启动从 3 s 变 30 s、某些 QoS 组合与加密路径不兼容。修复：开发早期开 Permissive 起用，把启动时长与吞吐纳入 076 章基准。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>画出你的车队"通信矩阵"：行是节点角色（调度器、巡逻机、监控），列是话题/服务，格内标 P（发布）/S（订阅）/C（调用）。然后把它翻译成权限条目的清单（不用写完整 XML）。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>从第 001 章的计算图直接抄骨架；重点检查"跨机器人"的每条边都有对应授权，以及有没有哪个节点"订阅了其实从没用过的数据"，多授权就是多余的风险面。</div></details>
+      </li>
+      <li>分析重放攻击为什么在"仅加密不签名"的配置下依然可行，而在签名配置下不可行；为什么 LIFESPAN 不能替代签名，签名也不能替代 LIFESPAN。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>加密只保证"别人看不懂"，攻击者可以原样重放密文，接收端解密后无法分辨新旧；签名绑定身份与内容，但合法节点的旧消息仍是"合法签名"，需要 LIFESPAN/序列号做时效判断。两者是身份与时序两个正交维度。</div></details>
+      </li>
+      <li>估算安全开销：某 SBC 上 1 KB 消息加密约 40 μs、签名约 25 μs。20 Hz、10 条话题、单机收发合计 400 msg/s 时，安全处理占单核多少百分比？再加 5 台机器共享一个接入点，回到第 013 章的带宽估算，说明为什么安全开销对"带宽"影响有限、对"小机器 CPU"影响更大。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>400 × 60 μs ≈ 24 ms/s ≈ 2.4% 单核；带宽只增加协议头（< 5%）。但小型 MCU-class 节点 CPU 弱、消息又小，占比可到 20%+，这正是"先基准后上线"的原因。</div></details>
+      </li>
+      <li>设计证书轮换流程：车队 20 台机器人、证书有效期 90 天。写出轮换步骤（生成新 enclave 工件、在线替换策略、rollback 方案）、要避免的停机模式，以及如何验证轮换成功。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>分批（维护窗口 5 台/批）—每台先落新工件、切身份重启、自检通过再进下一批；rollback 保留旧工件与旧治理兼容期；验证 = 全队节点图完整 + 关键话题端到端连通 + 治理审计日志无拒绝条目。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>ROS2 默认无认证无加密；窃听、伪造、篡改、重放四类威胁在多机器人场景都是现实风险。</li>
+      <li>SROS2 信任链：管理机的 CA 签发身份，enclave 是身份边界，一机一私钥；治理管"保护级别与准入"，权限管"谁能说什么"。</li>
+      <li>最小授权 + 默认拒绝 + 变更评审是权限管理三纪律；缺权限的典型症状是"静默不通信"，要靠 CI 与自检脚本兜住。</li>
+      <li>安全开销可量化：发现握手影响启动时长，逐消息加解密影响小机器 CPU；时钟、轮换、私钥保护是三大运维约束。</li>
+      <li>下一章从"防外部"转向"扛内部"：机器人自己会坏，<strong>多机器人故障检测与恢复</strong>。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch072.html">← 第 072 章：多机器人服务质量保障</a>
+    <a class="next" href="ch074.html">第 074 章：多机器人故障检测与恢复 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第088章 分布式训练数据流与一致性 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第五篇 · 训练工程与系统进阶</span>
+    <span class="sep">/</span>
+    <span>第 088 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第五篇 · 训练工程与系统进阶</div>
+    <h1>第 088 章：分布式训练数据流与一致性</h1>
+    <p class="lead">一句话：本章把采样、传输、缓冲、学习与参数广播串成一张数据流图，逐层定义一致性要求、违约症状与满足要求的协议。</p>
+    <ul class="meta">
+      <li>主题：训练工程 / 数据一致性（Data Consistency）</li>
+      <li>关键机制：版本一致性、新鲜度上界、原子检查点、反压（Backpressure）</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 087 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>能画出分布式强化学习训练的数据流闭环，并标出每个环节的读方与写方。</li>
+      <li>掌握四个一致性层级：参数版本一致性、样本新鲜度、写入原子性、检查点快照一致性，以及各自的违约症状。</li>
+      <li>理解不可变对象（Immutable Object）与版本计数为何能替代细粒度锁，成为分布式训练默认的一致性手段。</li>
+      <li>会设计反压机制与有界队列，防止数据积压演变为内存故障。</li>
+      <li>掌握原子检查点的提交协议：先写临时目录、最后提交清单（Manifest）。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>前两章分别处理了数据在途的滞后与在库的陈旧，两者都默认"数据的版本、顺序与完整性是可靠的"。<strong>在跨进程、跨节点的真实系统里，这一默认恰恰最脆弱：参数广播到达顺序不同、缓冲写入与淘汰并发、检查点写到一半进程退出，任何一项失守都会让训练出现难以复现的异常。</strong>一致性讨论的任务，是把隐含假设变成显式契约，并为每条契约配置可验证的实现。</p>
+    <p>强化学习训练的数据流与常规分布式训练有两点不同。其一，数据本身是"策略的函数"：样本的有效性绑定采集时的策略版本，版本错配会让同策略算法静默退化为无修正的离策略算法。其二，训练是一个长期闭环：参数从学习器流向采样端再以样本形式流回，闭环中任何环节的不一致都会累积放大。这两点决定了本章的四层契约模型。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p><strong>一致性设计从数据流图出发：先标注每个对象的唯一写入者，再为跨对象的关系定义不变式，最后选择满足不变式的最弱协议。</strong>本节先给出数据流图，再逐层展开四类契约。</p>
+
+    <h3>1. 数据流闭环与唯一写入者</h3>
+    <p>分布式强化学习训练的数据流可以抽象为五个环节：采样端（环境步进与前向推理）产出样本；传输层（对象存储与队列）承载样本；缓冲层（回放队列）长期保存样本；学习器消费样本产出参数更新；参数分发把最新参数广播回采样端，闭环完成。<strong>为每个共享对象指定唯一写入者（Single Writer），是消除竞争条件的第一原则</strong>：样本由采样端写入后不再修改；参数快照由学习器发布后不可变；缓冲的优先级字段只由其所有者进程更新。写入者唯一时，读者无需加锁，一致性从"协调"退化为"约定"。</p>
+
+    <h3>2. 第一层契约：参数版本一致性</h3>
+    <p>参数版本一致性的要求取决于算法族，可以写成两种形式：</p>
+    <div class="formula">
+      同策略要求：∀s ∈ Batch，version(s) = v<sub>current</sub>；离策略约束：v<sub>current</sub> − version(s) ≤ L<sub>max</sub>
+      <span class="note">version(s) 为样本采集时的策略版本；同策略要求整批同版本，离策略允许有界混合</span>
+    </div>
+    <p>违约症状很容易辨认却常被忽略：批内混版本数据使裁剪比率与 KL 统计失去意义，训练曲线呈现"回报突然抬升后缓慢回落"的锯齿。实现要点有三：样本结构体携带整数版本号；学习器维护单调计数器作为逻辑时钟；批组装时执行断言或过滤。<strong>版本号采用逻辑计数</strong>，墙钟时间会因跨节点时钟偏差导致比较失效。</p>
+
+    <h3>3. 第二层契约：样本新鲜度上界</h3>
+    <p>有界滞后是第 086 章的设计，这里给出它与一致性的关系：新鲜度上界是一道容量管理规则，队列深度、缓冲窗口、丢弃阈值共同决定任何时刻系统内最旧样本的年龄。<strong>三个参数必须联动配置</strong>：只限制队列深度而不限制缓冲窗口时，旧样本从队列进入缓冲后年龄继续增长，上界形同虚设。监控口径为样本年龄分布的 95 分位，超限即触发丢弃或降采样，丢弃率持续高企则说明采样或学习速率失配，应调整结构参数；放宽上界只会掩盖失配。</p>
+
+    <h3>4. 第三层契约：写入原子性与顺序</h3>
+    <p>缓冲写入需要满足两条不变式：<strong>一条样本写入后其内容字段不可再变</strong>（优先级等元数据字段允许由所有者更新，且更新需对读者原子可见）；<strong>淘汰与抽样并发时不得出现"样本已淘汰但索引仍被引用"</strong>。标准解法是环形缓冲加代际号（Generation）或版本引用：抽样返回样本索引与代际号，消费前校验代际一致，不一致则重新抽样。乱序到达在多生产者场景不可避免，接收端按显式序号重组，缺失序号超时即判为丢失并重新请求或丢弃。<strong>顺序假设一旦写进下游逻辑，就必须由上游机制保证</strong>，两者不能各说各话。</p>
+
+    <h3>5. 第四层契约：检查点快照一致性</h3>
+    <p>检查点需要跨多个分片原子生效：网络参数、优化器状态、计数器与随机数状态分布在若干进程或对象中，任何两部分不同步都会产生无法恢复的混合状态。提交协议用"先写后提交"实现原子性：</p>
+    <div class="formula">
+      阶段一：各分片写入临时路径并计算校验和；阶段二：全部就绪后写入清单文件（Manifest）指向各分片
+      <span class="note">清单的写入是原子操作；恢复时先读清单，再按校验和验证分片，校验失败即视为检查点不存在</span>
+    </div>
+    <p>这一协议保证"清单存在 ⇒ 全部有效分片存在"，读者永远不会观察到部分写入的状态。恢复流程相应地分为三步：读清单、验分片、装载；任一步失败即回退到上一个有效检查点或从头开始，并在日志中记录回退原因。<strong>把"检查点是否可用"定义为布尔判断，恢复逻辑才能保持简单。</strong></p>
+
+    <h3>6. 反压与故障边界</h3>
+    <p>反压解决供给与消费速率失配时的积压问题：有界队列满时，采样端收到减速信号，降低采集速率（或按策略丢弃旧样本），把内存占用锁在常量上界内。反压信号应沿数据流反向传播：学习器变慢 → 队列积压 → 采样端降速，三者构成负反馈环。<strong>丢弃与阻塞代表两种哲学：阻塞保数据完整但浪费采样算力，丢弃保吞吐但需监控丢弃率；选择依据是样本的价值密度。</strong>故障边界上，行业惯例是"数据可丢、参数不可丢"：样本丢失由丢弃率指标暴露并重新采集，参数与优化器状态则始终通过原子检查点保护。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>一致性设计的落地按六步执行，产出物是一份不变式清单与对应的验证用例。</p>
+    <ol>
+      <li><strong>画数据流图</strong>：标注五个环节与每条边的对象类型、写入者、读者。</li>
+      <li><strong>列出不变式</strong>：把四层契约翻译为可断言的条件，例如"批内版本号唯一"、"样本年龄 95 分位小于阈值"。</li>
+      <li><strong>选择协议</strong>：按最弱可用原则选择实现，避免过度设计（例如单写者场景不引入分布式锁）。</li>
+      <li><strong>实现校验点</strong>：在批组装、缓冲出入、检查点提交处插入断言与指标。</li>
+      <li><strong>注入测试</strong>：模拟乱序、重复、部分失败，验证校验点能捕获违约。</li>
+      <li><strong>联调监控</strong>：把版本违规计数、丢弃率、校验和失败数纳入常规监控面板。</li>
+    </ol>
+    <h3>协议与代价对照表</h3>
+    <table>
+      <tr><th>契约</th><th>实现手段</th><th>代价</th><th>违约症状</th></tr>
+      <tr><td>版本一致性</td><td>版本标签、批断言、有界过滤</td><td>丢弃部分样本</td><td>KL 统计失真、回报锯齿</td></tr>
+      <tr><td>新鲜度上界</td><td>队列深度、年龄阈值</td><td>高丢弃率</td><td>训练缓慢漂移、复用失效</td></tr>
+      <tr><td>写入原子性</td><td>单写者、代际校验、显式序号</td><td>少量重抽样</td><td>采样崩溃、读到悬空索引</td></tr>
+      <tr><td>快照一致性</td><td>临时路径加清单提交</td><td>双份存储瞬时占用</td><td>恢复到混合状态、校验失败</td></tr>
+    </table>
+    <div class="box warn">
+      <span class="box-title">与上一章的差异</span>
+      <p>第 087 章把缓冲当作"能用的数据结构"，本章把缓冲当作"必须被证明正确的共享状态"：抽样概率、写入顺序与快照时机都升级为有不变式约束的协议对象。上一章的调参前提，正是本章定义并守护的契约。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>以下片段基于 Ray 2.x 时期的通用写法，接口随版本演进，以对应版本的官方文档为准。</p>
+
+    <p><strong>片段 1：带版本标签的样本与批组装校验</strong></p>
+    <pre class="code"><code>def tag_batch(batch, policy_version):
+    """采样端为每批样本打上策略版本号；版本号来自采集时使用的参数快照。
+    逻辑计数：跨节点比较不受时钟偏差影响。"""
+    batch["policy_version"] = int(policy_version)
+    return batch
+
+def assemble_batch(fragments, mode="on_policy", max_lag=4):
+    """学习器侧批组装：按算法族执行不同的版本契约。
+    同策略要求整批同版本；离策略只做有界滞后过滤。"""
+    versions = {f["policy_version"] for f in fragments}
+    if mode == "on_policy":
+        # 违约时先记录再处置：静默修正会让实验记录与实际不符
+        assert len(versions) == 1, f"版本混用: {sorted(versions)}"
+        return fragments
+    current = max(versions)
+    kept = [f for f in fragments if current - f["policy_version"] &lt;= max_lag]
+    # 丢弃率是需要监控的业务信号：持续偏高说明两侧速率失配
+    dropped = len(fragments) - len(kept)
+    return kept, dropped</code></pre>
+    <p>解读：这段代码把版本契约写成显式断言与过滤。<strong>（1）</strong>同策略分支用断言拦截越界版本，让不一致在最早的位置暴露；静默取最新版本会把故障推迟暴露。<strong>（2）</strong>离策略分支返回丢弃数，把"过滤发生率"变成可监控指标。<strong>（3）</strong>版本号由采集时的参数快照决定，参数快照的所有者始终是学习器，写入者唯一，无需协调。</p>
+
+    <p><strong>片段 2：原子检查点的提交协议</strong></p>
+    <pre class="code"><code>import hashlib
+import os
+import json
+
+def save_checkpoint(root, step, shards):
+    """原子检查点：先写临时目录与校验和，最后提交清单。
+    读者只见清单，清单不存在即视为无检查点，杜绝部分状态。"""
+    tmp_dir = os.path.join(root, f"tmp-{step}")
+    final_dir = os.path.join(root, f"ckpt-{step}")
+    os.makedirs(tmp_dir, exist_ok=True)
+    manifest = {"step": step, "shards": {}}
+    for name, write_fn in shards.items():
+        path = os.path.join(tmp_dir, name)
+        write_fn(path)                               # 分片内容由各所有者写入
+        with open(path, "rb") as fh:
+            digest = hashlib.sha256(fh.read()).hexdigest()
+        manifest["shards"][name] = {"sha256": digest}
+    # 清单最后写入：它的出现等价于"全部分片已就绪"
+    with open(os.path.join(tmp_dir, "manifest.json"), "w", encoding="utf-8") as fh:
+        json.dump(manifest, fh)
+    os.replace(tmp_dir, final_dir)                   # 同文件系统内改名是原子操作</code></pre>
+    <p>解读：提交协议的三步各有防守目标。<strong>（1）</strong>分片先进入临时目录，任何中途失败都不会污染已提交的检查点序列。<strong>（2）</strong>每个分片单独计算摘要并汇入清单，恢复时逐片校验，把"部分字节损坏"这种最隐蔽的故障也拦下来。<strong>（3）</strong><code>os.replace</code> 的原子性要求临时目录与最终目录位于同一文件系统，跨设备复制不满足该前提，这是部署检查点目录时的硬性约束。</p>
+
+    <p><strong>片段 3：反压队列与采样端降速</strong></p>
+    <pre class="code"><code>import queue
+
+class BoundedQueueWithBackpressure:
+    """有界队列：满时给采样端返回减速信号，把内存锁在常量上界。
+    负反馈环：学习器变慢 -> 队列积压 -> 采样端降速。"""
+    def __init__(self, maxsize):
+        self.q = queue.Queue(maxsize=maxsize)
+        self.drop_count = 0
+
+    def push(self, batch):
+        try:
+            # 非阻塞写入：队列满时立即返回信号，采样端据此降低采集频率
+            self.q.put_nowait(batch)
+            return "ok"
+        except queue.Full:
+            # 策略二选一：等待（保数据）或丢弃（保吞吐），此处示例按年龄丢弃
+            self.drop_count += 1
+            return "slow_down"
+
+    def pop(self):
+        # 学习器消费侧：空队列时返回 None，调用方决定空转或降级
+        try:
+            return self.q.get_nowait()
+        except queue.Empty:
+            return None</code></pre>
+    <p>解读：反压装置的价值在于把失配变成显式信号。<strong>（1）</strong><code>put_nowait</code> 的非阻塞语义让"满"作为返回值立即暴露，采样端可以立即调整节奏，不占用计算线程。<strong>（2）</strong>丢弃计数作为监控指标：丢弃率持续上升说明学习侧是瓶颈，与第 085 章的判定结论互相印证。<strong>（3）</strong>注释明确两种策略的取舍位置：选择由调用方按样本价值密度决定，装置本身只负责暴露状态。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>批内混用不同策略版本</strong>：同策略配置下静默混入旧版本样本，KL 与裁剪指标失真。修复：加入批组装断言，违约即失败并保留现场。</li>
+      <li><strong>把顺序假设留在下游</strong>：缓冲假定样本按时间序到达，上游却可能乱序或重发，导致采样分布偏移。修复：显式序号加重组窗口，或按有界乱序机构造缓冲。</li>
+      <li><strong>检查点逐分片直接写正式目录</strong>：写到一半进程退出，恢复时读到不完整状态。修复：临时目录加清单提交，恢复以清单为准。</li>
+      <li><strong>队列无界</strong>：学习器短暂变慢导致样本无限积压，内存线性增长直至故障。修复：所有队列设容量上限并接入反压信号。</li>
+      <li><strong>用墙钟时间做版本比较</strong>：节点时钟偏差使滞后计算出现负值或跳变。修复：使用学习器的单调计数器作为逻辑时钟。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>设计题：为"8 个采样单元、1 个学习器、单机多进程"的配置画出数据流图，标出每类对象的唯一写入者，并列出四条可断言的不变式。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>样本写入者为采集进程，参数快照写入者为学习器；不变式如批内版本唯一、序号连续、队列上界、清单先于恢复可见。</div></details>
+      </li>
+      <li>预测题：把有界队列容量减半，其余不变。预测丢弃率、样本年龄 95 分位与回报曲线的变化。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>丢弃率上升、年龄分布收窄、回报可能因数据更新鲜而略升，但吞吐受丢弃影响；观察丢弃是否集中在个别慢单元。</div></details>
+      </li>
+      <li>分析题：解释"单写者"原则如何消除锁开销，并举一个训练系统中故意保留多写者的反例（例如计数器），说明其安全条件。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>原子计数或单调自增在硬件保证下可由多进程安全写入；条件是操作本身为原子读改写且语义只要求单调性。</div></details>
+      </li>
+      <li>验证题：为检查点协议设计一组注入测试：在分片写入中途、清单写入后立即、恢复装载中途分别终止进程，说明每种情况下系统应表现的行为。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>中途终止应回退到上一检查点；清单后终止应完整恢复；装载中途应校验失败并回退；三种行为都要有日志证据。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>一致性从数据流图与唯一写入者原则出发，把隐含假设变成显式契约。</li>
+      <li>四层契约：参数版本一致性、样本新鲜度上界、写入原子性、检查点快照一致性，各有违约症状与验证断言。</li>
+      <li>不可变对象与逻辑时钟是分布式训练默认的一致性手段；乱序与重复由显式序号协议处理。</li>
+      <li>检查点用"临时写入加清单提交"实现原子性；恢复以清单为唯一权威。</li>
+      <li>下一章把一致性要求折算成资源与容量：大规模并行训练的资源规划方法。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch087.html">← 第 087 章：经验共享与数据复用</a>
+    <a class="next" href="ch089.html">第 089 章：大规模并行训练的资源规划 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

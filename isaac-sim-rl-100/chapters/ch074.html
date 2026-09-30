@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第074章 实现偏好学习 | 机器人仿真学习课程 · Isaac Sim 强化学习训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第三篇 · 高级强化学习专题</span>
+    <span class="sep">/</span>
+    <span>第 074 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第三篇 · 高级强化学习专题</div>
+    <p class="lead">不问"值多少分"，只问"这两个哪个好"：本章用 Bradley-Terry 模型从成对比较中训练奖励模型，再以 KL 锚定优化策略，偏好学习（RLHF）在机器人上的完整闭环。</p>
+    <ul class="meta">
+      <li>主题：人类反馈学习 / 奖励模型与策略优化</li>
+      <li>相关组件：Isaac Sim / Isaac Lab / PPO / PyTorch</li>
+      <li>预计学时：65 分钟</li>
+      <li>前置章节：第 073 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>说清偏好学习的三段式管线：采样对比数据 → 训练奖励模型 → 优化策略，以及与 IRL 的异同。</li>
+      <li>理解 Bradley-Terry 模型与"比较优于打分"的认知依据，掌握其成对交叉熵损失。</li>
+      <li>会在 Isaac Sim 中设计对比标注协议（片段长度、对比维度、主动查询）。</li>
+      <li>会训练带不确定性估计的奖励模型集成，并用留出对评估其泛化。</li>
+      <li>会实现 KL 锚定的策略优化，理解 KL 系数在"改进"与"跑偏"之间的调节作用。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 073 章从演示里学，但演示只告诉你"专家怎么做"，没说"哪些行为不好、为什么不好"。现实中人对质量的判断更擅长<strong>相对比较</strong>："这一下插得比那一下顺"，给出标签的成本几乎为零，而让他写一个从零到一的奖励函数则痛苦万分。偏好学习（preference-based learning / RLHF）就建立在这一点上：收集成对比较，拟合一个奖励模型，再用强化学习优化策略。</p>
+    <p>大语言模型的对齐（RLHF）让这套流程广为人知，其实它在机器人领域有更早的根：后空翻、行走姿态的风格化、装配的"轻柔度"这类无法写成公式的质量，都可以用比较来定义。本章把它落到 Isaac Sim：偏好标签既可以来自人类审看回放（离线），也可以来自一个<strong>脚本化"评审员"</strong>（用隐藏的评分规则生成标签，用于可复现的研究与算法验证），本章两者都会涉及。它的独特点在于：奖励模型是学出来的、且会随策略改进而过时，因此必须配合<strong>KL 锚定</strong>防止策略把"代理奖励"刷爆。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 为什么比较比打分可靠</h3>
+    <p>认知科学里有一个稳健现象：人对两个选项的相对判断，比给出绝对分数一致性更高，绝对打分随心情、疲劳、上下文漂移，而"A 比 B 好"在重复实验中稳定得多。对奖励建模的数学收益也很大：Bradley-Terry 模型只需要奖励的<strong>差值</strong>，从而天然绕开了奖励不可辨识问题里的"常值平移"（差值不变）。</p>
+
+    <h3>2. Bradley-Terry 模型与成对损失</h3>
+    <p>设奖励模型 r̂<sub>θ</sub>(s, a) 对轨迹 τ 打的分为 R(τ) = Σ<sub>(s,a)∈τ</sub> r̂<sub>θ</sub>(s, a)（或折扣和）。比较两条轨迹 (τ<sub>1</sub>, τ<sub>2</sub>)，模型预测"τ<sub>1</sub> 被偏好"的概率：</p>
+    <div class="formula">
+      P(τ<sub>1</sub> ≻ τ<sub>2</sub>) = σ( R(τ<sub>1</sub>) − R(τ<sub>2</sub>) ) = 1 / (1 + e<sup>−(R(τ<sub>1</sub>)−R(τ<sub>2</sub>))</sup>)
+      <span class="note">σ 为 sigmoid：分差越大，越确信；分差为 0 时概率 50%，这正是"平局"的自然表达</span>
+    </div>
+    <p>给定标注集合（每条比较含"更受偏好"的 τ<sub>w</sub> 与"较差的" τ<sub>l</sub>），训练目标是最大化偏好似然，等价于最小化成对交叉熵：</p>
+    <div class="formula">
+      L(θ) = − E<sub>(τ<sub>w</sub>, τ<sub>l</sub>)</sub> [ log σ( R<sub>θ</sub>(τ<sub>w</sub>) − R<sub>θ</sub>(τ<sub>l</sub>) ) ]
+      <span class="note">R 的绝对水平完全不被约束，只有分差参与损失，平移不改变损失</span>
+    </div>
+    <p>几个直接推论：<strong>其一</strong>，奖励模型的输出只能按"相对"使用，训练策略时要把它当优势/相对量处理，别指望它给出"毫牛米"级别的物理意义；<strong>其二</strong>，如果两条轨迹长度差异大且奖励逐项相加，长轨迹容易累积更高分，要么对 R 做长度归一化（除以步数），要么强制等长片段；<strong>其三</strong>，标签噪声（人点错、脚本评审不严谨）会让损失下界升高，需要用更多比较和鲁棒损失（如对分差做截断）来对抗。</p>
+
+    <h3>3. 奖励模型的结构与不确定性</h3>
+    <p>标准做法：共享躯干的 MLP，逐状态输出标量（每帧奖励），轨迹分取和。工程上加两个组件：<strong>集成（ensemble）</strong>，训练 3–5 个不同初始化的模型，预测分差的标准差作为不确定性；<strong>主动查询</strong>，优先挑选"预测分差接近零"（模型分不清）或"集成方差大"的轨迹对去标注，让每一次标注的信息量最大化。这是把标注预算用在刀刃上的关键：随机挑选时，大量"明显更好"的对不提供新信息。</p>
+
+    <h3>4. 策略优化：KL 锚定与迭代闭环</h3>
+    <p>有了奖励模型，直接最大化 R<sub>θ</sub> 会出两种事：奖励模型在训练分布外没有外推能力（策略找到其盲区即可刷分）；策略跑离参考分布太远，把"代理奖励"当成了目标。标准解法是加 KL 惩罚：</p>
+    <div class="formula">
+      max<sub>π</sub>　E<sub>π</sub>[ R<sub>θ</sub>(τ) ] − β · KL( π(·|s) ‖ π<sub>ref</sub>(·|s) )
+      <span class="note">π<sub>ref</sub> 是参考策略（如上一轮或预训练策略）；β 越大越"忠诚"，越小越"敢改"</span>
+    </div>
+    <p>RLHF 的完整闭环是迭代的：<strong>策略采样新轨迹 → 人工/评审比较（聚焦新旧策略的差异）→ 奖励模型更新 → 策略再优化</strong>。每轮都要重估奖励模型的有效性（留出的比较准确率不能掉），且 KL 系数可以逐轮微调。它和 IRL 的关系：GAIL 让判别器在线充当奖励，偏好学习让"奖励模型 + 离线比较"充当奖励；两者都是在不可写奖励时引入的<strong>学习信号中介</strong>，区别在信号形态（分类概率 vs 成对偏好）与稳定性（在线 vs 迭代离线）。</p>
+
+    <h3>5. 评估：奖励模型与策略要分开验收</h3>
+    <p>奖励模型的验收：留出比较集上的<strong>准确率</strong>（模型偏好与标签一致的比例，60–75% 是可用的合理区间，太低说明标注噪声大或容量不足）。策略的验收依旧独立：任务成功率、隐藏质量指标（如力峰值、动作平滑度，注意这些不能等于奖励模型的输入，否则是循环论证）。再加两个诊断：<strong>KL 曲线</strong>（策略飘离参考多远）与<strong>代理奖励-真实质量散点</strong>（代理涨了真实质量是否同步涨；背离即过优化）。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>以"插销插入的柔顺度"为质量维度（隐藏真值：力峰值越低、时间越短越好），在 Isaac Sim 里搭完整闭环：</p>
+    <ol>
+      <li><strong>数据采集</strong>：先用第 073 章的 GAIL 或手工塑形训一个"能完成任务但风格粗糙"的基础策略；用它生成 400 条片段（每条 1.5 s、90 步），两两配对（每次从不同回合随机抽两条）。</li>
+      <li><strong>标注</strong>：脚本评审员按隐藏规则打分：偏好 = 0.7·(−力峰值) + 0.3·(−用时)（数值归一化后比较），分差小于阈值的标记为"平局"并丢弃，研究阶段脚本评审保证可复现；部署阶段换成人类审看回放。</li>
+      <li><strong>奖励模型</strong>：5 个成员的集成，每个是 2×256 MLP 逐帧打分；用 80% 比较训练、20% 留出评估；数据增强：把每对 (w, l) 交换顺序生成镜像样本，消除位置偏置。</li>
+      <li><strong>主动查询</strong>：第二轮起，按集成预测分差的标准差从大到小排序，取前 30% 去标注；每轮新增 150 条比较。</li>
+      <li><strong>策略优化</strong>：PPO + 奖励 = 集成均值分差（逐帧化）+ 可选任务锚点；KL 锚定到上一轮策略，β 从 0.05 起（KL 采用逐 batch 估计，单位 nats）。每轮输出"代理奖励 vs 真实力峰值"散点，若背离则增大 β 或停止该轮。</li>
+    </ol>
+    <div class="box key">
+      <span class="box-title">设计思维：为什么不直接让"脚本评审员"当奖励函数？</span>
+      <p>如果可以写脚本规则（力峰值 + 用时），当然可以直接塑形，但脚本评审员的规则就是隐藏真值，研究里它只是"站在人类位置上的替身"。偏好学习管线的价值有两点：一是<strong>规则写不出来时</strong>（"插得好看"这种整体质感），只有比较可给；二是它训练出的奖励模型可以作为<strong>可迁移的质量评估器</strong>，用于筛选新数据、奖励其他任务策略。把脚本评审当奖励直接训练只是跳过管线的捷径，却验证不了管线本身，研究阶段两条路线都跑，才能对比出偏好学习真正的增益。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：偏好数据集与 Bradley-Terry 损失</strong></p>
+    <pre class="code"><code>import torch
+import torch.nn as nn
+
+class PreferenceDataset:
+    """成对比较数据集：存两条片段的观测序列与'谁更受偏好'的标签。"""
+    def __init__(self, capacity=1000, clip_len=90, obs_dim=48):
+        self.win = torch.zeros(capacity, clip_len, obs_dim)   # τ_w：更受偏好
+        self.lose = torch.zeros(capacity, clip_len, obs_dim)  # τ_l：较差
+        self.count = 0
+
+    def add(self, obs_w, obs_l):
+        self.win[self.count] = obs_w
+        self.lose[self.count] = obs_l
+        self.count += 1
+
+    def add_swapped(self, obs_w, obs_l):
+        self.add(obs_w, obs_l)          # 镜像样本：交换位置再存一遍（见片段 2 的用法）
+        self.win[self.count], self.lose[self.count] = obs_l, obs_w
+        self.count += 1
+
+
+def bradley_terry_loss(reward_model, obs_w, obs_l):
+    """成对交叉熵：只训练'分差'，奖励的绝对水平与长度归一化在这里处理。"""
+    r_w = reward_model.score(obs_w)     # 每条片段的回报 = Σ 逐帧奖励（可加长度归一化）
+    r_l = reward_model.score(obs_l)
+    diff = r_w - r_l
+    # 用 logsigmoid 代替 log(sigmoid())：数值稳定，极大分差下也不会下溢成 -inf
+    return -torch.nn.functional.logsigmoid(diff).mean()</code></pre>
+    <p>解读：<code>score</code> 约定为"片段内逐帧奖励之和"，因此对长片段有天然偏置（第 2 节的推论二），这也是为什么在 Isaac Sim 里采集时要固定片段长度 90 步（1.5 s）。<code>logsigmoid</code> 是对数域安全版本：分差到 −40 时 sigmoid 直接下溢到 0、log 变 −inf，训练 NaN；logsigmoid 全程平滑且数值稳定。<code>add_swapped</code> 是对抗"位置偏置"的标准操作：如果标注流程（人或脚本）对"第一条"有系统性偏好，训练数据里交换配对能把这种偏差平均掉，脚本评审员规则对称时它是无害的保险，人类标注时它是必需品。数据集容量按"每轮 150 条 × 若干轮 + 镜像"取 1000–2000；裁剪到固定长度让张量形状规整，是仿真里训练奖励模型比语言模型省心的地方。</p>
+
+    <p><strong>片段 2：奖励模型集成与主动查询</strong></p>
+    <pre class="code"><code>import torch
+import torch.nn as nn
+
+class RewardEnsemble(nn.Module):
+    """3–5 个逐帧奖励网络：均值给训练、标准差给不确定性（主动查询和保守化）。"""
+    def __init__(self, obs_dim=48, hidden=256, members=5):
+        super().__init__()
+        self.members = nn.ModuleList([
+            nn.Sequential(nn.Linear(obs_dim, hidden), nn.Tanh(),
+                          nn.Linear(hidden, hidden), nn.Tanh(),
+                          nn.Linear(hidden, 1)) for _ in range(members)])
+
+    def frame_reward(self, obs):            # obs: [B, T, obs_dim] → [M, B, T]
+        return torch.stack([m(obs).squeeze(-1) for m in self.members], dim=0)
+
+    def score(self, obs):                   # [B, T] → [B]，成员均值
+        return self.frame_reward(obs).mean(dim=0).mean(dim=-1)
+
+    def disagreement(self, obs_w, obs_l):
+        """集成对同一对片段的预测分差标准差：越大越该拿去问标签。"""
+        diffs = []
+        for m in self.members:
+            r_w = m(obs_w).squeeze(-1).sum(-1)
+            r_l = m(obs_l).squeeze(-1).sum(-1)
+            diffs.append(r_w - r_l)
+        return torch.stack(diffs, dim=0).std(dim=0)   # [B]
+</code></pre>
+    <p>解读：逐帧打分 + 求和的结构是刻意的：机器人轨迹的"好坏"常常发生在局部时刻（插入瞬间的力峰），逐帧打分让奖励模型能定位到具体时刻，也为后续"时序信用分配"留了钩子。<code>disagreement</code> 是主动学习的选择器：集成成员独立训练，遇到彼此没学透的区域会"吵架"，分歧越大说明该区域的奖励越不可靠，把这些对拿到标注台前，单位标注的收益最高。经验上主动查询能让达到同等奖励模型准确率所需标注量减少 30–50%。逐帧奖励用于策略训练时不建议直接用"求和"：训练强烈建议把分差平摊到帧（或除以长度）再用 PPO，PPO 本身按步折扣，两种口径不要混。集成规模 5 是精度与显存的平衡点，3 个也可以，1 个（无不确定性）则主动查询与保守化都做不了。</p>
+
+    <p><strong>片段 3：KL 锚定的策略优化与过优化监控</strong></p>
+    <pre class="code"><code>import torch
+
+class RewardSurrogate:
+    """训练用代理奖励：奖励模型逐帧分（平摊后）+ KL 锚定项。"""
+    def __init__(self, ensemble, ref_policy, beta=0.05, clip_k=10.0):
+        self.ensemble, self.ref, self.beta = ensemble, ref_policy, beta
+        self.clip_k = clip_k                  # 单项 KL 上限：防个别状态把整批损失放大
+
+    @torch.no_grad()
+    def __call__(self, obs, act, logp, length):
+        # 代理奖励：集成均值分差，除以长度 → 与 PPO 的逐步折扣同量级
+        r_model = self.ensemble.frame_reward(obs[None]).mean(0).squeeze(0) / length
+        kl = logp - self.ref.logprob(obs, act)          # 当前策略相对参考的 KL 增量
+        r_kl = -self.beta * torch.clamp(kl, max=self.clip_k)  # 只用正向 KL 惩罚
+        return r_model + r_kl
+
+def overopt_monitor(proxy_reward_history, true_quality_history, window=20):
+    """过优化检测：代理奖励上涨而真实质量不再涨甚至下降即报警。"""
+    import numpy as np
+    p = np.convolve(proxy_reward_history, np.ones(window) / window, "valid")
+    q = np.convolve(true_quality_history, np.ones(window) / window, "valid")
+    if len(p) &lt; 2:
+        return {"alarm": False}
+    dp, dq = p[-1] - p[0], q[-1] - q[0]     # 滑动窗首尾差：趋势的粗糙代理
+    return {"alarm": bool(dp &gt; 0 and dq &lt;= 0), "d_proxy": float(dp), "d_true": float(dq)}</code></pre>
+    <p>解读：KL 计算用"当前 logp − 参考 logp"的样本估计（这是单样本 KL 的无偏估计型，工程上足够），并对单项截断，<strong>个别极端状态上的 KL 可能极大</strong>（新策略在那里几乎肯定不做参考动作），不截断会被它主导整批梯度，截断后保留主趋势。β=0.05 的起点依据是 RLHF 文献的常用区间（0.01–0.1）；太小则策略几天内就漂到奖励模型盲区，太大则第二轮几乎学不动，观察指标是每轮优化后的平均 KL，落在 5–20 nats 量级通常是健康区间。真正重要的其实是 <code>overopt_monitor</code>：<strong>代理奖励总是会涨（策略在它自己的“考卷”上刷分），真实质量涨不涨才是验收</strong>。报警后按顺序处理：增大 β → 重训奖励模型（用新策略数据补标注）→ 换更保守的查询策略。注意监控里的"真实质量"必须独立于奖励模型输入，否则是自证。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>比较不同长度片段</strong>：分差随长度线性增长，短片段永远"吃亏"，奖励模型学到"长=坏"。症状是策略学会尽快结束回合。修复：固定片段长度；或先按步数归一化分数。</li>
+      <li><strong>奖励模型过拟合</strong>：比较数据不足或模型太大，留出准确率虚高（数据泄漏）或训练损失趋零而验证暴涨。症状是策略学到诡异的"对抗样本行为"。修复：80/20 划分严格隔离、早停、dropout/权重衰减、集成；每轮新增数据后再评估一次。</li>
+      <li><strong>标签噪声不设防</strong>：10% 的错标在交叉熵里会把奖励模型拉向"困惑"，表现为分差分布被压得极窄、策略学不动。修复：丢弃低置信标注、对分差损失做截断（如 diff 的软裁剪）、多用镜像样本。</li>
+      <li><strong>忘记 KL 锚定</strong>：政策很快跑进奖励模型的分布外区域，代理奖励暴涨、真实质量跳水。症状是训练曲线"好得反常"，上手一测全崩。修复：加 KL 惩罚并监控平均 KL 与过优化报警。</li>
+      <li><strong>把奖励模型输出当绝对奖励用</strong>：训练里的折扣、归一化和多目标权重都以它为基准，尺度漂移后历史经验失效。修复：奖励模型输出只做相对量（逐轮重归一化到零均值单位方差），并把"绝对物理质量"留给独立监控指标。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把标注预算从 200 对增加到 400 对，比较奖励模型的留出准确率与策略最终的真实力峰值，画出"预算-收益"曲线说明边际递减。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>前 200 对提升快，之后趋平；主动查询的曲线应比随机查询更陡。</div></details>
+      </li>
+      <li>人为把 15% 的标签翻转，观察奖励模型准确率与策略行为的变化，验证镜像与截断损失能缓解多少。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>准确率上界约为 1−噪声率；镜像样本对"位置偏置型"噪声有效，对随机翻转则收益有限。</div></details>
+      </li>
+      <li>对比 KL 系数 β∈{0.005, 0.05, 0.5} 三组训练：画出代理奖励、真实力峰值、平均 KL 三条曲线，找出你任务上的合理区间。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>β 过小：代理涨、KL 剧增、真实质量掉；β 过大：KL 稳、代理不动、质量不涨。找"质量仍在涨"的最大 KL 点。</div></details>
+      </li>
+      <li>实现主动查询的对照实验：随机挑选 vs 集成分歧最大挑选，各带 300 条标注预算，比较留出准确率与真实质量。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>分歧选择器离线即可实现：用当前集成对候选对算 std，排序取前 N 去标注；记录每次新数据的"信息增益"。</div></details>
+      </li>
+      <li>设计一个"迭代 RLHF"的回归测试：每轮策略更新后自动跑 20 次真实质量评估，把不达标轮次回滚，写出回滚判定规则。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>用过优化报警 + 成功率双条件；回滚时保留奖励模型与数据，只回滚策略权重与 β。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>偏好学习的输入是成对比较：比较更稳定、成本更低，且天然绕开奖励的常值平移歧义。</li>
+      <li>Bradley-Terry：P(τ₁≻τ₂)=σ(R(τ₁)−R(τ₂))，训练用 logsigmoid 成对交叉熵；固定片段长度、镜像样本、分差截断是三大数据纪律。</li>
+      <li>奖励模型用集成给不确定性；主动查询（分歧最大的对）是标注预算的高杠杆用法。</li>
+      <li>策略优化必须 KL 锚定：max E[R] − β·KL(π‖π<sub>ref</sub>)，β 调"改进 vs 跑偏"，并监控平均 KL。</li>
+      <li>代理奖励总会涨，验收看独立的真实质量指标；过优化报警（代理涨、质量不涨）触发时加大 β 或补数据。</li>
+      <li>下一章把演示与偏好落成同一条实用路线：演示引导的强化学习，先用演示把策略"扶上马"，再让 RL 接管"送一程"。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch073.html">← 第 073 章：实现逆强化学习</a>
+    <a class="next" href="ch075.html">第 075 章：实现演示引导的强化学习 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第008章 设置相机并捕获图像 | 机器人仿真学习课程 · Isaac Sim 强化学习训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · 仿真环境与训练框架</span>
+    <span class="sep">/</span>
+    <span>第 008 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · 仿真环境与训练框架</div>
+    <h1>第 008 章：设置相机并捕获图像</h1>
+    <p class="lead">给机器装上第一只"眼睛"：从针孔模型理解内参如何决定像素与物理的对应，配置视角、分辨率与剔除范围，并把 RGB 数据整理成策略可用的张量。</p>
+    <ul class="meta">
+      <li>主题：观测设计 / RGB 相机与图像读取</li>
+      <li>相关组件：Isaac Sim（Camera 传感器、RTX 渲染管线）</li>
+      <li>预计学时：50 分钟</li>
+      <li>前置章节：第 007 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解针孔成像模型：内参（焦距、光心）如何把三维点投影到像素平面，焦距与视场角（FOV）的换算。</li>
+      <li>会创建并挂载 RGB 相机：设置分辨率、视场角、剔除范围（clipping range）与采样频率。</li>
+      <li>会读取相机数据并把 RGBA 图像整理成训练张量：去 alpha、缩放、归一化、帧堆叠。</li>
+      <li>能估算一个物体在图像中的像素尺寸，据此选择分辨率与相机距离。</li>
+      <li>理解渲染成本与分辨率的平方关系，会为训练吞吐选择合理的相机规格。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>关节状态能告诉策略"自己在哪里"，但没告诉它"世界长什么样"。要做视觉抓取、避障、装配，就必须给机器人装上相机。相机数据也是所有观测里最"贵"的：一张 640×480 的 RGB 图有 92 万个数，是 27 维关节观测的三万倍，喂给策略前必须经过明确的几何理解（知道每个像素对应世界的什么）和工程处理（缩放、归一化、可能的降采样）。</p>
+    <p>本章只做 RGB 彩色图像；深度图（009）与点云（010）会复用本章的全部概念，同一套针孔模型，换一种数据通道而已。相机数据的读取方式（annotator、渲染更新时机）也是后面 OmniGraph 事件驱动（013）的动机来源。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 针孔模型：像素是三维世界的投影</h3>
+    <p>相机工作的几何模型是"小孔成像"：三维点 P = (X, Y, Z)（相机坐标系，Z 是沿光轴的距离）投影到像素 (u, v)：</p>
+    <div class="formula">
+      u = f<sub>x</sub>·X/Z + c<sub>x</sub>，v = f<sub>y</sub>·Y/Z + c<sub>y</sub>
+      <span class="note">f_x、f_y 是焦距（单位：像素），(c_x, c_y) 是光心，通常取图像中心</span>
+    </div>
+    <p>展开这个公式就能看懂相机的两个性质。第一，<strong>X/Z 里除以 Z 是透视效应</strong>：物体越远，成像越小，像素尺寸与距离成反比。第二，<strong>焦距与视场角一一对应</strong>：图像半宽 W/2 处对应的光线角度是 FOV<sub>h</sub>/2，所以</p>
+    <div class="formula">
+      f<sub>x</sub> = (W/2) / tan(FOV<sub>h</sub>/2)
+      <span class="note">640 宽 + 水平 FOV 60° 时 f_x = 320 / tan30° ≈ 554 像素</span>
+    </div>
+    <p>估算数量级（做任务设计时非常实用）：0.5 m 外一个 2 cm 的方块，在图像中约占 f<sub>x</sub>·0.02/0.5 ≈ 22 像素宽。如果目标检测网络需要物体至少 32 像素，你就知道要么拉近相机、要么提高分辨率、要么缩小 FOV（变焦）。这比反复试错高效得多。</p>
+
+    <h3>2. 外参：相机挂在哪儿，决定看到什么</h3>
+    <p>相机的世界位姿由挂载点决定：挂在腕部是"随动视角"（任务相关区域始终在画面里，但抖动大、需要策略理解自运动）；固定第三人称是"上帝视角"（画面稳定，但手臂可能遮挡目标）。挂载时两个注意点：<strong>局部偏移要把相机挪出机械臂网格</strong>（否则贴脸遮挡），<strong>光轴朝向的坐标约定要在实践中确认</strong>，USD 相机与机器人常用光学坐标系（ROS optical frame）的轴向定义不同，不同版本传感器的默认朝向也有差异，最稳妥的做法是挂载后渲染一帧看画面，凭记忆写旋转容易出错。</p>
+
+    <h3>3. 图像数据的格式与整理</h3>
+    <p>渲染管线吐出的 RGB 图是 <strong>(高度, 宽度, 4)</strong> 的 uint8 数组：三个颜色通道加一个 alpha（不透明通道）。整理成策略输入的标准流水线是：</p>
+    <ul>
+      <li><strong>去 alpha</strong>：取 <code>[:, :, :3]</code>，否则训练代码会把 alpha 当第四通道，颜色统计全错。</li>
+      <li><strong>缩放</strong>：典型做法是双线性缩放（或按整数 stride 间隔采样）到 224×224 甚至 84×84；分辨率减半，计算量约降 4 倍。</li>
+      <li><strong>归一化</strong>：除以 255 映射到 [0,1]，或者按均值方差标准化。注意保持训练/推理一致。</li>
+      <li><strong>通道顺序与帧堆叠</strong>：CNN 输入需要 (C, H, W) 通道优先；单帧图像无法表达运动，堆叠最近 2–4 帧（或直接配关节速度观测）才能让策略"看见"速度。</li>
+    </ul>
+    <p>数值感受一下成本：一张 640×480×3 的图约 92 万个数；缩到 84×84 只剩 2.1 万，是原来的 1/43。视觉策略"慢"，根源往往在于输入规模失控。</p>
+
+    <h3>4. 渲染成本模型：分辨率、帧率与相机数的乘积</h3>
+    <p>把渲染成本近似看作与像素产出总量成正比，训练循环每秒需要的像素数与原始带宽为：</p>
+    <div class="formula">
+      P<sub>rate</sub> = N<sub>cam</sub> · W · H · f<sub>fps</sub>，&nbsp;B<sub>raw</sub> = N<sub>cam</sub> · W · H · 3 · f<sub>fps</sub>
+      <span class="note">只统计 RGB 通路；深度图、语义分割等 annotator 各自计账，用同样方式相加</span>
+    </div>
+    <p>数值对比：一台 640×480@60 Hz 相机每秒产出约 1.8 × 10⁷ 像素；换成 224×224@30 Hz 后降到约 1.5 × 10⁶，相差约 12 倍。按原始字节算，前者每秒搬运约 55 MB，后者约 4.5 MB。为训练吞吐做决策时，先问"任务需要多少像素密度、多少帧率"，再把两者乘起来核对预算。</p>
+
+    <h3>5. 像素密度与观测距离：从任务反推分辨率</h3>
+    <p>距离 Z 处的空间分辨率（每个像素覆盖的物理尺寸）为：</p>
+    <div class="formula">
+      Δx<sub>px</sub> = Z / f<sub>x</sub>（米/像素）
+      <span class="note">f_x = 554 像素、Z = 0.5 m 时约 0.9 mm/像素；距离翻倍，分辨率减半</span>
+    </div>
+    <p>反推算例：识别一个 2 cm 的方块需要至少 32 像素宽，在 Z = 0.5 m 处要求 f<sub>x</sub> ≥ 32 × 0.5 / 0.02 = 800 像素；水平 FOV 保持 60° 时对应水平分辨率 W = 2 × 800 × tan30° ≈ 924 像素。三条可选路径：把相机拉近到 0.32 m、收窄 FOV 以提高 f<sub>x</sub>、或直接采用 800–900 像素量级的分辨率。选择时核对每条路径的代价：拉近会缩小可见范围，收窄 FOV 会丢掉周边物体，提高分辨率增加渲染与网络成本。</p>
+
+    <h3>6. 三类相机的配置对照</h3>
+    <table>
+      <tr><th>用途</th><th>分辨率</th><th>帧率</th><th>说明</th></tr>
+      <tr><td>策略输入</td><td>84×84 – 224×224</td><td>10–30 Hz</td><td>与决策频率对齐；像素密度按上一节反推</td></tr>
+      <tr><td>可视化与调试</td><td>640×480 – 1280×720</td><td>30–60 Hz</td><td>单独相机、需要时开启，训练默认关闭</td></tr>
+      <tr><td>数据采集</td><td>按标注需求确定</td><td>按场景变化率</td><td>离线数据集常用高分辨率加低帧率；带宽先算后采</td></tr>
+    </table>
+    <p>还要计算一类容易漏掉的成本：图像从渲染结果到策略张量的转换（去 alpha、缩放、转置、堆叠）。这些操作按像素逐个处理，若每步都对 640×480 做浮点转换，开销可与物理步相当。对策是让相机直接渲染目标尺寸（如 224×224），转换只做必要的几步。</p>
+
+    <h3>7. 视觉观测的时间对齐</h3>
+    <p>相机频率低于物理频率时，策略拿到的图像总是"旧"的，最大滞后等于采样周期：30 Hz 相机配 60 Hz 物理步，图像最多滞后 33 ms。数值换算：末端以 0.5 m/s 运动时，33 ms 对应约 1.7 cm 的位置偏差；精细抓取的容差常在 1 cm 量级，这个偏差已经不可忽略。</p>
+    <p>三种对策按实现成本排序：<strong>对齐频率</strong>（把相机频率设为决策频率的整数倍，例如 15 Hz 相机配 15 Hz 决策，滞后固定为固定拍数）；<strong>附时间戳</strong>（观测里带上距上次决策的时间，让策略显式感知数据新鲜度）；<strong>观测外推</strong>（用当前关节速度把图像特征推算到当前时刻，实现复杂，只在高速任务中值得）。多数任务用前两种即可把视觉滞后控制在可接受范围。</p>
+    <p>做训练预算时把这条滞后算进"任务难度"：同样的任务，把相机从 30 Hz 提到 60 Hz 可让滞后减半，但渲染成本翻倍。先量化任务容差（物体速度 × 滞后时间），再决定用哪种频率档位。</p>
+    <p>验收时用一个约 0.2 m/s 匀速移动的目标实测：若观测位置与真值的偏差明显超过 v × (1/f<sub>cam</sub>)，说明还有其它延迟叠加（渲染排队、数据拷贝、预处理耗时），逐个环节计时就能定位。实操上把相机频率设为决策频率的一半与整数倍各跑一次，对比成功率是否出现可辨差异；没有差异就不必为更高帧率付费。</p>
+
+    <h3>8. 分辨率、视场角与像素密度的联合选型</h3>
+    <p>把针孔模型做成一张查阅表，选型时直接对照。取"0.5 m 外一个 2 cm 方块"作为统一目标，逐组合计算 f<sub>x</sub> = (W / 2) / tan(FOV / 2) 与目标像素宽度 f<sub>x</sub> × 0.02 / 0.5：</p>
+    <table>
+      <tr><th>分辨率与视场角</th><th>f<sub>x</sub>（像素）</th><th>2 cm 目标在 0.5 m 处的像素宽</th><th>适用判断</th></tr>
+      <tr><td>640×480，60°</td><td>约 554</td><td>约 22.2 px</td><td>检测与精细对准的舒适区</td></tr>
+      <tr><td>224×224，45°</td><td>约 270</td><td>约 10.8 px</td><td>收窄视场后的可用折中</td></tr>
+      <tr><td>224×224，60°</td><td>约 194</td><td>约 7.8 px</td><td>粗定位可行，精细对准吃力</td></tr>
+      <tr><td>224×224，90°</td><td>112</td><td>约 4.5 px</td><td>覆盖广，目标偏小</td></tr>
+      <tr><td>84×84，60°</td><td>约 73</td><td>约 2.9 px</td><td>只能承载"目标在画面里"级别的信息</td></tr>
+    </table>
+    <p>三行结论从这个表里读出来。第一，<strong>像素密度由分辨率与视场角共同决定</strong>：从 640×480 缩到 224×224、视场角保持 60° 时，像素密度降到约 35%（7.8 / 22.2）；而把视场角从 60° 收到 45° 能挽回约 40%（194 → 270），收窄视场与提高分辨率的作用方向一致，代价是可见范围变小。第二，<strong>先写指标再选相机</strong>：目标检测通常需要 10 px 上下，精细对准需要 20 px 上下，拿着这两个数回表查组合，比反复试错快得多。第三，84×84 的输入在 0.5 m 尺度上只剩不到 3 像素的目标，任何"看清细节"的期待都不现实，它适合的是"目标大致在哪"这一档信息的任务。</p>
+    <p>把延迟一并入账（第 7 节的换算）：目标任务以 0.2 m/s 移动时，60 Hz 采样的滞后位移约 3.3 mm，30 Hz 约 6.7 mm，15 Hz 约 13.3 mm。容差 1 cm 的精对准任务里，15 Hz 相机已经吃掉全部预算，30 Hz 占去约三分之二；这是"相机频率不低于决策频率"这条经验规则的量化来源，也说明低帧率方案只适合慢速任务。</p>
+
+    <h3>9. 预处理流水线的成本账</h3>
+    <p>图像进入网络之前要过几道工序，每道工序都在搬运内存。以 224×224 的三通道图为例：一帧含 224 × 224 × 3 ≈ 15 万个数值，按 float32 存放约 0.6 MB。去 alpha、类型转换、通道转置加归一化大致是 3 到 4 遍全量读写，单帧的搬运量约 1.8–2.4 MB；30 Hz 下单环境每秒约 54–72 MB，64 个并行环境合计超过 3 GB/s。这笔开销发生在 CPU 侧时，会与物理步和策略推理抢同一份带宽。</p>
+    <p>降本的三条路径各有量化依据。<strong>相机直接渲染目标尺寸</strong>：省掉从 640×480 到 224×224 的一次双线性重采样，逐像素约 4–8 次乘加，五万个像素合计几十万次运算，真正省下的是那一次全图读写。<strong>把归一化推迟到网络入口或 GPU 上做</strong>：中间流程用 uint8 存放，数据量只有 float32 的四分之一。<strong>帧堆叠用环形缓冲</strong>：避免每步整块复制三帧，只更新一个槽位。三条都落实后，单帧搬运量可以压到 0.6 MB 量级，64 环境的合计吞吐回到 1 GB/s 以内。核对规则一句话：<strong>处理成本与像素数乘以处理遍数成正比，先把遍数从 3 降到 1，再谈其它优化</strong>。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>配置一台任务相机的步骤：</p>
+    <ol>
+      <li><strong>选视角</strong>（随动腕部 vs 固定第三人称；先用手动拖拽一个视角，确认任务关键物在画面里）。</li>
+      <li><strong>定分辨率</strong>（训练吞吐优先取 224×224 或更小；评估可视化可单独用高分辨率相机）。</li>
+      <li><strong>定 FOV</strong>（看得全 vs 看得清：宽 FOV 覆盖大工作区，但每个物体像素变少）。</li>
+      <li><strong>定剔除范围</strong>（近平面 0.05 m 防止贴脸网格，远平面 5–10 m 够用即可；深度精度与它有关，009 章展开）。</li>
+      <li><strong>挂载与冷却</strong>（相对挂点 + 局部偏移；创建后至少渲染一帧再读数据）。</li>
+      <li><strong>预处理流水线</strong>（去 alpha、缩放、归一化、帧堆叠，固定成函数，训练与部署共用）。</li>
+    </ol>
+    <table>
+      <tr><th>参数</th><th>典型值</th><th>理由</th></tr>
+      <tr><td>分辨率</td><td>224 × 224（策略）；640 × 480（可视化）</td><td>像素数与渲染/网络成本成正比；策略用小图 + 数据增强已足够</td></tr>
+      <tr><td>水平 FOV</td><td>60°–90°</td><td>60° 畸变小、物体像素多；90° 覆盖广、适合导航</td></tr>
+      <tr><td>剔除范围</td><td>0.05 – 10 m</td><td>近端避开机械臂自身网格，远端按工作区大小</td></tr>
+      <tr><td>采样频率</td><td>15–30 Hz</td><td>策略不需要 60 Hz 图像；降频直接省渲染时间</td></tr>
+    </table>
+    <p>采样频率一行的数值依据：15 Hz 相机配 15 Hz 决策时滞后固定为一拍（66.7 ms）；30 Hz 相机配 60 Hz 决策时平均滞后约半拍（16.7 ms），都在可接受范围。先按决策频率确定"整数倍"关系，再在渲染预算里调整。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：创建并挂载 RGB 相机</strong>（类名与参数随版本有差异，以官方文档为准）</p>
+    <pre class="code"><code>import numpy as np
+from isaacsim.core.api.sensors import Camera  # 相机类路径随版本有差异
+
+camera = world.scene.add(Camera(
+    prim_path="/World/Robots/Franka/panda_hand/WristCamera",  # 挂在手掌下：随动视角
+    name="wrist_cam",
+    resolution=(224, 224),        # (宽, 高)：策略输入尺寸，直接决定渲染成本
+    frequency=30,                  # 30 Hz 采样：图像比控制慢一点没关系，省一半渲染时间
+    translation=np.array([0.0, 0.0, 0.1]),  # 从掌心沿局部轴外移 10 cm，避开手指网格
+    orientation=np.array([0.7071, 0.0, 0.7071, 0.0]),  # 90 度旋转示例：朝向前方
+))
+# 光轴的具体轴向约定随传感器实现变化：挂载后先渲染一帧确认画面朝向
+world.reset()                     # 相机在 reset 时完成初始化
+world.step(render=True)           # 至少渲染一帧：首帧图像要等渲染管线产出</code></pre>
+    <p>解读：每个参数都对应 2、3 节的原理。<code>resolution=(224, 224)</code> 直接写策略输入尺寸，训练管线里就省掉一次缩放开销，相机自己渲染更小的图，比渲染大图再缩放便宜得多。<code>frequency=30</code> 是一个容易被忽视的省时技巧：策略的决策频率是 60 Hz 时，图像每两拍更新一次通常完全够用，而渲染成本直接减半。<code>translation</code> 的 10 cm 偏移不是随便写的：相机要装在机械臂网格之外，否则近平面 0.05 m 内全是自己的手指，画面被遮挡。<code>orientation</code> 的四元数演示了"把相机朝向前方"的一种旋转，但<strong>不同传感器实现的默认光轴不同</strong>，这就是注释里强调"先渲染一帧确认"的原因，几何直觉比记忆坐标系可靠。</p>
+
+    <p><strong>片段 2：读取图像并整理成训练张量</strong></p>
+    <pre class="code"><code>import numpy as np
+
+def capture_image(camera):
+    """读取一帧 RGB 并整理成 (3, H, W) 的 float32 张量（通道优先）。"""
+    rgb = camera.get_rgb()                 # 返回 numpy 数组，形状 (H, W, 4)，uint8
+    img = rgb[:, :, :3]                    # 去掉 alpha 通道：不然颜色统计会带一个常数维
+    img = img.astype(np.float32) / 255.0   # 归一化到 [0,1]：让像素量级与关节观测可比
+    img = np.transpose(img, (2, 0, 1))     # (H,W,C) 转 (C,H,W)：CNN 卷积层的标准输入
+    return img
+
+# 帧堆叠：单帧没有运动信息；堆 3 帧让策略从画面变化里读出"物体在往哪动"
+frame_stack = np.zeros((3, 3, 224, 224), dtype=np.float32)
+def stacked_observation(camera):
+    frame = capture_image(camera)
+    frame_stack[:-1] = frame_stack[1:]     # 整体前移一格
+    frame_stack[-1] = frame              # 最新帧放到队尾
+    return frame_stack.copy()              # copy 防止调用方持有的视图被后续改写</code></pre>
+    <p>解读：这四步转换是视觉 RL 的"教科书流水线"，每一步都有明确原因。<strong>去 alpha</strong> 不做的典型症状是明明预处理了却训练不收敛，预训练权重期望 3 通道输入，你给 4 通道静默改变了每一层的统计。<strong>除以 255</strong> 让像素与关节观测处在相近量级；有些管线改用 ImageNet 均值方差标准化，效果差异不大，但训练与部署必须用同一套。<strong>转置到 (C, H, W)</strong> 是 PyTorch 卷积的约定；若用 TensorFlow 风格则保持 (H, W, C)。<strong>帧堆叠</strong>解决的是单帧图像的不可观测性问题：静止画面无法告诉策略"球正朝哪飞"，三帧一起看就有了差分信息。注意 <code>frame_stack.copy()</code>：不拷贝的话，下一次调用会原地改写调用方已持有的数组，训练数据会被悄悄污染，与 007 章 EMA 的坑同源。</p>
+
+    <p><strong>片段 3：图像健康检查与渲染成本测量</strong></p>
+    <pre class="code"><code>import time
+import numpy as np
+
+def image_health_check(camera):
+    """四项检查：黑屏、过曝、尺寸、数据范围。"""
+    rgb = camera.get_rgb()
+    mean_val = rgb[:, :, :3].mean()        # 全黑应接近 0，过曝接近 255
+    std_val = rgb[:, :, :3].std()          # 纹理丰富度：全同色画面 std 接近 0
+    print(f"尺寸 {rgb.shape}  均值 {mean_val:.1f}  标准差 {std_val:.1f}")
+    assert rgb.shape[0] == 224 and rgb.shape[1] == 224, "分辨率与配置不符"
+    if mean_val &lt; 5.0:
+        print("警告：画面接近全黑：检查灯光、朝向与剔除范围")
+
+# 渲染成本测量：分别用渲染开/关跑 200 步对比墙钟时间
+t0 = time.perf_counter()
+for i in range(200):
+    world.step(render=False)              # 不渲染：相机会拿到旧数据（训练里两者都要权衡）
+t1 = time.perf_counter()
+print(f"render=False: {(t1-t0)/200*1000:.1f} ms/步")</code></pre>
+    <p>解读：健康检查的两项统计（均值、标准差）足以回答"相机配好了吗"：均值接近 0 通常是没灯或朝向对着虚空；标准差接近 0 是看到了纯色（贴脸网格或墙）。<code>assert</code> 检查分辨率是否与配置一致，防止"改了参数没生效"这类静默错误（相机参数在创建时确定，运行时改动需要重建）。成本测量部分刻意只测了 <code>render=False</code>：它代表策略训练时的物理步进成本，与渲染步的差值就是相机等渲染的实际开销。这个差值决定了你能开几路相机、以多高频率采样，先测再定，避免凭感觉堆视觉输入。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>全黑画面</strong>：没开渲染、场景缺灯光、相机朝向天空或剔除范围把物体裁掉。修复：按片段 3 做健康检查，逐项排除。</li>
+      <li><strong>把 (H, W, C) 直接喂给 PyTorch</strong>：卷积按最后一维通道解释会错位，训练 loss 异常。修复：显式转置，并把该转换固化在数据函数里。</li>
+      <li><strong>忘记帧堆叠</strong>：策略看到的是静态图，无法感知速度，抓取动态目标时表现"反应迟钝"。修复：堆 2–4 帧或额外提供速度观测。</li>
+      <li><strong>分辨率贪大</strong>：640×480 全尺寸喂网络，训练吞吐掉一个数量级。修复：按任务决定物体需要的像素数（用 f<sub>x</sub>·s/Z 估算），够用即可。</li>
+      <li><strong>相机贴脸网格</strong>：局部偏移不足或近平面过大，画面被自身连杆遮挡。修复：把相机挪出网格并调小近平面；在可视化里绕机器人转一圈确认。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>计算：640×480、水平 FOV 60° 的相机，f<sub>x</sub> 是多少？一个 5 cm 的方块在 0.8 m 处占多少像素宽？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>f_x = 320/tan30° ≈ 554；像素宽 ≈ f_x × 0.05 / 0.8 ≈ 35 像素。</div></details>
+      </li>
+      <li>实验：把相机分辨率从 640×480 依次降到 224×224、112×112，记录 RTF 与显存占用，画出"分辨率-吞吐"曲线。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>预期时间随面积近似线性：从 640×480 到 224×224 面积降约 6 倍，渲染时间应大幅下降。</div></details>
+      </li>
+      <li>设计对比：同一到达任务分别用腕部随动相机与固定第三人称相机，列出两种观测各自的优缺点，并预测哪种训练更快收敛（从"信息是否足够"角度推理）。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>腕部视角里目标一直在画面中但随运动抖动；固定视角稳定但可能被遮挡，信息充分性比画面美观更重要。</div></details>
+      </li>
+      <li>推导：水平 FOV 从 60° 扩到 90°（保持分辨率），画面中心附近的物体像素数变成多少？边缘的物体呢？解释为什么宽 FOV 相机在远处目标的识别上更吃亏。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>f_x 从 554 降到 320/tan45° = 320；中心投影的缩放只由 f_x 决定，边缘还有额外的透视拉伸与畸变。</div></details>
+      </li>
+      <li>实验设计：把相机采样频率从 60 Hz 降到 15 Hz，预测策略成功率与训练吞吐的变化，并设计包含"目标物缓慢移动"场景的对照实验。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>15 Hz 下 66 ms 才有一帧，高速动作会出现"视觉盲区"；吞吐提升但信息延迟，权衡点取决于任务速度。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>针孔模型是相机的全部几何：u = f<sub>x</sub>X/Z + c<sub>x</sub>；<strong>像素尺寸 ∝ 焦距/距离</strong>，f<sub>x</sub> 由分辨率与 FOV 换算。</li>
+      <li>挂载决定视角与坐标系：局部偏移避让网格，光轴朝向要渲染一帧实测确认，不要凭记忆假设。</li>
+      <li>RGB 数据整理四步：去 alpha → 归一化 → 转 (C,H,W) → 帧堆叠；每步都有明确的失败模式。</li>
+      <li>渲染成本与分辨率面积成正比：策略用小图、低帧率，可视化单独开高分辨率相机。</li>
+      <li>下一章：009 设置深度相机并获取深度图，同一套针孔几何下，深度数据如何给出"每个像素多远"，以及它与 RGB 的关键差异。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch007.html">← 第 007 章：读取传感器数据</a>
+    <a class="next" href="ch009.html">第 009 章：设置深度相机并获取深度图 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

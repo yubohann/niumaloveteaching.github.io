@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第036章 实现避障任务 | 机器人仿真学习课程 · Isaac Sim 强化学习训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 任务与技能实现</span>
+    <span class="sep">/</span>
+    <span>第 036 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 任务与技能实现</div>
+    <h1>第 036 章：实现避障任务</h1>
+    <p class="lead">第一个完整任务：机械臂在障碍之间伸手够目标，进度奖励 + 间隙势场 + 碰撞终止的三件套，以及安全与速度的权衡。</p>
+    <ul class="meta">
+      <li>主题：任务实现 / 安全约束型任务</li>
+      <li>相关组件：Isaac Sim、Stable-Baselines3（PPO / SAC）</li>
+      <li>预计学时：50 分钟</li>
+      <li>前置章节：第 035 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>掌握避障任务的完整规格定义：任务、观测、动作、奖励分项、终止条件、评估指标六件套。</li>
+      <li>理解"进度奖励 + 间隙势场 + 碰撞终止"的三层奖励结构及其权重取舍逻辑。</li>
+      <li>会用最近点距离与相对方向构造障碍观测，并对比"几何特征观测"与"点云观测"两条路线。</li>
+      <li>能诊断势场类奖励的典型病态：局部极小值、贴墙滑行、绕远取巧。</li>
+      <li>会给避障任务设计评估协议：成功率、碰撞率、路径效率、安全间隙分布。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>前三章的工具（IK、模仿学习、规划）到这里第一次合体成一个"有实体感的任务"：<strong>Franka 机械臂从初始位形出发，绕开 2–4 个悬空障碍，把末端送到随机目标点；碰到任何障碍、或接触力超过安全阈值都算失败。</strong>它同时是后续所有抓取类任务的前置技能，抓取的第一步就是"不撞东西地靠近物体"。</p>
+    <p>避障也是"奖励设计"教学的最佳案例：任务本身只有两个二元结局（到没到、撞没撞），中间的"怎么走得好"完全没有信号。你得用进度奖励引导方向、用间隙势场引导安全、用碰撞终止划出红线。<b>本章把这三种信号写成可复用的奖励模块，它将是第 037–041 章每一个任务奖励函数的骨架。</b></p>
+  </section>
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 进度奖励：把"接近目标"变成可累积的信号</h3>
+    <p>最常用的引导项是单位步内的距离减少量（progress）：</p>
+    <div class="formula">
+      r<sub>progress</sub> = k<sub>p</sub> · ( d<sub>t−1</sub> − d<sub>t</sub> )，  d = ‖p<sub>ee</sub> − p<sub>goal</sub>‖
+      <span class="note">只奖励"靠近"的增量，不奖励"离得近"的状态，否则策略学会停在目标旁边蹭奖励</span>
+    </div>
+    <p>这个形式的两个性质值得记住：<b>(1) 它是有界信号</b>，每步最多走关节限速允许的位移，"进度"自然被物理速度上限约束；<b>(2) 它是势能形式的</b>，把奖励写成 Φ(s<sub>t−1</sub>) − Φ(s<sub>t</sub>) 的差分（Φ = −k·d），沿任意闭合轨迹的累积为零，不会像稠密状态奖励那样改变最优策略的集合（Ng 等的势能奖励定理）。系数 k<sub>p</sub> 的量级：一步典型位移 1–3 cm，若希望进度项的每步量级在 0.01–0.03，k<sub>p</sub> 取 1.0（单位：每米）。<strong>进度奖励的绝对值不携带"离目标多远"的信息，那是观测的职责，不是奖励的职责。</strong></p>
+
+    <h3>2. 间隙势场：为什么用指数衰减</h3>
+    <p>安全引导的标准形态是对每个障碍的接近惩罚：</p>
+    <div class="formula">
+      r<sub>clear</sub> = − w<sub>o</sub> · Σ<sub>j</sub> exp( −d<sub>j</sub> / σ )，  d<sub>j</sub> = 末端到障碍 j 表面的最近距离
+      <span class="note">σ 是"危险尺度"（如 0.08 m）：距离远时惩罚趋零，进入 σ 范围内指数上升</span>
+    </div>
+    <p>指数形式的意义：<b>它几乎不干扰远处的路径选择（d &gt; 3σ 时惩罚 &lt; 5%），但在危险距离附近梯度急剧增大，形成"无形的斥力墙"。</b>σ 的选择就是"安全余量"的物理表达：机械臂末端半径 4 cm，选择 σ=8 cm 意味着"离表面 24 cm 之外基本不管"。多个障碍时惩罚取和，因为"同时靠近两个障碍"确实更危险，叠加合理。注意 r<sub>clear</sub> 是<b>逐帧</b>的状态惩罚（不是差分）：它表达"待在危险区就要交税"，这是允许的，它惩罚的是安全约束，不是塑造进度。它与进度奖励的差分主导地位不冲突，只要权重足够小（w<sub>o</sub> ≈ 0.3–0.5：常规距离下单步 ≤0.15，贴面极端 0.4/障碍、四障碍叠加 ≤1.6）。</p>
+
+    <h3>2.1 数值算例：间隙势场的梯度尺度</h3>
+    <p>把 σ = 0.08 m、w<sub>o</sub> = 0.4 代入逐点计算：d = 0（贴面）时惩罚 −0.4·e⁰ = −0.4；d = 0.04 m（半个危险尺度）时 −0.243；d = 0.08 m 时 −0.147；d = 0.16 m（两个 σ）时 −0.054；d = 0.24 m（三个 σ）时 −0.020，恰好是贴面惩罚的 5%。<b>"三个 σ 之外基本不管"的说法有精确的数字支撑：0.02 的单步量级与进度项（每步 0.01 量级）相比已属噪声。</b></p>
+    <p>再看单步位移尺度的影响：末端速度 0.5 m/s、控制 60 Hz 时，每步末端移动 8.3 mm。从 d = 0.08 m 走到 d = 0.0717 m（一步靠近 8.3 mm），惩罚从 −0.147 变成 −0.163，单步多付 0.016；作为对比，同一份位移若朝向目标，进度收益 k<sub>p</sub>×8.3 mm ≈ 0.008。<b>两者同量级，说明"贴着 σ 边界横走"与"朝目标走"的每步收益差很小，滑行策略正是被这一点缝隙喂大的：正确的修复手段是时间税（−0.01/步）与"不靠近就零进度"的差分结构，调 σ 解决不了这个问题。</b>另一个实现细节：σ 不能小于单步位移的数倍，否则同一段轨迹上的惩罚值"跳台阶"，梯度时有时无。经验取 σ ≥ 3 倍单步位移：本任务单步 8.3 mm，σ = 0.08 m 满足约 10 倍余量；若把 σ 缩到 0.02 m，一步就能跨过 σ 的 40%，训练会表现出"忽紧忽松"的振荡。</p>
+    <p>进度奖励的量级也核一遍：单步末端位移 8.3 mm、k<sub>p</sub> = 1.0 时单步进度收益 0.008，理想直线路径 100 步的累计上限约 0.83；时间税 0.01/步、按 100 步计合计 1.0，与整局进度收益同量级，这就是"绕远"与"磨蹭"都占不到便宜的量级设计。两个边界情形可以预先算清。其一是振荡检测：势能差分的实现里，任何闭合轨迹（策略兜圈子）的累计进度收益应为零，验证方法是固定一条兜圈策略、把每步进度求和，期望值趋近 0 说明实现正确；如果和为显著正值，说明某处把"状态量"当成了"差分"，这类实现错误会直接喂出蹭分行为。其二是势场饱和：surf_dist 因穿透而取负值时被 clamp(min=0) 截住，指数项取到最大值 1，单障碍单步上限 −0.4，四障碍同时侵入的极端情况上限 −1.6；它是"擦入"的最坏罚单，仍小于碰撞终止的硬红线，这个大小关系保证势场负责"推开"、终止负责"判死"，两层语义互不重叠。</p>
+    <p>最后给目标采样的过滤率一个量：按"离任何障碍表面 &gt; 5 cm"的可行性检查，障碍（半径 4 cm）先膨胀到 9 cm，4 个膨胀圆的截面积共 4×π×0.09² ≈ 0.102 m²；0.5 m 半径的工作区圆盘面积 π×0.5² ≈ 0.785 m²，可见约 13% 的目标采样会被过滤掉。<b>被过滤的比例即为"浪费样本"的上限，若发现训练日志里任务无解的环境占一成以上，就要连采样区域一起重新设计，仅靠过滤解决不了根源。</b></p>
+    <p>评估协议里的"平均最小间隙"还有一层分位数视角：平均值会被少数"宽敞回合"抬高，掩盖贴着障碍过的高风险回合；更稳的做法是同时报告 P5（第五百分位）最小间隙，P5 低于 3 cm 说明策略的"安全下限"不达标，即使平均成功率漂亮也不能放行。<b>把 P5 间隙与成功率画在同一张图上，两轴同时改善才算真实进步</b>；如果成功率上涨而 P5 间隙下降，说明策略在拿安全换分数，部署前必须把它压回训练前的水平。碰撞率与超时率的配比也有诊断价值：碰撞率高说明间隙引导不足，超时率高说明进度引导不足或目标不可达，两类失败指向不同的权重调整方向，日志分开统计的价值正在于此。</p>
+    <p>观测维度可以按规格表核对一遍：关节角 7 + 关节速度 7 + 末端位姿 7 + 目标相对位置 3 + 每个障碍 4 维乘 4 个共 16，合计 40 维（2 个障碍时为 32 维，0 障碍版本为 24 维），规格表写"20+ 维"是保守下界。<b>障碍数课程让观测维度随阶段变化，网络输入层要按最大障碍数固定宽度、空槽位补零，否则从 0 障碍升到 2 障碍时网络结构变化，训练成果无法延续</b>；空槽位的方向向量补零、表面距离补一个大值（如 1 m），策略才能区分"无此障碍"与"真实贴近"两种情形。</p>
+
+    <h3>3. 碰撞终止与安全红线</h3>
+    <p>碰撞是硬约束，用"终止 + 大罚"处理：接触力超过阈值（如 5 N）或接触对里出现在非目标刚体 → 立即终止、给 −1 的终局惩罚。为什么采用终止处理，只记惩罚有什么问题？<b>惩罚只会在回报里记一笔账，策略可能发现"抄近路小撞一下"的期望收益仍为正；终止把"撞了"从可交易的代价变成"回合没得玩了"的硬结局，切断这种交易。</b>代价也要承认：终止会让"高风险位置附近"的数据稀疏，策略对边界情况的学习样本变少，这是后续课程学习要补的（先无碰撞场景，再加障碍）。</p>
+
+    <h3>4. 势场的病态与观测救场</h3>
+    <p>只靠势场奖励会暴露两个经典病态：<b>局部极小值</b>（被两个障碍夹住的区域，斥力与引力平衡，策略卡住不动）与<b>贴墙滑行</b>（持续沿着 σ 边界蹭最高奖励）。RL 不是势场法，但势场塑造的奖励一样会诱导这些行为。三种解药：</p>
+    <ul>
+      <li><b>观测里给"全局几何"</b>：把每个障碍的最近点相对位置（方向 + 距离）放入观测，策略有条件学出"从上面绕"的决策，而这是只看势场奖励学不出来的；条件越充分，局部极小越少。</li>
+      <li><b>进度奖励的差分形式</b>：它拒绝了"原地蹭"的行为（不靠近目标就没有进度），把滑行行为的收益压到负数（还有时间罚）。</li>
+      <li><b>点云观测（第 028 章）</b>：最彻底的方案，网络自己做几何推理；代价是训练成本高一个量级。本章实验会用"几何特征观测"起步，留给读者做点云对照。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p><strong>任务规格（六件套）：</strong>Franka 从初始位形出发，末端到达随机目标点（半径 0.5 m 的工作区半球内），工作区内随机放置 2–4 个球形障碍；碰到障碍或峰值接触力 &gt; 5 N 判失败。</p>
+    <table>
+      <tr><th>规格</th><th>设计</th><th>理由</th></tr>
+      <tr><td>观测（20+ 维）</td><td>关节角(7) + 关节速度(7) + 末端位姿(7) + 目标相对位置(3) + 每个障碍"最近点相对向量 + 距离"(4×4)</td><td>用相对量，绝对量的数值范围随场景漂移；障碍特征写成(方向 3 + 距离 1)让策略能推理"绕哪边"</td></tr>
+      <tr><td>动作</td><td>关节位置增量 × 0.05 rad（连续 7 维）</td><td>与第 026 章一致；探索半径与平滑的平衡</td></tr>
+      <tr><td>奖励</td><td>进度 1.0 + 间隙 −0.4 + 时间 −0.01/步 + 碰撞 −1.0 + 成功 +5</td><td>进度是主信号；间隙是守护；成功给强终局信号</td></tr>
+      <tr><td>终止</td><td>成功（d &lt; 3 cm）｜碰撞（力 &gt; 5 N）｜超时（100 步）</td><td>三类结局分开统计；超时按截断处理（第 022 章）</td></tr>
+      <tr><td>随机化</td><td>障碍位置/半径、目标位置、初始位形、质量 ±10%</td><td>第 021 章域随机化的任务级应用</td></tr>
+      <tr><td>课程</td><td>障碍数 0 → 2 → 4；目标距离 0.25 → 0.5 m</td><td>第 032 章状态机；0 障碍版先学会"伸手"</td></tr>
+    </table>
+    <p>奖励权重取舍的推理过程：<b>进度 1.0 是锚</b>，其余项都以"不被进度淹没、也不淹没进度"为约束反推。间隙罚的峰值设计为 0.4/障碍（贴面时指数项取最大值 1，四障碍叠加极端 1.6），即"碰壁一步等于退回去一大步"；时间罚 0.01/步（100 步共 1.0）保证"拖延与碰撞哪个亏"的量级直觉。成功奖励 +5 与碰撞 −1 的差距（6 倍）表达"宁可绕远，不可碰撞"的任务偏好，这个比值就是任务的安全等级宣言，第 041 章插拔会用到同一套量纲习惯。</p>
+    <div class="box key">
+      <span class="box-title">设计思维：终止条件里的"截断 vs 失败"</span>
+      <p>三类终止要保持语义清醒：<b>成功</b>（真终止，bootstrap=0，给 +5）、<b>碰撞</b>（真终止，给 −1）、<b>超时</b>（截断，价值估计正常保留，不给额外惩罚，第 022 章讲过）。很多实现把超时也当成失败给 −1，结果策略把"没碰到障碍但走得慢"和"撞了"学成同一类结局，安全边界被模糊。日志上也要分开：<code>success / collision / timeout</code> 三条独立曲线是避障任务的"体检报告"。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：障碍特征观测</strong></p>
+    <pre class="code"><code>def obstacle_features(ee_pos, obs_centers, obs_radii):
+    """每个障碍的特征：(方向 3 + 表面距离 1)。比"(位置 3+半径 1)"更贴近策略直觉"""
+    rel = obs_centers - ee_pos.unsqueeze(1)          # (N, K, 3)：末端到各障碍球心
+    dist_center = rel.norm(dim=-1, keepdim=True)     # (N, K, 1)
+    surf_dist = dist_center.squeeze(-1) - obs_radii  # 到表面的距离：负值=已侵入
+    direction = rel / dist_center.clamp(min=1e-6)    # 单位方向：策略据此判断"往哪绕"
+    feats = torch.cat([direction, surf_dist.unsqueeze(-1)], dim=-1)   # (N, K, 4)
+    return feats.reshape(feats.shape[0], -1)         # (N, 4K)：K=4 时 16 维</code></pre>
+    <p>解读：观测表达的两个选择。<b>(1) 为什么给"方向 + 表面距离"，绝对位置有什么问题？</b>绝对位置让策略自己去算相对关系（减法与范式），在归一化之后数值范围还不稳；直接给相对向量与表面距离，是"人类操作者视角"的表达，你看到一个球在左边 20 cm，动作直觉立刻有了。<b>(2) 表面距离（减半径）作为距离项</b>：危险程度的物理量就是离表面的距离；球心距离还要策略知道半径，半径随机化时（练习会做）它就成了隐藏变量。零距离保护（1e-6）防方向除零。注意这个函数对每个环境都是纯张量运算，4096 环境 × 4 障碍的特征提取是一次 kernel，没有循环（第 022 章纪律的又一实例）。</p>
+
+    <p><strong>片段 2：避障奖励的向量化计算</strong></p>
+    <pre class="code"><code>def avoid_reward(prev_dist, cur_dist, surf_dists, contact_peak, reached):
+    """三层奖励：进度（差分） + 间隙（状态罚） + 终局（硬约束）"""
+    r_progress = 1.0 * (prev_dist - cur_dist)        # 主信号：每步靠近的增量
+    # cur_dist 只在物理层面缓慢变化：差分天然有界，不会被"靠近"状态本身反复兑现
+    r_clear = -0.4 * torch.exp(-surf_dists.clamp(min=0.0) / 0.08).sum(dim=-1)
+    # σ=8 cm 危险尺度：3σ 外贡献 &lt;5%，进入内部指数上升，形成软性斥力墙
+    r_time = -0.01                                   # 时间税：堵死"原地蹭奖励"策略
+    r_collide = -1.0 * (contact_peak &gt; 5.0).float()  # 碰撞：硬红线（峰值力用原始值，第 029 章）
+    r_success = 5.0 * reached.float()                # 成功终局：比碰撞重 6 倍（安全等级宣言）
+    return r_progress + r_clear + r_time + r_collide + r_success
+
+def termination(contact_peak, dist, step, max_steps=100):
+    reached = dist &lt; 0.03                            # 3 cm 到达阈值：任务精度的量级
+    collided = contact_peak &gt; 5.0                    # 接触力红线：抓取前的任务不允许多余接触
+    timeout = step &gt;= max_steps
+    terminated = reached | collided                  # 真终止：成功或失败
+    truncated = timeout &amp; (~terminated)             # 截断：引导时保留价值（第 022 章）
+    return reached, terminated, truncated</code></pre>
+    <p>解读：这段是"奖励量纲设计"的教科书样本。<b>(1) 进度项为什么用 <code>prev_dist − cur_dist</code> 的差分形式，<code>−cur_dist</code> 有什么问题？</b>后者是稠密状态奖励：同样的"停在 3 cm 外"每步都能拿 −0.03，策略可能乐于滞留；差分形式下"不动 = 零进度 = 只亏时间税"，唯一赚钱的动作就是继续靠近。<b>(2) 间隙罚为什么对四个障碍求和</b>：多个障碍的接近是叠加风险，且求和后梯度自然指向"远离最危险的那个"。<b>(3) 撞与成功的量级对比</b>：−1 对 +5 的 1:6 比例，加上碰撞直接终止（后续步骤全部拿不到时间损失之外的东西），这两个约束把"稳妥优先"写进了回报结构。<b>(4) 终止函数的返回值拆成三个布尔</b>：调用方才能正确区分"真终止"与"截断"，这个拆分在第 022 章讲训练循环时就强调过，本章把它落实进任务代码。</p>
+
+    <p><strong>片段 3：训练配置与课程接入</strong></p>
+    <pre class="code"><code>config = dict(
+    num_envs=4096,                    # 状态观测任务：GPU 物理能撑住（第 022 章）
+    horizon=32,                       # 避障是 20-80 步的短任务：视野比 Reach 略长
+    minibatch=32768,                  # 4096 × 32 / 4：整倍关系
+    gamma=0.99, lam=0.95, clip=0.2,
+    lr=3e-4,
+    obs_scale={                       # 量纲统一到 O(1)：距离按工作区半宽、角度按 π
+        "joint_pos": 1.0, "joint_vel": 0.2, "goal_rel": 2.0, "obs_feat": 2.0,
+    },
+    curriculum=dict(                  # 第 032 章状态机：障碍数与目标距离双课程
+        promote=0.7, demote=0.3, beta=0.01, cooldown=2000,
+        obstacle_counts=[0, 2, 4], target_radius=[0.25, 0.35, 0.5],
+    ),
+    success_bonus=5.0, collision_penalty=-1.0,
+)
+# 训练日志至少打点五条：成功率、碰撞率、超时率、平均步数、平均最小间隙
+# 评估：100 个固定种子 episode；另跑"障碍数 = 训练最大值 +1"的泛化组</code></pre>
+    <p>解读：配置里每个数字都接回前文。<b>horizon=32</b>：避障任务的信用分配距离约 20–60 步，0.95 的 GAE 在 32 步视野内衰减不明显，比 Reach 任务的 16 步更合适。<b>obs_scale</b>：状态观测同样要做量纲统一，关节速度的数值范围（±5 rad/s）比关节角大一个量级，不缩放会让速度特征主导第一层网络。缩放策略采用"除以物理量程"（第 029 章的结论），这里没有用运行时统计，因为每项都有明确的物理范围。<b>课程配置</b>：障碍数 0 → 2 → 4，0 障碍版本就是"纯 Reach"，让策略先学会伸手这个前置技能再升级；目标半径从 0.25 m 到 0.5 m 逐步扩展。日志五条线里最容易被忽略的是"平均最小间隙"，它是策略安全风格的度量，间隙过小的策略即使在训练分布内成功率高，部署到有标定误差的真机上也容易撞。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>间隙权重过大</strong>：把 w<sub>o</sub> 设成 5.0，策略发现"后退远离一切"最安全，离目标越来越远。症状：成功率不涨、平均距离缓慢增大。修复：间隙罚峰值保持 0.4/障碍（w<sub>o</sub> 取 0.3–0.5），四障碍叠加极端 1.6，与碰撞终局罚 −1 同量级。</li>
+      <li><strong>碰撞只做逐帧软惩罚、没有终止</strong>：策略学会"蹭着障碍抄近路"，因为短期收益覆盖了罚款。症状：碰撞率随成功率同步上升。修复：碰撞终止 + 终局罚；软惩罚只做补充。</li>
+      <li><strong>接触力判定用滤波值</strong>：第 029 章的纪律被遗忘，撞击瞬间被平滑掉，碰撞率虚低。症状：训练日志碰撞率低于实际。修复：安全判定读原始力峰值。</li>
+      <li><strong>目标在障碍内部</strong>：随机采样不做可行性检查，目标点落在障碍里，任务无解，这些环境的样本全是"学不会的噪声"。症状：成功率天花板卡在某个值。修复：目标采样时做距离检查（离任何障碍表面 &gt; 5 cm）。</li>
+      <li><strong>超时当失败罚</strong>：把 timeout 也按 −1 处理，安全边界模糊（第 036 章设计思维）。症状：策略过度保守。修复：超时只截断不罚，独立打点超时率。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>参数实验：σ 从 0.04 调到 0.16（危险尺度翻四倍），预测并验证"平均最小间隙"与"成功率"的变化方向。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>σ 大 → 策略更早开始绕、间隙分布右移，但绕行成本增加可能压低即时成功率；看两条曲线的交叉。</div></details>
+      </li>
+      <li>消融实验：去掉时间罚（r_time=0）训练一次，观察"回合步数"与"成功率"曲线。策略会用更长的路换更高的成功概率吗？<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>没有时间罚时策略倾向于"贴 σ 边界慢慢挪"，步数上升、进度收益持平，超时率可能上升。</div></details>
+      </li>
+      <li>观测消融：把障碍特征从"方向+表面距离"换成"绝对位置+半径"，比较收敛速度。解释相对量为什么更快。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>预训练统计量归一化后，绝对量的分布随目标漂移，相对量天然稳定，收敛差值通常在前 100 个 update 最明显。</div></details>
+      </li>
+      <li>设计点云对照：用第 028 章的 1024 点点云替换几何特征做同样任务，列出你能预期的三个变化（吞吐、收敛步数、泛化到新障碍形状的能力）并逐一验证。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>点云对障碍形状泛化更好（几何特征依赖"球形假设"）；代价是渲染/采样开销与训练时长。新障碍形状测试是验证泛化的关键组。</div></details>
+      </li>
+      <li>思考题：势场类奖励的两个病态（局部极小、贴边滑行）分别被本设计的哪个机制抑制？如果没有差分进度奖励，滑行行为的回报结构会变成什么样？<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>局部极小靠"完整几何观测 + 条件策略"缓解；滑行靠"差分进度 + 时间税"消除。若无差分：贴边不动也能持续拿 −0.4×exp(−0) 的固定值，回报比乱走更"稳定"。 </div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>避障任务的奖励骨架：差分进度（主信号）+ 指数间隙势场（安全引导）+ 碰撞终止（硬红线）+ 时间税（防蹭）+ 成功奖励（终局）。</li>
+      <li>量级纪律：进度 1.0、间隙峰值 0.4/障碍（四障碍叠加 ≤1.6）、时间 −0.01/步、碰撞 −1、成功 +5；间隙权重过大必致保守。</li>
+      <li>观测用相对量（方向+表面距离）；碰撞判定用原始力；三类终止（成功/碰撞/超时）分开统计。</li>
+      <li>课程：障碍数 0→2→4、目标半径 0.25→0.5 m；评估五指标：成功率、碰撞率、超时率、平均步数、平均最小间隙。</li>
+      <li>下一章把"到达"升级为"抓住并举起"：抓取任务的接触阶段、抓握判据与立体奖励设计。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch035.html">← 第 035 章：实现运动规划与强化学习结合</a>
+    <a class="next" href="ch037.html">第 037 章：实现抓取任务 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

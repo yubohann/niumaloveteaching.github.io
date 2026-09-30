@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第044章 SAC的优先级经验回放 | 深度强化学习课程 · PPO、SAC 与多智能体系统</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 离策略方法与 SAC</span>
+    <span class="sep">/</span>
+    <span>第 044 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 离策略方法与 SAC</div>
+    <h1>第 044 章：SAC的优先级经验回放</h1>
+    <p class="lead">给回放池装上"注意力"：用求和树按 TD 误差给样本排优先级，让还没学会的经验获得更高的被抽中概率，再用重要性权重把采样偏差修正回来，在 Pendulum-v1 上对比均匀采样与比例优先级采样的收敛速度。</p>
+    <ul class="meta">
+      <li>主题：优先经验回放（Prioritized Experience Replay, PER）</li>
+      <li>关键公式：P(i) ∝ p<sub>i</sub><sup>α</sup>；w<sub>i</sub> = (N·P(i))<sup>−β</sup></li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 043 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解优先级回放的动机：TD 误差代表"教训的信息量"，大误差样本才是还没消化的因果。</li>
+      <li>掌握求和树（SumTree）的结构，知道按优先级采样与优先级更新为什么都能做到 O(log N)。</li>
+      <li>吃透比例优先级的两个指数：α 控制优先强度，β 退火修正采样偏差，二者缺一不可。</li>
+      <li>看得懂重要性加权 Q 损失的实现，能解释"权重归一化到最大值为 1"的理由。</li>
+      <li>会对比 uniform 与 prioritized 的达标步数、批次 |TD| 均值，解释 PER"更快但更不稳"的双面性。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>均匀回放有一个隐含假设：每条经验对当前策略的学习价值相同。现实恰好相反，回放池里大部分样本的 TD 误差已经很小（网络早就学会了），只有少数"反直觉"的样本还带着大误差。均匀采样把大部分梯度花在"已经会了的题"上，样本效率被稀释。</p>
+    <p>本章给第 043 章的回放池加装一个"注意力机制"：用样本的 TD 误差当优先级，按比例抽签；同时用重要性权重把这种有偏采样带来的梯度偏差修正回来。<strong>目标在于让同样的环境步数榨出更多有效学习</strong>，回放池的复杂度只是手段；清单上半场看收敛速度，下半场看代价（方差与调参难度）。需要提前建立的心理预期是：PER 不是"免费的加速器"。它把采样分布改成了非均匀，就必须付出两个代价，一是每个样本的梯度不再等权（要用重要性权重修回来，有效步长因此变小），二是训练方差更大（少数高误差样本主导梯度）。衡量 PER 是否值得，本质上是在问"早期省下的样本量，能不能抵过后期多出的不稳定"。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 比例优先级采样</h3>
+    <p>给每条经验 i 维护一个优先级 p<sub>i</sub>（正数，新样本初值取当前全局最大优先级，保证它至少被抽中一次）。采样概率定义为</p>
+    <div class="formula">
+      P(i) = p<sub>i</sub><sup>α</sup> / Σ<sub>k</sub> p<sub>k</sub><sup>α</sup>
+      <span class="note">α ∈ [0,1]：α=0 退化为均匀采样；α=1 完全按优先级比例；常用 0.6</span>
+    </div>
+    <p>符号说明：p<sub>k</sub> 是池内第 k 条经验的优先级，α 是"优先强度"指数。优先级本身用 TD 误差定义：</p>
+    <div class="formula">
+      p<sub>i</sub> ← ( |δ<sub>i</sub>| + ε )<sup>α</sup>
+      <span class="note">δ 为该样本最新一次更新时的 TD 误差；ε=1e-6 防止零优先级样本永不复活</span>
+    </div>
+    <p>直觉：TD 误差是"惊讶程度"。惊讶大，说明这条经验还没被价值函数消化，值得多学几遍；惊讶小，说明已经学会了，先放一放。优先级只是启发式信号：下一轮更新会用新的 TD 误差覆盖它。</p>
+
+    <div class="box key">
+      <span class="box-title">数值例子：四条样本的采样概率与权重</span>
+      <p>设池内只有 4 条样本（N=4），原始优先级 p = [9, 4, 1, 1]，取 α=0.6。先算 p<sup>α</sup> = [9<sup>0.6</sup>, 4<sup>0.6</sup>, 1, 1] ≈ [3.74, 2.30, 1.00, 1.00]，总和约 8.03，于是采样概率 P ≈ [0.465, 0.286, 0.124, 0.124]。对比均匀采样的 0.25：优先级最高的样本被抽中概率约为均匀时的 1.9 倍，一批 256 条里期望出现约 119 次，而均匀时是 64 次。</p>
+      <p>再算重要性权重 w = (N·P)<sup>−β</sup>。N·P ≈ [1.86, 1.14, 0.50, 0.50]。取 β=0.4：w ≈ [0.78, 0.95, 1.32, 1.32]，归一化（除以最大值）后为 [0.59, 0.72, 1.00, 1.00]；取 β=1.0：w ≈ [0.54, 0.87, 2.01, 2.01]，归一化后为 [0.27, 0.44, 1.00, 1.00]。</p>
+      <p>解读：<strong>优先级越高，权重越小</strong>，这正是重要性修正的作用：把"被偏爱"的样本的梯度贡献压回去，让总梯度期望仍对应均匀分布。β 从 0.4 升到 1.0 时，高优先级样本的权重从 0.59 降到 0.27，偏差修正的力度明显加强，代价是有效步长变小。这也解释了 β 需要退火的原因：早期需要大步长探索，后期才需要严格无偏；一上来就取 1 会把有效步长压得过小。</p>
+      <p>再把"不加权会怎样"与"修正的代价"算出来。若按 P 抽签却忘了乘 w，四条例子里高优先级样本的梯度贡献相当于被放大 1.86 倍（P 除以 0.25），偏差方向朝高误差样本倾斜；乘上权重后这一项恢复到 1。修正也不是白拿的：用归一化权重计算有效样本量 ESS=(Σw)<sup>2</sup>/Σw<sup>2</sup>，β=0.4 时约 3.82 条、β=1.0 时约 3.23 条（名义 4 条）。偏差修得越干净，有效样本量损失越大，这就是"β 退火"的统计含义：前期少修正、保住有效样本量；后期全修正、接受少量损失。</p>
+    </div>
+
+    <h3>2. 重要性采样修正</h3>
+    <p>用分布 P 采样、去估计均匀分布 U 下的期望，必须乘上重要性权重，否则梯度方向有偏。加权平方误差写成：</p>
+    <div class="formula">
+      w<sub>i</sub> = ( N · P(i) )<sup>−β</sup> &nbsp;&nbsp;·&nbsp;&nbsp; L<sub>Q</sub> = Σ<sub>i</sub> w<sub>i</sub> · ( Q(s<sub>i</sub>,a<sub>i</sub>) − y<sub>i</sub> )<sup>2</sup> ÷ Σ<sub>i</sub> w<sub>i</sub>
+      <span class="note">β 从 0.4 线性退火到 1.0：早期容忍偏差保收敛速度，后期收紧保无偏</span>
+    </div>
+    <p>符号说明：N 是当前池内样本数，y<sub>i</sub> 是 SAC 的软 bootstrap 目标（含折扣与熵项），β 是偏差修正强度。β=1 时完全无偏；β&lt;1 时保留一点偏差、换取更大的有效步长。实现上通常把 w 归一化到最大值为 1（整批除以 max w），避免整体学习率随池子大小漂移。当 α=0 时 w 全部为 1，PER 严格退化为均匀回放，uniform 模式因此复用同一条代码路径。归一化到最大值为 1 后，批内平均权重会小于 1（四条例子里 β=0.4 时约 0.83、β=1.0 时约 0.68），有效学习率因此打了折扣，这也是 PER"更稳但可能更慢"的又一处来源。</p>
+    <p>分段抽签相对独立抽签的波动优势也能具体化。若独立抽取 256 次，最高优先级样本（P≈0.465）出现次数服从二项分布，标准差约 √(256×0.465×0.535)≈8，批次之间忽多忽少；分段抽签把 [0, total] 均分给 256 段后，这条样本的期望出现次数约 119，且每段至多贡献一次抽取，波动被明显压缩。样本越是被"温和偏爱"，分段抽签的批次稳定性收益越大，这是它作为实现细节却值得保留的原因。</p>
+
+    <h3>3. 为什么必须用求和树</h3>
+    <p>按 P(i) 抽签需要"按权重找前缀和"。朴素实现每次采样都要遍历全部 N 条经验，N=10 万时采一个 batch 要多花上百万次比较。求和树把这件事压到 O(log N)：叶子存每条经验的优先级，内部节点存子树优先级之和。采样时在 [0, 总和] 上取随机数、从根逐层下沉；更新优先级时从叶子回溯到根、只修正沿途差值。容量 10 万时树深约 17 层（2<sup>17</sup> = 131072 刚好覆盖），采 256 个样本只有几千次操作，这是 PER 能用在真实回放池上的关键。把两条路径的开销算成整数更直观：一次优先级更新约 17 次加法，一次采样约 17 次比较，抽一个 256 的批次总计约 256×17≈4352 次基本操作；朴素实现每次采样都要累加全池前缀和，约 256×100000=2560 万次比较，是前者的约 5900 倍。这条数量级差异就是"PER 能用"与"PER 只存在于论文"的分界线。</p>
+
+    <h3>4. 两种采样的正面对照</h3>
+    <table>
+      <tr><th>维度</th><th>uniform（第 043 章）</th><th>prioritized（本章）</th></tr>
+      <tr><td>采样概率</td><td>每条 1/N，与误差无关</td><td>P(i) ∝ p<sub>i</sub><sup>α</sup>，大误差样本被偏爱</td></tr>
+      <tr><td>重要性权重</td><td>恒为 1</td><td>(N·P)<sup>−β</sup>，随 β 退火收紧</td></tr>
+      <tr><td>Q 损失</td><td>普通 MSE</td><td>加权 MSE（权重只加在 Q 回归上）</td></tr>
+      <tr><td>批次 |TD| 均值</td><td>随训练稳步下降</td><td>显著高于 uniform，专挑难样本</td></tr>
+      <tr><td>早期收敛</td><td>基准</td><td>通常更快，4000～8000 步即可见差距</td></tr>
+      <tr><td>后期稳定性</td><td>更平稳</td><td>方差更大，最终评估甚至可能略低</td></tr>
+      <tr><td>调参负担</td><td>无额外参数</td><td>α、β 区间、退火步数三个新旋钮</td></tr>
+    </table>
+    <p>对照的读法：先看达标步数（早期效率），再看最后两三个评估点的波动（后期稳定性），最后看批次 |TD| 均值是否确实高于 uniform（机制是否生效）。三个读数方向不一致时，以"固定预算下的最终评估 + 波动幅度"为主要判据。</p>
+
+    <h3>5. α 的两端行为与失效边界</h3>
+    <p>α 决定采样分布的集中程度，两端都值得算一遍。α=0 时所有 p<sup>α</sup>=1，采样等概率、权重恒为 1，PER 严格退化为均匀回放，uniform 对照正是这条退化路径。α 接近 1 时分布被优先级主导：若池内前 1% 样本的优先级是其余样本的 100 倍，它们的采样质量占比约 0.01×100/(0.01×100+0.99)≈0.50，一半的梯度预算砸在这 1% 上；倍数扩大到 10000 倍时占比逼近 0.99，训练几乎只剩极少样本的声音，这就是"后期震荡、离群样本被反复抽"的算术来源。常用值 0.6 取在中间：高优先级样本被偏爱但不垄断，四条例子里最高优先级样本的抽中概率只有均匀的 1.86 倍，属于温和加权。另一个边界是 ε：优先级里的 (|δ|+ε) 让误差恰好为 0 的样本仍有极小概率被抽中，避免大批已学会样本被彻底冻结；若 ε 取 0，训练推进后大部分 δ 趋近 0，采样会极端集中在少数尾部样本上。读日志时把 α 与批次 |TD| 两列一起看：|TD| 长期高居不下而回报停滞，通常意味着 α 太大或 ε 太小，采样过度集中在离群样本上。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+
+    <h3>数据流</h3>
+    <p>训练循环与第 043 章同构，只在"抽样一更新"这一步分岔：prioritized 模式调用 <code>sample_prioritized</code> 拿到 <code>(batch, weights, idx, beta)</code> → <code>SAC.update</code> 用加权 MSE 更新网络、同时返回逐样本 TD 误差 → <code>update_priorities(idx, td_error)</code> 把新误差写回求和树。<strong>先更新网络、再写优先级</strong>，保证优先级反映的是刚出炉的误差信号。评估点额外记录 beta 与批次 |TD| 均值。</p>
+
+    <h3>模块划分</h3>
+    <table>
+      <tr><th>组件</th><th>职责</th><th>关键点</th></tr>
+      <tr><td><code>PrioritizedReplayBuffer</code></td><td>环形储数据 + SumTree 存优先级 + 两种采样接口</td><td><code>add</code> 用全局最大优先级初始化新样本</td></tr>
+      <tr><td><code>sample_uniform</code></td><td>均匀采样，权重恒为 1</td><td>与第 043 章口径一致，作为对照组</td></tr>
+      <tr><td><code>sample_prioritized</code></td><td>分段抽签 + β 退火 + 权重归一化</td><td>把总优先级均分成 batch 段，每段抽一签</td></tr>
+      <tr><td><code>SAC.update</code></td><td>加权 Q 损失，返回逐样本 TD 误差</td><td>权重只加在 Q 损失上；策略与温度损失保持原样</td></tr>
+      <tr><td><code>update_priorities</code></td><td>用新 TD 误差刷新树、抬高 max_priority</td><td>叶子优先级 = (|δ|+ε)<sup>α</sup></td></tr>
+    </table>
+
+    <h3>关键超参数</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用与取值理由</th></tr>
+      <tr><td><code>--alpha</code></td><td>0.6</td><td>优先级指数；0=均匀，1=完全按优先级。太大时少数离群样本被反复抽</td></tr>
+      <tr><td><code>--beta-start</code> / <code>--beta-end</code></td><td>0.4 / 1.0</td><td>重要性权重指数退火区间；后期收紧到 1 才是无偏估计</td></tr>
+      <tr><td><code>--beta-steps</code></td><td>10000</td><td>退火所用的采样批次数（注意不是环境步数）</td></tr>
+      <tr><td><code>--modes</code></td><td>uniform,prioritized</td><td>两种采样模式依次训练，同种子对照</td></tr>
+      <tr><td><code>--buffer-size</code> / <code>--batch-size</code></td><td>100000 / 256</td><td>与第 043 章一致，只改采样分布</td></tr>
+      <tr><td><code>--target-return</code></td><td>−400</td><td>达标阈值，用于统计达标步数</td></tr>
+    </table>
+
+    <p>β 退火步数取 10000 的考虑：训练总预算 20000 步、每步更新一次，退火在训练中点完成，前一半用低 β 换速度、后一半用 β=1 换无偏；若预算更长，退火步数也应同比放大，否则后半程会长时间停留在"偏差修正不足"的状态。另一个细节是 <code>--beta-steps</code> 按采样批次数计，与环境步数无关：每抽一次签推进一格，和优先级写回的节奏一致，统计口径不会因为 <code>--update-every</code> 的变化而错位。</p>
+
+    <h3>与前一章的差异点</h3>
+    <ul>
+      <li>回放池从"均匀抽签"升级为"求和树 + 两种采样路径"，容量与接口保持不变。</li>
+      <li>Q 损失从普通 MSE 变成<strong>重要性加权 MSE</strong>，<code>update()</code> 额外返回逐样本 TD 误差。</li>
+      <li>主循环在 prioritized 模式下多一步 <code>update_priorities</code>，日志新增批次 |TD| 与 beta 两列。</li>
+      <li>对照指标从"保留率/年龄"换成"批次 |TD| 均值"，直接度量"抽到的样本有多难"。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：求和树的两条路径</strong></p>
+    <pre class="code"><code>    def _leaf(self, i: int) -&gt; int:
+        return i + self.capacity - 1        # 叶子段起点：缓冲区下标 i 的叶子位置
+
+    def _update_tree(self, i: int, priority: float) -&gt; None:
+        """自底向上更新 leaf i 及其祖先的优先级和。"""
+        idx = self._leaf(i)
+        change = priority - self.tree[idx]  # 只把"增量"往上加，避免整树重算
+        self.tree[idx] = priority
+        while idx &gt; 0:
+            idx = (idx - 1) // 2            # 一路走向根节点
+            self.tree[idx] += change
+
+    def add(self, obs, act, rew, next_obs, done) -&gt; None:
+        i = self.ptr
+        self.obs[i] = obs
+        self.act[i] = act
+        self.rew[i] = rew
+        self.next_obs[i] = next_obs
+        self.done[i] = done
+        self._update_tree(i, self.max_priority ** self.alpha)   # 新样本按"最难"待遇
+        self.ptr = (self.ptr + 1) % self.capacity
+        self.size = min(self.size + 1, self.capacity)
+
+    def _get_leaf_index(self, s: float) -&gt; int:
+        """在树上按前缀和 s 找到对应叶子，返回缓冲区下标。"""
+        idx = 0
+        while idx &lt; self.capacity - 1:      # 内部节点区间
+            left = 2 * idx + 1
+            if s &lt;= self.tree[left]:        # 落在左子树范围内就往左走
+                idx = left
+            else:
+                s -= self.tree[left]        # 否则扣掉左子树的和、往右走
+                idx = left + 1
+        return idx - self.capacity + 1</code></pre>
+    <p>解读：这是 PER 的引擎。<strong>（1）</strong>树用数组存储：<code>tree[2N−1]</code>，下标 <code>i+N−1</code> 起是叶子。父子关系是 <code>idx=(idx−1)//2</code>，无需指针、缓存友好。<strong>（2）</strong><code>_update_tree</code> 只把"新值 − 旧值"这个增量往上传播：每个祖先加一个 <code>change</code> 即可，代价 O(log N)。<strong>（3）</strong><code>_get_leaf_index</code> 是"前缀和查找"：随机数 s 落在哪个叶子的权重区间里就返回哪个叶子，比较 <code>s</code> 与左子树之和一路下沉。<strong>（4）</strong><code>add</code> 给新样本全局最大优先级（<code>max_priority ** alpha</code>）：若给 0，它永远抽不到，这是工程上最常见的 PER bug。</p>
+
+    <p><strong>片段 2：分段抽签、β 退火与优先级回写</strong></p>
+    <pre class="code"><code>    def sample_prioritized(self, batch_size: int) -&gt; dict:
+        """比例优先级采样 + 重要性权重（beta 线性退火）。"""
+        total = float(self.tree[0])         # 根节点 = 全部优先级之和
+        seg = total / batch_size
+        indices = np.zeros(batch_size, dtype=np.int64)
+        priorities = np.zeros(batch_size, dtype=np.float64)
+        for b in range(batch_size):
+            s = np.random.uniform(seg * b, seg * (b + 1))   # 每段各抽一签
+            i = self._get_leaf_index(s)
+            indices[b] = i
+            priorities[b] = max(self.tree[self._leaf(i)], 1e-12)
+        probs = priorities / max(total, 1e-12)
+        # beta 从 beta_start 线性退火到 beta_end（按采样批次数计）
+        frac = min(1.0, self.n_samples / self.beta_steps)
+        beta = self.beta_start + (self.beta_end - self.beta_start) * frac
+        self.n_samples += 1
+        # 重要性权重：抵消有偏采样带来的梯度偏差，并归一化到最大值为 1
+        weights = (self.size * probs) ** (-beta)
+        weights = weights / max(weights.max(), 1e-12)
+        return self._pack(indices, weights.astype(np.float32), beta=beta)
+
+    def update_priorities(self, indices: np.ndarray, td_errors: np.ndarray) -&gt; None:
+        """用最新 TD 误差刷新优先级；新优先级同时抬高 max_priority。"""
+        for i, err in zip(indices, td_errors):
+            p = (abs(float(err)) + self.eps) ** self.alpha
+            self._update_tree(int(i), p)
+            if p &gt; self.max_priority:
+                self.max_priority = p       # 保证"当前最难"的优先级同步上浮</code></pre>
+    <p>解读：<strong>（1）</strong>分段抽签（stratified sampling）：把 [0, total] 均分成 256 段，每段内均匀取一个随机数。这比独立抽 256 个随机数更稳，既保证高优先级样本被抽到，又避免同一条样本在 batch 里重复太多次（重复会稀释有效样本数）。<strong>（2）</strong>β 退火按<strong>采样批次数</strong>推进：每个 batch 抽一次签、<code>n_samples</code> 加一，10000 步退火完成；步进方式与"环境步数"无关。<strong>（3）</strong>权重 <code>(size·P)^(−β)</code> 后整体除以最大值：学习率尺度与 uniform 模式可比。<strong>（4）</strong><code>update_priorities</code> 用"|δ|+ε 的 α 次方"写回，并同步维护 <code>max_priority</code>，否则新样本的初始优先级会随时间越差越远。</p>
+
+    <p><strong>片段 3：把权重塞进 Q 损失</strong></p>
+    <pre class="code"><code>        q1 = self.q1(obs, act)
+        q2 = self.q2(obs, act)
+        # 加权 MSE：重要性权重抵消有偏采样，让梯度期望回到均匀口径
+        q1_loss = (weights * (q1 - backup) ** 2).mean()
+        q2_loss = (weights * (q2 - backup) ** 2).mean()
+        q_loss = q1_loss + q2_loss
+        self.opt_q.zero_grad()
+        q_loss.backward()
+        self.opt_q.step()
+
+        new_act, logp = self.policy.sample(obs)      # 策略提升：不加权，保持原配方
+        q_pi = torch.minimum(self.q1(obs, new_act), self.q2(obs, new_act))
+        policy_loss = (self.alpha.detach() * logp - q_pi).mean()
+        self.opt_policy.zero_grad()
+        policy_loss.backward()
+        self.opt_policy.step()
+
+        alpha_loss = -(self.log_alpha * (logp + self.target_entropy).detach()).mean()
+        self.opt_alpha.zero_grad()
+        alpha_loss.backward()
+        self.opt_alpha.step()
+
+        with torch.no_grad():
+            soft_update(self.q1, self.q1_target, args.tau)
+            soft_update(self.q2, self.q2_target, args.tau)
+
+        # 用当前 Q 的 TD 误差作为优先级信号（取双 Q 的平均，更平滑）
+        td_error = (0.5 * ((q1 - backup).abs() + (q2 - backup).abs())).detach()</code></pre>
+    <p>解读：权重只加在 Q 回归上，这是有意的，PER 的原始配方只修正价值网络的偏差；策略损失里 q_pi 的选择行为不因采样分布而改变。<strong>（1）</strong><code>(weights * (...)**2).mean()</code> 中 weights 已归一化到最大 1，量级可控。<strong>（2）</strong><code>td_error</code> 取双 Q 误差均值并立即 <code>.detach()</code>：它只是统计量，不能带梯度回传；用双 Q 平均比单网络信号更平滑。<strong>（3）</strong>顺序上，主循环在 <code>update</code> 之后才调用 <code>update_priorities</code>，把"新鲜出炉"的误差写回树，若在更新前写，优先级会滞后一步。</p>
+
+    <p><strong>片段 4：训练循环里的分叉与回写</strong></p>
+    <pre class="code"><code>        if step % args.update_every == 0 and buffer.size &gt;= args.start_steps:
+            if mode == "prioritized":
+                batch = buffer.sample_prioritized(args.batch_size)   # 有偏抽签
+            else:
+                batch = buffer.sample_uniform(args.batch_size)       # 均匀对照
+            stats = agent.update(batch, args)
+            td_mean = float(np.mean(stats["td_error"]))
+            td_recent.append(td_mean)
+            if mode == "prioritized":
+                buffer.update_priorities(batch["idx"], stats["td_error"])</code></pre>
+    <p>解读：这段 10 行是两种模式的唯一分叉点：<strong>采样</strong>不同（分段抽签 vs 均匀）、<strong>回写</strong>只在 prioritized 模式下发生。uniform 模式不写优先级，因此树里的值保持初始状态，这没关系，反正它从不按树抽签。<code>td_recent</code> 累积的 |TD| 均值是"PER 是否生效"的直接证据：prioritized 的批次 |TD| 会显著高于 uniform，因为它专挑没学会的样本。</p>
+
+    <p>完整可运行脚本（附录）：<a href="../code/ch044.py" download>code/ch044.py</a></p>
+    <pre class="sh"><code>python code/ch044.py                              # 两种模式各 20000 步，CPU 约 5–8 分钟
+python code/ch044.py --quick                      # 快速跑通：4000 步/模式，约 1 分钟
+python code/ch044.py --modes prioritized --alpha 0.9   # 只跑优先级模式，调大 alpha</code></pre>
+    <p>预期：<strong>prioritized 早期（4000～8000 步）评估回报明显高于 uniform，批次 |TD| 均值也高出一截</strong>；后期两者差距缩小，prioritized 的最终评估甚至可能略低，它方差更大。alpha 调得过大（接近 1.0）时会看到"反复训练少数离群样本、后期震荡"的典型症状。以实跑为准。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>新样本优先级给 0</strong>：优先级为 0 的叶子永远抽不到，新数据进不了训练，价值函数停在旧分布上。修复：用当前 <code>max_priority ** alpha</code> 初始化。</li>
+      <li><strong>忘了重要性权重</strong>：只按 P(i) 采样、损失不乘 w，优化目标被悄悄换成了加权分布，Q 朝高误差样本过拟合，症状是后期评估震荡、|Q| 尺度漂移。修复：加权 + 归一化，一样不能少。</li>
+      <li><strong>权重没有归一化</strong>：w=(N·P)<sup>−β</sup> 的量级可以到几百，直接把 Q 损失放大，梯度爆炸。修复：除以 <code>weights.max()</code>，保持与均匀模式可比的损失尺度。</li>
+      <li><strong>SumTree 下标对不上</strong>：树有 2N−1 个节点，叶子下标是 <code>i+N−1</code>。若按 <code>i+N</code> 换算，采样索引整体错位一格，训练会用到错误的 next_obs，不报错、只表现为学得慢，极难排查。</li>
+      <li><strong>容量变化后树没重建</strong>：训练中途改容量但保留旧树，节点数与新数组不匹配，祖先和全部失真。修复：容量属于构造参数，改动时从零重建。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把 <code>--alpha</code> 依次设为 <code>0.0</code>、<code>0.6</code>、<code>1.0</code> 跑 <code>--modes prioritized</code>。alpha=0 时结果应该与 uniform 一模一样吗？为什么？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>alpha=0 时所有优先级为 1，抽签退化为等权；w=(N·P)^(−β)=1。理论等价，但随机数消耗路径不同，结果只是统计等价，不是逐位相同。</div></details>
+      </li>
+      <li>把 <code>--beta-steps</code> 设为 <code>500</code> 再跑 prioritized，观察批次 |TD| 与评估回报的变化。β 太早收紧到 1 有什么副作用？<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>β=1 时高优先级样本权重被压得很小，等效于"选中了难样本却不怎么学它"。对照 beta 日志爬到 1.0 的步数与评估曲线拐点。</div></details>
+      </li>
+      <li>先预测再验证：把 <code>--buffer-size</code> 从 100000 缩到 10000，uniform 与 prioritized 的相对差距会扩大还是缩小？说明推理。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>小池子新样本比例更高、整体 |TD| 更大，"均匀采样漏掉难样本"的问题被稀释，预期 PER 的边际收益变小。跑完对照达标步数验证。</div></details>
+      </li>
+      <li>在 <code>update_priorities</code> 里把新优先级改成与旧优先级的滑动平均（如 0.5·p_old + 0.5·p_new），重跑实验，解释对稳定性的影响。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>旧值可从 <code>self.tree[self._leaf(i)]</code> 读出。平滑后优先级变化更慢，离群样本不会突然霸占采样池，但响应课程变化的速度也变慢。</div></details>
+      </li>
+      <li>把 PER 用在第 042 章的 <code>single</code> 估计器上（单 Q）。过估计偏差会变大还是变小？结合"高 TD 样本被反复抽"给出推理并设计验证。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>把 ch042 的 <code>combine</code> 接过来设为 single，其余保持本章代码；单 Q 的自举误差被高误差聚焦放大，用 ch042 的 <code>measure_q_bias</code> 每 4000 步对账一次即可看到 bias 曲线的变化。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>优先级回放把采样概率指向 TD 误差大的样本，把梯度花在"还没学会的题"上，早期收敛更快，代价是方差与调参复杂度上升。</li>
+      <li>比例优先级的两个旋钮：<strong>α 决定优先强度，β 退火修正有偏采样</strong>；缺一不可，且 β 必须按采样批次数推进。</li>
+      <li>SumTree 让"按权重抽签"和"更新优先级"都是 O(log N)，10 万容量的树深约 17 层，这是能用在真实回放池上的关键。</li>
+      <li>Q 损失改为重要性加权 MSE，策略与温度不动；批次 |TD| 均值是 PER 是否生效的直接证据。</li>
+      <li>四条样本的算例显示：α=0.6 时最高优先级样本的抽中概率约为均匀的 1.9 倍，β 从 0.4 升到 1.0 会把它对应的权重从 0.59 压到 0.27，修正力度随退火增强。</li>
+      <li>PER 的账要两头算：早期达标更快，后期方差更大、调参更繁；是否采用取决于任务更缺样本还是更缺稳定。</li>
+      <li>下一章离开数据侧，回到策略本身：SAC 如何在"多探索"和"多利用"之间取舍，温度系数、log_std 下限与动作分布的关系将放在同一个框架里讨论。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch043.html">← 第 043 章：SAC的样本复用与经验回放</a>
+    <a class="next" href="ch045.html">第 045 章：SAC的探索与利用平衡 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

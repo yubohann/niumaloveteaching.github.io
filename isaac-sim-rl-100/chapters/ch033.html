@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第033章 实现模仿学习 | 机器人仿真学习课程 · Isaac Sim 强化学习训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 任务与技能实现</span>
+    <span class="sep">/</span>
+    <span>第 033 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 任务与技能实现</div>
+    <h1>第 033 章：实现模仿学习</h1>
+    <p class="lead">向专家借捷径：录制示教轨迹 → 行为克隆热身 → RL 微调，兼谈协变量漂移这个模仿学习的第一性缺陷。</p>
+    <ul class="meta">
+      <li>主题：任务实现 / 示教数据与学习</li>
+      <li>相关组件：Isaac Sim、PyTorch、Stable-Baselines3</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 032 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解模仿学习的定位：当探索比学习更难时，用示教数据直接给出"好动作长什么样"。</li>
+      <li>掌握行为克隆（BC）的监督学习形式与它的致命缺陷，协变量漂移（compounding error），以及 DAgger 如何修补。</li>
+      <li>会在 Isaac Sim 里生成示教数据的三条来源（脚本策略、运动规划、遥操作）并录制成规范的数据集。</li>
+      <li>会组合"BC 预热 + RL 微调"的训练配方，并说清哪种算法（SAC / PPO）该配哪种用法。</li>
+      <li>能诊断模仿学习的典型失败：动作语义不对齐、只学平均动作、分布外状态崩塌。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>课程学习让探索变容易，但没有改变"从零探索"的成本结构。有些任务即使难度可调，从零学会仍然昂贵：插孔需要毫米级对准、接线需要长时序操作、开门前要先抓到小而滑的把手，这些任务里连"随机试错碰到正确路径"的概率都低得可怜。<strong>模仿学习换了个思路：既然人类（或一个脚本教师）演示一次只要几秒，为什么不直接把演示变成训练数据？</strong></p>
+    <p>它在本课程体系里的位置很特别：第 034 章的逆运动学、第 035 章的运动规划都是天然的"教师"，它们在仿真里能轻松给出专家轨迹；而强化学习负责补上教师做不到的部分（对抗随机化、优化最终成功率、适应接触）。<b>"教师给方向、RL 给优化"是工业界操作任务最常见的组合拳。</b>本章把数据面讲透：怎么录、怎么学、怎么和 RL 缝合。</p>
+  </section>
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 行为克隆：看起来像监督学习，但它不是</h3>
+    <p>BC 的目标直白：给定专家数据集 D = {(s<sub>i</sub>, a<sub>i</sub>)}，训练策略最大化动作似然（或最小化回归误差）：</p>
+    <div class="formula">
+      L<sub>BC</sub>(θ) = − E<sub>(s,a)~D</sub> [ log π<sub>θ</sub>(a | s) ]（离散）或 E[ ‖π<sub>θ</sub>(s) − a‖² ]（连续）
+      <span class="note">形式上是监督学习，但数据分布是"专家访问的状态分布"，而部署时策略自己访问的状态分布会漂移</span>
+    </div>
+    <p>关键差异在数据分布：监督学习里测试分布与训练分布一致；BC 里策略一旦偏离专家轨迹，它看到的状态就<b>不在</b>训练集里，预测随之变差；变差导致偏得更远，这就是协变量漂移（covariate shift）。更精确的代价估计：若单步模仿误差为 ε，专家轨迹每步都能纠错，误差随步数线性累积 O(Tε)；而 BC 策略没有纠错机制，误差按平方累积 O(T²ε)，<strong>同样的单步精度，闭环表现可以差一个数量级，且回合越长越糟。</strong>这也解释了为什么纯 BC 在 100 步的插孔任务里往往"看起来学会了，跑起来一步错步步错"。</p>
+
+    <h3>2. DAgger：把"学生去过的状态"补上专家标签</h3>
+    <p>DAgger（Dataset Aggregation）用一个迭代循环修补分布漂移：让当前策略去跑环境，在它访问到的每个状态上问专家"你会怎么做"，把新的 (s, a*) 加进数据集再训练：</p>
+    <div class="formula">
+      D<sub>i+1</sub> = D<sub>i</sub> ∪ { (s, a*(s)) : s ~ d<sub>π<sub>i</sub></sub> }，  π<sub>i+1</sub> = BC( D<sub>i+1</sub> )
+      <span class="note">数据分布从"专家分布"逐步转向"策略实际分布"；理论上 DAgger 把遗憾的累积从平方压到随迭代次数线性</span>
+    </div>
+    <p>在仿真里 DAgger 的成本很低：专家的纠错标签可以由 IK/规划器在线算出，这正是第 034/035 章技能的价值。实践要点：每轮只增一部分新数据（如每轮 20%）；训练时用全部数据；如果在线专家不总是可用，就退化为"离线 DAgger"，固定几轮迭代而已。</p>
+
+    <h3>3. 数据的四种来源与质量陷阱</h3>
+    <table>
+      <tr><th>来源</th><th>做法</th><th>优点</th><th>陷阱</th></tr>
+      <tr><td>脚本策略</td><td>用 IK 走到目标 + 简单抓取逻辑</td><td>零成本、可无限生成</td><td>脚本会失败的位置要不录（只录成功段）</td></tr>
+      <tr><td>运动规划</td><td>RRT/规划器生成无碰轨迹回放</td><td>轨迹平滑、覆盖全工作区</td><td>规划出的是路径不是控制，需要跟踪器转成动作</td></tr>
+      <tr><td>遥操作</td><td>人类用键盘/手柄/VR 控制</td><td>行为自然、含人类偏好</td><td>慢；控制频率与 RL 不一致要重采样</td></tr>
+      <tr><td>RL 引导</td><td>先跑弱 RL 收集"部分成功"轨迹</td><td>分布匹配好</td><td>只有成功轨迹才该当正样本</td></tr>
+    </table>
+    <p>质量纪律：<b>(1) 只录成功轨迹</b>，失败段混入数据会教策略重复错误；(2) 动作语义与 RL 完全一致（增量还是绝对、缩放系数、控制频率），否则学出的是"另一个动作空间"的映射；(3) 覆盖面优先于条数，1000 条只在同一区域打转的轨迹，比不上 200 条覆盖工作区四角的轨迹。</p>
+
+    <h3>4. 完整算例：协变量漂移的累积账</h3>
+    <p>把第 1 节的 O(Tε) 与 O(T²ε) 两个量级列成表（ε=0.01 的动作单位误差）：</p>
+    <table>
+      <tr><th>回合长度 T</th><th>有纠错（线性 Tε）</th><th>纯 BC（平方 T²ε）</th><th>倍数</th></tr>
+      <tr><td>10</td><td>0.10</td><td>1.0</td><td>10×</td></tr>
+      <tr><td>50</td><td>0.50</td><td>25</td><td>50×</td></tr>
+      <tr><td>100</td><td>1.0</td><td>100</td><td>100×</td></tr>
+      <tr><td>200</td><td>2.0</td><td>400</td><td>200×</td></tr>
+    </table>
+    <p>这张表的用法是"反推可接受的回合规摸"：若任务允许的累计偏差是 0.05 个动作单位，有纠错的系统可以撑 5 步，纯 BC 只能撑约 2.2 步；把单步误差从 0.01 压到 0.001，纯 BC 的可行回合长度按平方根改善（约 7 步），仍不足以完成 100 步的任务。<strong>结论：纯 BC 的可行域只覆盖"短回合 + 高单步精度"的小角落</strong>；100 步级的任务必须引入纠错数据（DAgger）或 RL 微调，把误差累积从平方拉回线性。这也是"BC 预热 + RL 微调"配方在操作任务里比纯 BC 常见得多的原因。</p>
+
+    <h3>5. 演示覆盖的量化：轨迹间距与分布外半径</h3>
+    <p>"覆盖面优先于条数"可以换算成一个间距指标。工作区面积按 0.8×0.8 m 计（可视作 0.64 m² 的代表面），N 条轨迹近似均布时，相邻轨迹的典型间距 ≈ √(A/N)：</p>
+    <table>
+      <tr><th>轨迹条数 N</th><th>典型间距</th><th>含义</th></tr>
+      <tr><td>50</td><td>11.3 cm</td><td>偏离演示 10 cm 的状态已属分布外</td></tr>
+      <tr><td>200</td><td>5.7 cm</td><td>与 5 cm 级成功阈值同档，勉强够用</td></tr>
+      <tr><td>800</td><td>2.8 cm</td><td>分布外半径压到 3 cm 内，RL 微调负担大减</td></tr>
+    </table>
+    <p>读法：这条算术给出了"200 条演示"推荐值的来处，它来自"间距与成功阈值同量级"的推导。若任务的工作区更小或轨迹更集中，所需条数按面积与轨迹方差缩放；若演示都挤在同一角落，实际间距远大于表格值，BC 在别处的表现无从保证。与 RL 微调的关系：<strong>分布外半径越小，RL 需要自己补的状态区域越小，微调阶段就越短</strong>，这正是"演示覆盖投资回报"的机制。</p>
+
+    <h3>6. 缝合 RL 的三种方式</h3>
+    <ul>
+      <li><b>BC 预热 + RL 微调</b>：先 BC 到损失平台期，再用 RL 继续训（PPO 最常用）。本质是给探索一个好起点；缺点是 RL 的梯度会把 BC 先验磨掉（若无约束），微调学习率要小。</li>
+      <li><b>演示数据进回放缓冲区</b>：off-policy 算法（SAC/TD3）把演示 transition 混入经验回放，并给演示样本更高的采样权重（如 20% 概率抽演示）。数学上等价于"有社会经验的 Q 学习"，效果通常最好，代表作是 DDPGfD 一系。</li>
+      <li><b>演示做有效探索种子</b>：on-policy 场景里，把演示直接当成"初始 rollout"灌入，或在奖励里加"接近演示动作"的塑形项。最轻量、也最脆弱。</li>
+    </ul>
+    <p><strong>算法匹配结论：连续控制任务优先"BC 预热 + SAC 混演示缓冲"；需要并行吞吐或部署到 on-policy 生态时用"BC 预热 + PPO 小步微调"。</strong>后者要在微调时监控"BC 损失回升"：如果任务成功率上不去而 BC 损失快速回退，说明先验被磨掉，应降低学习率或加入 KL 锚定项。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p><strong>完整实现分四段：录制 → 清洗与对齐 → BC 训练 → RL 缝合。</strong>每段的检查点都围绕"数据分布"这个核心变量。</p>
+    <ol>
+      <li><strong>录制</strong>：用脚本策略/规划器驱动环境，控制频率固定 60 Hz，逐步存 (obs, action, reward, next_obs, done, meta)。meta 里记随机种子与场景参数，方便后续切片分析。</li>
+      <li><strong>清洗</strong>：丢弃失败段（按终局奖励筛）、丢弃近零动作段（死时间）、对重复样本去重；统计动作分布（直方图）检查覆盖面。</li>
+      <li><strong>BC 训练</strong>：MSE 损失（连续）或交叉熵（离散）；观测用与 RL 完全相同的归一化管线；早停看"验证集动作误差"不再下降。</li>
+      <li><strong>RL 缝合</strong>：把演示转换到与 RL 同一缓冲区格式，按权重混采；或把 BC 网络权重直接灌给 RL 策略网络（层结构一致时），再小学习率微调。</li>
+    </ol>
+    <table>
+      <tr><th>设计点</th><th>推荐值</th><th>理由</th></tr>
+      <tr><td>演示条数</td><td>200 条轨迹 / 2–3 万 transition</td><td>覆盖工作区所需的最低量级；再多边际收益小</td></tr>
+      <tr><td>轨迹长度</td><td>与 RL 回合长度一致（如 100 步）</td><td>避免训练/部署时间尺度错位</td></tr>
+      <tr><td>BC 训练轮数</td><td>到动作 MSE 平台期（约 50–200 epoch）</td><td>过拟合演示分布后 RL 更难逃出局部解</td></tr>
+      <tr><td>微调学习率</td><td>RL 常规值的 1/3–1/10</td><td>保护先验不被第一波梯度冲掉</td></tr>
+      <tr><td>混采比例</td><td>演示占采样 20%</td><td>太少会被忘记，太多会让策略困在演示分布里</td></tr>
+      <tr><td>验证集划分</td><td>按轨迹划分（非按样本）</td><td>同一轨迹的相邻样本高度相关，按样本划分会泄漏</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计思维：把"教师做不到的"留给 RL</span>
+      <p>一个经验判据：<strong>教师能覆盖的状态，BC 学；教师覆盖不到的状态（随机化后的极端参数、被撞歪的场景、接触摩擦细节），RL 补。</strong>所以演示数据的价值不在"完美"，而在"覆盖起点的多样性"：录制时主动做域随机化（位置、质量偏移），让 200 条轨迹各自落在不同场景里，这等于把"分布外"提前变成了"分布内"。相反的失败模式是 200 条几乎一样的轨迹：BC 学得再准，RL 微调时依然要从零面对扰动。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：演示录制，格式与语义对齐</strong></p>
+    <pre class="code"><code>import torch, h5py
+import numpy as np
+
+class DemoRecorder:
+    """录制专家轨迹：动作语义必须与 RL 完全一致，否则学出的是另一套映射"""
+    def __init__(self, env, path, obs_dim, act_dim):
+        self.env = env
+        self.f = h5py.File(path, "w")               # HDF5：分轨迹存，方便按轨迹切验证集
+        self.obs_buf, self.act_buf, self.rew_buf = [], [], []
+        self.obs_dim, self.act_dim = obs_dim, act_dim
+
+    def record_step(self, obs, action, reward, done):
+        # 关键纪律：存的 action 是"策略口径"的动作（如 (-1,1) 的增量），
+        # 不是关节角目标：BC 要学的是 RL 空间里的动作，转换在环境侧做
+        self.obs_buf.append(obs.cpu().numpy())
+        self.act_buf.append(action.cpu().numpy())
+        self.rew_buf.append(float(reward))
+        if done.any():             # 整批同步（单环境录制模式）：一集结束即落盘
+            self._flush_episode()
+
+    def _flush_episode(self):
+        success = self.rew_buf[-1] &gt; 0.0            # 只保存成功轨迹：
+        if success:                                # 失败段附带的"坏动作"会教错误行为
+            g = self.f.create_group(f"demo_{len(self.f.keys()):04d}")
+            g.create_dataset("obs", data=np.stack(self.obs_buf))
+            g.create_dataset("actions", data=np.stack(self.act_buf))
+            g.attrs["episode_return"] = float(sum(self.rew_buf))
+            g.attrs["seed"] = self.env.current_seed  # 记录随机种子：复现与切片分析用
+        self.obs_buf, self.act_buf, self.rew_buf = [], [], []</code></pre>
+    <p>解读：录制的每个决策都服务下游的 BC。<b>"action 存策略口径"是本章第一号坑</b>：录制脚本自然记的是"关节目标角"（便于回放），但 BC 要输出的是 RL 的动作（如 (−1,1) 的位置增量），两种口径差了缩放、积分与坐标系，直接拿错的就是"学出另一套映射"。统一做法：让录制走和 RL 相同的动作接口，存转换前的动作。<b>为什么只存成功轨迹？</b>BC 是模仿"专家怎么做"，把专家失败的片段当示范会教策略重复错误；如需利用失败数据，用 RL 或过滤（失败前若干步弃掉）。<b>按轨迹分组的 HDF5 结构</b>不是形式主义：验证集必须按轨迹切分（同一轨迹的相邻帧高度相关），否则准确率高得虚、部署时打脸。<b>种子字段</b>让"哪条轨迹对应哪个随机化场景"可追溯，后面做数据切片分析（发现某类场景覆盖不足）时是硬需求。</p>
+
+    <p><strong>片段 2：BC 训练循环与验证纪律</strong></p>
+    <pre class="code"><code>def train_bc(policy, train_loader, val_loader, epochs=100, lr=3e-4):
+    opt = torch.optim.Adam(policy.parameters(), lr=lr)
+    best_val = float("inf")
+    for epoch in range(epochs):
+        policy.train()
+        for obs, act in train_loader:
+            pred = policy(obs)                    # 连续策略：前向输出均值 μ(s)
+            loss = torch.nn.functional.mse_loss(pred, act)   # 动作回归：BC 的标准目标
+            opt.zero_grad(); loss.backward(); opt.step()
+
+        policy.eval()
+        val_err = 0.0
+        with torch.no_grad():
+            for obs, act in val_loader:           # 验证集按轨迹划分，不是按样本！
+                val_err += torch.nn.functional.mse_loss(policy(obs), act).item()
+        if val_err &lt; best_val:
+            best_val = val_err                    # 只保存验证最优：BC 很容易过拟合演示
+            torch.save(policy.state_dict(), "bc_policy.pt")
+    return best_val</code></pre>
+    <p>解读：这个训练循环很短，但四个纪律要记住。<b>(1) 只回归均值</b>：把 BC 当作确定性映射训练（预测 μ、MSE 回归），不要在这阶段学方差，初始化的 σ 留给 RL 微调时自适应；否则 BC 会把噪声也"学"进策略。<b>(2) 验证集按轨迹划分</b>：同一轨迹相邻帧高度相关，随机划分训练/验证会泄漏，验证误差虚低，你也看不出是否过拟合。<b>(3) 只保存验证最优</b>：BC 训练过久会"背题"（在演示状态上极准、稍微偏移就崩），早停是性价比最高的正则。<b>(4) MSE 的隐忧要心里有数</b>：若演示里同一观测对应多个合理动作（多模态），MSE 会学成它们的平均，夹爪在"从左边抓还是从右边抓"之间"抓空"。检测方法：看动作直方图是否出现演示中不存在的中间值；修复：改用混合密度网络或做动作分桶分类，本章的进阶题会给具体方向。</p>
+
+    <p><strong>片段 3：RL 微调，演示混合进回放缓冲</strong></p>
+    <pre class="code"><code>from stable_baselines3 import SAC
+from stable_baselines3.common.buffers import ReplayBuffer
+import numpy as np
+
+# 1) 建模型（演示数据在训练开始前直接灌入缓冲区）
+model = SAC("MlpPolicy", vec_env, learning_starts=0,  # 已有演示数据：无需随机预热
+            buffer_size=1_000_000, batch_size=256, tau=0.05, device="cuda")
+buf = model.replay_buffer
+
+# 2) 从 HDF5 读取演示，转换到与 RL 相同的 obs/act 口径后写入缓冲
+for grp in demo_file.values():
+    obs = torch.as_tensor(np.array(grp["obs"]), device="cuda")
+    act = torch.as_tensor(np.array(grp["actions"]), device="cuda")
+    rew = torch.zeros(len(obs), 1, device="cuda")     # 奖励留空：训练时按需重算
+    nobs = torch.roll(obs, -1, dims=0)                # next_obs：注意最后一步需 truncation 处理
+    done = torch.zeros(len(obs), 1, device="cuda")
+    done[-1] = 1.0                                    # 轨迹尾部按终止处理（或 truncation）
+    buf.add(obs.cpu().numpy(), nobs.cpu().numpy(), act.cpu().numpy(),
+            rew.cpu().numpy(), done.cpu().numpy(), [{}] * len(obs))
+
+# 3) 训练时以 20% 概率优先抽演示样本：近似等价于"演示经验永不遗忘"
+model.learn(total_timesteps=1_000_000, log_interval=10)</code></pre>
+    <p>解读：把演示灌进缓冲区有三个必须想清楚的细节。<b>(1) 奖励留零也能训练吗？</b>能，但要用"到目标距离"之类的任务奖励在训练时重算（或把演示只当作"动作先验"，Q 值靠真实交互修正）。给演示伪造高奖励是常见错误，会让 Q 函数在演示状态上虚高，策略提前收敛到演示水平就不再提高。<b>(2) next_obs 用 roll 移动时，最后一步的 next_obs 会绕回头帧</b>：必须把该步按"截断"处理（done=1 或 truncation），否则 Q 学习会认为"插到底的任务结尾又回到了初始状态"，价值传播彻底错乱。<b>(3) "20% 概率优先抽演示"的落点</b>：SB3 原版没有这个开关，工程上通常继承 ReplayBuffer 覆写 <code>sample</code>，让演示索引以固定概率被抽中，这就是"演示经验不参与衰减"的实现。若不想改源码，把演示数据重复复制 K 份进缓冲（隐式加权）是等价的土办法，代价是占用缓冲容量。最后提醒：<b>微调前把学习率降到常规的 1/3</b>，让 RL 先在不破坏 BC 先验的范围内探索。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>动作口径不一致</strong>：演示存了关节目标角，BC 学出来的策略却接到 (−1,1) 增量接口上。症状：评估回放时机器人动作幅度明显不对、直接发散。修复：录制与训练共用同一动作转换代码路径。</li>
+      <li><strong>忽略协变量漂移</strong>：纯 BC 在演示状态上误差 0.01，闭环跑 100 步后偏离。症状：离线 MSE 很低、实际成功率极低。修复：DAgger 补纠错数据，或加 RL 微调让策略学会回轨。</li>
+      <li><strong>MSE 学出"平均动作"</strong>：多模态演示（左绕/右绕都可行）被平均成中间轨迹撞障碍。症状：动作直方图出现演示分布里没有的中间值。修复：混合密度头/动作分桶，或把演示按模式分开训练。</li>
+      <li><strong>按样本划分验证集</strong>：相邻帧泄漏，验证误差虚低，看不出过拟合。症状：离线指标优秀、真实部署崩盘。修复：按轨迹分组切分。</li>
+      <li><strong>伪造演示奖励</strong>：给演示 transition 编造高额奖励，Q 函数在演示状态虚高，策略提前固化在演示水平。症状：早期曲线飙升后长期平台。修复：奖励留空重算，或只学动作先验。</li>
+      <li><strong>演示缺"恢复段"</strong>：只录顺畅的成功轨迹，示范里从不出现"偏了怎么救回来"，BC 学不到纠错，环境扰动后无法回到轨迹。症状：仿真里成功率尚可、加噪声或上真机后骤降。修复：录制带扰动的轨迹（故意注入初始偏差与中途推力），或在 DAgger 轮次里让教师覆盖恢复状态。</li>
+      <li><strong>轨迹间距失控</strong>：演示集中在工作区一角，间距指标远超成功阈值（如 15 cm 对 5 cm），评估只在熟悉区好看。修复：按 5 节算间距、检查轨迹空间分布直方图，缺的象限定向补录。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>定量题：单步模仿误差 ε=0.01，回合 100 步。用 O(Tε)（有纠错）与 O(T²ε)（无纠错）分别估计闭环误差量级，并解释差一个数量级的含义。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>线性累积：100×0.01=1 个动作单位；平方累积：100²×0.01=100 个动作单位，量级上已经完全失控，这就是纯 BC 失效的数学原因。</div></details>
+      </li>
+      <li>实验：录 50 条轨迹，分别用"随机 80/20 划分验证集"与"按轨迹 80/20"两种方式训练 BC，对比验证误差曲线与真实成功率，解释差异。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>随机划分的验证误差会明显更低（泄漏），但两者真实闭环成功率可能倒挂，关注"验证误差与真实表现的排名一致性"。</div></details>
+      </li>
+      <li>设计 DAgger 的仿真实现：每轮让 BC 策略跑 20 条轨迹，遇到偏离（与规划器参考轨迹距离 &gt; 5 cm）时调用 IK 教师生成纠错动作。给出数据集增长的曲线预期。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>第一轮之后数据集主要来自"学生状态"；观察每轮新增样本数递减（策略越来越贴近专家）与成功率上升的关系。</div></details>
+      </li>
+      <li>消融实验：微调学习率设成 RL 常规值 vs 1/3 值，监控 BC 先验的保留程度（用固定测试状态上的动作偏差衡量）。哪个配置最终成功率更高？<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>大学习率会快速磨掉先验：若任务本身探索不难，磨掉先验的代价小、收敛可能更快；但若任务难，先验被打碎后很难恢复，结合任务难度解读。</div></details>
+      </li>
+      <li>思考题：为什么"演示缓冲区优先采样"能让经验不遗忘？从优先级经验回放（prioritized replay）的角度写出它与"高 TD 误差优先"的异同。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>两者都在改变采样分布；前者按"来源"固定加权（防遗忘），后者按"惊讶度"动态加权（加速学习）。可以叠加使用，但权重和要归一。</div></details>
+      </li>
+      <li>按 5 节的方法做覆盖规划：工作区 0.6×0.6 m、成功阈值 4 cm，问"间距与阈值同档"需要多少条均布轨迹？再假设演示只能覆盖 60% 的工作区面积，实际所需条数如何变化？<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>N = A/d² = 0.36/0.0016 ≈ 225 条；覆盖 60% 时有效面积变小，其余区域属于 RL 要补的分布外区，要么补录要么接受微调变长。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul>
+      <li>BC 是"以专家状态分布为训练集的监督学习"：单步误差 ε 在闭环里按 T²ε 累积，长回合任务必须配纠错机制或 RL 微调。</li>
+      <li>DAgger 用"学生访问状态 + 专家标签"把分布逐步修正；仿真里教师是 IK/规划器，成本极低。</li>
+      <li>数据四来源（脚本/规划/遥操作/弱 RL），三条纪律：只录成功、动作口径一致、覆盖面优先于条数。</li>
+      <li>RL 缝合三配方：BC 预热 + PPO 小步微调；演示混缓冲 + 优先采样（SAC/TD3）；演示塑形探索。监控"BC 损失回升"判断先验是否被磨掉。</li>
+      <li>下一章动手造教师：实现逆运动学控制，雅可比伪逆与阻尼最小二乘，把"末端去目标点"变成专家的关节动作序列。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch032.html">← 第 032 章：实现课程学习</a>
+    <a class="next" href="ch034.html">第 034 章：实现逆运动学控制 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

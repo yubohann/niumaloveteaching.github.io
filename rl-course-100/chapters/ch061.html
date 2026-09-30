@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第061章 SAC的离线强化学习 | 深度强化学习课程 · PPO、SAC 与多智能体系统</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 离策略方法与 SAC</span>
+    <span class="sep">/</span>
+    <span>第 061 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 离策略方法与 SAC</div>
+    <h1>第 061 章：SAC的离线强化学习</h1>
+    <p class="lead">拔掉环境接口：用"随机 + 脚本专家"的混合行为策略预采 5 万条数据，然后完全离线地训练三种策略，纯行为克隆、朴素离线 SAC、带保守惩罚的 CQL 风格 SAC，看谁能在没有新交互的前提下学到能用的控制器，以及朴素离线 SAC 的 Q 值如何失控膨胀。</p>
+    <ul class="meta">
+      <li>主题：离线强化学习（Offline RL）/ 保守 Q 学习（CQL）</li>
+      <li>关键公式：L<sub>CQL</sub> = λ·𝔼<sub>s</sub>[ logsumexp<sub>a′</sub> Q(s,a′) − Q(s,a<sub>data</sub>) ]</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 060 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解离线强化学习的设定与核心难点：数据分布固定、策略更新会走向数据之外的"外推区"。</li>
+      <li>通过实验观察朴素离线 SAC 的 Q 值虚假膨胀，以及它如何导致策略在评估时崩坏。</li>
+      <li>实现 CQL 风格的保守惩罚：在数据动作上抬高 Q、在策略与均匀采样的 OOD 动作上压低 Q。</li>
+      <li>把行为克隆作为下界基线，建立"离线学习至少不能差于数据质量"的评估习惯。</li>
+      <li>会用"固定探针 Q 均值"追踪 Q 尺度，把"膨胀 → 崩坏"的因果链条变成可观测的曲线。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>真实项目里，与环境交互往往是最贵的环节：医疗试验不能反复试错、自动驾驶不能随便撞、工业设备不允许冒险。离线强化学习（Offline RL）回答的就是这个场景：<strong>手头只有一批历史数据，没有模拟器也没有真机权限，能不能只靠这些数据训练出好策略？</strong></p>
+    <p>本章把第 057 章的脚本专家复用作"行为策略"来生成历史数据，然后<strong>训练阶段完全禁用环境交互</strong>，环境只在评估时打开。这是与前面所有章节都不同的数据范式：数据一旦采完就冻结，样本会被反复采样几千次。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 离线 RL 的困境：外推误差</h3>
+    <p>数据由行为策略 π<sub>β</sub> 产生，记其状态-动作分布为 ρ<sub>β</sub>。训练时的 TD 目标需要查询 (s′, a′) 的 Q 值，但策略 π 会访问 π<sub>β</sub> 从未覆盖的动作：</p>
+    <div class="formula">
+      min<sub>θ</sub> 𝔼<sub>(s,a)∼ρ<sub>β</sub></sub>[ ( Q<sub>θ</sub>(s,a) − ( r + γ·min<sub>j</sub>Q̄<sub>j</sub>(s′, a′) − α·log π(a′|s′) ) )<sup>2</sup> ]
+      <span class="note">问题出在 a′：它由当前策略采样，可能落在 ρ<sub>β</sub> 之外，Q̄ 的估计没有数据支撑</span>
+    </div>
+    <p>外推误差有两个来源：函数逼近（神经网络在无数据区域随意外插）与自举（目标值里的 Q̄ 本身就带误差）。两者叠加，再被策略的最大化倾向放大，Q 估计会系统性偏高：本实验里探针 Q 全程为负，但与真实回报的差距会从几十点扩大到数百点，而评估回报毫无同步改善。这就是"离线 SAC 必须先解决保守化"的原因。</p>
+
+    <h3>2. CQL 保守惩罚</h3>
+    <p>保守 Q 学习（Conservative Q-Learning, CQL）的解法直接：给 Q 加一个惩罚项，把 OOD 动作的价值压低、把数据动作的价值抬起来：</p>
+    <div class="formula">
+      L<sub>CQL</sub> = λ · 𝔼<sub>s∼𝒟</sub>[ logsumexp<sub>a′</sub> Q(s, a′) − Q(s, a<sub>data</sub>) ]
+      <span class="note">第一项压低策略动作族；第二项抬高数据动作；logsumexp 是"软最大值"，比 max 更平滑</span>
+    </div>
+    <p>符号说明：a<sub>data</sub> 是数据集里的真实动作，a′ 是 OOD 候选（策略采样 + 均匀采样），λ 是惩罚强度。这样 Q 值会形成一个"数据动作高、OOD 动作低"的保守下界。策略更新时，唯一能获得高 Q 的区域就贴着数据分布，自然限制在 ρ<sub>β</sub> 附近。logsumexp 的梯度覆盖所有 OOD 动作，比取 max 只在单个动作上给梯度更稳定。</p>
+
+    <h3>3. 行为克隆下界</h3>
+    <p>行为克隆（Behavior Cloning, BC）只做监督回归 min ‖π(s) − a<sub>data</sub>‖²，完全不碰奖励与 Q。它没有外推问题，但也学不过数据的平均水平。把它放进对比表的意义是：<strong>离线 RL 算法只有明显超过 BC，才证明它真的在"利用奖励结构"；没超过这条线，它做的事与更花哨的模仿无法区分</strong>。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+
+    <h3>数据流</h3>
+    <p>主流程两步。<strong>采集</strong>：混合行为策略（70% 专家动作加 σ=0.5 噪声 + 30% 随机动作）在环境中采集 5 万条转移，连同行为策略回报一起定格。<strong>训练</strong>：三种方法（bc / sac / cql）同种子各做 8000 次梯度更新，每 2000 次更新评估一次；sac 与 cql 还额外记录固定 512 条探针的 min(Q1,Q2) 均值。评估环境与训练完全隔离。</p>
+
+    <h3>模块划分</h3>
+    <table>
+      <tr><th>组件</th><th>职责</th><th>关键点</th></tr>
+      <tr><td><code>collect_dataset</code></td><td>混合行为策略采集固定数据集</td><td>70% 专家动作（σ=0.5）+ 30% 随机动作，兼顾质量与覆盖</td></tr>
+      <tr><td><code>SAC.bc_update</code></td><td>纯模仿学习基线</td><td>只优化策略均值动作的 MSE；不构造 Q 更新</td></tr>
+      <tr><td><code>SAC.update(..., cql_coef=0)</code></td><td>朴素离线 SAC 与 CQL 共用一条路径</td><td>cql_coef=0 时退化为标准 SAC；大于 0 时叠加保守惩罚</td></tr>
+      <tr><td><code>probe_q</code></td><td>固定 512 条探针的 Q 均值</td><td>追踪 Q 尺度随时间的变化，是"看穿"膨胀的关键指标</td></tr>
+      <tr><td>评估协议</td><td>每 2000 次更新评估 5 回合</td><td>环境只在评估中使用，绝不给训练补充数据</td></tr>
+    </table>
+
+    <h3>关键超参数</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用与取值理由</th></tr>
+      <tr><td><code>--dataset-size</code></td><td>50000</td><td>约 250 个回合；太小会让离线问题更病态</td></tr>
+      <tr><td><code>--random-frac</code></td><td>0.3</td><td>数据中随机动作比例；太高降低质量，太低覆盖不足</td></tr>
+      <tr><td><code>--train-steps</code></td><td>8000</td><td>梯度更新次数（注意：不是环境步数）</td></tr>
+      <tr><td><code>--cql-coef</code></td><td>1.0</td><td>保守惩罚强度；太小压不住膨胀，太大会过度悲观</td></tr>
+      <tr><td><code>--cql-samples</code></td><td>8</td><td>每状态 OOD 采样数（策略与均匀各一份，共 16 个动作）</td></tr>
+    </table>
+
+    <h3>与前一章的差异点</h3>
+    <ul>
+      <li>第 060 章还需要环境做 MPC 滚动预测；本章<strong>训练阶段完全禁用环境交互</strong>，是数据范式的转变。</li>
+      <li>新增离线数据集采集器、BC 更新、CQL 惩罚与 Q 值探针。</li>
+      <li>指标从"回报 + 耗时"扩展为"回报 + Q 尺度"的联合诊断。</li>
+      <li>评估协议与第 062 章保持一致，方便直接对比在线与离线。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：混合行为策略与固定数据集</strong></p>
+    <pre class="code"><code>def collect_dataset(n_transitions: int, seed: int, noise: float, random_frac: float):
+    """用混合行为策略采集固定数据集，返回 (ReplayBuffer, 行为策略平均回报)。"""
+    env = make_pendulum(seed)
+    obs_dim = env.observation_space.shape[0]
+    act_dim = env.action_space.shape[0]
+    buffer = ReplayBuffer(n_transitions, obs_dim, act_dim)
+    rng = np.random.default_rng(seed)
+    obs, _ = env.reset()
+    ep_ret = 0.0
+    ep_returns = []
+    while buffer.size &lt; n_transitions:
+        if rng.random() &lt; random_frac:
+            action = env.action_space.sample()            # 30% 随机：保证覆盖
+        else:
+            action = expert_action(obs) + rng.normal(0.0, noise, size=1).astype(np.float32)
+            action = np.clip(action, -2.0, 2.0).astype(np.float32)   # 70% 专家：保证质量
+        next_obs, rew, terminated, truncated, _ = env.step(action)
+        buffer.add(obs, action, rew, next_obs, float(terminated))
+        obs = next_obs
+        ep_ret += rew
+        if terminated or truncated:
+            ep_returns.append(ep_ret)
+            ep_ret = 0.0
+            obs, _ = env.reset()
+    return buffer, float(np.mean(ep_returns[-30:]))</code></pre>
+    <p>解读：<strong>（1）</strong>行为策略是"质量与覆盖"的折中：纯专家数据回报高，但状态分布窄，CQL 的保守惩罚会过度收紧；纯随机数据覆盖广，但 BC 的下界太低。30% 随机 + 70% 带噪专家是教学版的甜点。<strong>（2）</strong>采集用的 <code>ReplayBuffer</code> 与训练时<strong>共用同一个结构</strong>：训练时只读、采样反复取批，<code>add()</code> 再也不会被调用，这正是"离线"的含义。<strong>（3）</strong>返回行为策略的平均回报（最后 30 回合）：它是数据集质量的口径，也是后面判断"算法有没有超过数据"的基准线。<strong>（4）</strong>数据一旦采完就冻结，样本会被反复采样几千次，同一批 transition 的误差被反复自举放大，这是离线问题的病根。</p>
+
+    <p><strong>片段 2：CQL 保守惩罚，压低 OOD、抬高数据动作</strong></p>
+    <pre class="code"><code>        if cql_coef &gt; 0.0:
+            # 保守惩罚：抬高数据动作的 Q、压低 OOD（策略采样+均匀采样）的 Q
+            n_ood = args.cql_samples
+            # 策略采样：对每个状态采 n_ood 个动作
+            obs_rep = obs.repeat_interleave(n_ood, dim=0)  # (B*n, obs)
+            policy_actions, _ = self.policy.sample(obs_rep)
+            uniform_actions = (torch.rand_like(policy_actions) * 2.0 - 1.0) \
+                * self.policy.act_scale
+            ood_actions = torch.cat([policy_actions, uniform_actions], dim=0)
+            obs_rep2 = obs.repeat_interleave(2 * n_ood, dim=0)
+            q1_ood = self.q1(obs_rep2, ood_actions).view(obs.shape[0], 2 * n_ood)
+            q2_ood = self.q2(obs_rep2, ood_actions).view(obs.shape[0], 2 * n_ood)
+            cql1 = torch.logsumexp(q1_ood, dim=1) - q1
+            cql2 = torch.logsumexp(q2_ood, dim=1) - q2
+            q_loss = q_loss + cql_coef * (cql1 + cql2).mean()</code></pre>
+    <p>解读：<strong>（1）</strong>OOD 动作用两个来源：<strong>策略采样</strong>（覆盖策略当前会去的区域）与<strong>均匀采样</strong>（覆盖整个动作空间，包括策略还没去过的角落）。只有策略采样时惩罚范围会随策略漂移，均匀采样补上"盲区"。<strong>（2）</strong><code>repeat_interleave</code> 把每个状态复制 2n 份、与 OOD 动作一一对齐：形状必须严格匹配（B×N），错位会让惩罚打在错误的 (s,a) 上，效果从"保守"变成"随机扰动"。<strong>（3）</strong><code>logsumexp(q_ood, dim=1)</code> 是"软最大值"：数值上比 max 稳定、梯度覆盖所有 OOD 动作；减去数据动作的 Q（<code>q1</code> 是当前批里真实动作的估计）形成"数据高、OOD 低"的挤压。<strong>（4）</strong>惩罚对两个 Q 都施加：min 与 max 的一致保守，避免"一个网络守规矩、另一个偷偷乐观"。</p>
+
+    <p><strong>片段 3：探针 Q 与三种方法的训练节奏</strong></p>
+    <pre class="code"><code>    @torch.no_grad()
+    def probe_q(self, probe: dict) -&gt; float:
+        """固定探针批次的 min(Q1,Q2) 均值：诊断 Q 值是否虚假膨胀。"""
+        q = torch.minimum(self.q1(probe["obs"], probe["act"]),
+                          self.q2(probe["obs"], probe["act"]))
+        return float(q.mean().item())
+
+    def bc_update(self, batch: dict, args) -&gt; dict:
+        """纯行为克隆：只回归数据集里的动作（不使用奖励与 Q）。"""
+        mean_action = self.policy.mean_action(batch["obs"])
+        loss = F.mse_loss(mean_action, batch["act"])
+        self.opt_policy.zero_grad()
+        loss.backward()
+        self.opt_policy.step()
+        return {"bc_loss": loss.item()}
+
+    # train_offline 的训练循环：
+    for step in range(1, args.train_steps + 1):
+        batch = dataset.sample(args.batch_size)       # 数据源永远固定
+        if mode == "bc":
+            stats = agent.bc_update(batch, args)
+        elif mode == "sac":
+            stats = agent.update(batch, args, cql_coef=0.0)
+        else:  # cql
+            stats = agent.update(batch, args, cql_coef=args.cql_coef)
+
+        if step % args.eval_every == 0:
+            eval_ret = evaluate(agent, eval_env, args.eval_episodes)
+            eval_history.append((step, eval_ret))
+            q_mean = agent.probe_q(probe) if mode != "bc" else float("nan")</code></pre>
+    <p>解读：<strong>（1）</strong>探针批次在训练前固定（512 条数据里的 (s,a)）：每次测量的输入不变，Q 均值的变化只归因于网络本身，这是"看穿膨胀"的关键设计。<strong>（2）</strong>真实数据的 Q 应在 −1000～0 之间（Pendulum 的折扣回报尺度）；涨到正几百甚至上千，说明 Q 网络在"赌"未来，朴素离线 SAC 的典型病征。<strong>（3）</strong><code>bc_update</code> 只走策略优化器：不进 Q、不进温度，它不认识奖励，因此没有外推问题，也没有"超越数据"的可能。<strong>（4）</strong>训练循环里<strong>没有任何 <code>env.step</code></strong>：评估用独立的 <code>eval_env</code>，训练与评估完全隔离。三种方法同种子、同数据、同预算，只是损失函数不同，这是控制变量最干净的形态。</p>
+
+    <p>完整可运行脚本（附录）：<a href="../code/ch061.py" download>code/ch061.py</a></p>
+    <pre class="sh"><code>python code/ch061.py                    # 采集 5 万条 + 三种方法各 8000 次更新，CPU 约 3–5 分钟
+python code/ch061.py --quick            # 快速跑通：约 50 秒
+python code/ch061.py --modes sac,cql --cql-coef 4.0   # 体验更强的保守惩罚</code></pre>
+    <p>预期（一次典型实跑读数）：<strong>行为策略平均回报约 −680；BC 收敛到 −530 附近；朴素离线 SAC 的评估在 −1000 与 −200 之间大幅震荡（最好点约 −200、最终回落到 −780），探针 Q 虽为负、与真实回报的差距却高达数百点；CQL 稳定收敛到 −130 附近，探针 Q 保持在 −60 上下、与真实回报的差距明显更小</strong>。CQL 每步多算两批 OOD 动作，训练时间约为朴素版的 2～3 倍。以实跑为准。一次参考运行的结果对照如下：</p>
+    <table>
+      <tr><th>方法</th><th>最好评估</th><th>最终评估</th><th>探针 Q 均值</th><th>用时</th></tr>
+      <tr><td>BC</td><td>约 −535</td><td>约 −535</td><td>不适用</td><td>约 26 s</td></tr>
+      <tr><td>朴素离线 SAC</td><td>约 −200（随后回落）</td><td>约 −780</td><td>约 −50（与真实回报差数百点）</td><td>约 140 s</td></tr>
+      <tr><td>CQL</td><td>约 −130</td><td>约 −130</td><td>约 −60（差距明显更小）</td><td>约 430 s</td></tr>
+    </table>
+    <p>读表顺序：先看 BC 这一行确立"数据质量的下界"，对比朴素 SAC 的"最好点与最终点的落差"（过估计造成的失稳），再看 CQL 的探针 Q 与真实回报是否同步（本运行里两者基本贴合，这正是保守惩罚想要的效果）。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>训练时偷偷用环境补充数据</strong>：那就不再是离线实验。本章的 <code>collect_dataset</code> 只在开头调用一次，训练循环里没有任何 <code>env.step</code>；评估用的环境与训练隔离。</li>
+      <li><strong>把"最好评估"当成离线算法的成绩</strong>：朴素离线 SAC 的最好分数出现在崩坏之前，拿它比较会严重高估方法。报告离线结果必须用稳定后的最终值或多点平均。</li>
+      <li><strong>CQL 的 OOD 动作没有对齐状态</strong>：<code>repeat_interleave</code> 与 <code>view</code> 的形状必须严格匹配（B×N），错位会让惩罚打在错误的 (s,a) 上。</li>
+      <li><strong>BC 基线用采样动作训练，未取均值动作</strong>：采样噪声让回归目标自带方差，BC 学不准；监督项必须用确定性输出（<code>mean_action</code>）。</li>
+      <li><strong>以为 Q 膨胀是"学习太快"</strong>：它是结构性问题（外推 + 自举），调小学习率只能延迟而不能根治；解法是保守化（CQL）或策略约束（TD3+BC）。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把 <code>--random-frac</code> 改成 <code>0.1</code> 与 <code>0.6</code>，重跑三种方法。数据质量与覆盖面如何影响 BC 与 CQL？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>random_frac 越低，行为策略平均回报越高、BC 上限越高，但状态覆盖变窄。观察数据多样性对 CQL 保守惩罚效果的影响。</div></details>
+      </li>
+      <li>把 <code>--cql-coef</code> 从 1.0 调到 0.1 与 4.0，观察探针 Q 与最终评估的变化。保守惩罚的"过犹不及"体现在哪？<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>λ=0.1 时 Q 是否仍缓慢膨胀？λ=4.0 时评估是否落后于 BC？把运行结果与 BC 基线对比即可判断方向。</div></details>
+      </li>
+      <li>把离线 SAC 的更新次数从 8000 提到 20000，观察崩坏发生的时机。是"更新太多"导致的，还是数据外推导致的？<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>崩坏与更新次数强相关，说明外推误差在反复自举中积累。记录探针 Q 超过 0 的首次更新次数，比较两次运行该数字是否一致。</div></details>
+      </li>
+      <li>把 CQL 的均匀采样去掉（只用策略采样），重跑。惩罚的覆盖范围变化如何影响结果？<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>把 <code>uniform_actions</code> 一行去掉、<code>2*n_ood</code> 改为 <code>n_ood</code>。策略采样只覆盖当前策略附近，均匀采样覆盖整个动作空间，后者对"策略还没去过的区域"更有效。</div></details>
+      </li>
+      <li>给离线 SAC 加一个简单的"策略约束"替代 CQL：策略损失里加 λ·MSE(π(s), a<sub>data</sub>)（类似 TD3+BC）。比较它与 CQL 的最终评估与训练成本。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>把 BC 损失直接加到策略损失上（用数据动作做正则），Q 侧不做惩罚。训练便宜，但 λ 很敏感；对比它的探针 Q 曲线是否比朴素版更平。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>离线 RL 的困难来自外推误差：策略查询数据分布外的动作，Q 的估计无约束且被最大化倾向放大。</li>
+      <li>本章实现了纯 BC、朴素离线 SAC、CQL 三种方法，用固定探针的 Q 均值把"Q 膨胀 → 策略崩坏"的链条量化。</li>
+      <li>CQL 的保守惩罚 <strong>λ·(logsumexp Q(s,a′) − Q(s,a<sub>data</sub>))</strong> 把 Q 压回数据支撑的区域，训练成本约为朴素版的 2～3 倍。</li>
+      <li>BC 是评估离线算法的必要基线：只有显著超过行为数据的平均水平，算法才算"用上了奖励信号"。</li>
+      <li>下一章把战线拉齐：同一任务、同一评估协议下对比在线 SAC 与离线 SAC，看看省下的交互量到底值多少性能。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch060.html">← 第 060 章：SAC的模型预测控制结合</a>
+    <a class="next" href="ch062.html">第 062 章：SAC的在线与离线对比 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

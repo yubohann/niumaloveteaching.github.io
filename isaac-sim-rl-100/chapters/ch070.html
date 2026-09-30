@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第070章 实现鲁棒强化学习 | 机器人仿真学习课程 · Isaac Sim 强化学习训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第三篇 · 高级强化学习专题</span>
+    <span class="sep">/</span>
+    <span>第 070 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第三篇 · 高级强化学习专题</div>
+    <h1>第 070 章：实现鲁棒强化学习</h1>
+    <p class="lead">不设违约预算，改为假设"最坏情况会发生"：本章用不确定集上的 max-min 目标、对抗扰动训练与最坏情况评测，训练在参数剧变下性能不塌的策略。</p>
+    <ul class="meta">
+      <li>主题：鲁棒 RL / 对抗训练与最坏情况优化</li>
+      <li>相关组件：Isaac Sim / Isaac Lab / PPO（对抗回路）</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 069 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>会用鲁棒 MDP 的 max-min 形式表述目标，并说清它与域随机化（期望目标）、安全 RL（约束目标）的区别。</li>
+      <li>会构造不确定集：参数区间盒与相关结构，理解集的大小如何决定鲁棒性的"保费"。</li>
+      <li>会实现对抗扰动训练（RARL 风格）：扰动方最小化回报、策略方最大化回报，含强度调度与防压垮机制。</li>
+      <li>会实现实用的"最坏 K 分位加权"鲁棒目标，作为 min-max 的采样近似。</li>
+      <li>会写固定的最坏情况评测协议（参数搜索 + 推力扰动扫描），让不同策略的鲁棒性可比。</li>
+      <li>能诊断 min-max 训练振荡、对抗方过强、评测协议不自洽等典型问题。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 066 章的域随机化优化的是<strong>期望</strong>回报：分布上一个点表现差一点没关系，只要平均高。但机器人有些不友好场景：真机上"最差 5% 的那类扰动"（最大负载、最滑地面、最强侧推）恰恰是任务失败与硬件损伤的来源。对这类风险，期望指标会麻痹你，平均成功率 92% 的步态策略，可能在"负重 + 侧推"组合下直接摔倒。</p>
+    <p>鲁棒强化学习（Robust RL）换一个准则：<strong>在不确定集内的最坏情况下最大化性能</strong>，max<sub>π</sub> min<sub>θ∈Θ</sub> J(π; θ)。它与第 069 章的安全 RL 是两种不同的"防护哲学"：安全 RL 给违规设预算（约束满足问题），鲁棒 RL 要求在看不见的坏世界里也别崩（性能保持问题）。一个策略可以两者都强：低违约率且最坏情况不塌，但那需要把本章与上一章的工具组合使用。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 鲁棒 MDP：把"最坏情况"写进目标</h3>
+    <p>设环境动力学由参数 θ 决定（质量、摩擦、延迟、外力等），不确定集 Θ 是你认为真机可能落入的参数范围。鲁棒目标：</p>
+    <div class="formula">
+      max<sub>π</sub>　min<sub>θ∈Θ</sub>　J(π; θ)
+      <span class="note">先取最坏参数下的表现，再最大化它，策略被"保险"到整个 Θ 上</span>
+    </div>
+    <p>三个目标的关系值得放在一起看：DR 优化 E<sub>θ~p</sub>[J]（平均好），安全 RL 优化 max J<sub>r</sub> s.t. J<sub>c</sub> ≤ d（约束内最好），鲁棒 RL 优化 min<sub>θ</sub> J（最坏也不差）。<strong>DR 是鲁棒的采样近似，但二者不等价</strong>：分布上极端差的 slice 若概率很小，DR 期望几乎不受影响，而 min 会立刻把它暴露出来。</p>
+
+    <h3>2. 不确定集：几何决定保费</h3>
+    <p>Θ 的构造方式是鲁棒训练的"保险合同"。常见两种：<strong>独立区间盒</strong>，每个参数各给区间（质量 [8,12] kg、摩擦 [0.4,1.0]……），实现简单但集合角落（所有参数同时取极值）几乎不可能在真机上同时出现，保守度被放大；<strong>相关结构</strong>，把参数分成"载荷组""地面组"，组内联动、组间独立，或直接用一个低维隐变量 z 生成所有参数（质量与惯量、质心随 z 联动）。推荐后者：<strong>不确定集要覆盖真实可能；覆盖所有数学组合只会无谓放大保守度</strong>。集合大小的代价是明确的：半径越大，最坏点越恶劣，策略越保守，这就是下一节的"保费曲线"。</p>
+    <div class="formula">
+      J(π<sub>rob</sub>) = J(π<sub>nom</sub>) − 保费(Θ)；保费随半径近似线性增长（敏感度 × 半径）
+    </div>
+
+    <h3>3. 三层求解：对抗、采样近似与正则</h3>
+    <table>
+      <tr><th>方法</th><th>机制</th><th>特点</th></tr>
+      <tr><td>对抗训练（RARL）</td><td>扰动方学习"如何让策略最难受"（扰动动作/外力/参数），策略方反制</td><td>能发现人类想不到的坏工况；但需要防压垮</td></tr>
+      <tr><td>最坏分位加权</td><td>每批采样 K 组参数，按 J 排序，梯度按最差 20% 分位重新加权</td><td>实现简单、稳定，是 min 的采样近似</td></tr>
+      <tr><td>正则化</td><td>目标改为 J − β·Var(J<sub>θ</sub>) 或 J − β·CVaR</td><td>把尾部风险直接写进损失，方差可微无对抗</td></tr>
+    </table>
+    <p>工程上常组合使用：以分位加权为主训练回路，周期性地跑对抗扰动作"体检"。RARL 的原始形态是"鲁棒臂 + 对抗臂"两个策略博弈：对抗方观察状态并输出有界扰动 w（如额外力矩），目标是最小化回报；鲁棒方在受扰环境中最大化回报。数学上这是同一 max-min 的随机博弈近似，双方交替更新即可。</p>
+
+    <h3>4. 保费曲线与"不该保的险"</h3>
+    <p>鲁棒化的代价必须量化，否则你会得到一个"什么都防、什么都慢"的策略。做法：训练 3–4 个不同半径的策略，对每个策略测两条曲线，名义性能 J<sub>nom</sub> 与最坏性能 J<sub>worst</sub>。经验形态：半径增大时 J<sub>nom</sub> 缓慢下降、J<sub>worst</sub> 先快速上升后趋平；<strong>选点放在 J<sub>worst</sub> 的平台拐点</strong>，再扩半径只是继续缴保费，不买新保障。另一个必须接受的事实：对不敏感参数（第 066 章敏感度扫描里回报变化小于 1% 的项）做鲁棒化是纯浪费，把 Θ 开在那些维度上只会让网络容量被无意义的保守性吃掉。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>以四足机器人"负重行走 + 随机侧推 + 地面摩擦变化"为例，落地四步：</p>
+    <ol>
+      <li><strong>定义不确定集</strong>：载荷 0–6 kg（含质心偏移 ±3 cm）、地面摩擦 μ ∈ [0.4, 1.0]、侧推冲量 0–40 N·s（持续 0.1 s）、延迟 0–2 步。参数按"载荷组 / 地面组 / 干扰组"三组独立采样，组内联动（载荷同时改变质量与惯量）。</li>
+      <li><strong>训练主回路</strong>：每个并行环境逐回合从 Θ 采样参数（与第 066 章同一个采样器，但评测与目标换成最坏分位）；PPO 的回报损失按"环境内最差 20% 分位"重加权，具体做法是每个更新批次里先算每个环境的折扣回报，排序后只对最差 20% 环境加倍权重。</li>
+      <li><strong>对抗体检</strong>：每 200 个迭代冻结策略，用 2000 次随机搜索在最坏参数组合上评估（见代码片段 2）；如果找到"参数搜索出的最坏点"回报比采样均值低 40% 以上，说明还有没覆盖的坏角落。</li>
+      <li><strong>可选 RARL</strong>：若侧推这类连续干扰是主要威胁，加一个小对抗网络：输入本体状态，输出受限的外力指令（幅值 ≤ 25 N、每 0.5 s 换一次方向），目标函数取负回报；对抗方学习率取策略的 1/3，并用"只有当策略回报高于阈值时才允许增强扰动"的调度防止早期压垮。</li>
+      <li><strong>评测协议</strong>：固定测试集（10 组参数组合 × 20 回合），组合覆盖"名义、单维极端、双重极端"三档；报告每档均值与最差值，以及回放录屏抽查失败模式。</li>
+    </ol>
+    <div class="box key">
+      <span class="box-title">设计思维：对抗方为什么不直接改物理参数？</span>
+      <p>直接改物理参数（质量、摩擦）的对抗搜索成本高，每换一组参数都要重置环境与仿真状态。让对抗方输出"等效外力/力矩扰动"是一个廉价代理：它能近似表示"参数错误的后果"（如摩擦低估等价于额外前向推力），且可微、可高频率变化。理论差分是近似，工程收益是效率，两类扰动在敏感度扫描中通常高度相关。（纯参数对抗见练习 3。）</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：对抗扰动注入与强度调度</strong></p>
+    <pre class="code"><code>import torch
+import torch.nn as nn
+
+class AdversaryPerturber(nn.Module):
+    """输出有界外力扰动：目标是让鲁棒策略难受，但扰动幅度受预算与调度控制。"""
+    def __init__(self, obs_dim=48, act_dim=3, w_max=25.0):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(obs_dim, 128), nn.Tanh(),
+                                 nn.Linear(128, act_dim), nn.Tanh())  # Tanh 天然限幅 ±1
+        self.w_max = w_max                       # 25 N：由硬件能承受的侧推上限标定
+
+    def forward(self, obs, scale):
+        w = self.net(obs) * self.w_max * scale   # scale 是课程学习的扰动强度系数 0→1
+        return w
+
+class AdversarySchedule:
+    """防压垮调度：策略表现富余才允许增强对抗，否则回退扰动强度。"""
+    def __init__(self):
+        self.scale = 0.0
+        self.fail_count = 0
+
+    def update(self, success_rate, threshold=0.7):
+        if success_rate &gt; threshold:             # 策略已能应付当前扰动
+            self.scale = min(1.0, self.scale + 0.1)
+            self.fail_count = 0
+        else:
+            self.fail_count += 1
+            if self.fail_count &gt;= 3:
+                self.scale = max(0.2, self.scale - 0.2)  # 连续崩：回退，保持可学习
+                self.fail_count = 0
+        return self.scale</code></pre>
+    <p>解读：对抗训练最大的工程风险是<strong>早期压垮</strong>：策略还是随机权重时，对手全力输出 25 N 侧推，回报恒为负、梯度全被"站立失败"占满，双方一起学不动。<code>AdversarySchedule</code> 是关键防线：以成功率 70% 为门槛，先让鲁棒策略在弱扰动下站稳，系数按 0.1 步长爬升；连续三次不达标就回退，变相实现"扰动强度的自动课程"。对抗网络用 <code>Tanh</code> 收尾：梯度在输出端仍然非零（饱和区梯度小但不为 0），对抗方能通过梯度连续地学习"多大扰动最有效"；耦合 <code>scale</code> 后，物理上限由 <code>w_max</code> 统一控制，调参只需动一个旋钮。每 0.5 s 换向的实现写在环境侧（对 <code>w</code> 做每 30 步零阶保持），避免高频抖振让仿真求解器失真。</p>
+
+    <p><strong>片段 2：最坏 K 分位加权的鲁棒目标</strong></p>
+    <pre class="code"><code>import torch
+
+def worst_quantile_weights(episode_returns, q=0.2):
+    """把大多数环境的权重压到 1，最差 q 分位的环境权重升高：min 的采样近似。"""
+    n = episode_returns.shape[0]
+    k = max(1, int(n * q))                       # 最差 20% 的个数（至少 1 个）
+    idx = torch.argsort(episode_returns)         # 升序：最差在前
+    weights = torch.ones_like(episode_returns)
+    weights[idx[:k]] = 1.0 + 3.0 * (k - torch.arange(k, device=weights.device)) / k
+    # 最差的那几个权重最高（4 倍），其后线性衰减到 1：平滑过渡，避免只盯单个离群环境
+    return weights / weights.mean()              # 归一化：不改变总梯度尺度，只改变分布
+
+def robust_policy_gradient(loss_per_env, weights):
+    """按环境重加权策略梯度：loss_per_env 是 [n_envs] 的逐环境损失。"""
+    return (loss_per_env * weights).sum()
+
+
+# 训练循环内：
+# ret = discounted_returns(episodes_per_env)      # 每个并行环境的回合回报
+# w = worst_quantile_weights(ret, q=0.2)
+# loss = robust_policy_gradient(policy_losses, w)</code></pre>
+    <p>解读：这是把 min 目标"软化"成可训练形式的标准工程套路，严格取 min 只对单一最差环境求梯度，方差极大且会忽略"次坏"的一整片区域；分位加权让最差 20% 的环境主导更新（权重最高 4 倍），同时保留其余 80% 的正常学习信号。<code>weights / weights.mean()</code> 的归一化很重要：不归一化时总损失尺度会随批次波动，等价于给学习率加噪声；归一化后目标变成"改变梯度方向指向最差切片"，整体尺度保持稳定。权重曲线从 4 线性衰减到 1 的形态是刻意的：如果让权重在分位边界突变（4 和 1 之间跳变），当两个环境回报接近时会来回夺权，表现为训练曲线的高频抖动。实践中 q 取 0.1–0.3，太小等同单个最差样本、太大退化为普通 PPO。</p>
+
+    <p><strong>片段 3：最坏情况评测，随机搜索找"策略的噩梦"</strong></p>
+    <pre class="code"><code>import numpy as np
+
+def worst_case_eval(env, policy, param_space, n_samples=2000, n_episodes=5):
+    """在不确定集内随机搜索最坏参数组合：固定协议，让不同策略可比。"""
+    rng = np.random.default_rng(123)             # 固定种子：所有候选策略面对同一组参数
+    worst = {"return": np.inf, "params": None}
+    best = {"return": -np.inf, "params": None}
+    for _ in range(n_samples):
+        params = {k: rng.uniform(lo, hi) for k, (lo, hi) in param_space.items()}
+        rets = []
+        for _ in range(n_episodes):
+            obs = env.reset(params=params)       # 每组参数跑多次，压测随机性
+            done, ep_ret = False, 0.0
+            while not done:
+                obs, r, done, _ = env.step(policy.act(obs, deterministic=True))
+                ep_ret += r
+            rets.append(ep_ret)
+        mean_ret = float(np.mean(rets))
+        if mean_ret &lt; worst["return"]:
+            worst = {"return": mean_ret, "params": params}
+        if mean_ret &gt; best["return"]:
+            best = {"return": mean_ret, "params": params}
+    # 报告：最坏值、最优值、以及"最坏/最优比"：保费大小的直接度量
+    return {"worst": worst, "best": best, "ratio": worst["return"] / max(best["return"], 1e-9)}</code></pre>
+    <p>解读：评估协议的第一原则是<strong>固定且共享</strong>：固定种子生成同一批候选参数、同一次序、同一初始状态集，任何两个策略都在"同一个噩梦矩阵"上比较，否则策略间的差异里混着抽样噪声。每组参数跑 5 回合是为了把"参数导致的性能下降"与"单次 rollout 的随机性"分开，不重复的话，你可能把一个偶然的差回合误判为最坏点。<code>ratio</code>（最坏/最优比）是鲁棒性的核心读数：接近 1 表示策略对各工况几乎一视同仁（强鲁棒但可能整体保守），接近 0 表示"顺风超神、逆风崩溃"。最后把找到的最坏参数组合写进回归测试：每次策略更新后先在这个点上跑 10 回合，防止迭代中悄悄掉出保障范围。若参数空间维度高、随机搜索效率不够，再升级为 CMA-ES 或对对抗网络做投影梯度搜索（练习 3 会让你实现）。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>只报名义性能</strong>：训练日志里全是平均回报，策略悄悄退化成"对轻度扰动好、对重度扰动崩"，验收才发现。症状是上线后"平时很稳、一遇事就完"。修复：训练全程记录最坏分位与固定评测点的回报，把"最坏值"当第一指标。</li>
+      <li><strong>对抗方太强或太弱</strong>：太强则策略退化为保守蠕动（回报长期低位），太弱则鲁棒性没练出来（评测时一碰就倒）。症状是两条曲线都难看。修复：强度调度 + 对抗方学习率取策略的 1/2 到 1/3 + 设置扰动幅值上限。</li>
+      <li><strong>min-max 同时更新引起振荡</strong>：双方每个迭代都全力回应对方，形成"你强我弱"的极限环。症状是回报曲线周期性起伏。修复：交替更新节奏（策略更新 4 次、对抗 1 次）、对扰动方加权重衰减/熵正则（防止它死盯单一模式）。</li>
+      <li><strong>不确定集过大导致过度保守</strong>：把"可能永远不出现的极端组合"放进 Θ，策略学会慢速小步的"万金油"行为。症状是最坏值不错但名义值大幅下滑。修复：按敏感度与真机数据收窄 Θ；用相关结构替代独立区间盒；画保费曲线找平台拐点。</li>
+      <li><strong>把鲁棒当作域随机化的同义词</strong>：训练用了 DR 就宣称"已鲁棒"。症状是评测挑一组固定最坏工况就露馅。修复：区分两个目标函数（期望 vs 最坏），补上最坏情况评测协议，必要时切换训练目标。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把最坏分位 q 从 0.2 调成 0.05 与 0.5，比较最终的名义/最坏性能，解释曲线含义。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>q=0.05 接近纯 min（方差大、可能只防一个点）；q=0.5 接近普通训练（最坏保障弱）。</div></details>
+      </li>
+      <li>训练"DR 期望目标"与"最坏分位目标"两个策略，在同一个最坏情况评测上对比，给出两者在名义与最坏指标上的数字差异。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>预期 DR 策略名义更高、最坏更低；分位加权策略相反。两列数字就是两种目标函数的"人格"。</div></details>
+      </li>
+      <li>把对抗方从"加外力"改成"直接改参数"（质量、摩擦），提示：用有限差分近似梯度或随机搜索每 100 步更新一次扰动参数。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>参数扰动的响应比力扰动慢但更"系统"；观察它找到的最坏组合是否与你的参数敏感度排序一致。</div></details>
+      </li>
+      <li>画保费曲线：训练质量半宽 Δ∈{5%,15%,25%,40%} 四个策略，测各自名义与最坏回报，找出你任务上的平台拐点。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>用同一评测协议、同一随机种子；拐点之后最坏值不再提升而名义值继续下降，即"多缴的保费没买到保障"。</div></details>
+      </li>
+      <li>设计"侧推恢复"专项测试：在行走中施加 0.1 s、幅值 10/25/40 N 的侧推，记录恢复步数与摔倒率，讨论对抗训练对哪一档提升最大。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>对抗训练通常把"中间档"（训练时见过附近强度）提升最大；超出训练强度上界的档位提升有限，这是"覆盖之外的鲁棒不存在"的直接体现。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>鲁棒 RL 的目标是 max<sub>π</sub> min<sub>θ∈Θ</sub> J：关心最坏情况，平均值仅作参考；与安全 RL（约束）合起来构成"防 Injury + 防 Degrade"的组合。</li>
+      <li>不确定集的几何决定保守度：优先用相关结构（隐变量联动）覆盖真实可能；独立区间盒的数学组合会放大保守度。</li>
+      <li>三种解法：对抗训练（RARL，测搜人类想不到的坏工况）、最差分位加权（稳定主回路）、方差/CVaR 正则（可微无对抗）。</li>
+      <li>工程细节：强度调度防压垮、对抗方降速跑、min-max 时间尺度分离、权重归一化稳定梯度。</li>
+      <li>评测先行：固定种子 + 固定参数网格的最坏搜索协议，报告最坏值与 worst/best 比；把找到的噩梦点写进回归测试。</li>
+      <li>下一章回到学习机制本身：当回报稀疏、环境巨大时，"怎么探索"决定了你能不能学到任何东西，探索策略。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch069.html">← 第 069 章：实现安全强化学习</a>
+    <a class="next" href="ch071.html">第 071 章：实现探索策略 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第040章 联合训练中的正则化技术 | 具身智能学习课程 · VLA 与世界模型联合训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 联合训练进阶与策略能力</span>
+    <span class="sep">/</span>
+    <span>第 040 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 联合训练进阶与策略能力</div>
+    <h1>第 040 章：联合训练中的正则化技术</h1>
+    <p class="lead">联合训练的参数多、有效数据有限，过拟合会以"训练损失低、闭环表现差"的形式出现；本章讲清权重衰减、dropout、指数移动平均与标签平滑的用途分工与实现细节。</p>
+    <ul class="meta">
+      <li>主题：正则化（regularization） / 泛化控制</li>
+      <li>关键公式：L = L<sub>task</sub> + λ·‖θ‖<sup>2</sup>；EMA θ̄ ← τθ̄ + (1 − τ)θ；dropout 期望缩放</li>
+      <li>预计学时：50 分钟</li>
+      <li>前置章节：第 039 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解联合训练中过拟合的三种表现形式，能在指标层面区分过拟合与欠拟合。</li>
+      <li>掌握 AdamW 解耦权重衰减的机制，会按参数类型划分衰减组与非衰减组。</li>
+      <li>掌握 dropout、指数移动平均（Exponential Moving Average, EMA）与标签平滑的作用位置与参数选择。</li>
+      <li>会设计正则化组合方案并评估其与想象稳定性、动作平滑度的相互作用。</li>
+      <li>能诊断 EMA 滞后、dropout 引入动作抖动与衰减误配三类问题。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>联合训练的可用数据通常远小于模型容量：视觉语言骨干为数十至数百兆参数，而机器人轨迹数据以万条量级计。过拟合在这种配比下属于常态，并且表现形式比监督学习更隐蔽：训练损失与单步预测误差持续下降，闭环成功率却停滞或倒退；世界模型记住了训练环境的光照纹理，换场景后想象轨迹迅速发散。</p>
+    <p>正则化（regularization）控制有效容量，让模型优先拟合可迁移的结构。联合训练的特殊之处在于模块耦合：对策略过强的正则化削弱其表达能力，对世界模型过强的正则化降低预测精度，两者都通过想象回路传导。因此正则化需要按模块分工配置，全局统一的做法难以奏效。</p>
+    <p>量级感的例子：骨干 3 亿参数、轨迹数据 1 万条回合、每回合约 100 步，训练样本约 10<sup>6</sup> 条转移，参数与样本之比约 300 : 1；预训练语言模型每参数可摊到数十个 token，两者相差数个量级。这个比例决定了联合训练默认处在过拟合区间，正则化属于基础配置，数据侧的缓解手段（随机化与想象数据）与控制容量并行使用，才构成完整的泛化方案。</p>
+    <p>本章与第 039 章的衔接：学习率调度与正则化共同决定有效容量，调度偏高时正则化可以部分补偿；与第 028 章的区分：随机化从数据侧扩大覆盖，本章从参数与损失侧限制容量，两者是互补的泛化手段。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 过拟合在联合训练中的三类信号</h3>
+    <p>三类可观察的信号：</p>
+    <table>
+      <tr><th>信号</th><th>指标表现</th><th>对应模块</th></tr>
+      <tr><td>想象与真实脱节</td><td>想象回报上升、真实成功率停滞</td><td>世界模型记住训练分布</td></tr>
+      <tr><td>动作分布收缩</td><td>动作熵下降、轨迹多样性丢失</td><td>策略过拟合演示模式</td></tr>
+      <tr><td>跨环境退化</td><td>留出环境指标与训练环境差距扩大</td><td>视觉编码器记忆纹理</td></tr>
+    </table>
+    <p>与欠拟合的区分方法：同时报告训练集与留出集的指标。两者的差值持续扩大是过拟合；两者都差是欠拟合，正则化会加重问题。<strong>正则化强度的一切调整都以"留出指标是否改善"为唯一判据，训练损失的变化不构成依据。</strong></p>
+    <p>留出集的分组标准影响结论方向：训练覆盖组（同分布）检验纯过拟合，偏移组（光照、物体材质、相机位姿三类中每次更换一类）检验泛化缺口。偏移组每个条件至少 30 条轨迹，指标按条件分层报告；两组的差距曲线随时间的变化比单点数值更有信息量，差距早期平稳、后期快速扩大是过拟合启动的标志。</p>
+
+    <h3>2. 权重衰减与参数分组</h3>
+    <p>L2 正则把参数范数加入目标：</p>
+    <div class="formula">
+      L = L<sub>task</sub> + λ · Σ<sub>θ∈Θ<sub>decay</sub></sub> ‖θ‖<sup>2</sup>
+      <span class="note">λ 为衰减系数；AdamW 将其与梯度更新解耦，衰减强度不随自适应学习率缩放</span>
+    </div>
+    <p>分组原则：归一化层参数（LayerNorm 的缩放与偏置）、嵌入层与所有偏置项不参与衰减。原因有两点：这些参数的理想值通常不在零点附近（例如归一化缩放接近 1、偏置作为阈值偏移），向零收缩会直接损害表达；它们参数量占比小、过拟合贡献低。剩余参数（线性与卷积权重）进入衰减组，λ 的起点取 0.01 至 0.05（大模型微调场景）或 1×10<sup>−4</sup>（小规模从零训练）。</p>
+    <p>衰减强度的数值感受：AdamW 的衰减为每步 θ ← θ(1 − ηλ)。η = 1 × 10<sup>−4</sup>、λ = 0.05 时每步收缩因子 0.999995，一万步的累积收缩约 4.9%（(1 − 5 × 10<sup>−6</sup>)<sup>10000</sup> ≈ e<sup>−0.05</sup> ≈ 0.951）；λ 提高到 0.5 时一万步累积收缩约 39%。衰减的作用时间尺度是步数、学习率与 λ 的乘积，与调度联动：退火后期学习率降到峰值的十分之一，同样 λ 下的实际收缩速度同步下降，容量约束随时间自然放松。</p>
+
+    <h3>3. dropout 的位置与模块差异</h3>
+    <p>dropout 在训练时按概率 p 置零激活并缩放，推理时关闭。位置选择决定副作用：</p>
+    <ul>
+      <li><strong>视觉语言骨干的 MLP 层</strong>：p 取 0.1，抑制通道共适应，收益稳定。</li>
+      <li><strong>动作头</strong>：谨慎使用。动作分块输出对时间连续性敏感，训练时的随机置零让相邻时间步的特征被不同子网络处理，解码动作出现高频细节丢失；若必须使用，选择结构化丢弃（按整通道执行）并取 p 不超过 0.05。</li>
+      <li><strong>世界模型动力学核心</strong>：与想象力相关，p 取 0.1 以内，训练后期随误差修正阶段关闭（第 036 章的课程与丢弃调度耦合）。</li>
+    </ul>
+    <p>推理一致性是另一个工程要点：训练与推理的 dropout 状态切换通过模块的 train/eval 模式统一管理，评估脚本遗漏该切换会让指标虚高（多次推理采样产生平均效应）。</p>
+    <p>dropout 的期望与方差可以精确核算：保留概率 1 − p，训练时按 1 / (1 − p) 缩放后激活的期望不变；p = 0.1 时缩放因子 1.111、缩放后的相对方差为 p / (1 − p) = 0.111，p = 0.05 时缩放因子 1.053、相对方差 0.053。动作头被谨慎对待的原因在这个数字里：噪声在连续时间步上独立采样，分块动作的帧间相关性被破坏的程度随 p 上升，动作平滑度对它高度敏感。</p>
+
+    <h3>4. 指数移动平均与标签平滑</h3>
+    <p>EMA 维护参数的平均轨迹：</p>
+    <div class="formula">
+      θ̄ ← τ · θ̄ + ( 1 − τ ) · θ ，τ 为衰减系数（如 0.999）
+      <span class="note">平均后的参数等效于对训练轨迹做低通滤波，抑制随机梯度噪声；τ 越大平均窗口越长</span>
+    </div>
+    <p>EMA 在联合训练中承担双重角色：评估时用平均参数获得更稳的指标；世界模型推进想象轨迹时用平均参数减少单步噪声对长链的累积影响，与第 036 章的误差修正互补。代价是适应滞后：训练分布快速变化时（课程推进、新数据批次换分布），EMA 参数落后于在线参数，需要按训练阶段调整 τ 或使用自适应衰减。<strong>实践中同时维护在线与平均两套参数：训练用在线参数，评估与想象用平均参数，切换逻辑集中在一处实现。</strong></p>
+    <p>EMA 的数值特性：一阶低通滤波下独立同分布梯度噪声的方差被衰减到约 (1 − τ) / (1 + τ) 倍。τ = 0.99 时剩余约 0.5%，等效窗口约 1 / (1 − τ) = 100 步；τ = 0.999 时剩余约 0.05%，窗口约 1000 步；τ = 0.9999 时剩余约 0.005%，窗口约 1 万步。方差抑制与适应滞后同源：窗口越长噪声抑制越强，分布切换后的响应越慢，τ 的选择由训练分布的稳定程度决定。</p>
+    <p>标签平滑用于动作分类头（离散动作场景）：把 one-hot 目标改为 (1 − ε) 的比例分布。ε 取 0.05 至 0.1 时，动作分类的过度自信被抑制，概率输出更可靠（对第 027 章的置信度消费与第 029 章的低置信保持都有利）。副作用是分箱边界的细分精度略降，需要按任务容差评估。</p>
+    <p>标签平滑的数值形态：动作分箱 256 类、ε = 0.05 时正类目标 0.95，其余 255 类各分得 0.05 / 255 ≈ 0.000196；平滑质量 0.05 被摊到全部非正类上。ε 提高到 0.3 时非正类各约 0.00118，目标分布接近平坦，相邻箱之间的差异监督被明显稀释，这是精度先平后降的直接原因；工程上 ε 的上界取"相邻箱动作差异仍可分辨"的最大值，按任务容差逐档测试确定。</p>
+    <h3>5. 五种手段的分工对照</h3>
+    <table>
+      <tr><th>手段</th><th>作用位点</th><th>机制</th><th>主要代价</th></tr>
+      <tr><td>权重衰减</td><td>权重参数</td><td>范数收缩</td><td>有用的大权重被压制</td></tr>
+      <tr><td>dropout</td><td>激活</td><td>随机置零并缩放</td><td>训练与推理行为差异</td></tr>
+      <tr><td>EMA</td><td>参数轨迹</td><td>低通滤波</td><td>分布切换时的滞后</td></tr>
+      <tr><td>标签平滑</td><td>分类目标</td><td>软化 one-hot</td><td>分箱分辨率下降</td></tr>
+      <tr><td>早停</td><td>训练过程</td><td>停止条件</td><td>依赖可信的留出信号</td></tr>
+    </table>
+    <p>五者可以叠加：衰减与 dropout 控制容量，EMA 稳定输出，平滑校准置信，早停兜底。叠加时按模块分工配置并保持克制：每增加一种手段，归因成本上升，消融实验的组合数翻倍，建议的消融粒度停在两两组合。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>正则化方案按模块分工配置，四个工作项：参数分组、dropout 布点、EMA 管理、平滑与早停协议。与第 039 章的差异：039 调节优化步长，本章限制模型的有效容量。</p>
+    <ol>
+      <li><strong>参数分组</strong>：按名称过滤划分衰减组与非衰减组，两组的更新逻辑共用优化器。</li>
+      <li><strong>dropout 布点</strong>：骨干 MLP 0.1、动力学 0.1、动作头不放或结构化 0.05；训练后期按调度衰减到 0。</li>
+      <li><strong>EMA 管理</strong>：维护平均参数副本，每步更新；评估与想象统一走平均参数接口。</li>
+      <li><strong>验收协议</strong>：留出环境分训练覆盖与偏移两组，正则化参数调整只看后者的成功率与动作平滑度。</li>
+    </ol>
+    <h3>超参数起点表</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>权重衰减 λ</td><td>0.05（权重）/ 0（其余）</td><td>抑制大权重</td><td>留出指标的拐点</td></tr>
+      <tr><td>骨干 dropout</td><td>0.1</td><td>抑制通道共适应</td><td>训练与留出损失差</td></tr>
+      <tr><td>动作头 dropout</td><td>0（结构化时 0.05）</td><td>动作平滑度保护</td><td>动作二阶差分统计</td></tr>
+      <tr><td>动力学 dropout</td><td>0.1（末期衰减至 0）</td><td>预测泛化</td><td>想象误差曲线</td></tr>
+      <tr><td>EMA 衰减 τ</td><td>0.999</td><td>参数平均窗口</td><td>指标波动幅度</td></tr>
+      <tr><td>标签平滑 ε</td><td>0.05</td><td>分类置信度校准</td><td>分箱精度与置信可靠性</td></tr>
+      <tr><td>早停窗口</td><td>留出偏移集 3000 步无改善</td><td>终止过拟合训练</td><td>评估预算</td></tr>
+    </table>
+    <div class="box warn">
+      <span class="box-title">注意：正则化无法替代数据</span>
+      <p>留出偏移集指标长期不改善时，提高正则化只能延缓过拟合，无法弥补覆盖缺口。区分方法：正则化调整一轮后若训练集指标下降而留出指标不升，说明容量约束已到位、瓶颈在数据；此时应转向数据采集与随机化扩展，继续加大衰减或丢弃率只会延缓问题。</p>
+    </div>
+    <p>验收清单按顺序执行：其一，核对参数分组后非衰减组的实际权重衰减为零；其二，对比 EMA 参数与在线参数在留出偏移集上的指标差距；其三，检查动作头输出的二阶差分在训练后期是否稳定；其四，确认早停窗口的触发记录与最终保留的检查点一致。四项通过后，正则化配置才允许进入跨版本对比；任何一项变更都记录进训练配置，便于复盘归因。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>以下片段参照公开的正则化实现设计，版本中立；PyTorch 风格，接口随版本演进。</p>
+
+    <p><strong>片段 1：参数分组与 AdamW</strong></p>
+    <pre class="code"><code>import torch
+
+def build_optimizer(model, lr=1e-4, weight_decay=0.05):
+    """按参数类型分组：归一化与偏置不进衰减组，权重进衰减组。"""
+    no_decay, decay = [], []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        # 判定规则：名称含 norm 或 bias 的参数不衰减；嵌入层单独列出
+        if ("norm" in name) or name.endswith("bias") or ("embed" in name):
+            no_decay.append(param)
+        else:
+            decay.append(param)
+    groups = [
+        {"params": decay, "weight_decay": weight_decay},
+        {"params": no_decay, "weight_decay": 0.0},
+    ]
+    # AdamW 的衰减与梯度更新解耦：衰减不经过自适应缩放
+    return torch.optim.AdamW(groups, lr=lr)
+</code></pre>
+    <p>解读：<strong>（1）</strong>按名称过滤是最简单的分组实现，大型项目可维护显式白名单防止命名演进导致的漏分组；<strong>（2）</strong>归一化参数与偏置的理想值远离零，衰减会直接损害表达，这是分组的第一原理；<strong>（3）</strong>两组共用优化器与学习率调度，只有衰减系数不同，保持其余行为一致便于消融；<strong>（4）</strong>嵌入层（语言词表、具身标识表）通常不衰减：稀有 token 的表征被收缩后难以恢复。</p>
+
+    <p><strong>片段 2：EMA 参数管理与评估切换</strong></p>
+    <pre class="code"><code>import copy
+
+class EMAModel:
+    """维护平均参数：训练用在线参数，评估与想象用平均参数。"""
+    def __init__(self, model, decay=0.999):
+        self.decay = decay
+        self.shadow = copy.deepcopy(model)
+        self.shadow.eval()
+        for p in self.shadow.parameters():
+            p.requires_grad_(False)               # 平均参数不参与优化
+
+    @torch.no_grad()
+    def update(self, model):
+        for s, p in zip(self.shadow.parameters(), model.parameters()):
+            # 原地滑动平均：避免每步分配新张量
+            s.mul_(self.decay).add_(p.detach(), alpha=1 - self.decay)
+        # 缓冲量（如归一化统计）直接复制，不做平均
+        for s, b in zip(self.shadow.buffers(), model.buffers()):
+            s.copy_(b)
+
+    def evaluate_with_ema(self, fn, *args, **kwargs):
+        """统一切换入口：评估与想象统一走平均参数，避免遗漏。"""
+        return fn(self.shadow, *args, **kwargs)
+</code></pre>
+    <p>解读：<strong>（1）</strong>平均参数关闭梯度并与在线模型分离，显存成本约等于一份模型副本；<strong>（2）</strong>缓冲量（批归一化统计等）直接复制：统计量本身即是平均语义，再次平均会造成滞后叠加；<strong>（3）</strong>评估入口函数化，任何评估与想象调用都经过同一路径，杜绝"某处忘记切换到 EMA"的问题；<strong>（4）</strong>衰减系数 τ 越接近 1，平均窗口约 1/(1−τ) 步，τ = 0.999 对应千步量级的平滑，与训练分布变化速度匹配。</p>
+
+    <p><strong>片段 3：动作分类头的标签平滑与丢弃调度</strong></p>
+    <pre class="code"><code>import torch.nn.functional as F
+
+def action_ce_with_smoothing(logits, target_bins, n_bins=256, eps=0.05):
+    """动作分箱交叉熵：平滑目标抑制过度自信，便于置信度消费。"""
+    # 平滑目标分布：正类 1-eps，其余 eps/(K-1)
+    loss = F.cross_entropy(logits, target_bins, label_smoothing=eps)
+    return loss
+
+def dropout_schedule(step, total, start=0.1, end=0.0, start_ratio=0.6):
+    """dropout 衰减调度：训练后段关闭丢弃，稳定想象与动作输出。"""
+    ramp_start = int(total * start_ratio)
+    if step &lt; ramp_start:
+        return start
+    progress = min((step - ramp_start) / max(1, total - ramp_start), 1.0)
+    return start + (end - start) * progress     # 线性降到 end
+</code></pre>
+    <p>解读：<strong>（1）</strong>标签平滑用框架内置参数实现，与第 027 章的分箱动作头直接对接；<strong>（2）</strong>平滑幅度 ε 与分箱精度存在权衡，ε 过大会让相邻箱的概率差异被抹平，细粒度动作的选择变模糊；<strong>（3）</strong>丢弃调度在训练后段关闭 dropout，让模型进入"确定性模式"，为世界模型的误差修正阶段（第 036 章）与闭环部署做准备；<strong>（4）</strong>调度按训练步的纯函数形式实现，参数可回放核对，避免训练脚本内散落的状态变量。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>dropout 加在动作头引起抖动</strong>：训练时逐元素丢弃让分块动作的高频细节丢失，推理时又全部恢复，训练与推理行为不一致。修复：动作头不放 dropout，或使用整通道结构化丢弃并限制到 0.05。</li>
+      <li><strong>EMA 衰减过大导致滞后</strong>：训练分布快速变化时平均参数落后，评估指标持续低于在线模型。修复：按阶段调整 τ，课程推进期临时减小；或使用与训练步数联动的自适应衰减。</li>
+      <li><strong>权重衰减误配到归一化与偏置</strong>：全局 weight_decay 应用于所有参数，归一化缩放被持续拉向零。修复：按名称分组，非权重参数设 0 衰减，并用分组计数核对。</li>
+      <li><strong>评估未切换到 EMA 或未切 eval 模式</strong>：指标在两套参数与两种模式间漂移，实验不可复现。修复：统一评估入口函数，训练脚本与评估脚本共用。</li>
+      <li><strong>用正则化掩盖数据不足</strong>：反复加大衰减与丢弃率，训练指标下降而留出指标不动。修复：先固定正则化参数做数据覆盖分析，确认瓶颈在数据侧后转向采集与随机化扩展。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把 EMA 衰减 τ 从 0.999 提到 0.9999。预测评估指标波动、对新数据批次的响应速度与想象轨迹平滑度的变化，并指出上下调整的分界信号。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>波动减小、平滑度提升，但响应变慢、分布切换期的指标滞后明显。分界信号是"评估指标连续落后于在线模型超过一个评估窗口"，出现时应减小 τ 或暂停 EMA 评估。</div></details>
+      </li>
+      <li>推导：在梯度噪声为独立同分布的假设下，证明 EMA 平均把参数方差降低到约 (1−τ)/(1+τ) 倍，并解释 τ 与等效平均步数的关系。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>把 EMA 视为一阶低通滤波，方差传递函数给出一阶近似；等效窗口约 1/(1−τ) 步，τ = 0.999 时约千步，τ = 0.99 时约百步。方差抑制与滞后同源，取舍由噪声水平决定。</div></details>
+      </li>
+      <li>设计正则化消融：权重衰减开 / 关 × EMA 开 / 关四组，在训练覆盖与偏移两组留出集上报告指标，预测每组过拟合信号（想象与真实脱节）的出现概率排序。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>两组全关时该信号出现最早；单开 EMA 对指标平稳帮助大、对泛化帮助有限；单开衰减提升偏移集表现；全开组合最优。排序按偏移集成功率给出。</div></details>
+      </li>
+      <li>把标签平滑 ε 从 0.05 提到 0.3，预测动作分类精度、置信度可靠性与低置信保持机制的触发频率变化，说明 ε 的合理上界由什么决定。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>精度先平后降，置信可靠性提升，低置信触发频率上升；上界由任务对分箱分辨率的容忍（相邻箱动作差异的物理意义）决定，精密任务容忍度低。</div></details>
+      </li>
+      <li>计算：AdamW 下 η = 1 × 10<sup>−4</sup>、λ = 0.05，求一万步的累积收缩比例；再把 λ 改为 0.5 对照，说明衰减的作用时间尺度与学习率调度的关系。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>一万步累积收缩为 1 − (1 − 5 × 10<sup>−6</sup>)<sup>10000</sup> ≈ 4.9%，与 e<sup>−ηλ·步数</sup> 的近似一致；λ = 0.5 时约 39%。作用尺度是 ηλ 乘步数，退火期 η 下降会同步放缓收缩，容量约束随时间自然放松。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul>
+      <li>联合训练的过拟合以想象与真实脱节、动作分布收缩与跨环境退化三类信号出现，判定依据是留出指标。</li>
+      <li>权重衰减按参数类型分组，归一化参数、偏置与嵌入层不衰减；AdamW 的解耦实现是前提。</li>
+      <li>dropout 布点按模块差异配置，动作头慎用，训练后段调度关闭。</li>
+      <li>EMA 同时服务评估与想象，缓冲量直接复制，评估入口函数化保证一致性。</li>
+      <li>标签平滑提升分类置信可靠性，与分箱精度存在权衡。</li>
+      <li>本篇章到此收束：多任务协调、奖励预测、模仿初始化到正则化构成联合训练的完整进阶工具箱；下一章开篇第三篇，从对抗样本鲁棒性开始进入策略与世界模型的深化。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch039.html">← 第 039 章：世界模型的动态学习率调整</a>
+    <a class="next" href="ch041.html">第 041 章：VLA策略的对抗样本鲁棒性 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

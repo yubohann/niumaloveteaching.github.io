@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第053章 实现多任务学习 | 机器人仿真学习课程 · Isaac Sim 强化学习训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第三篇 · 高级强化学习专题</span>
+    <span class="sep">/</span>
+    <span>第 053 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第三篇 · 高级强化学习专题</div>
+    <h1>第 053 章：实现多任务学习</h1>
+    <p class="lead">让一个策略同时学会抓取、推物、开门、插孔：本章讲任务条件化的三种接口（one-hot、嵌入、FiLM 调制）、负迁移的成因与补救，以及奖励尺度归一化为什么是多任务训练的第一刚需。</p>
+    <ul class="meta">
+      <li>主题：高级专题 / 多任务与任务条件化</li>
+      <li>相关组件：Isaac Sim / Isaac Lab / Stable-Baselines3 / PyTorch</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 052 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>能把多任务 RL 写成"任务分布上的期望目标"，并解释它与单任务目标的差别。</li>
+      <li>理解负迁移（negative transfer）的来源：梯度冲突与奖励尺度失衡，会识别它们各自的症状。</li>
+      <li>掌握任务条件化的三种接口：one-hot 拼接、学习嵌入、FiLM 特征调制，并知道各自成本与适用面。</li>
+      <li>会实现逐任务的奖励归一化（Welford 在线统计），说清为什么它是多任务训练的第一刚需。</li>
+      <li>会设计任务采样策略（均匀/加权）与评估协议（逐任务成绩、遗忘、前向/后向迁移）。</li>
+      <li>能判断一个任务家族是否"值得合训"：看共享结构占比，任务数量只作参考。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>前 52 章每个环境训一个策略。但真实机器人不可能带 50 个网络：抓取、推物、开门这些技能共享 90% 的底层能力（接近、对准、抓稳），把它们拆成 50 个独立策略既浪费样本又浪费显存。多任务学习（multi-task RL）的目标是：<strong>一个策略 + 一个任务标识，覆盖一族任务</strong>，并让任务之间互相"借力"，开门学到的对位能力帮助插孔，抓取学到的抓稳帮助堆叠。</p>
+    <p>但多任务不是免费的午餐：不同任务的最优行为可能直接冲突（一个要求"先向左"，一个要求"先向右"），共享的神经网络会收到互相矛盾的梯度，出现所谓的负迁移，合训之后每个任务都不如单独训练。本章讲清冲突的两种来源，并给出工程上最有效的三个抓手：任务条件化、奖励归一化、采样配比。它也是第 054 章（元学习）与第 060 章（注意力）的共同地基。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 多任务目标：从一条曲线到一族曲线</h3>
+    <p>单任务目标是 J(π) = E[Σγ<sup>t</sup>r<sub>t</sub>]；多任务把任务本身变成随机变量 T ~ p(T)，任务携带自己的动力学、奖励与初始分布：</p>
+    <div class="formula">
+      J<sub>multi</sub>(π) = E<sub>T~p(T)</sub> E<sub>轨迹~π,T</sub> [ Σ γ<sup>t</sup> r<sup>(T)</sup><sub>t</sub> ]
+      <span class="note">策略输入从 s 变成 (s, T)：任务描述符是观测的扩展</span>
+    </div>
+    <p>最朴素的实现是"把任务 ID 拼进观测"，这已经把多任务问题转化成了（在扩展状态空间上的）单任务问题。理论上的最优解存在且唯一：π<sup>*</sup>(a | s, T)。真正的难点不在可行性，而在<strong>优化</strong>：一个共享网络要同时拟合多个目标的映射。</p>
+
+    <h3>2. 负迁移之一：梯度冲突</h3>
+    <p>把共享参数记作 θ<sub>shared</sub>，每个任务给出自己的梯度 g<sub>i</sub>。批次里混合多个任务时，更新的方向是这些梯度的平均 ḡ。当 g<sub>1</sub> 与 g<sub>2</sub> 近似反向（点积为负）时，平均后的向量对两个任务都不好：</p>
+    <div class="formula">
+      ḡ = Σ w<sub>i</sub> g<sub>i</sub>, &nbsp; 若 g<sub>1</sub>·g<sub>2</sub> &lt; 0 则两者互相抵消
+      <span class="note">想象"向左"和"向右"的梯度各占一半，平均后趋近于零</span>
+    </div>
+    <p>症状很好辨认：<strong>每个任务单独评估都不如单任务基线，且训练损失震荡剧烈</strong>。缓解手段按性价比排序：加任务条件化（把冲突从"网络内部"移到"输入差异"，让网络有条件区分）、加深网络容量（表达力换冲突容忍）、任务分头（共享 trunk + 独立 head）、以及梯度手术类方法（PCGrad 等：先投影掉冲突分量再平均）。工程上优先做前两个，梯度手术属于"前面都做了还不行"时的进阶选项。</p>
+
+    <h3>3. 负迁移之二：奖励尺度失衡</h3>
+    <p>更常见也更隐蔽的问题是奖励量级。假设抓取任务每步奖励在 ±5 浮动、行走任务在 ±0.5，共用一个 critic 时：价值函数的拟合误差由"大方"的任务主导，策略的更新也偏向大尺度任务，小尺度任务实际上被"降权"了。这不是网络的错，是最小二乘的目标里，大数值天然占据了大梯度。</p>
+    <p>解法是逐任务归一化：用统计量把奖励变换到相近尺度，典型做法是把回报缩放到标准差约 1 的量级：</p>
+    <div class="formula">
+      r̂<sup>(T)</sup> = clip( (r<sup>(T)</sup> − μ<sub>T</sub>) / (σ<sub>T</sub> + ε), −c, c )
+      <span class="note">μ<sub>T</sub>、σ<sub>T</sub> 为该任务奖励的在线均值/标准差；c 常取 5–10</span>
+    </div>
+    <p>两个细节：归一化必须<strong>逐任务</strong>进行（全局统计量救不了尺度差异），且统计量要在训练中在线更新（奖励分布会随策略改进漂移）。此外，归一化会改变最优策略的尺度敏感性，因为它是仿射变换，不改变每个任务内部的最优策略，但把跨任务的可比性建立了起来。</p>
+
+    <h3>4. 任务条件化的三种接口</h3>
+    <table>
+      <tr><th>接口</th><th>做法</th><th>参数量</th><th>适用</th></tr>
+      <tr><td>one-hot 拼接</td><td>任务 id 作为 0/1 向量拼进观测</td><td>0（只加输入维度）</td><td>任务数少（2–20），首选起点</td></tr>
+      <tr><td>学习嵌入</td><td>可训练 embedding 向量拼进观测</td><td>n_tasks × d<sub>emb</sub></td><td>任务数多、想表达任务相似度</td></tr>
+      <tr><td>FiLM 调制</td><td>任务生成 (γ, β) 乘加在隐层特征上</td><td>n_tasks × 2 × hidden</td><td>冲突明显、需要"改网络行为"而不只是"改输入"</td></tr>
+    </table>
+    <p>为什么 FiLM 特别有效？因为 one-hot 拼接只影响网络第一层输入，深层表示对"任务差异"的敏感度要靠网络自己一层层传下去（梯度信号弱）；FiLM 直接按任务改写中间层特征（h′ = γ<sub>T</sub> ⊙ h + β<sub>T</sub>），相当于让每个任务拥有"自己的网络配置"，参数量却只有几个向量。初始化 γ=1、β=0 时 FiLM 等价于恒等映射，训练起点与单任务网络完全一致，这是它工程上"零风险接入"的原因。</p>
+
+    <h3>5. 任务采样与"值不值得合训"</h3>
+    <p>采样策略影响平衡：均匀采样适合任务难度相近的情形；一旦某个任务明显更难，它会长期占用大量梯度份额，此时按"任务的在训成绩"做加权（性能差的多采）能加速整体收敛。评估则要看四个数：每个任务的最终成绩、平均值、最差任务、以及<strong>相对单任务基线的差值</strong>。最后一个最关键：多任务的全部意义是"一个网络顶多个"，如果某任务比单任务版差 30% 以上，要么给该任务更大的采样权重/网络容量，要么承认它和家族里其他任务"不搭"。</p>
+    <p>判断"搭不搭"的经验法则：看任务之间共享结构的占比。抓取 / 推物 / 开门共享"接近与对准"（约占流程 70%），合训收益大；抓取与四足行走共享的底层动作空间近乎为零，硬合训只会互相拖累。多任务学习的经验法则是"越共享越好"。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>以"一个机械臂 + 四类桌面操作任务"为例搭建多任务系统：</p>
+    <ol>
+      <li><strong>任务族</strong>：抓取（reach-grasp-lift）、推物（reach-push-to-goal）、开门（reach-pull）、插孔（align-insert）。四个任务共用同一个 Franka 观测接口，差异在目标定义与奖励构成。</li>
+      <li><strong>任务描述符</strong>：先用 4 维 one-hot；实验阶段升级为可学习嵌入（8 维）；若观察到负迁移再加 FiLM。</li>
+      <li><strong>观测</strong>（约 24 维统一接口）：关节状态（14）、末端位姿速度（6）、任务相关目标（4 维统一编码：目标种类 + 相对位姿），拼接任务描述符。</li>
+      <li><strong>奖励归一化</strong>：逐任务 Welford 在线统计，clip 到 ±5；critic 用归一化后的奖励，日志里同时记录原始回报（否则无法解释绝对成绩）。</li>
+      <li><strong>采样</strong>：起步均匀；当某任务成功率低于平均值 20 个百分点时，把它的采样概率提到 1.5 倍（封顶 3 倍）。</li>
+      <li><strong>网络</strong>：共享 MLP（256×2）+ 每任务独立动作头（4 个 head）作为中间方案，既共享表示又允许动作层分化；若单头也能行，优先单头（参数更少）。</li>
+      <li><strong>评估</strong>：4 个任务 × 3 个随机种子，训练中途每 100 万步测一次全部任务，记录逐任务成功率与"最差任务"；同时与 4 个单任务基线对比。</li>
+    </ol>
+    <table>
+      <tr><th>配置</th><th>平均成功率</th><th>最差任务</th><th>总样本消耗</th></tr>
+      <tr><td>4 个单任务策略</td><td>最高（各自最优）</td><td>—</td><td>4 倍</td></tr>
+      <tr><td>多任务 + one-hot</td><td>接近单任务</td><td>偶尔差 5–15%</td><td>1 倍</td></tr>
+      <tr><td>多任务 + FiLM</td><td>接近单任务</td><td>差距可压到 5% 内</td><td>1 倍</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计思维：共享什么、分开什么？</span>
+      <p>一层一层问自己："这层的特征对不同任务是否通用？"底层（视觉/本体感觉编码）几乎总是通用的，共享；中间层（任务相关的关系推理）部分共享，FiLM 或独立分支；输出层（动作分布）视动作空间是否一致，一致就共享，不一致就分头。这个"金字塔"式的共享结构是多任务网络设计的通用模板。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：任务采样器与任务描述符</strong></p>
+    <pre class="code"><code>import numpy as np
+
+class TaskSampler:
+    # 任务族：每个任务是一份环境配置（目标、奖励权重、初始分布）
+    def __init__(self, tasks, rng):
+        self.tasks = tasks                     # list[dict]，长度 = 任务数
+        self.rng = rng
+        self.probs = np.full(len(tasks), 1.0 / len(tasks))   # 起步均匀采样
+        self.w = np.ones(len(tasks))                         # 累计权重（1.0 起、封顶 3.0）
+
+    def sample(self):
+        idx = int(self.rng.choice(len(self.tasks), p=self.probs))
+        return idx, self.tasks[idx]
+
+    def reweight(self, per_task_success):
+        # 按在训成绩调权重：低于全体均值 20 个百分点的任务逐轮累计加权（封顶 3 倍）
+        mean = float(np.mean(per_task_success))
+        for i, s in enumerate(per_task_success):
+            if s &lt; mean - 0.20:
+                self.w[i] = min(3.0, self.w[i] * 1.5)   # 掉队任务权重 ×1.5
+            else:
+                self.w[i] = max(1.0, self.w[i] / 1.5)   # 追上后退回基准
+        self.probs = self.w / self.w.sum()     # 归一化回概率分布
+
+def task_descriptor(idx, n_tasks):
+    # one-hot 是最低成本的接口：4 个任务只加 4 维输入，先跑通再谈 FiLM
+    return np.eye(n_tasks, dtype=np.float32)[idx]</code></pre>
+    <p>解读：任务采样器是"多任务训练配平"的手：<code>reweight</code> 只对"明显掉队"的任务加权重（低于均值 20 个百分点）；精确按难度反比会过于激进，成功率在训练早期噪声很大，配平会让采样概率持续震荡。封顶 3 倍防止"一个任务垄断"。注意重权后立即归一化：<code>self.probs</code> 必须始终是概率分布（和为 1），否则 <code>rng.choice</code> 会直接报错。task_descriptor 用单位阵取行生成 one-hot：比手写列表更不容易出错，调参时加任务只需改 n_tasks。什么时候该从 one-hot 升级到嵌入？当任务数超过几十、且你希望网络利用"任务相似度"（比如抓取与推物比抓取与开门更像）时，嵌入的距离可以学到这种结构，one-hot 则完全对称、所有任务"一视同仁"。</p>
+
+    <p><strong>片段 2：FiLM 特征调制层</strong></p>
+    <pre class="code"><code>import torch
+import torch.nn as nn
+
+class FiLMLayer(nn.Module):
+    # 按任务改写隐层特征：h_out = gamma(task) * h + beta(task)
+    # 参数量只有 n_tasks × 2 × hidden，却能让每个任务"定制"中间表示
+    def __init__(self, n_tasks, hidden_dim):
+        super().__init__()
+        self.gamma = nn.Embedding(n_tasks, hidden_dim)
+        self.beta = nn.Embedding(n_tasks, hidden_dim)
+        # 初始化 gamma=1、beta=0：训练起点等价于"没有调制"的普通网络
+        # 这个恒等起点让 FiLM 可以安全地追加到已有网络，不会开局就破坏表示
+        nn.init.ones_(self.gamma.weight)
+        nn.init.zeros_(self.beta.weight)
+
+    def forward(self, h, task_id):
+        g = self.gamma(task_id)                # (B, hidden)
+        b = self.beta(task_id)
+        return g * h + b
+
+class MultiTaskPolicy(nn.Module):
+    def __init__(self, obs_dim, n_tasks, act_dim, hidden=256):
+        super().__init__()
+        self.backbone1 = nn.Sequential(nn.Linear(obs_dim, hidden), nn.Tanh())
+        self.film = FiLMLayer(n_tasks, hidden)          # 在共享表示之后调制一次
+        self.backbone2 = nn.Sequential(nn.Linear(hidden, hidden), nn.Tanh())
+        self.action_head = nn.Linear(hidden, act_dim)
+
+    def forward(self, obs, task_id):
+        h = self.backbone1(obs)
+        h = self.film(h, task_id)                       # 调制：靠近输入的表示
+        h = self.backbone2(h)
+        return torch.tanh(self.action_head(h))</code></pre>
+    <p>解读：FiLM 的实现只有 8 行，但放置位置有讲究：这里调制在"第一层之后、第二层之前"。放在太浅（第一层之前）等价于改输入，和拼 one-hot 区别不大；放在太深（输出头之前）则任务差异影响不到中间表示，负迁移仍会发生。经验位置是"共享 trunk 的 1/3 到 1/2 深度处"。恒等初始化（γ=1、β=0）是它工程好用的关键：直接把 FiLM 追加到已训练好的单任务网络上，初始性能不降，再微调即可，这让"单任务 → 多任务"的升级变成增量过程，无需推倒重来。最后注意：<code>task_id</code> 必须是整型张量索引（不是 one-hot），embedding 查表要求它是 index；这是最常见的接口错用。如果你的任务量少且不需要任务间相似度，把 FiLM 换成"one-hot 拼接进第一层"也是完全可以的起点。</p>
+
+    <p><strong>片段 3：逐任务奖励归一化（Welford 在线统计）</strong></p>
+    <pre class="code"><code>import numpy as np
+
+class TaskRewardNormalizer:
+    # 多任务训练的第一刚需：不同任务的奖励尺度可能差 10 倍
+    # 不归一化时，梯度被"大尺度"任务垄断，小尺度任务事实上被降权
+    def __init__(self, n_tasks, clip=5.0):
+        self.mean = np.zeros(n_tasks, dtype=np.float64)   # 逐任务均值
+        self.m2 = np.zeros(n_tasks, dtype=np.float64)     # 平方差累积
+        self.count = np.zeros(n_tasks, dtype=np.float64)
+        self.clip = clip
+
+    def normalize(self, task_id, reward):
+        # Welford 递推：只维护 (mean, m2, count) 就能在线得到均值与方差
+        self.count[task_id] += 1.0
+        n = self.count[task_id]
+        delta = reward - self.mean[task_id]
+        self.mean[task_id] += delta / n
+        self.m2[task_id] += delta * (reward - self.mean[task_id])
+        var = self.m2[task_id] / max(n - 1.0, 1.0)
+        std = float(np.sqrt(var)) + 1e-6                # 加 eps 防除零
+        # clip 到 ±5 个标准差：单个离群回报（比如第一次成功）不应主导整批梯度
+        z = (reward - self.mean[task_id]) / std
+        return float(np.clip(z, -self.clip, self.clip))</code></pre>
+    <p>解读：三个实现选择都重要。第一，<strong>逐任务统计</strong>：如果用全局均值/方差，"抓取 +5、行走 +0.5"这类差异依然存在，必须每个任务独立维护。第二，Welford 递推只维护三个标量：训练动辄上亿步，存一个列表再算并不现实；Welford 只需三个标量就得到与两遍算法相同的数值结果，且对浮点误差更稳（这是它比"累加 Σr、Σr²"更好的原因，后者在奖励接近大常数时灾难性抵消）。第三，clip 到 ±5 个标准差：多任务早期，某任务偶尔完成一次会给一个 +30 的回报（相对该任务当前均值可能超 10 个标准差），不裁剪的话这一条样本的梯度会压倒整个批次。评估阶段要记住这个类只用于<strong>训练输入</strong>，回报日志必须记录原始值，否则你无法回答"策略绝对成绩如何"，也无法和论文/基线对比。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>奖励不归一化直接合训</strong>：抓取与行走同批训练，价值函数被大尺度任务带偏，小任务"学不动"。症状是逐任务曲线里大尺度任务独涨。修复：逐任务 Welford 归一化（片段 3），日志保留原始回报。</li>
+      <li><strong>把负迁移误诊为容量不足</strong>：一见掉分就加宽网络，参数翻倍后问题依旧。修复：先做梯度冲突诊断（记录各任务梯度的余弦相似度），冲突严重时优先加条件化（FiLM/分头），加容量属于次要手段。</li>
+      <li><strong>任务描述符没进 critic</strong>：actor 看到了 one-hot，critic 没看到，价值目标混着多个任务，优势估计被污染，策略学得忽左忽右。修复：critic 与 actor 共用同一份任务条件（或使用集中式 critic 见 059 章）。</li>
+      <li><strong>评估只看平均值</strong>：平均值掩盖"某任务零分"。症状是平均成功率 75% 看着不错，实际四任务里有一个是 0%。修复：报告"逐任务 + 最差任务 + 单任务基线差"三大指标。</li>
+      <li><strong>任务数堆太多、共享结构不足</strong>：把八竿子打不着的任务（机械臂操作 + 四足行走）硬塞进一个策略，结果全线掉分。修复：按"共享结构占比"分组，先合训共享 > 60% 的任务，跨域任务用独立策略或分层架构（055 章）。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把四个任务合训版与四个单任务基线的逐任务成功率做成表格，计算"最差任务差距"，判断合训是否划算。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>划算与否的判据是"最差任务差距 < 15% 且样本总量减少 4 倍"，仅看"平均分接近"会误判。如果某任务差距大，先检查该任务的奖励尺度与采样权重。</div></details>
+      </li>
+      <li>在合训中记录各任务共享层梯度的两两余弦相似度，找出冲突最严重的一对任务，并验证 FiLM 或分头能否缓解。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>余弦相似度持续为负的两个任务就是冲突对。加 FiLM 后应观察该指标向 0 附近移动，同时两者的成功率差距缩小。</div></details>
+      </li>
+      <li>把任务采样从均匀改成"按成功率加权"，对比收敛速度与最差任务成绩，写出你的配平规则与理由。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>适度加权（1.5–2 倍）通常加速最差任务的追赶；激进配平（按 1/success）会让采样概率抖动，反而拖慢整体。画采样概率随训练的变化曲线验证。</div></details>
+      </li>
+      <li>把 FiLM 换成 one-hot 拼接，保持其他不变，对比两者在冲突任务对上的成功率与参数量。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>FiLM 参数量 = n_tasks×2×hidden（4×2×256 ≈ 2048），one-hot 只加 4 维输入但调制能力弱。冲突任务对上的差距最能体现差异。</div></details>
+      </li>
+      <li>设计"任务课程"实验：先训两个容易的、再引入两个难的，对比一次性四任务全开的收敛步数与最终成绩。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>课程版通常更快达到同等成绩，但要小心"灾难性遗忘"，新任务训练时旧任务成绩下滑。解决：引入新任务时混采旧任务（比例不低于 20%）。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>多任务 RL = 在任务分布上做期望优化，观测量从 s 变为 (s, T)；可行性不是问题，优化（梯度冲突与尺度失衡）才是。</li>
+      <li>负迁移的两大来源：梯度冲突（余弦为负）与奖励尺度失衡；前者靠条件化/分头/梯度手术，后者靠逐任务归一化。</li>
+      <li>任务条件化三接口：one-hot（先跑通）、嵌入（任务多时学相似度）、FiLM（冲突明显时改中间表示，恒等初始化零风险接入）。</li>
+      <li>奖励归一化用逐任务 Welford 在线统计 + ±5σ 裁剪；训练用归一化奖励，日志记原始回报；critic 必须与 actor 共享任务条件。</li>
+      <li>评估看四数：逐任务成绩、最差任务、平均值、与单任务基线的差值；"值得合训"的经验门槛是共享结构占比大于六成。</li>
+      <li>下一章更进一步：<strong>元强化学习</strong>，不只让一个策略会多任务，还要让它在新任务上"几回合内"就适应。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch052.html">← 第 052 章：实现部分可观测环境</a>
+    <a class="next" href="ch054.html">第 054 章：实现元强化学习 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

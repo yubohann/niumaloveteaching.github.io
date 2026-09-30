@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第028章 多机器人SLAM协同 | 多机器人协同学习课程 · ROS2 通信与系统集成</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 数据分发与协同感知</span>
+    <span class="sep">/</span>
+    <span>第 028 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 数据分发与协同感知</div>
+    <h1>第 028 章：多机器人SLAM协同</h1>
+    <p class="lead">每台机器人各自 SLAM 只能看到局部；本章讲它们的地图与轨迹如何"互相纠正"，位姿图的弹簧直觉、会合约束的形成、以及分布式优化需要交换什么、不需要交换什么。</p>
+    <ul class="meta">
+      <li>主题：地图协同 / 同时定位与建图</li>
+      <li>关键机制：位姿图优化、机器人际回环（rendezvous 约束）、集中式与分布式协同架构</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 027 章（动态地图更新共享）</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解位姿图的构成与优化目标：节点、边、信息矩阵与"弹簧网络"的直觉。</li>
+      <li>掌握多机器人 SLAM 的两类架构：集中式全局优化与分布式增量优化，及其通信量差异。</li>
+      <li>理解机器人际回环（inter-robot loop closure）从会合检测到约束生成的全过程。</li>
+      <li>知道协同 SLAM 里该交换什么（约束、锚点、摘要），以及哪些东西不必交换（稠密点云、原始扫描）。</li>
+      <li>能判断你的系统需要"真协同"还是"各扫各的最后合并"，两者成本差一个量级。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 026、027 章把"已经建好的局部地图"拼起来，但那只是后处理：每台机器人的轨迹误差已经在各自地图里"固化"了，如果机器人 A 的长走廊漂移了 30 cm，合并后的全局地图就带着这 30 cm 的错位。真正的协同 SLAM 不止于拼图，其核心是让<strong>机器人们在建图过程中互相提供约束</strong>：B 在会合点看到的 A 的旧地图特征，可以反过来修正 A 的轨迹，就像单机 SLAM 里"回到起点"的回路闭合一样，只不过这次闭合发生在两台机器人之间。</p>
+    <p>这也是分布式机器人系统里最优雅的一类问题：<strong>用极少的通信量（相对位姿约束只有几十到几百字节）换取全局地图质量</strong>。对比之下，交换原始激光/点云动辄每秒数 MB。理解"传约束不传数据"的分寸感，是本章最重要的工程收获。它与第 029 章的分工：本章管"地图与轨迹的联合优化"，第 029 章管"实时位姿估计的融合"。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 位姿图：用"弹簧网络"理解 SLAM 后端</h3>
+    <p>单机 SLAM 的后端通常归结为一个位姿图（pose graph）：节点是机器人各时刻的位姿 x<sub>1</sub>, x<sub>2</sub>, …（位置 + 朝向），边是两条位姿之间的<strong>相对变换观测</strong>，连续位姿之间来自里程计的"短边"，回路闭合时的"长边"来自扫描匹配。每条边带一个信息矩阵 Ω（测量越可靠，Ω 越大）。优化目标是最小二乘：</p>
+    <div class="formula">
+      min Σ<sub>(i,j)∈E</sub> e<sub>ij</sub><sup>t</sup> Ω<sub>ij</sub> e<sub>ij</sub>，e<sub>ij</sub> = (x<sub>i</sub><sup>−1</sup>x<sub>j</sub>) ⊖ z<sub>ij</sub>
+      <span class="note">z<sub>ij</sub> 是观测到的相对变换；⊖ 表示变换之差（平移差 + 角度差）</span>
+    </div>
+    <p>把它想象成一张弹簧网：每个节点是一个珠子，每条边是一根弹簧，弹簧的自然长度等于"观测到的相对位姿"。优化过程就是让整张网的总弹性势能最小，<strong>某一根弹簧的拉伸，会通过网传递到很远处的节点</strong>。这正是远端回环能修正整条轨迹的原理，也是多机器人协同的立足点：<strong>机器人之间新增一根弹簧（会合约束），两侧的整段轨迹就会互相"拉齐"。</strong></p>
+
+    <h3>2. 两类协同架构：集中式 vs 分布式</h3>
+    <table>
+      <tr><th>架构</th><th>做法</th><th>通信量</th><th>优点</th><th>风险</th></tr>
+      <tr><td>集中式</td><td>各机上传位姿图/子图摘要到服务器，全局优化后下发修正</td><td>每机每轮几十 KB 级</td><td>实现简单，全局最优性好</td><td>单点依赖、链路中断即停</td></tr>
+      <tr><td>分布式</td><td>各机只与通信半径内邻居交换位姿/子图锚点，本地迭代求解</td><td>随邻居数线性增长，常为 KB 级</td><td>无中心、容错好</td><td>收敛慢、需处理拓扑变化</td></tr>
+    </table>
+    <p>选择的判断标准：<strong>有稳定的车队网关（如车间里的基站）→ 集中式省事；无中心、机器人群漂移作业（如野外编队）→ 分布式必需</strong>。两者可以混合：平时分布式运行，回到基地后集中式做一次"全量精修"。</p>
+
+    <h3>3. 机器人际回环：会合检测与约束生成</h3>
+    <p>协同 SLAM 的关键原料是<strong>跨机器人约束</strong>。它通常这样产生：</p>
+    <ol>
+      <li><strong>会合发现</strong>：两机距离足够近（基于各自上报的全局位姿粗判，第 029 章的定位输出），或观测到对方的视觉标记/共享地理特征；</li>
+      <li><strong>相对观测</strong>：用激光互扫、共享地标匹配或视觉标定板，估计出两机之间的相对位姿 z<sub>AB</sub>（含不确定度）；</li>
+      <li><strong>约束入图</strong>：把 (A 的某时刻位姿, B 的某时刻位姿, z<sub>AB</sub>, Ω) 作为一条边加入双方的位姿图；</li>
+      <li><strong>时间对齐</strong>：两个位姿节点的时间戳必须对应同一物理时刻（第 030 章），否则"会合时的相对位姿"张冠李戴。</li>
+    </ol>
+    <p>注意信息矩阵的估计：一个仅凭一次 UWB 测距的约束应该 Ω 很小（弱约束），一次高质量的点云匹配可以有强 Ω。<strong>Ω 的诚实程度决定优化的可信度</strong>，虚高的 Ω 会让地图被噪声"拽跑"。</p>
+
+    <h3>4. 分布式优化：为什么以及怎么收敛</h3>
+    <p>分布式求解的思路是"各扫门前雪 + 轮流对齐公共变量"。常见两类协议：</p>
+    <ul>
+      <li><strong>分布式高斯-赛德尔</strong>：每个机器人只优化自己的位姿节点，但把邻居共享节点的<strong>最新值</strong>当作固定量；一轮一轮交替进行下去。直觉：两个工匠轮流对齐各自半张拼图，直到接缝不再变化。</li>
+      <li><strong>ADMM 类对偶分解</strong>：把"共享变量必须一致"做成惩罚项，子问题并行求解 + 对偶变量更新。收敛理论更完整，但需要调罚参数。</li>
+    </ul>
+    <p>收敛速度取决于通信拓扑：<strong>链式拓扑收敛最慢（信息要沿链传播），全连接最快</strong>；还有一个常被忽略的量化事实，每次迭代的通信量很小（几十个节点位姿 × 每项几十字节），所以"多迭代几轮"通常在带宽预算内，真正稀缺的是"两机什么时候能见面通信"。这与第 041 章一致性协议的直觉相通：<strong>连接性（connectivity）是分布式算法的第一前提</strong>。</p>
+    <div class="box key">
+      <span class="box-title">设计决策：协同 SLAM 交换什么？</span>
+      <p>交换顺序按"信息密度 × 实时性"排：<strong>① 跨机约束（首选项）</strong>：几十字节，直击优化目标；<strong>② 子图锚点与摘要</strong>：位姿 + 边界特征，几百字节到几 KB，用于地图拼接与匹配；<strong>③ 压缩特征/描述子</strong>：KB–MB 级，需要时按需拉取；<strong>④ 原始扫描/点云</strong>：几乎不交换（除本机本地）。把这张优先级表贴在架构文档里，能省下很多"要不要传点云"的争论。</p>
+    </div>
+
+    <h3>5. 数值算例：一条会合约束拉齐两侧轨迹</h3>
+    <p>用一条最简的轨迹链看清"弹簧"的作用。机器人 A 与 B 各自的位姿图都是一条 10 节点的链（节点间距 1 m，共 10 m 路程），两机起点锚定在同一参考系、误差为零；走完一圈后各自漂移：A 的末端估计位置比真实位置多出 30 cm，B 少 10 cm。一次会合观测到的相对位姿与当前估计相差 40 cm。</p>
+    <p>把这条约束当作一根强弹簧加入两张图。由于两链的起点被锚定、弹簧刚度相同，修正量在两条链之间对半分配：每条链的末端被拉回 20 cm。拉力沿链均匀摊开，链上第 k 个节点的修正量约为 0.2 m × k ÷ 10，即首端 2 cm、中点 10 cm、末端 20 cm，沿链线性过渡。<strong>这就是"远端回环修正整条轨迹"的定量版本</strong>：修正的手段是把误差分摊到全链，末端并不做一次性对齐；单个节点的位姿跳变因此很小（本例每步 2 cm），轨迹形状保持连续。</p>
+    <p>算例还给出三条实现纪律。<strong>第一，锚点必须有。</strong>去掉两端的全局锚定后，40 cm 的错位在两张自由链之间分配时，整体平移分量无人约束，弹簧网可以整体平移而不改变任何一个弹簧的拉伸；这对应真实系统里"world 基准由标定锁定，优化器不能移动它"。<strong>第二，相对一致与绝对正确是两码事。</strong>修正后 A、B 末端都停在 +10 cm，两机之间的相对几何已经正确，共同的 10 cm 残余偏移需要绝对观测（回到已知点、卫星定位或高质量回环）才能消掉。<strong>第三，修正量要全链更新。</strong>只把会合点末端拉 20 cm、链上其余节点不动，等于让最后一根弹簧独自拉伸，下一次优化会把这份拉伸弹回去，系统在两套解之间来回震荡；正确做法是解算全链、批量更新所有位姿，再同步重投影地图（片段 3）。</p>
+
+    <h3>6. 失效模式与边界条件</h3>
+    <ul>
+      <li><strong>修正阶跃冲击控制环</strong>：map → odom 一步跳 20 cm，依赖 map 系的高频控制器会看到位置突变。边界动作：对修正做限速平滑（如每秒不超过 5 cm 与 2°），大跳变单独打日志并复核约束来源。</li>
+      <li><strong>位姿图规模无界</strong>：长时间运行后节点数万，每次优化成本与内存持续上升。边界动作：滑窗边缘化旧节点或按子图裁剪，但必须保留仍被回环引用的地标与锚点，裁剪策略要与约束生命周期一起设计。</li>
+      <li><strong>有偏的会合观测</strong>：自遮挡、标定板角度过大或时钟残留使相对位姿带系统偏差，强 Ω 会把两侧地图整体拽歪。对策：Ω 按残差估计、配合鲁棒核函数与卡方检验剔除离群约束。</li>
+      <li><strong>对称拉锯</strong>：分布式的 A、B 同时更新共享变量且步长为 1 时，强耦合约束下可能互相过冲。对策：小步长（如 0.5）、确定性更新顺序（按 id 轮流主导），并监控相邻两轮修正量的衰减。</li>
+      <li><strong>通信量误估</strong>：约束消息本身只有约 250 B，但一轮迭代要交换最多 50 个共享位姿（约 600 B），几十轮下来约 30 KB，仍远小于交换一帧 3 万点扫描的 480 KB（约 1900 倍差距）。边界：真正稀缺的是"两机物理接近"的窗口，迭代的字节数可以忽略。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>搭建协同 SLAM 的六步：</p>
+    <ol>
+      <li><strong>现状盘点</strong>：先明确单机 SLAM 的输出（位姿话题、地图话题、子图结构），确定协同插入点，通常挂在"位姿图后端"外侧，不动前端。</li>
+      <li><strong>选架构</strong>：按上表判断集中式/分布式/混合；集中式先跑通，再谈分布式。</li>
+      <li><strong>定义交换消息</strong>：<code>PoseGraphEdge</code>（两端节点、相对位姿、Ω、时间戳）、<code>SubmapAnchor</code>（子图 id、锚点位姿、覆盖范围）。消息要小、要带不确定度。</li>
+      <li><strong>会合流程</strong>：近邻检测 → 相对观测 → 约束生成 → 双方各自入图 →（集中式时）上传服务器。</li>
+      <li><strong>优化循环</strong>：本地位姿图按固定周期（如 1 Hz）优化；优化后把修正量作用到地图与 TF（map → odom 修正，第 024 章的边）。</li>
+      <li><strong>验收</strong>：两机重叠区对齐误差（第 026 章冲突率或专门的对齐评估）、协同后轨迹相对单机的改善量、会合约束的数量与质量和运行中的收敛震荡。</li>
+    </ol>
+    <table>
+      <tr><th>参数</th><th>起点值</th><th>依据</th></tr>
+      <tr><td>会合判定距离</td><td>3–5 m</td><td>保证相对观测质量；过远观测噪声大</td></tr>
+      <tr><td>优化周期</td><td>1 Hz（本地）</td><td>地图与轨迹是慢变量；控制环另走高速通道</td></tr>
+      <tr><td>约束频率上限</td><td>每个会合事件 1 条</td><td>重复约束会让同一证据被多次计入</td></tr>
+      <tr><td>共享节点数上限</td><td>每机最近 20–50 个</td><td>位姿图局部化，控制通信与计算规模</td></tr>
+    </table>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：会合检测与跨机约束生成</strong></p>
+    <pre class="code"><code>def detect_rendezvous(pose_self, pose_other, stamp, min_gap=3.0, max_gap=5.0):
+    """基于双方上报的全局位姿粗判会合：距离进入 [min_gap, max_gap] 才值得观测。"""
+    dx = pose_other[0] - pose_self[0]
+    dy = pose_other[1] - pose_self[1]
+    dist = (dx * dx + dy * dy) ** 0.5
+    if dist &lt; min_gap:
+        return None                     # 太近：可能互相遮挡，观测质量差
+    if dist &gt; max_gap:
+        return None                     # 太远：测距/匹配噪声主导，不生成约束
+    # 相对观测 z：这里示意为"基于共享特征匹配的相对位姿"（鲁棒估计后）
+    z, omega = estimate_relative_pose(self_id, other_id, stamp)
+    edge = PoseGraphEdge()
+    # 节点命名 = 机器人 + 时刻：优化器必须能精确定位"谁的哪个位姿"
+    edge.node_a = f"/{self_id}/pose_{stamp.sec}"
+    edge.node_b = f"/{other_id}/pose_{stamp.sec}"
+    edge.dx, edge.dy, edge.dtheta = z          # 相对平移与相对航向
+    edge.info = omega                          # 信息矩阵：由匹配残差估计
+    edge.stamp = stamp                         # 同一时刻，约束才有物理意义
+    return edge</code></pre>
+    <p>解读：这段"会合检测"代码体现了约束生成的三条纪律。<strong>（1）</strong>距离窗口是双边的：太近（&lt; 3 m）时两机可能互相遮挡、激光互扫变成"面对面"的死角；太远（&gt; 5 m）时相对观测的不确定度快速膨胀。<strong>（2）</strong>节点命名直接编码"机器人 + 时刻"：优化器需要精确定位"哪个时刻的哪个位姿"，模糊的节点引用是分布式优化最阴险的 bug 来源。<strong>（3）</strong>约束必须携带信息矩阵与时间戳：前者告诉优化器"这条观测有多可信"，后者保证两端位姿对应同一物理时刻，缺了时间戳，两机时间差会被当成真实位移吃掉。工程实现里，会合判定还应有去抖和"同一会合事件只生成一条约束"的判据，防止重复计数。</p>
+
+    <p><strong>片段 2：分布式优化的"直觉版"，Gauss-Seidel 式交替松弛</strong></p>
+    <pre class="code"><code>def relax_once(pos, edges, anchor=0, step=0.5):
+    """一轮松弛：对每条边把两端位姿互相拉向"观测相对位姿"。
+    pos: (N, 3) 数组（x, y, theta）；edges: (i, j, dx, dy, dtheta, w)。
+    这是分布式高斯-赛德尔的极简直觉版：生产系统请用 GTSAM/Ceres 等库。"""
+    import numpy as np
+    pos = pos.copy()
+    for (i, j, dx, dy, dtheta, w) in edges:
+        if i == anchor or j == anchor:
+            continue                      # 锚点固定：全局基准不可动
+        # 当前两节点的相对位姿与观测的偏差（旋转按小角度近似处理）
+        ex = (pos[j, 0] - pos[i, 0]) - dx
+        ey = (pos[j, 1] - pos[i, 1]) - dy
+        eth = (pos[j, 2] - pos[i, 2]) - dtheta
+        # 每端各承担一半修正，按权重 w（信息矩阵的标量简化）缩放
+        pos[i] += step * np.array([ex, ey, eth]) * w * 0.5
+        pos[j] -= step * np.array([ex, ey, eth]) * w * 0.5
+    return pos
+
+def run_until_stable(pos, edges, iters=50, tol=1e-4):
+    """交替迭代直到最大修正量小于阈值：分布式协议的收敛判据。"""
+    for k in range(iters):
+        new = relax_once(pos, edges)
+        delta = float(abs(new - pos).max())
+        pos = new                          # 本地求解后广播共享节点的新值
+        if delta &lt; tol:                    # 收敛：接缝不再变化
+            return pos, k
+    return pos, iters</code></pre>
+    <p>解读：这段代码是"位姿图优化"的玩具版本，但它的结构映射了真实分布式协议的全部要素。<strong>（1）</strong>锚点固定：没有锚点的弹簧网会整体漂移到无穷，全局基准（第一台机器人初始位姿或 world 原点）必须锁定，对应真实系统里"world 原点由标定确定，不可被优化移动"。<strong>（2）</strong>两条边对两端的拉拽是对称的（各承担一半）：这正是共识协议的味道，<strong>信息通过边的传递让两端慢慢达成一致</strong>，与第 041 章的拉普拉斯共识同构。<strong>（3）</strong><code>tol</code> 与迭代上限是分布式算法的必备控制项：通信中断时外部循环会停在那里反复重试，本地的一轮迭代必须有界。<strong>（4）</strong>注释里说明"生产用 GTSAM/Ceres"是诚实的做法：真实的位姿图优化要处理旋转流形、稀疏 Cholesky、鲁棒核函数，玩具代码的价值只在于把算法骨架和通信模式讲清楚。</p>
+
+    <p><strong>片段 3：修正落地，把优化结果变成 TF 与地图更新</strong></p>
+    <pre class="code"><code>def apply_correction(self, map_to_odom_delta):
+    """优化产生的修正作用在 map->odom 边上：位姿立刻生效，历史地图同步平移。
+    map_to_odom_delta: (dx, dy, dtheta)，即优化前后该机器人位姿的差值。"""
+    # 只在"慢通道"上更新：map->odom 允许跳变，odom->base_link 绝不动
+    self.correction[0] += map_to_odom_delta[0]
+    self.correction[1] += map_to_odom_delta[1]
+    self.correction[2] += map_to_odom_delta[2]
+    self.publish_map_to_odom(self.correction)   # 50 Hz 动态广播（第 024 章）
+    # 地图是被优化的对象之一：子图/栅格按同一变换重投影，保持与位姿一致
+    self.remap_existing_map(map_to_odom_delta)
+    self.get_logger().info(
+        f"应用协同修正 dx={map_to_odom_delta[0]:.3f} "
+        f"dy={map_to_odom_delta[1]:.3f} dth={map_to_odom_delta[2]:.3f}",
+        throttle_duration_sec=5.0)</code></pre>
+    <p>解读：优化结果必须"落地"才有效，而落地方式直接决定系统是否稳定。<strong>（1）</strong>修正施加在 <code>map → odom</code> 这条边上，是因为它在 REP-105 语义里就是"全局一致性与局部连续性之间的接缝"，跳变被允许、且不会破坏控制环依赖的平滑性。<strong>（2）</strong>地图与位姿必须<strong>同步修正</strong>：只改位姿不改地图，旧栅格会与新位姿不对齐，表现为"地图整块错位"；只改地图不改位姿，导航轨迹会漂移。<strong>（3）</strong>日志节流（5 秒一条）在协同运行中很实际：优化修正高频出现时，日志本身也会成为性能负担。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>没有统一时间基就生成会合约束</strong>：两机时间差 100 ms、各以 1 m/s 运动，约束里混入 10–20 cm 假位移，优化越"努力"地图越歪。修复：时间同步（第 009 章）后再生约束。</li>
+      <li><strong>信息矩阵虚高</strong>：给一次低质量匹配也填大 Ω，噪声获得"权威"，把好轨迹拽跑。修复：Ω 由匹配残差/特征数量估计，宁可保守。</li>
+      <li><strong>重复约束</strong>：两机会合 10 秒内生成了 200 条约束，等价于把同一证据重复计入 200 次。修复：每次会合事件最多一条；不同事件要求位姿差异足够大再生成。</li>
+      <li><strong>优化后忘记重投影地图</strong>：位姿与栅格脱节，导航用旧地图"撞墙"。修复：apply_correction 里地图与位姿同步更新（片段 3）。</li>
+      <li><strong>分布式迭代无超时</strong>：邻居离线后本地循环等待响应，整个协同停摆。修复：每轮外部迭代设置超时与降级（无邻居时用上一次的解继续本地运行）。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>用 4 个节点、3 条边的手工位姿图（其中一个节点位置故意偏 0.5 m）跑片段 2 的松弛，观察需要多少轮收敛、锚点选择对结果的影响。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>误差会按权重"摊"到各边上；锚点不动时其余节点向其对齐。改变锚点会整体平移解，这解释了为什么全局基准必须外部指定。</div></details>
+      </li>
+      <li>把会合约束的信息矩阵权重从 1.0 改成 10，预测优化后地图对齐误差与轨迹形状的变化。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>高权重让两机被"强拉"到会合观测上；若观测有偏，轨迹被带斜。可与第 029 章的加权融合呼应：权重的意义是信任度。</div></details>
+      </li>
+      <li>设计对比实验：同一段数据，(a) 各机独立 SLAM + 最后合并；(b) 协同 SLAM（会合约束入图）。量化两者在重叠区的对齐误差、走廊末端的漂移差异。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>关键控制变量：相同数据、相同标定。预期 (b) 在远端回环受益明显（漂移被约束"拉回"），但要注意会合观测质量差时 (b) 也可能变差。</div></details>
+      </li>
+      <li>设计题：为 3 台机器人设计分布式协同 SLAM 的"会合协议"：谁发起、如何互认、约束如何生成与去重、断连后如何继续。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>发起可用距离阈值 + 随机延迟防碰撞；互认用各自全局位姿粗对齐；去重靠"已配对事件表"；断连后本地优化继续，恢复后再交换增量约束。</div></details>
+      </li>
+      <li>思考：为什么说"多迭代几轮"在协同 SLAM 里通常不算成本，而"见面通信"才是稀缺资源？把你的系统的通信机会画在时间轴上再看一遍。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>约束消息只有几十字节，迭代几十轮也就是几 KB；但机器人要物理接近才能产生高质量观测，机会窗口以分钟计。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>SLAM 后端 = 位姿图的弹簧网络；多机协同 = 在两张网之间加"会合弹簧"，让远端轨迹互相拉齐。</li>
+      <li>架构选择看基础设施：有稳定网关用集中式，无中心场景用分布式；混合方案是现实工程的常态。</li>
+      <li>跨机约束 = 相对位姿 + 信息矩阵 + 时间戳；Ω 要诚实，重复约束必须去重。</li>
+      <li>协同交换的优先级：约束 ≫ 锚点/摘要 ≫ 特征 ≫ 原始数据；"传约束不传点云"是核心纪律。</li>
+      <li>下一章把视角从"地图与轨迹"切到"实时位姿"：<strong>多机器人定位融合</strong>，EKF 更新与协方差交叉如何给出实时、不过度自信的队形位姿。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch027.html">← 第 027 章：动态地图更新共享</a>
+    <a class="next" href="ch029.html">第 029 章：多机器人定位融合 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第061章 实现循环神经网络策略 | 机器人仿真学习课程 · Isaac Sim 强化学习训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第三篇 · 高级强化学习专题</span>
+    <span class="sep">/</span>
+    <span>第 061 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第三篇 · 高级强化学习专题</div>
+    <h1>第 061 章：实现循环神经网络策略</h1>
+    <p class="lead">把 052 章的 POMDP 与 054 章的隐状态适应汇成一条主线：本章实现 GRU 策略、跨回合的隐状态管理与截断 BPTT 序列训练，让"记忆"真正变成可训练的能力。</p>
+    <ul class="meta">
+      <li>主题：高级专题 / 记忆与序列训练</li>
+      <li>相关组件：Isaac Sim / Isaac Lab / PyTorch / RL-Games 风格 PPO</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 060 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>能把 RNN 策略放进 POMDP 框架：h<sub>t</sub> 是历史的可学习压缩，近似替代信念状态。</li>
+      <li>理解 RNN/LSTM/GRU 的结构差异与门控对梯度流的保护作用，知道为什么 RL 里 GRU 常是默认选择。</li>
+      <li>掌握 RL 中的序列训练三要素：隐状态存储、跨回合重置掩码、截断 BPTT 的连续序列划分。</li>
+      <li>会实现带 done 掩码的 GRU 策略前向，并解释隐状态泄漏的后果。</li>
+      <li>理解 off-policy + RNN 的困难（回放需要存序列），以及 burn-in 的作用。</li>
+      <li>能判断"何时不需要 RNN"：全观测任务上 RNN 只会增加成本与方差，必须做对照消融。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 052 章告诉我们：部分可观测环境里，无记忆策略注定次优（状态别名）。当时给出的临时解法是帧堆叠与时间戳特征，它们便宜但僵硬：只覆盖固定长度的最近历史，且把"记忆什么"完全交给人工设计。第 060 章的注意力解决了"关注哪些实体"，但没有解决"跨越时间的信息保留"。</p>
+    <p>循环神经网络（recurrent neural network, RNN）补上这块拼图：它用一组隐藏状态 h<sub>t</sub> 把所有历史压缩成一个定长向量，并且"压缩什么、丢弃什么"由训练决定。它是第 054 章 RL² 元适应的载体，也是当前仿真到现实迁移中处理传感器延迟、遮挡、状态估计噪声的标准工具。本章讲清它的公式与门控机制、RL 专属的工程坑（隐状态生命周期与序列化回放），并给出可直接迁移的代码骨架。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 从 POMDP 到隐状态：记忆是一种压缩</h3>
+    <p>POMDP 的最优策略依赖信念 b<sub>t</sub>(s) = P(s<sub>t</sub> | o<sub>1:t</sub>, a<sub>1:t</sub>)，完整的可能状态分布。直接维护贝叶斯信念在高维空间不可行，RNN 的做法是"用一个定长向量 h<sub>t</sub> ∈ R<sup>d</sup>（d 通常 128–512）近似所有与决策有关的历史信息"：</p>
+    <div class="formula">
+      h<sub>t</sub> = f<sub>θ</sub>(h<sub>t−1</sub>, o<sub>t</sub>, a<sub>t−1</sub>), &nbsp; π<sub>θ</sub>(a<sub>t</sub> | o<sub>t</sub>, h<sub>t</sub>)
+      <span class="note">h 不需要对应物理量；训练目标（回报）决定了它保留什么</span>
+    </div>
+    <p>关键认知：<strong>RNN 把策略类从"o → a"扩展到"(o, h) → a"，让记忆与决策联合优化</strong>。这也是它与帧堆叠的本质差别：帧堆叠的压缩方式（最近 k 帧原样保留）是固定的，RNN 的压缩方式是学出来的，可以把"十步之前目标可见过一次"一直保留到需要的时候，也可以把无关噪声彻底丢弃。</p>
+
+    <h3>2. 门控机制：梯度为什么需要"高速公路"</h3>
+    <p>最朴素的 RNN 更新是 h<sub>t</sub> = tanh(W<sub>x</sub>x<sub>t</sub> + W<sub>h</sub>h<sub>t−1</sub> + b)。训练要用 BPTT（沿时间反向传播），梯度连乘 T 个雅可比矩阵：</p>
+    <div class="formula">
+      ∂h<sub>T</sub>/∂h<sub>1</sub> = Π<sub>t=2..T</sub> ∂h<sub>t</sub>/∂h<sub>t−1</sub>
+      <span class="note">tanh 导数 ≤ 1，多数配置下连乘会指数衰减（梯度消失）或爆炸</span>
+    </div>
+    <p>LSTM 与 GRU 用"门"改造了这条链：LSTM 的遗忘门 f、输入门 i、输出门 o 与细胞状态 c 让信息有一条"加法式"的通道，只要遗忘门接近 1，c 就能近乎无损地跨过很多步（梯度高速路）；GRU 把三门合并为更新门 z 与重置门 r，参数量少约 25%，效果在多数 RL 任务上相当。工程默认选择是 GRU：训练更快、超参更少，LSTM 在更长序列（数百步以上）上才显出优势。</p>
+
+    <h3>3. RL 中的隐状态生命周期：三处必须打理的地方</h3>
+    <p>RNN 训练最易错的部分不在公式，而在"h 什么时候更新、什么时候清零、什么时候存起来"。三条纪律：</p>
+    <ul>
+      <li><strong>采样时</strong>：每个环境维护一份 h；每步前向产生 h<sub>new</sub>；回合终止时清零，否则新回合带着旧回合的记忆。注意还要把"清零后的 h"写回环境槽位。</li>
+      <li><strong>存储时</strong>：回放里每步要保存"进入这一步时的 h<sub>in</sub>"。更新阶段重放序列时从 h<sub>in</sub> 出发，才能复现当时的前向计算；不存 h<sub>in</sub> 就只能从零重启 BPTT，学习信号被削弱。</li>
+      <li><strong>更新时</strong>：序列不能打散。PPO 把 (T, N) 数据切成 minibatch 时，RNN 要求切"连续时间段"（比如每段 8 步），同一段内时间连续、跨段用存储的 h<sub>in</sub> 定界；把单步样本随机打散等于把因果链剪断，RNN 退化成 MLP。</li>
+    </ul>
+
+    <h3>4. 截断 BPTT 与 burn-in</h3>
+    <p>序列总长（比如 1000 步）不能一次反传：显存与梯度稳定性都不允许。标准做法是<strong>截断 BPTT</strong>：按 L = 8–32 步为一段训练，段内完整反传，段间通过 h 传递（梯度不跨段）。这相当于承认"更早的影响由 h 承载，而其梯度不精确回传"，一个被实践验证的近似。L 的取值是方差与信息的折中：L 太小（4）时记忆类任务学不动；L 太大（64+）时单段内序列越长梯度越不稳、且小批次意义下降。</p>
+    <p>当 h<sub>in</sub> 来自很久之前、与当前策略分布已不匹配时，重放会失真；改进是 <strong>burn-in</strong>：在序列前多喂 k 步历史（不计算损失，只让 h"热起来"到当前分布，类似 054 章 RNN 在 trial 内的适应），然后才开始正式反传。k 取 8–16 步即可，它把"隐状态过期"的影响压缩到可接受范围。</p>
+
+    <h3>5. 何时用、何时不用</h3>
+    <table>
+      <tr><th>场景</th><th>建议</th><th>理由</th></tr>
+      <tr><td>全观测（经典 mujoco / 大部分运动任务）</td><td>不用 RNN</td><td>RNN 增加训练方差与时间；无信息缺口时无收益（文献里常见 0–10% 波动，且常为负）</td></tr>
+      <tr><td>观测延迟 2–10 步</td><td>帧堆叠或 RNN 二选一</td><td>帧堆叠便宜；RNN 在延迟时变时更强</td></tr>
+      <tr><td>遮挡 / 状态估计噪声大</td><td>RNN</td><td>需要"记住刚才看到过什么"并做滤波</td></tr>
+      <tr><td>元学习（054 章 RL²）</td><td>RNN</td><td>隐状态就是适应机制本身</td></tr>
+      <tr><td>对手意图 / 人机交互（050 章）</td><td>RNN</td><td>意图是时间序列信息</td></tr>
+    </table>
+    <p>纪律：<strong>RNN 一定要跑消融对照</strong>。如果 MLP 版达到了同样成绩，用 MLP，训练更快、评估更省、调试更简单。RNN 的复杂度是有代价的：一次前向要携带 h、评估要重置状态、日志要额外记录隐状态统计，工程成本至少增加一个档位。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>在"记忆抓取"任务（052 章）上实现完整的 RNN-PPO 训练系统：</p>
+    <ol>
+      <li><strong>网络</strong>：观测编码 MLP(64) → GRU(hidden=128, 1 层) → actor/critic 各一个小头（动作 7 维，价值 1 维）。选 GRU 的理由：任务记忆地平线约 15–20 步，GRU 足够；若把遮挡拉长到 100+ 步再试 LSTM。</li>
+      <li><strong>采样</strong>：4096 并行环境 × horizon 96 步（比 MLP 版的 24 步长很多，序列任务需要更长的连续片段才能提供记忆梯度）。每步存 (o, a, logp, r, v, done, h<sub>in</sub>)。</li>
+      <li><strong>重置</strong>：回合终止的帧做两件事，该帧的 h 清零（影响下一回合），以及存储时标记 done 供 GAE 与 BPTT 掩码使用。</li>
+      <li><strong>更新</strong>：把 96 步切成 12 段 × 8 步序列；minibatch 按"序列块"抽样，块内时间连续；每个块用其 h<sub>in</sub> 重放；burn-in 前置 8 步（不反传）。</li>
+      <li><strong>PPO 其余部分</strong>：与 057 章相同（clip 0.2、GAE λ=0.95、5 epochs，RNN 建议减到 3 epochs，防止对旧序列过拟合）。</li>
+      <li><strong>观测归一化</strong>：沿用 RunningMeanStd，但注意统计量更新按"每步观测"进行，序列化不改变归一化逻辑。</li>
+      <li><strong>评估</strong>：每回合格重置 h；对比三个基线：无记忆 MLP、帧堆叠 k=8、GRU；在"记忆地平线"测试（052 章片段 3）上报告成功率曲线。</li>
+    </ol>
+    <table>
+      <tr><th>超参</th><th>MLP 版（对照）</th><th>RNN 版</th><th>理由</th></tr>
+      <tr><td>horizon</td><td>24</td><td>96</td><td>序列需要足够长的连续数据</td></tr>
+      <tr><td>序列长度 L</td><td>—</td><td>8（可 16）</td><td>截断 BPTT 的方差-信息折中</td></tr>
+      <tr><td>epochs</td><td>5</td><td>3</td><td>序列数据重复拟合风险更高</td></tr>
+      <tr><td>hidden</td><td>—</td><td>128–256</td><td>太小记不住，太大过拟合且慢</td></tr>
+      <tr><td>burn-in</td><td>—</td><td>8 步</td><td>让 h 预热到当前分布</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计思维：为什么 RNN 的评估协议比 MLP 更需要仪式感？</span>
+      <p>因为 RNN 有"状态"：忘了在回合边界重置 h，评估分数会虚高（跨回合作弊）；忘了在评估时清零梯度/退出训练模式，统计量会漂移；把不同记忆长度的任务混在一个评估批里，h 的"热度"不一致。标准仪式是：<strong>每个回合 reset → h 清零 → 确定性动作 → 记录回合统计 → 下一回合</strong>，并在日志里同时输出"平均 h 范数"（突然变大往往是数值不稳的前兆）。这套仪式写进评估函数一次，之后所有 RNN 实验复用。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：带 done 掩码的 GRU 策略前向</strong></p>
+    <pre class="code"><code>import torch
+import torch.nn as nn
+
+class RecurrentActorCritic(nn.Module):
+    # h_t 是历史的可学习压缩：策略类从 o->a 扩展为 (o, h)->a
+    def __init__(self, obs_dim, act_dim, hidden=128):
+        super().__init__()
+        self.fc = nn.Sequential(nn.Linear(obs_dim, 64), nn.Tanh())
+        # GRU 比 LSTM 少一个门：参数量约少 25%，RL 常见任务上两者性能相当
+        self.gru = nn.GRU(64, hidden, batch_first=True)
+        self.actor = nn.Linear(hidden, act_dim)
+        self.critic = nn.Linear(hidden, 1)
+
+    def forward(self, obs, h, done):
+        # done 掩码：某环境这一帧终止时，把它的隐状态清零
+        # 不清零的后果：新回合的决策被上一回合"残影"污染，评估分数虚高且不稳定
+        h = h * (1.0 - done).view(1, -1, 1)        # h 形状 (1, B, hidden)
+        x = self.fc(obs).unsqueeze(1)              # (B, 1, 64) 单步序列
+        out, h_new = self.gru(x, h)                # 输入旧 h、输出新 h
+        feat = out.squeeze(1)                      # (B, hidden)
+        return torch.tanh(self.actor(feat)), self.critic(feat).squeeze(-1), h_new
+
+    def init_hidden(self, batch):
+        return torch.zeros(1, batch, self.gru.hidden_size)</code></pre>
+    <p>解读：十几行代码里有两个必须先想清楚的设计。第一，<strong>清零掩码的位置</strong>：<code>h * (1 − done)</code> 发生在"使用旧 h 之前"，意思是"如果上一帧终止了，那么本帧不要带任何记忆"。这比"在终止帧把 h 清零"更不容易错：终止帧的 h 还要用于它自己的前向（计算价值与 GAE），而新回合的第一帧必须用干净的 h。半精度训练时 <code>done</code> 要显式转成与 h 相同的 dtype 和形状（view 广播），否则会静默提升精度。第二，<strong>单步前向 vs 整段前向</strong>：这里设计的是单步接口（采样时逐步调用）；更新阶段为了 BPTT，会用另一个扁平化接口一次把 (B, L) 段喂进 GRU。两个接口共享同一组权重，但采样版更清晰、更新版更快，这是 RNN-RL 实现的标准分工。最后 <code>init_hidden</code> 的批量维度对应"并行环境数"：4096 个环境就有 4096 份独立记忆，互不相干。</p>
+
+    <p><strong>片段 2：采样循环，隐状态与数据的同步存储</strong></p>
+    <pre class="code"><code>def collect_recurrent_rollout(env, policy, obs, h, horizon):
+    # 采样阶段的铁律：每步入账 (o, a, logp, r, v, done, h_in)
+    # h_in = "进入该步时的隐状态"：更新阶段重放序列的起点，缺它只能从零 BPTT
+    buf = {"obs": [], "act": [], "logp": [], "rew": [], "val": [],
+           "done": [], "h_in": []}
+    done = torch.zeros(env.num_envs)
+    for t in range(horizon):
+        h_before_step = h.clone()                # 先保存"进入该步时"的隐状态
+        with torch.no_grad():
+            # policy 内部会做 h = h * (1 - done)，所以传入"上一步结束后的 done"
+            mean, value, h = policy(obs, h, done)
+            std = torch.exp(policy.logstd)
+            action = mean + std * torch.randn_like(mean)   # 高斯采样（PPO 的探索）
+            logp = gaussian_logprob(action, mean, std)
+        next_obs, rew, done_np, info = env.step(action.numpy())
+        done = torch.as_tensor(done_np, dtype=torch.float32)
+
+        buf["obs"].append(obs)
+        buf["h_in"].append(h_before_step)        # h_in 必须是前向之前的旧 h
+        buf["act"].append(action)
+        buf["logp"].append(logp)
+        buf["rew"].append(torch.as_tensor(rew))
+        buf["val"].append(value)
+        buf["done"].append(done)
+        obs = torch.as_tensor(next_obs, dtype=torch.float32)
+    return buf, obs, h</code></pre>
+    <p>解读：这段代码的每一行都在防"时间错位的 bug"，这类 bug 的共同症状是"训练在动但学不好"。第一个关键点是 <code>h_in</code> 存的是前向<strong>之前</strong>的隐状态：更新时重放这段序列，必须从与当时完全一致的状态出发，才能复现 logp；存错了（存前向之后的新 h）会让重放的概率比计算系统性地偏离 1，PPO 的 ratio 全乱（表现为 KL 巨大、clip 触发率飙升）。第二，<code>done</code> 的传递方向：它描述的是"上一步是否终止"，所以 policy 前向时用的是"上一步拿到的 done"；代码里在循环开始处初始化全零、循环末尾更新 done 的顺序不能颠倒。第三，高斯采样直接用 mean + std·ε：PPO 只需要"采样 + 记录 logp"，不需要重参数化梯度，这个写法最省；<code>gaussian_logprob</code> 是标准正态对数密度减 log std 的实现。最后注意采样全程 <code>torch.no_grad()</code>，采样不需要构建计算图，更新阶段独立重放。</p>
+
+    <p><strong>片段 3：截断 BPTT 的序列 minibatch 更新</strong></p>
+    <pre class="code"><code>def rnn_update_epoch(buf, policy, seq_len=8, burn_in=8, clip=0.2):
+    # 回放形状 (T, N)：把时间维切成连续序列块，块内时间必须连续！
+    # 随机打散单步样本会剪断 BPTT 的因果链，RNN 直接退化成 MLP
+    T = len(buf["obs"])
+    n_env = buf["obs"][0].shape[0]
+    starts = list(range(0, T - seq_len + 1, seq_len))
+    for start in starts:
+        # 1) burn-in：先用前置步骤"预热" h，不计算梯度（让 h 贴近当前分布）
+        h = buf["h_in"][start]
+        for t in range(max(0, start - burn_in), start):
+            with torch.no_grad():
+                _, _, h = policy(buf["obs"][t], h, buf["done"][t])
+        # 2) 正式的 BPTT 段：从 start 到 start+seq_len，梯度穿过这段的隐状态
+        losses = []
+        for t in range(start, start + seq_len):
+            mean, value, h = policy(buf["obs"][t], h, buf["done"][t])
+            logp = gaussian_logprob(buf["act"][t], mean, torch.exp(policy.logstd))
+            ratio = torch.exp(logp - buf["logp"][t])
+            adv = buf["adv"][t]                     # 已按 (T, N) 归一化
+            losses.append(-torch.min(ratio * adv,
+                                     torch.clamp(ratio, 1 - clip, 1 + clip) * adv))
+        loss = torch.stack(losses).mean()
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)   # 序列梯度更易爆
+        optimizer.step()</code></pre>
+    <p>解读：这段更新代码是"截断 BPTT 在 RL 里的骨架"。第 1 步 burn-in：从存储的 h<sub>in</sub> 再往前多喂 8 步（不含梯度），把隐状态"热"到与当前策略一致，<strong>不做 burn-in 时，重放的 h 可能来自几轮更新前的旧策略，概率比失真</strong>；burn-in 的代价只有前向，收益是 ratio 更稳，性价比极高。第 2 步的范围选择：<code>max(0, start − burn_in)</code> 防止回放起点越界；序列块之间没有梯度相连（h 在块间只作为数据传递），这就是"截断"的含义。损失结构：与 057 章的 PPO 逐样本损失完全一样，只是 logp 由带 h 的前向产生，这体现了一个设计原则：<strong>RNN 是"策略类"的扩展，不改变算法本身</strong>；PPO 的超参（clip、GAE、epochs）几乎可以照搬，只把 epochs 减一减。梯度裁剪 1.0 是序列训练的第二道保险：BPTT 的梯度范数天然比逐步 MLP 大，日志里看到梯度尖峰时应优先怀疑"某段序列里 h 爆炸"，检查项包括 done 掩码是否漏了、hidden 是否过大。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>隐状态跨回合泄漏</strong>：回合终止后 h 未清零，新回合的第一帧带着旧记忆。症状是评估分数波动大、跨回合出现"未卜先知"。修复：done 掩码（片段 1）+ 评估器每回合重置 h（052 章同款仪式）。</li>
+      <li><strong>更新阶段随机打散数据</strong>：RNN 的 minibatch 必须是连续时间片。症状是训练完全不收敛或退化到 MLP 水平。修复：按序列块切分（片段 3），并断言"同一块内 obs 的时间差为 1"。</li>
+      <li><strong>没存 h<sub>in</sub></strong>：重放只能从零启动 BPTT，记忆梯度被截掉一大段。症状是记忆任务学得很慢。修复：采样时逐步存储（片段 2），并做"重放 logp vs 采样 logp"的断言，两者应几乎相等（数值误差 1e-4 内）。</li>
+      <li><strong>序列长度与 horizon 不匹配</strong>：horizon=24、seq_len=32，一块都凑不齐。修复：horizon 取 seq_len 的整数倍（如 96 = 12×8），并在配置校验里加断言。</li>
+      <li><strong>在全观测任务上强上 RNN</strong>：样本效率不升反降，还增加了训练时间。修复：任何 RNN 实验都先跑 MLP 基线；只有"记忆地平线测试"显示明确的记忆需求时，RNN 才是正确投资。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把 seq_len 从 8 调到 4 与 32，在"记忆抓取"任务上对比训练步数与成功率，解释"截断长度—梯度信息量"的权衡。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>L=4 时与记忆相关的跨步梯度太短，学习慢；L=32 时单段方差大、显存高。看"到达同等成功率所需步数"，通常 L=8–16 最优。</div></details>
+      </li>
+      <li>去掉 done 掩码（其余不变），统计评估分数与"隐状态范数"的异常，验证跨回合泄漏。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>重点看评估时"回合第 1 帧"的隐状态范数，未清零时它非零且随评估进行波动。把"回合内指标"按帧号分桶更能暴露问题。</div></details>
+      </li>
+      <li>做"h<sub>in</sub> 一致性"单元测试：用采样数据重放一次，比较重算 logp 与存储 logp 的最大偏差，并解释偏差来源。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>正常情况下偏差在浮点误差量级；若偏差较大，检查归一化统计量是否在采样与更新之间被更新过、以及 burn-in 是否遗漏。</div></details>
+      </li>
+      <li>对比"无记忆 MLP、帧堆叠 k=8、GRU"三者的记忆地平线曲线，画出三条曲线并指出各自的记忆边界。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>帧堆叠的边界固定在 k−1 帧；MLP 在 0 帧可见时接近随机猜测；GRU 的边界由训练时的可见时长分布决定。三条曲线的交叉点解释了"为什么记忆方案要匹配信息缺口"。</div></details>
+      </li>
+      <li>把 burn-in 从 8 步增加到 32 步，观察训练吞吐与 ratio 稳定性（KL 曲线）的变化，给出你的取舍结论。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>burn-in 只做前向，成本约为同长度反传的 1/3；32 步时该成本已不可忽略，而 KL 稳定性提升趋于饱和。找"KL 达标且吞吐可接受"的最小 burn-in。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>RNN 策略把 POMDP 的信念压缩成可学习的隐状态：h<sub>t</sub> = f(h<sub>t−1</sub>, o<sub>t</sub>)，策略 π(a | o, h)；压缩方式由回报驱动，比人工帧堆叠更灵活。</li>
+      <li>门控（GRU/LSTM）为长依赖提供梯度高速路；RL 里 GRU 常是默认选择，序列超长再考虑 LSTM。</li>
+      <li>三条纪律：采样时每环境维护 h 并在 done 处清零；存储每步的 h<sub>in</sub>；更新按连续时间块划分 minibatch，绝不打散单步。</li>
+      <li>截断 BPTT（L=8–32）+ burn-in（8–16 步）+ 梯度裁剪是训练稳定的三件套；PPO 其余超参几乎可沿用，epochs 适度减小。</li>
+      <li>RNN 不是免费午餐：全观测任务上必须跑 MLP 对照；只有记忆地平线测试显示明确需求时才投资。</li>
+      <li>下一章走向序列建模的另一个极端：<strong>Transformer 策略</strong>，用注意力替代循环，把"长历史、稀疏关键帧"的记忆问题一次解决。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch060.html">← 第 060 章：实现注意力机制</a>
+    <a class="next" href="ch062.html">第 062 章：实现Transformer策略 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

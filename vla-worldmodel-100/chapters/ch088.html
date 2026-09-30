@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第088章 联合训练中的多模态融合时机 | 具身智能学习课程 · VLA 与世界模型联合训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第五篇 · 系统集成与研究实践</span>
+    <span class="sep">/</span>
+    <span>第 088 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第五篇 · 系统集成与研究实践</div>
+    <h1>第 088 章：联合训练中的多模态融合时机</h1>
+    <p class="lead">早期融合、中期交叉注意力、晚期融合各有代价：融合点放在网络哪一层、门控如何按可靠度加权、缺失模态时系统如何不崩，是本章的主题。</p>
+    <ul class="meta">
+      <li>主题：联合训练（joint training）/ 融合时机（fusion timing）</li>
+      <li>关键公式：门控融合的加权形式和门控熵</li>
+      <li>预计学时：50 分钟</li>
+      <li>前置章节：第 087 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解三种融合范式的机制差别：早期融合、中期交叉注意力融合与晚期融合，以及各自的信息保留与鲁棒性特征。</li>
+      <li>掌握可靠度条件门控（reliability-conditioned gating）的设计，理解门控熵与模态 dropout 如何防止单模态主导。</li>
+      <li>会分析融合深度与推理延迟的定量关系，在延迟预算内选择融合层数。</li>
+      <li>掌握渐进式融合课程：先独立预训练再逐步打开融合层，避免早期噪声耦合。</li>
+      <li>能诊断门控坍缩（gate collapse）、注意力汇聚（attention sink）与时间戳错位三类融合故障。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p><strong>融合时机的选择决定三件事：跨模态信息的对齐粒度、缺失模态时的系统稳定性、以及推理延迟的增量。</strong>把所有模态在输入层拼接，底层噪声会直达高层语义；把各模态独立处理到最后再加权，又丢失了语言对视觉的细粒度指称（"把左边那个递给我"依赖词元与区域的对应）。融合点给出的正是这一组权衡。</p>
+    <p>第 010 章实现了多模态输入融合模块的基本结构，本章从系统角度讨论"放在哪里"与"何时打开"：融合层位置、门控机制、渐进训练计划与延迟预算的联合设计。这些问题在联合训练中更突出，因为世界模型分支与策略分支对时间分辨率与模态完整性的要求不同，融合策略要同时满足两侧。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <p><strong>融合范式按融合点深度排列，从底向上依次是早期、中期与晚期；深度的选择在信息保留、鲁棒性与延迟三者间取舍。</strong></p>
+
+    <h3>1. 三种范式的机制与代价</h3>
+    <ul>
+      <li><strong>早期融合</strong>：把原始模态张量在输入层对齐拼接。跨模态对应保留最完整，适合像素级条件生成；代价是要求模态间空间与时间严格对齐，任一模态缺失或退化会污染全部下游特征。</li>
+      <li><strong>中期融合</strong>：各模态先独立编码到语义层，再经交叉注意力或拼接融合。对齐发生在语义粒度，参数量与延迟居中，是 VLA 的主流选择；代价是低层跨模态对应（精确接触点）可能丢失。</li>
+      <li><strong>晚期融合</strong>：各模态各自主出预测，最后在输出层加权。模块化程度最高，单模态故障影响局部；代价是失去跨模态约束，模态间一致性依赖输出层权重的表达能力。</li>
+    </ul>
+    <p>从梯度路径看，早期融合的每个模态梯度都经过共享底层，模态间相互干扰强；晚期融合的梯度路径独立，训练稳定性好。信息保留与交互强度沿融合深度单调反向变化，<strong>没有绝对最优的融合点，只有与任务与噪声结构匹配的融合点</strong>。</p>
+
+    <h3>2. 门控融合的形式</h3>
+    <p>中期融合的一种通用形式是门控加权：每个模态的特征 f<sub>m</sub> 配一个由输入决定的权重 g<sub>m</sub>，融合结果为加权和：</p>
+    <div class="formula">
+      g = softmax( W · [ φ<sub>1</sub>, …, φ<sub>M</sub>, r<sub>1</sub>, …, r<sub>M</sub> ] )，f<sub>fused</sub> = Σ<sub>m</sub> g<sub>m</sub> f<sub>m</sub>
+      <span class="note">φ<sub>m</sub> 为模态特征，r<sub>m</sub> 为可靠度标量（置信度或近期预测误差），M 为模态数</span>
+    </div>
+    <p>把可靠度并入门控输入是关键设计：当触觉读数异常时 r<sub>m</sub> 下降，门控自动降权，无需人工切换。softmax 保证权重和为 1，融合特征幅度稳定。风险在于门控坍缩：训练早期某一模态恰好误差小，门控把权重集中到它，其他模态梯度减弱，进一步降低其质量，形成正反馈。<strong>防坍缩的三件工具</strong>：模态 dropout 强迫网络在缺模态时也能工作；门控熵正则 H(g) = −Σ g<sub>m</sub> log g<sub>m</sub> 的下界约束（惩罚过低的熵）；按模态分组的损失平衡确保每个模态的梯度不消失。</p>
+
+    <h3>3. 融合深度与延迟预算</h3>
+    <p>交叉注意力融合每层引入 O(N<sub>vis</sub> · N<sub>lang</sub> · d) 的计算，N<sub>vis</sub> 为视觉词元数（224×224 输入下 196–256 个），N<sub>lang</sub> 为指令词元数（20–40 个）。单层融合在主流算力下约增加 2–5 ms 延迟，四层叠加进入 10–20 ms 量级。控制环 50 Hz 的时间预算为 20 ms，因此<strong>融合层数要与控制频率联合核算</strong>：高频环用单层浅融合或晚期融合，低频规划环可用深层融合。时序上还需保证融合两侧的特征取自同一时间窗口，跨频率模态先重采样到公共栅格。</p>
+
+    <h3>4. 渐进式融合训练</h3>
+    <p>从随机初始化直接开始全量融合，早期各模态特征都不可靠，融合层会学到错误的耦合关系，且难以在后续训练中解耦。渐进计划分三阶段：第一阶段各模态独立预训练（视觉编码器与语言编码器分别用代理任务），融合层冻结；第二阶段打开浅层融合，学习率调低；第三阶段全量联合微调。计划按训练步数分段执行，每阶段的切换点由各模态单独的验证指标触发，避免在单模态尚未收敛时提前耦合。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p><strong>数据流为：各模态独立编码 → 语义层门控融合/交叉注意力 → 策略头与世界模型头。</strong>训练采用三阶段渐进计划，模态 dropout 全程开启。</p>
+    <ol>
+      <li><strong>编码器</strong>：视觉用第 056 章的主干输出词元序列，语言用指令编码器输出词元序列，本体感觉与触觉输出单个向量。</li>
+      <li><strong>融合层</strong>：语言到视觉的交叉注意力（单层，4 头）后接门控加权（四路模态），融合结果同时供策略头与预测头使用。</li>
+      <li><strong>可靠度输入</strong>：视觉可靠度取帧间预测误差的负值，触觉取传感器自检标志，本体感觉取通信心跳，归一化后进入门控。</li>
+      <li><strong>训练计划</strong>：前 1/3 步冻结融合层，中段打开浅层，末段全量；模态 dropout 概率 0.15 全程生效。</li>
+      <li><strong>与第 010 章的差异</strong>：结构从单点拼接升级为"交叉注意力 + 门控 + 可靠度"的组合，新增训练计划与延迟核算框架。</li>
+    </ol>
+    <h3>超参数与取值依据</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>交叉注意力层数</td><td>1</td><td>语言视觉对齐深度</td><td>单层承担指称对齐，两层以上延迟收益比下降</td></tr>
+      <tr><td>注意力头数</td><td>4</td><td>对齐子空间数量</td><td>224 分辨率、256 词元下 4 头足够，8 头收益不显著</td></tr>
+      <tr><td>门控隐层</td><td>128</td><td>门控表达能力</td><td>输入维度约 1000，隐层过大会过拟合可靠度噪声</td></tr>
+      <tr><td>门控熵下界</td><td>0.5·log M</td><td>防坍缩</td><td>低于均匀熵一半时惩罚，保留模态竞争空间</td></tr>
+      <tr><td>模态 dropout</td><td>0.15</td><td>缺模态鲁棒</td><td>与第 081 章一致，低 0.1 学不到鲁棒性</td></tr>
+      <tr><td>阶段切换点</td><td>1/3、2/3 步数</td><td>渐进融合</td><td>以单模态验证指标触发的经验分割</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：门控为什么由可靠度驱动？</span>
+      <p>固定权重在训练分布内调好的平衡，遇到传感器退化（触觉漂移、视觉过曝）立即失效。可靠度驱动让门控在运行时感知模态质量，退化模态自动降权，系统退化曲线平滑。可靠度信号本身要轻量可靠：用各模态自检与近期预测误差组合得到。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>以下片段为 PyTorch 风格示意，接口命名以各开源实现的公开设计为参照，随版本演进可能变化。</p>
+
+    <p><strong>片段 1：可靠度条件门控融合</strong></p>
+    <pre class="code"><code>class GatedFusion(nn.Module):
+    """按可靠度加权的门控融合：退化模态自动降权。"""
+    def __init__(self, n_mod=4, d=256, hidden=128):
+        super().__init__()
+        # 门控输入 = 各模态特征 + 各模态可靠度标量（越大越可信）
+        self.gate = nn.Sequential(nn.Linear(n_mod * d + n_mod, hidden), nn.GELU(),
+                                  nn.Linear(hidden, n_mod))
+
+    def forward(self, feats, reliability):
+        x = torch.cat(list(feats) + [reliability], dim=-1)
+        g = torch.softmax(self.gate(x), dim=-1)      # 权重和为 1，融合幅度稳定
+        fused = sum(g[:, i:i + 1] * feats[i] for i in range(len(feats)))
+        # 返回门控权重供训练时做熵正则与监控
+        return fused, g
+
+def gate_entropy_loss(g, floor_ratio=0.5):
+    """门控熵下界：低于均匀熵的一定比例时施加惩罚，防止单模态主导。"""
+    m = g.size(-1)
+    entropy = -(g * (g + 1e-8).log()).sum(dim=-1).mean()
+    floor = floor_ratio * math.log(m)
+    return torch.relu(floor - entropy)               # 超过下界时梯度为零</code></pre>
+    <p>解读：门控输入同时包含特征与可靠度，网络学到的映射是"看见什么"与"能信什么"的函数。softmax 归一化和为 1 保证融合特征不因模态增减而缩放。熵正则用 relu 实现单侧约束，只在熵低于下界时产生梯度，避免把门控推向均匀分布而损失选择性。<code>g</code> 输出参与监控：某一路门控均值长期低于 0.05 即触发排查。</p>
+
+    <p><strong>片段 2：语言到视觉的交叉注意力融合</strong></p>
+    <pre class="code"><code>class CrossAttentionFusion(nn.Module):
+    """交叉注意力：以指令词元为查询、视觉词元为键值，学习指称对齐。"""
+    def __init__(self, d=256, heads=4, dropout=0.1):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(d, heads, batch_first=True, dropout=dropout)
+        self.norm = nn.LayerNorm(d)
+
+    def forward(self, lang_tokens, vis_tokens, key_padding_mask=None):
+        # 查询来自语言：每个指令词元选择相关视觉区域（"左边那个"指向具体位置）
+        out, weights = self.attn(lang_tokens, vis_tokens, vis_tokens,
+                                 key_padding_mask=key_padding_mask,
+                                 need_weights=True, average_attn_weights=True)
+        # 残差连接保留原始语言语义，门控层再做多模态加权
+        return self.norm(lang_tokens + out), weights</code></pre>
+    <p>解读：查询方向选语言到视觉，与指令跟随的语义一致：每个词元需要从画面中取证据。残差加归一化让融合输出在"原始语言特征"与"视觉对齐特征"之间平滑插值，训练早期即使注意力未收敛也不会破坏语言表示。<code>weights</code> 返回用于诊断注意力汇聚：若某视觉词元长期吸收全部权重，说明键表示退化，需要检查视觉主干或加入词元 dropout。<code>key_padding_mask</code> 处理指令长度不一时的填充位，防止注意力分配到无效词元。</p>
+
+    <p><strong>片段 3：渐进式融合训练计划</strong></p>
+    <pre class="code"><code>def fusion_schedule(step, total_steps):
+    """三阶段融合课程：冻结、开浅层、全量联合。返回训练配置。"""
+    if step &lt; total_steps // 3:
+        # 阶段一：各模态独立学习，融合层冻结，防止早期噪声耦合
+        return {"train_fusion": False, "lr_fusion": 0.0, "dropout": 0.15}
+    if step &lt; 2 * total_steps // 3:
+        # 阶段二：打开融合层，小学习率让门控缓慢成形
+        return {"train_fusion": True, "lr_fusion": 1e-4, "dropout": 0.15}
+    # 阶段三：全量联合微调，融合层回到主学习率
+    return {"train_fusion": True, "lr_fusion": 2e-4, "dropout": 0.15}</code></pre>
+    <p>解读：阶段划分按训练步数实现，切换点可按单模态验证指标微调。融合层学习率在阶段二刻意压低，原因在于各模态特征仍在调整，门控若学得过快会锁定早期偏差。<code>dropout</code> 全程恒定，保证缺模态场景始终在训练分布内。该计划只控制融合层参数组，三段边界值写入实验配置，保证不同运行之间可比较。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>门控坍缩</strong>：某模态权重长期接近 1，其余模态梯度消失。症状是缺失该模态时性能断崖。修复：熵下界正则、模态 dropout 提高、按模态分组检查梯度范数。</li>
+      <li><strong>注意力汇聚</strong>：全部查询集中到少数视觉词元，指称分辨率消失。症状是注意力热图几乎恒定，指令变化不影响对齐。修复：词元 dropout、注意力熵监控、检查视觉主干是否存在过强的全局词元。</li>
+      <li><strong>时间戳错位</strong>：视觉 10 Hz 与触觉 50 Hz 未对齐直接参与同一融合层。症状是接触时刻的预测系统性偏移。修复：先重采样到公共时间栅格，融合层只消费对齐窗口内的特征。</li>
+      <li><strong>融合层过早引入</strong>：训练开始即全量融合，单模态特征质量低，耦合关系错误且难以解开。症状是训练损失平台期长、单模态消融掉点异常大。修复：渐进式计划，冻结期与打开期分开评估。</li>      <li><strong>延迟预算超支</strong>：深层融合与控制环频率不匹配，动作时效性下降。症状是推理延迟分布尾部越过控制周期，闭环出现振荡。修复：按预算裁剪融合层数，或把深层融合移到低频规划分支。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>分别画出早期、中期、晚期融合的梯度路径图，指出模态间梯度干扰最强与最弱的方案，并说明与鲁棒性的关系。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>早期融合共享底层，梯度路径交织；晚期融合路径独立。干扰强意味着单模态噪声外溢大，鲁棒性差。</div></details>
+      </li>
+      <li>把门控熵下界从 0.5·log M 调高到 0.9·log M，预测门控行为与融合效果的变化。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>门控趋近均匀，模态选择能力下降，退化模态无法被有效降权；验证方法是检查模态退化场景下的输出质量。</div></details>
+      </li>
+      <li>推导门控坍缩的正反馈机制：权重集中如何让弱模态的梯度进一步减小，给出打破正反馈的两种干预。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>加权和使弱模态输出对损失的贡献正比于 g<sub>m</sub>，梯度随之减小，质量下降使门控更不选它。干预：熵正则、模态 dropout、按模态分组归一化损失。</div></details>
+      </li>
+      <li>按 224 分辨率、256 视觉词元与 32 个指令词元估算单层交叉注意力的浮点运算量，结合 20 ms 预算给出可用的融合层数上限。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>注意力核心运算约为 2·N<sub>vis</sub>·N<sub>lang</sub>·d 乘加；乘以层数与每秒推理次数，对比硬件有效算力。</div></details>
+      </li>
+      <li>设计对比实验：三种融合时机分别在模态完整、单模态缺失、模态退化三组条件下评测成功率与推理延迟，给出结论表述模板。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>固定主干与训练预算，只改变融合点；缺失条件用掩码注入，退化条件用噪声注入；报告均值与分位数两组延迟。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>融合深度决定信息保留、模态交互强度与延迟增量，三者不可兼得，按任务与噪声结构选题。</li>
+      <li>门控融合把可靠度纳入权重计算，退化模态自动降权；熵下界与模态 dropout 是防坍缩的基本配置。</li>
+      <li>交叉注意力以语言查询视觉完成指称对齐，残差结构保护早期训练；注意力权重是重要诊断信号。</li>
+      <li>融合层数与控制频率联合核算；渐进式课程先独立预训练再打开融合，减少错误耦合。</li>
+      <li>下一章进入时间尺度：<strong>VLA 策略的长期规划</strong>，讨论子目标分解、滚动视野与价值函数如何支撑长程任务。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch087.html">← 第 087 章：世界模型的离散化状态预测</a>
+    <a class="next" href="ch089.html">第 089 章：VLA策略的长期规划 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

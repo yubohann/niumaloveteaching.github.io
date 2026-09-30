@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第034章 实现逆运动学控制 | 机器人仿真学习课程 · Isaac Sim 强化学习训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 任务与技能实现</span>
+    <span class="sep">/</span>
+    <span>第 034 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 任务与技能实现</div>
+    <h1>第 034 章：实现逆运动学控制</h1>
+    <p class="lead">从雅可比矩阵到阻尼最小二乘：亲手推导并实现末端位姿到关节动作的翻译器，给第 033 章的模仿学习造一个靠谱的教师。</p>
+    <ul class="meta">
+      <li>主题：控制基础 / 逆运动学（IK）</li>
+      <li>相关组件：Isaac Sim（关节/末端状态 API）、PyTorch</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 033 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解正运动学 x = f(q) 与雅可比矩阵 J 的几何意义：每一列是"某个关节拧一下，末端往哪个方向、转多快"。</li>
+      <li>掌握微分逆运动学的两条核心公式：伪逆解 Δq = J⁺Δx 与阻尼最小二乘解，并知道为什么后者在奇异位形附近更稳。</li>
+      <li>会用零空间投影在不影响末端的前提下优化次要目标（避限位、避奇异、保持姿态）。</li>
+      <li>会实现一个迭代式笛卡尔控制循环：误差钳位、步长限制、限位截断、收敛判据一应俱全。</li>
+      <li>能说清 IK 与 RL 的分工：IK 当教师/粗调，RL 学接触与鲁棒性，以及两者的混合架构。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>上一章说"教师是 IK 和规划器"，本章就来把教师造出来。逆运动学的任务可以用一句话说清：<strong>给定末端要去的位姿，反推关节要转到什么角度。</strong>对 7 自由度机械臂，这是个 6 个方程（位姿）对 7 个未知数（关节角）的欠定问题，解不唯一；而在奇异位形附近，微小的末端移动会要求巨大的关节速度，直接求逆会让机器人"爆炸"。</p>
+    <p>在 RL 工作流里 IK 扮演三个角色：<b>(1) 教师</b>，生成第 033 章的示教轨迹；<b>(2) 动作接口</b>，策略输出末端的笛卡尔位移，由 IK 翻译成关节目标（"操作空间动作"），让策略专注学几何，把运动学交给 IK；<b>(3) 基线</b>，评估时和脚本 IK 对比，判断 RL 到底有没有增益。回顾 IK 的意义在于让 RL 站上经典控制的肩膀。</p>
+  </section>
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 正运动学与雅可比：一列一个直觉</h3>
+    <p>机械臂的正运动学把关节角 q ∈ ℝ<sup>n</sup> 映射为末端位姿 x ∈ ℝ<sup>6</sup>（位置 + 朝向）：</p>
+    <div class="formula">
+      x = f(q)，  两边对时间求导：  ẋ = J(q) · q̇，  J ∈ ℝ<sup>6×n</sup>
+      <span class="note">J 的第 j 列 = "只转关节 j 时末端的瞬时速度"，把一列看成一个小向量，几何意义立刻清楚</span>
+    </div>
+    <p>这就是雅可比矩阵（Jacobian）。它是整个逆运动学的核心对象，因为"末端想动一点"等价于"关节怎么动"这个线性问题：<b>ẋ 是期望，q̇ 是待求，J 是汇率。</b>对 Franka 这样的 7 关节臂，J 是 6×7 的"瘦长"矩阵：方程 6 个、未知 7 个，解是一条（仿射）子空间，欠定。反过来 6 自由度臂 J 是方阵，一般有唯一解（在非奇异位形）。</p>
+
+    <h3>2. 伪逆解：为什么是 Jᵀ(JJᵀ)⁻¹</h3>
+    <p>要求解 Δx = J Δq，最直接的想法是两边"除以 J"；但 J 不方。数学上最小二乘意义下的最小范数解是<b>摩尔-彭若斯伪逆</b>。推导直觉分两步：</p>
+    <div class="formula">
+      设 Δq = Jᵀ y（把解限制在 Jᵀ 的行空间内），代入：Δx = J Jᵀ y → y = (J Jᵀ)<sup>−1</sup> Δx
+      <br>于是  Δq = Jᵀ (J Jᵀ)<sup>−1</sup> Δx = J<sup>+</sup> Δx
+      <span class="note">当 J 行满秩（末端六维都能动）时成立；解是"最小关节运动"意义下唯一的</span>
+    </div>
+    <p>为什么"最小范数"是好事？因为同样的末端位移有无数关节组合，其中关节转角总量最小的那个最省力、最安全、离奇异最远。伪逆自动选出它，还能顺带处理方阵（JJᵀ 变成可逆的常形）。<strong>但它有一个致命弱点：JJᵀ 在奇异位形附近接近奇异（即将不可逆），求逆放大数值误差，Δq 爆到几百弧度。</strong>奇异位形的物理图像：手臂完全伸直时，末端沿手臂方向的运动需要"关节速度无穷大"来合成，这是机构学的几何事实，不是数值问题。</p>
+
+    <h3>3. 阻尼最小二乘：λ 的物理意义</h3>
+    <p>工程解法是在求逆前给 JJᵀ 加一个"安全垫"（Levenberg–Marquardt 阻尼）：</p>
+    <div class="formula">
+      Δq = Jᵀ ( J Jᵀ + λ² I )<sup>−1</sup> Δx
+      <span class="note">λ 是阻尼系数（典型 0.01–0.1）：奇异附近把它"垫"成可逆，牺牲一点精度换稳定性</span>
+    </div>
+    <p>λ 的取值有代数量化：加入 λ²I 后，JJᵀ 的最小特征值被抬到至少 λ²，条件数被限制在 (σ<sub>max</sub>/λ)² 之内，<strong>这就是"用精度换数值稳定"的精确公式</strong>。λ 太小（如 10⁻⁶）等于没加；λ 太大（如 1.0）会让末端"变慢"（等效于给每个方向加弹簧阻尼），跟踪精度肉眼可见地下降。工程经验：λ=0.05 对 O(1 m) 尺度的工作空间是通用起点；更好的做法是按误差自适应，误差大时用小 λ（要精度），接近目标时用大 λ（要稳定）。</p>
+
+    <h3>4. 迭代的笛卡尔控制：把微积分用成"导航"</h3>
+    <p>上面的公式是"瞬时的"：给定 Δx 求 Δq。要在实际控制里用，把它包进一个迭代回路：</p>
+    <div class="formula">
+      每周期：e = x<sub>desired</sub> − x<sub>current</sub> → 钳位 |e| ≤ e<sub>max</sub> → Δq = IK(J, e) → q<sub>cmd</sub> ← q<sub>cmd</sub> + clamp(Δq)
+      <span class="note">e 钳位防止"目标很远时一步冲过头"；Δq 钳位防奇异爆速；60 Hz 下每步只走误差的一小部分，天然平滑</span>
+    </div>
+    <p>三个钳位的意义要区分：<b>误差钳位</b>（如 5 cm）让机器人"先朝大方向走"、逐步逼近，避免直线冲过目标；<b>步长钳位</b>（如 0.1 rad/步）是安全的最后防线；<b>关节限位截断</b>在积分后执行，限位内插值可以更聪明（先转到限位挡住的那个关节的备用解），但截断已够 RL 场景使用。<strong>迭代式解法的好处正是不追求一步到位：每一帧都在重新测量误差、重新求解，扰动（被推动、负载变形）下一帧就被纠正。</strong>这是它能对付接触、适合做教师的根本原因。</p>
+
+    <h3>5. 零空间：次要目标的免费午餐</h3>
+    <p>7 自由度臂的"多余" 1 维自由度（7−6=1）可以用于次要目标：在最小范数解之外叠加一个零空间项</p>
+    <div class="formula">
+      Δq = J<sup>+</sup>Δx + ( I − J<sup>+</sup>J ) Δq<sub>0</sub>
+      <span class="note">N = I − J⁺J 是零空间投影器：它把 Δq₀ 投影到"不改变末端运动"的子空间</span>
+    </div>
+    <p>投影器 N 的几何意义：把任意关节向量压到"仍然满足 J·Δq = 0"的方向上，末端照原路走，多余的自由度用来优化别的目标。常用 Δq₀：<b>避开关节限位</b>（离限位越近排斥力越强）、<b>远离奇异</b>（最大化可操作度 w = √det(JJᵀ)）、<b>保持肘部朝上</b>的姿势偏好。<strong>这是"任务优先级"思想的入门：主任务不能被牺牲，次要目标只在剩余的 1 维里腾挪。</strong>第 084 章会把这套优先级框架系统化，那章的避奇异、关节限位控制都以本章为地基。</p>
+
+    <h3>6. 阻尼解的最优化视角与数值算例</h3>
+    <p>阻尼最小二乘还有一个更本质的读法：它是下面这个无约束优化问题的解。</p>
+    <div class="formula">
+      min<sub>Δq</sub> ‖J Δq − Δx‖² + λ² ‖Δq‖²
+      <span class="note">对 Δq 求导令零：JᵀJ Δq + λ² Δq = JᵀΔx，即 (JᵀJ + λ²I) Δq = JᵀΔx</span>
+    </div>
+    <p>再用矩阵恒等式 (JᵀJ + λ²I)<sup>−1</sup>Jᵀ = Jᵀ(JJᵀ + λ²I)<sup>−1</sup> 就得到前面的阻尼公式。优化视角回答了一个常见疑问：λ 项"惩罚"的是关节运动的平方（能量），误差项与关节项以 λ² 为相对价格被同时压小。<strong>λ 越大，系统越愿意"少动关节、多留误差"；λ → 0 则退化为伪逆的严格解。</strong>这也是自适应 λ 的原理：误差大时调小 λ 追求追上目标，误差小（接近奇异）时调大 λ 换稳定，两头的取舍都可以在同一个目标函数里解释。</p>
+    <p>取一个最小算例把奇异附近的两种解并排放：平面上两连杆臂 l₁ = 0.4 m、l₂ = 0.3 m，位形取 q = (0°，0.57°)，即第二关节几乎伸直（q₂ = 0.01 rad）。此时雅可比矩阵（只取末端的 x、y 两行）为 J = [[−0.0030, −0.0030], [0.7000, 0.3000]]。想让末端沿 x 方向移动 1 cm，即 Δx = (0.01, 0)，伪逆解 J⁺Δx 给出 Δq ≈ (2.50, −5.83) rad，关节位移范数 6.35 rad。<b>一个控制周期内让关节转 6 rad 在物理上不可能，这组数字就是"奇异附近伪逆爆速"的精确图像：沿手臂伸直的轴向移动 1 cm，需要两个关节一正一负地大角度互相抵消，末端才勉强净前进 1 cm。</b>同一误差换阻尼最小二乘（λ = 0.05）：Δq ≈ (0.0024, −0.0058) rad，关节几乎不动，这一步的末端进度被放弃，但避免了关节速度爆表与随之而来的步长截断。</p>
+    <p>用另外两个量复核同一个位形：可操作度 w = |det J| = l₁·l₂·|sin q₂|，q₂ = 0.01 rad 时 w ≈ 1.2 mm，q₂ = 90° 时 w = 120 mm，相差 100 倍；雅可比的条件数 κ(J) = σ<sub>max</sub>/σ<sub>min</sub> ≈ 483，而阻尼解把"即将为零的奇异值"垫到 λ 量级，等效条件数上限为 (σ<sub>max</sub>/λ)² ≈ 232。<b>伪逆与阻尼解代表两种取舍：前者追求"末端多走一点"而牺牲关节量，后者限制关节量而放弃部分末端进度；接口设计时按任务的精度与安全要求选择，训练教师的场景通常选后者。</b></p>
+    <p>阻尼解"放弃进度"的幅度也可以量化：把上面的 Δq ≈ (0.0024, −0.0058) 代回 J·Δq，末端实际只移动了约 0.052 mm，兑现请求位移的 0.5%，其余 99.5% 留在误差里。这个"每帧只兑现一小步"的行为与误差钳位（5 cm）叠加后，教师轨迹的天然形态就是"渐近逼近"：远离目标时每帧按钳位后的误差求解、快速接近，靠近目标或靠近奇异时每帧兑现的比例自动变小、越来越谨慎。<b>把这一步的比例打印出来（‖J·Δq‖ / ‖e‖）是调试 IK 教师的第一指标：比例健康时在 0.1–0.8 之间随位形变化，长期低于 0.01 说明系统卡在准奇异区，应检查目标点是否落在了工作空间边缘。</b></p>
+    <p>自适应阻尼的一个经典做法（Nakamura 型）直接挂在可操作度上：w 低于阈值 w₀ 时取 λ<sub>eff</sub> = λ₀·(1 − w/w₀)，w ≥ w₀ 时 λ<sub>eff</sub> = 0（退化为纯伪逆）。对本算例取 w₀ = 0.02、λ₀ = 0.05：q₂ = 0.01 rad 时 w = 0.0012，λ<sub>eff</sub> ≈ 0.047，阻尼几乎全额生效；正常位形（如 q₂ = 90° 时 w = 0.12，是阈值的 6 倍）阻尼自动归零，跟踪精度不被牺牲。<b>阈值 w₀ 的取值依据是"正常位形可操作度的 1/5 到 1/10"：低于这个比例说明末端对关节运动的响应能力塌了一个量级，继续用纯伪逆的代价（关节爆速）已经超过精度收益。</b></p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p><strong>实现路线："拿末端误差 → 构造 6 维误差向量 → 算雅可比 → 阻尼解 → 限幅与限位 → 下发关节目标"。</strong>在 Isaac Sim 里，雅可比可由物理 API 直接读，也可以数值差分估计，两者差别与选用场景如下。</p>
+    <ol>
+      <li><strong>误差向量</strong>：位置误差 3 维（目标−当前）；朝向误差用四元数差转为旋转向量（轴角）3 维，绝不要各自独立欧拉角作差，会绕大弯。</li>
+      <li><strong>雅可比获取</strong>：仿真里读张量 API 的雅可比（最准）；通用性优先时用数值差分：对每个关节加小扰动，观察末端位移，n+1 次前向计算换一个 J。</li>
+      <li><strong>阻尼求解</strong>：Jᵀ(JJᵀ+λ²I)⁻¹e；λ=0.05 起步，自适应可选（误差大时减 λ）。</li>
+      <li><strong>安全层</strong>：误差钳位 5 cm、Δq 钳位 0.1 rad、积分后关节限位截断；奇异检测（可操作度低于阈值时增大 λ）。</li>
+      <li><strong>下发</strong>：把 q<sub>cmd</sub> 交给位置控制器（第 004 章）；控制频率 60 Hz；每步打点"末端误差"作为教师质量指标。</li>
+    </ol>
+    <table>
+      <tr><th>参数</th><th>推荐值</th><th>理由</th></tr>
+      <tr><td>阻尼 λ</td><td>0.05</td><td>条件数限制在 (σ<sub>max</sub>/λ)²；误差小时可增到 0.1 更稳</td></tr>
+      <tr><td>误差钳位</td><td>5 cm / 0.2 rad</td><td>防一步冲过头；让跟踪呈现"渐近逼近"，避免过冲</td></tr>
+      <tr><td>关节步长钳位</td><td>0.1 rad/步</td><td>60 Hz 下等效 6 rad/s，接近 Franka 关节速度上限</td></tr>
+      <tr><td>收敛判据</td><td>位置误差 &lt; 2 mm 且朝向 &lt; 0.02 rad</td><td>教师轨迹"到位"的判定；比 RL 的任务成功阈值更严</td></tr>
+      <tr><td>控制频率</td><td>60 Hz（与 RL 一致）</td><td>教师数据与 RL 数据同时间尺度才能用于模仿</td></tr>
+      <tr><td>可操作度阈值</td><td>w &lt; 0.01 时 λ 加倍</td><td>接近奇异自动加阻尼；数值量级按机器人与单位截取</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计思维：IK 当动作接口，"操作空间动作"</span>
+      <p>与其让 RL 直接输出 7 个关节动作（它要自己学运动学），不如让它输出末端 6 维位移，由 IK 翻译成关节目标。<strong>这等于把运动学先验"白送"给策略：策略只需学"往哪走"，不必学"怎么转腕"。代价是 IK 的延迟与奇异处理进了回路</strong>，接触任务里被挡住时 IK 会"顶着限位"、行为受限。经验结论：自由空间任务（够取、放置）用操作空间动作更省样本；接触密集任务（插拔、擦拭）让 RL 直接出关节动作、IK 只做教师，两种模式的分界线就是"接触的自由度"。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：阻尼最小二乘 IK 一步求解</strong></p>
+    <pre class="code"><code>import torch
+
+def damped_ik_step(jac, err6, lam=0.05):
+    """一步阻尼 IK：jac (N,6,n) / err6 (N,6) → dq (N,n)
+    原理：dq = Jᵀ (J Jᵀ + λ²I)⁻¹ e；λ 垫高最小特征值，防奇异爆速"""
+    n = jac.shape[-1]
+    eye = torch.eye(6, device=jac.device).expand(jac.shape[0], 6, 6)
+    jjt = jac @ jac.transpose(-1, -2) + (lam ** 2) * eye   # (N,6,6)：批处理求逆
+    y = torch.linalg.solve(jjt, err6.unsqueeze(-1)).squeeze(-1)  # 解线性方程组，比显式求逆稳
+    dq = jac.transpose(-1, -2) @ y                          # Jᵀ y：转回关节空间
+    return dq</code></pre>
+    <p>解读：这段十行代码是本章的心脏，三个细节保证它在生产里可靠。<b>(1) 用 <code>linalg.solve</code> 解方程组</b>：求解 JJᵀy = e 与显式求逆在数学上等价，但 solve 用分解法（Cholesky/LU）数值上更稳、更快，逆矩阵只是中间产物，没有理由真的算出来。<b>(2) 阻尼项直接加在对角上</b>：λ²I 的加入让最小特征值 ≥ λ²；lam=0.05 时把"即将为零的特征值"垫到 0.05 量级，条件数封顶在 (σmax/0.05)²。<b>(3) 批处理形状 (N,6,6)</b>：4096 个环境同时做小矩阵求解，GPU 上是一次 kernel；若写成逐环境循环，这个函数会直接吃掉 IK 教师的全部性能预算，第 022 章的原则在这里再次生效。<b>换个写法会怎样？</b>若删掉阻尼项（λ=0），在奇异位形附近 dq 会出现 10²–10³ 量级的值，被步长钳位截断后表现为"关节卡住不动"，机器人看起来"突然傻了"。</p>
+
+    <p><strong>片段 2：迭代笛卡尔控制循环（含钳位与限位）</strong></p>
+    <pre class="code"><code>class CartesianIKController:
+    """每控制周期调用一次：误差反馈 + DLS求解 + 三层保护 + 限位截断"""
+    def __init__(self, robot_view, lam=0.05, e_pos_max=0.05, e_rot_max=0.2,
+                 dq_max=0.1):
+        self.view = robot_view
+        self.lam = lam                            # 阻尼系数：奇异附近保稳
+        self.e_pos_max, self.e_rot_max = e_pos_max, e_rot_max   # 误差钳位
+        self.dq_max = dq_max                      # 关节步长钳位
+        self.q_cmd = None                         # 累计关节目标：我们自己的积分器
+
+    def reset(self):
+        self.q_cmd = self.view.get_joint_positions().clone()
+
+    def step(self, target_pos, target_quat):
+        cur_pos, cur_quat = self.view.get_end_effector_pose()
+        e_pos = target_pos - cur_pos
+        # 误差钳位：目标很远时"先朝大方向走"，避免直冲引起过冲与奇异穿越
+        e_pos = e_pos * (self.e_pos_max / e_pos.norm(dim=-1, keepdim=True).clamp(min=1e-6)).clamp(max=1.0)
+
+        e_rot = quat_error_to_axis_angle(cur_quat, target_quat)   # 四元数差 → 轴角 3 维
+        e_rot = e_rot * (self.e_rot_max / e_rot.norm(dim=-1, keepdim=True).clamp(min=1e-6)).clamp(max=1.0)
+        err6 = torch.cat([e_pos, e_rot], dim=-1)                   # (N,6)：位置+旋转误差
+
+        jac = self.view.get_jacobian()            # (N,6,n)：物理 API 直读，最精确
+        dq = damped_ik_step(jac, err6, self.lam)
+        dq = dq.clamp(-self.dq_max, self.dq_max)  # 步长钳位：安全的最后防线
+
+        self.q_cmd = self.q_cmd + dq              # 关节目标积分
+        low, high = self.view.get_joint_limits()  # 限位截断：与第 025/026 章同款"软墙"
+        self.q_cmd = torch.clamp(self.q_cmd, low, high)
+        self.view.set_joint_position_targets(self.q_cmd)
+        return (target_pos - cur_pos).norm(dim=-1)   # 返回"真实"末端误差供教师质量打点</code></pre>
+    <p>解读：这个循环把"渐近逼近"的工程美学展示完整了。<b>误差钳位的写法值得慢读</b>：先把误差向量按比例缩到不超过上限（方向不变、长度受限），再交给 DLS，注意它没有用逐分量的切比雪夫截断，改用等比缩放，方向信息完整保留。<b>为什么朝向误差要专门写一个四元数差函数？</b>四元数的差不是元素相减：正确做法是 q<sub>err</sub> = q<sub>target</sub> ⊗ q<sub>current</sub>⁻¹，再转轴角（旋转向量），并且处理双覆盖问题（q 与 −q 表示同一旋转，取点积为负的那个要翻转符号）。<b>关节目标积分与限位截断的组合</b>与第 025/026 章的决策层完全同构，控制层与学习层的"积分+限位"结构竟然相同，这不是巧合：它们都在解同一个问题，安全地把序列动作变成轨迹。<b>返回值</b>用的是钳位前的"真实误差"：日志里教师误差应该反映物理现实，用钳位后的控制信号会掩盖真实差距，让你看到"误差永远 ≤5 cm"的假象。</p>
+
+    <p><strong>片段 3：把 IK 包装成示教生成器（衔接第 033 章）</strong></p>
+    <pre class="code"><code>def collect_ik_demos(env, controller, num_episodes=200, seed=0):
+    """跑 IK 教师，按第 033 章的格式录制成功轨迹"""
+    rec = DemoRecorder(env, "demos/ik_push.h5", obs_dim=env.obs_dim, act_dim=7)
+    for ep in range(num_episodes):
+        obs, _ = env.reset(seed=seed + ep)        # 每个回合换种子：主动覆盖场景多样性
+        controller.reset()
+        done = False
+        while not done:
+            target = env.current_goal_pos()       # 教师的目标：从任务状态直接读
+            controller.step(target, env.goal_quat())
+            action = controller.last_dq / 0.05    # 转回 RL 动作口径：增量 / 缩放系数
+            # 上面这行是"动作口径对齐"的落点：demos 里存的必须是策略空间的动作
+            obs, rew, done, truncated, info = env.step(action)
+            rec.record_step(obs, action, rew, done | truncated)
+            done = done | truncated
+    return rec</code></pre>
+    <p>解读：这段代码是第 033 章"三条纪律"的回收站。<b>(1) 动作口径对齐</b>：IK 控制器算出的 dq 是"关节增量"，RL 的动作空间是"增量 / 0.05"，录制前必须做同一套换算；代码里那行 <code>/ 0.05</code> 就是纪律的物理落点，注释写明原因，未来重构时不会被误删。<b>(2) 种子多样性</b>：每个回合递增种子，让 200 条演示覆盖 200 个随机化场景，这比"同一个场景录 200 遍"有价值得多，也让后续 RL 微调起点更高。<b>(3) 收敛质量</b>：教师到位精度（位置 &lt; 2 mm）远高于任务成功阈值（5 cm），留出的余量用于承受 RL 微调阶段的扰动探索。<b>什么时候 IK 教师会失败？</b>目标在工作空间外、被抓物体挡住、接触导致末端偏离，这些失败轨迹按第 033 章纪律过滤掉。真实的工程里还会监测教师的成功率：若某类场景（如角落区域）教师成功率 &lt; 50%，先修教师再录数据，别把噪声喂给 BC。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>λ 太小等于没阻尼</strong>：奇异位形附近 dq 爆到千弧度，被步长钳位后关节"卡死"。症状：手臂伸直的姿态附近 IK 不收敛。修复：λ=0.05 起步，按可操作度自适应加倍。</li>
+      <li><strong>朝向误差用欧拉角相减</strong>：绕远路、过万向锁点。症状：末端"甩头"绕大圈。修复：四元数差 → 旋转向量（轴角），并处理双覆盖。</li>
+      <li><strong>目标坐标系写错</strong>：目标位置是世界系、末端位姿读到的是本体/基座系，误差向量直接乱掉。症状：机器人朝反方向走。修复：所有量统一到基座系，误差在同一个坐标系里作差。</li>
+      <li><strong>误差不钳位</strong>：初始目标距离 0.8 m，一步全量求解把关节拽到奇异位形或被步长截断成猛冲。症状：开局"抽风"、轨迹暴烈。修复：误差钳位 5 cm/0.2 rad，渐近逼近。</li>
+      <li><strong>教师频率与 RL 不一致</strong>：IK 以 200 Hz 跑，RL 动作 60 Hz，演示数据的时间尺度错位，BC 学出的动作幅度全部偏小。修复：控制频率统一 60 Hz，教师的每个决策步与 RL 一一对应。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>推导题：在 JJᵀ 上加 λ²I 后，说明矩阵最小特征值至少为 λ²，条件数被限制在什么范围内。λ=0.05、σ<sub>max</sub>=1 时的条件数上限是多少？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>条件数 ≤ (σmax² + λ²)/λ² ≈ (σmax/λ)² = 400，相比奇异附近的无穷大，这就是阻尼"买"到的东西。</div></details>
+      </li>
+      <li>实验：把阻尼系数 λ 从 0.001 依次调到 0.5，让末端沿一条穿过"手臂伸直位形"的直线运动，记录跟踪误差峰值与关节速度峰值，找到你机器人的甜点 λ。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>λ 太小：速度峰值爆表；λ 太大：过奇异后跟踪滞后明显。画两条曲线交叉区域即为折中。</div></details>
+      </li>
+      <li>实现题：加一个零空间项 Δq₀ = −k·∂H/∂q（H 为"关节离中位的距离"代价），验证末端轨迹不变但关节更居中（监控关节角偏离中位的 RMS）。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>用 N = I − J⁺J 投影后再叠加；监控量取"限位余量的最小值"，居中化后它应该显著增大。</div></details>
+      </li>
+      <li>对比实验：同一够取任务，用"关节动作 RL"与"操作空间动作 + IK"分别训练，比较样本效率与接触阶段表现，解释差异来源。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>自由空间阶段 IK 版更快（运动学先验）；接触阶段 IK 版受限于"IK 顶着限位"的行为，用成功率与接触力分布两个指标看。</div></details>
+      </li>
+      <li>思考题：为什么迭代式 IK（每帧重解）比"一次性解析逆解再跟踪"更鲁棒？从"反馈 vs 前馈"的角度给出一段论证，并指出它在哪种情况下反而更差。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>迭代法天然闭环，扰动下一帧被纠正；但高频噪声输入时每帧重解会放大抖动，需要滤波或低频决策。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>雅可比 J 的第 j 列 = 关节 j 的单位速度引起的末端运动；逆运动学是"用 J 做汇率把末端需求换成关节动作"。</li>
+      <li>伪逆解 Jᵀ(JJᵀ)⁻¹ 给出最小范数解；阻尼最小二乘 Jᵀ(JJᵀ+λ²I)⁻¹ 用 λ 把条件数封在 (σmax/λ)² 内，奇异位形附近保稳。</li>
+      <li>迭代笛卡尔控制 = 误差反馈 + 三层钳位（误差/步长/限位）；四元数差转轴角是朝向误差的正确姿势。</li>
+      <li>零空间投影 N=I−J⁺J 让 7 自由度臂的冗余自由度服务次要目标（避限位、避奇异、保持姿态）。</li>
+      <li>下一章把 IK 放进更大的框架：运动规划（全局可行、局部优化）与 RL（适应、接触、鲁棒）如何接力完成复杂任务。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch033.html">← 第 033 章：实现模仿学习</a>
+    <a class="next" href="ch035.html">第 035 章：实现运动规划与强化学习结合 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

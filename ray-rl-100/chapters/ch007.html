@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第007章 Ray集群配置与启动 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · Ray 基础与分布式编程</span>
+    <span class="sep">/</span>
+    <span>第 007 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · Ray 基础与分布式编程</div>
+    <h1>第 007 章：Ray集群配置与启动</h1>
+    <p class="lead">从本机单进程集群走向多机集群：头节点与工作节点的分工、端口与目录的规划、驱动进程的连接方式，以及如何在集群上验证"任务真的跑在了别的机器上"。</p>
+    <ul class="meta">
+      <li>主题：Ray 核心 / 多机部署与初始化</li>
+      <li>关键机制：头节点角色、节点注册、端口规划、运行时环境（Runtime Env）</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 006 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解集群拓扑：头节点承担的控制面职责与工作节点的计算面职责，以及单点风险的边界。</li>
+      <li>掌握手工启动流程：头节点启动、工作节点注册、状态核对三步的标准命令与参数含义。</li>
+      <li>会做端口与目录规划：控制面端口的开通范围、临时目录的磁盘选择。</li>
+      <li>掌握驱动进程的两种连接方式（自动发现与显式地址），以及运行时环境对依赖一致的保障。</li>
+      <li>能在集群上验证任务分布，诊断"任务全挤在一台机器"类问题。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>本机模式的资源上限就是单台机器的核数，训练吞吐到顶后无法再扩展。跨机之后，资源池从"一台机器"变成"一组机器"，但随之而来的是新问题：哪个进程负责全局协调，节点之间怎么发现彼此，任务怎么落到正确的机器上。<strong>Ray 集群的启动过程本质上是把第 001 章的运行时组件按节点角色重新摆放</strong>：控制面收敛到头节点，数据面均摊到各工作节点。</p>
+    <p>手工启动是理解集群行为的最短路径：亲手执行过头节点与工作节点的启动命令，再看到节点出现在状态列表中，对后面自动缩放（Autoscaling）与故障恢复的机制就有了具体参照。RLlib 的大规模采样与 Tune 的分布式试验调度，都以本章的集群形态为运行基座。</p>
+    <p>本章覆盖拓扑分工、启动流程、端口规划、连接方式与验证方法五部分，自动扩缩容留到第 008 章。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 拓扑分工：控制面与计算面</h3>
+    <p>Ray 集群由一个头节点（Head Node）与若干工作节点（Worker Node）组成，各节点的进程布局如下：</p>
+    <table>
+      <tr><th>节点角色</th><th>常驻进程</th><th>职责</th></tr>
+      <tr><td>头节点</td><td>GCS、调度单元、对象存储、仪表盘、驱动进程（通常）</td><td>全局状态、Actor 注册、节点管理、提交训练任务</td></tr>
+      <tr><td>工作节点</td><td>调度单元、对象存储、工作进程</td><td>执行任务与 Actor，本地资源记账</td></tr>
+    </table>
+    <p>控制面集中在头节点的设计带来两个推论：<strong>其一，头节点故障影响全局</strong>，训练任务部署时应配合快照与重启机制（第 009 章展开）；<strong>其二，头节点的计算资源应与工作节点分开规划</strong>，驱动进程与作业提交本身要占用核数与内存，把训练负载也全压在头节点上会加剧单点压力。常见做法是头节点只做协调，或者接受头节点同时也作为计算节点但预留弹性。</p>
+
+    <h3>2. 节点注册：工作节点如何加入</h3>
+    <p>工作节点的启动命令携带头节点地址，启动过程中完成三件事：</p>
+    <ol>
+      <li><strong>连接与注册</strong>：工作节点向头节点的 GCS 注册自身，上报本机资源探测结果（核数、显存、自定义资源）。</li>
+      <li><strong>服务拉起</strong>：工作节点本地拉起调度单元与对象存储，准备接受任务分派与对象存储。</li>
+      <li><strong>心跳维持</strong>：此后节点与 GCS 之间保持心跳，心跳超时会触发节点移除与资源回收流程，这正是第 009 章故障检测的输入。</li>
+    </ol>
+    <div class="formula">
+      集群总资源 = Σ 各节点资源声明；任务调度只在声明范围内进行
+      <span class="note">4 节点 × 16 核 = 64 核总容量；节点资源声明与实际物理配置不一致是扩容事故的常见源头</span>
+    </div>
+    <p>资源探测在容器环境里可能读不到宿主机的真实配置（受编排平台限制），启动参数允许显式覆盖核数与显存，<strong>显式声明优先于自动探测，也是保证跨节点配置一致的最简单手段</strong>。</p>
+
+    <h3>3. 地址、端口与目录</h3>
+    <p>控制面通信依赖一组固定端口，集群规划时需在节点间防火墙放行：</p>
+    <ul>
+      <li><strong>GCS 端口</strong>：控制面主端口，工作节点注册与状态同步走这里；</li>
+      <li><strong>调度单元端口段</strong>：节点间任务分派使用，通常为一段连续区间；</li>
+      <li><strong>对象管理器端口</strong>：跨节点对象传输使用；</li>
+      <li><strong>仪表盘端口</strong>：集群状态可视化，仅需对管理网络开放。</li>
+    </ul>
+    <table>
+      <tr><th>通道</th><th>默认端口口径</th><th>放行范围</th></tr>
+      <tr><td>控制面与 GCS</td><td>固定端口（常见默认 6379）</td><td>全部节点之间</td></tr>
+      <tr><td>仪表盘</td><td>固定端口（常见默认 8265）</td><td>仅管理网络</td></tr>
+      <tr><td>节点与工作进程</td><td>从高位区间自动分配</td><td>节点之间按区间整体放行</td></tr>
+    </table>
+    <p>端口号随版本与配置变化，以对应版本官方文档为准；规划的要点是<strong>把"自动分配的高位区间"整段放行</strong>，逐端口申请的方式在节点扩容后必然遗漏，故障以"注册成功但任务无法分派"的形态出现。</p>
+    <p>临时目录同样需要规划。运行时会在临时目录下放置套接字与溢写文件，默认位置可能落在容量较小的系统盘上。<strong>大规模任务的溢写量可达数十 GiB，临时目录应显式指向大容量数据盘</strong>，且各节点路径保持一致，便于日志与排障。</p>
+
+    <h3>4. 驱动连接与依赖一致</h3>
+    <p>驱动进程通过 <code>ray.init(address="auto")</code> 自动发现本机已启动的集群，适合在集群节点上提交作业的场景。连接方式决定了运行边界：</p>
+    <ul>
+      <li><strong>集群内提交</strong>：驱动跑在某个集群节点上，使用自动发现，适合长作业与需要读取本地数据集的场景。</li>
+      <li><strong>集群外提交</strong>：驱动在开发机上，使用显式地址连接远程头节点，适合调试；开发机退出即作业中断，长训练不建议。</li>
+    </ul>
+    <table>
+      <tr><th>连接方式</th><th>驱动位置</th><th>生命周期绑定</th><th>适用场景</th></tr>
+      <tr><td>自动发现</td><td>集群内某节点</td><td>与该节点上的进程绑定</td><td>长训练作业、数据本地读取</td></tr>
+      <tr><td>显式地址</td><td>集群外开发机</td><td>与开发机会话绑定</td><td>短时调试、临时验证</td></tr>
+      <tr><td>作业提交接口</td><td>由集群托管</td><td>由集群作业系统管理</td><td>生产流程、断线保活</td></tr>
+    </table>
+    <p>三者的关键差别是"谁为驱动的存活负责"：自动发现模式下节点进程退出即驱动消失；显式地址模式下开发机断网即作业中断；作业提交接口把驱动托管进集群，是生产环境的常见选择。</p>
+    <p>依赖一致依靠运行时环境（Runtime Environment）机制：作业可以声明自己的 Python 依赖或工作目录，运行时负责把依赖分发到涉及的节点，并在进程启动前激活。<strong>集群节点的基础环境保持干净、作业依赖由描述文件声明，是避免"某台机器版本不对"的标准实践</strong>。</p>
+
+    <h3>5. 数值算例：从训练需求反推节点数量的容量账本</h3>
+    <p>集群规模由训练需求反推，按四步核算。第一步定需求吞吐：每轮需要 1000000 环境步，轮时间预算 20 秒，需求吞吐为 1000000 ÷ 20 = 50000 步/秒。第二步定单副本速率：单环境副本在目标策略下实测约 500 步/秒，需要 50000 ÷ 500 = 100 个副本，每副本声明 1 核。第三步加训练与驱动的消耗：训练进程 16 核加 1 张卡，驱动与系统预留 12 核。第四步向上取整到整节点：总算力需求 100 + 16 + 12 = 128 核，按每节点 32 核组织，恰好 4 个工作节点，头节点另配 16 核专用于协调。</p>
+    <table>
+      <tr><th>分项</th><th>核算过程</th><th>结果</th></tr>
+      <tr><td>需求吞吐</td><td>1000000 步 ÷ 20 秒</td><td>50000 步/秒</td></tr>
+      <tr><td>采样副本</td><td>50000 ÷ 500（单副本速率）</td><td>100 个，占 100 核</td></tr>
+      <tr><td>训练与驱动</td><td>训练 16 核 + 预留 12 核</td><td>28 核</td></tr>
+      <tr><td>工作节点数</td><td>(100 + 28) ÷ 32 核</td><td>4 个</td></tr>
+    </table>
+    <p>账本算完必须做敏感性检验：若某节点实际只有 16 核可用（资源声明偏差或硬件差异），总采样核降为 96，吞吐上限降为 96 × 500 = 48000 步/秒，轮时间升为 1000000 ÷ 48000 ≈ 20.83 秒，超出预算约 4%。偏差会被逐节点放大，因此启动后用 <code>ray status</code> 核对资源总量与账本一致，是部署流程的必要步骤。账本的价值在于让容量问题在部署前暴露：需求吞吐、单副本速率、预留量三项中任何一项估计错误，都会直接转化为轮时间超支。</p>
+    <p>跨节点流量同样要进账本。按每步观测 84×84 单通道 float32 计 28224 字节：单副本每批 200 步产出约 5.6 MB，每 0.4 秒交付一批，即约 14.1 MB/秒；100 个副本合计约 1.41 GB/秒，超过 10 GbE 链路约 1.25 GB/秒的有效带宽，<strong>头节点入口成为网络瓶颈</strong>。缓解手段有三类：把观测精度从 float32 降到 uint8，字节数降为四分之一，汇聚流量回到约 353 MB/秒；启用序列化侧压缩；增大每批步数，并让节点先做局部合并以减少传输次数与协议开销。每节点内部流量为 25 × 14.1 ≈ 353 MB/秒，本身落在链路能力内，说明瓶颈集中在头节点入口方向，扩容前先核对这一路流量。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>手工搭建一套可复现实验集群的步骤：</p>
+    <ol>
+      <li><strong>前置对齐</strong>：所有节点统一的 Python 与 Ray 版本、统一的临时目录路径、统一的时钟来源。</li>
+      <li><strong>启动头节点</strong>：声明端口与资源，记录输出的连接地址。</li>
+      <li><strong>启动工作节点</strong>：携带头节点地址加入；逐台核对注册成功。</li>
+      <li><strong>状态验证</strong>：查看节点列表与总资源，确认与规划值一致。</li>
+      <li><strong>分布验证</strong>：提交跨节点任务，核对执行位置的节点编号；通过后再部署真实训练作业。</li>
+      <li><strong>退出清理</strong>：实验结束停止所有节点进程，避免残留进程占用端口与资源。</li>
+    </ol>
+    <table>
+      <tr><th>参数</th><th>典型取值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>num-cpus（每节点）</td><td>16–64</td><td>资源声明覆盖</td><td>与物理核一致，容器内必须显式声明</td></tr>
+      <tr><td>num-gpus（每节点）</td><td>0–8</td><td>显存调度声明</td><td>与物理卡数一致，多机训练时逐卡核对</td></tr>
+      <tr><td>temp-dir</td><td>数据盘路径</td><td>套接字与溢写目录</td><td>容量充足、路径各节点一致</td></tr>
+      <tr><td>端口区间</td><td>默认区间放行</td><td>节点间通信</td><td>安全策略按控制面最小开放</td></tr>
+    </table>
+    <p>前置对齐中的三项各有其故障形态。Python 与 Ray 版本不一致会引发序列化错误与接口错位；临时目录路径不一致会让溢写文件与日志散落，排障时难以定位；时钟偏差超过心跳判定阈值时，节点会被误判为失效并从集群移除，其上任务触发重建。容器环境中的时钟由宿主机同步，但心跳超时阈值与网络抖动叠加仍可能产生误判，部署文档中应记录超时参数取值及其依据，作为排障基线。</p>
+    <div class="box tip">
+      <span class="box-title">与上一章的差异点</span>
+      <p>第 006 章的所有并发手段运行在单一进程边界内；本章把边界扩展到多台机器，跨机通信引入网络带宽与延迟约束，对象本地性（Locality）从优化项变成主要矛盾。后续章节的调度与容错都要在此基础上重新审视。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>以下片段采用 Ray 2.x 时期的通用写法；接口随版本演进，以对应版本官方文档为准。</p>
+    <p><strong>片段 1：头节点与工作节点的启动命令</strong></p>
+    <pre class="sh"><code># 头节点：声明控制面端口、资源规模与临时目录
+ray start --head --port=6379 --num-cpus=16 --num-gpus=0 --temp-dir=/data/ray_tmp
+
+# 输出中会打印工作节点使用的连接地址，例如：
+#   ray start --address='192.168.1.10:6379'
+
+# 每个工作节点：携带头节点地址加入，显式声明本机资源防止探测偏差
+ray start --address='192.168.1.10:6379' --num-cpus=16 --num-gpus=8 --temp-dir=/data/ray_tmp
+
+# 在任意节点上核对集群状态：节点列表、资源总量与当前空闲量
+ray status</code></pre>
+    <p>解读：命令里每个参数都对应一个易错点。<code>--num-cpus</code> 与 <code>--num-gpus</code> 把资源声明与实际硬件对齐，容器环境中这两个值常被显式覆盖；<code>--temp-dir</code> 指向大容量数据盘，避免系统盘被溢写文件占满。<strong>GCS 端口在每个集群中应唯一且固定</strong>，同一台机器上并存多个集群时必须为每个集群分配不同端口。工作节点加入后立即执行 <code>ray status</code>，把"预期资源总量"与"实际注册总量"做一次对照，是部署的标准动作。</p>
+
+    <p><strong>片段 2：驱动进程连接集群并核对节点</strong></p>
+    <pre class="code"><code>import ray
+import socket
+
+ray.init(address="auto")      # 自动发现本机已启动的集群；跨机提交时改用地址串
+
+nodes = ray.nodes()           # 节点视图：包含地址、状态与资源声明
+alive = [n for n in nodes if n["Alive"]]
+print("存活节点数:", len(alive))
+for n in alive:
+    print(n["NodeManagerAddress"], n["Resources"].get("CPU"), "核",
+          n["Resources"].get("GPU", 0), "卡")
+
+# 集群总资源与当前空闲资源对照：差值即已被占用的容量
+print("总资源:", ray.cluster_resources())
+print("空闲资源:", ray.available_resources())</code></pre>
+    <p>解读：<code>ray.nodes()</code> 返回的视图是排查部署问题的第一现场：节点缺席说明注册失败，核数不符说明声明有偏差。<strong>把节点视图打印进作业日志，让每次训练的集群快照可追溯</strong>，后续出现性能异常时可以回溯当时的资源规模。注意自动发现要求驱动进程与集群在同一台机器上且能找到运行时配置；在容器编排环境中，这条判定依赖临时目录的可见性，跨容器提交应使用显式地址。</p>
+
+    <p><strong>片段 3：验证任务真的分布到了不同机器</strong></p>
+    <pre class="code"><code>import ray
+
+ray.init(address="auto")
+
+@ray.remote(num_cpus=1)
+def probe(local_id):
+    import socket
+    ctx = ray.get_runtime_context()      # 运行时上下文提供当前任务的身份信息
+    return {
+        "local": local_id,
+        "host": socket.gethostname(),     # 执行所在主机名
+        "node": ctx.get_node_id()[:8],    # 节点编号前缀：区分机器的稳定标识
+    }
+
+# 提交 32 个探针任务；调度器按资源与本地性把它们散列到各节点
+placements = ray.get([probe.remote(i) for i in range(32)])
+by_node = {}
+for p in placements:
+    by_node.setdefault(p["node"], []).append(p["host"])
+for node_id, hosts in by_node.items():
+    print(node_id, hosts[0], "任务数:", len(hosts))</code></pre>
+    <p>解读：这是上线前的分布验证脚本。默认调度偏向负载均衡，32 个单核任务应大致按资源比例散落到 4 个节点上。<strong>只看到一台主机的任务集中，就要检查其他节点的注册状态与资源声明</strong>：工作节点未注册、资源声明为 0、或驱动进程连接错了集群，都会产生这种形态。任务返回值携带节点编号，把执行位置变成可核对的数据；单靠日志推断在集群上并不可靠；同样的探针模式可以推广到"数据是否落在预期的节点"的检查。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>节点间版本不一致</strong>：头节点与工作节点上 Ray 或 Python 版本存在差异，注册表面成功，任务执行时报序列化或接口错误。修复：镜像统一基础环境，作业依赖用运行时环境描述文件声明。</li>
+      <li><strong>防火墙拦截控制面端口</strong>：能启动、无法注册，<code>ray status</code> 始终只有头节点。症状与资源不足相似但日志不同。修复：放行控制面端口区间与对象传输端口，或先在同网段验证连通性。</li>
+      <li><strong>容器内资源探测偏差</strong>：工作节点的调度单元读到宿主机的核数或读不到显卡，资源声明与实际不符。修复：启动参数显式声明核数与显存，并在节点视图里定期核对。</li>
+      <li><strong>临时目录落在小容量分区</strong>：溢写文件与套接字塞满系统盘，节点静默失去响应。修复：为所有节点配置统一的、位于数据盘的临时目录。</li>
+      <li><strong>残留进程与端口占用</strong>：实验结束未停止节点，重启时端口冲突或连接到旧集群的陈旧状态。修复：实验流程中加入统一的停止步骤，重启前核对进程与端口。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>用两到四台机器（或容器）搭集群：头节点 16 核、每个工作节点 16 核加 8 卡。核对 <code>ray status</code> 的总资源与规划值，列出所有偏差并逐项解释。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>常见偏差来源：自动探测把物理核数上报、容器内读不到显卡、资源声明遗漏。所有偏差都应能追溯到某个启动参数。</div></details>
+      </li>
+      <li>预测题：把片段 3 的探针任务从 32 个改为 128 个，声明不变。预测任务在节点间的分布形态变化，并说明调度器负载均衡与资源容量的关系。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>任务数远大于核数时分布趋近按容量等比例；任意时刻任一两节点间的在途任务数差异应在核数量级以内。</div></details>
+      </li>
+      <li>设计题：为"头节点同时承担协调与部分训练负载"与"头节点仅协调"两种形态各写一份资源规划，给出各自的适用条件与风险点。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>共用形态省一台机器但单点压力大；专用形态多一台机器换稳定性。规划项至少包含驱动进程的核数预留与对象存储预算。</div></details>
+      </li>
+      <li>分析：某作业在开发机上用显式地址连接远程集群提交，训练进行到中途网络抖动，作业直接失败。从驱动连接方式的语义解释原因，并给出两种改进方案。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>集群外驱动的生命周期与作业绑定，连接中断即失去协调方。改进：把驱动部署进集群（自动发现模式），或使用作业提交接口托管驱动。</div></details>
+      </li>
+      <li>验证设计：设计一套集群健康验证清单，覆盖节点注册、资源声明、跨节点通信、共享存储四条通道，每项给出具体的验证命令或探针脚本思路。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>节点注册看节点视图，资源声明核对数值，跨节点通信用探针任务互传对象，共享存储读写临时目录下的大文件。四条通道各自独立，任何一条异常都会以不同形态暴露。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>集群拓扑分两面：头节点承担控制面（GCS、仪表盘、驱动），工作节点承担计算面（任务与 Actor 执行）。</li>
+      <li>启动三步：头节点声明资源与端口，工作节点携带地址注册，<code>ray status</code> 核对总量；<strong>资源声明必须与实际硬件一致</strong>。</li>
+      <li>端口区间与临时目录是部署规划的两个固定项；容器环境务必显式覆盖资源探测。</li>
+      <li>驱动连接有集群内自动发现与跨机显式地址两种方式；长作业应把驱动部署进集群。</li>
+      <li>下一章在手工集群之上引入弹性：<strong>资源管理与自动缩放</strong>，讲清资源声明、调度策略与扩缩容决策。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch006.html">← 第 006 章：Ray异步任务与Future</a>
+    <a class="next" href="ch008.html">第 008 章：Ray资源管理与自动缩放 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第014章 阶段实践：分布式数据流水线 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · Ray 基础与分布式编程</span>
+    <span class="sep">/</span>
+    <span>第 014 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · Ray 基础与分布式编程</div>
+    <h1>第 014 章：阶段实践：分布式数据流水线</h1>
+    <p class="lead">把第一篇全部零件拼成一台机器：生产者 Actor 池、带背压的聚合循环、批量写入的回放缓冲、可恢复的检查点，最后用实测吞吐回答"这台机器跑多快、瓶颈在哪"。</p>
+    <ul class="meta">
+      <li>主题：Ray 核心 / 综合实践</li>
+      <li>关键机制：生产者消费模式、背压窗口、批量聚合、检查点恢复</li>
+      <li>预计学时：70 分钟</li>
+      <li>前置章节：第 013 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>能把需求拆成四类角色：生产者、传输、聚合、落库，并为每类角色选定合适的原语。</li>
+      <li>会用窗口背压把生产者与消费者的速率解耦，控制内存与队列水位。</li>
+      <li>会设计批量写入与可结合聚合，避免单点 Actor 成为吞吐瓶颈。</li>
+      <li>能给流水线接上检查点与恢复路径，验证中断重启后进度不归零。</li>
+      <li>会测量端到端吞吐并定位三段（生产、聚合、落库）中的瓶颈段。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>强化学习的训练前置环节本身就是一条流水线：多个环境副本并行采样，样本经批量整理与统计后进入回放缓冲，供训练循环消费。这条链路用到的每个机制都在前十三章出现过，但<strong>把它们正确拼装成系统的工程经验，需要一次完整的端到端练习</strong>：速率怎么配平、背压放哪一层、检查点写多频、故障后从哪里续跑。</p>
+    <p>本章的练习环境是纯计算的生产者（用确定性函数模拟环境推进），这样整条链路的速率可控、结论可复现。把它换成真实环境只改动生产者的内部实现，管道骨架不变：这正是分层设计的意义，也是第 023 章以后 RLlib 采样器（Sampler）的架构原型。</p>
+    <p>实践目标有三条硬指标：单机 16 核上端到端吞吐达到万步每秒量级；中断任意一段后重启，累计进度不回到零；通过一次参数扫描定位瓶颈段。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 四类角色与原语选择</h3>
+    <table>
+      <tr><th>角色</th><th>状态性质</th><th>原语选择</th><th>理由</th></tr>
+      <tr><td>生产者</td><td>有状态：随机数流与推进进度</td><td>Actor 池</td><td>状态跨批保持，重启要能续跑</td></tr>
+      <tr><td>传输</td><td>无状态：引用搬运</td><td>对象引用</td><td>零拷贝共享，批量聚合同一对象</td></tr>
+      <tr><td>聚合</td><td>无状态：可结合统计</td><td>远程函数</td><td>可并行、可重试、与调度器配合</td></tr>
+      <tr><td>落库</td><td>有状态：缓冲内容</td><td>单个 Actor</td><td>写入需串行化，顺序即安全</td></tr>
+    </table>
+    <p>角色划分的依据是第 002 章的判定标准：状态在谁身上。生产者与落库持有跨批状态选 Actor；聚合是无状态变换选远程函数。传输层以引用约定实现：<strong>生产者返回结果引用，聚合与落库全链路只搬运引用</strong>，这条约定让整条链路的数据只有一份。</p>
+
+    <h3>2. 背压与速率配平</h3>
+    <p>流水线的稳态吞吐由最慢段落决定，而所有段落的行为都会受"在途量"影响。三个速率要同时配平：</p>
+    <div class="formula">
+      稳态吞吐 = min(R<sub>生产</sub>, R<sub>聚合</sub>, R<sub>落库</sub>)
+      <span class="note">任一阶段过慢，都会通过队列增长把压力回传；背压窗口就是把压力显式化</span>
+    </div>
+    <ul>
+      <li><strong>生产速率</strong>：生产者数与单副本步速的乘积。提高靠加副本或优化单步成本。</li>
+      <li><strong>聚合速率</strong>：聚合任务并发数与批处理成本的函数。聚合是纯计算，可按核数扩展。</li>
+      <li><strong>落库速率</strong>：单 Actor 串行队列，是链路里最容易被低估的瓶颈。对策是批量写入，让单次方法调用承载多个样本。</li>
+    </ul>
+    <p>背压窗口实现"生产者不停、消费者不崩"的软配平：窗口满时提交侧等待最早的引用就绪并消费一个，再补投一个。窗口太小学生者会出现空转，太大则队列与内存在慢段前堆积。<strong>窗口值的合理起点是生产者数的两倍，再用观测到的队列深度微调</strong>。</p>
+
+    <h3>3. 尾延迟与慢分片治理</h3>
+    <p>生产者池的耗时天然有方差：环境状态的差异会让个别副本的单批耗时明显偏高。排队模型里，慢分片不仅延迟自身交付，还会通过等待逻辑拖住消费循环：如果消费循环固定等"第 k 个任务"，一个慢分片就阻塞整条链路。<strong>治理原则是让消费顺序与完成顺序对齐，用"最先就绪"替代"按序等待"</strong>，同时设置超时哨兵：超过阈值的分片记录告警并在下一轮补投，不让单点拖垮全局吞吐。</p>
+    <p>用基准读数给尾延迟的影响定量：200 批在 64 批/秒的产能下约需 3.125 秒完成。若一个生产者掉队 0.25 秒（单批耗时从 125 毫秒退化到 375 毫秒），最先就绪消费只延迟自身交付，总完成时间至多加约 8%；换作按序等待，后续产出都要排队让路，多个掉队者会叠加同量级延迟。掉队出现的频率比幅度更值得关注：持续出现的慢分片应检查环境难度分布或输入尺寸，只调超时阈值无济于事。超时阈值也不宜拍脑袋：先统计单批耗时的中位数与 P99，阈值取 P99 的 2 至 3 倍，避免把正常的重尾波动误判为卡死；误判会触发重复补产，把尾延迟问题转换成数据重复问题。</p>
+
+    <h3>4. 检查点与恢复</h3>
+    <p>流水线的检查点要覆盖两类状态：生产者的推进进度（每个副本已产出多少）与落库的缓冲内容。设计遵循第 009 章的四问：存进度与缓冲摘要、按固定批次间隔写、临时文件加原子替换、启动时统一走加载分支。<strong>恢复语义定成"至多丢失一个检查点间隔的进度"</strong>：这个上界写进恢复流程，测试时按它验收。</p>
+
+    <h3>5. 数值算例：三段速率配平与批量落库收益</h3>
+    <p>给这条流水线代入一组合成读数：单批 4000 步，单个生产者产出一批耗时 125 毫秒，即 8 批/秒；8 个生产者合计 64 批/秒，折合 25.6 万步/秒。聚合函数每次 10 毫秒，容量 100 批/秒；落库单次调用 5 毫秒，容量 200 批/秒。三段取最小值，稳态吞吐为 64 批/秒，瓶颈在生产段。</p>
+    <p>把落库做差：若落库方法退化为每次调用 22 毫秒（写盘抖动、校验变重），容量掉到约 45.5 批/秒，稳态吞吐被压到约 18.2 万步/秒，整条链路损失约 29%。把 8 批合并成一次调用（固定开销 20 毫秒加每批 2 毫秒乘员），摊薄后每批约 4.5 毫秒，容量回到约 222 批/秒，瓶颈重新回到生产段。批量写入在这里承担关键角色，把吞吐从落后 29% 拉回满配。</p>
+    <table>
+      <tr><th>场景</th><th>生产（批/秒）</th><th>聚合（批/秒）</th><th>落库（批/秒）</th><th>稳态吞吐（步/秒）</th><th>瓶颈段</th></tr>
+      <tr><td>基准（落库 5 ms/次）</td><td>64</td><td>100</td><td>200</td><td>256,000</td><td>生产</td></tr>
+      <tr><td>落库退化（22 ms/次）</td><td>64</td><td>100</td><td>45.5</td><td>约 182,000</td><td>落库</td></tr>
+      <tr><td>落库合并 8 批（4.5 ms/批）</td><td>64</td><td>100</td><td>222</td><td>256,000</td><td>生产</td></tr>
+    </table>
+    <p>检查点和内存也能由这组读数推出：检查点间隔 50 批时，丢失上界为 50 ÷ 64 ≈ 0.78 秒的进度；窗口 16 的在途内存等于 16 × 单批体积，观测 64 维 float32（每批约 1 MB）时约 16 MB，处在安全区，若单批体积升到 8 MB 则窗口内存跨过百兆量级，需要同步缩小窗口或压缩观测。</p>
+
+    <h3>6. 并行度与依赖链的边界</h3>
+    <p>片段 2 的合并方式藏着一条依赖链：每次合并都接收上一轮的累计结果，合并任务因此串行执行。合并成本低（本例 10 毫秒）时，容量 100 批/秒盖过生产段，串行无碍；若合并变重（去重、写索引、加密），单点容量掉到生产速率以下，依赖链立刻成为瓶颈。修复方向是把归并改成树形两两合并，让合并任务彼此独立并行，最后一层再收敛到单点。</p>
+    <p>重试会带来重复交付：任务失败重发时，同一批样本可能被生产两次或落库两次。统计类聚合要求合并运算满足可结合与幂等去重（按批标识去重），否则开启重试后总量偏大。对顺序敏感的场景，需要回到单 Actor 串行路径或引入两阶段提交，这条代价在设计阶段就要向需求方摆明。</p>
+    <p>慢分片治理也有边界：最先就绪消费让单个卡死任务不再阻塞整条链路，但收尾循环仍会等待全部在途任务，若某任务永久卡死，循环结束条件永远不满足。超时哨兵要把"超时任务"从窗口里摘除并补投，同时记录其标识供事后复盘；摘除意味着该批数据丢弃或改由重试路径补产，属于"至多一次"与"至少一次"之间需要明确写下来的语义选择。</p>
+    <p>检查点写入的开销要按占比核算：20 毫秒的落盘若每 50 批触发一次（64 批/秒下约合每 0.78 秒一次），吞吐税约 2.6%；间隔缩短到每 10 批，税负升到约 12.8%，换来的是丢失上界从 0.78 秒降到 0.16 秒。间隔选择就是这条曲线的取舍：先定可接受的丢失秒数，再反推间隔，最后确认写入税落在可接受范围。检查点调用与插入调用共用同一条串行队列，落盘期间写入请求一度排队，这项隐性成本同样计入税负。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>从零搭起这条流水线的步骤：</p>
+    <ol>
+      <li><strong>定义数据契约</strong>：单批样本的字段、批大小（4k 步量级）、批标识；契约先于代码确定。</li>
+      <li><strong>写生产者</strong>：内部维护随机数流与累计步数；提供推进与快照两个方法。</li>
+      <li><strong>写聚合循环</strong>：窗口提交、最先就绪消费、批量合并统计；循环内不含阻塞 IO。</li>
+      <li><strong>写落库 Actor</strong>：批量写入方法加缓冲快照；容量到达阈值时触发检查点。</li>
+      <li><strong>接检查点</strong>：生产者在构造时尝试加载进度，落库同理；用一次人为中断验证。</li>
+      <li><strong>测吞吐与扫描</strong>：固定总步数测端到端吞吐；扫描生产者数与窗口值，定位瓶颈段。</li>
+    </ol>
+    <p>参数扫描的做法要固定其余变量：先把窗口固定在生产者数的两倍，生产者数取 8、16、32 依次测吞吐；再把生产者数固定在拐点处，窗口取 4、16、64 复测。每轮同时记录吞吐与队列深度两条曲线，拐点处对照聚合与落库容量判读瓶颈归属：加生产者而吞吐不动、排队上升，说明瓶颈已在下游；生产者空闲率高，说明它被下游回传的等待压住。两次扫描足以覆盖本章的配平问题，多变量同改会让读数失去可归因性。</p>
+    <table>
+      <tr><th>参数</th><th>典型取值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>生产者数</td><td>8–32</td><td>生产速率</td><td>核数以内的单副本声明</td></tr>
+      <tr><td>单批步数</td><td>4k–8k</td><td>数据粒度</td><td>单批处理耗时与窗口容量折中</td></tr>
+      <tr><td>窗口上限</td><td>2 × 生产者数</td><td>背压水位</td><td>按队列深度观测微调</td></tr>
+      <tr><td>落库批大小</td><td>16–64 批</td><td>摊薄串行开销</td><td>单次方法耗时控制在毫秒级</td></tr>
+      <tr><td>检查点间隔</td><td>每 10–50 批</td><td>丢失上界</td><td>写入开销与丢失容忍折中</td></tr>
+    </table>
+    <div class="box tip">
+      <span class="box-title">与前面章节的关系</span>
+      <p>本章不引入新机制，全部零件来自第 002 至 013 章：Actor 池来自第 002、005 章，背压窗口来自第 005、006 章，批量与检查点来自第 003、009 章。实践的价值在于验证这些零件组合后的整体行为。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>以下片段采用 Ray 2.x 时期的通用写法；接口随版本演进，以对应版本官方文档为准。</p>
+    <p><strong>片段 1：有状态生产者，进度可续</strong></p>
+    <pre class="code"><code>import ray
+import random
+
+ray.init(num_cpus=16)
+
+@ray.remote
+class Producer:
+    def __init__(self, pid, seed):
+        self.pid = pid
+        self.rng = random.Random(seed)
+        self.done_steps = 0           # 累计推进步数：检查点要覆盖的核心状态
+
+    def produce(self, steps):
+        """推进 steps 步并返回一批样本摘要（真实场景为轨迹数组）。"""
+        batch = [self.rng.random() for _ in range(steps)]   # 模拟采样输出
+        self.done_steps += steps
+        return {"pid": self.pid, "steps": steps,
+                "reward_sum": sum(batch), "done": self.done_steps}
+
+    def snapshot(self):
+        # 快照随机数状态：恢复时从同一条随机流继续，保证可复现
+        return {"pid": self.pid, "done": self.done_steps,
+                "rng_state": self.rng.getstate()}
+
+producers = [Producer.remote(i, seed=1000 + i) for i in range(8)]   # 8 个副本</code></pre>
+    <p>解读：生产者的状态有两件：累计步数与随机数流。快照接口把两者一起返回，<strong>恢复时重放随机数状态才能保证采样轨迹与未中断时一致</strong>；只恢复步数会得到"进度对得上、数据对不上"的隐蔽偏差。批数据在本例中直接以摘要形式返回，真实采样场景返回轨迹数组，由对象存储承担传输（第 003 章）。生产者方法保持纯计算，不调用外部服务，这是池化扩展的前提。</p>
+
+    <p><strong>片段 2：聚合循环，背压加最先就绪</strong></p>
+    <pre class="code"><code>import time
+import ray
+
+ray.init(num_cpus=16)
+
+@ray.remote(num_cpus=1)
+def merge_stats(stat_a, stat_b):
+    """可结合聚合：与顺序无关，支持逐批合并。"""
+    return {"steps": stat_a["steps"] + stat_b["steps"],
+            "reward_sum": stat_a["reward_sum"] + stat_b["reward_sum"]}
+
+def run_pipeline(producers, total_batches=200, window=16, batch_steps=4000):
+    in_flight = []                    # 在途引用窗口：背压的唯一抓手
+    merged = {"steps": 0, "reward_sum": 0.0}
+    submitted = 0
+    t0 = time.perf_counter()
+    while submitted &lt; total_batches or in_flight:
+        while submitted &lt; total_batches and len(in_flight) &lt; window:
+            pid = producers[submitted % len(producers)]   # 轮转派发到生产者池
+            ref = pid.produce.remote(batch_steps)
+            agg = merge_stats.remote(ref, merged)         # 依赖图：先产出后合并
+            in_flight.append(agg)
+            submitted += 1
+        ready, in_flight = ray.wait(in_flight, num_returns=1)  # 最先就绪先消费
+        merged = ray.get(ready[0])
+    dt = time.perf_counter() - t0
+    print(f"完成 {merged['steps']} 步, 耗时 {dt:.2f}s, "
+          f"吞吐 {merged['steps'] / dt:,.0f} 步/秒")
+    return merged
+
+merged = run_pipeline(producers)</code></pre>
+    <p>解读：循环结构是本章的核心工程模式：<strong>提交条件与消费条件互锁，窗口在任何时刻封顶在途任务数</strong>。<code>merge_stats</code> 接收上一轮合并结果与当前批摘要作为输入，在依赖图上形成一条收敛链，合并本身是远程函数，不与生产者争抢核数配额（各声明 1 核）。<code>ray.wait</code> 保证消费顺序与完成顺序一致，慢分片只会延迟自己。这段代码的吞吐读数由"步数除以墙钟时间"得到，测量口径是端到端（提交到消费完成），排除了事后汇总的干扰。</p>
+
+    <p><strong>片段 3：批量落库与检查点恢复</strong></p>
+    <pre class="code"><code>import os
+import pickle
+import tempfile
+import ray
+
+ray.init(num_cpus=16)
+
+CKPT = os.path.join(tempfile.mkdtemp(prefix="pipeline_ckpt_"), "sink.pkl")
+
+@ray.remote
+class ReplaySink:
+    def __init__(self):
+        self.buffer = []
+        self.batches = 0
+        if os.path.exists(CKPT):                  # 统一恢复路径：有则加载
+            with open(CKPT, "rb") as f:
+                state = pickle.load(f)
+                self.batches = state["batches"]
+
+    def insert(self, stats_list):
+        # 批量写入：单次方法调用承载多批，摊薄串行队列开销
+        self.buffer.extend(stats_list)
+        self.batches += len(stats_list)
+        return self.batches
+
+    def checkpoint(self):
+        tmp = CKPT + ".tmp"
+        with open(tmp, "wb") as f:
+            pickle.dump({"batches": self.batches}, f)
+        os.replace(tmp, CKPT)                     # 原子替换，防止半截文件
+        return self.batches
+
+sink = ReplaySink.remote()
+print("落库计数:", ray.get(sink.insert.remote([merged] * 8)))   # 一次写入 8 批
+print("检查点:", ray.get(sink.checkpoint.remote()))</code></pre>
+    <p>解读：落库 Actor 的两个设计点对应两条纪律。<strong>批量写入</strong>：单 Actor 的串行队列是链路最容易出现的瓶颈，把 8 批样本合为一次调用，单位样本的队列开销降到八分之一；批大小可按"单次调用耗时保持在毫秒级"现场标定。<strong>检查点原子写</strong>：临时文件加替换，恢复分支读到的永远是完整快照。验证恢复的方法固定：运行一段时间后终止驱动进程，重启脚本并观察 <code>batches</code> 是否从检查点值继续累加（归零说明恢复分支未生效）。至此，生产、聚合、落库、恢复四件事闭环，把这条链路的吞吐与 RLlib 采样器对照，架构层面的差异只剩实现细节。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>窗口失效导致内存膨胀</strong>：提交循环忘记检查窗口，任务海把未消费结果堆进对象存储。症状是运行数分钟后内存与延迟同步攀升。修复：窗口判定放在提交之前，并在一处集中执行。</li>
+      <li><strong>落库单点未做批量</strong>：每批样本单独调用一次落库方法，串行队列被高频小调用塞满，吞吐在万步每秒处封顶。修复：合并调用，批大小按单次耗时标定。</li>
+      <li><strong>按提交顺序等待结果</strong>：消费循环固定等待最慢分片，尾延迟沿链路放大。修复：按完成顺序消费，配合超时哨兵处理极端慢分片。</li>
+      <li><strong>检查点只存进度不存随机流</strong>：恢复后步数对得上，采样分布却漂移。修复：快照覆盖随机数状态；验收标准加上"恢复前后同区间样本统计一致"。</li>
+      <li><strong>吞吐口径混乱</strong>：把提交速率当吞吐，或把生产与消费分别计时取最大值。修复：统一用"已消费总步数除以端到端墙钟时间"，让最慢段自动体现。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把生产者数从 8 扩到 16、32，预测吞吐拐点位置，运行验证并解释拐点与核数、聚合负载的关系。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>拐点出现在总声明核数用满处；继续加生产者只会互相排队。若聚合任务与生产者共用核配额，拐点还会提前，需为两类角色分别规划额度。</div></details>
+      </li>
+      <li>预测题：把窗口从 16 改成 4 和 64，吞吐与内存分别怎么变？给出这台 8 生产者机器上窗口的合理区间。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>窗口 4 时提交侧频繁等待，生产者出现空转；窗口 64 时核数用满但队列拉长。合理区间约为生产者数的 1–3 倍。</div></details>
+      </li>
+      <li>设计题：为落库段增加第二个分片 Actor（按生产者编号取模分配），改写片段 3 的写入路径；说明分片带来的一致性代价与合并统计的应对。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>分片写入提升吞吐，代价是"全局顺序"消失；统计类需求改用可结合聚合，在读取端按分片合并，顺序敏感的语义需回到单 Actor。</div></details>
+      </li>
+      <li>分析：某次运行端到端吞吐只有理论值的一半，观测到生产者空闲比例高、落库队列持续增长。给出瓶颈判定与两种修复方案，并预估修复后的吞吐上限。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>瓶颈在落库段。方案：批量写入摊薄队列，或分片写入；修复后上限由 min(生产, 聚合, 新落库速率) 决定。</div></details>
+      </li>
+      <li>推导：设生产、聚合、落库三段的单批服务率分别为 p、a、s（批/秒），生产者数为 n。写出系统稳态吞吐（批/秒）表达式，并求使三段完全平衡的参数关系。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>吞吐约 min(np, a, s)；平衡条件 np 等于 a 等于 s。任何一段高出该值都是冗余，规划时应把预算移到最慢段。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>流水线分四类角色：有状态生产者与落库选 Actor，无状态聚合选远程函数，传输走对象引用。</li>
+      <li>稳态吞吐由最慢段决定；<strong>背压窗口是把压力显式化的唯一抓手，窗口值以生产者数的 1–3 倍为起点</strong>。</li>
+      <li>尾延迟治理的三个动作：按完成顺序消费、超时哨兵、批量摊薄。</li>
+      <li>检查点覆盖进度与随机流；恢复验收标准是"至多丢失一个检查点间隔的进度且分布不漂移"。</li>
+      <li>第一篇到此收官：从单机任务到可恢复流水线，核心原语已成体系。<strong>下一章起进入第二篇：RLlib 核心接口</strong>，先实现一个符合标准接口的环境。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch013.html">← 第 013 章：分布式编程调试与性能诊断</a>
+    <a class="next" href="ch015.html">第 015 章：RLlib环境接口实现 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

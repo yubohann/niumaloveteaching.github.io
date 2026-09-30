@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第080章 实现容错控制 | 机器人仿真学习课程 · Isaac Sim 强化学习训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第四篇 · 控制与优化</span>
+    <span class="sep">/</span>
+    <span>第 080 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第四篇 · 控制与优化</div>
+    <h1>第 080 章：实现容错控制</h1>
+    <p class="lead">电机卡死、关节掉力、传感器漂移：故障一定会发生，问题只在"何时"。本章讲检测（残差）、隔离（定位到部件）、容纳（重新分配控制）三段式，并在 Isaac Sim 中注入故障训练出带健康掩码的策略。</p>
+    <ul class="meta">
+      <li>主题：故障检测与容纳 / 控制重分配</li>
+      <li>相关组件：Isaac Sim / Isaac Lab / PPO / 加权伪逆分配</li>
+      <li>预计学时：65 分钟</li>
+      <li>前置章节：第 079 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>会用控制效能模型描述故障：u<sub>eff</sub> = diag(ρ)·u + d，区分卡死、掉力、偏差、漂移四类。</li>
+      <li>掌握残差法故障检测：模型预测与实测的差、阈值与 CUSUM 累积检测的取舍。</li>
+      <li>理解控制分配与加权伪逆：冗余执行器系统里如何把任务"让给"健康部件。</li>
+      <li>会在 Isaac Sim 中实现故障注入包装器（时机、类型、强度、持久性可控）。</li>
+      <li>会训练带"健康掩码"的容错策略：故障指示进观测、课程从轻到重、与故障无关的失败模式被隔离。</li>
+      <li>会建立容错验收矩阵：故障类型 × 严重度 ×（成功率、检测延迟、误报率、降级模式可用性）。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 070 章的鲁棒 RL 让策略"在参数变动下不塌"，但故障是另一类事件：它的本质是<strong>系统结构变了</strong>，远超"参数偏了一点"的范畴：一个电机彻底卡死、一路传感器开始撒谎、某根线缆接触不良。对这类事件，单纯鲁棒化只能买到有限的宽容度；真正需要的是容错管线：<strong>检测故障、定位部件、重新分配控制</strong>，把"还能做的任务"在"剩下的健康部件"上完成。飞机、卫星、核电站的控制系统几十年来都是这么设计的，机器人只是把同一套方法论搬到更小的尺度上。</p>
+    <p>本课程的主线（RL）与容错结合的方式很直接：<strong>把故障注入进训练环境</strong>，让策略在训练中就见过"某关节掉了"的世界，并给它一个"健康掩码"观测告诉它哪些部件还可用；推理时掩码来自检测模块。这样策略在故障后会切换到"三足模式"这类降级方案，不再硬撑着执行原计划。本章的验收标准也因此特殊：允许性能下降，但要求<strong>下降可控、可预测、可挽救</strong>。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 故障模型：效能矩阵与加性干扰</h3>
+    <p>把标称控制输入 u 与"实际作用"的关系写成：</p>
+    <div class="formula">
+      u<sub>eff</sub> = diag(ρ)·u + d，ρ<sub>i</sub> ∈ [0, 1]
+      <span class="note">ρ<sub>i</sub>=1 健康；ρ<sub>i</sub>=0 完全失效（卡死或断线）；中间值=部分掉力；d 表示卡死位、偏置等加性项</span>
+    </div>
+    <p>四类常见故障对应关系：<strong>卡死（lock）</strong>：ρ=0 且 d=常数（关节锁在某位置，等效于持续干扰力矩）；<strong>掉力（loss of effectiveness）</strong>：ρ 降到 0.3–0.8，控制仍有效但变弱；<strong>偏差（bias）</strong>：传感器故障，输出加常数；<strong>漂移（drift）</strong>：输出缓慢变化。执行器故障改变的是 B 矩阵的列（效能），传感器故障改变的是观测方程 y = h(x) + b(t)，两者在残差里都会现形，但定位方法不同。</p>
+
+    <h3>2. 检测：残差从哪里来、阈值怎么定</h3>
+    <p>残差 = "应该发生"与"实际发生"的差。执行器故障用动力学模型预测的残差：</p>
+    <div class="formula">
+      r(t) = ẋ<sub>meas</sub> − f(x, u)　（观测到的加速度 − 模型在同样输入下的预测）
+      <span class="note">传感器故障则用解析冗余：多源观测互检（如 IMU 与编码器估计的速度差）</span>
+    </div>
+    <p>阈值判据 r(t) 与噪声协方差挂钩：单点阈值 r &gt; 3σ<sub>r</sub> 触发简单但误报/漏报难两全；<strong>CUSUM（累积和）</strong>对"持续的小偏差"更敏感：</p>
+    <div class="formula">
+      S<sub>k</sub> = max( 0, S<sub>k−1</sub> + (|r<sub>k</sub>| − ν) )；S<sub>k</sub> &gt; h 时报警
+      <span class="note">ν 是噪声容限（漂移量），h 是报警阈值：小故障靠时间累积浮出水面</span>
+    </div>
+    <p>检测的核心矛盾是<strong>延迟与误报的取舍</strong>：阈值低则 10 ms 内报出小故障、但噪声大时每分钟误报；阈值高则噪声免疫、但 20% 掉力这种"温和故障"可能要几秒才被发现，期间控制器一直在用错误模型。CUSUM 的门限设计要参考"故障可容忍时间"：先问"这类故障最多能容忍多久不被发现"（例如掉力 20% 容忍 2 s，卡死容忍 0.1 s），再反推参数。</p>
+
+    <h3>3. 容纳：控制分配与降级策略</h3>
+    <p>检测到 ρ 后，两种容纳路径。<strong>路径 A：控制重分配（解析法）</strong>，对于冗余执行器（例如全向底盘、多旋翼、带冗余执行器的机械臂），任务可以写成"需要某个合力/力矩 w"，由执行器分配解出 u：</p>
+    <div class="formula">
+      u* = argmin<sub>u</sub> ‖u‖²<sub>W</sub>　s.t.　A·u = w；解 u* = W<sup>−1</sup>A<sup>T</sup>(A W<sup>−1</sup>A<sup>T</sup>)<sup>−1</sup>w
+      <span class="note">W 是对角权重矩阵：故障后把对应维权重调到极大（等效于禁用），任务自动分给健康执行器</span>
+    </div>
+    <p><strong>路径 B：策略降级</strong>，对于欠驱动情况（4 足坏 1 腿只剩 3 足），"重新分配"无法完全恢复任务能力，需要改变行为模式（步态改变、承担范围变小）。这属于策略层面的容纳，正是 RL 的用武之地：把健康掩码给策略，训练它几种故障模式下的降级行为。</p>
+
+    <h3>4. 容错 RL：掩码、课程与观测</h3>
+    <p>训练容错策略的三个关键设计：<strong>故障掩码进观测</strong>，m ∈ {0,1}<sup>n</sup> 或软化的 ρ̂ 估计，告诉策略"哪个部件不可信"，否则策略只能从异常状态里猜（学习慢且容易过拟合特定故障）；<strong>故障注入课程</strong>，从"无故障"开始，先教好任务，再逐步加"单部件轻度故障"、再到"单部件完全故障"、最后"故障时机随机"；一上来就 50% 故障率会让任务基线都学不出来；<strong>故障事件标记</strong>，在观测里加入"故障发生后的相对时间"（或把故障检测的置信度给进去），让策略区分"刚坏、还在挣扎"与"坏了一段时间、已经适应"两种阶段。</p>
+
+    <h3>5. 验收矩阵：四类指标</h3>
+    <table>
+      <tr><th>指标</th><th>定义</th><th>典型目标</th></tr>
+      <tr><td>检测延迟</td><td>故障发生到报警的时间</td><td>卡死 &lt;100 ms；20% 掉力 &lt;2 s</td></tr>
+      <tr><td>误报率</td><td>无故障时每分钟误报次数</td><td>&lt;0.1 次/分钟</td></tr>
+      <tr><td>故障后成功率</td><td>带故障继续任务的成功比</td><td>按故障类型分列（卡死腿仍能 3 足行走等）</td></tr>
+      <tr><td>降级行为可用性</td><td>最坏故障下能否安全停靠/保持</td><td>100%，这是底线，不是目标</td></tr>
+    </table>
+    <p>注意最后一行的性质：<strong>"能安全停靠"是容错的第一性目标，任务性能恢复是第二性</strong>。任何设计都要先能安全降级，再谈降级后继续干活。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>场景：四足机器人行走，注入三类故障：单腿"掉力 50%"、单腿"完全卡死"、IMU 偏置 0.2 rad/s。流程五步：</p>
+    <ol>
+      <li><strong>注入器</strong>：环境包装器管理"故障剧本"，故障类型、生效时刻（回合内 20–80% 处随机）、持续到回合结束；注入方式：缩放该关节力矩（掉力）／把目标位置写死为当前值（卡死）／在观测速度上叠加偏置（传感器）。</li>
+      <li><strong>检测器</strong>：对每条腿用关节位置/速度与模型预测做残差，CUSUM 检测；检测输出两件东西，布尔告警与连续的健康估计 ρ̂∈[0,1]（用残差幅度映射，做滑动平均），后者更平滑、更适合进观测。</li>
+      <li><strong>掩码观测</strong>：obs 中加入 4 维 ρ̂（每条腿一个）与 1 维"距最近故障的时间/检测置信度"，共 5 维；故障前这些维恒为 1 / 0。</li>
+      <li><strong>训练课程</strong>：阶段 1 无故障（照常学步态，10k 迭代）→ 阶段 2 单腿掉力 30–70% 随机（10k）→ 阶段 3 单腿卡死概率 0.3（10k）→ 阶段 4 全谱故障 + 随机时机（10k）。每阶段验收后再进下一阶段。</li>
+      <li><strong>评测</strong>：按验收矩阵跑 4 类故障 × 3 档严重度 × 20 回合；对照组为无故障训练的普通策略与第 070 章鲁棒策略；记录故障后 3 s 内的姿态恢复时间。</li>
+    </ol>
+    <div class="box key">
+      <span class="box-title">设计思维：为什么用"软化的 ρ̂"？</span>
+      <p>布尔掩码有两个问题：检测抖动（1→0→1 跳变）会让策略观测突变、行为跳变；检测延迟期间策略拿不到任何提示。连续 ρ̂ 携带"故障有多确凿"的信息，策略可以在"疑似故障"时提前准备（略微改变步态），在"确诊"后完全切换；训练时对 ρ̂ 加噪声（模拟检测误差）还能让策略对检测器的不完美脱敏，<strong>可观测的信息当礼物，不可靠的布尔当炸弹</strong>。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：故障注入包装器（可控剧本）</strong></p>
+    <pre class="code"><code>import numpy as np
+
+class FaultInjector:
+    """故障剧本管理器：类型、时机、强度、持续全部可控，支持并行环境张量化。"""
+    def __init__(self, n_envs, n_joints=12, rng=None):
+        self.n, self.m = n_envs, n_joints
+        self.rng = rng or np.random.default_rng(0)
+        self.kind = np.array(["none"] * n_envs, dtype=object)   # 每环境当前故障类型
+        self.rho = np.ones((n_envs, n_joints), dtype=np.float32)  # 效能系数矩阵
+        self.bias = np.zeros((n_envs, n_joints), dtype=np.float32) # 传感器偏置
+        self.onset_step = np.zeros(n_envs, dtype=np.int64)         # 故障发生的仿真步
+        self.fault_joint = np.zeros(n_envs, dtype=np.int64)
+
+    def reset(self, t_episode_len, fault_prob=0.3):
+        """每个回合开始时采样：是否故障、何时、哪里、多严重。"""
+        will_fault = self.rng.random(self.n) &lt; fault_prob
+        self.onset_step = (self.rng.random(self.n) * 0.6 * t_episode_len).astype(np.int64)
+        self.kind = np.array(["none"] * self.n, dtype=object)
+        self.rho[:] = 1.0; self.bias[:] = 0.0
+        self.fault_joint = self.rng.integers(0, self.m, self.n)
+        for i in np.where(will_fault)[0]:
+            # 三类故障轮换采样：掉力 / 卡死 / 传感器偏置
+            self.kind[i] = ["loss", "lock", "bias"][self.rng.integers(0, 3)]
+            if self.kind[i] == "loss":
+                self.rho[i, self.fault_joint[i]] = self.rng.uniform(0.3, 0.8)
+
+    def apply(self, step, action, sensor_vel):
+        """每步调用：返回被故障修改后的动作与观测。"""
+        active = (~np.isin(self.kind, ["none"])) &amp; (step &gt;= self.onset_step)
+        for i in np.where(active)[0]:
+            j = self.fault_joint[i]
+            if self.kind[i] == "loss":
+                action[i, j] *= self.rho[i, j]        # 掉力：执行器力矩按比例衰减
+            elif self.kind[i] == "lock":
+                action[i, j] = 0.0                     # 卡死：该关节不再接受指令
+            elif self.kind[i] == "bias":
+                if self.bias[i].sum() == 0.0:
+                    self.bias[i, j] = 0.2              # 传感器偏置一次到位（可改漂移）
+        # 传感器故障作用在观测上，不在执行器上；两条路径分开处理
+        return action, sensor_vel + self.bias[:, :sensor_vel.shape[1]]
+
+    def truth_rho(self):
+        """训练时可用的"真值健康度"（模拟理想检测器）；部署时换成本章检测器的 ρ̂。"""
+        return self.rho.copy()</code></pre>
+    <p>解读：剧本管理有三个必须显式化的量：<strong>时机</strong>（<code>onset_step</code> 在回合 0–60% 处采样，保证故障后至少还有 40% 回合长度来观察恢复行为）、<strong>位置</strong>（随机关节，避免策略只学会应付"第 3 关节坏"）、<strong>类型轮换</strong>（三类故障的注入路径不同：动作缩放、动作归零、观测叠加，一定分开写，混在一起会调试不清）。<code>truth_rho</code> 暴露真值是有意的：训练早期用理想检测器（真值掩码）让策略先学会"拿着准确故障信息该怎么动"；后期把掩码换成检测器输出并加噪声，让策略适应检测误差，这是"先心理学、后生理学"的两阶段设计。并行环境下的 Python 循环（<code>np.where</code> 内的 for）在故障稀疏时开销可接受；若故障率设得很高，应把三类故障的注入全部改成张量运算。</p>
+
+    <p><strong>片段 2：CUSUM 故障检测器</strong></p>
+    <pre class="code"><code>import numpy as np
+
+class CUSUMDetector:
+    """残差累积检测：对持续小故障敏感，同时用阈值ν抑制噪声。"""
+    def __init__(self, n_envs, n_joints, nu=0.5, h=4.0, rho_lr=0.05):
+        self.n, self.m = n_envs, n_joints
+        self.S = np.zeros((n_envs, n_joints))       # 累积和
+        self.nu, self.h = nu, h                     # 噪声容限与报警阈值
+        self.rho_hat = np.ones((n_envs, n_joints))  # 连续健康估计（进观测用）
+        self.rho_lr = rho_lr                        # 健康估计的更新速率
+
+    def update(self, residual, dt):
+        """residual：|观测加速度 − 模型预测加速度|，逐环境逐关节（已归一化）。"""
+        # CUSUM 递推：小残差被 ν 吃掉，持续超过 ν 的部分才累积
+        self.S = np.maximum(0.0, self.S + (residual - self.nu) * dt)
+        alarm = self.S &gt; self.h                     # 布尔报警（供安全逻辑使用）
+        # 连续健康度：报警越深，ρ̂ 越低；无报警时缓慢回归 1（带遗忘）
+        target = 1.0 / (1.0 + self.S)
+        self.rho_hat += self.rho_lr * (target - self.rho_hat)
+        return alarm, self.rho_hat.copy()</code></pre>
+    <p>解读：<code>residual</code> 的来源应与动力学模型对齐：四足上用"关节实际加速度 − 由指令力矩与简化模型预测的加速度"的差（归一化后），传感器故障则走另一路解析冗余。参数标定有物理锚点：<code>nu</code> 应取"无故障残差的 95 分位"（用一段健康数据统计），保证噪声基本不积累；<code>h</code> 决定"多少积累算确凿"，h=4 意味着持续 8 倍于噪声容限的残差约 1.1 s 后报警（按 dt 归一：4 ÷ (8×0.5−0.5)）。<strong>连续健康度 ρ̂ = 1/(1+S)</strong> 是一个方便的有界映射：无故障 S≈0 时 ρ̂≈1，S 升到 4（报警线）时 ρ̂≈0.2，正好是"严重不可信"的直观刻度；加一阶滤波（rho_lr）是为了让观测平滑。检测器只做检测不做隔离，隔离由"哪个关节的 S 最大"自然给出（block 3 会用上）。这段代码在 4096 环境下每步只需几次张量运算，开销可忽略。</p>
+
+    <p><strong>片段 3：控制重分配（加权伪逆）与掩码策略入口</strong></p>
+    <pre class="code"><code>import numpy as np
+
+def weighted_pseudoinverse_alloc(A, w_desired, health, eps=1e-6):
+    """控制分配：把期望力矩 w_desired 分给执行器；health 低者权重被降。
+    A: [k, m] 执行器对任务的贡献矩阵；u* = W⁻¹Aᵀ(AW⁻¹Aᵀ+εI)⁻¹ w。"""
+    W_inv = np.diag(health + eps)          # 健康度直接当权重：故障执行器自动被边缘化
+    AWA = A @ W_inv @ A.T + eps * np.eye(A.shape[0])
+    u = W_inv @ A.T @ np.linalg.solve(AWA, w_desired)
+    return u
+
+class FaultAwarePolicyWrapper:
+    """策略入口：观测拼接健康估计；故障严重时退回安全模式。"""
+    def __init__(self, policy, safe_mode, rho_threshold=0.35):
+        self.policy, self.safe_mode = policy, safe_mode
+        self.thr = rho_threshold
+
+    def act(self, obs, rho_hat, desired_wrench, alloc_matrix):
+        obs_aug = np.concatenate([obs, rho_hat])          # 故障信息进入策略观测
+        if np.min(rho_hat) &lt; self.thr:
+            # 健康度过低：任务性能已不可保，切换"安全保持"（蹲伏/停靠）
+            return self.safe_mode()
+        u_task = self.policy.act(obs_aug)
+        return weighted_pseudoinverse_alloc(alloc_matrix, desired_wrench, rho_hat) \
+               if alloc_matrix is not None else u_task</code></pre>
+    <p>解读：加权伪逆的三行是控制分配的标准解：<code>W_inv</code> 用健康度做权重，故障执行器（health→0）在最小范数解里自动被"躲开"，任务由剩余执行器承担；<code>eps</code> 保证矩阵可逆（全部健康时也数值稳定）。它适用于执行器冗余的系统；四足这类欠驱动平台走 <code>FaultAwarePolicyWrapper</code> 的策略降级路线，注意 <code>rho_threshold</code> 的语义是"任务性能不可保的边界"，越过它时切安全模式（蹲伏、慢停），<strong>这不是失败，这是设计好的降级态</strong>。策略观测里拼接 rho_hat 是训练与部署的共同接口：训练时喂检测器输出（含噪声），部署时喂真检测器输出，两者口径一致。这个 wrapper 演示的是"检测→反应"的最小闭环完整链路：注入器制造故障、检测器估计健康、分配器/策略消化健康信息。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>训练环境无故障，部署盼奇迹</strong>：普通策略遇到卡死关节会把全部控制量堆到坏关节上（教学里所谓"对抗式努力"），加速磨损甚至损伤其他部件。症状是故障后行为夸张、失败迅速。修复：故障注入进训练 + 健康掩码进观测，这是根本手段。</li>
+      <li><strong>检测阈值照搬论文</strong>：ν 与 h 与噪声水平强相关，实验室静音环境的值到真机上必出问题。症状是误报泛滥或漏报。修复：用健康数据统计残差分位（ν=95 分位起步）；上线前记录"每分钟误报次数"并接受再调。</li>
+      <li><strong>故障指示不做延迟训练</strong>：训练时用理想检测器（零延迟），部署时检测器有 200 ms 延迟，策略在"信息迟到"的窗口里行为错乱。修复：训练加随机检测延迟（0–300 ms）与 ρ̂ 噪声；这属第 066 章随机化思想在"检测器维度"的移植。</li>
+      <li><strong>把安全模式和任务策略混在一个动作输出</strong>：故障后安全模式与策略输出插值，结果"既没停下也没走好"。症状是故障后抖动爬行。修复：硬切换 + 平滑过渡窗口（如 0.2 s 的斜率限制），并明确各自的验收指标。</li>
+      <li><strong>只在故障类型上训练、不在故障时机上训练</strong>：只训练"回合开始就坏"的策略，遇到"行走中途突然坏"仍然崩。症状是中途故障的恢复率远低于开局故障。修复：故障时机也要随机化（0–60% 回合处），验收时分开统计两种时机。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>固定故障为"单腿掉力 50%"，对比无故障训练策略与容错训练策略的故障后成功率与恢复时间。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>重点看故障后前 2 s 的行为差异：普通策略可能直接翻倒，容错策略有一个"步态重组"的过渡段。</div></details>
+      </li>
+      <li>把 CUSUM 的 ν 从 95 分位调到 50 分位，观察误报率与检测延迟的此消彼长，选出你系统上的折中点。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>ν 太小→噪声积累→频繁误报；太大→检测迟钝。画"ν vs（延迟, 误报率）"双轴图。</div></details>
+      </li>
+      <li>把健康掩码从观测里去掉（策略得不到故障提示），保持其余设置不变，比较两种训练的成功率与行为方式。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>无掩码时策略需要从状态里"猜"故障，学习慢、且对未见故障泛化差；对比故障后 3 s 的关节力矩分布。</div></details>
+      </li>
+      <li>设计并实现"故障时机随机化"实验：开局故障 vs 中途故障，比较策略在不同时机的恢复能力，解释为什么两者都需要出现在训练集里。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>中途故障时策略带着"全腿运动记忆"进入残障相位，需要能快速改写周期性步态；分开统计才看得清短板。</div></details>
+      </li>
+      <li>给系统加一条"双故障"压力测试（两腿同时掉力 30%），报告成功率与降级策略切换率，说明容错设计的边界在哪。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>预期双故障下任务性能大幅下降甚至不可行；重点验收"安全保持/停靠"的完成率，继续行走只作参考。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul>
+      <li>故障是"结构变化"：u<sub>eff</sub> = diag(ρ)u + d 模型统一了卡死、掉力、偏差、漂移四类。</li>
+      <li>三段式管线：检测（残差 / CUSUM，延迟与误报取舍）、隔离（哪一路的残差最大）、容纳（加权伪逆重分配 或 策略降级）。</li>
+      <li>容错 RL 三件套：故障注入训练（类型、位置、时机、强度随机）、连续健康估计 ρ̂ 进观测、课程从无故障到全谱。</li>
+      <li>验收用矩阵：检测延迟、误报率、故障后成功率、降级可用性；"能安全停靠"是底线目标，任务恢复是上限目标。</li>
+      <li>工程细节：检测阈值用健康数据标定、训练包含检测延迟、安全模式与任务策略硬切换。</li>
+      <li>下一章收束本篇：把"性能"换一个维度衡量，从"更快更准"转向"更省电"，能量优化与无源性。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch079.html">← 第 079 章：实现事件触发控制</a>
+    <a class="next" href="ch081.html">第 081 章：实现能量优化 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

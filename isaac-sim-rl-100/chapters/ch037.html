@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第037章 实现抓取任务 | 机器人仿真学习课程 · Isaac Sim 强化学习训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 任务与技能实现</span>
+    <span class="sep">/</span>
+    <span>第 037 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 任务与技能实现</div>
+    <h1>第 037 章：实现抓取任务</h1>
+    <p class="lead">从"够到"到"抓住并举起来"：夹爪闭合、双侧接触、力平衡，用事件梯奖励把抓取的每个阶段焊成一条学习路径。</p>
+    <ul class="meta">
+      <li>主题：任务实现 / 接触密集操作</li>
+      <li>相关组件：Isaac Sim（夹爪 + 接触力）、Stable-Baselines3</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 036 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>掌握抓取任务的六件套规格：对象、观测、动作（臂 + 夹爪的混合空间）、奖励、终止、评估。</li>
+      <li>理解"事件梯"奖励设计：接近 → 抓握 → 抬升 → 保持 → 成功，每一级的奖励量与判据如何设计。</li>
+      <li>会实现抓握判据：双侧指接触 + 夹爪闭合程度 + 相对速度，并处理"假抓握"（碰一下不算抓）。</li>
+      <li>会处理混合动作空间：手臂连续增量 + 夹爪单维连续（或用二分档），以及它的执行顺序。</li>
+      <li>能设计抓取的评估协议：抓取成功率、掉落率、抬升高度分布、到抓取耗时。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>上一章的避障任务里，"接触"是要避免的负事件；本章把它翻转成核心技能。<strong>抓取是机器人操作的第一技能，也是接触动力学最密集的任务之一</strong>：夹爪与方块之间要建立两个稳定的接触点、摩擦要能抵抗重力、抬升过程不能让物体滑脱。这些物理条件在真机上脆弱得惊人，仿真里的成功率与真机成功率之间的落差，往往就出在"抓握判据太宽松"。本章会用严格的判据构建它。</p>
+    <p>奖励上，抓取是把第 030 章"事件梯"思想讲透的最佳载体：从接近（可微分、密集）到抓握（离散事件）到抬升（再次可微分）到保持（状态奖励），<b>每一段的信号密度、事件性质与量级都不同，拼接方式决定训练是"步步高"还是"原地打转"。</b>抓取学会后，第 038 章的堆叠就是"抓取 + 放置"的组合。</p>
+  </section>
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 抓握的物理学：两个力之间的较量</h3>
+    <p>夹爪抓住方块的本质是摩擦力的平衡。单侧接触的摩擦力上限为 μ·N（μ 摩擦系数、N 法向力），两侧一共 2μN。要提起质量 m 的物体，需要：</p>
+    <div class="formula">
+      2 μ N ≥ m g，  即单侧法向力 N ≥ m g / (2 μ)
+      <span class="note">m=200 g、μ=0.5 时 N ≥ 1.96 N，这是"稳定抓取"对夹爪力的最低要求，也是抓握判据里力阈值的物理来源</span>
+    </div>
+    <p>这个不等式解释了仿真里最常见的两种抓取失败：<b>(1) 夹得太浅</b>，接触点靠近物体边缘，法向力方向偏斜，有效夹持力下降；<b>(2) 提得太快</b>，加速瞬间需要 2μN ≥ m(g+a)，a 越大要求越高，还没夹稳就抬升会导致滑脱。判据设计直接引用这个不等式：<strong>"双侧指接触 + 接触力 &gt; 1.5 N + 物体随夹爪运动"三条同时成立，才算真抓握。</strong>只看"有接触"会把"碰了一下"算成抓（假抓握），奖励梯就此断裂。</p>
+
+    <h3>1.1 数值算例：摩擦锥余量与时间尺度核算</h3>
+    <p>把摩擦不等式做成三个核算，检验设计里的数字。核算一（静止悬挂）：m = 200 g、μ = 0.5 时单侧最小夹持力 N ≥ mg/(2μ) = 0.2×9.81/1.0 = 1.96 N，判据阈值 1.5 N 低于它，说明 1.5 N 只是"证明接触力真实存在"的下限，"足够提起"的门槛在其之上；能不能提起来由抬升段的物理（滑移与否）自然检验。核算二（加速抬升）：抬升加速度 2 m/s² 时 N ≥ m(g+a)/(2μ) = 0.2×11.81/1.0 = 2.36 N，比静止工况高 20%。核算三（最不利组合）：课程后期质量随机化到 240 g、摩擦降到 0.3、抬升加速度 1 m/s²，需要 N ≥ 0.24×10.81/0.6 = 4.32 N。<b>三个核算给出同一条结论：判据阈值管"检测"，真正的抓稳边界由夹持力上限、质量与摩擦的随机化组合共同决定；把检测阈值调高既不会让物理变简单，还会把轻接触的合法抓握误判成大失败。</b></p>
+    <p>时间尺度的核算同样直接。持续窗口 3 帧在 60 Hz 控制下是 50 ms，自由落体在这段时间里下降 0.5×9.81×0.05² = 12.3 mm，超过"相对位移 &lt; 1 cm"的稳定性阈值：<b>一个真正脱手的物体，会在同一段时间里用位移自己暴露</b>，窗口长度与位移阈值是同一件物理事实的两个侧面。夹爪闭合时间：宽度增量 5 mm/步、行程 0–8 cm 需要 16 步，约 0.27 s 完成全闭合，这解释了为什么"预闭合"（在接触前先把夹爪收到略宽于物体的开口）是常见的学习行为：它把 0.27 s 的闭合时间藏进接近阶段，让接触瞬间就能立刻建立力。</p>
+    <p>观测与动作的量纲也核对一遍。动作 8 维：7 个关节位置增量乘 0.05 rad，60 Hz 下等效关节速度上限 3 rad/s；夹爪 5 mm/步对应 0.3 m/s 的闭合线速度，与 0.27 s 的全行程时间一致。观测量纲：指尖—物体相对位姿用米与旋转向量（0.1 m、0.3 rad 量级），物体速度 0.1 m/s 量级，双侧接触标志是 0/1 布尔量。<b>把速度类特征按 0.5 m/s、距离类按 0.2 m 归一化后，各通道量级都在 O(1)，第一层网络的权重不会被某一通道垄断</b>；漏做归一化时，米制距离（0.01 量级）会被速度（0.1 量级）在数值上压制，接近段的学习明显变慢，这是"状态观测也要做量纲统一"的一个具体账。</p>
+
+    <h3>2. 事件梯：五种信号的结构与量级</h3>
+    <table>
+      <tr><th>阶段</th><th>信号类型</th><th>判据</th><th>量级</th></tr>
+      <tr><td>接近</td><td>差分进度（连续）</td><td>指尖到物体距离减少</td><td>每步 ~0.01–0.05</td></tr>
+      <tr><td>抓握</td><td>一次性事件</td><td>双侧接触 + 力阈值 + 闭合成功</td><td>+0.5（一次性）</td></tr>
+      <tr><td>抬升</td><td>差分进度（连续）</td><td>抓握后物体高度增加</td><td>每步 ~0.02（仅当被抓）</td></tr>
+      <tr><td>保持</td><td>状态奖励（有界）</td><td>物体高于 5 cm 且仍未脱手</td><td>+0.2/步，上限 2.0</td></tr>
+      <tr><td>成功</td><td>终局事件</td><td>高度 &gt; 5 cm 连续 3 步</td><td>+10</td></tr>
+      <tr><td>掉落</td><td>终局事件</td><td>抓握后脱手且高度回落到阈值下</td><td>−2</td></tr>
+    </table>
+    <p>量级设计的三条原理：<b>(1) 每升一级，单次收益跳一个台阶</b>，抓握 +0.5 是"接近一整段"的量级，成功 +10 是"保持一整回合"的量级（2.0×10 步 = 2.0，加抓握 0.5，成功仍显著高于自然吸积），保证策略有动力走到底；停在中间等级拿不到同等量级的收益。<b>(2) 保持奖励有上限</b>：+0.2/步×每回合上限 2.0，防止"举着不动"无限刷分；上限一到，继续举着的边际收益为零，唯一的高收益动作是尽快完成/或按课程重置。<b>(3) 掉落惩罚把事件梯的漏洞焊死</b>：抓握事件 +0.5 和掉落 −2 的 1:4 配比，让"抓了就扔刷事件"的策略亏损。</p>
+    <p>整条事件梯的总量预算核一遍：接近段全程累计约 0.5–1.0（单步 0.01–0.05 乘几十步），抓握事件 0.5，抬升段 2.0 权重乘约 0.05 m 行程累计约 0.1，保持流上限 2.0，成功 +10。<b>成功一项约等于前面所有信号总和的两倍，"把任务做完"始终是最赚钱的动作</b>；这个比例与第 038 章堆叠任务的 +15、第 039 章推动的 +10 属于同一套"终局信号占主导"的量级习惯，跨任务迁移时只需替换具体数值，结构调整的余地很小。</p>
+
+    <h3>3. 假抓握与判据的时序设计</h3>
+    <p>"碰一下"与"抓住"在物理上的区别是什么？<b>碰一下：接触力瞬态、无持续法向力、物体运动独立；抓住：接触力持续、物体与夹爪运动学耦合。</b>所以抓握判据采用"持续条件"：双侧接触持续 3 帧以上（50 ms），接触力在持续窗口中保持 &gt; 1.5 N，并且物体相对夹爪的位置在窗口内稳定（相对位移 &lt; 1 cm）。<strong>三个条件里最重要的是"持续"，仿真接触求解的瞬态毛刺会让单帧判据反复误触发</strong>，这一点与第 030 章的接触去抖同源。同时抓握状态也要能"失效"：一旦持续窗口被打破（脱手），抓握标志清零、抬升进度奖励停发、掉落判定上线。</p>
+
+    <h3>4. 混合动作空间：夹爪怎么表达</h3>
+    <p>完整动作是把臂与手组合：7 个手臂关节增量（连续）+ 1 个夹爪指令。夹爪指令有两种表达：<b>(a) 连续量</b>，策略输出一个 (−1,1) 的值映射成夹爪目标宽度，好处是可与臂动作一起学习，还能表达"半开"（对形状适配有用）；<b>(b) 二值开合</b>，第 025 章的离散化方案，语义清晰、探索快，代价是需要 MultiDiscrete 接口或手工阈值化。<strong>本章用连续表达</strong>：把夹爪目标宽度作为第 8 维连续动作（映射范围 0–8 cm），因为"闭合的时机与速度"在抓取里是微妙技能，连续量给策略更细的控制粒度。</p>
+    <p>执行的顺序细节：手臂动作与夹爪动作<b>同时</b>下发（同一控制步生效），不采用"先动臂后合爪"的串行顺序。理由：策略应该学会两者协同（一边接近一边预闭合），强制串行会消掉一部分最优策略空间；如果你发现策略总是"没到就合爪"，那是接近奖励不够强的信号，应该调奖励，限制动作只会掩盖信号缺陷。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p><strong>任务规格：</strong>桌上随机位置放一个 4 cm 边长、200 g 的方块；Franka 用平行夹爪抓住它并抬升到桌面以上 5 cm 并保持，成功即结束并给大奖励。</p>
+    <table>
+      <tr><th>规格</th><th>设计</th><th>理由</th></tr>
+      <tr><td>观测（27 维）</td><td>关节角(7)+速度(7)+夹爪宽度(1)+指尖—物体相对位姿(7)+物体速度(3)+双侧接触标志(2)</td><td>指尖相对量是抓取的核心几何；物体速度帮助判断"是否已随夹爪运动"</td></tr>
+      <tr><td>动作（8 维）</td><td>7 关节增量 ×0.05 rad + 夹爪宽度增量 ×0.005 m</td><td>夹爪增量比绝对宽度更稳；每步 5 mm 的行程与 2.5 Hz 的闭合节奏匹配</td></tr>
+      <tr><td>抓握判据</td><td>双侧接触持续 3 帧 + 最小接触力 1.5 N + 相对位移 &lt; 1 cm</td><td>物理下限 m·g/(2μ)；持续窗口抗毛刺；耦合条件排除假抓握</td></tr>
+      <tr><td>奖励</td><td>接近进度 1.0 + 抓握事件 0.5 + 抬升进度 2.0 + 保持 0.2/步（上限 2.0） + 成功 +10 − 掉落 −2</td><td>事件梯：逐级抬高收益；保持封顶防刷分</td></tr>
+      <tr><td>终止</td><td>成功（高 &gt; 5 cm 持续 3 步）｜掉落（抓握后脱手）｜超时 100 步</td><td>掉落单列一类；超时截断</td></tr>
+      <tr><td>随机化</td><td>方块位置/朝向、质量 ±20%、摩擦 0.3–0.8、夹爪增益 ±10%</td><td>质量与摩擦直接关乎摩擦锥余量；增益模拟真机夹持力误差</td></tr>
+    </table>
+    <p>权重取舍的推理：<b>抬升进度给 2.0（比接近大两倍）</b>，抬升段只有约 0.05 m 的行程、10–20 步，单步距离增量的物理量与接近段相同，若同权重，策略缺少"一定要抬起来"的偏好；放大 2 倍让抬升段成为"当前最赚钱的事"。<b>保持奖励 0.2/步配 2.0 上限</b>：若成功了但策略还想多拿保持分，最多 10 步就封顶，避免"举着无限拖时间"；同时 10 步窗口正好覆盖成功判据（3 步）的验证期。<b>课程</b>：方块初始距离 0.25 → 0.45 m，质量 100 → 200 g，摩擦 0.8 → 0.4（从易到难的关键轴是摩擦，摩擦越低越难夹住）。</p>
+    <div class="box key">
+      <span class="box-title">设计思维：抓握标志是"任务状态机"的第一等公民</span>
+      <p>抓握与否改变后续所有奖励的语义（抬升奖励只发给抓着的，掉落惩罚只发给抓过的）。<strong>把"是否已抓握"实现为显式的每环境布尔状态、随重置清零，放弃"最近几步有没有接触"的隐式判断</strong>，前者可测试、可打点（抓握成功率、平均抓握时长），后者在长回合里会因窗口设计不当产生系统性错误。任务越复杂，"阶段标志"越值得独立：第 040 章开门（抓把手）、第 041 章插拔（对准/插入阶段）都是同一个模式。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：抓握判据，三个条件的持续窗口</strong></p>
+    <pre class="code"><code>class GraspDetector:
+    """抓握判据：双侧接触持续 3 帧 + 力 &gt; 1.5 N + 相对位姿稳定"""
+    def __init__(self, num_envs, min_force=1.5, hold_frames=3, device="cuda"):
+        self.min_force = min_force            # 物理下限：m·g/(2μ) ≈ 1.9 N 的保守取值
+        self.hold_frames = hold_frames        # 持续窗口：抗接触求解毛刺（第 030 章同源）
+        self.hold_count = torch.zeros(num_envs, dtype=torch.long, device=device)
+        self.grasped = torch.zeros(num_envs, dtype=torch.bool, device=device)  # 显式阶段标志
+        self.rel_pos_prev = None
+
+    def update(self, left_contact, right_contact, left_f, right_f,
+               obj_pos, ee_pos, reset_mask):
+        both = left_contact &amp; right_contact
+        force_ok = (left_f &gt; self.min_force) &amp; (right_f &gt; self.min_force)
+        rel_pos = (obj_pos - ee_pos)                     # 物体相对夹爪的位置
+        stable = torch.ones_like(both)                   # 首帧视为稳定（无历史）
+        if self.rel_pos_prev is not None:
+            stable = (rel_pos - self.rel_pos_prev).norm(dim=-1) &lt; 0.01
+        # 条件同时成立计一帧；任一破缺则计数清零（"中断即重计"，与 030 章一致）
+        ok = both &amp; force_ok &amp; stable
+        self.hold_count = torch.where(ok, self.hold_count + 1,
+                                      torch.zeros_like(self.hold_count))
+        newly = (self.hold_count &gt;= self.hold_frames) &amp; (~self.grasped)
+        self.grasped = self.grasped | (self.hold_count &gt;= self.hold_frames)
+        # 失效逻辑：已抓握但连续破缺 → 脱手，标志清零
+        self.grasped = torch.where(ok | (~self.grasped), self.grasped, torch.zeros_like(self.grasped))
+        self.grasped[reset_mask] = False                 # 重置清单：阶段标志必须回零
+        self.rel_pos_prev = rel_pos.detach().clone()
+        return self.grasped, newly                       # 状态 + 上升沿（给一次性事件奖励）</code></pre>
+    <p>解读：这个检测器把"物理学"翻译成了"三行布尔逻辑"。<b>力阈值 1.5 N 的来源</b>：摩擦锥下限 N ≥ mg/(2μ)≈1.96 N，取 1.5 N 留出数值余量，低于它物理上就抓不住，检测它没有意义。<b>相对位姿稳定条件</b>是"真抓握"最本质的判据：物体若在滑移，相对位置每帧变化大于 1 cm，窗口计数清零；稳定悬挂的物体相对位姿近乎不变。<b>两个标志的分工</b>：<code>grasped</code> 是状态（供抬升奖励与掉落判定持续读取），<code>newly</code> 是上升沿（只发一次 +0.5）。<b>失效逻辑那行</b>要细读：<code>ok | (~grasped)</code> 表示"本帧条件成立，或本来就没抓着"时保持原状，其余情况清零，抓着时一帧条件破缺就判脱手，语义最严格；若希望容忍瞬时毛刺，可以对失效也做一个持续窗口（维护"连续坏帧计数"，超过 3 帧才清零 grasped），代价是脱手判定的 50 ms 延迟。<code>rel_pos_prev</code> 用 <code>detach().clone()</code>：它是状态快照不是计算图节点，忘了 detach 会在训练时泄漏整条时间图、吃掉全部显存，这是张量状态管理的常见事故。</p>
+
+    <p><strong>片段 2：事件梯奖励的完整计算</strong></p>
+    <pre class="code"><code>def grasp_reward(prev_ee_obj_dist, ee_obj_dist, grasped, newly_grasped,
+                 prev_obj_height, obj_height, height_ref=0.05, hold_sum=None):
+    """五段式事件梯：接近 → 抓握 → 抬升 → 保持 → 成功（成功在终止层另加）"""
+    r_approach = 1.0 * (prev_ee_obj_dist - ee_obj_dist)          # 接近：差分进度
+    r_grasp = 0.5 * newly_grasped.float()                        # 抓握：一次性事件
+    # 抬升进度只在抓住时发：没抓住时的"物体升高"是撞出来的，不该给信用
+    lift_delta = (obj_height - prev_obj_height).clamp(min=0.0)   # 只奖励上升，不罚下降
+    r_lift = 2.0 * lift_delta * grasped.float()
+    # 保持：高于阈值且未脱手，每步 +0.2；由调用方按回合累计值做 2.0 封顶
+    r_hold = 0.2 * ((obj_height &gt; height_ref) &amp; grasped).float()
+    r_approach = r_approach * (1.0 - grasped.float())            # 抓住后接近项自动退场
+    return r_approach + r_grasp + r_lift + r_hold
+
+def grasp_termination(grasped, ever_grasped, obj_height,
+                      height_ref=0.05, stable_steps=3):
+    success = (obj_height &gt; height_ref) &amp; grasped
+    # 成功需要"高度 + 抓握"连续保持：用外部计数器累计 stable_steps 步再触发
+    dropped = ever_grasped &amp; (~grasped) &amp; (obj_height &lt; height_ref)
+    # 掉落：抓过、现在没抓着、且物体低于阈值；三者同时成立才是"摔了"
+    return success, dropped</code></pre>
+    <p>解读：逐项看信用分配的细腻处。<b>(1) 接近项乘以 (1 − grasped)</b>：抓住之后"指尖到物体的距离"已经没有意义（两者一起动），继续发梯度会让策略在抓握后做出奇怪的小动作去"缩小距离"；一个掩码让该项优雅退场。<b>(2) 抬升的 clamp(min=0.0)</b>：只奖励上升、不惩罚下降，下降可能出于策略"调整握姿"的需要，负惩罚会让策略不敢做必要的小幅下放；真正的失败（掉落）由终止层的 −2 兜底，不需要这里加码。<b>(3) 保持项的有界性</b>：0.2/步配外部累计封顶（本函数只发瞬时量，封顶由调用方对着回合累计值判断），这样"举着不动"最多赚 2.0，低于成功 +10 的量级，事件梯的"逐级升高"得以保持。<b>(4) 掉落判据的三合一同</b>：抓过（ever_grasped 锁存）、当前没抓、物体低于阈值，防止"根本没抓住的回合"被误判成掉落（那只是没抓成功，不是失败事件）。</p>
+
+    <p><strong>片段 3：混合动作与成功保持计数</strong></p>
+    <pre class="code"><code>def step_grasp_task(self, actions):
+    arm_delta = actions[:, :7] * 0.05            # 手臂：关节位置增量
+    gripper_delta = actions[:, 7] * 0.005        # 夹爪：宽度增量（每步最多 5 mm）
+    self.gripper_target = torch.clamp(self.gripper_target + gripper_delta, 0.0, 0.08)
+    # 夹爪 0-8 cm：目标宽度积分 + 限幅，与手臂同一套"积分+软墙"安全层
+    self._apply_arm_and_gripper(arm_delta, self.gripper_target)
+
+    for _ in range(self.decimation):             # 一个控制步内推 4 次物理
+        self._world.step(render=False)
+
+    grasped, newly = self.grasp_detector.update(
+        self.left_contact, self.right_contact, self.left_f, self.right_f,
+        self.object_pos(), self.tcp_pos(), self.just_reset)
+    self.ever_grasped = self.ever_grasped | grasped      # 锁存：掉落判定要用
+
+    height = self.object_pos()[:, 2]
+    rew = grasp_reward(self.prev_dist, self._dist(), grasped, newly,
+                       self.prev_height, height)
+    rew += self._hold_bonus(grasped, height)             # 保持项：内部做 2.0 封顶
+    success, dropped = grasp_termination(grasped, self.ever_grasped, height)
+    rew = rew + 10.0 * success.float() - 2.0 * dropped.float()
+
+    self.success_hold = torch.where(success, self.success_hold + 1,
+                                    torch.zeros_like(self.success_hold))
+    done = (self.success_hold &gt;= 3) | dropped | (self.progress_buf &gt;= 100)
+    # 成功判据：高度+抓握连续 3 步（50 ms）；单帧判定会被接触毛刺欺骗
+    self._autoreset(done)
+    return self._build_obs(), rew, done</code></pre>
+    <p>解读：这段把前两段部件装配进控制循环。<b>(1) 夹爪用"目标宽度积分"的方式</b>：与手臂的动作语义（增量）保持一致性，策略不必在两种动作类型间切换思维；0–8 cm 的限幅是机械行程的软墙。<b>(2) success_hold 计数器实现"持续 3 步"</b>：与抓握检测的 hold_frames 同构，连续条件用计数器、破缺即清零，这是本课程第三次出现同一模式（接触去抖、抓握窗口、成功保持），它是"事件化任何持续条件"的通用工具。<b>(3) 重置换行</b>：<code>done</code> 同时包含成功/掉落/超时三类结局，autoreset 统一处理；注意 ever_grasped、success_hold 等状态都在重置清单里（本行没展示重置函数内部，但留作纪律提醒）。<b>为什么成功奖励在终止层 +10、而不用"达到 5 cm 就结束"？</b>因为单帧瞬时高度可能因碰撞噪声越线，先要求"高度+抓握连续 3 步"再成功，避免假成功污染训练信号；这 50 ms 的额外验证换来的成功率指标可信度，是抓取评估的生命线。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>只看单指接触就判抓握</strong>：一侧碰上就发事件奖励，策略学会"戳一下就跑"刷分。症状：抓握事件率高但成功率低。修复：双侧接触 + 力阈值 + 稳定窗口三条件。</li>
+      <li><strong>抬升奖励没做抓握掩码</strong>：不抓也能通过"顶起物体"拿抬升分，策略学会掀翻方块取巧。症状：物体高度波动大、抓握率不涨。修复：抬升项乘以 grasped 掩码。</li>
+      <li><strong>保持奖励不封顶</strong>：举着不动逐渐刷满回报，成功率停滞但回报曲线漂亮。症状：回合步数逼近时限、成功奖励取得少。修复：封顶 2.0，并单独打点"成功/保持"比率。</li>
+      <li><strong>抓握标志忘记重置</strong>：跨回合残留，新回合开局就"已抓握"，抬升奖励发给了空气。症状：成功率虚高。修复：一切阶段标志进重置清单。</li>
+      <li><strong>夹爪动作幅度过大</strong>：每步 5 mm 是合理量级；若给 2 cm/步，夹爪"啪"一下闭死，接触冲击力大、方块被弹飞。症状：抓握瞬间物体跳走。修复：夹爪增量 ≤ 5 mm/步，或用低通滤波平滑夹爪指令。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>计算题：方块 300 g、摩擦 0.4，稳定抓取所需的单侧最小夹持力是多少？把夹握判据的力阈值从 1.5 N 提到 3 N，能否覆盖这个质量？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>N ≥ mg/(2μ) = 0.3×9.8/0.8 ≈ 3.7 N，1.5 N 不够，这就是"成功抓握但抬升打滑"的物理根源；阈值应随质量随机化上界调整。</div></details>
+      </li>
+      <li>消融实验：把成功判据从"连续 3 步"改成"单帧判定"，观察成功率指标与训练稳定性的变化，解释差异。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>单帧判定会被碰撞瞬间的弹跳高度欺骗，日志里成功率跳变、评估重测方差大。</div></details>
+      </li>
+      <li>设计实验：摩擦从 0.8 降到 0.4 的训练课程该按什么顺序放？给出课程轴：位置距离、质量、摩擦三者的推荐顺序与理由。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>先近后远、先轻后重、先涩后滑，每一步只增加一个难度轴，避免多轴同时爬升导致成功率崩盘。</div></details>
+      </li>
+      <li>对照实验：把夹爪第 8 维从连续量改成二值开合（阈值 0），比较收敛速度与最终成功率。什么任务下你会坚持连续夹爪？<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>二值版探索更快，但无法表达"半开适配宽物体"；当物体尺寸随机化范围大或需要"夹住但不过力"时，连续量的优势才显出来。</div></details>
+      </li>
+      <li>思考题：为什么掉落惩罚设为 −2，−0.5 或 −10 各有什么问题？从"事件梯量级预算"的角度，分别论证两个方向的失衡后果。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>−0.5 时"抓了就扔刷 +0.5"接近不亏；−10 时策略会过度避险（宁可不抓），抓握事件率崩盘。−2 让"刷分必亏、正常失败可控"。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>抓握的物理判据：双侧接触 + 力 &gt; mg/(2μ) + 相对位姿稳定，且全部要持续窗口；抓握标志是显式阶段状态。</li>
+      <li>事件梯：接近（差分）→ 抓握 +0.5（一次性）→ 抬升（差分 ×2，带抓握掩码）→ 保持 +0.2/步（封顶 2.0）→ 成功 +10 / 掉落 −2。</li>
+      <li>混合动作：7 关节增量 + 夹爪宽度增量（5 mm/步）；同时下发，不串行。</li>
+      <li>成功判据用"高度 + 抓握连续 3 步"，拒绝单帧假成功；三类结局（成功/掉落/超时）分开打点。</li>
+      <li>下一章加一层空间约束：把抓到的方块准确放到另一个方块上，堆叠任务的"对齐 + 释放 + 稳定"三重判据。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch036.html">← 第 036 章：实现避障任务</a>
+    <a class="next" href="ch038.html">第 038 章：实现堆叠任务 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

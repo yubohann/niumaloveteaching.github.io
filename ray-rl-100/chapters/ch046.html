@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第046章 RLlib多智能体训练 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第三篇 · RLlib 算法实现</span>
+    <span class="sep">/</span>
+    <span>第 046 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第三篇 · RLlib 算法实现</div>
+    <h1>第 046 章：RLlib多智能体训练</h1>
+    <p class="lead">把多智能体训练当成一个系统来建设：环境接口的生命周期契约、智能体分组（Agent Grouping）如何降低批次组织成本、逐策略回放与计数口径（Counting Basis）如何决定训练预算，以及评估配置必须与训练保持哪些一致性。</p>
+    <ul class="meta">
+      <li>主题：RLlib 训练（多智能体系统组织）</li>
+      <li>关键机制：智能体生命周期、分组、逐策略回放、计数口径</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 045 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>掌握多智能体环境接口的完整生命周期契约：智能体集合的增删、逐智能体终止与全局终止标志。</li>
+      <li>理解智能体分组的动机与效果：同构智能体合并批次、减少策略条目、降低调度与内存开销。</li>
+      <li>掌握训练预算的两套计数口径（环境步与智能体步），能按任务结构选择并换算。</li>
+      <li>会配置逐策略经验回放（Replay Buffer），并解释容量与智能体规模、批次大小的关系。</li>
+      <li>能设计多智能体训练与评估的一致性检查清单，包括映射、空间与报表口径。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 041 章从算法角度处理了策略共享与信用分配，本章转向系统建设：真实的群体任务里，智能体会中途加入或退出（机器人断电、单位阵亡、新个体生成），观测字典的键集合随时间变化；每个采样时刻产生的经验数量是智能体数量的若干倍，训练预算的计量、回放容量的规划、评估协议的设计都随之改变。</p>
+    <p>这些都属于训练系统的组织问题。把接口契约与配置口径组织好，多智能体训练才能像单智能体一样可控可复现；组织不当则会出现幽灵智能体、预算翻倍、评估口径混乱三类典型故障。本章逐项给出可执行的方案。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p>本节按"环境契约、批次组织、预算计量、评估协议"四条线索展开。</p>
+
+    <h3>1. 环境生命周期契约</h3>
+    <p>多智能体环境与单智能体环境的关键差别在于智能体集合是动态的。接口契约由四个约定组成：</p>
+    <ul>
+      <li><strong>活动集合</strong>：<code>agents</code> 列表记录当前仍存活的智能体；观测字典的键集合是它的子集。</li>
+      <li><strong>动力衰减</strong>：已终止的智能体从后续观测字典中移除，采样器不再为它请求动作。</li>
+      <li><strong>逐智能体终止</strong>：<code>terminated</code> 字典为每个活动智能体给出布尔值。</li>
+      <li><strong>全局终止</strong>：<code>terminated["__all__"]</code> 声明整局结束；未激活时字典里不含该键，或显式置假。</li>
+    </ul>
+    <p>一个容易被忽视的细节：智能体退出后，其当前回合的回报与长度如何计入报表，取决于采样器的统计口径。<strong>短命智能体的回合统计会把均值拉向异常值，报表解读时需要按智能体类型分组查看。</strong></p>
+    <p>活动集合的标识管理有两条纪律：ID 在同一局内唯一且不复用，回收的编号不要立即分给新智能体，避免回放缓冲里新旧样本混进同一个键；ID 的命名结构要能被映射函数解析到组，前缀、类型、序号三段式是常见方案。生命周期压力测试正是围绕这两条纪律设计断言。</p>
+
+    <h3>2. 智能体分组：合并同构批次</h3>
+    <p>当一组智能体的观测与动作空间完全一致时，可以把它们视作同组，合并组织批次。分组带来三方面收益：批次张量堆叠效率提高（相同形状可拼接）、策略条目减少（一份策略覆盖一组）、调度开销下降（fewer policy lookups per step）。代价是丧失组内身份区分，需要额外特征（如身份编码、相对位置）恢复必要差异。</p>
+    <p>分组与策略映射是两个层次：分组是"数据组织方式"，映射是"参数分派方式"。<strong>常见组合是"一组数据、一份共享策略"，即分组与参数共享同时生效；也可以"一组数据、多份策略"，用于组内仍需要角色差异的场景。</strong>部分 Ray 版本提供实验性的智能体分组接口（以组为键的空间与观测字典），接口随版本演进，接入前应核对对应版本文档。</p>
+    <p>分组的收益可以按批次分摊核算：8 个智能体分 2 组、批次 16384 智能体步时，每组平均约 8192 条经验，单份策略的更新数据量与单智能体任务相当；若改为 8 份独立策略，每份约 2048 条，梯度噪声按批次平方根关系放大约 2 倍。分组是在角色差异与单策略数据量之间选点，角色差异小的任务应优先合并进同一组。</p>
+
+    <h3>3. 计数口径：环境步与智能体步</h3>
+    <p>训练预算有两种计量方式，差值随智能体数量线性放大：</p>
+    <div class="formula">
+      智能体步 ≈ 环境步 × 平均同时存活智能体数
+      <span class="note">N 个智能体全程存活时，同一段训练在两种口径下相差 N 倍；报表与停止条件必须标明所用口径</span>
+    </div>
+    <p>口径选择标准：<strong>智能体数量恒定且同质时用环境步，计量直观；智能体数量可变或异质时用智能体步，它反映实际的经验吞吐。</strong>停止条件、抽样预算、回放容量三者必须使用同一口径，混用会造成预算偏差数倍而不易察觉。后果给一个数：停止条件写 20 万环境步、批次却按智能体步配置时，8 个智能体全程存活下两套单位按 8 倍错位，训练的名义预算与实际经验量相差近一个数量级。巡检清单把停止条件、批次、回放容量三项的单位并列打印，是防混用的最低成本手段。</p>
+
+    <h3>4. 逐策略回放与训练组织</h3>
+    <p>异策略算法（DQN、SAC 的多智能体变体）为每份策略维护独立回放缓冲。容量规划需要按策略承担的数据量分配：共享策略承受全部智能体的写入，容量应约为单智能体任务的 N 倍；独立策略各自承受 1/N 的写入，按单智能体容量配置即可。<strong>容量不足会让缓冲区只剩极新数据，训练退化为近似同策略；容量过大则早期陈旧数据稀释梯度。</strong>合理量级是每策略容量的填满周期为 10<sup>4</sup> 至 10<sup>5</sup> 个智能体步。</p>
+    <p>训练名单与映射函数的一致性检查应做成例行巡检：映射函数可能返回的全部策略 ID 集合，与配置声明的策略集合相等；训练名单是声明集合的子集；三者关系破坏时，训练会以"部分策略静默冻结"的形式失效。</p>
+
+    <h3>5. 评估协议的一致性要求</h3>
+    <p>多智能体评估沿用训练配置的映射函数与空间声明，三项必须与训练一致：映射结果、智能体数量上限、终止判定。评估环境的智能体数量与训练不同（如训练 4 个、评估 8 个）是常见需求，处理方式是把映射写成与数量无关的形式（按前缀或类型查表），并在评估前用小规模冒烟测试验证。</p>
+
+    <h3>6. 数值算例：口径换算、填满周期与批次覆盖</h3>
+    <p>口径换算先算：3 个智能体全程存活时，20 万环境步即 60 万智能体步；平均存活 2 个时，同样 20 万环境步只对应约 40 万智能体步。两者相差 1.5 倍，停止条件用环境步、批次预算用智能体步时，两种口径下的实际经验量不一致，事后曲线对齐也无从下手。</p>
+    <p>回放填满周期用批次作单位：容量 20 万智能体步、批次 16384 智能体步时，容量约为 12.2 个批次的写入量；按每环境步写入 3 条、环境步频 500 步每秒估算，写入速率约 1500 智能体步每秒，填满需约 133 秒。填满周期过短（容量只等于一两个批次）时缓冲区只剩最新数据，离策略复用退化为同策略；过长则陈旧数据占比过高。</p>
+    <p>批次覆盖按存活数换算：16384 智能体步在 3 个智能体时约 5461 环境步，在 8 个智能体时约 2048 环境步；智能体数量变化时，同一批次对应的环境步跨度与回合覆盖数随之变化，评估间隔与批次配置要按平均存活数复核。</p>
+    <table>
+      <tr><th>平均存活智能体数</th><th>批次 16384 智能体步对应环境步</th><th>容量 20 万智能体步对应批次数</th></tr>
+      <tr><td>3</td><td>约 5461</td><td>约 12</td></tr>
+      <tr><td>8</td><td>约 2048</td><td>约 12</td></tr>
+    </table>
+
+    <h3>7. 边界与失效模式</h3>
+    <p>中途加入的边界：新智能体在某一步末尾进入观测字典，采样器下一步为它请求动作；若映射没有覆盖它的 ID 前缀（类型未声明或命名变化），运行时报未知策略。加入逻辑要与映射的与数量无关约定配套，凡是可能出现的 ID 前缀都应在映射里可分类。</p>
+    <p>回报统计的边界：短命智能体的回合很短，其回合回报会把均值拉向异常值；按智能体类型分组查看报表，是避免误读的固定动作。业务关心团队整体表现时，还应单独维护团队级回报指标，与逐智能体指标并排展示。</p>
+    <p>回放容量的边界在写入速率不均：同样容量的共享策略，写入快的一组周转快、写入慢的一组长期积压；容量应按各策略的实际写入速率分别核定，全局一个常数无法同时匹配快慢两组的周转。核定前先统计各组每分钟的智能体步写入量。</p>
+    <p>评估的边界：评估时维护与训练相同的映射对象，是对照可比的前提；评估智能体数量与训练不同时，先跑小规模冒烟测试确认生命周期与终止逻辑全部正常，再进入正式评估。评估报表同时记录映射版本与智能体数量，才能解释两次评估之间的差异。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>多智能体训练系统的建设按六步推进。</p>
+    <ol>
+      <li><strong>定义空间与分组</strong>：按同构性划分组，为每组确定空间；异形空间直接拆分策略。</li>
+      <li><strong>实现生命周期</strong>：编写加入与移除逻辑，维护活动集合，逐局校验全局终止标志。</li>
+      <li><strong>编写映射与训练名单</strong>：映射按类型查表，与数量无关；名单只含学习者。</li>
+      <li><strong>选择计数口径</strong>：按智能体数量是否恒定决定环境步或智能体步，并写入所有预算相关配置。</li>
+      <li><strong>规划回放</strong>：按策略分配容量与优先级参数，检查填满周期。</li>
+      <li><strong>建立巡检清单</strong>：映射结果、空间一致性、计数口径、报表口径四项例行检查。</li>
+    </ol>
+    <h3>参数表</h3>
+    <table>
+      <tr><th>参数</th><th>典型值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td><code>policies</code></td><td>1–8 份</td><td>声明策略集合</td><td>组数与角色数的交集</td></tr>
+      <tr><td><code>count_steps_by</code></td><td>agent_steps</td><td>预算计量口径</td><td>智能体数量可变时必须</td></tr>
+      <tr><td><code>train_batch_size</code></td><td>16384 智能体步</td><td>训练批次</td><td>约覆盖全部智能体 1000 至 4000 个环境步</td></tr>
+      <tr><td>回放容量（共享策略）</td><td>2e5 智能体步</td><td>数据池规模</td><td>约 10 倍批次大小的量级</td></tr>
+      <tr><td><code>num_env_runners</code></td><td>4–32</td><td>并行采样</td><td>采样吞吐与调度开销的平衡</td></tr>
+      <tr><td>评估间隔</td><td>10 轮</td><td>评估频率</td><td>评估成本约为训练的 10%–20% 时的折中</td></tr>
+    </table>
+    <p>与上一章的差异：045 章的序列打包处理单策略的时间结构，本章处理多策略的空间结构；两者在批次组织上叠加时，整除约束需要同时满足序列长度、并行环境数与智能体组数三者的关系。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：带生命周期的环境（可变智能体集合）</strong></p>
+    <pre class="code"><code>class ForagingEnv(MultiAgentEnv):
+    """采集场景：食物采集完毕后该智能体退出，模拟阵亡与生成。"""
+    def __init__(self, config=None):
+        super().__init__()
+        self.observation_space = Box(-1.0, 1.0, (6,), dtype="float32")
+        self.action_space = Discrete(6)
+        self._agent_ids = {"harvester_0", "harvester_1", "harvester_2"}
+
+    def reset(self, *, seed=None, options=None):
+        # agents 是活动集合的权威来源，任何增删都必须同步维护它
+        self.agents = ["harvester_0", "harvester_1", "harvester_2"]
+        self.energy = {a: 10 for a in self.agents}
+        return {a: self._obs(a) for a in self.agents}, {}
+
+    def step(self, action_dict):
+        for a, act in action_dict.items():
+            self.energy[a] -= 1
+        terminated, truncated = {}, {}
+        for a in list(self.agents):
+            if self.energy[a] == 0:          # 能量耗尽：该智能体退场
+                terminated[a] = True
+                self.agents.remove(a)        # 从活动集合移除，后续不再请求动作
+        # 全局终止由业务定义：全体退场或剩余智能体达成目标
+        terminated["__all__"] = len(self.agents) == 0
+        truncated["__all__"] = False
+        obs = {a: self._obs(a) for a in self.agents}
+        rew = {a: -0.1 for a in action_dict}
+        return obs, rew, terminated, truncated, {}</code></pre>
+    <p>解读：逐块说明。<strong>（1）</strong><code>self.agents.remove(a)</code> 与终止字典同步更新是契约的核心；只更新一方会触发采样器对已退出智能体请求动作的运行时错误。<strong>（2）</strong>回报字典覆盖本步参与决策的智能体（<code>action_dict</code> 的键），比活动集合更准确：刚退场的智能体仍应得到最后一步的回报。<strong>（3）</strong>全局终止在业务层定义，示例取"全灭"，实际任务中也可取"任一智能体达成目标"，两种定义对应完全不同的训练语义，需要与回报设计一并决定。</p>
+
+    <p><strong>片段 2：分组映射与逐策略回放配置</strong></p>
+    <pre class="code"><code>from ray.rllib.algorithms.sac import SACConfig
+
+def group_mapping(agent_id, episode, worker=None, **kwargs):
+    """按智能体 ID 前缀分组：同前缀共享策略，与数量无关。
+    与数量无关这一点让"训练 3 个、评估 6 个"成为可能。"""
+    prefix = agent_id.split("_")[0]          # 例如 harvester / transporter
+    return f"policy_{prefix}"
+
+per_policy_capacity = 200000             # 智能体步口径：约 10 倍训练批次
+
+config = (
+    SACConfig()
+    .environment(ForagingEnv)
+    .framework("torch")
+    .env_runners(num_env_runners=8, num_envs_per_env_runner=2)
+    .training(
+        train_batch_size=16384,           # 智能体步口径，覆盖全部存活智能体
+        replay_buffer_config={
+            "type": "MultiAgentReplayBuffer",
+            "capacity": per_policy_capacity,   # 每份策略各自持有容量
+        },
+    )
+    .multi_agent(
+        policies={"policy_harvester", "policy_transporter"},
+        policy_mapping_fn=group_mapping,
+        policies_to_train=["policy_harvester", "policy_transporter"],
+        count_steps_by="agent_steps",     # 智能体数量可变：用智能体步计量
+    )
+)</code></pre>
+    <p>解读：三个设计决策需要明确。<strong>（1）</strong>映射按前缀分组并返回组级策略 ID，新增同类智能体无需改映射，这是"与数量无关"的实现方式。<strong>（2）</strong>回放容量按策略分配：共享策略容纳两组数据中的一组全部写入，容量按组规模设定；若两组写入速率差异大，可分别覆盖容量。<strong>（3）</strong><code>count_steps_by</code> 取智能体步，与批次大小、回放容量的口径一致，避免"预算是环境步、容量是智能体步"的隐性错位。</p>
+
+    <p><strong>片段 3：一致性巡检函数</strong></p>
+    <pre class="code"><code>def audit_multi_agent_config(config, env):
+    """上线前的四查：映射覆盖、空间匹配、口径一致、训练名单合法。"""
+    mapped = set(config.policy_mapping_fn(a, None) for a in env.get_default_policy_agents())
+    declared = set(config.policies.keys())
+    print("映射返回但未声明=", mapped - declared)     # 必须为空
+    print("声明但从未映射=", declared - mapped)       # 允许为空集合之外的情况需确认
+    # 空间匹配：声明空间与组的真实空间逐项比对
+    for pid in declared:
+        spec = config.policies[pid]
+        assert spec.observation_space is not None and spec.action_space is not None
+    # 口径一致：批次、容量、停止条件三者的单位统一
+    print("计数口径=", config.count_steps_by)
+    assert config.count_steps_by in ("agent_steps", "env_steps")
+    # 训练名单必须是声明集合的子集，否则策略永远不更新
+    stray = set(config.policies_to_train) - declared
+    assert not stray, f"训练名单含未声明的策略: {stray}"
+    return True</code></pre>
+    <p>解读：巡检函数把三类静默故障变成显式输出。<strong>（1）</strong>"映射返回但未声明"对应运行时报错类问题，提前拦截。<strong>（2）</strong>"声明但从未映射"是隐蔽问题：该策略的数据源为空，条目损失恒零，巡检打印供人工确认是否为有意保留的备用策略。<strong>（3）</strong>训练名单的集合关系断言防止最常见的配置错误之一。辅助函数 <code>get_default_policy_agents</code> 为示意，实际按版本提供的枚举方式替换。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>幽灵智能体</strong>：终止后未从 <code>agents</code> 移除，采样器持续为其请求动作，报"缺失动作"错误或步进停滞。修复：终止与移除必须原子成对出现，写进同一分支。</li>
+      <li><strong>全局终止遗漏</strong>：<code>terminated["__all__"]</code> 恒为假，回合无限延长，采样吞吐随时间衰减。修复：在生命周期逻辑末尾统一计算并写入该键。</li>
+      <li><strong>计数口径混用</strong>：批次用智能体步、停止条件用环境步，训练预算相差 N 倍，实验记录不可比。修复：配置与文档统一口径，巡检函数校验。</li>
+      <li><strong>回放容量按单智能体经验设置</strong>：共享策略承受 N 倍写入，缓冲区只存最近一小段数据，训练退化为近似同策略。修复：容量按策略承受的写入速率放大，检查填满周期。</li>
+      <li><strong>评估映射与训练不一致</strong>：评估改用了简化的映射函数，评估结果与训练分布失配，出现"训练好、评估差"的假象。修复：训练与评估共用同一映射对象，评估前做小规模冒烟测试。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>给片段 1 增加"新智能体生成"逻辑：当场上食物耗尽时加入一个新采集者。说明 <code>reset</code> 与 <code>step</code> 各需要改什么，以及观测字典的键集合在哪个时刻变化。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>在 <code>step</code> 中向 <code>self.agents</code> 追加新 ID 并给出初始能量；返回的观测字典在本次 <code>step</code> 末尾即包含新智能体，采样器下一步即为其请求动作。</div></details>
+      </li>
+      <li>计算：训练 3 个智能体、全程存活，配置停止条件为 200000 环境步，换成智能体步口径后预算如何变化？若中途平均只有 2 个存活，两者相差多少？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>恒定 3 个时为 600000 智能体步；平均存活 2 个时为 400000 智能体步。差值即口径定义，与算法无关。</div></details>
+      </li>
+      <li>比较"一组数据两策略"与"一组数据一共享策略"的批次组织差异：单次更新使用多少条经验、每策略参数更新频率如何变化。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>两策略时同组经验按映射二分，各自更新频率减半；共享策略一次更新使用全组经验，频率最高。</div></details>
+      </li>
+      <li>设计生命周期压力测试：随机加入与移除智能体，运行 10000 环境步，验证活动集合、观测键、终止标志三者的不变量。给出断言清单。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>断言包括：观测键集合等于活动集合、动作字典键是观测键的子集、任一智能体终止后不再出现在后续观测中、全局终止只在活动集合为空时为真。</div></details>
+      </li>
+      <li>解释为什么"声明但从未映射"的策略会使训练静默浪费资源，给出两种合理的保留场景与一种应修复的场景。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>备用策略等待后续阶段启用、评估专用策略属合理保留；误拼写映射键导致主策略从未被使用则应修复。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>多智能体环境的核心契约是动态生命周期：活动集合、逐智能体终止与全局终止标志三者必须原子一致。</li>
+      <li>智能体分组合并同构批次，提供"一组数据、单份策略"到"一组数据、多份策略"的灵活组合。</li>
+      <li>环境步与智能体步两套口径相差 N 倍，预算相关配置必须统一口径并写入文档。</li>
+      <li>回放容量按策略承受的写入速率分配，共享策略按智能体规模放大，填满周期控制在 10<sup>4</sup> 至 10<sup>5</sup> 智能体步。</li>
+      <li>评估与训练共用映射与空间声明，巡检函数把静默配置错误变成显式断言。</li>
+      <li>下一章转入方法论：面对一个新任务，如何从任务特性出发选择算法，把前六章的算法家族组织成决策路径。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch045.html">← 第 045 章：RLlib使用LSTM处理部分可观测环境</a>
+    <a class="next" href="ch047.html">第 047 章：RLlib算法选择方法：从任务特性出发 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

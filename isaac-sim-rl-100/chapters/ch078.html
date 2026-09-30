@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第078章 实现自适应控制 | 机器人仿真学习课程 · Isaac Sim 强化学习训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第四篇 · 控制与优化</span>
+    <span class="sep">/</span>
+    <span>第 078 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第四篇 · 控制与优化</div>
+    <h1>第 078 章：实现自适应控制</h1>
+    <p class="lead">载荷加了 2 公斤、电池电压掉了、关节磨损了，控制器怎么自己补上这些变化？本章讲透模型参考自适应控制（MRAC）的 Lyapunov 更新律，并在 Isaac Sim 里用负载突变实测它。</p>
+    <ul class="meta">
+      <li>主题：在线参数适应 / 模型参考自适应</li>
+      <li>相关组件：Isaac Sim / Isaac Lab / NumPy / PyTorch（可选）</li>
+      <li>预计学时：65 分钟</li>
+      <li>前置章节：第 077 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>说清"鲁棒"与"自适应"的分工：固定控制器抗所有变化 vs 在线估计变化并主动补偿。</li>
+      <li>掌握模型参考自适应控制（MRAC）的架构：参考模型、跟踪误差、参数化控制律、Lyapunov 更新律。</li>
+      <li>会用 Lyapunov 函数 V = e<sup>T</sup>Pe + θ̃<sup>T</sup>Γ<sup>−1</sup>θ̃ 解释"为什么这个更新律保证误差有界"。</li>
+      <li>会实现带投影限幅与 e-修正的离散自适应律，处理噪声与未建模动力学。</li>
+      <li>会在 Isaac Sim 中设计"负载突变"实验，验证自适应相对于固定 PD 的稳态误差改善。</li>
+      <li>理解自适应与 RL/MPC 的边界：什么时候用在线适应、什么时候用离线学习。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 077 章的 MPC 依赖模型，第 068 章的差距分析告诉你模型总有误差；第 066/070 章的鲁棒化则是"为最坏情况买保险"。但还有一类变化是<strong>缓慢、持续、可估计的</strong>：机器人抓起一个 2 kg 的工件、电池从 25 V 掉到 21 V、关节减速器使用半年后摩擦增大 30%。对这些变化，鲁棒控制要么牺牲性能（按最坏情况调参），要么勉强调节（靠积分项慢慢磨）；而<strong>自适应控制</strong>的思路更直接：把未知量写成参数，在线从跟踪误差里"读出"它，实时补偿。</p>
+    <p>模型参考自适应控制（Model Reference Adaptive Control, MRAC）是最经典的框架：你定义一个"理想响应"的参考模型，控制器包含可调参数项，参数按 Lyapunov 推导的规则更新，使得实际跟踪误差趋于小、参数趋于真值附近。它的优点是低维、可解释（能看到估计出的载荷质量）、有稳定性理论支撑；边界是它假设了"参数化匹配条件"与"持续激励"，超出假设（强噪声、未建模柔性）时需要修正项兜底。它与本课程 RL 主线的关系是互补的：<strong>自适应层处理"近期变化"，学习层处理"大范围策略"</strong>，两者组合是 Sim2Real 工具箱的常见配置。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 问题设定：匹配条件下的参数化控制</h3>
+    <p>以单关节或解耦后的轴为例，真实动力学可以写成"已知名义模型 + 未知参数的未知项"：</p>
+    <div class="formula">
+      ẋ = f<sub>0</sub>(x) + b·u + θ*<sup>T</sup>φ(x)　（f<sub>0</sub> 为已知部分，θ* 为未知参数，φ 为已知特征）
+      <span class="note">例：θ* 含负载质量与摩擦系数，φ 含重力项与速度项，它们进入系统的方式是线性的</span>
+    </div>
+    <p>"匹配条件"的含义：未知项落在控制输入能影响的方向上，存在理想参数 θ* 使系统与参考模型完全一致。实际的负载/摩擦变化通常满足或接近这个条件，所以 MRAC 在机械臂上非常好用。参考模型取二阶临界阻尼（自然频率 ω<sub>n</sub>、阻尼比 1），代表"你希望机器人怎么动"：</p>
+    <div class="formula">
+      ẍ<sub>m</sub> = −2ζω<sub>n</sub>ẋ<sub>m</sub> − ω<sub>n</sub>²x<sub>m</sub> + ω<sub>n</sub>²x<sub>ref</sub>
+      <span class="note">ζ=1 无超调；ω<sub>n</sub>=10 rad/s 时阶跃上升时间（10%–90%）约 0.34 s；取比真机名义闭环略快一点点的 ω<sub>n</sub> 是故意的</span>
+    </div>
+
+    <h3>2. 控制律：名义控制 + 自适应补偿</h3>
+    <p>跟踪误差 e = x − x<sub>m</sub>。控制律取：</p>
+    <div class="formula">
+      u = u<sub>0</sub>(x, x<sub>ref</sub>) + θ̂<sup>T</sup>φ(x)
+      <span class="note">u<sub>0</sub> 用名义参数算（PD/计算力矩）；θ̂ 是 θ* 的在线估计，多出的项专门抵消未知变化</span>
+    </div>
+    <p>把误差动力学整理成"线性系统 + 参数误差"的标准形：ė = A·e + b·θ̃<sup>T</sup>φ（θ̃ = θ̂ − θ* 为估计误差，A 是 Hurwitz 的参考误差系统矩阵，Hurwitz 意味着无输入时误差自衰减）。到这里，"设计自适应律"变成"选一个 θ̂ 的更新规则，让 e 和 θ̃ 一起有界"。</p>
+
+    <h3>3. Lyapunov 证明：为什么 θ̂̇ = −Γφe<sup>T</sup>Pb 是对的</h3>
+    <p>取正定函数（表述为能量）：</p>
+    <div class="formula">
+      V = e<sup>T</sup>Pe + θ̃<sup>T</sup>Γ<sup>−1</sup>θ̃，其中 A<sup>T</sup>P + PA = −Q（Q&gt;0）
+    </div>
+    <p>沿误差动力学求导：</p>
+    <div class="formula">
+      V̇ = −e<sup>T</sup>Qe + 2e<sup>T</sup>Pb·θ̃<sup>T</sup>φ + 2θ̃<sup>T</sup>Γ<sup>−1</sup>·θ̂̇
+      <span class="note">第一项 ≤0（好），后两项是"参数误差与跟踪误差的耦合"，它们必须自己抵消掉</span>
+    </div>
+    <p>令 θ̂̇ = −Γ·φ·(e<sup>T</sup>Pb)，后两项恰好抵消，得 V̇ = −e<sup>T</sup>Qe ≤ 0。结论：<strong>V 单调不增、有下界（0），所以 e 与 θ̃ 一致有界；且只要激励充分，e→0</strong>。这就是更新律里每项的来历：<code>Γ</code> 是学习速率（自适应增益矩阵），<code>φ</code> 是"当前状态在未知参数方向上的灵敏度"，<code>e<sup>T</sup>Pb</code> 是"误差在被控方向上的分量"。注意它<strong>不保证参数收敛到真值</strong>（没有持续激励时参数可以在真值附近游走而误差照样小），这是 MRAC 与系统辨识的重要区别。</p>
+
+    <h3>4. 工程修正：投影与 e-修正</h3>
+    <p>纯 MRAC 有三类现实麻烦：噪声让 θ̂ 缓慢漂移（积分器漂移）；未建模动力学（柔性、延时）不在匹配条件内，可能激发高频振荡；负载回去后参数需要"遗忘"旧值。标准修正：</p>
+    <table>
+      <tr><th>修正</th><th>做法</th><th>解决的问题</th></tr>
+      <tr><td>投影（projection）</td><td>θ̂ 超界时截断并把更新量投影回边界</td><td>参数越界导致系统不稳定</td></tr>
+      <tr><td>σ-修正 / e-修正</td><td>θ̂̇ 加 −σθ̂ 或 −|e|θ̂ 项</td><td>无激励时参数缓慢无界漂移</td></tr>
+      <tr><td>死区（deadzone）</td><td>|e| 小于噪声量级时不更新</td><td>噪声驱动的无效适应</td></tr>
+    </table>
+    <p>修正会让 Lyapunov 分析从"V̇ ≤ 0"变成"V̇ ≤ −cV + k"，即<strong>误差非零但一致最终有界</strong>，代价换来工程可用性，这笔交易几乎总要做。</p>
+
+    <h3>5. 自适应 vs 离线学习：四个判据</h3>
+    <p>什么时候该用 MRAC、什么时候该重训 RL？判据：<strong>一，变化可参数化</strong>（载荷、摩擦、电压）；<strong>二，需要即时响应</strong>（在线 10 ms 级调整，而 RL 再训练以小时计）；<strong>三，安全要求高的连续量</strong>（有 Lyapunov 保证的适应比无保证的策略切换更让人放心）；<strong>四，问题低维</strong>（3–5 个参数以内）。超出这些边界（变化的物理本质不可参数化、需要的是行为模式切换，参数补偿无法覆盖），就该回到学习路线，或者混合：RL 输出参考轨迹/增益，MRAC 在底层补偿。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>在 Isaac Sim 里让 Franka 的肩关节（单轴）带未知负载跟踪正弦轨迹，实验组（MRAC）与对照组（固定 PD）：</p>
+    <ol>
+      <li><strong>被控对象与不确定项</strong>：关节动力学简化为 I·q̈ = τ − m·g·l·sin(q) − c·q̇（I 已知 1.2 kg·m²；不确定项 θ* = [m·l 的重力矩系数, c 摩擦]）。φ = [−sin(q), −q̇]，θ* 随负载在实验中途变化（0→2 kg，对应第一项从 1.5 变到 8.8）。</li>
+      <li><strong>参考模型</strong>：ζ=1、ω<sub>n</sub>=12 rad/s 的二阶系统；输入为经过限幅的参考位置（轨迹幅值 ±0.6 rad）。</li>
+      <li><strong>控制律</strong>：u = u<sub>PD</sub>(e) + θ̂<sup>T</sup>φ；PD 用名义参数 I 计算，保证名义闭环先稳定，<strong>自适应永远叠在"能用"的名义控制器上</strong>，它不是用来救一个调不好的基线。</li>
+      <li><strong>自适应律</strong>：离散实现 θ̂ ← θ̂ − Γ·φ·(e<sup>T</sup>Pb)·dt，Γ = diag(0.8, 0.3)（先小后大扫参）；e-修正系数 0.05；θ̂ 限幅在 [−20, 20]（投影）。</li>
+      <li><strong>实验协议</strong>：在 t=5 s 时把负载加入（仿真里直接改连杆质量），记录两组：跟踪误差 RMS（前 5 s 与后 5 s 分段）、θ̂ 轨迹（应看见第一项向新值收敛）、控制量峰值。验收：MRAC 后段误差比 PD 降 50% 以上且无振荡。</li>
+    </ol>
+    <div class="box key">
+      <span class="box-title">设计思维：为什么 θ̂ 的初始值不能给零？</span>
+      <p>θ̂(0)=0 意味着开局没有重力补偿，机械臂在重力下下坠，误差 e 很大，自适应律被大误差驱动猛冲，轻则振荡、重则撞击。工程做法：用第 067 章的辨识结果作为 θ̂(0)（辨识值可以离线来，毕竟负载通常在任务开始时已经知道个大概），让适应只在"偏差部分"工作。这也是第 067 与本章的衔接：<strong>离线辨识给先验，在线适应跟踪时变</strong>。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：参考模型与跟踪误差</strong></p>
+    <pre class="code"><code>import numpy as np
+
+class ReferenceModel:
+    """二阶临界阻尼参考模型：定义'理想响应'，MRAC 的误差从它与真机的差里来。"""
+    def __init__(self, wn=12.0, zeta=1.0, dt=0.001):
+        self.wn, self.zeta, self.dt = wn, zeta, dt
+        self.xm, self.vm = 0.0, 0.0           # 参考位置与速度（内部状态）
+
+    def step(self, x_ref):
+        # ẍm = −2ζωn·ẋm − ωn²·xm + ωn²·xref（离散欧拉，dt 固定 1 ms）
+        acc = -2 * self.zeta * self.wn * self.vm - self.wn ** 2 * self.xm \
+              + self.wn ** 2 * x_ref
+        self.vm += acc * self.dt
+        self.xm += self.vm * self.dt
+        return self.xm, self.vm
+
+class TrackingError:
+    """误差定义与微分：e = x − xm，用滤波差分算 ė，避免原始差分放大噪声。"""
+    def __init__(self, alpha=0.2):
+        self.alpha, self.e_prev, self.de = None, 0.0, 0.0
+
+    def __call__(self, x, xm, dt):
+        e = x - xm
+        de_raw = (e - self.e_prev) / dt if self.e_prev is not None else 0.0
+        # 一阶低通滤波：纯差分把编码器噪声放大 1/dt 倍，滤波后保留趋势丢掉毛刺
+        self.de = self.alpha * de_raw + (1 - self.alpha) * self.de
+        self.e_prev = e
+        return e, self.de</code></pre>
+    <p>解读：参考模型是"法律文本"，它定义了理想行为，因此 <code>wn</code> 的选取要对齐真实系统的能力：wn=12 rad/s 对应约 0.28 s 的上升时间（10%–90%，设计里的名义 PD 闭环 ω<sub>n</sub>≈9.5 rad/s，上升约 0.35 s），比真机名义闭环稍快即可；设得过于激进（wn=50）会让参考模型产生真机永远追不上的轨迹，误差恒大、自适应猛冲。<code>TrackingError</code> 里的滤波差分是必须的：e 的导数参与 Lyapunov 更新律，而编码器量化噪声在差分下会被 1/dt 放大（1 ms 采样下放大 1000 倍），直接使用会让 θ̂ 被噪声主导、无界漂移。滤波系数 alpha=0.2 对应约 5 ms 的时间常数，明显快于自适应律本身的响应，又足以压制噪声。这类"信号在进控制器前先修好"的意识比算法细节更常决定成败。</p>
+
+    <p><strong>片段 2：自适应更新律（带投影与 e-修正）</strong></p>
+    <pre class="code"><code>import numpy as np
+
+class MRACAdapter:
+    """离散自适应律：θ̂ ← θ̂ − Γ·φ·(e^T P b)·dt − e修正 − 投影。"""
+    def __init__(self, Gamma=(0.8, 0.3), theta0=(1.5, 0.15),
+                 theta_min=(-20.0, -5.0), theta_max=(20.0, 5.0),
+                 emod=0.05, dt=0.001):
+        self.G = np.diag(Gamma)                 # 自适应增益：每个参数一个速率
+        self.theta = np.array(theta0)           # 初值来自离线辨识，避免从零起步
+        self.lo, self.hi = np.array(theta_min), np.array(theta_max)
+        self.emod, self.dt = emod, dt
+
+    def feature(self, q, qd):
+        # φ(x)：未知参数"进入系统的方向"：重力项与摩擦项，都是运动量的确定性函数
+        return np.array([-np.sin(q), -qd])
+
+    def update(self, q, qd, e_signal_times_Pb):
+        """e_signal_times_Pb 仅为一个标量：单轴下 e^T P b 退化为加权误差组合。"""
+        phi = self.feature(q, qd)
+        dtheta = -self.G @ phi * e_signal_times_Pb      # 核心更新：Lyapunov 推导的形式
+        dtheta -= self.emod * abs(e_signal_times_Pb) * self.theta  # e-修正：抑制无激励漂移
+        self.theta = self.theta + dtheta * self.dt      # 离散积分：dt 必须与调用周期一致
+        self.theta = np.clip(self.theta, self.lo, self.hi)  # 投影：把估计锁在物理合理区
+        return self.theta
+
+    def compensating_torque(self, q, qd):
+        # 自适应补偿项：τ_adapt = θ̂ᵀφ，直接叠加到名义控制器输出上
+        return float(self.theta @ self.feature(q, qd))</code></pre>
+    <p>解读：更新律的每一项都对上第 3 节的理论。<code>-G @ phi * e_signal</code>：参数沿"特征方向 × 误差大小"修正，如果当前姿态的 φ 在该参数方向上为零（例如关节在水平位重力项最小），这个参数就"学不到东西"，这正是持续激励条件在代码层面的样子。<code>dt</code> 与调用周期必须严格一致：自适应律是积分器，dt 写错 2 倍等于把适应速度改了 2 倍。<strong>e-修正</strong>（emod·|e|·θ̂）只在误差大时显著，它给 θ̂ 加了一个"向原点收缩"的力：无激励或纯噪声阶段，θ̂ 不会无界漂移，会停在合理范围。投影 <code>np.clip</code> 是最后防线，即使以上机制全部失灵，估计值也不会跑到物理上荒谬的区域（例如负重力系数），避免控制器输出荒谬力矩。离散实现时若采样周期小于 2 ms，建议改为辛普森/中点积分减小相位误差；1 ms 的欧拉在这个尺度足够。</p>
+
+    <p><strong>片段 3：Isaac Sim 中的自适应闭环与负载突变实验</strong></p>
+    <pre class="code"><code>import numpy as np
+
+class AdaptiveJointController:
+    """名义 PD + MRAC 补偿；在 Isaac Sim 物理步进之前计算力矩并下发。"""
+    def __init__(self, ref, adapter, kp=90.0, kd=18.0, i_nominal=1.2):
+        self.ref, self.adapter = ref, adapter
+        self.kp, self.kd, self.i_nom = kp, kd, i_nominal
+        # 单轴 P 矩阵：对参考模型矩阵（wn=12、ζ=1）解 Lyapunov 方程 A^T P + P A = -I 得
+        self.P = np.array([[3.10, 0.0035], [0.0035, 0.021]])
+        self.b = np.array([0.0, 1.0 / i_nominal])   # 输入通道向量
+
+    def step(self, q, qd, q_ref, dt):
+        xm, vm = self.ref.step(q_ref)               # 参考模型推进
+        e1, e2 = q - xm, qd - vm                    # 位置误差与速度误差
+        # 名义 PD：用已知惯量算增益，保证名义闭环稳定（自适应只补充未知项）
+        tau_nom = self.i_nom * (self.kp * (q_ref - q) + self.kd * (-qd))
+        e_vec = np.array([e1, e2])
+        s = float(e_vec @ self.P @ self.b)          # e^T P b：Lyapunov 更新律的标量信号
+        theta = self.adapter.update(q, qd, s)       # θ̂ 更新（含投影与 e-修正）
+        tau = tau_nom + self.adapter.compensating_torque(q, qd)
+        return float(np.clip(tau, -87.0, 87.0))     # 力矩限幅：与真机电机一致
+
+
+# 实验协议（伪代码流程）：t=5 s 时把负载连杆质量从 0 改为 2 kg
+# 记录：两组（PD / MRAC）的分段跟踪误差 RMS、θ̂ 的轨迹、力矩峰值
+# 预期：MRAC 后段误差 RMS 约为 PD 的 1/3–1/2；θ̂[0] 从 1.5 爬向 ~8.8 并稳定</code></pre>
+    <p>解读：把三个来源拼在一起的顺序有讲究：参考模型推进 → 误差计算 → 自适应更新 → 名义控制 + 补偿 → 限幅。<code>s = e<sup>T</sup>Pb</code> 是 Lyapunov 更新律里的"误差投影"标量：它把位置与速度误差按 P 加权合成一个对"控制方向"敏感的量，单轴下它的物理含义就是"当前误差若沿控制通道衰减会以多快速度消失"。力矩限幅放在最后一步（与真机电机限幅一致），让所有计算在同一个物理约束下闭环，若把限幅放在自适应之前，θ̂ 会学到"更大的补偿来对抗你自己的限幅"，产生参数虚高。实验读数的三个注意：分段统计（突变前/后）看的是"适应速度"；θ̂ 轨迹看的是"有没有收敛到物理意义的量"（第一项趋近 mgl≈8.8 是好信号）；力矩峰值看的是"适应的代价"（允许短暂冲高，不应持续升高）。若 θ̂ 在第一项附近反复震荡、无法稳定，优先降低 Γ 或增大 e-修正，这是自适应增益与信噪比失配的典型症状。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>自适应增益 Γ 过大</strong>：θ̂ 追着噪声急速变化，控制量出现高频振荡，真机会"嗡嗡"作响。症状是误差不降反升、频谱在高频冒尖。修复：Γ 从"能让误差在 0.5–2 s 内明显改变"的量级起，降一个数量级试；配合滤波差分与死区。</li>
+      <li><strong>没有投影与修正</strong>：长时间无激励（机器人静止待命）时 θ̂ 缓慢漂移，下次运动瞬间输出异常力矩。症状是"休息久了第一次动作会猛冲"。修复：投影 + e-修正 + 死区三件套；θ̂ 的上下界按物理含义定。</li>
+      <li><strong>用自适应救坏基线</strong>：名义 PD 本身振荡或增益不合理，指望自适应"学回来"。症状是系统抖得厉害还挂着自适应。修复：先调好名义控制器（第 004/006 章的 PD/计算力矩），确认它在名义参数下稳定，再叠自适应。</li>
+      <li><strong>误差信号没滤波</strong>：编码器噪声经 1/dt 放大进入更新律。症状是 θ̂ 毛刺大、控制量抖。修复：滤波差分（片段 1）；必要时对 e 本身也做轻滤波，但注意滤波引入的相位损失会削弱适应速度。</li>
+      <li><strong>把 θ̂ 当"真参数"使用</strong>：把估计值拿去报给控制台/当成系统辨识结果存档。症状是"辨识报告"数据诡异。修复：区分概念，辨识（第 067 章）在激励充分时给可验证的参数估计；MRAC 的 θ̂ 只保证误差有界，无持续激励时不承诺收敛真值。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把 Γ 从 (0.8, 0.3) 扫到 (0.08, 0.03) 与 (8, 3)，观察误差 RMS 与力矩峰值随 Γ 的变化，找出你系统上的稳定区间。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>Γ 太小时适应慢（突变后误差长时间不降）；太大时振荡。用"突变后 2 s 内 RMS"当主指标。</div></details>
+      </li>
+      <li>仿真实验：负载从 0 加到 2 kg 再在 2 s 后去掉，观察 θ̂ 的爬升与回落速度，解释 e-修正对回落的作用。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>去掉负载后误差反号，更新律自动把 θ̂ 拉回；没有 e-修正时回落会明显更慢、残留更久。</div></details>
+      </li>
+      <li>把参考模型的 ωn 从 12 调到 30 与 6，观察真机跟踪误差与 θ̂ 行为，说明"参考模型必须匹配硬件能力"的原因。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>ωn=30 时参考轨迹太快，误差常驻、θ̂ 持续猛拉；ωn=6 时适应轻松但性能保守。找"误差小且 θ̂ 稳定"的中间值。</div></details>
+      </li>
+      <li>设计持续激励实验：对比"静止保持"与"小幅正弦抖动"两种待命状态下的 θ̂ 漂移量，验证激励条件对参数收敛的作用。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>静止时 φ 几乎恒定，某些参数方向"看不见"；正弦抖动让 φ 覆盖更宽，θ̂ 漂移显著减小，这是 PE 条件的操作性证据。</div></details>
+      </li>
+      <li>把 MRAC 与"固定鲁棒 PD"（按最大负载调增益）对比：跟踪误差、力矩峰值、适应时间三项列表，讨论哪种方案在你的应用里更划算。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>鲁棒 PD 的误差在轻载时偏大（增益按最坏情况配）、重载时接近 MRAC；MRAC 的代价是复杂度与调参成本。按应用的安全与性能要求取舍。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>自适应控制把"缓慢变化"写成未知参数，从跟踪误差在线读出它并补偿：适合可参数化、低维、要求即时响应的变化。</li>
+      <li>MRAC = 参考模型（理想响应）+ 参数化控制（θ̂<sup>T</sup>φ）+ Lyapunov 更新律（θ̂̇ = −Γφe<sup>T</sup>Pb）：V̇=−e<sup>T</sup>Qe≤0，误差与参数有界。</li>
+      <li>参数收敛需要持续激励，不保证收敛真值；工程上必须加投影、e-修正、死区，换来"一致最终有界"的鲁棒性。</li>
+      <li>纪律：名义控制器先稳、误差信号先滤波、θ̂ 初值用辨识结果、力矩限幅放在最后一步。</li>
+      <li>定位：MRAC 管"近期变化"，RL/MPC 管"大范围策略"；三者接口清晰（参考轨迹、增益、补偿项）时最好用。</li>
+      <li>下一章解决"什么时候算"：控制系统没必要死板地每 1 ms 算一次，事件触发控制按需计算、按需通信。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch077.html">← 第 077 章：实现模型预测控制</a>
+    <a class="next" href="ch079.html">第 079 章：实现事件触发控制 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

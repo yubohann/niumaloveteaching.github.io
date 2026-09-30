@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第049章 RLlib训练吞吐与并行度调优 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第三篇 · RLlib 算法实现</span>
+    <span class="sep">/</span>
+    <span>第 049 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第三篇 · RLlib 算法实现</div>
+    <h1>第 049 章：RLlib训练吞吐与并行度调优</h1>
+    <p class="lead">把训练循环当流水线来算账：迭代时间如何分解为采样、学习与开销三部分，环境 worker 数与并行环境数两种并行粒度的取舍，同步屏障与长尾效应如何限制扩展效率，以及用计时指标定位瓶颈的操作方法。</p>
+    <ul class="meta">
+      <li>主题：RLlib 训练（吞吐调优）</li>
+      <li>关键机制：迭代时间分解、并行粒度、瓶颈定位</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 048 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>掌握训练迭代时间的分解模型，能在采样受限与学习受限两种状态间判断当前系统位置。</li>
+      <li>理解环境 worker 数与并行环境数两种并行粒度的成本差异，能按内存与调度开销选择组合。</li>
+      <li>会用迭代计时指标（采样时间、学习时间、总时间）定位瓶颈并预测调参后的吞吐变化。</li>
+      <li>能解释同步屏障与任务长尾如何造成并行效率随 worker 数递减，并给出缓解手段。</li>
+      <li>会设计并行度扫描实验，按边际收益停止增加资源，避免无效扩展。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>分布式训练的收益来自并行，但并行不是免费资源：每个 worker 占用进程与内存，每次迭代存在同步等待，模型副本与数据传输消耗带宽。盲目增加 worker 数会同时抬高成本与尾延迟，吞吐却趋于饱和。调优的目标是把学习循环的瓶颈从"采样不足"或"学习不足"的单侧限制中解放出来，让两侧处于匹配状态。</p>
+    <p>本章给出吞吐的解析模型与测量方法。模型用于预测，测量用于验证，两者配合才能把"加机器"变成有依据的决策，也为后续 Tune 阶段同时开多个试验时的资源规划提供基础。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p>本节先建立迭代时间的分解模型，再讨论两类并行粒度与同步开销。</p>
+
+    <h3>1. 迭代时间分解</h3>
+    <p>同步式训练器（以 PPO 为例）每轮迭代按顺序做两件事：并行收集一个训练批次的经验，再在批次上做若干次梯度更新。忽略通信开销，迭代时间为两部分的最大值与固定开销之和：</p>
+    <div class="formula">
+      T<sub>iter</sub> ≈ max( T<sub>sample</sub>, T<sub>learn</sub> ) + T<sub>overhead</sub> ， 吞吐 = train_batch_size / T<sub>iter</sub>
+      <span class="note">T<sub>sample</sub> ≈ batch / (W · E · r)，W 为 worker 数，E 为每 worker 并行环境数，r 为单环境步进速率</span>
+    </div>
+    <p>分解模型给出两个可操作的判断：<strong>当 T<sub>sample</sub> 显著大于 T<sub>learn</sub> 时，系统处于采样受限，增加并行采样资源直接缩短迭代时间；当 T<sub>learn</sub> 占主导时，增加采样资源没有收益，应调整更新结构（减少更新轮数、缩小批次梯度计算量）或为学习环节提速。</strong>注意并行环境数与 worker 数的区分：E 增加使 r 的总和线性增长，但单 worker 内多个环境共享一次模型前向，边际成本低于新增 worker。</p>
+    <p>两侧的匹配点可以直接解出：令 T<sub>sample</sub> = T<sub>learn</sub>，得临界并行环境数 W*·E = batch ÷ ( r · T<sub>learn</sub> )。代入本节的算例数字：32768÷(200×12) ≈ 13.7，即约 14 个并行环境处两侧持平，超过它的资源投入会闲置在等待中。若把学习时间压到 8 秒，匹配点升到约 20.5 个环境，同一集群可以支撑更大的批次。匹配点在资源规划阶段就能算出，比事后看图更有决策价值。</p>
+
+    <h3>2. 两种并行粒度：worker 与环境</h3>
+    <table>
+      <tr><th>维度</th><th>新增一个 worker</th><th>新增一个并行环境</th></tr>
+      <tr><td>进程与内存</td><td>新进程、模型副本、通信端点</td><td>同进程内，仅环境状态与缓冲</td></tr>
+      <tr><td>步进并行度</td><td>线性提升采样能力</td><td>线性提升采样能力</td></tr>
+      <tr><td>调度开销</td><td>同步与对象传输成本上升</td><td>几乎不变</td></tr>
+      <tr><td>适用场景</td><td>环境步进本身慢（物理仿真）</td><td>环境轻量、需要批量前向摊薄成本</td></tr>
+    </table>
+    <p>经验次序是<strong>先把每 worker 的并行环境数从 1 提到 4 至 8，再增加 worker 数量</strong>。环境轻量时，一个 worker 内的多个环境由同一份策略推理服务，模型前向的开销被摊薄；当单环境步进重（真实仿真、长计算）时，环境之间没有共享收益，直接增加 worker 并行度更有效。</p>
+
+    <h3>3. 同步屏障与长尾效应</h3>
+    <p>同步式收集要求全部 worker 在一轮内完成各自份额，迭代时间由最慢的 worker 决定。设单环境步进时间分布存在长尾（少数步需要额外计算），最慢 worker 的期望用时随 worker 数量增长而上升。<strong>这解释了一个常见现象：worker 从 8 增到 32，吞吐提升远低于 4 倍，部分场景甚至下降。</strong>缓解手段有三类：把长尾任务拆小（减小每 worker 的份额）、使用异步架构（异步收集允许 worker 不等齐，代价是数据略陈旧，IMPALA 与 APPO 的核心差异）、或按任务分片做负载均衡。</p>
+
+    <h3>4. 学习侧的影响因素</h3>
+    <p>学习时间由更新轮数与每轮计算量共同决定：每个批次做若干轮小批量更新，轮数乘以小批量数目构成前向反向的总次数。小批量过小时 GPU 利用率低、单次更新耗时被固定开销支配；小批量过大则内存压力上升、每轮可用的更新次数减少。<strong>把学习时间压到采样时间以下的常用手段是调整更新轮数与小批量规模；消减批次总量会同时损害样本效率。</strong></p>
+    <p>数据搬运是常被忽略的隐性成本：采样结果从 worker 进程进入对象存储（Object Store）再被学习进程读取，批次越大搬运越可观。把批次规模控制在单次迭代能在内存中完整驻留的量级，可避免搬运与训练争抢带宽。</p>
+
+    <h3>5. 数值算例：迭代时间分解与扩展效率</h3>
+    <p>给定一批参数逐步计算：train_batch_size=32768，单环境步进速率 200 步每秒，学习时间 12 秒，同步与上报开销按 0.5 秒计，环境 worker 各带 1 个并行环境。按本节的分解模型逐档代入：</p>
+    <table>
+      <tr><th>并行环境数</th><th>T<sub>sample</sub></th><th>T<sub>iter</sub></th><th>吞吐（步/秒）</th><th>相对上一档</th></tr>
+      <tr><td>4</td><td>41.0 秒</td><td>41.5 秒</td><td>790</td><td>基准</td></tr>
+      <tr><td>8</td><td>20.5 秒</td><td>21.0 秒</td><td>1562</td><td>1.98 倍</td></tr>
+      <tr><td>16</td><td>10.2 秒</td><td>12.5 秒</td><td>2621</td><td>1.68 倍</td></tr>
+      <tr><td>32</td><td>5.1 秒</td><td>12.5 秒</td><td>2621</td><td>1.00 倍</td></tr>
+    </table>
+    <p>读表：并行环境从 4 增到 8，吞吐接近翻倍，处于采样受限区，扩展近似线性；从 8 增到 16 只剩 1.68 倍，开始接触学习侧天花板；从 16 增到 32 吞吐完全不变，因为 12 秒的学习时间把迭代时间固定在 12.5 秒。要让第三档产生收益，必须先把学习时间压到 10 秒以下（例如更新轮数从 8 降到 5），或把批次同步放大到 65536，让两侧重新匹配。<strong>这张表给出"扩展收益何时耗尽"的量化答案：采样时间向学习时间收敛的过程中，边际吞吐按档位递减，触碰地板后增量为零。</strong></p>
+
+    <h3>6. 长尾与数据搬运的量化</h3>
+    <p>用两点分布给长尾建模：每个 worker 每轮以概率 p=0.05 走到慢路径，慢路径使该 worker 用时增加 20%。一轮迭代要等齐全部 worker，用时倍率为 1 + 0.2×( 1 − (1−p)<sup>W</sup> )：W=8 时约 1.067，W=16 时约 1.112，W=32 时约 1.161。把倍率乘回并行加速比：W 从 8 增到 32 的理论加速是 4 倍，计入该长尾模型后约 3.68 倍，再叠加对象存储传输与调度抖动，实测加速比还会更低。缓解方向与模型中的变量一一对应：减小每 worker 的份额（提高并行度的同时保持批次不变）、换异步架构吸收长尾、按任务分片做负载均衡。</p>
+    <p>数据搬运成本的算法：单帧观测为 64×64×3 字节（无符号 8 位存储）合计 12288 字节，批次 32768 步对应约 384 MiB 的观测载荷；对象存储带宽按 1 GB/s 计，单轮搬运约 0.40 秒，相对 12.5 秒的迭代约占 3%。把观测升到 128×128×3，载荷约 1.5 GiB、搬运约 1.6 秒，占比超过一成；观测若以 32 位浮点存储，载荷再乘四倍，64×64 帧也会达到 1.5 GiB。观测压缩（无符号 8 位、降低分辨率、帧差分）省下的正是这部分预算，搬运占比核算应写进吞吐基线报告。</p>
+
+    <h3>7. 两种并行粒度的成本口径</h3>
+    <p>两种粒度有明确的成本差：策略前向的固定开销 C<sub>f</sub>（例如每次决策 0.2 毫秒）在单环境时全部计入该环境步；一个 worker 内共享 E 个环境时，每次前向服务 E 个决策，摊到单步为 C<sub>f</sub>/E。环境步 2 毫秒、E 从 1 提到 8 时，摊薄量约 0.175 毫秒每步，相当于采样式成本的 8.8%；环境步 50 毫秒的重仿真里，同一摊薄量不到 0.4%，此时直接增加 worker 更有效。判据可以写成：摊薄收益 C<sub>f</sub>·(1−1/E) 与单步采样成本之比，超过一成先提 E，低于百分之一直接提 W，中间区间两者都值得扫描对照。</p>
+
+    <h3>8. 异步架构的代价核算</h3>
+    <p>异步架构（IMPALA、APPO）让 worker 不等齐，长尾被流水线吸收，代价是样本陈旧：设每轮迭代执行 32 次梯度更新、流水线深度为 2 轮，最旧样本进入学习时已经落后约 64 次梯度更新；同策略目标对陈旧的容忍通常只有一到两轮更新量，因此异步方案需要重要性采样修正或缩短流水线。可测量的代理指标是样本生成时的迭代号与进入学习时的迭代号之差，把它按分位数记录进面板，陈旧度上界控制在一轮梯度总量以内，超过就下调流水线深度。陈旧度与吞吐两列并排后，异步收益的来源就一目了然：吞吐上升而陈旧度可控，才值得保留异步采集；吞吐上升伴随陈旧度失控，收益会在稳定性指标上被收回。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>吞吐调优按"测量、定位、扩展、验证"四步循环。</p>
+    <ol>
+      <li><strong>建立基线</strong>：单 worker 单环境跑固定批次，记录迭代时间与吞吐。</li>
+      <li><strong>定位瓶颈</strong>：读取采样时间与学习时间，判断受限侧。</li>
+      <li><strong>按序扩展</strong>：采样受限时先提并行环境数，再提 worker 数；学习受限时调整更新结构与设备。</li>
+      <li><strong>验证边际收益</strong>：每次扩展后比较吞吐增量，增量低于阈值时停止。</li>
+    </ol>
+    <p>验证环节保留两列对照数：绝对吞吐与并行效率。绝对吞吐回答"加这些资源后快了多少"，并行效率回答"这些资源本身值不值"，两者并列后，"再加一档"的判断不需要回忆上一轮的数字。扫描结果归档时同时记录批次、单环境步进速率与学习时间三个量，它们中任何一项变化都会让旧表格失去可比性。</p>
+    <h3>参数表</h3>
+    <table>
+      <tr><th>参数</th><th>典型值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td><code>num_env_runners</code></td><td>8–32</td><td>采样 worker 数</td><td>递增到边际收益显著下降为止</td></tr>
+      <tr><td><code>num_envs_per_env_runner</code></td><td>1–8</td><td>每 worker 并行环境</td><td>环境轻量时优先提升该值</td></tr>
+      <tr><td><code>train_batch_size</code></td><td>32768–131072 步</td><td>每轮采样量</td><td>批次越大梯度越稳，但迭代时间线性增长</td></tr>
+      <tr><td>更新轮数</td><td>2–10</td><td>批次内重复学习次数</td><td>学习受限时下调，采样受限时可上调</td></tr>
+      <tr><td>小批量规模</td><td>2048–8192</td><td>单次梯度计算粒度</td><td>按显存与 GPU 利用率取值</td></tr>
+      <tr><td><code>num_gpus</code></td><td>0 或 1（学习侧）</td><td>学习设备数</td><td>worker 默认不占 GPU</td></tr>
+    </table>
+    <p>扫描的停止规则要预先写定：每档资源的吞吐增量低于 10% 视为边际收益耗尽；并行效率（吞吐除以按资源倍数线性外推的期望值）低于 0.7 视为同步开销已经吃掉近三成收益，两个条件任一触发即停止扩展。记录每一档的采样时间与学习时间，扩展到学习受限区间时增量归零而学习时间保持不变，这条现象可以作为图表读数正确的交叉验证。</p>
+    <p>与上一章的差异：048 章决定单步计算的成本结构，本章决定这些计算在多少资源上并行展开；模型结构变化会改变两侧时间的比例，因此吞吐结论应在结构定稿后复核。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：从迭代报表分解吞吐</strong></p>
+    <pre class="code"><code>def throughput_report(result):
+    """读取一轮迭代的计时字段，判断系统处于采样受限还是学习受限。"""
+    timers = result.get("timers", {})
+    sample_ms = timers.get("sample_time_ms", float("nan"))
+    learn_ms = timers.get("learn_time_ms", float("nan"))
+    iter_s = result.get("time_this_iter_s", float("nan"))
+    steps = result.get("num_env_steps_sampled_this_iter", 0)
+    tps = steps / max(iter_s, 1e-9)
+    # 受限侧判断：两者相差超过两成即视为单侧主导
+    if sample_ms &gt; learn_ms * 1.2:
+        side = "采样受限：优先增加并行环境或 worker"
+    elif learn_ms &gt; sample_ms * 1.2:
+        side = "学习受限：优先调整更新轮数、批量或设备"
+    else:
+        side = "两侧接近：系统匹配良好，扩展收益以同步开销为主"
+    print(f"采样={sample_ms:.0f}ms 学习={learn_ms:.0f}ms 迭代={iter_s:.2f}s "
+          f"吞吐={tps:.0f} 步/秒")
+    print(side)
+    return {"sample_ms": sample_ms, "learn_ms": learn_ms, "tps": tps}</code></pre>
+    <p>解读：这段代码把理论模型落为单行判断。<strong>（1）</strong>时间阈值取 1.2 倍是工程折中：两侧完全相等不现实，两成差异内可以视为已匹配。<strong>（2）</strong>吞吐按本轮实际采样步数除以迭代时间计算，与配置值区分开（同步收集可能超出或低于配置批次）。<strong>（3）</strong>返回结构化数据供扫描实验汇总，避免只打印肉眼查看。计时键名随版本演进，缺失时需在版本文档中确认替代字段。</p>
+
+    <p><strong>片段 2：并行度扫描实验</strong></p>
+    <pre class="code"><code>from itertools import product
+
+def parallel_sweep(make_algo, workers=(4, 8, 16), envs=(1, 4, 8), iters=5):
+    """扫描 worker 数与并行环境数的组合，输出吞吐与并行效率。
+    并行效率 = 吞吐 / (单 worker 基准吞吐 × worker 数)，无量纲。"""
+    rows, baseline = [], None
+    for w, e in product(workers, envs):
+        algo = make_algo(num_env_runners=w, num_envs_per_env_runner=e)
+        last = None
+        for _ in range(iters):
+            last = algo.train()
+        rep = throughput_report(last)
+        if baseline is None and w == workers[0] and e == envs[0]:
+            baseline = rep["tps"]
+        # 效率口径把"资源换来的吞吐"与"资源本身的倍数"分开看
+        rows.append((w, e, rep["tps"], rep["tps"] / (baseline * w / workers[0])))
+    for w, e, tps, eff in rows:
+        print(f"workers={w:2d} envs={e} 吞吐={tps:7.0f} 效率={eff:.2f}")
+    return rows</code></pre>
+    <p>解读：三点说明。<strong>（1）</strong>跳过前若干轮再取最后一轮报表，避开启动阶段的模型编译、对象存储预热对计时的干扰。<strong>（2）</strong>并行效率做归一化：分母是"按 worker 倍数线性外推"的期望值，效率低于 0.7 时说明同步开销或长尾已经开始吃掉收益。<strong>（3）</strong>扫描组合保持有界（本文示例九组），每次只改变一个维度会遗漏"worker 多但环境少"与"worker 少但环境多"的交互效应。全量扫描的成本要计入实验预算。</p>
+
+    <p><strong>片段 3：采样与学习重叠的观测</strong></p>
+    <pre class="code"><code>class ThroughputProbe:
+    """轻量探针：连续记录多轮的时间分解，识别长尾与漂移。"""
+    def __init__(self):
+        self.history = []
+
+    def on_train_result(self, *, algorithm, result, **kwargs):
+        timers = result.get("timers", {})
+        self.history.append({
+            "iter": result.get("training_iteration"),
+            "sample_ms": timers.get("sample_time_ms", 0.0),
+            "learn_ms": timers.get("learn_time_ms", 0.0),
+        })
+        if len(self.history) == 20:
+            samples = [h["sample_ms"] for h in self.history]
+            learn = [h["learn_ms"] for h in self.history]
+            # 方差大说明采样侧存在长尾或资源争抢，均值不能代表单轮成本
+            print(f"采样均值={sum(samples)/20:.0f}ms 波动={max(samples)-min(samples):.0f}ms")
+            print(f"学习均值={sum(learn)/20:.0f}ms 波动={max(learn)-min(learn):.0f}ms")
+            self.history.clear()
+
+# 探针挂在回调上，不侵入算法代码；同步式训练中两段时间不重叠，
+# 异步式（IMPALA/APPO）中两段时间部分重叠，分解口径需按架构解释
+probe = ThroughputProbe()</code></pre>
+    <p>解读：逐块说明。<strong>（1）</strong>单轮计时受调度抖动影响，用 20 轮窗口的均值加波动区间描述系统状态更可靠。<strong>（2）</strong>波动幅度是关键信号：采样时间波动大意味着长尾或 CPU 争抢，此时继续加 worker 只会放大等待。<strong>（3）</strong>注释强调架构差异：同步式两段时间互斥可直接相加，异步式允许重叠，同样的计时字段在不同架构下的解释口径不同。</p>
+    <p>波动读数可以给出定量判据：采样时间的极差超过均值 30% 时，长尾或资源争抢已经在主导单轮成本，增加 worker 会把等待同步放大，正确动作是先核对 CPU 核数、内存带宽与对象存储吞吐，再决定缩批或换异步架构；学习时间的极差超过均值 20% 时，波动通常来自显存压力与数据加载，优先检查小批量规模与数据管道。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>worker 数量越多越好</strong>：忽视同步屏障与长尾，从 32 加到 64 后吞吐持平甚至下降，还占用了双倍内存。修复：用扫描实验找边际收益拐点，以吞吐增量决定是否继续扩展。</li>
+      <li><strong>采样 worker 误占 GPU</strong>：为 worker 声明 GPU 资源，多个进程争抢同一张卡，学习侧反而变慢。修复：训练任务里的 GPU 默认只归学习进程；推理加速需求单独立项评估。</li>
+      <li><strong>小批量过小</strong>：显存充足却用小批量，GPU 利用率低，学习时间被固定开销主导。修复：在显存允许范围内放大单次计算粒度，观察学习时间的下降曲线。</li>
+      <li><strong>批次规模与迭代时间口径混淆</strong>：把"每轮采样步数"当作吞吐指标，批次调大后该数字上升但墙钟吞吐未变。修复：统一用步/秒或样本/秒衡量，报表同时记录批次与迭代时间。</li>
+      <li><strong>基线被启动阶段污染</strong>：用第一轮的时间做基线，模型编译与缓存预热让基线虚高，后续扩展看起来总是无收益。修复：跳过启动轮次，取稳定阶段窗口。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>计算：批次 65536 步、32 个 worker 各带 4 个环境、单环境步进 5000 步/秒，估算 T<sub>sample</sub>；若学习时间 3 秒，系统处于哪一侧？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>单轮采样容量 32×4×5000=640000 步/秒，65536 步约 0.10 秒，远小于 3 秒学习时间，系统学习受限。</div></details>
+      </li>
+      <li>在片段 2 的扫描中加入 <code>workers=(8,16,32)</code>、<code>envs=(2,4)</code>，预测效率列随组合的变化趋势，并指出哪一组最可能达到效率峰值。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>worker 少、环境多的组合调度开销最低，效率峰值通常出现在 8 至 16 个 worker、每 worker 4 个环境附近；32 worker 时同步长尾开始主导。</div></details>
+      </li>
+      <li>推导：设单环境步进时间服从"均值 m、最大值 m+Δ"的两点分布，证明最慢 worker 的期望用时随 worker 数 W 单调上升，并解释其对吞吐上限的含义。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>W 个样本中至少一个取到最大值的概率为 1−(1−p)<sup>W</sup>，随之上升；最慢决定性路径的增长让线性加速比在实践中被截断。</div></details>
+      </li>
+      <li>设计实验区分"采样受限"与"对象存储搬运受限"：两者都表现为采样时间偏高，给出至少两种区分手段。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>缩小批次看采样时间是否等比例下降（搬运受限时不成比例）；或临时把学习设备置空只留采样，观察耗时结构。</div></details>
+      </li>
+      <li>解释为什么异步架构能缓解长尾，但会带来样本陈旧（Off-policyness）；写出评估"陈旧度"的一个可测量代理指标。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>异步下快 worker 不等慢 worker，长尾被流水线吸收；陈旧度可用生成样本时的策略版本与当前版本的更新次数差衡量。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>迭代时间近似为采样与学习两段时间的最大值加固定开销，吞吐等于批次除以迭代时间。</li>
+      <li>采样受限时扩展并行采样资源，学习受限时调整更新轮数、批量粒度与设备，方向选错则投入无效。</li>
+      <li>并行粒度两层：每 worker 的环境数摊薄前向成本，worker 数承担重环境并行；优先提环境数。</li>
+      <li>同步屏障与长尾让并行效率随 worker 数递减，异步架构缓解长尾但引入样本陈旧。</li>
+      <li>调优流程是测量、定位、扩展、验证的循环，停止条件取边际收益，资源规模本身不构成理由。</li>
+      <li>下一章处理训练成果的出口：策略蒸馏如何把大模型压小，以及导出与部署衔接的关键动作。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch048.html">← 第 048 章：RLlib策略模型选择：MLP、CNN与RNN</a>
+    <a class="next" href="ch050.html">第 050 章：RLlib策略蒸馏与部署衔接 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

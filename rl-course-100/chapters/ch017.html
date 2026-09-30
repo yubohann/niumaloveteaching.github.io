@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第017章 PPO的元学习初始化 | 深度强化学习课程 · PPO、SAC 与多智能体系统</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · 策略梯度与 PPO</span>
+    <span class="sep">/</span>
+    <span>第 017 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · 策略梯度与 PPO</div>
+    <h1>第 017 章：PPO的元学习初始化</h1>
+    <p class="lead">用 Reptile 在"重力随机"的 CartPole 任务族上训练一个初始化：meta 参数 + 几轮 PPO 适配就能应付新重力。对照随机初始化，看"学会学习"到底省多少适配样本。</p>
+    <ul class="meta">
+      <li>主题：元学习 / 快速适配</li>
+      <li>关键公式：min<sub>θ</sub> 𝔼<sub>T</sub>[L<sub>T</sub>(Adapt(θ,T))]；θ ← θ + β·mean(θ′<sub>i</sub> − θ)</li>
+      <li>预计学时：65 分钟</li>
+      <li>前置章节：第 016 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解元学习的目标：训练一个"迁移性好、适配快"的初始化，让新任务能用极少量样本完成适配。</li>
+      <li>理解 Reptile 的更新规则 θ ← θ + β·mean(θ′−θ) 及其几何直觉，与 MAML 的差别。</li>
+      <li>实现完整的 Reptile + PPO 管线：任务采样、内循环适配、元批插值、初始化保存。</li>
+      <li>设计正确的元测试：held-out 任务、固定适配预算、逐轮评估曲线，避免"偷看测试任务"。</li>
+      <li>用适配曲线量化元初始化的优势：前期几轮适配的领先幅度，以及它随适配轮数的收敛。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>上一章的多任务网络能同时处理多个任务，但要加一个新任务仍得重新训练，只是从"更快的起点"出发。如果新任务很多、每个任务只允许极少的交互预算（例如机器人每换一个负载就要快速适应），你需要的是<strong>元学习：训练一个"特别容易被微调"的初始化</strong>。</p>
+    <p>Reptile 是这类方法里最容易实现的一个：内循环用普通 RL 在任务上跑几步梯度，外循环把参数往"内循环结束的位置"挪一点。它不需要二阶导数（不像 MAML 要穿过内循环求导），也不需要存储内循环的完整计算图，因此与 PPO 这种多轮更新的算法配合非常自然。本章在 CartPole 的重力任务族（g ~ U[8, 13]）上做完整演示，并在四个 held-out 重力上对比"元初始化 vs 随机初始化"的适配曲线，这条曲线就是元学习的成绩单。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 元学习的目标函数</h3>
+    <p>设任务分布 p(T)，内循环用学习率 α 在任务 T 上做几步更新得到 θ′<sub>T</sub> = Adapt(θ, T)。元学习优化的是<strong>适配之后</strong>的表现：</p>
+    <div class="formula">
+      min<sub>θ</sub> 𝔼<sub>T~p</sub>[ L<sub>T</sub>( Adapt(θ, T) ) ]
+      <span class="note">MAML 对这个目标求二阶梯度；Reptile 用"朝适配后参数移动"的一阶近似</span>
+    </div>
+    <p>直觉上，最优 θ 位于"所有任务的解附近、且到它们的路都好走"的位置，通常并不是任何一个任务的解，更接近任务族共享结构的表征点。</p>
+
+    <h3>2. Reptile 的更新规则</h3>
+    <p>对元批里的每个任务，从同一个 θ 出发做内循环，得到 θ′<sub>i</sub>，然后：</p>
+    <div class="formula">
+      θ ← θ + β · (1/K) Σ<sub>i=1..K</sub> ( θ′<sub>i</sub> − θ )
+      <span class="note">β 是元步长（0～1）；K 是元批任务数</span>
+    </div>
+    <p>几何直觉：θ′<sub>i</sub> − θ 指向"该任务想要的移动方向"，平均后取一步。想清楚三个参数：<strong>β 太大</strong>会让元参数抖、吸收单任务噪声；<strong>内循环步数太多</strong>时 θ′ 已经取得高分，Reptile 退化成"多任务平均解"；<strong>内循环步数太少</strong>时 θ′ 的方向噪声大、信号弱。实践中内循环 1～4 次 PPO 更新、β 取 0.3～1.0 是常见区间。</p>
+    <p>"不需要元梯度"这句话在一步内循环时可以推到精确：若内循环只做 α 倍的梯度步，则 θ′<sub>i</sub> − θ = αg<sub>i</sub>，Reptile 更新就是 βα·mean(g<sub>i</sub>) = βα·∇L̄(θ)，即平均损失的一阶梯度，没有任何近似。内循环步数变多后，平均位移变成多步梯度累积的复合方向，它与二阶元梯度不再逐项相等，只在"朝适配结果靠拢"的意义上近似。Reptile 与 MAML 的差别就聚在这里：MAML 精确穿过内循环求导，Reptile 用一条便宜的直线逼近。</p>
+
+    <div class="box key">
+      <span class="box-title">数值算例：简化模型里的 Reptile 轨迹与"平均解"退化</span>
+      <p>把每个任务的适配缩成一维模型"向自己的最优参数 μ 迈一步"：θ′<sub>i</sub> = θ + α(μ<sub>i</sub> − θ)。取两个任务 μ<sub>1</sub>=0.2、μ<sub>2</sub>=0.6（均值 0.4），α=0.2、β=0.5，从 θ=0 出发。每次迭代 θ ← θ + βα(μ̄−θ)，即 θ<sub>k</sub> = 0.4(1−0.9<sup>k</sup>)：第 1、2、5、10、20 次迭代后 θ 为 0.040、0.076、0.164、0.261、0.351，逐步收敛到 0.4。</p>
+      <p>这个玩具模型给出三条可迁移的结论。<strong>其一</strong>，收敛依赖"任务方向随 θ 变化"：若内循环每次都跑到各任务收敛，平均方向只剩任务解的中心，元学习退化成多任务平均，这就是内循环步数不能过多的数学形态。<strong>其二</strong>，线性化模型下的稳定条件是 0 &lt; βα &lt; 2（此处 0.10），β 接近 1 且内循环学习率大时才可能冲过头；真实网络的曲率不一致，经验上把 β 留在 1 以内更稳。<strong>其三</strong>，收敛速度由 βα 控制：把 β 降到 0.2（βα=0.04）时，20 次迭代后 θ 只到约 0.22，元训练进展明显更慢。</p>
+    </div>
+
+    <h3>3. 三种路线横向对照</h3>
+    <table>
+      <tr><th>维度</th><th>Reptile</th><th>MAML</th><th>单任务预训练</th></tr>
+      <tr><td>元目标</td><td>朝适配结果靠拢（一阶近似）</td><td>适配后损失的梯度（精确）</td><td>单一任务的解</td></tr>
+      <tr><td>二阶导数</td><td>不需要</td><td>需要（或取一阶近似）</td><td>不需要</td></tr>
+      <tr><td>内循环计算图</td><td>不需要保留</td><td>必须保留</td><td>不涉及</td></tr>
+      <tr><td>与 PPO 组合</td><td>直接重用内循环，省事</td><td>昂贵：内循环本身是多轮更新</td><td>省事</td></tr>
+      <tr><td>新任务适配</td><td>快，精细度中等</td><td>通常最快</td><td>不稳定，取决于目标接近度</td></tr>
+    </table>
+
+    <h3>4. 与"预训练"的区别</h3>
+    <p>在单一任务上预训练（第 015 章）优化的是"这个任务的解"；元学习优化的是"适配过程"。证据就在适配曲线上：<strong>若元初始化只是"离某个任务近"，它在别的任务上的首轮优势会很小；若它真的学到了适配结构，首轮适配后的提升会比随机初始化大得多</strong>。本章的对照实验正是为了把这两者区分开，练习 3 会让你用"单任务预训练"作为第三个基线。</p>
+
+    <h3>5. 元测试的纪律与成本账</h3>
+    <p>三条纪律缺一不可：<strong>确认任务（held-out）不能出现在元训练里</strong>，否则测的是记忆不是学习；<strong>两种初始化用完全相同的适配预算</strong>（步数、更新轮数、学习率），否则比较的是"谁被喂得多"；<strong>评估用同一种贪婪口径</strong>。本章的 held-out 重力是 {8.5, 10.0, 11.5, 13.0}，元训练任务从连续分布 U[8,13] 采样，绝不与评测集重合。</p>
+    <p>任务分布本身也是需要设计的超参数：U[8,13] 覆盖从轻到重的完整区间；分布太窄（如 U[9, 9.5]）会把初始化拽成单任务预训练，太宽（如 U[5, 20]，其中 20 已接近不可解）会让元训练把容量耗在极端任务上。低成本诊断：元训练结束后，在训练分布上取几个网格重力，测第 0 轮适配前成绩，画成"重力-成绩"曲线。曲线平坦说明初始化覆盖广；只在中段凸起说明覆盖不足，需要更多迭代或更合理的任务分布。</p>
+    <p>成本账同样要摆在台面上：元训练 60 迭代 × 2 任务 × 2048 步 = 24.6 万环境步；元测试对 4 个 held-out 重力、两种初始化各做 3 轮适配，每任务 3072 步，总计约 2.5 万步。若某个新重力从零训练到 400 分平均需要 2 万步，元初始化把它压到 3072 步以内，每个新任务省约 1.7 万步；用 24.6 万步的元训练去摊销，保本点约 15 个下游任务（24.6/1.7）。结论与第 015 章一致：元学习的账只有在"任务多、单任务适配预算少"的场景里才算得过来。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+
+    <h3>模块划分</h3>
+    <table>
+      <tr><th>组件</th><th>职责</th><th>与第 016 章的关系</th></tr>
+      <tr><td><code>inner_loop</code></td><td>从当前参数在单任务上采样 + 少量 PPO 更新</td><td><strong>新增</strong>：把"学习"变成可复用的操作</td></tr>
+      <tr><td><code>reptile_step</code></td><td>θ ← θ + β·mean(θ′−θ)</td><td><strong>新增</strong>：元更新</td></tr>
+      <tr><td>元训练循环</td><td>每迭代采 K 个任务、共享同一 θ 起点、批量插值</td><td>从"任务共享网络"升级为"任务共享初始化"</td></tr>
+      <tr><td><code>adaptation_curve</code></td><td>固定预算下逐轮适配并评估，meta 与 random 共用</td><td><strong>新增</strong>：元测试协议</td></tr>
+      <tr><td>任务分布</td><td>重力 U[8, 13]；held-out {8.5, 10.0, 11.5, 13.0}</td><td>由固定三任务升级为连续分布</td></tr>
+      <tr><td>状态工具</td><td><code>clone_state</code> 与 <code>load_state_dict</code> 复位</td><td>继承 015 的权重复用工具</td></tr>
+    </table>
+
+    <h3>关键超参数</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用与取值理由</th></tr>
+      <tr><td><code>--meta-iters</code></td><td>60</td><td>元迭代次数；每次约 4096 环境步，总计约 25 万步</td></tr>
+      <tr><td><code>--meta-batch</code></td><td>2</td><td>每迭代两个任务，降低元梯度方差；任务越多信号越稳但越慢</td></tr>
+      <tr><td><code>--meta-steps</code></td><td>2048</td><td>内循环每任务采样步数；两条轨迹量级</td></tr>
+      <tr><td><code>--inner-epochs</code></td><td>2</td><td>内循环 PPO 轮数：不要多，"适配几步"才像元学习</td></tr>
+      <tr><td><code>--meta-beta</code></td><td>0.5</td><td>插值步长；0.3～1.0 区间都常用</td></tr>
+      <tr><td><code>--adapt-steps</code> / <code>--adapt-epochs</code></td><td>1024 / 1</td><td>元测试每轮适配的数据与更新量，meta/random 必须一致</td></tr>
+      <tr><td><code>--adapt-rounds</code></td><td>3</td><td>逐轮评估 0～3 轮适配后的成绩</td></tr>
+    </table>
+
+    <h3>数据流</h3>
+    <p>元训练：每次迭代从 U[8,13] 抽 <code>meta_batch</code> 个重力 → 每个任务先把网络复位到本轮起点 θ → <code>inner_loop</code>（采样 2048 步、2 epochs PPO）得到 θ′<sub>i</sub> → <code>reptile_step</code> 把 θ 朝 β·mean(θ′−θ) 移动。元测试：加载 <code>meta_init.pt</code> 与 <code>random_init.pt</code>，在 4 个 held-out 重力上各做 3 轮适配（每轮 1024 步 × 1 epoch），逐轮贪婪评估，输出平均曲线与优势列。</p>
+    <p>元批大小 K 的作用可以先算清楚：平均方向的方差按 1/K 下降，K=2 时是单任务方差的 50%（方向上标准差约 71%），K=4 时降到 25%。但每迭代成本随 K 线性增长，等预算下"多任务少迭代"与"少任务多迭代"的总体效果需要实测（练习 2）；本章取 K=2，是在方向稳定性与迭代次数之间折中，同时每迭代只多消耗一个任务的采样成本。</p>
+    <p>适配学习率的口径也要写进报告：元初始化是为"指定的适配流程"优化的，它假定适配时用 <code>--adapt-steps</code> / <code>--adapt-epochs</code> 这一套配置与适配学习率；换了适配步长、轮数或学习率，优势会打折甚至消失。元测试的公平比较因此有第四层含义：两臂面对同一条适配流程，任何一臂被单独调过适配超参，比较都作废。</p>
+
+    <div class="box key">
+      <span class="box-title">Reptile 为什么不需要元梯度</span>
+      <p>MAML 要算 ∂L<sub>T</sub>(θ′)/∂θ，必须穿过内循环求导（二阶、昂贵、还要计算图留存）。Reptile 只用 θ′−θ 这个一阶差分：<strong>把参数往"适配后走到的位置"平均方向挪一步</strong>。它不精确等于元目标的梯度，但在大量任务上效果接近，而且更新里只有加减乘除，对 PPO 这种内循环本身就含多轮更新的算法，这是工程上最省事的选择。代价是它不保证走到 MAML 的最优点：任务曲率差异越大，两者差距越可能拉开，选型前值得用小预算各跑一条适配曲线对比。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：内循环，"少量学习"的最小单元</strong></p>
+    <pre class="code"><code>def inner_loop(net, gravity, args, steps: int, epochs: int, rng_seed: int):
+    set_seed(rng_seed)                            # 每次内循环固定自己的随机流
+    device = torch.device("cpu")
+    env = make_env(gravity)                       # “任务” = 一个重力值
+    obs, _ = env.reset(seed=rng_seed)
+    obs_t = to_tensor(obs, device)
+    # 每次内循环都新建优化器：不复用外循环的 Adam 状态
+    optimizer = torch.optim.Adam(net.parameters(), lr=args.inner_lr)
+
+    batch, ep_returns, obs_t = collect_rollout(
+        env, net, steps, obs_t, device, args.gamma, args.lam)
+    stats = ppo_update(net, optimizer, batch, args, epochs)
+    return stats, ep_returns</code></pre>
+    <p>解读：<strong>（1）</strong>内循环做的事与普通 PPO 训练一样，只是"预算很小"（默认 2048 步、2 epochs），这正是"适配"的语义：从初始化学几步。<strong>（2）</strong><code>set_seed(rng_seed)</code> 在函数开头：每个任务的内循环用独立种子，保证元批内任务的可复现，也避免任务间共享随机流导致的隐性耦合。<strong>（3）</strong><strong>每次新建 Adam</strong>：Reptile 假设内循环是"从零开始的小步适配"；复用外循环优化器会把动量状态带进来，让不同任务的内循环互相污染。这是一行代码的差别，但语义完全不同。<strong>（4）</strong>返回 <code>(stats, ep_returns)</code>：主循环只拿第一个任务的内循环日志打印，不做别的处理，元训练关心的是参数移动，不是单任务成绩。</p>
+
+    <p><strong>片段 2：Reptile 元更新，θ 朝适配结果的均值走一步</strong></p>
+    <pre class="code"><code>def clone_state(net):
+    return {k: v.detach().clone() for k, v in net.state_dict().items()}
+
+def reptile_step(net, state_before, states_after, beta: float):
+    """θ ← θ_before + β · mean(θ_after − θ_before)。"""
+    with torch.no_grad():
+        for name, p in net.state_dict().items():
+            deltas = [sa[name] - state_before[name] for sa in states_after]
+            avg_delta = sum(deltas) / len(deltas)
+            p.copy_(state_before[name] + beta * avg_delta)   # 原地写回</code></pre>
+    <p>解读：<strong>（1）</strong><code>clone_state</code> 用 <code>detach().clone()</code> 做真正的深拷贝：<code>state_dict()</code> 里的张量是共享存储，不 clone 拿到的"快照"会随后续训练变化，这是全书反复出现的模式（015 章的检查点、这里的元批起点都是它）。<strong>（2）</strong><code>reptile_step</code> 是<strong>纯数值更新</strong>：<code>torch.no_grad()</code> 包住全部操作，没有反向传播、没有优化器；每个参数张量独立计算 <code>state_before + β·avg_delta</code> 再 <code>copy_</code> 写回。<strong>（3）</strong>注意公式细节：参考点取 <code>state_before</code>，即进函数时的参数快照；它与"当前参数"在函数入口相同，显式用 <code>state_before</code> 让语义无歧义（练习里若循环内多次调用也不会错）。<strong>（4）</strong>换种写法：用 <code>torch.stack(deltas).mean(0)</code> 更向量化，但对小网络来说逐参数循环同样快，可读性更好；用 <code>p.data.copy_</code> 或 <code>p.copy_</code> 都可行，后者更干净。</p>
+
+    <p><strong>片段 3：元训练主循环，复位是灵魂</strong></p>
+    <pre class="code"><code>    for it in range(args.meta_iters):
+        state_before = clone_state(net)               # 本轮所有任务共享的起点 θ
+        states_after = []
+        for k in range(args.meta_batch):
+            task_seed = rng.randint(0, 10**9)
+            gravity = rng.uniform(8.0, 13.0)          # 从任务分布抽一个重力
+            net.load_state_dict(state_before)         # 关键：每个任务从同一 θ 出发
+            stats, ep_returns = inner_loop(
+                net, gravity, args, args.meta_steps, args.inner_epochs, task_seed)
+            states_after.append(clone_state(net))     # 记录 θ′_i
+            if k == 0:
+                last_stats, last_task = stats, (gravity, ep_returns)
+        reptile_step(net, state_before, states_after, args.meta_beta)</code></pre>
+    <p>解读：<strong>（1）</strong>结构的核心是"先存起点、再逐任务复位"：<code>state_before</code> 是本轮元参数 θ；每个任务开始前 <code>load_state_dict(state_before)</code> 把网络拉回同一个起点。如果省略这一步，第二个任务会从第一个任务适配后的参数继续，元批内的"平均方向"被隐式串联，Reptile 更新被拉偏，这是本章最常见、最难察觉的实现错误。<strong>（2）</strong>任务从 <code>rng.uniform(8.0, 13.0)</code> 连续采样：任务分布是"连续统"，网络不可能记住具体值，只能学到"不同重力下的通用控制结构"。<strong>（3）</strong><code>states_after</code> 收集的是每个任务的 θ′<sub>i</sub> 快照，交给 <code>reptile_step</code> 做平均；元批大小 K 越大方向越稳（练习 2）。<strong>（4）</strong><code>last_stats/last_task</code> 只是为了日志：打印最后一个任务的内循环回报与 KL，帮助判断元训练是否健康。</p>
+
+    <p><strong>片段 4：适配曲线，两种初始化用同一把尺子</strong></p>
+    <pre class="code"><code>def adaptation_curve(init_state, gravity, args):
+    """从给定初始化出发，做 adapt_rounds 轮适配，记录每轮后的贪婪评估。"""
+    set_seed(args.seed + int(gravity * 100))          # 每种重力固定随机流
+    device = torch.device("cpu")
+    env = make_env(gravity)
+    net = ActorCritic(env.observation_space.shape[0], env.action_space.n)
+    net.load_state_dict(init_state)                   # meta 与 random 共用这段代码
+    obs, _ = env.reset(seed=args.seed)
+    obs_t = to_tensor(obs, device)
+
+    curve = [evaluate(env, net, args.eval_episodes, device)]   # 第 0 轮：适配前
+    for r in range(args.adapt_rounds):
+        optimizer = torch.optim.Adam(net.parameters(), lr=args.adapt_lr)
+        batch, _, obs_t = collect_rollout(
+            env, net, args.adapt_steps, obs_t, device, args.gamma, args.lam)
+        ppo_update(net, optimizer, batch, args, args.adapt_epochs)
+        curve.append(evaluate(env, net, args.eval_episodes, device))
+    return curve</code></pre>
+    <p>解读：<strong>（1）</strong>函数接受"任意初始化状态"，流程对 meta 与 random 完全一致：这就是公平对照的实现方式，差异只来自 <code>init_state</code> 一个变量。<strong>（2）</strong><code>curve[0]</code> 是"适配前"的成绩：它衡量初始化的<strong>先验质量</strong>；后面每轮的增量衡量<strong>适配速度</strong>。两条信息分开看，才能区分"离解近"与"好适应"。<strong>（3）</strong>每轮适配都用<strong>同一个</strong> <code>env</code> 继续采样（不重新 reset 环境对象，但回合边界内自然 reset）：数据流连续，与真实"持续适应"的场景一致。<strong>（4）</strong><code>set_seed(args.seed + int(gravity * 100))</code>：每种重力有自己的固定随机流，且 meta 与 random 的评估在相同重力下面对相同的评估环境种子，评估噪声被控住。<strong>（5）</strong>每轮新建 Adam（与内循环同理）：适配是独立的小段学习，不跨轮共享优化器状态。</p>
+
+    <p>完整可运行脚本（附录）：<a href="../code/ch017.py" download>code/ch017.py</a></p>
+    <pre class="sh"><code>python code/ch017.py             # 元训练 60 迭代 + 适配评估，CPU 约 4–8 分钟
+python code/ch017.py --quick     # 8 次迭代、1 轮适配，约 30–60 秒
+python code/ch017.py --meta-iters 120   # 更长的元训练
+python code/ch017.py --meta-beta 0.3    # 改变元步长</code></pre>
+    <p>预期结论（<strong>以实跑为准</strong>）：元初始化第 0 轮就有 300～420 分（它已经"会玩 CartPole"，只是对不同重力的精细控制还需适配），随机初始化接近 20～60 分；第 1 轮适配后元初始化通常到 420～470、领先 200 分以上；随着轮数增加随机初始化逐步追上，第 3 轮差距缩到几十到一百分。<strong>这正是元学习的价值曲线：在极少数据的区间领先最大</strong>。读曲线时配一次统计换算：10 个贪婪回合的均值标准误约 16 分（按单回合 50 分波动），200 分级别的领先远超噪声、可以放心下结论；第 3 轮"几十到一百"的残余差距落在 2～6 个标准误，属于"可讨论"区间，想写进结论就把评估回合加到 30 个。若元初始化第 0 轮低于 200，说明元训练不足或 β 过大；若第 0 轮很高但第 1 轮增量落后于随机，说明元训练任务太窄，退化成了单任务预训练（用练习 3 验证）。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>元批内忘记复位参数</strong>：第 i+1 个任务必须从 <code>state_before</code> 出发，不能接着第 i 个任务的适配结果。否则元批内的任务被隐式串联，Reptile 的方向被拉偏。</li>
+      <li><strong>复用内循环的优化器状态</strong>：Adam 的动量会跨任务泄漏，内循环不再是"独立的小步适配"。每次内循环新建优化器。</li>
+      <li><strong>元训练任务与评测任务重叠</strong>：评测重力若出现在训练任务里，分数高只说明记住了。本章用连续分布采样 + held-out 固定评测集规避。</li>
+      <li><strong>内循环步数过多</strong>：内循环跑到收敛后，Reptile 就退化为多任务平均；元学习的优势区间在"少步适配"。内循环 1～4 epochs 是合理区间。</li>
+      <li><strong>快照没克隆</strong>：用 <code>state_dict()</code> 直接当快照（不 clone），张量共享存储，<code>state_before</code> 会随训练一起变，"起点"无从谈起。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把 <code>--meta-beta</code> 设为 0.2 / 0.5 / 1.0，对比第 0 轮与第 1 轮的平均成绩，找本任务族的最佳元步长。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>β 太大时元参数在任务间"跳"，评估方差大；太小时元训练进展缓慢。固定 60 次迭代对比即可，注意每次都要重新元训练。</div></details>
+      </li>
+      <li>把 <code>--meta-batch</code> 改成 1 与 4，观察元训练日志的波动与最终适配曲线。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>K=1 时 Reptile 每次只朝一个任务方向走，方差大；K=4 时元梯度的方向更"平均"，但每次迭代成本翻倍。看平均曲线的平滑度。</div></details>
+      </li>
+      <li>加入第三个基线"单任务预训练"：在重力 9.8 上把网络训到 450+，再跑同一套适配评估，比较它与元初始化的适配曲线。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>复用 <code>inner_loop</code> 多跑几轮即可得到预训练权重（或直接调用现有训练循环 20 次）。预期它第 0 轮分数高但适配增益不稳定，这正是"解一个任务"与"学会适配"的区别。</div></details>
+      </li>
+      <li>实现"适配到 400 分需要多少步"的指标：适配过程中逐更新评估，记录三种初始化首次达到 400 的步数，取多任务平均。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>把 <code>adaptation_curve</code> 的每轮改成"采 256 步就评估一次"，直到 400 或耗尽预算。这个指标比固定轮数曲线更贴近"快速适应"的业务口径。</div></details>
+      </li>
+      <li>用三个不同 <code>--seed</code> 重跑元训练与适配评估，报告第 0 轮与第 1 轮成绩的均值与标准差，判断"领先 200 分"是否远超种子间波动。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>脚本已带 <code>--seed</code>；把三种子的适配曲线画在同一张图上，种子间的分散程度就是这条结论的置信区间。若波动与领先幅度同量级，需要加长元训练或增大元批。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>元学习优化的是"适配后的表现"，Reptile 用 θ ← θ + β·mean(θ′−θ) 做一阶近似，无需二阶导数，与 PPO 容易组合。</li>
+      <li>关键超参数是元步长 β、元批大小 K、内循环步数：它们分别控制前进幅度、方向噪声、以及"适配"的难度。</li>
+      <li>元测试必须用 held-out 任务与统一适配预算；本章的适配曲线上，元初始化在第 0～1 轮领先 200 分以上，随轮数增加差距收敛。</li>
+      <li>元初始化与单任务预训练不同：前者追求"哪里都好走"，后者追求"一个任务的最优"。</li>
+      <li>下一章把"先验知识"换成另一种来源：人类演示。用行为克隆初始化 PPO，对比从零训练，量化示范数据节省的样本。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch016.html">← 第 016 章：PPO的多任务学习</a>
+    <a class="next" href="ch018.html">第 018 章：PPO的模仿学习初始化 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

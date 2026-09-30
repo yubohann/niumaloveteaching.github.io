@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第049章 实现多机器人协作 | 机器人仿真学习课程 · Isaac Sim 强化学习训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 任务与技能实现</span>
+    <span class="sep">/</span>
+    <span>第 049 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 任务与技能实现</div>
+    <h1>第 049 章：实现多机器人协作</h1>
+    <p class="lead">让两台机械臂共同端住一个托盘：本章从任务工程角度搭建协作环境，共享工件的耦合动力学、每智能体的观测拼装、团队奖励与个体塑形的配比，以及共享策略的接口设计。</p>
+    <ul class="meta">
+      <li>主题：任务实现 / 多机器人协作任务</li>
+      <li>相关组件：Isaac Sim / Isaac Lab / Stable-Baselines3</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 048 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解协作任务与单机任务的本质区别：多个智能体通过共享物体产生动力学耦合，状态空间是联合的。</li>
+      <li>能说清"内力问题"：两个刚性抓握同时约束一个物体时，位置误差如何变成互相拉扯的力。</li>
+      <li>会搭多智能体环境接口：联合动作、逐智能体观测（自身 + 队友 + 任务状态）、同步 step。</li>
+      <li>掌握"团队奖励 + 个体塑形"的配比设计，并解释纯团队奖励为什么会出现"搭便车"。</li>
+      <li>会给同构智能体设计共享策略与 id 嵌入，理解参数共享对样本效率与置换对称的作用。</li>
+      <li>能设定协作质量指标：工件倾角、内力估计、两端同步误差、完成时间。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>前面 8 章的任务都是一个"执行者"：一台机械臂、一个移动平台、一个足式机器人。真实场景常常不止于此，双机械臂抬一块太阳能板、移动机械臂合力搬箱子、多台机器人编队搬货架。协作的第一性困难在于<strong>耦合</strong>：两台机械臂抓住同一个托盘后，托盘的位姿由两只手的共同运动决定，任何一方的运动都会改变另一方的接触状态。单机时代"我的动作决定我的未来"这个假设失效了。</p>
+    <p>本章聚焦任务的工程实现：怎么把共享工件建进场景、观测里怎么表达队友、奖励怎么分配、策略怎么共享。算法层面的深入讨论留给第 059 章（多智能体强化学习），读完本章你会得到"问题是什么样"，059 章再回答"用什么算法解"。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 耦合：1 + 1 不是 2</h3>
+    <p>协作任务的状态必须写成联合状态 s = (s<sub>1</sub>, s<sub>2</sub>, s<sub>obj</sub>)，动作同样联合：a = (a<sub>1</sub>, a<sub>2</sub>)。难点在动力学：两个末端都抓住托盘后，托盘的运动被两条运动学链同时约束。若把抓握理想化为刚性约束，任一时刻托盘位姿必须同时满足两只手的位姿，仿真里表现为约束求解器：</p>
+    <div class="formula">
+      J<sub>1</sub>·q̇<sub>1</sub> = J<sub>2</sub>·q̇<sub>2</sub> = twist<sub>obj</sub>
+      <span class="note">抓握点速度必须一致；不一致的部分被转成"内力"</span>
+    </div>
+    <p>两只手速度指令不一致时，求解器会产生一组大小相等、方向相反的内力把误差压住。危险在于量级：末端位置误差 1 mm 时，接触刚度 10<sup>5</sup> N/m 的抓握对应 100 N 级的内力，远超器件与工件的承受能力。所以协作任务的第一个设计原则是<strong>"软抓握 + 顺从"</strong>：用柔性/力控抓握（048 章的阻抗思想），让不一致先被弹性吸收，再靠学习把误差压下去。</p>
+
+    <h3>1.1 数值算例：软约束刚度、通信延迟与内力预算</h3>
+    <p>把内力算成一笔账。抓握等效刚度 k<sub>c</sub> = 2000 N/m 的软约束下，1 mm 的两端位置不一致产生 2 N 的内力；若换成刚性约束（k<sub>c</sub> = 10<sup>5</sup> N/m），同一错位是 100 N，相差 50 倍。再把通信延迟放进来看：策略 20 Hz（决策周期 50 ms），队友状态经通信延迟 50 ms 到达时，等于用"一步之前"的信息做补偿；两端相对速度 0.05 m/s 时，一步的错位是 2.5 mm，软约束下内力 5 N，刚性约束下 250 N。<b>软硬约束在"延迟容错"上的差距同样是 50 倍，协作任务先把抓握做软，换来的正是一步延迟的安全余量</b>；如果延迟本身不确定，训练时把 0–50 ms 随机化、评估时用 50 ms 上限，行为才不会依赖"幸运的零延迟"。</p>
+    <p>团队奖励的指数核也可以代入核算：托盘位置误差 8 cm 时 exp(−0.08²/0.01) = exp(−0.64) ≈ 0.527，团队项 2×0.527 ≈ 1.05；误差减到 2 cm 时 exp(−0.04) ≈ 0.961，团队项约 1.92。倾角罚权重 3.0 下，5°（0.087 rad）倾斜付出 0.023，10° 付出 0.091，<b>平方罚让 10° 的代价恰好是 5° 的 4 倍，"端平"的紧迫感随倾角超线性增长，把塔倒的前兆提前编码进了奖励曲率</b>。这三组数字放在一起，就是"软约束 + 指数核 + 平方罚"协作奖励骨架的全部量级依据。</p>
+    <p>评估表里的"内力估计 &lt; 20 N"与约束刚度可以互换核对：k<sub>c</sub> = 2000 N/m 下，20 N 对应 10 mm 的两端相对错位；而"两端同步误差 &lt; 0.02 m/s"在 50 ms 决策周期上折算，每步只允许 1 mm 的错位增长。<b>两条指标分别约束"稳态错位上限"与"错位增长速度"，合起来把内力压在 20 N 以内</b>；若只测速度不测位置，慢性的相互拉扯（错位不继续增长但也从不收敛）会被漏掉，这正是"内力估计"必须写进评估表的原因。共享策略的样本账也顺带核算：两台机器人共用一组权重时，每个控制步产生的训练样本是单机的 2 倍，在对称任务上等效于把每单位算力的经验量翻倍，收敛步数通常下降 1.5–2 倍。</p>
+
+    <h3>2. 观测工程：队友的信息必须进观测</h3>
+    <p>单个智能体的观测 o<sub>i</sub> 通常由三块组成：</p>
+    <div class="formula">
+      o<sub>i</sub> = [ 自身状态, 队友状态（位姿、速度、抓握力）, 任务状态（工件位姿、目标）, 上一步动作 ]
+    </div>
+    <p>为什么不给队友状态就学不会？理论上是 POMDP（052 章）：队友的运动是隐藏变量，同一观测下队友可能正在加速也可能在减速，最优响应完全不同。工程上更直接：把队友的末端速度与抓握力给进来，策略才能做"预判"，比如察觉到对方那端在抬升，自己就配合上跟；等到工件倾斜后再救就慢了。在真机落地上还有个现实问题：队友状态只能通过通信获得（有延迟），训练时若总是用零延迟的真值，迁移到真机会因为 10–50 ms 的延迟而表现下降。稳妥做法是训练时把队友观测随机延迟 0–50 ms。</p>
+
+    <h3>3. 奖励分解：团队项与个体项怎么配</h3>
+    <p>纯团队奖励（所有智能体拿同一个分数）有一个经典病：<strong>搭便车</strong>，一端的智能体发现"反正另一端会把工件稳住，我什么都不做也有分"。纯个体奖励则引向自私：各自追自己的目标，工件被撕扯。常用的配比是"团队奖励为主（0.6–0.8），个体塑形为辅（0.2–0.4）"：</p>
+    <div class="formula">
+      r<sub>i</sub> = w<sub>team</sub>·r<sub>team</sub> + w<sub>ind</sub>·r<sub>i</sub><sup>ind</sup>
+      <span class="note">r<sub>team</sub> = 工件跟踪 + 倾角 + 完成；r<sub>i</sub><sup>ind</sup> = 该端跟踪误差 + 内力估计</span>
+    </div>
+    <p>个体塑形的选择有讲究：要选"与团队目标一致但可单独测量"的量。以托盘为例，"我这端手柄的跟踪误差"和"我这端的力与全队平均力的偏差"都满足条件，把力偏差做进个体奖励，等于给每个智能体一根"对齐队友"的局部梯度。</p>
+
+    <h3>4. 共享策略：同构智能体的红利</h3>
+    <p>两台相同的机械臂没必要用两套网络。共享参数（parameter sharing）带来两个好处：所有智能体的数据都用来更新同一组权重，有效样本翻倍；策略天然学会"无论我是谁都能干"的行为，不会出现"左臂策略只会在左侧工作"的偏科。代价是要给每个智能体一个身份信息，否则它不知道自己此刻扮演的角色，最简单的做法是加 one-hot id（第 053 章会展开更一般的任务条件化）。注意对称性：如果两臂严格对称、任务也对称，理论上不需要 id；一旦夹具不同、分工不同（一端主抬、一端主稳），id 就必要了。</p>
+
+    <h3>5. 同步与接口：所有智能体在同一时钟上</h3>
+    <p>多智能体环境的 step 必须<strong>同时推进所有智能体</strong>：收集每个智能体的动作 → 组装联合动作 → 物理引擎推进一个控制周期 → 拆分出新观测与新奖励。不要让智能体各自异步 step，玩具级实现里很常见，但物理世界只有一个时钟，异步会导致"一半的智能体看到的是旧世界"，训练与真机部署都失去意义。工程上通常在环境类里维护 agents 列表和一个 <code>step(joint_actions)</code> 接口，这一点与 059 章的 CTDE 实现直接对接。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>两台 Franka 共抬托盘任务的完整搭建步骤：</p>
+    <ol>
+      <li><strong>场景</strong>：两臂相对布置（间距 1.2 m），中间是 0.4 m×0.3 m 托盘（质量 2 kg）。抓握用"刚性附着 + 柔性约束"的组合：物理上用 D6 关节把托盘固定在两个末端之间（带有限刚度的软约束），并把约束刚度设为 2000 N/m 量级，先保证数值稳定，真正的柔顺由控制器提供。</li>
+      <li><strong>控制</strong>：策略 20 Hz、物理 100 Hz（decimation=5）；每臂动作 7 维（6 位姿增量 + 1 抓握力指令），联合动作 14 维。</li>
+      <li><strong>每智能体观测</strong>（约 40 维）：自身关节状态（14）、自身末端位姿（6）、队友末端位姿与速度（12）、工件位姿与倾角（7）、自己这端抓握力（1）。</li>
+      <li><strong>奖励</strong>：团队项占 0.7，工件位置跟踪 + 姿态倾斜惩罚 + 到达奖励；个体项占 0.3，各自末端相对工件的跟踪误差 + 抓握力与均值的偏差。时间罚共用。</li>
+      <li><strong>策略结构</strong>：共享 MLP 策略（256×2），输入 = 观测 + 2 维 one-hot id；两台智能体各自采样动作。</li>
+      <li><strong>终止</strong>：工件倾角超过 15°、高度低于 0.5 m、或内力估计超过 60 N。</li>
+      <li><strong>课程</strong>：<strong>先单臂练、后双臂合</strong>，第一阶段让一臂固定住工件，另一臂学"端稳"；第二阶段双臂同时放开，学协调。这是协作训练里最常用的课程结构：把"工具"先变成环境的一部分，再把它变成队友。</li>
+    </ol>
+    <table>
+      <tr><th>指标</th><th>含义</th><th>目标值</th></tr>
+      <tr><td>工件位置跟踪 RMS</td><td>团队精度</td><td>&lt; 8 mm</td></tr>
+      <tr><td>工件最大倾角</td><td>协调质量</td><td>&lt; 5°</td></tr>
+      <tr><td>内力估计</td><td>两端"较劲"程度</td><td>&lt; 20 N</td></tr>
+      <tr><td>两端同步误差</td><td>速度一致性</td><td>&lt; 0.02 m/s</td></tr>
+      <tr><td>完成时间</td><td>效率</td><td>&lt; 6 s</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计思维：为什么先"单臂 + 冻结工件"再"双臂"？</span>
+      <p>双臂同时从零学，相当于两个随机策略在互相干扰：每一方的探索都会给另一方造成非平稳的噪声，学习信号被淹没。冻结工件（或让仿真直接把工件钉住一段时间）把第一步任务变成"单臂跟踪一个会动的东西"，再撤销冻结，让策略面对"工件由两边共同决定"的真实耦合。课程的本质是<strong>逐步引入非平稳性</strong>，一次到位的耦合是学不动的。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：多智能体协作环境骨架（同步 step + 逐智能体观测）</strong></p>
+    <pre class="code"><code>class DualArmCoopEnv:
+    # 关键约定：物理世界只有一个时钟，所有智能体必须同时 step
+    def __init__(self, world, arm_left, arm_right, tray):
+        self.world = world
+        self.arms = [arm_left, arm_right]      # 两个 Articulation（第 002 章）
+        self.tray = tray                        # 共享工件
+        self.n_agents = 2
+        self.prev_actions = [np.zeros(7), np.zeros(7)]
+
+    def observe(self, agent_id):
+        # 观测三块：自己 + 队友 + 任务状态。队友只用可通信获得的信息
+        own = np.concatenate([self.arms[agent_id].get_joint_positions(),
+                              self.arms[agent_id].get_joint_velocities(),
+                              self.arms[agent_id].get_ee_pose()])
+        peer_id = 1 - agent_id                  # 两人任务：队友就是另一个
+        peer = np.concatenate([self.arms[peer_id].get_ee_pose(),
+                               self.arms[peer_id].get_ee_lin_vel()])
+        task = np.concatenate([self.tray.get_world_pose()[0],
+                               self.tray.get_world_pose()[1][:3],
+                               self.goal_pose])
+        # one-hot id 让共享策略知道自己是谁（两臂分工不同时必须有）
+        agent_id_feat = np.eye(self.n_agents)[agent_id]
+        return np.concatenate([own, peer, task, agent_id_feat,
+                               self.prev_actions[agent_id]])
+
+    def step(self, joint_actions):
+        # 1) 把所有智能体的动作一起写进各自控制器（同一控制周期内）
+        for arm, act in zip(self.arms, joint_actions):
+            arm.apply_pose_delta(act[:6], act[6])   # 第 6 位是抓握力指令
+        # 2) 物理只推进一次；谁也不能"偷跑"半步
+        self.world.step(render=False)
+        # 3) 拆分新观测与新奖励
+        obs = [self.observe(i) for i in range(self.n_agents)]
+        rewards = [self.reward(i) for i in range(self.n_agents)]
+        self.prev_actions = joint_actions
+        return obs, rewards, self.done(), self.info()</code></pre>
+    <p>解读：这段骨架传递三个工程约定。第一，<code>step(joint_actions)</code> 的签名强制"联合动作"作为原子操作，如果写成每个智能体各调一次 <code>arm.step()</code>，物理世界会被推进两次，两个智能体其实活在错开的时钟里，训练出的策略在真机上无法复现。第二，观测拼装里队友信息刻意只取"可通信"的量（位姿、线速度），不取队友的关节扭矩、接触细节这类真机上拿不到的数据，<strong>训练期用了部署期拿不到的特征，是 sim-to-real 失败的高频原因</strong>。第三，<code>prev_actions[agent_id]</code> 是每个智能体自己的上一步动作，不是队友的；把队友上一步动作也加进观测是常见增强（用于推断队友意图），可以按任务试验。最后注意 one-hot id 的位置：放在观测尾部、与状态特征分开，便于后续章节（053）替换为更一般的任务嵌入。</p>
+
+    <p><strong>片段 2：团队奖励与个体塑形的配比</strong></p>
+    <pre class="code"><code>def reward(self, agent_id):
+    # ---- 团队项（占 0.7）：工件跟踪 + 姿态 + 完成 ----
+    tray_pos, tray_quat = self.tray.get_world_pose()
+    pos_err = np.linalg.norm(self.goal_pose[:3] - tray_pos)
+    tilt = tilt_angle(tray_quat)              # 托盘法向与竖直方向的夹角
+    r_team = 2.0 * np.exp(-pos_err ** 2 / 0.01)          # exp 核：10 cm 误差处衰减到 0.37
+    r_team -= 3.0 * tilt ** 2                            # 倾角平方罚，量级压住抖动
+    if pos_err &lt; 0.02 and tilt &lt; 0.05:
+        r_team += 20.0                                   # 到达奖励：两端共享
+
+    # ---- 个体项（占 0.3）：这端跟踪 + 与队友的力对齐 ----
+    ee_pos = self.arms[agent_id].get_ee_pose()[0]
+    r_track = -2.0 * np.linalg.norm(ee_pos - self.grasp_target[agent_id])
+    # 力对齐：罚"我这端出力与两端平均值的偏差"，等价于抑制互相较劲的内力
+    force_avg = 0.5 * (self.grip_force[0] + self.grip_force[1])
+    r_bal = -0.5 * abs(self.grip_force[agent_id] - force_avg)
+
+    return 0.7 * r_team + 0.3 * (r_track + r_bal) - 0.001</code></pre>
+    <p>解读：每个项都在回答"会不会被钻空子"。团队项用 exp 核跟踪误差而不用平方：托盘位置误差在早期是厘米级，平方罚会把梯度全花在"大误差"上，指数核让团队先把"大致到位"学会。倾角用平方罚且权重 3.0：倾角是协作质量的直接度量，平方让 10° 的倾斜付出的代价约是 5° 的 4 倍，逼两端把托盘端平。到达奖励 20.0 只在位置 2 cm、倾角 3° 同时满足时给，多条件与 042 章的成功判据同源，防止"位置到位但歪着"的假成功。个体项的量级刻意小于团队项：跟踪罚最大 2.0 量级、力对齐罚最多几十分之一，它们只做"微调分工"，不会让智能体为个体利益牺牲团队。力对齐项的实现细节值得注意，罚的是"与平均值的偏差"，因为两端各出多少力并不重要，重要的是平衡；写成目标力偏差会在任务本身需要不对称出力时（比如一端先抬）给出错误信号。</p>
+
+    <p><strong>片段 3：共享策略 + id 嵌入的组装</strong></p>
+    <pre class="code"><code>import torch
+import torch.nn as nn
+
+class SharedActorCritic(nn.Module):
+    # 同构智能体共享一套权重：所有智能体的数据一起更新，等价于样本翻倍
+    # n_agents 个 one-hot id 负责告诉网络"我是谁"，避免角色混淆
+    def __init__(self, obs_dim, act_dim, n_agents, hidden=256):
+        super().__init__()
+        self.trunk = nn.Sequential(
+            nn.Linear(obs_dim + n_agents, hidden), nn.Tanh(),
+            nn.Linear(hidden, hidden), nn.Tanh(),
+        )
+        self.action_mean = nn.Linear(hidden, act_dim)   # 动作均值（PPO 其实用高斯策略）
+        self.action_logstd = nn.Parameter(torch.full((act_dim,), -0.5))
+        self.value = nn.Linear(hidden, 1)               # 共享价值头：团队奖励主导时合理
+
+    def forward(self, obs, agent_ids):
+        # obs: (num_agents, obs_dim)  agent_ids: (num_agents, n_agents)
+        x = torch.cat([obs, agent_ids], dim=-1)
+        feat = self.trunk(x)
+        mean = torch.tanh(self.action_mean(feat))       # 动作限幅到 [-1,1]
+        # 每个智能体用自己的 std 采样：共享权重但独立探索，避免动作同步
+        std = torch.exp(self.action_logstd).expand_as(mean)
+        return mean, std, self.value(feat).squeeze(-1)</code></pre>
+    <p>解读：共享策略有三个容易忽略的细节。第一，动作经 <code>tanh</code> 限幅再进控制器：多点协作里动作过冲会直接转化为内力，tanh 让输出天然有界。第二，log_std 是参数但输出维度是 act_dim=7，每个动作维度有自己的噪声，两台机器人共享同一组 std 参数，训练时各自采样，这样既共享统计又保留独立性；如果连采样都共享（同网络同输入必然同输出），两臂动作会完全同步，永远学不会"错开一点"的动态配合。第三，value 头输入只有自己的特征，这是本章的简化版。严格按 CTDE（集中训练分散执行）原则，价值函数应该看到全局状态（两端观测拼接），这才是一致而准确的团队价值估计；第 059 章会给出标准实现。这里保留共享 value 的写法是为了先跑通任务，评估阶段一旦发现"两端价值估计互相矛盾"（比如一方觉得能赢、另一方觉得要输），就应该升级到集中式 critic。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>异步 step</strong>：每个智能体各调一次物理推进，两个智能体实际活在错开的时钟里。症状是训练能跑、评估时行为怪异、迁移真机失败。修复：环境层只暴露联合 <code>step(joint_actions)</code>，物理推进集中在里面。</li>
+      <li><strong>观测缺队友</strong>：智能体看不见对方在做什么，只能等工件被拉歪再反应，行为表现为"互相拖拽"。修复：队友的位姿与速度必须进观测；如需更隐蔽的协调，再加通信通道或注意力机制（060 章）。</li>
+      <li><strong>纯团队奖励的搭便车</strong>：一端长期不出力，团队分只由另一端撑。症状是两端动作能量差异巨大、合力亏损。修复：加个体塑形（跟踪 + 力对齐），或在团队奖励里对"不出力端"单独加代价。</li>
+      <li><strong>刚性抓握建得太硬</strong>：约束刚度开到 10<sup>6</sup> N/m，微小位置误差转化为上百牛内力，求解器要么爆要么抖。修复：软约束 + 力控抓握（047/048 章），并把"内力估计"设为终止条件之一。</li>
+      <li><strong>训练期用了部署期没有的信息</strong>：比如把队友的关节扭矩、物体真实质量写进观测。训练指标很漂亮，但真机上这些量不可得，策略直接失效。修复：逐项审查观测字段，凡是"只能仿真拿到"的，或者删掉，或者按 051 章的思路做特权信息蒸馏。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把团队权重从 0.7 调到 1.0（去掉个体项），训练后统计两端的动作幅度与抓握力差异，验证搭便车现象。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>重点看两端"动作能量的时间平均值"：搭便车端的输出会长期贴近 0，尤其是当任务对一个端更难时（比如那端更远离目标）。</div></details>
+      </li>
+      <li>在观测中删掉队友速度（只留位姿），预测并验证工件倾角与完成时间的变化。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>没有速度信息，策略只能"看到倾斜后再救"，倾角峰值应明显增大，动作从"预判式"变成"追补式"。</div></details>
+      </li>
+      <li>给队友观测加 0–50 ms 随机延迟再做训练，对比零延迟版在"带延迟评估"下的鲁棒性。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>零延迟训练的策略在延迟评估下倾角会变大；随机延迟训练的版本抗延迟能力强，但干净场景下的峰值性能略低。这是鲁棒性与最优性的经典权衡。</div></details>
+      </li>
+      <li>把共享策略换成两套独立策略（各训练各的），从样本效率与对称性两个角度对比结果。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>独立策略需要各自的数据分布累积，收敛步数通常增加 1.5–2.5 倍；还会出现"左臂比右臂强"的不对称。共享策略在对称任务上优势明显。</div></details>
+      </li>
+      <li>设计一个异构分工任务（一端负责抬升、一端负责姿态），写出团队/个体奖励里各需要增加什么项，并解释 one-hot id 为何从"可选"变成"必需"。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>抬升端需要高度跟踪项，姿态端需要倾角修正项；两个角色对同一观测的最优动作不同，没有 id 的共享策略会在两种行为之间取平均。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>协作的本质是耦合：共享工件把多个智能体的状态空间变为联合空间，速度不一致会被约束求解器转成内力（1 mm 误差可达上百牛）。</li>
+      <li>观测必须包含队友信息与任务状态，并注意"只能给部署期可得的信息"；队友延迟最好在训练期随机化。</li>
+      <li>奖励用"团队为主 + 个体塑形为辅"（约 7:3）；个体项选择与团队目标一致但可单独测量的量（跟踪误差、与平均力的偏差）。</li>
+      <li>同构智能体共享策略 + one-hot id：数据共享、角色可辨别；独立策略在对称任务上样本效率明显更差。</li>
+      <li>环境接口只暴露联合 <code>step(joint_actions)</code>，物理时钟唯一；用"先单臂后双臂"的课程逐步引入非平稳性。</li>
+      <li>下一章把"队友"从机器人换成<strong>人</strong>：人机交互中人不可控、不可测、还不该被伤害，安全约束与意图预测将成为新的主角。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch048.html">← 第 048 章：实现柔顺控制</a>
+    <a class="next" href="ch050.html">第 050 章：实现人机交互 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

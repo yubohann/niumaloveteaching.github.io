@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第016章 VLA策略的端到端训练 | 具身智能学习课程 · VLA 与世界模型联合训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · 基础框架与联合训练</span>
+    <span class="sep">/</span>
+    <span>第 016 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · 基础框架与联合训练</div>
+    <h1>第 016 章：VLA策略的端到端训练</h1>
+    <p class="lead">本章把策略训练落到工程配置：端到端的边界定义、显存预算与混合精度、参数分组与学习率调度、梯度累积的正确次序，以及可复现检查点的完整状态。</p>
+    <ul class="meta">
+      <li>主题：VLA 策略 / 端到端训练</li>
+      <li>关键公式：B<sub>effective</sub> = B<sub>micro</sub> × N<sub>accum</sub> × N<sub>device</sub></li>
+      <li>预计学时：65 分钟</li>
+      <li>前置章节：第 015 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解端到端训练的边界：梯度从动作损失直达到视觉前端，与分阶段训练的本质区别。</li>
+      <li>掌握显存预算的估算方法，以及混合精度、梯度检查点、梯度累积三种压缩手段的作用位置。</li>
+      <li>掌握参数分组与学习率调度：主干与头部差异化学习率、预热与余弦衰减、权重衰减的豁免项。</li>
+      <li>能正确实现“累积后裁剪”的训练步与可复现的检查点保存。</li>
+      <li>能诊断损失尖峰、续训曲线断裂、显存不足三类工程问题。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>到此为止，策略、损失、数据、梯度、融合、语言各模块都已就绪，本章回答最后一个第一性问题：<strong>整条链路怎么以端到端方式训练，工程上哪些配置决定成败</strong>。端到端指梯度从动作损失不经阻断直达视觉与语言前端，表征按控制任务的需要塑造，与“冻结编码器、只训头部”的分阶段做法形成对照。</p>
+    <p>端到端的代价集中在工程侧：激活显存随深度与 token 数增长，长窗口联合训练进一步放大；低精度计算的数值稳定性需要损失缩放；大批量依赖累积与多卡。这些配置项的取值与次序都有明确的规则，偏离规则的常见后果是“训练能跑但收敛更慢或不可复现”。</p>
+    <p>边界：007 章排班“谁训”，本章配置“怎么训”；009 章解释梯度机制，本章落实执行次序；017 章的潜空间会重新标定显存预算。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 端到端的边界与收益</h3>
+    <p>端到端训练的判据是梯度可达性：动作损失的梯度能流经主干到达视觉与语言前端。收益有两层：表征对齐控制目标（视觉前端学到的特征直接服务于动作决策），免去人工设计中间监督；代价有三项：显存需求最高、对数据量敏感、早期不稳定。<strong>常规做法是混合边界：编码器加载预训练权重后解冻参与端到端，仅对小数据量的新增模态保留分阶段预热。</strong>两种训练形态的对照见下表。</p>
+    <table>
+      <tr><th>训练形态</th><th>梯度边界</th><th>显存</th><th>数据需求</th><th>适用</th></tr>
+      <tr><td>分阶段（冻结编码器）</td><td>止于头部</td><td>低</td><td>小</td><td>新增模态、数据稀缺</td></tr>
+      <tr><td>端到端（解冻主干）</td><td>直达前端</td><td>高</td><td>大</td><td>主训练阶段</td></tr>
+      <tr><td>混合边界</td><td>部分路径可达</td><td>中</td><td>中</td><td>预训练权重加载后的常规起步</td></tr>
+    </table>
+    <p>判据可以执行化：取一个小批次，计算动作损失对视觉前端首层输入的梯度范数。范数为正且与头部梯度同阶时端到端路径成立；范数为零说明路径存在 detach 或 requires_grad 被关闭。该检查纳入冒烟测试，模型结构调整后重跑，避免冻结开关误配造成“名义端到端、实际分阶段”的假象，这类假象的典型症状是训练正常但视觉前端长期停留在预训练特征上。</p>
+
+    <h3>2. 显存预算与三种压缩</h3>
+    <p>训练显存由四部分组成：参数、参数梯度、优化器状态、激活。前三项与参数量成正比，激活与“批量 × token 数 × 层数”成正比，是可变项。</p>
+    <div class="formula">
+      M<sub>act</sub> ≈ c · B<sub>micro</sub> · L<sub>token</sub> · D<sub>层数</sub> （c 为每 token 每层字节系数）
+      <span class="note">224×224 分块 16 得 196 token/帧；联合训练窗口含多帧时 L<sub>token</sub> 相应倍增</span>
+    </div>
+    <p>三种压缩手段作用于不同环节：<strong>混合精度</strong>把激活与计算压到 16 位，显存约减半；<strong>梯度检查点</strong>只存层边界激活，反向时重算中间激活，以约三成计算换大幅显存；<strong>梯度累积</strong>用小批量多次前向累积梯度，等效大批量而不增加激活峰值。</p>
+    <p>把预算代入具体配置过一遍：微批 16、token 长 392、主干 32 层，每 token 每层保留约 20 个 d=512 的 fp32 张量，即 40 KB 的系数 c，则激活 M<sub>act</sub> ≈ 40 KB × 16 × 392 × 32 ≈ 8.2 GB。参数侧按 2 亿参数计：权重 800 MB、梯度 800 MB、AdamW 一阶与二阶矩 1.6 GB，合计约 3.2 GB。混合精度把激活压到约 4.1 GB；再启用每 8 层一个段边界的梯度检查点，激活降到约 1.0 GB。两者叠加后训练峰值从约 11.4 GB 降到约 4.2 GB 量级，这就是“先精度、再检查点”的启用顺序在数字上的依据。</p>
+    <div class="formula">
+      B<sub>effective</sub> = B<sub>micro</sub> × N<sub>accum</sub> × N<sub>device</sub>
+      <span class="note">等效批量决定学习率与训练动态；显存由 B<sub>micro</sub> 决定，两者解耦</span>
+    </div>
+    <p>三者可叠加使用，但每项都有约束：混合精度需要损失缩放防下溢；检查点对含随机性的层（丢弃）需保证重算一致；累积与批量归一化的统计口径需要对齐，否则小批量统计噪声被带入全局。</p>
+    <p>梯度累积与批统计的交互值得单独展开：批归一化类模块在微批上计算的统计与等效批量不同，统计噪声会经累积写进滑动平均。Transformer 主干使用层归一化，天然规避该问题；若结构中含批归一化或任何跨样本统计模块，处理规则是累积期间冻结滑动统计，仅在最后一步按等效批量统一更新。验收方式是核对滑动统计的更新次数等于参数更新步数，与微批次数脱钩。吞吐与显存的对偶关系同样一句话可总结：累积步数增加不改变梯度期望，只拉长单步耗时；微批增大提高吞吐但抬高峰值。选型顺序固定为显存优先（微批压到最小可用），再按吞吐需求调累积与卡数。</p>
+
+    <h3>3. 参数分组与学习率调度</h3>
+    <p>端到端不等于全参数同一学习率。标准分组：主干（预训练权重）用基准学习率，动作头与新增投影层用 2–3 倍学习率加速收敛；<strong>权重衰减豁免归一化层与偏置参数</strong>，这些参数衰减会破坏其统计职责。调度采用预热加余弦衰减：预热期线性升到峰值，随后余弦降到峰值的 10%，全程训练步数按数据规模标定。</p>
+    <p>余弦段的学习率代入数字：峰值 1e-4、终点 1e-5 时，进度 25%、50%、75% 处的学习率分别为 8.7e-5、5.5e-5、2.3e-5。曲线的形状是前段缓、后段陡：从 25% 到 50% 只降三分之一，而 50% 到 75% 降近六成，末段的小步长承担细调职责。预热段与余弦段的衔接点在峰值处，两段的斜率不连续属于预期行为；若在衔接点观察到损失尖峰，先查预热是否足够长（2000 步是数据规模中等时的起点），再查该处批次是否恰逢课程调度切换（018 章），两者叠加才会产生可见扰动。</p>
+    <p>权重衰减的取值依据：AdamW 的解耦衰减取 0.05 是视觉语言模型微调的常用档。偏大（0.1 以上）在数据量小时抑制对新任务的适应，表现为训练损失下降缓慢；偏小（0.01 以下）正则不足，训练与验证的指标差距拉大。豁免组与衰减组分开后，两组学习率可以一致，衰减只在衰减组生效，配置审阅时逐组核对参数数量与前缀。</p>
+
+    <h3>4. 稳定性机制</h3>
+    <p>三类机制配合使用：梯度裁剪限制单步更新的最坏情况（累积后执行，009 章结论）；损失尖峰检测在异常步回滚优化器状态并跳过高风险批次；权重指数滑动平均（EMA）维护评估用的平滑副本，<strong>评估用 EMA 权重、训练用在线权重是精度与稳定的常规配对</strong>。所有机制都需要记录触发次数，尖峰频率上升往往预告数据或学习率配置的问题。</p>
+    <p>EMA 参数与 007 章同口径：ρ=0.999 对应等效权重年龄约千步，评估副本的改进滞后于在线权重约一个评估周期以内，适合作为发布权重的来源。触发计数的监控线可以写成比例：尖峰回滚在最近千步内超过 1% 的步数，或混合精度溢出超过 0.5% 的步数，任一越线即暂停自动继续并转入排查，因为这两类事件的高频出现通常对应学习率、缩放初值或数据批次构成的具体缺陷。</p>
+    <p>尖峰回滚的粒度是工程细节：完整回滚需要逐步快照优化器状态，成本高；通行做法是维护“最近一次更新前”的单步状态副本，回滚发生时丢弃该步并跳过触发尖峰的批次。回滚日志要带批次来源标记，同一来源反复触发指向数据缺陷，分散触发才指向学习率或缩放配置，两类问题的修复动作完全不同。</p>
+
+    <h3>5. 检查点与可复现</h3>
+    <p>完整检查点包含五类状态：模型参数（在线与 EMA）、优化器状态、学习率调度器状态、数据管线进度（采样器与随机种子）、混合精度缩放器状态。<strong>缺少任何一类都会让续训曲线在断点处出现可见断裂，且断裂难以事后归因</strong>。可复现还要求随机源的统一管理：Python、NumPy、框架三层种子绑定同一个训练步，数据增强与丢弃的随机流分离。</p>
+    <p>检查点的体积也要预算：按 2 亿参数模型计，在线权重 800 MB、EMA 副本 800 MB、优化器一阶与二阶矩 1.6 GB，合计约 3.2 GB，调度器与缩放器状态可忽略。按每 5000 步保存一次、保留最近 5 份的策略，存储配额约 16 GB；若存储紧张，压缩方向是“只对发布候选点保存 EMA 与优化器全量，中间点只存在线权重与步数”，代价是中间点不能用于严格续训，适合作为评估快照使用，不能作为恢复点。</p>
+    <p>严格复现还有一层算子级因素：部分注意力内核与并行归约在默认设置下非确定，同一批次两次前向的末位数值会有差异。要求比特级复现时启用确定性内核开关，代价是吞吐下降；多数实验只需统计级复现，即固定种子下两条曲线在噪声带内重合，此时保留默认内核并在实验记录中注明内核与驱动版本。复现验收的判据也据此分档：比特级用于排查回归缺陷，统计级用于常规实验对照。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>训练循环骨架按“累积窗口内前向反向、窗口结束裁剪更新”组织；精度策略为 bf16 前向加 fp32 参数副本；显存策略按优先级启用：先累积对齐等效批量，再检查点主干，最后降微批。评估周期与检查点周期对齐。</p>
+    <h3>关键参数起点</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>等效批量</td><td>128</td><td>训练动态</td><td>与全课程约定一致（32–256）</td></tr>
+      <tr><td>微批大小</td><td>16</td><td>显存峰值</td><td>联训窗口下按单卡显存压到最小可用</td></tr>
+      <tr><td>累积步数</td><td>8</td><td>等效批量装配</td><td>128/(16×1 卡) 的整除配置</td></tr>
+      <tr><td>主干学习率</td><td>1e-4</td><td>预训练权重更新</td><td>Transformer 常规下限</td></tr>
+      <tr><td>头部学习率</td><td>3e-4</td><td>新增模块收敛</td><td>2–3 倍加速，过大会震荡</td></tr>
+      <tr><td>预热步数</td><td>2000</td><td>早期稳定</td><td>与 007 章热身语义一致的常用值</td></tr>
+      <tr><td>余弦终点比例</td><td>10%</td><td>末期细调</td><td>保留足够小的收官步长</td></tr>
+      <tr><td>精度</td><td>bf16 + 损失缩放</td><td>显存与速度</td><td>动态缩放初值 2<sup>16</sup></td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：先定等效批量，再定压缩组合</span>
+      <p>等效批量决定学习率与优化动态，先固定它并作为不变量；微批、累积、卡数都只是“如何凑出该批量”的手段，可随显存与机器配置自由变化。这样超参数搜索的结果与硬件配置解耦，换机器不必重扫学习率。若显存仍不足，才考虑降低等效批量并同步下调学习率。</p>
+    </div>
+    <p>衔接与差异：005 章的损失与 009 章的梯度规则在本章组装成可执行的循环；007 章在需要时把本章循环按阶段启用；017 章换用潜空间后，激活占用的主导项从像素解码转为潜序列，本章预算公式需要相应替换系数。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>片段以大规模 Transformer 训练与 VLA 端到端实现的公开设计为参照，接口随版本演进。第 1 段给出参数分组。</p>
+
+    <p><strong>片段 1：参数分组与优化器配置</strong></p>
+    <pre class="code"><code>import torch
+
+def build_param_groups(model, trunk_lr=1e-4, head_lr=3e-4, wd=0.05):
+    """参数分组：主干与头部差异化学习率，归一化与偏置豁免权重衰减。"""
+    trunk, head, no_decay = [], [], []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue                                  # 冻结参数不进优化器
+        # 归一化层与偏置不施加权衰：衰减会破坏其统计与偏置职责
+        if p.ndim == 1 or name.endswith(".bias"):
+            no_decay.append(p)
+        elif "action_head" in name or "proj" in name or "modulation" in name:
+            head.append(p)                            # 动作头与新增投影走头部学习率
+        else:
+            trunk.append(p)                           # 预训练主干走基准学习率
+    return [
+        {"params": trunk, "lr": trunk_lr, "weight_decay": wd},
+        {"params": head, "lr": head_lr, "weight_decay": wd},
+        {"params": no_decay, "lr": trunk_lr, "weight_decay": 0.0},
+    ]
+
+def build_optimizer(model):
+    # AdamW：解耦权重衰减，与 Transformer 训练的标准选择一致
+    return torch.optim.AdamW(build_param_groups(model), betas=(0.9, 0.95))</code></pre>
+    <p>解读：<strong>（1）</strong>分组依据是参数职责，不看模块名字习惯：一维参数（归一化缩放、偏置）自动进入豁免组，避免逐个列出。<strong>（2）</strong>头部识别用名称匹配；更稳妥的做法是注册时显式打标签。<strong>（3）</strong>betas 取 (0.9, 0.95)，不用默认的 (0.9, 0.999)：长序列训练中二阶矩的慢速滑动会让更新迟滞，这是大模型训练的常见调整。</p>
+
+    <p><strong>片段 2：混合精度与累积训练步</strong></p>
+    <pre class="code"><code>def train_step(model, optimizer, scaler, batch_iter, n_accum=8, clip=1.0):
+    """一个更新步：累积内前向反向，累积完成后统一裁剪与更新。"""
+    optimizer.zero_grad(set_to_none=True)
+    total_parts = {}
+    for micro in range(n_accum):
+        batch = next(batch_iter)
+        # bf16 前向 + fp32 损失：低精度显存优势与数值稳定的组合
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            loss, parts = joint_loss_from_batch(model, batch)
+        # 按累积步数缩放：多次反向的梯度之和等价于一次大批量的平均
+        scaler.scale(loss / n_accum).backward()
+        for k, v in parts.items():
+            total_parts[k] = total_parts.get(k, 0.0) + v / n_accum
+    # 反缩放后再裁剪：先让梯度回到真实尺度，裁剪阈值才有意义
+    scaler.unscale_(optimizer)
+    torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
+    # scaler.step 内部处理溢出跳过：溢出批次不更新参数并自动调低缩放系数
+    scaler.step(optimizer)
+    scaler.update()
+    return total_parts</code></pre>
+    <p>解读：<strong>（1）</strong>loss/n_accum 的缩放与“在等效批量上取均值”的语义一致，保证累积步数改变时损失尺度不漂移。<strong>（2）</strong>unscale 必须在裁剪之前：缩放后的梯度范数被整体放大，直接裁剪等效于阈值缩小若干倍，属于隐性配置错误。<strong>（3）</strong>scaler.step 的溢出跳过是混合精度的安全网，溢出计数应纳入监控，频繁溢出说明学习率或缩放初值需要调整。</p>
+
+    <p><strong>片段 3：完整检查点与续训</strong></p>
+    <pre class="code"><code>def save_checkpoint(path, step, model, ema_model, optimizer, scheduler,
+                    scaler, sampler_state, seed_state):
+    """完整状态保存：五类状态缺一都会让续训曲线在断点处断裂。"""
+    torch.save({
+        "step": step,
+        "model": model.state_dict(),
+        "ema": ema_model.state_dict(),          # 评估副本与在线权重分开保存
+        "optimizer": optimizer.state_dict(),    # 含动量与二阶矩：缺失则更新动态重置
+        "scheduler": scheduler.state_dict(),    # 学习率进度：缺失则预热重放
+        "scaler": scaler.state_dict(),          # 损失缩放系数与溢出计数
+        "sampler": sampler_state,               # 数据采样进度与来源配额游标
+        "seed": seed_state,                     # 三层随机源状态绑定训练步
+    }, path)
+
+def load_checkpoint(path, model, ema_model, optimizer, scheduler, scaler):
+    """加载顺序与保存一致；返回步数与采样状态供训练循环恢复。"""
+    ckpt = torch.load(path, map_location="cpu")
+    model.load_state_dict(ckpt["model"])
+    ema_model.load_state_dict(ckpt["ema"])
+    optimizer.load_state_dict(ckpt["optimizer"])
+    scheduler.load_state_dict(ckpt["scheduler"])
+    scaler.load_state_dict(ckpt["scaler"])
+    return ckpt["step"], ckpt["sampler"], ckpt["seed"]</code></pre>
+    <p>解读：<strong>（1）</strong>EMA 副本单独保存：只存在线权重会导致评估结果在续训后跳变，无法区分“训练改善”与“评估切换”。<strong>（2）</strong>采样器状态包含来源配额游标，保证续训后的批次构成与不中断训练一致。<strong>（3）</strong>种子状态记录三层随机源在断点步的完整状态，是严格可复现的最后一环；对复现要求不严格的场景可省略，但评估一致性仍需 EMA 与优化器状态。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>裁剪在反缩放之前</strong>：梯度被缩放系数整体放大后裁剪，等效阈值除以缩放系数，更新被隐性削弱。修复：unscale 与 clip 的次序写入训练步的固定模板。</li>
+      <li><strong>参数组学习率串组</strong>：名称匹配的头部规则过宽，把主干层误分进头部，学习率暗中提高。修复：分组后打印各组的参数数量与前缀清单核对。</li>
+      <li><strong>显存估算漏掉世界模型路径</strong>：只按策略头估算，联合路径激活叠加后溢出。修复：按完整计算图估算，预估后预留两成余量。</li>
+      <li><strong>归一化层被权重衰减</strong>：豁免规则遗漏，长时间训练后归一化统计被拉偏。修复：一维参数自动豁免，规则固化为构建函数。</li>
+      <li><strong>续训只存模型权重</strong>：优化器与调度器状态缺失，曲线在断点明显断裂。修复：五类状态全量保存，续训后对比断点前后损失曲线做验收。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>单卡、微批 16、累积 8、等效批量目标 128，验证配置是否成立；若换双卡，给出两种等效批量不变的调整方案。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>16×8×1=128 成立。双卡可改微批 8×累积 8，或保持微批 16 把累积降到 4。</div></details>
+      </li>
+      <li>把余弦终点从 10% 改为 1%，预测末期训练动态与最终指标的变化。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>末期步长更小，细调更充分但训练总时长内损失下降变慢；通常在固定步数预算下收尾略优，超出预算则表现更差。</div></details>
+      </li>
+      <li>推导：说明梯度检查点以计算换显存的量级关系，并解释为什么它对含丢弃层的重算需要一致性保证。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>激活显存从 O(层数) 级降到 O(检查点间隔) 级，计算约增加一次前向；丢弃掩码若重算时不同，反向梯度与真实前向不符。</div></details>
+      </li>
+      <li>设计续训验收流程：从同一个检查点分别直接训练与中断续训，比较两条损失曲线的重合度，给出允许偏差与检查步骤。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>固定种子，续训后逐 100 步对比损失；重合偏差应在噪声范围内，超出则按“模型、优化器、调度器、缩放器、数据”顺序排查。</div></details>
+      </li>
+      <li>构造实验：在相同等效批量下比较“微批 64×累积 2”与“微批 16×累积 8”的收敛曲线与显存峰值，解释差异来源。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>两者梯度期望一致，但批内统计不同：大批量微批的收敛略快、显存峰值高；小批量累积吞吐略低。结论按“显存预算与吞吐”选择。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>端到端的判据是动作损失梯度可达视觉与语言前端，预训练权重解冻参与是常规混合边界。</li>
+      <li>显存三压缩：混合精度、检查点、累积；等效批量与微批解耦，先定批量再定组合。</li>
+      <li>参数分组差异化学习率，归一化与偏置豁免衰减；预热加余弦是稳定调度。</li>
+      <li>累积后反缩放再裁剪，混合精度的溢出计数纳入监控。</li>
+      <li>检查点五类状态缺一不可，<strong>EMA 副本与优化器状态是续训一致性的底线</strong>。</li>
+      <li>下一章转向世界模型侧的结构升级：隐空间学习。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch015.html">← 第 015 章：联合训练中的探索策略</a>
+    <a class="next" href="ch017.html">第 017 章：世界模型的隐空间学习 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

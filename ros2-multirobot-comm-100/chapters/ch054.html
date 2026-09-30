@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第054章 多机器人目标跟踪 | 多机器人协同学习课程 · ROS2 通信与系统集成</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第三篇 · 协同控制与任务协同</span>
+    <span class="sep">/</span>
+    <span>第 054 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第三篇 · 协同控制与任务协同</div>
+    <h1>第 054 章：多机器人目标跟踪</h1>
+    <p class="lead">盯住一个会动的目标：用 EKF 估计位置与速度，用协方差交叉融合多台观察者的航迹而不"过度自信"，并让机器人站到能看清目标的位置上去。</p>
+    <ul class="meta">
+      <li>主题：任务协同 / 目标状态估计</li>
+      <li>关键机制：扩展卡尔曼滤波、协方差交叉融合、观测站位优化、航迹消息与来源标记</li>
+      <li>预计学时：65 分钟</li>
+      <li>前置章节：第 053 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解目标跟踪的两个组成部分：状态估计（目标在哪、多快）与观察者控制（谁去看、站哪里）。</li>
+      <li>掌握 EKF 的预测与距离-方位观测更新，理解雅可比线性化、Q/R 选择与门限（gating）的作用。</li>
+      <li>能解释航迹融合中的"相关性未知"问题，会用协方差交叉（CI）做一致性融合并说清它与普通卡尔曼融合的差别。</li>
+      <li>会设计观测站位策略：方位分离避免三角退化、距离保持在传感器最优区间、按最小路程分配观察者。</li>
+      <li>能设计航迹消息与来源标记，避免转发航迹的重复计数导致估计过自信。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>052 章的搜索解决"目标在哪片区域"，053 章的救援解决"先救谁"。但有一类目标会跑：移动的人员、其它机器人、无人机。对它们做单点定位没有意义，需要的是<strong>持续的状态估计</strong>（位置 + 速度 + 不确定性）与<strong>持续的观察</strong>（谁盯着、从哪个角度盯）。这就是跟踪。</p>
+    <p>多机器人跟踪的价值来自几何：方位测量（bearing-only）单机不可观测距离，两台从不同角度观测才能三角定位；而且两台航迹融合可以显著压低估计协方差。但融合本身有个陷阱：两台机器人的估计并不独立（都用了共享的里程计漂移、都看过对方转发的情报），按独立假设做卡尔曼融合会得到"虚假的自信"。本章的协方差交叉就是为这个陷阱准备的。它是围捕（055）的前置：围捕者要围的是"估计出来的位置"，估计器的一切毛病都会在围捕圈上放大。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 目标状态与可观测性</h3>
+    <p>平面目标的最小状态是 x = [p<sub>x</sub>, p<sub>y</sub>, v<sub>x</sub>, v<sub>y</sub>]（匀速模型）。传感器观测常见两类：<strong>距离-方位</strong>（激光/雷达，可直接三角定位）与<strong>纯方位</strong>（相机 bearing-only）。纯方位观测单机不可观测距离，目标沿视线前后移动，观测序列几乎不变；因此单体跟踪行业内普遍用"机动 + 多观测"来补。多机器人跨角度观测则提供了充分的可观测性：两台相距基线 b 的观察者对同一目标测方位，几何上等同于三角测量。</p>
+    <div class="formula">
+      三角退化条件：观察者-目标-观察者近似共线（方位分离 &lt; 10–15°）
+      <span class="note">此时两条方位线近乎平行，交点对角度误差极其敏感；工程要求分离角 ≥ 30°</span>
+    </div>
+
+    <h3>2. EKF：预测、更新与门限</h3>
+    <p>扩展卡尔曼滤波（Extended Kalman Filter, EKF）把非线性观测在预测点处线性化：预测步用运动模型推进状态与协方差，更新步用雅可比 H 把观测残差映射回状态空间。距离-方位观测的雅可比是解析的：设预测点相对观察者的相对位置 (d<sub>x</sub>, d<sub>y</sub>)，距离 r，则 ∂r/∂p = [d<sub>x</sub>/r, d<sub>y</sub>/r]，∂θ/∂p = [−d<sub>y</sub>/r², d<sub>x</sub>/r²]。三个工程参数决定滤波器性格：</p>
+    <ul>
+      <li><strong>过程噪声 Q</strong>：目标机动越大 Q 越大。Q 太小 → 滤波器"死信"匀速假设，机动时估计滞后；Q 太大 → 稳态精度下降。常用尺度是"目标可能的最大加速度"反推。</li>
+      <li><strong>观测噪声 R</strong>：来自传感器标定，必须用实测（同一目标静止状态下 100 次观测的方差），不要抄默认值。</li>
+      <li><strong>门限 gating</strong>：用新息马氏距离 d² = y<sup>T</sup>S<sup>−1</sup>y 与卡方阈值（2 自由度、99% 对应 9.21）比较，超出即判为野值或目标丢失。门限太松会把别的目标/杂波吸进航迹，太紧则正常测量被拒、航迹频繁丢失。</li>
+    </ul>
+
+    <h3>3. 航迹融合与协方差交叉</h3>
+    <p>两台机器人各自维护一条航迹 (x<sub>1</sub>, P<sub>1</sub>)、(x<sub>2</sub>, P<sub>2</sub>)，融合有两条路线：<strong>测量级融合</strong>（把所有原始观测送到一个中心滤波）精度最高，但需要低延迟的全量观测汇聚；<strong>航迹级融合</strong>（各机本地滤波，再融合航迹）通信量小、抗断连，但要在本地解决"两条航迹不独立"的问题。不独立时不能直接用卡尔曼融合公式，它假设双方误差独立，会把重复计入的证据叠加两次，输出一个比真实精度乐观得多的 P（过自信），后续预测与围捕全部建立在错误信心上。</p>
+    <p>协方差交叉（Covariance Intersection, CI）是"相关性未知时的正确融合"：</p>
+    <div class="formula">
+      P<sup>−1</sup> = ω·P<sub>1</sub><sup>−1</sup> + (1−ω)·P<sub>2</sub><sup>−1</sup>，&nbsp; x = P·(ωP<sub>1</sub><sup>−1</sup>x<sub>1</sub> + (1−ω)P<sub>2</sub><sup>−1</sup>x<sub>2</sub>)
+      <span class="note">ω ∈ [0,1] 一维搜索使 trace(P) 最小；无论相关性如何，结果都是一致的（不会过自信）</span>
+    </div>
+    <p>CI 的代价是保守：当两条航迹确实独立时，CI 的 P 比最优融合略大。这份保守正是分布式跟踪需要的，它保证"最坏情况下也不过自信"，而过度自信的代价（围捕圈半径按虚假精度收缩、撞上目标）远高于保守。</p>
+
+    <h3>4. 观察者站位：把估计精度当作控制目标</h3>
+    <p>跟踪的控制目标是<strong>最小化估计协方差</strong>（例如 P 的迹），安全与可通行作为约束；单纯"靠近目标"的直觉在这里退居次要。三个几何直觉：</p>
+    <ul>
+      <li><strong>分离角度</strong>：两观察者方位分离越大，"三角测量"基线越宽，位置精度越高；低于 30° 精度急剧恶化（退化条件）。</li>
+      <li><strong>保持距离</strong>：传感器有最优区（示例 3–8 m）。太近视角变化剧烈、易丢失；太远测量噪声主导。</li>
+      <li><strong>跟随而不尾随</strong>：所有观察者都跟在目标正后方是最差几何（近似共线）。期望的构型是绕目标分布（环形或半环），并随目标运动滚动更新，这一点与 055 章围捕的目标构型完全一致：围捕是"跟踪 + 收拢"。</li>
+    </ul>
+    <p>实现上用"候选环位贪心"：目标周围按等分角取候选点，每台机器人被分配到"分离度优先、路程次优"组合中的位置；分配结果交给 046–049 的规划执行。站位切换要加滞回（分离度收益超过 15% 才换位），否则目标微动会让观察者来回横跳。</p>
+
+    <h3>5. 航迹消息设计：来源标记防重复计数</h3>
+    <p>航迹消息（约 100 字节：机器人 id、目标 id、状态 4 值、协方差 4×4 上三角 10 值、时间戳、来源集合）以 10 Hz 广播。两个协议级细节决定系统是否正确：</p>
+    <ul>
+      <li><strong>时间对齐</strong>：不同机器人的测量时刻不同，融合前把对方航迹外推到"本机当前时刻"，外推窗口控制在一个广播周期（100 ms）内。</li>
+      <li><strong>来源标记（origin）</strong>：航迹带"参与过产生它的机器人集合"。融合前检查：对方航迹的来源集合与本机航迹的来源集合有交集，说明两者共享了同一份证据（例如都融合过 C 的转发），此时必须用 CI；只有完全无交集时才允许用普通卡尔曼融合。转发链更深的坑是"自己融合自己"，收到包含本机 id 的航迹直接丢弃。</li>
+    </ul>
+
+    <h3>6. 数值算例：分离角决定精度上限</h3>
+    <p>把观测噪声 σ<sub>θ</sub> = 0.03 rad 与几何配置代入信息矩阵（每台观察者的方位观测各贡献一行雅可比，拼接后取逆得到位置协方差），可以直接算出目标位置的误差椭圆。目标在 (3, 4)、两台观察者各距目标 4 m、方位分离角分别取 10°、30°、90°、150° 时：</p>
+    <table>
+      <tr><th>分离角</th><th>x 方向 σ</th><th>y 方向 σ</th><th>协方差迹</th></tr>
+      <tr><td>10°</td><td>0.970 m</td><td>0.120 m</td><td>0.955</td></tr>
+      <tr><td>30°</td><td>0.317 m</td><td>0.120 m</td><td>0.115</td></tr>
+      <tr><td>90°</td><td>0.120 m</td><td>0.120 m</td><td>0.029</td></tr>
+      <tr><td>150°</td><td>0.317 m</td><td>0.120 m</td><td>0.115</td></tr>
+    </table>
+    <p>读表的三条结论。<strong>其一，10° 分离时位置误差在某一方向上接近 1 m</strong>，因为两条方位线近乎平行，交点对角度噪声极敏感；<strong>其二，30° 与 150° 的协方差迹完全相同</strong>，起作用的几何量是分离角的正弦：30° 与 150° 的正弦都是 0.5，分离超过 90° 后不再提升精度；<strong>其三，从 30° 到 90° 迹下降约 4 倍</strong>，这是"分离角达标与否决定跟踪可用性"的定量版本，工程上把 30° 设为最低线、习惯用 60–90° 是合理的。</p>
+    <p>航迹融合的保守性用一个一维例子看清：两台各有一维航迹，方差都为 1，误差相关系数 0.5（例如共享了同一份里程计漂移）。按独立假设的卡尔曼融合给出 P = 0.5；两个估计取平均的真实方差是 (1 + 1 + 2×0.5)/4 = 0.75，卡尔曼结果比真实乐观 33%。协方差交叉在同权重下给出 P = 1，大于真实值（保守），但方向正确、绝不会过自信。<strong>宁保守、不过信</strong>是分布式融合的第一原则，过自信的后果（围捕圈按虚假精度收缩）不可逆。</p>
+    <p>门限的取值也顺带核对：距离-方位观测的卡方门限 9.21 对应二维 99%，两个观测通道的等效门线约为各自标准差的三倍；4 m 距离上 σ<sub>θ</sub> = 0.03 rad 对应横向误差 0.12 m，而固定"1 m 门限"在远处（10 m 时横向 σ 升到约 0.3 m）会把正常观测拒之门外。<strong>门限必须写在马氏距离（除以 S）里，不能拍固定米数</strong>，这是更换传感器或调整安装高度后最容易忽略的一致性要求。标定顺序也要固定下来：先用静止目标标定 σ<sub>r</sub> 与 σ<sub>θ</sub>（各 100 次观测取方差），再用匀速直线段标定过程噪声 Q，最后用急转段验收门限的拒绝率；顺序颠倒是三个误差源互相掩盖的常见原因。门限拒绝率长期维持在 1% 量级，说明整套标定仍然有效。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <ol>
+      <li><strong>架构选型</strong>：优先"测量级融合"（中央或选举的融合节点）用于同网段、低延迟场景；"航迹级 + CI"用于通信受限场景。本章以航迹级为主线，它也是 051 章断连哲学的延续。</li>
+      <li><strong>本机滤波</strong>：每台机器人以 20 Hz 预测、10 Hz 更新维护本地航迹；观测来自本机传感器；门限 9.21（χ² 2 自由度 99%）。</li>
+      <li><strong>航迹共享</strong>：<code>/fleet/track</code> 10 Hz，Best-effort；融合时按来源标记选择 CI 或卡尔曼；外推上限 100 ms。</li>
+      <li><strong>站位管理</strong>：目标周围 24 个候选环位（半径 4 m）；贪心选择使最小方位分离最大；切换滞回 15%。</li>
+      <li><strong>丢失处理</strong>：连续 0.5 s 无有效更新转"预测模式"（协方差膨胀加速），2 s 无更新剪切航迹并通知搜索模块（退回 052 章信念搜索）。</li>
+      <li><strong>验收</strong>：单目标室内机动轨迹（含急转）10 分钟：位置 RMSE 小于 0.35 m、速度 RMSE 小于 0.4 m/s；方位分离全程不小于 30°（工作段）；跟踪丢失事件 0 次；CI 输出的 P 迹不小于测量级融合的 1.0 倍（一致性检查：不能更自信）。</li>
+    </ol>
+    <h3>参数表</h3>
+    <table>
+      <tr><th>参数</th><th>取值</th><th>依据</th></tr>
+      <tr><td>状态更新率</td><td>预测 20 Hz / 测量 10 Hz</td><td>与传感器帧率匹配；更高只增加计算</td></tr>
+      <tr><td>过程噪声 q</td><td>0.1 量级（按加速度反推）</td><td>目标机动能力越强越大；由急转测试校准</td></tr>
+      <tr><td>观测噪声</td><td>σ<sub>r</sub> = 0.2 m，σ<sub>θ</sub> = 0.03 rad</td><td>实测标定值（示例）</td></tr>
+      <tr><td>门限</td><td>d² ≤ 9.21</td><td>χ² 2 自由度 99%；误收率 1%</td></tr>
+      <tr><td>环半径</td><td>4.0 m</td><td>落在传感器最优区 3–8 m 中段</td></tr>
+      <tr><td>最小方位分离</td><td>30°</td><td>低于 15° 三角退化；30° 留两倍余量</td></tr>
+      <tr><td>站位滞回</td><td>15%</td><td>防目标微动引起观察者横跳</td></tr>
+    </table>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：EKF 预测与距离-方位更新</strong></p>
+    <pre class="code"><code>import math
+import numpy as np
+
+def ekf_predict(x, P, dt, q=0.1):
+    """匀速模型预测：x = [px, py, vx, vy]。"""
+    F = np.array([[1, 0, dt, 0], [0, 1, 0, dt],
+                  [0, 0, 1, 0], [0, 0, 0, 1]], dtype=float)
+    Q = q * np.array([[dt**3/3, 0, dt**2/2, 0],
+                      [0, dt**3/3, 0, dt**2/2],
+                      [dt**2/2, 0, dt, 0],
+                      [0, dt**2/2, 0, dt]], dtype=float)
+    return F @ x, F @ P @ F.T + Q
+
+def ekf_update_range_bearing(x, P, ox, oy, r_meas, th_meas,
+                             sigma_r=0.2, sigma_th=0.03):
+    """距离-方位观测更新：H 在预测位置处线性化（EKF 的标准做法）。"""
+    dx, dy = x[0] - ox, x[1] - oy
+    r_hat = math.hypot(dx, dy)
+    th_hat = math.atan2(dy, dx)
+    H = np.array([[dx / r_hat, dy / r_hat, 0, 0],
+                  [-dy / r_hat**2, dx / r_hat**2, 0, 0]])
+    # 方位残差必须归一化，跨越 ±pi 时否则会产生巨大新息
+    d_th = math.atan2(math.sin(th_meas - th_hat), math.cos(th_meas - th_hat))
+    y = np.array([r_meas - r_hat, d_th])
+    S = H @ P @ H.T + np.diag([sigma_r**2, sigma_th**2])
+    K = P @ H.T @ np.linalg.inv(S)
+    return x + K @ y, (np.eye(4) - K @ H) @ P, float(y @ np.linalg.solve(S, y))</code></pre>
+    <p>解读：这段代码的两个"数学脏活"都在细节里。<strong>(1) 雅可比是解析的</strong>：距离对方位、方位对位置的偏导直接按公式写死，比数值差分稳定且快。注意方位行没有速度分量，距离-方位观测不含速度信息，速度只能通过时间上的位置变化被间接观测，这就是为什么低机动假设（Q 小）的滤波器估计速度会滞后。<strong>(2)</strong> 函数返回的第三个值是归一化新息平方（马氏距离），供门限判断：调用方拿它和 9.21 比，超限的观测既不用来更新状态，也不应直接丢弃，通常转交"疑似多目标/野值"处理链。<code>d_th</code> 的归一化是必须的：目标在正后方时方位从 +π 跳到 −π，未归一化会让滤波器把目标"踹飞"。</p>
+
+    <p><strong>片段 2：协方差交叉融合</strong></p>
+    <pre class="code"><code>def covariance_intersection(x1, P1, x2, P2, steps=100):
+    """CI 融合：相关性未知时的一致性解；扫描权重最小化 trace(P)。"""
+    P1i = np.linalg.inv(P1)
+    P2i = np.linalg.inv(P2)
+    best = None
+    for i in range(steps + 1):
+        w = i / steps                              # omega 从 0 扫到 1
+        P = np.linalg.inv(w * P1i + (1 - w) * P2i)
+        x = P @ (w * (P1i @ x1) + (1 - w) * (P2i @ x2))
+        tr = float(np.trace(P))
+        if best is None or tr &lt; best[0]:
+            best = (tr, x, P, w)
+    return best[1], best[2], best[3]               # (状态, 协方差, 权重)</code></pre>
+    <p>解读：CI 的公式与最优卡尔曼融合只差"权重"这一层：卡尔曼融合隐含"双方同等可信、信息叠加"，CI 则用 ω 在两者之间滑动，并且<strong>先取逆再求和再取逆</strong>，信息矩阵（协方差的逆）才具备可加性。ω 的物理含义是"我信自己多一些还是信对方多一些"；在 trace 最小的目标下，几何上相当于在两条椭圆（置信椭圆）之间找到面积最小的"包住两者"的椭圆。100 步扫描对 4×4 矩阵是几百微秒，10 Hz 融合频率下毫无压力；追求极致可以用黄金分割搜索，但可读性下降。返回 ω 本身很有用：它直观显示两台机器人当前谁的航迹更"实"（ω 偏向自己 = 自己协方差更小）。</p>
+
+    <p><strong>片段 3：观测站位与最小路程分配</strong></p>
+    <pre class="code"><code>import math
+import itertools
+
+def ring_viewpoints(target_pos, n=2, R=4.0):
+    """在目标周围环上等分取 n 个观测点；0.1 rad 偏置避开正对门轴。"""
+    tx, ty = target_pos
+    out = []
+    for k in range(n):
+        a = 2.0 * math.pi * k / n + 0.1
+        out.append((tx + R * math.cos(a), ty + R * math.sin(a)))
+    return out
+
+def assign_observers(viewpoints, robots):
+    """最小总路程分配（n ≤ 3 直接枚举排列；更大规模用匈牙利）。"""
+    best, best_cost = None, float("inf")
+    for perm in itertools.permutations(range(len(robots)), len(viewpoints)):
+        cost = sum(math.hypot(robots[perm[i]][0] - viewpoints[i][0],
+                              robots[perm[i]][1] - viewpoints[i][1])
+                   for i in range(len(viewpoints)))
+        if cost &lt; best_cost:
+            best, best_cost = perm, cost
+    return [(robots[best[i]], viewpoints[i]) for i in range(len(viewpoints))]
+
+def separation_ok(robot_poses, target_pos, min_deg=30.0):
+    """检查方位分离：任意两台观察者对目标的方位角差是否达标。"""
+    angles = [math.atan2(p[1] - target_pos[1], p[0] - target_pos[0])
+              for p in robot_poses]
+    for i in range(len(angles)):
+        for j in range(i + 1, len(angles)):
+            d = abs(math.degrees(angles[i] - angles[j])) % 360.0
+            if min(d, 360.0 - d) &lt; min_deg:
+                return False
+    return True</code></pre>
+    <p>解读：三个小函数拼成站位管理的最小闭环。<code>ring_viewpoints</code> 用 0.1 rad 偏置有个具体动机：走廊场景里 0°/180° 的观测点正好压在门轴线上，机器人会堵门；偏置一点让它落在自然可停处。<code>assign_observers</code> 采用枚举排列：2–3 台规模下距离单项贪心可能取不到"总路程最短"，排列枚举精确且够快。<code>separation_ok</code> 服务于两个用途：规划器收不到合适站位时报警（退回保持现有站位，不做硬凑），以及作为验收指标在线计算，把"30° 分离"从一个设计承诺变成运行时可观测的数量。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>转发航迹重复计数</strong>：A 转发 B 的航迹，C 把它与 B 的原航迹按独立假设融合，P 虚假缩小（过自信），围捕圈随之收缩到危险半径。修复：来源集合 + "含本机 id 直接丢弃"；有交集只用 CI。</li>
+      <li><strong>直接融合不同时刻的航迹</strong>：双方时间戳差 300 ms，运动会带来米级偏差，直接混合还会污染协方差。修复：融合前统一外推到接收时刻，外推上限一个广播周期。</li>
+      <li><strong>共线站位</strong>：两台机器人一前一后跟着目标跑，方位分离接近 0°，距离估计实际上退化成单机。修复：站位分离检查 + 环位分配；发现分离不足先调站位再谈融合。</li>
+      <li><strong>门限过松或过紧</strong>：过松时两个靠近的目标航迹相互吞并（"换轨"），过紧时正常观测被拒导致航迹频繁丢失。修复：先用卡方标准值 9.21，再用实测目标机动数据调；观察"拒绝率"指标（正常应在 1% 量级）。</li>
+      <li><strong>Q/R 失配</strong>：Q 太小导致机动段估计滞后（目标急转 1 s，估计还停在直线上），Q 太大导致稳态抖动。修复：用录制的机动轨迹做离线标定，扫 q 值，选位置 RMSE 最小的。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>目标以 1 m/s 匀速直线运动，两台观察者位于其航线两侧（方位分离 90°），基线 6 m，距离各 4 m。定性说明：如果两台并排跟在目标正后方（分离 5°），距离估计误差会怎样变化？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>分离角趋零时两条方位线平行，距离方向不可观测；估计误差沿视线方向发散，等效于只知方向不知远近。</div></details>
+      </li>
+      <li>把 CI 的 ω 扫描步数从 100 改为 10 与 1000，评估融合输出的 trace 差异与计算耗时；说明什么时候值得用黄金分割搜索替代扫描。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>trace(ω) 是凸函数，10 步误差小但可见；1000 步耗时线性增加。频率高（&gt;50 Hz）或状态维度大时改用黄金分割，收敛快且步数固定。</div></details>
+      </li>
+      <li>构造一个"过自信"演示：生成两条共享 50% 证据的航迹，分别用（a）独立假设卡尔曼融合与（b）CI 融合，比较输出 P 的迹与真实误差的匹配度。写出实验参数与判据。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>(a) 会低估 P（trace 小于真实），(b) 不会。判据：用蒙特卡洛统计归一化估计误差平方（NEES），看是否落在卡方置信区间内。</div></details>
+      </li>
+      <li>设计站位切换的完整规则：环位分配周期、滞回阈值、目标机动时的重分配触发、以及"分离度无法满足时"的降级行为；给出可从日志验证的三个指标。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>指标：最小分离角 P5、站位切换次数/分钟、切换后 2 s 内的估计 RMSE 变化。降级行为：保持现有站位并降低融合权重（更依赖 CI 的保守）。</div></details>
+      </li>
+      <li>把跟踪与搜索打通：设计"丢失后回退到信念搜索"的接口，何时判定丢失、搜索先验如何从最后航迹构造（高斯球）、找回后如何重建跟踪（复用还是新建航迹 id）。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>丢失判定：2 s 无更新且协方差迹超过阈值；先验用最后状态的高斯外推（方差按扩散速度放大）；找回时按位置与速度连续性决定复用 id 或新建。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>跟踪 = 状态估计 + 观察者控制；纯方位单机不可观测，多机方位分离 ≥ 30° 是硬要求。</li>
+      <li>EKF 预测/更新之外，三件套决定成败：解析雅可比、方位残差归一化、卡方门限（9.21）。</li>
+      <li>航迹融合先问相关性：来源有交集时必须用 CI；CI 的保守换来的是一致性，永不过自信。</li>
+      <li>站位目标是最小化估计协方差：环形分布、保持 3–8 m 距离、滞回防横跳；分派用最小路程精确解。</li>
+      <li>下一章把"盯住"升级为"围住"：<strong>多机器人围捕任务</strong>，角度均匀分配、合围判定与反逃逸设计。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch053.html">← 第 053 章：多机器人协同搜索与救援</a>
+    <a class="next" href="ch055.html">第 055 章：多机器人围捕任务 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

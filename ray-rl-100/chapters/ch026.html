@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第026章 RLlib策略评估流程深入 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · RLlib 核心接口与训练</span>
+    <span class="sep">/</span>
+    <span>第 026 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · RLlib 核心接口与训练</div>
+    <h1>第 026 章：RLlib策略评估流程深入</h1>
+    <p class="lead">评估流程用独立的工作进程组周期性地测量当前策略，产出与训练回报口径分离的性能曲线。本章讲清评估的编排结构、指标口径、时长与频率配置，以及低噪声评估结论的获取方法。</p>
+    <ul class="meta">
+      <li>主题：RLlib 训练 / 策略评估</li>
+      <li>关键机制：独立评估进程组、权重同步、确定性动作、指标口径、评估预算</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 025 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解评估流程的独立编排结构：评估进程组的组成、触发时机与权重同步路径。</li>
+      <li>掌握评估指标与训练指标的口径差异，会用两条曲线判断策略的真实进展。</li>
+      <li>会配置评估频率、评估时长与确定性动作，平衡评估可信度与算力开销。</li>
+      <li>理解评估回合数与统计噪声的关系，会估算达到目标置信精度所需的采样量。</li>
+      <li>会诊断评估流程的常见异常：指标错位、进程反复重建与资源争抢。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>训练回报无法直接回答策略当前的真实水平：采样策略带探索噪声，环境随机性使单轮回报波动明显，策略还被多批数据反复更新。评估流程用独立进程组与固定协议周期性重测策略，产出可比性更高的曲线。</p>
+    <p>评估配置直接决定结论的可信度：回合太少曲线被噪声淹没，频率过低错过性能退化，与训练共用环境实例则测量被训练状态污染。<strong>把评估当作一条独立的数据管线来设计，才能得到可用于决策的曲线。</strong>上一章讲了回调插桩，本章把观测视角扩展到评估环节。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p>评估流程与训练流程在结构上并行、在数据上隔离、在时间上周期同步。</p>
+
+    <h3>1. 独立编排与权重同步</h3>
+    <p>评估使用自己的工作进程组（evaluation workers），与环境隔离：评估进程持有独立环境实例，训练进程的计数与状态不受影响。每隔一定训练轮数触发一次评估：训练策略的权重经对象存储广播到评估进程组，评估进程按固定协议采集若干回合，回报经聚合后写入训练结果的评估字段。<strong>权重传输量正比于模型参数量，评估频率乘以参数量构成额外的系统开销，配置时必须计入。</strong></p>
+
+    <h3>2. 指标口径的差异</h3>
+    <p>训练回报与评估回报来自两组测量：训练侧带探索动作，评估侧通常关闭探索（explore=False）取确定性动作；训练环境实例持续运行，评估侧从固定初始分布重新开始。比较有意义，混用会产生错误结论：训练回报偏高多来自探索的乐观偏差；评估回报停滞而训练回报上升，通常意味着策略在训练分布上过拟合。</p>
+    <div class="formula">
+      平均回报的标准误 ≈ σ / √n，n 为评估回合数，σ 为回合回报标准差
+      <span class="note">回合回报波动 σ 为 50、目标标准误 5 时，需要约 100 个评估回合；评估回合数决定了曲线抖动幅度，与策略质量无关</span>
+    </div>
+
+    <h3>3. 频率与预算</h3>
+    <p>评估频率由轮数间隔（evaluation_interval）控制，评估量由回合数或步数控制。评估预算占比需要显式设计：把评估耗时与迭代耗时对照，通常控制在百分之五到百分之十；早期曲线变化快可提高频率，后期趋于平稳可降低。<strong>计量单位按语义选择：回合长度稳定用回合，波动大用步数。</strong></p>
+
+    <h3>4. 并行评估与确定性协议</h3>
+    <p>评估进程组可配置多个并行进程（evaluation_num_env_runners），缩短单次评估墙钟时间。测量质量还取决于协议确定性：固定评估环境种子集合、关闭动作探索、保持初始分布与训练一致。<strong>确定性协议让两次评估的差异更多来自策略变化，环境采样噪声占比下降，</strong>这是把评估曲线用作模型选择依据的前提。需要预留一部分评估回合用于覆盖率检查，防止策略对固定起点集合产生记忆。</p>
+
+    <h3>5. 评估预算的数值核算</h3>
+    <p>评估开销由三部分构成：评估环境步数、权重同步流量与评估进程的常驻资源。环境步数示例：评估回合平均长度 120 步，每次评估 10 个回合即消耗 1200 环境步；训练每轮 8000 样本，间隔 5 轮触发一次评估时，评估量占训练量的 1200/(5 × 8000) = 3%。把回合数提高到 100 以追求精度，评估量升到 12000 步，同样间隔下占比升到 30%，超出百分之五到百分之十的目标区间；把间隔放宽到 20 轮，占比回落到 7.5%，重新落回区间。权重同步流量示例：模型 100 万参数按 float32 计约 4 MB，评估进程组含 2 个进程时每次同步合计约 8 MB，每 5 轮同步一次、训练 1000 轮累计约 1.6 GB 的对象存储流量。<strong>评估频率每提高一倍，同步流量与评估步数同时翻倍，两笔开销都要计入预算。</strong></p>
+    <div class="formula">
+      评估开销占比 ≈ (评估回合数 × 平均回合长度) / (评估间隔 × 训练批次大小)
+      <span class="note">回合长度 120、回合数 10、间隔 5、批次 8000 时占比约 3%；回合数或频率翻倍都会让占比同向变化，
+      调整时先算占比再启动训练</span>
+    </div>
+
+    <h3>6. 评估噪声与最小可分辨差异</h3>
+    <p>标准误描述单次评估的波动范围；判断两个检查点是否存在真实差异，还要比较两者差值的置信区间。两次独立评估的差值标准误约为 √2 × σ/√n，95% 置信水平下的最小可分辨差异近似为：</p>
+    <div class="formula">
+      Δ<sub>min</sub> ≈ 2√2 · σ / √n ≈ 2.83 σ / √n
+      <span class="note">σ = 50、n = 100 时 Δ<sub>min</sub> ≈ 14.1；两条评估曲线的均值差小于该值时，无法在 95% 置信水平上判定优劣，模型选择会退化为掷硬币</span>
+    </div>
+    <p>数值演算把评估规模与决策能力绑定：n = 10 时 Δ<sub>min</sub> ≈ 44.7，回报相差四十余点才能被可靠分辨，只能支撑趋势判断；n = 40 时降到约 22.4，可分辨中等幅度改进；n = 100 时约 14.1，适合最终检查点之间的精细比较。<strong>评估回合数的选择应由决策阈值反推：只需判断百分之十以上的提升时，数十个回合已经足够，不必为更小的分辨力支付平方增长的成本。</strong></p>
+
+    <h3>7. 评估档位的对比</h3>
+    <p>设回合回报标准差 σ = 50、间隔 20 轮、训练批次 8000，三档评估配置的定量对比如下：</p>
+    <table>
+      <tr><th>档位</th><th>评估回合数</th><th>标准误</th><th>最小可分辨差异</th><th>训练量占比</th><th>适用用途</th></tr>
+      <tr><td>轻量</td><td>10</td><td>15.8</td><td>约 44.7</td><td>0.75%</td><td>趋势跟踪、长时间监控</td></tr>
+      <tr><td>标准</td><td>40</td><td>7.9</td><td>约 22.4</td><td>3%</td><td>常规检查点比较</td></tr>
+      <tr><td>高精度</td><td>100</td><td>5.0</td><td>约 14.1</td><td>7.5%</td><td>最终模型选择与结论发表</td></tr>
+    </table>
+    <p>选择依据：训练全程用轻量档跟踪趋势；候选检查点收敛后用标准档区分优劣；只对最终少数几个候选启用高精度档。<strong>分层评估让大部分训练轮次只承担很小的评估开销，把可信度预算集中花在决策点上。</strong>训练轮次有限时，可把间隔与档位组合使用：前期用轻量档高频跟踪，后期切换到高精度档低频复核。</p>
+
+    <h3>8. 评估覆盖配置的继承规则</h3>
+    <p>评估进程组默认继承训练配置，evaluation_config 中的键按需覆盖，未列出的键继续沿用训练侧取值。常见覆盖项包括探索开关、环境参数与推理设置；覆盖粒度过大（例如整体替换模型配置）会让评估策略与训练策略不一致，症状是评估曲线长期原地不动。固定评估协议时可以把一组评估种子写入配置，让每次评估的环境初始序列相同；种子集合之外的回合用于覆盖率检查，防止策略对固定起点集合产生记忆。评估进程组在两次评估之间处于驻留状态，占用内存而不消耗计算资源，规划内存预算时应把这份常驻开销计入。覆盖率检查使用的种子集合单独记录在实验配置中，便于复现评估结论。</p>
+
+    <h3>9. 配对评估：用共同随机数进一步压噪声</h3>
+    <p>标准误公式描述的是"独立评估"的噪声。比较两个检查点时还有一项几乎免费的降噪手段：让两次评估使用同一组环境种子、同一批初始状态与同一序列的随机事件，两个策略在同一批回合上打分，逐回合回报的差值抵消了环境本身的难易差异。设单回合回报标准差 σ = 50，两个检查点在同一批回合上的回报相关系数为 ρ，差值标准差降为 σ√(2(1 − ρ))。</p>
+    <div class="formula">
+      差值标准差 = σ · √(2(1 − ρ))；Δ<sub>min</sub> ≈ 2 · σ√(2(1 − ρ)) / √n
+      <span class="note">σ = 50、n = 10 时：独立评估的 Δ<sub>min</sub> ≈ 44.7；ρ = 0.8 的配对评估降到约 20.0；ρ = 0.9 时约 14.2。配对不降低单次评估成本，只让同一成本下的分辨率更高</span>
+    </div>
+    <p>换算成等价规模更直观：n = 10 的配对评估（ρ = 0.8）与 n ≈ 50 的独立评估分辨率相当，因为把 Δ<sub>min</sub> = 20.0 代入 2.83σ/√n 可反解出 n ≈ 50；ρ = 0.9 时等价规模升到约 100 个回合。<strong>配对的前提是两次评估复用同一组种子与同一初始分布；种子集合一旦固定，覆盖率检查的样本必须来自集合之外，两者不可复用同一批回合。</strong></p>
+    <p>配对评估的失效边界有两处。其一，回合内状态发散：环境动力学对初始条件敏感时，两条轨迹的差异随步数放大，相关系数随回合长度衰减，长回合任务的配对收益下降；核对方法是按回合长度分段统计配对差值方差，长段方差不再下降即配对失效。其二，评估实现混入未受控的随机源（环境内全局随机、未种子化的包装器），同一组种子产生不同轨迹，配对静默退化回独立评估；上线前用固定种子连续跑两次、逐条比对轨迹即可发现。工程折中是：检查点精细比较用配对评估，跨批次、跨配置的大范围对比用独立评估。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>评估配置围绕四个决策展开：何时评估、评多少、在哪些环境上评、如何与训练资源共存。</p>
+    <table>
+      <tr><th>参数</th><th>示例值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td><code>evaluation_interval</code></td><td>5</td><td>每几轮训练评估一次</td><td>早期可取小值观察趋势，稳定后可放宽</td></tr>
+      <tr><td><code>evaluation_duration</code></td><td>10</td><td>每次评估的回合数或步数</td><td>按目标标准误反推，先粗后细</td></tr>
+      <tr><td><code>evaluation_duration_unit</code></td><td>episodes</td><td>评估量的计量单位</td><td>回合长度稳定用回合，波动大用步数</td></tr>
+      <tr><td><code>evaluation_num_env_runners</code></td><td>2</td><td>评估进程数</td><td>取训练进程数的三分之一到一半，避免争抢</td></tr>
+      <tr><td>评估覆盖配置</td><td>explore=False</td><td>关闭动作探索，取确定性动作</td><td>评估协议需要可复现</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：为什么评估要单独配置环境？</span>
+      <p>训练环境实例带有持续状态：回合进度、随机数流位置、内部缓存。复用会让评估结果依赖评估时刻的环境状态，两次测量失去可比性。独立实例从固定初始分布重新开始，评估回合之间互不影响；代价是额外的进程与内存开销。<strong>测量独立性优先于资源节省，是评估设计的第一原则。</strong></p>
+    </div>
+    <p>评估协议的记录项固定为五条：回合数与计量单位、探索开关、种子集合与覆盖率抽查比例、配对或独立口径、评估进程数。任意一项在两次实验之间变化，曲线都不再直接可比；记录项与结果文件一并归档，作为结论可复核的最低要求。</p>
+    <p>与上一章差异：第 025 章的回调在主训练管线内插桩，观测对象是训练过程本身；本章的评估构成第二条管线，产出独立口径的测量结果。下一章转向离线数据与行为克隆，讨论完全脱离环境交互的训练路径。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：评估配置</strong></p>
+    <pre class="code"><code>from ray.rllib.algorithms.ppo import PPOConfig
+
+config = (
+    PPOConfig()
+    .env_runners(num_env_runners=6, num_envs_per_env_runner=2)
+    .training(train_batch_size=8000)
+    .evaluation(
+        evaluation_interval=5,               # 每 5 轮训练触发一次评估
+        evaluation_duration=10,              # 每次评估采集 10 个回合
+        evaluation_duration_unit="episodes", # 计量单位：回合长度稳定时用回合
+        evaluation_num_env_runners=2,        # 评估进程独立于训练进程组
+        evaluation_config={
+            "explore": False,                # 关闭探索：评估取确定性动作
+            "env_config": {"split": "eval"}, # 评估环境使用独立参数
+        },
+    )
+)
+algo = config.build_algo()
+result = algo.train()
+# 评估结果与训练结果并列出现，两者的口径不能混用
+print(result["evaluation"]["episode_return_mean"],
+      result["episode_return_mean"])</code></pre>
+    <p>解读：配置把三件事分开表达：何时评（间隔）、评多少（时长与单位）、在哪里评（独立进程组与环境参数）。<strong>evaluation_config 是评估专用覆盖层，</strong>仅影响评估进程的配置；把评估环境的参数与训练环境区分开（例如不同的难度或起点分布），可以观察策略在训练分布之外的表现。接口名称随版本演进（评估相关的配置项在 2.x 中经历过调整），以对应版本的官方文档为准。评估与训练结果位于结果字典的不同字段，读取时先确认路径再解释数值。</p>
+
+    <p><strong>片段 2：评估与训练曲线的对照分析</strong></p>
+    <pre class="code"><code>def compare_curves(train_returns, eval_returns, window=5):
+    """对照训练回报与评估回报，判断策略进展的真实状态。"""
+    # 两端各取若干轮窗口做均值，抑制单点噪声
+    train_recent = sum(train_returns[-window:]) / window
+    eval_recent = sum(eval_returns[-window:]) / window
+    gap = train_recent - eval_recent          # 探索偏差与过拟合共同反映在差值上
+    if eval_recent &gt; 0 and gap / abs(eval_recent) &gt; 0.3:
+        return "训练回报明显高于评估回报：检查探索噪声或过拟合"
+    if eval_recent == 0:
+        return "评估回报尚未起步：确认评估协议与动作是否有效"
+    return "两条曲线的相对关系正常"</code></pre>
+    <p>解读：对照分析把曲线观感变成可执行的判断。<strong>训练回报偏高属于常见现象：探索动作带来乐观估计，评估侧的确定性动作暴露策略真实水平；</strong>差值持续扩大则指向分布偏移。两次测量都带噪，窗口统计比单点比较更能降低误判概率。输出文字集中指向两类排查方向，评估协议问题（探索未关闭、动作无效）与策略问题（过拟合、退化），两者在数值模式上高度相似，需结合评估环境配置进一步区分。</p>
+
+    <p><strong>片段 3：评估回合数与噪声的估算</strong></p>
+    <pre class="code"><code>import math
+
+
+def eval_rounds_for_error(sigma, target_stderr):
+    """按标准误目标推算需要的评估回合数：n ≈ (sigma / stderr)^2。"""
+    n = (sigma / target_stderr) ** 2
+    return math.ceil(n)
+
+
+# 回合回报标准差 50，期望标准误 5：需要约 100 个回合
+# 若缩短到 10 个回合，标准差 50 时标准误约 16，曲线抖动明显
+print(eval_rounds_for_error(50, 5))
+print(eval_rounds_for_error(50, 16))</code></pre>
+    <p>解读：估算公式把评估回合数变成可计算量。回合回报标准差可从结果中的评估统计量近似读取；目标标准误由决策需求决定：目视跟踪可容忍较大误差，模型选择需要更小误差。<strong>评估成本与回合数线性增长，估算给出的是成本的下限参考：</strong>先按较小规模评估跟踪趋势，在关键决策点（例如选择最终检查点）再放大回合数，用分层评估平衡成本与可信度。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>忘记关闭探索</strong>：评估沿用训练时的探索配置，评估回报被探索噪声拉低且波动大。症状是评估曲线系统性低于训练曲线。修复：评估覆盖配置中显式设置 explore=False。</li>
+      <li><strong>评估与训练指标混读</strong>：把训练回报当作性能结论引用。症状是上线后表现低于预期。修复：约定评估字段为对外口径，训练字段仅用于监控训练过程。</li>
+      <li><strong>评估回合数过少</strong>：只测量少数回合就下结论。症状是曲线抖动大、结论反复。修复：按标准误公式反推回合数，关键决策点放大评估规模。</li>
+      <li><strong>评估进程与训练进程争抢资源</strong>：评估触发时训练迭代耗时骤增。症状是迭代时间的周期性尖峰与评估间隔重合。修复：控制评估进程数与频率，或把评估安排到独立资源池。</li>
+      <li><strong>评估环境分布偏移</strong>：评估与训练环境参数差异过大且未记录。症状是结论无法解释。修复：把评估环境参数纳入实验配置存档。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>评估回合回报标准差为 40，希望标准误不超过 8，计算所需回合数；若评估预算只有 25 个回合，说明结论应如何使用。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>n=(40/8)²=25；回合数受限时结果只能用于趋势观察，不能用于精细的模型选择。</div></details>
+      </li>
+      <li>把 evaluation_interval 从 5 改为 20，评估总量不变的条件下，预测评估开销占比与退化检测延迟的变化方向。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>评估次数减少，总开销下降；性能退化最多需要经过约 20 轮训练才被检出，检测延迟上升。</div></details>
+      </li>
+      <li>推导：评估回合数增长为何只能按平方根降低噪声？说明高精度评估的成本含义。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>标准误随 n 的平方根下降；精度翻倍需要回合数变为四倍，高精度评估的成本增长快于线性。</div></details>
+      </li>
+      <li>设计评估协议：固定起点集合、确定性动作与覆盖率检查三项要求，说明各针对哪类评估偏差。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>固定起点降低跨次测量方差；确定性动作消除探索噪声；覆盖率检查防止固定起点集合导致的记忆偏差。</div></details>
+      </li>
+      <li>设计对比实验：同一次训练交替使用两种评估回合数配置，比较曲线平滑度与决策结论一致性，给出选择依据。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>小型配置跟踪趋势，大型配置在关键节点复核；对比同一检查点在两种规模下的估计差，差值小于决策阈值时小型配置即可用。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>评估使用独立工作进程组，定期同步策略权重，产出与训练口径分离的性能测量。</li>
+      <li>评估侧关闭探索、固定起点分布，测量协议确定化，结论才可复现、可比较。</li>
+      <li>评估回合数决定噪声水平，标准误按 σ/√n 下降，精度提升的成本增长快于线性。</li>
+      <li>评估频率与时长共同构成评估预算，通常控制在训练耗时的百分之五到百分之十。</li>
+      <li>训练回报与评估回报分属两条曲线，前者监控训练过程，后者用于对外结论。</li>
+      <li>下一章进入离线数据与行为克隆：脱离环境交互的监督式训练路径。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch025.html">← 第 025 章：RLlib回调函数机制</a>
+    <a class="next" href="ch027.html">第 027 章：RLlib离线数据与行为克隆 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第010章 设置激光雷达并获取点云 | 机器人仿真学习课程 · Isaac Sim 强化学习训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · 仿真环境与训练框架</span>
+    <span class="sep">/</span>
+    <span>第 010 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · 仿真环境与训练框架</div>
+    <h1>第 010 章：设置激光雷达并获取点云</h1>
+    <p class="lead">给机器人装上"环视测距"：理解激光雷达的扫描几何与点云格式，把稀疏的三维点整理成固定维度的观测，并与深度相机做一次彻底的对比。</p>
+    <ul class="meta">
+      <li>主题：观测设计 / 激光雷达点云</li>
+      <li>相关组件：Isaac Sim（RTX Lidar、点云数据）</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 009 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解激光雷达的测距与扫描几何：飞行时间原理、方位/俯仰角与通道数如何决定点云的分布。</li>
+      <li>会创建 RTX 激光雷达并读取点云，理解 (N, 3) 数据格式与无回波的表示。</li>
+      <li>掌握传感器坐标系到机器人坐标系/世界坐标系的变换，会用旋转矩阵或四元数批量变换点云。</li>
+      <li>会做点云后处理：过滤无效点、降采样到固定点数、构造可输入网络的观测。</li>
+      <li>能说清点云与深度图的异同，知道哪些任务用哪个更合适。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>深度相机给出整齐的"像素网格深度"，激光雷达给出的是一团<strong>三维散点</strong>：方位角范围通常 360°，距离可到几十米，但点的分布不均匀，近处密、远处疏。它是导航、避障与移动操作的主力传感器，也常与相机融合使用（相机提供纹理与语义，雷达提供精确几何）。</p>
+    <p>在 RL 里，点云比图像更难"喂"：点数不固定、无网格结构、直接展平进全连接网络会维度爆炸。本章除了配置传感器，重点讲清两件事：<strong>点云的几何含义</strong>（它是怎么从角度+距离生成的）与<strong>固定维度观测化</strong>（降采样策略），这也是 028 章"基于点云的观察"的前置。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 测距与扫描：角度 × 距离 = 三维点</h3>
+    <p>真实激光雷达用飞行时间（Time of Flight, ToF）测距：发射一束激光，测量反射回来经过的时间 Δt，距离 r = c·Δt/2（除以 2 是因为光走了往返两程）。仿真里不必真的发激光，RTX 渲染管线做 GPU 光线投射（ray casting），直接得到每条射线与场景的交点距离。无论哪种实现，输出都是同一套"扫描几何"：</p>
+    <div class="formula">
+      x = r·cos(θ<sub>el</sub>)·cos(θ<sub>az</sub>)，y = r·cos(θ<sub>el</sub>)·sin(θ<sub>az</sub>)，z = r·sin(θ<sub>el</sub>)
+      <span class="note">θ_az 是方位角（一圈内变化），θ_el 是俯仰角（由通道数决定，如 ±15° 分 32 线）</span>
+    </div>
+    <p>要点：<strong>通道数（线数）</strong>定垂直分辨率（32 线分 ±15°、层距约 1°）；<strong>旋转频率 × 每圈采样数</strong>定水平分辨率。每秒点数 = 三者相乘：32 × 1800 × 10 ≈ 57.6 万点/秒，训练里通常只保留几百到几千个点。</p>
+
+    <h3>2. 点云的数据格式与坐标系</h3>
+    <p>点云通常是一个 (N, 3) 或 (N, 3+k) 的数组：前三维是 x, y, z（米），额外的 k 列常见的是反射强度（intensity）、时间戳或环号（ring）。特殊点有两类：<strong>无回波</strong>（打到天空）与<strong>过近点</strong>（机器人自身），以 inf 或超范围值出现，处理原则与 009 章一致：掩码、替换、再使用。</p>
+    <p>坐标系要格外小心。点云默认在<strong>传感器本地坐标系</strong>里（＋x 朝前、z 朝上这类约定随实现而有差异）；要叠加多帧、做地图或计算"障碍物在底盘哪个方向"，需要把它变换到机器人坐标系或世界坐标系：</p>
+    <div class="formula">
+      P<sub>base</sub> = R<sub>sensor→base</sub> · P<sub>sensor</sub> + t<sub>sensor→base</sub>
+      <span class="note">R 是旋转矩阵（由安装角决定），t 是安装位置偏移；两者合称外参</span>
+    </div>
+    <p>传感器装在哪、朝哪，决定数字如何解读。导航任务把点云统一到 base 系后，"最近障碍距离"即可直接计算、直接进奖励。</p>
+
+    <h3>3. 稀疏性与降采样：如何把点云喂给策略</h3>
+    <p>点云三个特性让它难以直接进网络：<strong>无序</strong>（点的顺序没有意义）、<strong>数量不定</strong>（每帧有效点数不同）、<strong>分布不均</strong>（近处密集）。围绕它们有三条常用路线：</p>
+    <ul>
+      <li><strong>降采样到固定点数</strong>：从 N 点中抽 M 个（如 256），不足补零。最省事，适合入门与低维观测；缺点是大场景中"采样抽掉了关键障碍物"。</li>
+      <li><strong>体素化（voxelization）</strong>：空间切成固定网格（如 2 cm），每格标记有无点，得到固定形状的 3D 张量。保留空间结构，内存开销大。</li>
+      <li><strong>特征编码器</strong>（PointNet 风格或柱状编码 pillars）：让网络直接消费点云，学习对顺序不变的特征，是 028 章的进阶内容。</li>
+    </ul>
+    <p>工程准则：256 个点（768 维）已与相机特征量级相当；并行训练里每条经验都存一份点云，点数翻倍内存翻倍，<strong>降采样是必须的设计决策</strong>，属于架构层面的取舍。</p>
+
+    <h3>4. 扫描参数的量化：角分辨率与点数预算</h3>
+    <p>三种分辨率相互制约，先给出定义再分配预算：</p>
+    <div class="formula">
+      水平角分辨率 Δθ = 360° / 每圈采样数；垂直层距 Δφ = FOV<sub>v</sub> / (channels − 1)；点数率 = channels × 每圈采样数 × f<sub>旋转</sub>
+      <span class="note">16 线覆盖 ±15°（共 30°）时层距 2°；32 线时约 0.97°</span>
+    </div>
+    <p>数值换算：10 Hz、每圈 1800 采样时水平角分辨率 0.2°；在 5 m 距离处，相邻采样点的横向间隔约 R·Δθ ≈ 1.7 cm，相邻扫描线的间隔约 R·Δφ ≈ 17 cm。<strong>近处密、远处疏由几何决定</strong>：同一角分辨率在 10 m 处的间隔是 5 m 处的两倍。原始点数率按 16 × 1800 × 10 ≈ 28.8 万点/秒计，进入训练的是降采样后的 256 点/帧，10 Hz 下约 2560 点/秒，压缩掉两个数量级。</p>
+    <p>再估算一次数据带宽：每圈 16 × 1800 = 28,800 点，按单精度 12 字节/点约 346 KB/帧；10 Hz 下约 3.5 MB/秒。单看不大，但训练时每个并行环境都要独立拷贝、过滤、变换，若这些操作在 CPU 上按环境串行执行，2048 个环境意味着每秒约 7 GB 的搬运量。对策与深度图一致：把过滤与降采样放到 GPU 侧按批次张量运算，或用采样率限制进入策略的帧数。这条估算决定了点云传感器能否在整个训练规模上负担得起。对照 009 章的深度相机（224×224、单精度、30 Hz 约 6.0 MB/秒），两种传感器的数据量级接近，选择依据主要是视野要求与几何结构，带宽处在同一水平。</p>
+
+    <h3>5. 观测点数与回放内存的估算</h3>
+    <p>点云进入回放缓冲后按采样点存储，内存开销可以直接乘出来：</p>
+    <div class="formula">
+      bytes/样本 ≈ M × 3 × 4（单精度浮点）
+      <span class="note">M = 256 时约 3 KB/样本，10⁶ 条经验约 3 GB</span>
+    </div>
+    <table>
+      <tr><th>观测点数 M</th><th>观测维度（展平）</th><th>10⁶ 条经验内存</th><th>适用</th></tr>
+      <tr><td>64</td><td>192</td><td>约 0.75 GB</td><td>低维基线、快速迭代</td></tr>
+      <tr><td>256</td><td>768</td><td>约 3 GB</td><td>导航避障常用档位</td></tr>
+      <tr><td>512</td><td>1536</td><td>约 6 GB</td><td>需要更细的几何信息</td></tr>
+    </table>
+    <p>表格只统计点云坐标本身，尚未加入图像与关节数据。压缩手段有三类：降低 M、用半精度存储、限制写缓冲的帧率。任一手段都会改变信息量与训练表现，扩容前先做这条乘法估算。</p>
+
+    <h3>6. 外参标定的量化验证</h3>
+    <p>拿到点云后，用两个物理事实验证外参与坐标约定。地面验证：雷达安装高度 h = 0.12 m 时，base 系里地面点的 z 应集中在 −0.12 m 附近（±2 cm 以内），并形成按俯仰角分层的环状结构。水平验证：面对约 2 m 外的墙壁停稳，base 系点云在 +x 方向应形成一片密集平面，其 x 值集中在 2 m（±5 cm）。两条检查能同时发现轴向约定错误与符号反写。</p>
+    <p>再加一条几何预测核对：第 k 条扫描线在地面上的落地半径近似为 r<sub>k</sub> = h / tan(φ<sub>k</sub>)，φ<sub>k</sub> 为该线相对水平面的俯角。h = 0.12 m 时，15° 线的半径约 0.45 m，10° 线约 0.68 m，5° 线约 1.37 m。用实测环半径与预测值对照，偏差在厘米级说明俯仰角定义与外参都正确；若差出数倍，通常是俯仰角从垂直轴起量的约定没对齐。</p>
+    <p>这些验证加起来不到 20 行代码，却是后续地图构建、避障逻辑与奖励计算可信的前提；每次改安装位置或数据传输方式后都应重跑一遍，并把结果（地面峰值高度、墙距偏差、环半径表）写进标定文档。多传感器共存时先各自标定、再联合标定，联合误差约为两者之和。</p>
+
+    <h3>7. 扫描时间、运动畸变与体素内存</h3>
+    <p>旋转式雷达的一圈扫描需要时间：10 Hz 对应 100 ms。机器人以 0.5 m/s 前进时，一圈扫描里机体移动 5 cm；以 1 m/s 移动 10 cm。扫描起点与终点的射线基准不同，障碍物在点云里会被"拉斜"：1 m 处的横向位移 5 cm 约对应 2.9° 的角度偏移，近距离的薄障碍（立柱、桌角）在点云里会呈现为一段弧线。缓解手段有三条，按代价排序：降低行进速度（位移与速度成正比）；提高旋转频率（20 Hz 把单圈位移减半，代价是同等点数下角分辨率下降）；给每个点附加时间戳做运动补偿（效果最好，实现成本也最高）。</p>
+    <p>体素化观测的内存同样要预先做乘法。5 cm 体素覆盖 20 × 20 × 4 m 的环境，需要约 1.28 × 10<sup>7</sup> 个格子，按 1 bit 存占用位图约 1.6 MB，单环境可以接受；2 cm 体素覆盖 10 × 10 × 2 m，需要 2.5 × 10<sup>7</sup> 个格子，位图约 3.1 MB；若每格改存浮点概率或特征，体积再放大 32 倍，单环境约 100 MB，并行数千环境时无法承受。<strong>体素分辨率从来不是单独的选择，它与环境数一起被内存预算约束。</strong></p>
+    <p>数据带宽的账也要算在训练规模上：单环境一圈 16 × 1800 = 28800 个点，按每点 12 B（三个 float32）约 346 KB，10 Hz 下约 3.5 MB/s；2048 个环境副本在 CPU 侧串行处理时，每秒搬运量约 7 GB 量级。过滤与降采样只有落在 GPU 上批量执行，这笔账才回到可接受范围；这也是"点数预算从设计阶段就要控制"的另一半理由。</p>
+
+    <h3>8. 点数预算的分桶分配表</h3>
+    <p>把"降采样到 256 点"从一句话落实成一张分配表：按距离分桶，近处多给配额。示例分配（0.2–2 m、2–5 m、5–10 m 三个桶，配 256 点）：</p>
+    <table>
+      <tr><th>距离桶</th><th>点数配额</th><th>占比</th><th>理由</th></tr>
+      <tr><td>0.2 – 2 m</td><td>128</td><td>50%</td><td>避障与接触相关的主角，密度最高</td></tr>
+      <tr><td>2 – 5 m</td><td>77</td><td>30%</td><td>中程空间结构，支撑导航决策</td></tr>
+      <tr><td>5 – 10 m</td><td>51</td><td>20%</td><td>远场轮廓，信息价值低于近处</td></tr>
+    </table>
+    <p>为什么把一半点位留给近处？因为安全与操作行为的成败都由 2 m 内的几何决定，而随机抽样在面对"大片远处墙加一个近处小柱"的场景时，小柱的点数占比正比于其点数总量，很容易被抽丢。分桶分配把这个占比固定下来：近桶无论被填得多满，始终有一半配额。实现上用一次 <code>searchsorted</code> 把距离数组切成三段，各段独立抽样后拼接，向量化版本的单帧成本在微秒量级；桶的边界与配额写进配置，随任务不同的作用距离调整。核对方法是构造"近处小物体+远处大平面"的测试场景，检查小物体表面的点是否稳定出现在每次采样的样本里。</p>
+    <p>远场还有一类由垂直线数决定的失效模式值得量化：层距 = 垂直视场 / (通道数 − 1)，16 线覆盖 30° 时层距 2°，在 10 m 处的相邻扫描线间隔约 10 × tan 2° ≈ 0.35 m；32 线时层距约 0.97°，10 m 间隔约 0.17 m；4 线时层距 10°，10 m 间隔约 1.8 m。含义很直接：10 m 外一个高 0.2 m 的矮桩，16 线雷达的两条扫描线都可能从它头顶或脚边掠过，点云里完全没有它的痕迹；把线数升到 32 或把任务的作用距离压到 5 m 以内（间隔减半到约 0.17 m）才能稳定看到它。练习 5 让线数从 16 降到 4，预期后果就来自这张换算：垂直线数直接决定"多高的障碍在多远会被漏检"。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>配置雷达并把点云变成观测的步骤：</p>
+    <ol>
+      <li><strong>选安装位置与朝向</strong>（底盘顶部中心最常见：360° 视野无遮挡；机械臂任务常装腕部前方）。</li>
+      <li><strong>定扫描参数</strong>（水平 FOV、垂直 FOV、通道数、旋转频率，先按"每秒点数预算"估一遍）。</li>
+      <li><strong>读点云并过滤</strong>（无效点、自身点；记录有效比例与最近点距离）。</li>
+      <li><strong>坐标变换</strong>（需要跨帧/跨传感器融合时，变到 base 或 world；只在单帧内用的任务可留在传感器系）。</li>
+      <li><strong>降采样</strong>（体素格平均或随机抽样到固定 M 点；补零点用远处值填充，语义与 009 章一致）。</li>
+      <li><strong>监控</strong>（点数、最近障碍距离、有效率，三项指标能提前发现 90% 的配置错误）。</li>
+    </ol>
+    <table>
+      <tr><th>参数</th><th>导航任务</th><th>机械臂避障</th><th>影响</th></tr>
+      <tr><td>水平 FOV</td><td>360°</td><td>120°（前向）</td><td>覆盖范围；360° 需要旋转式扫描模型</td></tr>
+      <tr><td>垂直 FOV</td><td>±15°–30°</td><td>±20°</td><td>能否看到地面与高处障碍</td></tr>
+      <tr><td>通道数</td><td>16–32</td><td>8–16</td><td>垂直线数；与点数预算直接挂钩</td></tr>
+      <tr><td>旋转/扫描频率</td><td>10–20 Hz</td><td>5–10 Hz</td><td>时间分辨率；高频率下点数不变则角分辨率下降</td></tr>
+      <tr><td>观测点数 M</td><td>256–1024</td><td>128–512</td><td>直接决定网络输入维度与内存</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计思维：点云与深度图，什么时候用哪个？</span>
+      <p>深度图密集、有网格、窄视野，适合抓取插拔等精细操作；点云稀疏、无网格、大视野，适合导航避障等全向感知。两者的几何内核相同，深度图是密集角度采样，点云是稀疏角度采样，工程上常互相转换与融合。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：创建雷达并读取点云</strong>（类名与参数随版本有差异，以官方文档为准）</p>
+    <pre class="code"><code>import numpy as np
+from isaacsim.core.api.sensors import RTXLidarSensor  # 雷达类名随版本变化，如 LidarRtx
+
+lidar = world.scene.add(RTXLidarSensor(
+    prim_path="/World/Robots/Jetbot/Lidar",       # 底盘顶部中心：360° 无遮挡
+    name="lidar",
+    translation=np.array([0.0, 0.0, 0.12]),       # 抬高 12 cm：避开底盘自身的遮挡
+    config="Example_Rotary",                       # 扫描模式：旋转式/固态，按资产库名称选择
+    rotation_frequency=10.0,                       # 10 Hz 旋转：每秒十圈完整扫描
+    horizontal_fov=360.0,                          # 全向
+    vertical_fov=30.0,                             # 垂直 30 度
+    num_channels=16,                               # 16 线：点数与垂直分辨率折中
+))
+world.reset()
+world.step(render=True)                            # 雷达同样需要首帧渲染/更新
+
+points = np.asarray(lidar.get_current_frame()["point_cloud"])  # 形状 (N, 3)，单位米
+print("点数:", points.shape, " 有效点:", points[np.isfinite(points).all(axis=1)].shape)</code></pre>
+    <p>解读：参数的选择逻辑都在 1、4 节里。注意参数乘积：10 Hz × 16 线 × 每圈约 1800 采样 ≈ 28.8 万点/秒，所以后面必须降采样。挂载抬高 12 cm 是为了让底盘自身不进入扫描（真实雷达也常装在略高的位置）；如果忽略这一点，你会看到一圈常驻的"近距离点"，形状正好是机器人自己。读取时用 <code>np.isfinite(...).all(axis=1)</code> 先筛出含有效坐标的点，是第一道卫生检查。</p>
+
+    <p><strong>片段 2：过滤、坐标变换与降采样</strong></p>
+    <pre class="code"><code>import numpy as np
+
+MAX_RANGE = 10.0    # 有效距离上限：超过视为无效（与 near/far 的取舍同理）
+
+def to_base_frame(points, R_sensor_to_base, t_sensor_to_base):
+    """把点云从传感器本地系变换到 base 系：P_base = R @ P + t。"""
+    return points @ R_sensor_to_base.T + t_sensor_to_base  # 批量矩阵乘：一次处理 N 个点
+
+def clean_and_sample(points, R, t, num_points=256):
+    """过滤无效点 → 变到 base 系 → 降采样到固定点数（不足补远处点）。"""
+    pts = points[np.isfinite(points).all(axis=1)]        # 去掉 inf/NaN
+    dist = np.linalg.norm(pts, axis=1)                   # 传感器系下的距离
+    pts = pts[(dist &gt; 0.2) &amp; (dist &lt; MAX_RANGE)]          # 去掉自身点与超程点
+    pts = to_base_frame(pts, R, t)                       # 统一到 base 坐标系
+    if pts.shape[0] &gt;= num_points:
+        idx = np.random.choice(pts.shape[0], num_points, replace=False)  # 均匀随机抽样
+        pts = pts[idx]
+    else:
+        pad = np.full((num_points - pts.shape[0], 3), MAX_RANGE)          # 远处值填充
+        pts = np.vstack([pts, pad])
+    return pts.astype(np.float32)</code></pre>
+    <p>解读：这个函数把 3 节的三条路线里最省事的一条实现了出来，但每一步都有讲究。过滤放在"传感器系下的距离"上做：距离旋转不变，先筛再变换更省。<code>(dist &gt; 0.2) &amp; (dist &lt; MAX_RANGE)</code> 两个阈值分别对应"自身点"与"天空点"。变换用批量矩阵乘 <code>points @ R.T</code> 一次处理 N 点，避免逐点循环。降采样选择均匀随机抽样是入门方案：它保留了整体的空间分布，但可能抽丢关键的近处障碍。想保住近处信息，可以改成"按距离分桶、近桶多抽"（练习 4 会让你做这个改进）。补零点用 <code>MAX_RANGE</code> 填充，与深度图用 far 填充语义一致：让策略把"空缺"理解为"远方"，与"脚下"区分开。</p>
+
+    <p><strong>片段 3：最近障碍距离与健康监控</strong></p>
+    <pre class="code"><code>import numpy as np
+
+def lidar_health(points, R, t):
+    """三项指标：点数、有效率、最近障碍距离（base 系）。"""
+    total = points.shape[0]
+    valid = points[np.isfinite(points).all(axis=1)]
+    valid = valid[np.linalg.norm(valid, axis=1) &lt; MAX_RANGE]
+    ratio = valid.shape[0] / max(total, 1)                 # 有效率：朝向错误时会骤降
+    if valid.shape[0] == 0:
+        return total, ratio, float("inf")                  # 全无效：返回无穷远，便于上层判断
+    pts_base = to_base_frame(valid, R, t)
+    dist_xy = np.linalg.norm(pts_base[:, :2], axis=1)      # 只算水平距离：导航关心平面障碍
+    return total, ratio, float(dist_xy.min())
+
+# 让底盘朝不同方向各停一秒，观察最近距离的变化：
+# 面向墙壁时应稳定在 ~0.5 m 量级；旋转中 min 值应平滑变化、不出现乱跳</code></pre>
+    <p>解读：有效率骤降通常意味着雷达朝向配置错误；最近距离的平滑性验证变换的正确性，R 或 t 用错时最近距离会出现跳变（如恒等于"自身点"距离）。<code>dist_xy</code> 只取水平分量是导航任务的惯例：地面点云会让三维最近距离恒为"雷达到地面的高度"，对避障没有意义。这三行代码稍作包装就能直接产出导航奖励（离障碍越近惩罚越大，036 章展开），是"感知直接服务奖励"的典型例子。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>把 inf 当坐标</strong>：无回波点参与矩阵运算后整组数据变 NaN。修复：先 <code>isfinite</code> 过滤，再变换、再降采样，顺序不能反。</li>
+      <li><strong>忽略点数不固定</strong>：缓冲区每帧长度不同，网络输入维度变化直接报错。修复：固定 M 点输出并补零；把补零语义定为"远方"。</li>
+      <li><strong>坐标系混用</strong>：点云在传感器系，你按 base 系解读，导致避障方向左右颠倒。修复：明确每份数据的坐标系并写进函数注释；变换矩阵用已知几何验证（正前方墙壁应在 +x 方向）。</li>
+      <li><strong>把点云直接展平进 MLP</strong>：256 点就是 768 维，几万个点直接上万维，网络第一层参数爆炸。修复：降采样 + 特征编码（PointNet 风格，028 章）。</li>
+      <li><strong>雷达频率与控制频率错配</strong>：10 Hz 雷达配 60 Hz 控制时，同一帧被读 6 次，策略易误判运动障碍。修复：降低决策频率，或在观测里标记数据新旧。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>点数预算计算：16 线、水平 360° 每圈 1440 采样、10 Hz 的雷达每秒输出多少点？若要控制训练数据到每秒 5000 点以内，该怎么改参数？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>16×1440×10 = 23.04 万点/秒；可以降旋转频率、减线数或只保留经降采样的 256 点/帧。</div></details>
+      </li>
+      <li>把点云变换到 base 系后，找出所有地面点（|z| 接近雷达安装高度），验证它们大致在同一水平面上。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>雷达高 0.12 m 时地面点在 base 系 z ≈ −0.12；平面对应的距离随俯仰角变化，可以画距离-高度散点确认。</div></details>
+      </li>
+      <li>交叉验证：同一场景下用雷达算出的最近障碍距离与 009 章深度相机中心像素的深度对比，解释两者的合理差异（采样角度不同）。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>深度相机只看光轴附近；雷达取全向最近点，通常更小或相等。差值大说明场景里存在相机视野外的障碍。</div></details>
+      </li>
+      <li>改进降采样：实现"按距离分桶"的抽样（近处桶多抽、远处桶少抽），在保持 256 点的前提下不丢近处障碍，并设计一个能证明改进有效的测试场景。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>分成 4–8 个距离环，按数量反比分配配额；测试场景可用"大片远处墙 + 一个近处小柱"，看柱面点是否仍在样本中。</div></details>
+      </li>
+      <li>实验设计：把雷达线数从 16 降到 4（其余不变），预测移动避障任务的成功率与训练速度变化，并给出验证方案。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>线数降四倍意味着垂直分辨率变粗，薄障碍物可能漏检；训练单步成本降低，但任务成功率可能下降，典型的"信息-成本"权衡。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>雷达 = 角度 × 距离：<strong>通道数决定垂直分辨率、旋转频率与每圈采样数决定水平分辨率</strong>，每秒点数由三者相乘得来。</li>
+      <li>点云是 (N, 3) 量级的无网格数据：无序、数量不定、分布不均；无回波点必须先过滤。</li>
+      <li>坐标变换 P<sub>base</sub> = R·P + t 是解读点云的前提；用几何事实（地面高度、墙壁方向）验证外参。</li>
+      <li>喂给策略前必须固定维度：随机抽样 / 体素化 / 特征编码三选一；补零点用"远方值"，语义保持连续。</li>
+      <li>下一章：011 实现简单的重置逻辑，三种传感器都就绪后，回合制的另一个支柱登场：把机器人可靠地放回初始状态。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch009.html">← 第 009 章：设置深度相机并获取深度图</a>
+    <a class="next" href="ch011.html">第 011 章：实现简单的重置逻辑 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

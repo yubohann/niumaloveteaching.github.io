@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第076章 多机器人系统性能基准测试 | 多机器人协同学习课程 · ROS2 通信与系统集成</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第四篇 · 系统集成与工程化</span>
+    <span class="sep">/</span>
+    <span>第 076 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第四篇 · 系统集成与工程化</div>
+    <h1>第 076 章：多机器人系统性能基准测试</h1>
+    <p class="lead">"感觉挺流畅"不是工程结论：用可复现的方法学测出时延、抖动、吞吐与任务完成时间的真实分布，预热、稳态窗、多次重复、分位数与置信区间，再把结论写进验收文档。</p>
+    <ul class="meta">
+      <li>主题：系统集成 / 性能测量方法学</li>
+      <li>关键机制：测量点与时间戳、分位数统计、置信区间、可复现实验设计</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 075 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>区分基准测试（benchmark）与压力测试（stress）：前者在"定义清楚的条件"下量稳态性能，后者找系统极限，两者目的与报告方式不同。</li>
+      <li>掌握测量学四要素：测量点、时钟条件、稳态窗、统计量（分位数 + 置信区间），知道均值为什么不够用。</li>
+      <li>会设计可复现的基准实验：自变量矩阵、控制变量、重复次数与样本量估算。</li>
+      <li>能实现一个延迟/抖动测量节点：时间戳注入、接收端统计、直方图与分位数输出。</li>
+      <li>会读一份基准报告：判断哪条链路是时延预算的大头，哪个规模是容量的"膝盖点"。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>多机器人系统上线前最常被跳过的一步就是"量一遍"。默认路径是：功能联调通了、跑了几圈没出事、上线。然后第一次真实压力场景（20 台同时回传、大消息突发）就把控制环的时延从 15 ms 推到 60 ms。问题的根源在于<strong>没有人知道它到底能扛多少</strong>，没有基线，就无法回答"这次改动是变快还是变慢"、"20 台是不是超了"。</p>
+    <p>基准测试就是给系统建立"性能档案"：在明确条件下测出可复现的数字，成为后续所有优化与扩容决策的参照系。它也是第 072 章（保障）与第 077 章（压测）的底座，保障策略要知道"劣化到什么程度算越线"，压测要知道"从哪个基准出发找极限"。<strong>本章不教你跑分，教你设计实验。</strong></p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 指标的坐标系：测什么、在哪测</h3>
+    <table>
+      <tr><th>指标</th><th>定义</th><th>测量点</th><th>工程含义</th></tr>
+      <tr><td>单向时延</td><td>发布时刻到订阅回调的间隔</td><td>消息时间戳 vs 接收时钟</td><td>需要时钟同步才有意义</td></tr>
+      <tr><td>往返时延 RTT</td><td>ping-pong 两程之和</td><td>请求端（同钟）</td><td>免同步，但混入对端处理时间</td></tr>
+      <tr><td>抖动</td><td>相邻到达间隔的标准差或 P99−P50</td><td>接收端到达序列</td><td>控制环稳定性的真实敌人</td></tr>
+      <tr><td>吞吐</td><td>单位时间有效载荷字节数</td><td>接收端统计窗口</td><td>与消息大小、QoS、网卡相关的复合量</td></tr>
+      <tr><td>任务完成时间</td><td>任务下达到完成的端到端时长</td><td>task_event 话题</td><td>业务层最关心的整合指标</td></tr>
+    </table>
+    <p>选择测量点有个原则：<strong>尽量把测量点放在业务边界</strong>。网卡打点测的是通信本身，业务边界测的是"用户感受到的时延"，后者才是验收标准。两者都要测，但要分开报告：一帧图像 40 ms 里，多少是压缩、多少是 DDS、多少是回调排队，拆开才知道优化该砍哪里。</p>
+    <div class="formula">
+      单向时延测量误差 ≤ 时钟偏差 + 打点开销；置信区间 ≈ 1.96 × σ / √n（95%，n 为样本数）
+      <span class="note">局域网 chrony/PTP 同步可做到偏差 &lt; 1 ms；n = 100 时置信半径约为 σ 的 1/5</span>
+    </div>
+
+    <h3>2. 为什么均值会骗人：分位数与长尾</h3>
+    <p>两个服务器的平均时延都是 10 ms：一个稳定在 8–12 ms，另一个 95% 在 2 ms、5% 在 150 ms。对控制环来说后者是灾难，每二十帧就有一帧迟到，恰恰是老出问题的那一帧引发抖动与失稳。所以基准报告的最低配置是<strong>P50/P95/P99 + 最大值 + 采样数</strong>，均值仅在分布对称时才有参考价值。</p>
+    <p>抖动的来源多在排队侧，传输链路的贡献通常更小：发送端突发（一帧大图挤压小消息）、交换机缓冲、接收端回调线程被占用。量化方式是看"到达间隔分布"与"服务端的发送间隔分布"的差，差出来的就是你系统里"制造不确定性"的部分。<strong>基准测试的深层目的是让不确定性可见，记录数字只是手段。</strong></p>
+
+    <h3>3. 实验设计：让数字可复现</h3>
+    <p>同样的代码在不同条件下能测出两倍差距，所以基准实验要先"锁变量"：</p>
+    <ul>
+      <li><strong>自变量矩阵</strong>：机器人数量 N ∈ {2, 5, 10, 20}、消息大小 S ∈ {64B, 1KB, 64KB}、频率 f ∈ {10, 50, 100 Hz}、QoS（Reliable/Best-effort）、拓扑（直连/单 AP/双 AP），按需取子集，逐维扫描。</li>
+      <li><strong>控制变量</strong>：同一硬件型号、同一 AP、后台无其他流量；测试机 CPU 亲和性与电源模式固定；关闭无关日志与 rosbag 录制（录制本身吃带宽）。</li>
+      <li><strong>预热（warm-up）</strong>：前 30 秒数据丢弃，发现握手、CPU 升频、队列填充都在这个阶段，不预热会污染统计。</li>
+      <li><strong>稳态窗</strong>：取中段 60–300 秒数据，用"每分钟指标漂移 &lt; 5%"判稳态。</li>
+      <li><strong>重复</strong>：每个条件至少 5 次独立运行，报告"各次的中位数"；所有样本混在一起时，单次环境波动会主导结论。</li>
+    </ul>
+    <p>样本量感：要区分"15 ms 与 18 ms"这种 20% 的差异，σ ≈ 3 ms 时每组约需 n ≈ 2×(1.96+0.84)²×σ²/Δ² ≈ 16 次；为覆盖环境漂移与无效样本再留余量，每个条件的测量次数按三五十次规划，跑一次定论得不出可信结论。</p>
+
+    <h3>4. 读报告：找瓶颈与膝盖点</h3>
+    <p>基准报告的价值在"拆解"与"对照"。时延拆解的例子：控制指令端到端 18 ms = 应用生成 2 ms + DDS 序列化 1 ms + 发送排队 3 ms + 无线传输 6 ms + 接收排队 3 ms + 回调调度 3 ms，<strong>大头在传输与排队</strong>，那么优化方向是链路与线程，把应用代码重写一遍属于方向错位。</p>
+    <p>"膝盖点"是另一类关键结论：吞吐随负载上升，到达某点后时延非线性上翘（排队论里的饱和）。例如 4 台机器人时 P95 时延 12 ms，8 台 15 ms，12 台 40 ms，12 台附近的"膝盖"说明系统容量约 8–10 台。扩容决策（加 AP、分域）就以此为据，等到故障发生就晚了。<span class="note">这一方法直接对接 077 章的压测：压测找膝盖，基准测膝盖前那一段的稳态质量。</span></p>
+
+    <h3>5. 数值算例：样本量与置信区间怎么定</h3>
+    <p>先说单组测量：均值的 95% 置信半径约为 1.96σ/√n。σ = 4 ms、n = 25 时半径约 1.57 ms，意味着"P95 = 18 ms"这类结论自带 ±1.6 ms 的统计不确定性，改一个参数后测到 16.6 ms 的"提升"可能只是噪声；要把半径压到 1 ms，需要 n ≈ (1.96×4/1)² ≈ 62 个样本。再说两组比较：要在 σ = 3 ms 下分辨 15 ms 与 18 ms 的差异（Δ = 3 ms），每组约需 2×(1.96+0.84)²×σ²/Δ² = 2×7.84×9/9 ≈ 16 次；把判别目标收紧到 Δ = 2 ms，同样 σ 下升到约 36 次；若 σ = 4 ms 且 Δ = 2 ms，则约 63 次。这解释了"每条件三五十次起步"的经验值来自哪里，也给出升级方向：想让结论更细，要么加测量次数（成本线性），要么降低方差（固定硬件与后台流量、改进测量方法，成本可能更低）。报告中应同时给出 n 与置信半径，让读者能自行判断两条曲线的差异是否超过了统计噪声。</p>
+
+    <h3>6. 数值算例：时钟偏差与 Little 定律的量级感</h3>
+    <p>单向时延的误差上界就是两端时钟偏差。若同步做到 ±5 ms，而控制环 P95 的验收线是 20 ms，那么测量结果里有 25% 的预算可能来自时钟偏差，系统自身消耗的预算因此被高估；所以单向测量报告必须附同步偏差实测值，或者改用 RTT（单端自洽、免同步，代价是混入对端处理时间）。需要区分"偏差"与"漂移"：偏差是固定偏移，可事后校正；漂移随时在变，只能靠持续同步压制。基准测试关心的是两者合并后的最大误差，用"测试期间同步服务记录的最大偏差"作为报告字段最稳妥。</p>
+    <p>Little 定律给排队规模一个快照：系统内消息数 L = 到达率 λ × 平均驻留时间 W。λ = 1000 条/秒、W = 5 ms 时 L = 5 条，这直接告诉你队列深度至少留 5 的余量，留 10 就有 2 倍安全系数；如果压测中 W 涨到 50 ms，L 变成 50，原深度 10 的队列会持续丢消息，时延指标看似没变，实际是"丢出来的好看"。读膝盖点的数据也要带上这个视角：4 台 12 ms、8 台 15 ms、12 台 40 ms 的曲线里，12 台处的时延上翘对应队列利用率越过 80%，此时任何抖动都会被放大成尾延迟；工程容量取到膝盖前的 8–10 台，并预留"平台期"给固件升级与流量增长，是比赌极限更稳的选择。</p>
+
+    <h3>7. 数值算例：探针自身的流量税</h3>
+    <p>测量本身要花流量，这笔税必须先算再跑。100 Hz 探针、载荷 1 KB 时，单条链路的探针流量 = 100 × 1024 × 8 ≈ 0.8 Mbps，已经接近一路压缩视频的量级，把它叠加到本已紧张的链路上，测出来的时延包含"探针自己制造的拥塞"，结论不可信。对策有三：把探针载荷压到 64 B（流量降到约 51 kbps，比 1 KB 小 16 倍），在报告里显式记录探针开销并在分析时扣除，或者让探针复用业务消息的时间戳（零额外流量，代价是只能测真实业务流）。任何一份基准报告都应写明探针频率、载荷大小与是否与业务同时运行，这三项缺一个，数字就失去可比性。</p>
+    <p>再给时延拆解一个完整例子：一次 40 ms 的端到端时延 = 图像压缩 20 ms + DDS 序列化 2 ms + 发送队列 5 ms + 无线传输 6 ms + 接收回调排队 7 ms。大头在压缩与回调排队，优化方向就是编码参数与线程模型；如果分解显示无线传输占 25 ms，就该去查信道占用与干扰，重写应用代码解决不了它。RTT 与单向的换算也要带前提：RTT 40 ms、对端处理 6 ms 时，单向估计约 (40 − 6)/2 = 17 ms，前提是往返路径基本对称；上行窄、下行宽的非对称链路下这个折半公式有系统偏差，报告应注明"以同步后的单向实测为准，RTT 只做交叉验证"。</p>
+    <p>实验矩阵的时长预算要提前排。以"3 档台数 × 3 种载荷 × 2 种频率 × 5 次重复"为例共 90 个用例；每个用例预热 30 s、稳态 120 s、启停过渡约 30 s，合计约 3 min，全量跑完约 4.5 小时，只能安排在夜间。压缩策略是先粗筛再精测：把矩阵缩到"3 档台数 × 2 种载荷 × 5 次"共 30 个用例、约 90 分钟，找出问题区间后再对关键档位加密重复次数。把时长预算写进实验计划，可以避免"跑到一半发现天亮"导致半套数据作废；每轮跑完立即做一次元数据核对（commit、DDS 版本、AP 型号），数据不完整就当场重跑，别等分析阶段才发现。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>一套可运行的基准框架三件套：探针（probe）、负载（workload）、分析（analysis）。</p>
+    <ol>
+      <li><strong>探针</strong>：延迟测量节点对（发送端打时间戳、接收端统计）；统计口径固化在代码里（分位数、最大最小值、采样数），确保不同人跑出可比数据。</li>
+      <li><strong>负载生成</strong>：参数化节点（大小/频率/台数可配），用 launch 参数驱动一组实验矩阵；所有实验用同一份代码、只改参数，避免"改代码测性能"引入不可比因素。</li>
+      <li><strong>分析</strong>：接收端把原始样本落 CSV，离线脚本出报告（分位数表 + 直方图 + 与上次基线对比）；线上只保留汇总，原始数据归档（第 037 章回放思路）。</li>
+    </ol>
+    <h3>基准场景清单（建议全家桶）</h3>
+    <table>
+      <tr><th>场景</th><th>自变量</th><th>关键指标</th><th>验收线示例</th></tr>
+      <tr><td>B1 发现时间</td><td>N = 2/5/10/20</td><td>全图可见耗时、发现流量</td><td>20 台 ≤ 30 s</td></tr>
+      <tr><td>B2 控制环时延</td><td>QoS、f = 100 Hz</td><td>单向时延 P95、抖动 P99−P50</td><td>P95 ≤ 20 ms、抖动 ≤ 5 ms</td></tr>
+      <tr><td>B3 感知吞吐</td><td>S = 64KB、N、压缩开关</td><td>有效吞吐、丢帧率</td><td>丢帧 &lt; 1%，链路占用 &lt; 60%</td></tr>
+      <tr><td>B4 任务链端到端</td><td>任务批量 10/50/100</td><td>makespan 分布、单任务时延</td><td>makespan 与 070 章预测偏差 ≤ 20%</td></tr>
+    </table>
+    <div class="box tip">
+      <span class="box-title">技巧：每次基准都记录"基线快照"</span>
+      <p>报告里固定放三列：本次值、上次值、变化率；并把环境元数据（代码 commit、DDS 实现与版本、AP 型号、机器人台数）写进报告头部。<strong>没有元数据的性能数字是不可复现的</strong>，三周后你会对着一个孤零零的"12 ms"发呆，不知道它对应哪个版本哪个环境。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：延迟探针，发送端打时间戳</strong></p>
+    <pre class="code"><code>from rclpy.qos import QoSProfile, ReliabilityPolicy
+from builtin_interfaces.msg import Time     # 自定义消息里带发送时刻字段
+
+class LatencyProbe(Node):
+    """每帧在消息里写入发送时刻，接收端据此算单向时延。"""
+    def __init__(self):
+        super().__init__("latency_probe")
+        qos = QoSProfile(depth=1)
+        qos.reliability = ReliabilityPolicy.BEST_EFFORT   # 测稳态：重传会掩盖真实质量
+        self.pub = self.create_publisher(ProbeMsg, "/bench/probe", qos)
+        self.seq = 0
+        self.create_timer(0.01, self.tick)                # 100 Hz 探针流
+
+    def tick(self):
+        msg = ProbeMsg()
+        msg.seq = self.seq
+        msg.send_time = self.get_clock().now().to_msg()   # 消息内时间戳是唯一依据
+        # payload 做大小可变的填充：测不同消息尺寸下的时延曲线
+        msg.payload = b"\x00" * self.payload_bytes()
+        self.pub.publish(msg)
+        self.seq += 1</code></pre>
+    <p>解读：探针的两个设计决定测量质量。<strong>（1）时间戳放进消息体</strong>（接收端在回调里打"到达时刻"再猜发送时刻，会把排队延迟算进传输），这是单向时延测量的唯一正确姿势，前提是收发两端时钟同步（第 009 章），所以报告里必须记录同步方案的实测偏差。<strong>（2）Best-effort</strong>：基准测的是"系统在正常条件下的质量"，用 Reliable 会让 DDS 悄悄重传丢包，测出来的时延反而"好看"，掩盖了真实抖动；真实业务里控制链路怎么配，探针就怎么配。探针频率与业务同量级（这里 100 Hz），错开业务高峰时段还会引入"探针自己制造拥塞"的偏差，多探针场景要么与业务流量合并统计，要么显式记录探针开销。</p>
+
+    <p><strong>片段 2：接收端统计，分位数序列化产出</strong></p>
+    <pre class="code"><code>import time, csv
+import numpy as np
+
+class LatencyRecorder:
+    """接收端：记录 (seq, latency)，窗口结束后输出分位数与直方图数据。"""
+    def __init__(self, warmup_s=30.0, window_s=120.0):
+        self.t0 = None
+        self.warmup = warmup_s
+        self.window = window_s
+        self.samples = []          # (latency_ms,)
+
+    def on_probe(self, msg, now_msg):
+        if self.t0 is None:
+            self.t0 = time.monotonic()
+        t = time.monotonic() - self.t0
+        if t &lt; self.warmup:        # 预热窗：丢弃（握手/升频/队列填充期）
+            return
+        if t &gt; self.warmup + self.window:
+            return                  # 稳态窗已过：等待分析（不再记录）
+        send_ns = msg.send_time.sec * 1_000_000_000 + msg.send_time.nanosec
+        lat_ms = (now_msg.nanoseconds - send_ns) / 1e6   # 同钟前提下才有意义
+        self.samples.append(lat_ms)
+
+    def report(self):
+        a = np.array(self.samples)
+        q = np.percentile(a, [50, 95, 99])
+        jitter = np.percentile(a, 99) - np.percentile(a, 50)
+        out = {"n": len(a), "p50": q[0], "p95": q[1], "p99": q[2],
+               "max": a.max(), "jitter_p99_p50": jitter}
+        # 直方图数据落 CSV：报告出图/复算都基于原始文件，不用手抄
+        with open("latency_hist.csv", "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["latency_ms"])
+            w.writerows((v,) for v in a)
+        return out</code></pre>
+    <p>解读：统计函数的每个选择都在对抗测量错误。<strong>预热窗</strong>（30 s）丢弃启动期数据，发现握手与 CPU 升频会制造"假长尾"，不丢的话 P99 直接失真。<strong>稳态窗</strong>限定在 120 s 内，长跑会让机器人电量、温度漂移参与进来，混合多因素。<strong>抖动用 P99−P50</strong>：标准差假设分布对称，而时延分布天然右偏，P99−P50 直接表达"最差的 1% 比典型差多少"，与第 072 章 DEADLINE 判定同一语言。<strong>原始样本必须落盘</strong>：分位数是"压缩过"的结论，复算（换窗口、剔异常、两版本对比）都需要原始数据，这和第 037 章"记录与回放"的哲学一致。注意 <code>now_msg</code> 需要来自同一时钟源，跨机测量就换成 NTP/chrony 校时后的系统钟，并在报告里附最大偏差。</p>
+
+    <p><strong>片段 3：实验矩阵驱动，一个脚本跑完所有条件</strong></p>
+    <pre class="code"><code>import itertools, subprocess, json
+
+MATRIX = {
+    "n_robots": [2, 5, 10],
+    "size": ["64B", "1KB", "64KB"],
+    "rate_hz": [10, 50],
+}
+
+def run_suite():
+    results = []
+    for combo in itertools.product(*MATRIX.values()):
+        cfg = dict(zip(MATRIX.keys(), combo))
+        for rep in range(5):                      # 每个条件 5 次独立重复
+            tag = f"n{cfg['n_robots']}_{cfg['size']}_{cfg['rate_hz']}_r{rep}"
+            cmd = ["ros2", "launch", "fleet_bench", "bench.launch.py",
+                   f"n_robots:={cfg['n_robots']}",
+                   f"payload:={cfg['size']}",
+                   f"rate_hz:={cfg['rate_hz']}",
+                   f"result_file:=results/{tag}.json"]
+            subprocess.run(cmd, check=True, timeout=600)   # 超时保护：卡死的用例不阻塞
+            results.append({**cfg, "rep": rep, "file": tag})
+    # 汇总：报告读的是每条件 5 次的中位数；样本混起来会被单次波动带偏
+    with open("results/suite_index.json", "w") as f:
+        json.dump(results, f, indent=2)
+
+run_suite()</code></pre>
+    <p>解读：矩阵驱动的意义是<strong>消除"手工操作引入的不可比因素"</strong>，每次实验的参数、顺序、次数由同一个循环决定，任何人重跑得到同一序列。三个细节：<code>rep=5</code> 次重复记录独立文件，分析脚本按"每条件中位数"汇总（跨条件比较用中位数比用全样本均值稳健）；<code>timeout=600</code> 的用例级超时防止个别卡死吞掉整轮（基准跑一半卡住是家常便饭）；每个 tag 编码了全部自变量，报告里出图可以直接按文件名切片。真实项目中还应把"环境元数据"（commit、DDS 版本）写进每个结果文件，并在循环开始前打印一次到终端，人对了，数据才对。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>时钟未同步就测单向时延</strong>：两端时钟差 200 ms，测出来"时延"里 200 ms 是假的。修复：先跑时间同步并实测偏差（&lt; 1 ms 才用于报告）；否则改测 RTT（单端自洽）。</li>
+      <li><strong>不预热、不设稳态窗</strong>：前 30 秒的发现握手数据混进统计，P99 被拉爆。修复：预热丢弃 + 稳态判定（分钟漂移 &lt; 5%）。</li>
+      <li><strong>只报均值</strong>：伪装成健康系统的长尾分布骗过验收，上线后偶发超时。修复：报告固定含 P50/P95/P99/最大 + 采样数；验收线用 P95，均值会被长尾掩盖。</li>
+      <li><strong>观测者效应</strong>：开着 rosbag 录所有话题再测吞吐，把读写磁盘的开销算进系统。修复：基准环境关闭非必要录制与日志；必须录时单独标定开销。</li>
+      <li><strong>单次运行定结论</strong>：网络环境波动 ±30% 很常见，一次跑出来的数字不能当基线。修复：每条件 ≥ 5 次重复，比较不同 run 的离散度；报告注明重复策略。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>给"20 台机器人在 100 Hz 下控制时延 P95 ≤ 20 ms"这个需求设计测量方案：测量点放哪、时钟怎么处理、每条件跑多久、需要几分钟的总实验时长（含 30 s 预热、120 s 稳态、5 次重复）。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>测量点 = 发布回调与订阅回调（业务边界）；时钟 = chrony 校时并实测偏差；每条件 150 s 有效窗 × 5 次 ≈ 13 min；再乘条件数（QoS × 频率）就是总时长，规模一大就要夜里跑。</div></details>
+      </li>
+      <li>手头有一组时延样本：96% 在 2–5 ms、4% 在 40–120 ms。分别计算近似的 P50、P95、P99，并说明均值会落在哪里、为什么均值对控制环评估是危险的。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>P50 ≈ 3 ms、P95 ≈ 5 ms（96% 都在低区）、P99 ≈ 60 ms；均值 ≈ 0.96×3.5 + 0.04×80 ≈ 6.6 ms，均值几乎看不出长尾。控制环会因那 4% 的迟到帧抖动，P99 才是真话。</div></details>
+      </li>
+      <li>用公式估算置信区间：σ = 4 ms、n = 25 时的 95% 置信半径；要把半径压到 1 ms 需要多少样本？据此说明"每个条件跑几十次"的必要性。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>半径 ≈ 1.96×4/√25 ≈ 1.57 ms；要 1 ms 需 n ≈ (1.96×4/1)² ≈ 62。少于这个量级时，两个版本 1–2 ms 的差异在统计上不可分辨。</div></details>
+      </li>
+      <li>设计"发现时间 vs 台数"实验：N ∈ {2, 5, 10, 20}，每档 5 次，画出预期曲线形态（线性？平方？），并给出"发现时间超标"时的两个排查方向（多播/单播发现、域划分）。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>预期：低台数近似线性，上升后因 O(M²) 匹配与多播泛洪变成超线性，出现"膝盖"；排查方向：发现策略（单播列表/Discovery Server）、把大域拆小；把曲线与第 001 章的 O(M²) 估算对照验证。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>基准测稳态质量、压测找极限；基准四要素：测量点（业务边界）、时钟条件（同步或 RTT）、稳态窗（预热+中段）、统计量（分位数+置信区间）。</li>
+      <li>报告最低配置：P50/P95/P99/最大 + 采样数 + 环境元数据；均值只在对称分布时才可参考。</li>
+      <li>实验设计锁变量：自变量矩阵、控制变量、30 s 预热、5 次重复、每条件几十样本起步。</li>
+      <li>读报告两步：时延拆解找大头（应用/序列化/排队/传输/回调），曲线找膝盖点定容量（如 8–10 台）。</li>
+      <li>下一章往系统身上"加压"：把负载推到极限、把故障注进去，<strong>通信压测与故障注入</strong>。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch075.html">← 第 075 章：多机器人动态重构</a>
+    <a class="next" href="ch077.html">第 077 章：通信压测与故障注入 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

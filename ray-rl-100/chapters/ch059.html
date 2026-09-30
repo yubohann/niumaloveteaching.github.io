@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第059章 种群训练PBT | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第四篇 · Ray Tune 超参搜索</span>
+    <span class="sep">/</span>
+    <span>第 059 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第四篇 · Ray Tune 超参搜索</div>
+    <h1>第 059 章：种群训练PBT</h1>
+    <p class="lead">让超参随训练进度进化：种群训练（Population Based Training, PBT）用"利用（Exploit）加探索（Explore）"的异步进化循环，在训练中途交换模型参数与超参，把静态调参升级为在线生成超参调度（Schedule）。</p>
+    <ul class="meta">
+      <li>主题：Ray Tune 调优（进化式调度器）</li>
+      <li>关键机制：利用与探索、检查点交换、异步进化</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 058 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解 PBT 的核心主张：超参的最优值随训练阶段变化，调度可以借助种群进化在训练过程中在线发现，无需事先固定取值。</li>
+      <li>掌握利用与探索两步循环的机制：排名、淘汰比例、参数复制、扰动规则。</li>
+      <li>理解异步执行与检查点交换的依赖关系，能配置扰动间隔、分位比例与重采样概率。</li>
+      <li>会为强化学习任务选择稳健的评价指标与预热期，避免早期误淘汰与噪声驱动淘汰。</li>
+      <li>能对比 PBT 与"随机搜索加早停"的组合，按训练时长与超参的时间结构选择方案。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>固定超参在训练全程使用同一取值，而训练不同阶段的最优取值往往不同：学习率在早期需要大步快走，后期需要小步精修；熵系数在探索充分后应逐步收缩。人工设计的调度（阶梯衰减、余弦退火）依赖先验，PBT 的思路是用种群把调度"进化"出来：表现好的个体把参数与超参复制给落后个体，落后个体在继承的起点上继续变异。</p>
+    <p>这套机制把搜索从"评估配置"推进到"评估训练轨迹"：同一种群内同时进行并行训练与参数交换，需要训练过程可检查点、可恢复。强化学习任务的长训练时长恰好适合这种"边训边搜"的模式。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p>本节按"进化循环、两步机制、异步与检查点、评价与预热"四层展开。</p>
+
+    <h3>1. 进化循环的时间结构</h3>
+    <p>种群由 N 个并行试验组成，每个试验持有独立的模型与一组超参。每隔一个扰动间隔（Perturbation Interval），调度器执行一轮进化：按指标对全部试验排名，排名靠后的分位（如 25%）被判定为落后个体；落后个体从排名靠前的个体处复制完整训练状态（模型参数加超参），随后对超参施加扰动。<strong>复制的是完整训练状态：落后个体继承优胜者的"训练进度"，避免从零重训。</strong></p>
+    <p>循环持续到训练结束，每个试验的指标曲线记录着它继承与变异的历史。最终输出的是一组轨迹：最优个体在训练各阶段的超参序列，这条序列可被抽取成调度规则，供后续正式训练复用。</p>
+
+    <h3>2. 利用与探索：两个动作的细节</h3>
+    <table>
+      <tr><th>动作</th><th>操作</th><th>目的</th><th>关键参数</th></tr>
+      <tr><td>利用（Exploit）</td><td>落后个体复制优胜个体的检查点</td><td>淘汰劣质轨迹，传播有效结构</td><td>分位比例 <code>quantile_fraction</code></td></tr>
+      <tr><td>探索（Explore）</td><td>对超参做乘性扰动或重采样</td><td>在优胜者邻域继续变异</td><td><code>resample_probability</code></td></tr>
+    </table>
+    <p>扰动的实现有两种：<strong>乘性扰动</strong>把连续超参乘以 1.2 或 0.8 之类的系数（学习率、熵系数适用）；<strong>重采样</strong>以一定概率从原始分布重新抽取（类别参数适用）。<code>resample_probability</code> 控制"继承邻域"与"跳回原分布"的比例：过低会困在局部邻域，过高会破坏利用的连续性。<strong>连续超参的扰动必须设上下界</strong>：多轮乘 1.2 会让学习率指数级攀升，触发训练发散。</p>
+
+    <h3>3. 异步执行与检查点交换</h3>
+    <p>PBT 的进化是异步的：各试验按自己的进度运行，调度器在某个试验到达扰动边界时独立处理它，复制源也是"当时的最新检查点"。异步带来两个工程要求：<strong>（1）检查点必须包含完整训练状态</strong>（模型、优化器、采样器状态），且复制操作要以检查点为媒介，跨进程传输；<strong>（2）复制期间源与目标都可能继续训练</strong>，复制到的是源在稍早时刻的快照，状态略滞后属于机制固有代价，用较长的扰动间隔摊薄影响。</p>
+    <p>与暂停式早停调度器的区别也在这里：早停淘汰试验并释放资源，PBT 让落后个体"转世"继续占用资源。资源需求是种群规模乘单试验资源，规划时先确定种群再核算并发。</p>
+
+    <h3>4. 评价指标与预热期</h3>
+    <p>淘汰决策的质量取决于指标的信噪比。强化学习回报波动大，直接使用单点指标会把运气差的种子误判为劣质个体，正确做法是使用平滑指标（如最近若干个回合的均值，或评估回报）。<strong>预热期（Burn-in）在训练早期禁用利用动作</strong>：此时所有个体都处于高噪声的起步阶段，早期淘汰既无依据又浪费探索；预热结束后再开始排名与复制。</p>
+    <p>PBT 与"随机搜索加早停"的对比：<strong>后者探索配置空间，前者探索"配置随时间的变化"，适合训练时长以小时计、超参存在时间结构（学习率、熵系数、探索温度）的任务；训练很短或超参无明显时间结构时，随机加早停更简单且成本可控。</strong></p>
+
+    <h3>5. 进化事件的定量核算</h3>
+    <p>数值示例：总训练 200 轮、扰动间隔 10 轮、预热 20 轮时，进化事件从预热结束后的第一个边界（第 30 轮）起每 10 轮触发一次，合计 18 次；种群 16、分位比例 0.3 时每次替换约 5 个个体，全程复制事件约 90 次。复制事件计数是诊断利用动作是否正常发生的直接证据：计数为零说明预热或分位配置抑制了淘汰，计数远超预期说明间隔过密。传输成本按检查点体积估算：100 万参数的模型单次状态按 16 MB 量级计，90 次复制合计约 1.4 GB 的传输量。</p>
+    <div class="formula">
+      预期替换数 = quantile_fraction × 种群规模
+      <span class="note">0.3 × 16 ≈ 5 个每次；替换数与扰动间隔共同决定复制总次数，两者直接影响检查点传输量与个体的"重启"频率</span>
+    </div>
+
+    <h3>5.1 分位比例的灵敏度对照</h3>
+    <p>替换数的灵敏度可以列出对照：种群 16、总训练 200 轮、扰动间隔 10 轮时进化事件 18 次。分位比例 0.2 对应每次替换约 3 个个体、全程约 54 次复制，按单点 16 MB 折算传输约 0.86 GB；比例 0.3 对应每次约 5 个、全程约 90 次、约 1.4 GB；比例 0.4 对应每次约 6 个、全程约 108 次、约 1.7 GB。个体视角的读数更直观：每个个体全程经历约 q×18 次覆盖，比例 0.3 时约 6 次，平均每 33 轮被覆盖一次，两段被覆盖之间的连续训练段仍足够长。<strong>分位比例就是"选择压力"的旋钮：升高加快优胜扩散，也让检查点传输与个体重启频率同步上升。</strong></p>
+
+    <h3>6. 三类搜索方案的对比</h3>
+    <table>
+      <tr><th>维度</th><th>随机搜索加早停</th><th>贝叶斯优化</th><th>PBT</th></tr>
+      <tr><td>搜索对象</td><td>固定配置</td><td>固定配置</td><td>配置随时间的轨迹</td></tr>
+      <tr><td>决策依据</td><td>中间指标剪枝</td><td>代理模型</td><td>种群排名与复制</td></tr>
+      <tr><td>资源模式</td><td>逐级加预算加淘汰</td><td>顺序或小并发</td><td>固定种群持续进化</td></tr>
+      <tr><td>结果形式</td><td>单个配置</td><td>单个配置</td><td>调度轨迹</td></tr>
+      <tr><td>适用情形</td><td>训练便宜、试验多</td><td>维度低、单次评估贵</td><td>长训练、参数有时间结构</td></tr>
+    </table>
+    <p>选择依据：训练预算偏短时用随机搜索加早停；评估昂贵的低维问题用贝叶斯优化；学习率、熵系数等参数随阶段变化的长期训练用 PBT。三类方案可以组合：先用随机搜索筛出候选配置，再对候选跑小规模 PBT 精修调度。复制演练的最小流程：构造两个试验，手动触发一次复制，核对目标试验的模型参数与超参与源一致后再开正式训练；自定义探索函数内的随机源使用固定种子，扰动序列才可复现。</p>
+
+    <h3>6.1 数值算例：多样性的量化监控</h3>
+    <p>用学习率对数值的标准差做多样性指标可以量化：初始种群若在 10<sup>−4</sup> 到 10<sup>−3</sup> 之间均匀取值，对数（以 10 为底）跨度 1 个数量级对应的标准差为 1/√12≈0.289；跨度收窄到 0.2 个数量级时约 0.058，收窄到 0.1 个数量级时约 0.029。<strong>把"多样性不足"定义为对数标准差低于 0.05（相当于存活取值集中在 0.17 个数量级以内），触发条件是连续两代低于该值；触发后提高重采样概率或放大扰动系数，把分布重新拉开。</strong>记录方式与头部指标同屏：每一代记录学习率对数值的标准差、熵系数的标准差与各试验回报名次的相关系数，三条曲线同时走低时，种群已经进入早熟状态。</p>
+
+    <h3>7. 种群多样性的监控</h3>
+    <p>跟踪种群内超参分布的宽度：学习率取对数后的标准差持续收窄，说明探索不足，应提高重采样概率或增大扰动幅度；分布异常发散且回报波动加剧，说明扰动过强。复制来的状态携带过拟合特征，多样性指标下滑时即使头部指标仍在上升，也应在若干代后重新注入多样性。<strong>多样性指标与头部指标同屏监控，是防止种群早熟收敛的常规做法。</strong>把头部轨迹固化为正式调度时注意时基换算：轨迹以迭代为横轴，正式训练若改变批次或并行度，先按累计样本步数换算再套用。扰动幅度与重采样概率的配合关系：扰动系数决定邻域步长，重采样概率决定跳出邻域的频率；两者都偏小时种群在几代内收敛到单一取值，指标曲线的个体差异消失，此时应加大重采样概率重新展开。复制与扰动日志记录源个体与目标个体标识，复盘时才能重建每个个体的谱系。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>PBT 接入按五步执行。</p>
+    <ol>
+      <li><strong>选种群规模</strong>：8 至 32 个试验，按资源池除以单试验资源核算，宁可小种群长间隔。</li>
+      <li><strong>定义可变异超参</strong>：只把有时间结构的参数放入变异集合（学习率、熵系数、批次）；结构类参数保持固定。</li>
+      <li><strong>设扰动参数</strong>：扰动间隔 5 至 20 个训练迭代；分位比例 0.25 至 0.4；重采样概率 0.25 上下。</li>
+      <li><strong>设预热与指标</strong>：预热不少于一个扰动间隔的 2 倍；指标用平滑窗口或评估回报。</li>
+      <li><strong>验证检查点链路</strong>：先做复制演练，确认状态完整恢复后再开正式训练。</li>
+    </ol>
+    <h3>参数表</h3>
+    <table>
+      <tr><th>参数</th><th>典型值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>种群规模</td><td>8–32</td><td>进化搜索的宽度</td><td>资源池与单试验资源之商</td></tr>
+      <tr><td>扰动间隔</td><td>5–20 迭代</td><td>排名与复制的粒度</td><td>训练总迭代数的 1/10 量级</td></tr>
+      <tr><td>分位比例</td><td>0.25–0.4</td><td>被替换的落后比例</td><td>选择压力与多样性平衡</td></tr>
+      <tr><td>重采样概率</td><td>0.2–0.3</td><td>跳回原分布的比例</td><td>过低困于局部，过高失去连续</td></tr>
+      <tr><td>预热期</td><td>≥2 个扰动间隔</td><td>延迟首次淘汰</td><td>避开起步噪声</td></tr>
+      <tr><td>平滑窗口</td><td>最近 10 迭代</td><td>指标信噪比</td><td>与回报波动水平匹配</td></tr>
+    </table>
+    <p>扰动间隔与训练总长的匹配用事件数核对：总迭代数除以间隔即进化事件数，200 轮配 10 轮间隔是 20 次事件，量级合适；1000 轮训练若沿用 10 轮间隔会有 100 次事件，个体被覆盖的频率过高，连续训练段被切得太碎，应按比例把间隔放宽到 50 至 100 轮。核对口径：期望连续训练段长度约等于 总轮数除以（事件数乘分位比例），该值低于两个扰动间隔时就应放宽间隔或降低分位比例。</p>
+    <p>与上一章的差异：058 章在固定配置空间上选点，本章把搜索维度扩展到"时间轴"；贝叶斯优化输出一个配置，PBT 输出一条调度轨迹。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：PBT 调度器配置</strong></p>
+    <pre class="code"><code>from ray import tune
+from ray.tune.schedulers import PopulationBasedTraining
+
+pbt = PopulationBasedTraining(
+    time_attr="training_iteration",          # 排名与扰动按训练迭代计数
+    metric="evaluation/episode_reward_mean", # 平滑评估指标：抗噪声
+    mode="max",
+    perturbation_interval=10,                # 每 10 轮做一次进化
+    burn_in_period=20,                       # 预热 2 个间隔后再开始淘汰
+    quantile_fraction=0.3,                   # 落后的 30% 被替换
+    resample_probability=0.25,               # 1/4 概率跳回原始分布
+    hyperparam_mutations={
+        # 连续参数：给出乘性扰动的基准值集合（上界由此约束）
+        "lr": [1e-5, 3e-5, 1e-4, 3e-4, 1e-3],
+        "entropy_coeff": [1e-4, 1e-3, 1e-2],
+        # 类别参数：从列表重采样
+        "train_batch_size": [4096, 8192, 16384],
+    },
+)
+
+analysis = tune.run(
+    "PPO",
+    scheduler=pbt,
+    config={
+        "env": "LunarLander-v2",
+        "evaluation_interval": 5,            # 评估间隔不大于扰动间隔
+        "num_env_runners": 4,
+        "gamma": 0.99,
+        "lr": 3e-4,
+        "entropy_coeff": 1e-3,
+        "train_batch_size": 8192,
+    },
+    num_samples=16,                          # 种群规模：16 个并行试验
+    max_concurrent_trials=16,
+    stop={"training_iteration": 200},
+    checkpoint_config=tune.CheckpointConfig(checkpoint_frequency=5,
+                                            checkpoint_at_end=True),
+)</code></pre>
+    <p>解读：逐块说明。<strong>（1）</strong>时间属性与扰动间隔决定进化节奏：200 轮训练配 10 轮间隔约 20 次进化，量级合理；间隔过密会让复制频繁发生、个体来不及在继承状态上训练。<strong>（2）</strong>变异集合只含有时间结构的参数；<code>hyperparam_mutations</code> 中的数值列表同时充当扰动上界与重采样候选。<strong>（3）</strong>检查点频率 5 低于扰动间隔 10：复制操作读取最近检查点，粒度足够且避免复制到过期状态；评估间隔 5 保证排名输入取自评估指标，与训练噪声隔离。</p>
+
+    <p><strong>片段 2：自定义探索函数</strong></p>
+    <pre class="code"><code>import random
+
+def explore_fn(config):
+    """自定义扰动：对学习率做乘性扰动并裁剪，防止指数漂移。
+    PBT 调用该函数时传入的是刚被复制的配置副本，原地修改即可。"""
+    lr = config["lr"]
+    # 乘性扰动：随机选择 ×1.2 或 ×0.8，保持数量级连续
+    factor = 1.2 if random.random() &lt; 0.5 else 0.8
+    lr = lr * factor
+    # 裁剪到训练安全区间：下界防止学习停滞，上界防止发散
+    config["lr"] = min(max(lr, 1e-5), 1e-2)
+
+    # 熵系数单独处理：只在训练前段允许增大，后段只允许收缩
+    if config.get("entropy_coeff") is not None:
+        ec = config["entropy_coeff"]
+        config["entropy_coeff"] = min(max(ec * (1.1 if ec &lt; 1e-3 else 0.9),
+                                          1e-5), 1e-2)
+    return config
+
+pbt = PopulationBasedTraining(
+    time_attr="training_iteration",
+    metric="evaluation/episode_reward_mean",
+    mode="max",
+    perturbation_interval=10,
+    burn_in_period=20,
+    hyperparam_mutations={"lr": [1e-5, 1e-3], "entropy_coeff": [1e-5, 1e-2]},
+    custom_explore_fn=explore_fn,     # 覆盖默认扰动规则
+)</code></pre>
+    <p>解读：这段代码演示扰动规则的自定义方式。<strong>（1）</strong>乘性扰动的系数取自常用档位（1.2 与 0.8），随机方向保持对称；裁剪区间必须写死，任何一次忘记裁剪都会在多次进化后把参数推到发散区。<strong>（2）</strong>熵系数的方向性规则演示"利用领域知识"的扰动：早期允许增大探索、后期只允许收缩，把人工调度经验编码进变异。<strong>（3）</strong><code>custom_explore_fn</code> 的输入输出都是配置字典，原地修改与返回兼容；自定义后 <code>hyperparam_mutations</code> 仍用于界定合法范围，两者配合使用。</p>
+
+    <p><strong>片段 3：读取进化历史与抽取调度轨迹</strong></p>
+    <pre class="code"><code>import pandas as pd
+
+def extract_schedule(analysis, top_k=3):
+    """从试验结果中抽取最优个体的超参轨迹，形成可复用调度。"""
+    rows = []
+    for trial in analysis.trials:
+        df = trial.metrics_dataframe
+        if df is None or df.empty:
+            continue
+        # 每个试验的曲线即"它继承与变异的历史"，取末段表现好的个体
+        final = df["evaluation/episode_reward_mean"].tail(10).mean()
+        rows.append({"trial": trial.trial_id, "final": final,
+                     "lr_start": df["config/lr"].iloc[0],
+                     "lr_end": df["config/lr"].iloc[-1],
+                     "ec_end": df["config/entropy_coeff"].iloc[-1]})
+    table = pd.DataFrame(rows).sort_values("final", ascending=False)
+    print(table.head(top_k).to_string(index=False))
+    # 轨迹解读：若头部个体的 lr 单调下降、熵系数收缩，
+    # 即可把这条"下降轨迹"固化为正式训练的衰减调度
+    return table
+
+# 注意：config/lr 列在进化后会记录当前值，逐行读取即超参时间序列
+# 复制事件在 trial 日志中留有标记，可用于核对利用动作的发生次数</code></pre>
+    <p>解读：逐块说明。<strong>（1）</strong>PBT 的输出是一组轨迹：函数用"末段均值"评价个体，同时抽取学习率与熵系数的首末值，构成调度摘要。<strong>（2）</strong>头部个体的轨迹形状是重要证据：单调下降的学习率轨迹说明任务偏好"先大后小"的调度，可被固化复用到正式训练。<strong>（3）</strong>逐试验读取配置列的当前值即时间序列，复制事件标记用于验证利用动作确实发生；若从头到尾没有复制事件，先查预热期与分位比例是否把淘汰完全抑制。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>扰动间隔过密</strong>：每隔一两轮就复制，个体来不及在继承的状态上训练，种群退化为"不断重启"。修复：间隔取总迭代数的 1/10 量级，且检查点频率与之匹配。</li>
+      <li><strong>指标未平滑</strong>：用单点训练回报排名，噪声决定淘汰，优质轨迹被误杀。修复：使用评估指标或滚动窗口均值，预热期内不做淘汰。</li>
+      <li><strong>缺失检查点</strong>：没有周期性检查点，利用动作无状态可复制，调度器报错或跳过。修复：检查点频率不大于扰动间隔，并在正式训练前做复制演练。</li>
+      <li><strong>扰动无上下界</strong>：连续乘性扰动让学习率指数漂移，训练发散且污染种群。修复：在自定义探索函数中显式裁剪，区间写进代码常量。</li>
+      <li><strong>种群过小</strong>：少于 8 个个体时选择压力不足，进化近似随机游走。修复：种群至少 8 个，宁可拉长扰动间隔换取规模。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>计算：种群 16 个试验、单试验声明 6 CPU 与 0.25 GPU，需要多少资源才能全并发？若集群只有 48 CPU 与 2 张卡，种群应调整为多少？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>全并发需 96 CPU 与 4 张卡；按 48 CPU 与 2 张卡两条约束，种群缩到 8 个（48/6=8，2/0.25=8）。</div></details>
+      </li>
+      <li>预测：某任务上 PBT 头部个体的学习率轨迹呈"0.001→0.0003→0.0001"的阶梯下降，说明任务偏好什么形式的调度？给出把该轨迹固化为公式的方案。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>偏好随训练递减的阶梯或指数衰减；可拟合分段常数或按进度做指数衰减，作为正式训练的学习率调度。</div></details>
+      </li>
+      <li>设计对照实验：PBT（16 个体）与"随机搜索 16 组加 ASHA 早停"在同一任务同一资源下比较，给出评估口径与预期结论。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>口径取"相同墙钟时间内最优个体的评估回报"；预期长训练任务中 PBT 优势明显，短任务中两者接近，因为调度的时间结构来不及体现。</div></details>
+      </li>
+      <li>解释为什么"复制状态"比"只复制超参"更高效：从训练进度继承与探索连续性的角度分析，并说明状态复制带来的噪声传播风险。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>继承状态让落后个体免于重训，探索从有效区域继续；风险是被复制个体的过拟合特征随状态扩散，需靠种群多样性与重采样概率稀释。</div></details>
+      </li>
+      <li>给预热期设计一个数据驱动的判定方法：用前若干轮指标波动估计"何时排名可信"，写出判据与实现思路。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>跟踪个体间指标排名的稳定性（排名相关系数），当连续两个间隔的排名相关高于阈值即结束预热；实现上可在自定义回调中记录排名序列。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>PBT 用种群进化在线发现超参调度，适合训练时长较长、超参存在时间结构的任务。</li>
+      <li>进化循环两步：利用复制优胜者状态，探索对超参做乘性扰动或重采样。</li>
+      <li>异步执行依赖完整检查点，复制的是状态快照；扰动间隔与检查点频率必须匹配。</li>
+      <li>指标平滑与预热期是淘汰决策质量的两道保障，头部个体的轨迹可抽取为可复用调度。</li>
+      <li>连续超参扰动必须设上下界，种群规模不少于 8，分位比例在 0.25 至 0.4 之间。</li>
+      <li>下一章收束第四篇前半程：早停与 ASHA 调度器，把"逐级加预算、层层淘汰"的剪枝机制讲透。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch058.html">← 第 058 章：贝叶斯优化搜索</a>
+    <a class="next" href="ch060.html">第 060 章：早停与ASHA调度器 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

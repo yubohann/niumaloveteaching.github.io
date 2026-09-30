@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第040章 RLlib实现IMPALA算法 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第三篇 · RLlib 算法实现</span>
+    <span class="sep">/</span>
+    <span>第 040 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第三篇 · RLlib 算法实现</div>
+    <h1>第 040 章：RLlib实现IMPALA算法</h1>
+    <p class="lead">IMPALA（Importance Weighted Actor-Learner Architecture）用大规模并行采样器与 V-trace 修正把异步训练的容忍度推到新的量级。本章讲清阶梯式解耦架构、V-trace 的截断重要性修正、与 PPO 和 APPO 的目标差异，以及高吞吐场景的配置要点。</p>
+    <ul class="meta">
+      <li>主题：RLlib 算法 / 高吞吐异步架构</li>
+      <li>关键机制：阶梯式解耦、截断重要性比率、V-trace 修正、轨迹片段、学习率敏感性</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 039 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解阶梯式解耦架构：采样组、队列与学习器的角色分工。</li>
+      <li>掌握 V-trace 修正的构成：截断重要性比率与价值目标的累积结构。</li>
+      <li>理解截断参数在偏差与方差之间的取舍，会诊断截断过紧与过松两类症状。</li>
+      <li>会用吞吐与样本效率的取舍对照三种结构。</li>
+      <li>会配置高吞吐场景的关键参数：采样规模、片段长度、学习率量级。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>当环境仿真可以大规模并行（数千个副本）时，限制训练速度的因素从样本产出转移到学习侧对陈旧样本的容忍度。同步结构每个批次都等待全体采样器，长尾效应随规模放大；朴素的异步修正又因重要性权重方差随陈旧度指数增长而失效。</p>
+    <p>IMPALA 用两招突破：结构上把采样与学习彻底分层，采样器数量远超学习侧消费能力；数学上用 V-trace 修正把离策略偏差控制在有界范围。<strong>它把"异步"提升为有理论支撑的估计方法。</strong>上一章的 APPO 在其上叠加裁剪目标，本章回到该架构族的基础形态。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p>IMPALA 的两个支柱：阶梯式架构解决吞吐，V-trace 解决正确性。</p>
+
+    <h3>1. 阶梯式解耦架构</h3>
+    <p>采样器组独立运行，各自持有环境与策略副本，推进若干步后把轨迹片段送入队列；学习器取批更新参数，按固定节奏广播回采样器。采样器互不同步，队列容量有限，消费速度决定积压深度。<strong>设计目标是把学习器喂饱，让采样器数量远超消化能力。</strong>监控重点是队列深度与样本年龄：深度长期为零说明供给不足，触顶说明学习侧是瓶颈。</p>
+
+    <h3>2. V-trace 修正的构成</h3>
+    <p>片段中的动作由行为策略（采集时刻的策略）产生，学习目标是当前策略的价值函数。V-trace 为片段中每个时间步构造修正权重：重要性比率按行为与目标策略的对数概率之比计算，并做上截断；时序差分误差逐级乘以截断系数后累积。价值目标与策略目标使用两组不同的截断参数：</p>
+    <div class="formula">
+      ρ̄<sub>t</sub> = min( π(a<sub>t</sub>|s<sub>t</sub>) / μ(a<sub>t</sub>|s<sub>t</sub>), ρ̄ )，c̄<sub>t</sub> = min( 同式, c̄ )
+      <span class="note">ρ̄ 控制价值目标中瞬时修正的幅度，c̄ 控制沿时间累积的修正衰减；两者取 1 附近是常见起点，截断收紧则偏差上升、方差下降</span>
+    </div>
+    <p>截断给修正权重设上界：不加截断时，策略偏差越大权重方差越大，少量样本主导梯度，训练发散。截断把方差拉回可控区间，代价是引入偏差。<strong>ρ̄ 与 c̄ 是偏差与方差的旋钮：</strong>对偏差敏感时放宽，对稳定性敏感时收紧，均以评估回报验证。</p>
+
+    <h3>3. 与 PPO 裁剪的对照</h3>
+    <p>两者都处理"新旧策略不一致"，作用位置不同：PPO 在目标函数层裁剪代理目标，被截断样本梯度归零；V-trace 在价值与优势估计层修正数据，学习器近似在修正后的数据上做常规更新。<strong>工程含义的差别：</strong>PPO 依赖多轮复用，轮数与学习率联合受限；IMPALA 每批只更新一次或少量次，学习率敏感度更高。RLlib 的 IMPALA 默认启用 V-trace，APPO 则在同架构上叠加 PPO 式裁剪与回放选项。</p>
+
+    <h3>4. 参数配置的敏感性</h3>
+    <p>高吞吐结构对学习率的容忍区间更窄：更新更密集、样本带版本差，策略漂移更快。学习率取同步 PPO 的三分之一到二分之一量级；片段越长，累积修正越多、偏差越大。<strong>调参顺序：先固定采样规模与片段长度，再校准学习率，最后微调截断参数。</strong></p>
+
+    <h3>5. V-trace 目标的数值演算</h3>
+    <p>V-trace 目标的解析形式为截断修正的折扣累积：</p>
+    <div class="formula">
+      v<sub>t</sub> = V(s<sub>t</sub>) + ρ̄<sub>t</sub> Σ<sub>k≥t</sub> γ<sup>k−t</sup> ( ∏<sub>j=t</sub><sup>k−1</sup> c̄<sub>j</sub> ) δ<sub>k</sub>
+      <span class="note">δ 为时间差分误差，ρ̄ 控制当步修正幅度，c̄ 控制沿时间累积的衰减；级数在片段末端截断并自举</span>
+    </div>
+    <p>取片段长度 2、γ = 0.99、价值 [1.0, 1.5]、奖励 [1, 1]、第二步终止；对数概率差为 [0.2, −0.1]，截断参数均取 1.0：</p>
+    <table>
+      <tr><th>步 t</th><th>原始比率</th><th>截断后 ρ = c</th><th>时间差分误差 δ</th><th>累积 acc</th><th>目标</th></tr>
+      <tr><td>1（终止）</td><td>0.905</td><td>0.905</td><td>−0.5</td><td>−0.4525</td><td>1.091</td></tr>
+      <tr><td>0</td><td>1.221，截为 1.0</td><td>1.0</td><td>1.485</td><td>1.037</td><td>2.037</td></tr>
+    </table>
+    <p>演算过程：t = 1 时 δ = 1 + 0 − 1.5 = −0.5，acc = 0.905×(−0.5) = −0.4525，目标 1.5 + 0.905×(−0.4525) ≈ 1.091；t = 0 时 δ = 1 + 0.99×1.5 − 1.0 = 1.485，acc = 1.0×(1.485 + 0.99×(−0.4525)) ≈ 1.037，目标 1.0 + 1.0×1.037 = 2.037。若不截断，t = 0 的比率 1.221 全程保留，目标升到约 2.547。<strong>观察同一价值估计下目标的变化：截断把修正量从 +1.547 压到 +1.037，削减约三分之一，偏差换方差的效果可以在单样本上直接量出。</strong></p>
+
+    <h3>6. 供给与消费的数量核算</h3>
+    <p>样本供给 = 采样器数 × 每采样器环境数 × 单环境步频。数值示例：16 × 2 × 200 = 6400 步每秒；学习侧每次更新消耗 8000 样本，接住全部供给需要约 1.25 秒完成一次更新（8000 ÷ 6400）。把规模提到 64 × 2 × 200 = 25600 步每秒时，学习侧需要约 0.31 秒一次更新，超出学习算力后队列积压增长、样本年龄上升。<strong>供给与消费的比值决定队列行为：比值长期大于 1 时，减采样器或缩短片段是主要的止损手段。</strong></p>
+
+    <h3>7. 三种结构的配置对照</h3>
+    <table>
+      <tr><th>配置维度</th><th>同步 PPO</th><th>APPO</th><th>IMPALA</th></tr>
+      <tr><td>学习率（相对基准）</td><td>1.0</td><td>约 0.6</td><td>约 0.3 至 0.5</td></tr>
+      <tr><td>每批更新轮数</td><td>10 量级</td><td>3 量级</td><td>1</td></tr>
+      <tr><td>采样器规模</td><td>中等</td><td>中高</td><td>高，可远超学习消化能力</td></tr>
+      <tr><td>数据通道</td><td>无缓冲，交替执行</td><td>有界缓冲加回放比例</td><td>队列加 V-trace 修正</td></tr>
+      <tr><td>修正机制</td><td>裁剪代理目标</td><td>裁剪加回放控制</td><td>截断重要性比率（ρ̄、c̄）</td></tr>
+      <tr><td>首要监控</td><td>KL 与裁剪触发比例</td><td>队列深度与触发比例</td><td>样本吞吐与样本年龄</td></tr>
+    </table>
+    <p>选择依据：结构调整从同步起步逐级验证，每一级都在同预算对照下确认回报不降；高吞吐结构适合仿真代价低、采样可大规模并行的任务。V-trace 诊断的最小集合是三项：修正比率的分位数（中位数与九十分位）、价值目标与蒙特卡洛回报的偏离、样本年龄；三者共同解释回报波动来源。检查点与恢复的注意点：队列内容不随检查点保存，恢复后队列为空，学习侧从新样本重新积累，磨合期的指标波动属于机制内现象，不应误判为恢复失败。采样规模的逐级压测记录三项指标（样本吞吐、样本年龄、评估回报），拐点位置由学习侧的消化速度决定。回报与样本年龄同屏观察：回报下滑伴随年龄上升说明陈旧度失控；年龄平稳而回报下滑，把排查方向转向目标函数与学习率。评估阶段仍使用独立的同步进程组，异步结构只作用于训练侧采样；评估协议与同步基线保持一致，两边回报口径才可比较。截断参数的消融各取放宽与收紧两档，一次只调一个参数并保留对照记录。</p>
+
+    <h3>8. 数值算例：截断收紧的修正幅度与样本年龄</h3>
+    <p>沿用第 5 节的两步片段，把截断参数从 1.0 收到 0.5 再算一遍。t = 1 的比率 0.905 被截到 0.5，累积项变为 0.5 × (−0.5) = −0.25，目标从 1.091 升到 1.375；t = 0 的累积项变为 0.5 × (1.485 + 0.99 × (−0.25)) ≈ 0.619，目标从 2.037 降到 1.309。重点看修正量的变化：t = 0 的修正量从 +1.037 降到 +0.309，约为原来的三成；瞬时层与累积层同时收紧时两侧相乘，总修正衰减比单看 ρ̄ 更快，这是"一次只调一个参数"纪律的量化理由。</p>
+    <table>
+      <tr><th>截断参数</th><th>t = 1 目标</th><th>t = 0 目标</th><th>t = 0 修正幅度</th></tr>
+      <tr><td>ρ̄ = c̄ = 1.0</td><td>1.091</td><td>2.037</td><td>+1.037</td></tr>
+      <tr><td>ρ̄ = c̄ = 0.5</td><td>1.375</td><td>1.309</td><td>+0.309</td></tr>
+    </table>
+    <p>样本年龄也能核算：队列 32 槽、每批 8000 步，满队列持有 256,000 步；供给 6400 步每秒时，最旧批等待约 40 秒才被消费，按每 2 秒广播一次折算约落后 20 个策略版本。这条数字要与评估指标同屏观察：回报下滑伴随年龄上升说明陈旧度失控，年龄平稳而回报下滑则把排查方向转向目标函数与学习率。</p>
+
+    <h3>9. 边界与失效模式</h3>
+    <p>V-trace 的第一条实现边界是行为策略对数概率的可用性：修正比率由采样时刻记录的对数与当前策略的对数相除得到，采集端若没有把对数概率写进片段，修正无从计算，用近似值代替会引入系统性偏差。数据契约要把策略版本摘要与对数概率一起入列。</p>
+    <p>第二条边界在片段末端：片段在回合中途结束时需要价值自举，在回合终止处需要屏蔽后续项，两个口径混用会让末端目标整体偏离。循环网络场景还要把隐状态随片段一起携带，隐状态与片段边界不匹配时，修正比率的计算基准不一致，偏差随片段长度累积。</p>
+    <p>第三条边界是采样规模的收益上界：采样器加到学习侧消化能力之上后，吞吐不再增长而样本年龄持续上升，修正比率分布随之变重尾。监控以修正比率的中位数与九十分位为判据，中位数明显偏离 1 或九十分位越界时先收缩采样规模，再讨论目标函数层面的调整。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>配置顺序：先用中等采样规模验证架构连通，再放大采样器数量，最后做学习率与截断参数的二维校准。</p>
+    <table>
+      <tr><th>参数</th><th>示例值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>采样器数量</td><td>16</td><td>并行环境供给</td><td>核心数范围内尽量大，供给目标为喂饱学习器</td></tr>
+      <tr><td><code>num_envs_per_env_runner</code></td><td>2</td><td>单进程环境副本</td><td>提高单核样本产出，受内存约束</td></tr>
+      <tr><td>片段长度</td><td>50</td><td>单次提交的环境步数</td><td>长片段减少传输次数，但累积修正偏差上升</td></tr>
+      <tr><td><code>train_batch_size</code></td><td>8000</td><td>学习侧消费批次</td><td>与采样吞吐匹配，覆盖足够回合</td></tr>
+      <tr><td><code>lr</code></td><td>1e-4</td><td>学习率</td><td>同步 PPO 的三分之一到二分之一量级起步</td></tr>
+      <tr><td>V-trace 截断</td><td>ρ̄ = 1.0，c̄ = 1.0</td><td>修正权重上界</td><td>默认起点，按偏差与方差表现收紧或放宽</td></tr>
+      <tr><td>更新轮数</td><td>1</td><td>每批数据的更新次数</td><td>低轮数配合高吞吐，避免偏离累积</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：为什么 IMPALA 的学习率要低于同步 PPO？</span>
+      <p>两个因素叠加：单位墙钟时间内执行的更新步数更多，参数漂移的单位时间速度加快；样本自带版本差，梯度方向含有修正后的残余偏差。学习率偏高时，偏差被放大为可见的策略震荡，评估曲线持续抖动、难以收敛。<strong>正确做法是先把学习率压到同步基线的三分之一量级，再按吞吐收益逐步回调。</strong></p>
+    </div>
+    <p>片段长度的数量感受：单环境每秒推进 200 步、片段长度 50 时，每个采样器每秒提交 4 个片段；16 个采样器合计每秒 64 个片段进入队列。缩短片段到 25 时提交频率翻倍，传输与入队开销上升而修正偏差下降；放大到 100 时传输减半、累积偏差上升。<strong>片段长度的调节在传输效率与修正偏差之间移动，两端的代价分别出现在入队开销与价值目标偏离上。</strong>截断参数的调整先动瞬时层 ρ̄、再动累积层 c̄，一次只调一个，并用评估回报与回报方差两个指标同时判断。</p>
+    <p>学习率校准按两档对照：同步基线学习率的三分之一与二分之一各跑一组，固定其余配置，用评估回报的稳定性选择；校准完成后不再随轮数或采样规模联动调整，任何一项变更都重新验证。大规模采样的资源规划示例：64 个采样器、每进程 2 个环境副本时总并行环境 128 个，按每核一进程检查核心预算，图像观测任务还要按单环境内存乘 128 核对整机内存。<strong>监控面板的最小集合是样本吞吐、队列深度、样本年龄、裁剪触发比例与评估回报五项，前四项解释系统状态，最后一项判断学习质量。</strong></p>
+    <p>与上一章差异：第 039 章的 APPO 在解耦结构上保留裁剪目标与回放选项；本章的 IMPALA 把正确性交给 V-trace，更新轮数压到最低，配置重心从缓冲参数转向采样规模与学习率。下一章进入多智能体领域：MARL 算法把单智能体结构推广到联合动作空间。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：IMPALA 配置骨架</strong></p>
+    <pre class="code"><code>from ray.rllib.algorithms.impala import IMPALAConfig
+
+config = (
+    IMPALAConfig()
+    .environment(env=LineGoalEnv)
+    .training(
+        train_batch_size=8000,          # 学习侧消费批次，供给靠采样规模堆出
+        lr=1e-4,                        # 低学习率量级：异步结构下漂移更快
+        gamma=0.99,
+        num_epochs=1,                   # 每批一次更新，吞吐收益交给采样侧
+        vf_loss_coeff=0.5,
+        entropy_coeff=0.01,
+    )
+    .env_runners(
+        num_env_runners=16,             # 采样器数量可远超学习侧的消化并行度
+        num_envs_per_env_runner=2,
+        rollout_fragment_length=50,     # 片段长度：传输频率与修正偏差的折中
+    )
+)
+algo = config.build_algo()
+result = algo.train()
+print(result["sample_throughput"])      # 高吞吐结构的首要监控指标</code></pre>
+    <p>解读：配置的重心与同步 PPO 明显不同：轮数压到一次、学习率下调、采样器数量放大，片段长度承担传输效率与修正偏差的折中。<strong>采样吞吐是首要监控指标，</strong>它反映供给是否被学习侧接住；队列深度与样本年龄是第二层指标，用来判断供需关系。V-trace 相关截断参数与默认值随版本演进，以对应版本文档为准。</p>
+
+    <p><strong>片段 2：V-trace 价值目标</strong></p>
+    <pre class="code"><code>import numpy as np
+
+
+def vtrace_targets(rewards, values, logp_behavior, logp_target,
+                   dones, gamma=0.99, rho_bar=1.0, c_bar=1.0):
+    """按片段逆序构造 V-trace 价值目标与修正权重。"""
+    n = len(rewards)
+    targets = np.zeros(n, dtype=np.float32)
+    rho = np.minimum(np.exp(logp_target - logp_behavior), rho_bar)
+    c = np.minimum(np.exp(logp_target - logp_behavior), c_bar)
+    # 逐步累积截断系数：cs 表示从当前步到片段末端的乘积累积
+    acc = 0.0
+    for t in reversed(range(n)):
+        next_value = 0.0 if dones[t] else (
+            values[t + 1] if t + 1 &lt; n else values[-1])
+        delta = rewards[t] + gamma * next_value - values[t]   # 时间差分误差
+        acc = c[t] * (delta + gamma * acc)                    # 截断累积
+        targets[t] = values[t] + rho[t] * acc
+    return targets, rho</code></pre>
+    <p>解读：V-trace 目标由两层修正组成：瞬时层 ρ̄ 控制当步修正幅度，累积层 c̄ 沿时间衰减影响。终止掩码决定下一价值取零还是自举，与前面各章边界语义一致；逆序循环把累积写成单变量递推。返回的 rho 分布是诊断对象：长尾过重说明策略偏差大，应缩短片段或提高广播频率。</p>
+
+    <p><strong>片段 3：三种结构的配置差异对照</strong></p>
+    <pre class="code"><code>def structure_diff(base_lr=3e-4):
+    """列出同步 PPO、APPO、IMPALA 三种结构的关键配置取向。"""
+    rows = {
+        "sync_ppo": {
+            "lr": base_lr,             # 基准学习率
+            "epochs": 10,              # 同批多轮复用
+            "runners": 6,              # 采样与学习交替
+            "buffer": "none",          # 无解耦缓冲
+        },
+        "appo": {
+            "lr": base_lr * 0.6,       # 陈旧度存在，学习率下调
+            "epochs": 3,               # 轮数压缩，消化版本差
+            "runners": 8,
+            "buffer": "bounded + replay",   # 有界缓冲加回放比例
+        },
+        "impala": {
+            "lr": base_lr / 3,         # 更新更密集：学习率最低
+            "epochs": 1,               # 每批一次更新
+            "runners": 16,             # 采样规模最大
+            "buffer": "queue",         # 队列解耦，V-trace 修正
+        },
+    }
+    for name, spec in rows.items():
+        print(name, spec)
+    return rows</code></pre>
+    <p>解读：对照函数把三章内容压缩成一张决策表：从同步到异步，学习率下降、轮数递减、采样器递增、数据管理从无缓冲到队列加修正。<strong>这张表是选型起点，不是结论：</strong>结构调整以同预算对照实验收尾，回报与墙钟同时达标才算成立。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>学习率沿用同步设置</strong>：更新密度高，策略漂移过快。症状是评估曲线持续抖动不收敛。修复：降至同步基线的三分之一量级，按回报稳定性回调。</li>
+      <li><strong>片段过长</strong>：比值沿时间累积，V-trace 修正的偏差上升。症状是价值目标与回报偏离。修复：缩短片段长度或提高参数广播频率。</li>
+      <li><strong>截断参数收得过紧</strong>：修正权重被普遍压小，学习信号变弱。症状是回报曲线爬升缓慢。修复：放宽 ρ̄ 与 c̄，每次只调一个参数并保留对照。</li>
+      <li><strong>队列积压不可见</strong>：学习侧是瓶颈而采样侧持续产出，样本年龄增长。症状是训练后期回报下滑且难以归因。修复：监控队列深度与样本年龄，必要时减少采样器或提高广播频率。</li>
+      <li><strong>只盯吞吐不看回报</strong>：样本吞吐漂亮而评估回报低于同步基线。症状是"跑得快学得差"。修复：以同预算对照实验为准，吞吐与回报同时入账后再决定结构。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>采样器 16 个、每环境每秒 200 步、片段长度 50，估算每秒入队片段数与最大样本供给，判断 8000 样本的学习批次能否被喂饱。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>样本供给约每秒 6400 步量级，需与学习侧每批的消费耗时对照；供给略高于消费即视为喂饱，剩余积压由队列吸收。</div></details>
+      </li>
+      <li>把 rho_bar 从 1.0 收紧到 0.5，预测修正权重分布、方差与回报爬升速度的变化。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>权重上界减半，方差下降、偏差上升；回报爬升可能变慢，稳定性提升，需用评估回报验证净效应。</div></details>
+      </li>
+      <li>推导：说明不加截断时重要性权重方差随策略偏差增长的机制，以及截断为什么能控制它。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>比率为概率之比，偏差越大比值的分布越重尾，方差随比值平方增长；上截断把权重限制在常数以内，尾部被削平，代价是系统偏差。</div></details>
+      </li>
+      <li>设计对照实验：同步 PPO、APPO、IMPALA 在相同采样预算下的墙钟时间与评估回报，说明判据与结论表述方式。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>三组固定种子与硬件，记录到达目标回报所需样本量与墙钟；结论以"样本效率"与"时间效率"两个维度分别陈述，避免单指标排名。</div></details>
+      </li>
+      <li>设计压测：把采样器数量从 8 逐级加到 64，观察样本吞吐、队列深度与评估回报的走向，给出该硬件上的最优规模与理由。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>吞吐先升后平，队列深度随规模上升；规模超过学习侧消化能力后回报开始受陈旧度拖累，取吞吐拐点且回报未降的规模。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>IMPALA 用阶梯式架构把采样与学习分层，采样器数量可远超学习侧消化能力。</li>
+      <li>V-trace 以截断重要性比率修正离策略偏差：ρ̄ 控制瞬时修正，c̄ 控制沿时间累积。</li>
+      <li>截断是偏差与方差的旋钮；ρ̄ 与 c̄ 取 1 附近是起点，按评估回报调整。</li>
+      <li>与 PPO 裁剪的作用层不同：一个修正数据估计，一个截断目标梯度。</li>
+      <li>高吞吐结构的学习率低于同步基线，轮数压到一次，配置顺序是规模、片段、学习率、截断。</li>
+      <li>下一章进入多智能体领域：MARL 把单智能体结构推广到联合动作与联合观测。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch039.html">← 第 039 章：RLlib实现APPO算法</a>
+    <a class="next" href="ch041.html">第 041 章：RLlib实现MARL算法 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

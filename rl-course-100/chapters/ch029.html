@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第029章 PPO的自动超参数搜索 | 深度强化学习课程 · PPO、SAC 与多智能体系统</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · 策略梯度与 PPO</span>
+    <span class="sep">/</span>
+    <span>第 029 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · 策略梯度与 PPO</div>
+    <h1>第 029 章：PPO的自动超参数搜索</h1>
+    <p class="lead">把调参变成实验：随机采样超参数 + 逐次减半淘汰赛 + KL 稳定性提前终止，最后用搜出的最优配置与默认配置各做一次终训，算清搜索到底值不值。</p>
+    <ul class="meta">
+      <li>主题：超参数搜索 / 资源分配</li>
+      <li>关键公式：逐次减半成本 = N·R<sub>0</sub> + ⌈N/2⌉·(R<sub>1</sub>−R<sub>0</sub>) + ⌈N/4⌉·(R<sub>2</sub>−R<sub>1</sub>) + …</li>
+      <li>预计学时：70 分钟</li>
+      <li>前置章节：第 028 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解随机搜索为什么通常优于网格搜索，以及对数均匀采样对学习率的意义。</li>
+      <li>实现逐次减半（successive halving）：按预算分档淘汰、晋级者增量续训而不重训。</li>
+      <li>把第 028 章的稳定性诊断变成搜索剪枝规则，实现"明显不稳定的试验提前终止"。</li>
+      <li>实现可增量训练的 <code>Trial</code> 对象，管理配置、环境、网络与评估的生命周期。</li>
+      <li>对"搜索最优 vs 默认"做公平终训对比，并会解释为什么简单任务上搜索不一定赢。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>前几章你手工对比了一个又一个参数，但真实项目里参数是<strong>组合</strong>的：学习率、裁剪半径、熵系数、epochs 至少四个维度，网格全枚举要几十上百次训练。更麻烦的是，PPO 的一次训练不是"再跑一遍"那么便宜：单环境 CPU 上一次 3 万步的交互量已经可观，全组合扫完的计算开销难以承受。</p>
+    <p>本章引入两个工业界的标准工具：<strong>随机搜索</strong>（参数多、有效维度少时优于网格）与<strong>逐次减半</strong>（先用小预算撒网、再集中资源给有希望的配置）。再把上一章的 KL 报警改造成搜索剪枝：连续两次 KL 超限的试验直接停掉，不浪费预算。你要实现的核心技术是"试验可以被分段训练"：晋级者接着已有进度继续跑，不从零重训。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 随机搜索为什么优于网格</h3>
+    <p>网格搜索的隐含假设是"每个维度都同样重要"。实际经验（Bergstra 与 Bengio 的经典结论）是：多数超参数对最终性能的影响高度不均匀，真正起作用的核心维度只有一两个。网格把大量预算花在无关维度上；随机搜索每个点都带来"每个维度的新取值"，期望上更快找到好区域。本章在四维空间里随机采样：</p>
+    <div class="formula">
+      lr ~ 对数均匀 [1e-4, 3e-3] &nbsp; clip ∈ {0.1, 0.2, 0.3}<br>
+      ent_coef ∈ {0.0, 0.01, 0.03} &nbsp; epochs ∈ {5, 10}
+      <span class="note">学习率必须对数采样：倍数差异才是有效尺度，1e-4 与 2e-4 的差别远大于 2e-3 与 2.1e-3</span>
+    </div>
+
+    <h3>2. 逐次减半：把预算当资源分配</h3>
+    <p>设初始 N 个试验、预算台阶 R<sub>0</sub> &lt; R<sub>1</sub> &lt; R<sub>2</sub>，每轮保留评估分数前 keep_frac 的试验进入下一档：</p>
+    <div class="formula">
+      成本 = N·R<sub>0</sub> + ⌈N/2⌉·(R<sub>1</sub>−R<sub>0</sub>) + ⌈N/4⌉·(R<sub>2</sub>−R<sub>1</sub>) + …<br>
+      对照：把 N 个配置全部训到 R<sub>2</sub> 的成本 = N·R<sub>2</sub>
+    </div>
+    <p>把 N=8、R=(4000, 12000, 30000) 代入：逐次减半约 10 万步，全量对照是 24 万步，<strong>搜索省掉一半以上预算</strong>，代价是可能在低预算阶段误淘汰"慢热型"配置。慢热配置的公平性问题是逐次减半的已知局限（后续的 Hyperband 用多轮重启缓解）。</p>
+
+    <h3>3. 提前终止：把诊断量变成剪枝规则</h3>
+    <p>第 028 章的结论是"KL、梯度、解释方差先于回报恶化亮灯"。搜索里可以直接用它省钱：</p>
+    <div class="formula">
+      if &nbsp; approx_kl &gt; prune_kl &nbsp; 连续 2 次更新 &nbsp;→&nbsp; 终止该试验
+      <span class="note">单次尖峰不触发，避免误杀；被终止的试验不参与晋级</span>
+    </div>
+    <p>注意剪枝阈值（默认 0.08）要比日常报警线（0.05）更宽松：搜索的目标是"筛掉明显坏的"，不是"只留完美的"，误杀一个慢热好配置的代价，比多跑几次坏配置更高。</p>
+
+    <h3>4. 分数用什么：独立评估回合</h3>
+    <p>搜索的排名依据必须干净且可比较。训练滑窗回报会被探索噪声压低、被早期运气抬高；本章统一用<strong>贪心策略的独立评估回合均值</strong>（默认 5 回合）做唯一排名键。评估本身的方差意味着排名有噪声，配置间真实差距若小于约 20 分，名次可能被随机性翻盘，这是使用搜索时必须诚实面对的边界。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+
+    <h3>模块划分</h3>
+    <table>
+      <tr><th>组件</th><th>职责</th><th>与第 028 章的关系</th></tr>
+      <tr><td><code>sample_config</code></td><td>在四维空间采样一组配置（lr 对数均匀）</td><td><strong>新增</strong>：搜索空间定义</td></tr>
+      <tr><td><code>Trial</code></td><td>持有配置、环境、网络、优化器与历史回报；<code>train_until</code> 支持增量续训</td><td><strong>新增</strong>：可晋级的试验对象</td></tr>
+      <tr><td><code>ppo_update</code></td><td>超参数从 per-trial 命名空间读取</td><td><strong>改造</strong>：从全局 args 到局部覆盖</td></tr>
+      <tr><td>淘汰循环</td><td>逐 rung 训练 → 评估 → 排序 → 保留前 50%</td><td><strong>新增</strong>：逐次减半主流程</td></tr>
+      <tr><td>KL 剪枝</td><td>连续两次 KL 超限即终止试验</td><td><strong>复用</strong>：第 028 章诊断的搜索化</td></tr>
+      <tr><td>终训对比</td><td>搜索最优 vs 默认配置各训 <code>--final-steps</code></td><td><strong>新增</strong>：搜索价值的回答</td></tr>
+    </table>
+
+    <h3>关键超参数</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用与取值理由</th></tr>
+      <tr><td><code>--trials</code></td><td>8</td><td>初始试验数；越多越可能命中好配置，成本线性增加</td></tr>
+      <tr><td><code>--rungs</code></td><td>4000,12000,30000</td><td>累积预算台阶；末档决定搜索内可用的最大训练量</td></tr>
+      <tr><td><code>--keep-frac</code></td><td>0.5</td><td>每轮保留比例；0.5 对应标准的减半淘汰</td></tr>
+      <tr><td><code>--prune-kl</code></td><td>0.08</td><td>剪枝阈值，比日常危险线宽松，减少误杀</td></tr>
+      <tr><td><code>--final-steps</code></td><td>30000</td><td>终训对比预算；两配置共用，保证公平</td></tr>
+      <tr><td><code>--eval-episodes</code></td><td>5</td><td>排名用评估回合数；回合太多拖慢搜索，太少排名噪声大</td></tr>
+    </table>
+
+    <h3>数据流</h3>
+    <p>搜索主流程：<strong>采样 N 组配置</strong> → 为每组建一个 <code>Trial</code> → 逐 rung 循环：所有存活试验 <code>train_until(rung)</code>（增量训练）→ 各跑独立评估 → 按 <code>(not pruned, score)</code> 排序 → 保留前 <code>keep_frac</code>、其余关闭淘汰 → 末档胜者即"搜索最优"。最后用搜索最优与默认配置各从零训练终训对比，输出配置、评估与总成本。</p>
+
+    <h3>与第 028 章的差异点</h3>
+    <ul>
+      <li><strong>角色变化</strong>：028 用诊断量"巡逻"一次训练；029 用它们"裁剪"搜索树。</li>
+      <li><strong>新增生命周期管理</strong>：试验要能暂停、评估、晋级、继续训练，<code>Trial</code> 封装了全部状态。</li>
+      <li><strong>评估协议升级</strong>：从"末尾看一次"变成"每个 rung 都做独立评估排名"。</li>
+      <li><strong>结论口径</strong>：从"哪个臂稳"转向"搜索是否值得、省了多少预算"。</li>
+    </ul>
+
+    <div class="box key">
+      <span class="box-title">晋级者必须"接着跑"</span>
+      <p>如果每个 rung 都重建网络从零训练，淘汰赛省下的预算全部作废、还额外引入新的种子噪声，<code>Trial</code> 存在的唯一理由就是让试验对象可以<strong>暂停、评估、继续</strong>。<code>train_until(target)</code> 只补"还差的那部分步数"，被淘汰的试验则直接 <code>close()</code> 释放环境。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：sample_config，对数均匀采样</strong></p>
+    <pre class="code"><code>def sample_config(rng):
+    """在搜索空间里随机采样一组超参数。"""
+    # 学习率对数均匀：先在 log10 空间均匀取值再还原，
+    # 否则线性采样会把绝大多数样本丢进高位区间（1e-3 与 2e-3 差 1 倍，1e-4 与 2e-4 也差 1 倍）
+    lr = float(10 ** rng.uniform(math.log10(1e-4), math.log10(3e-3)))
+    return {
+        "lr": lr,
+        "clip": float(rng.choice([0.1, 0.2, 0.3])),
+        "ent_coef": float(rng.choice([0.0, 0.01, 0.03])),
+        "epochs": int(rng.choice([5, 10])),
+    }</code></pre>
+    <p>解读：九行代码定义了整个搜索空间。<strong>（1）</strong>对数均匀的实现是 <code>10 ** uniform(log10(lo), log10(hi))</code>：先在指数空间均匀取值、再做幂运算还原。直觉上，lr 的有效尺度是"倍数"，沿途每个数量级的被采样概率相等，才不会出现"低端两三个值、高端一大片"的畸形覆盖。<strong>（2）</strong>clip / ent_coef / epochs 是离散小集合，直接 <code>rng.choice</code>；<code>rng</code> 由主流程用搜索种子初始化，所以整个配置序列完全可复现。<strong>（3）</strong>注意返回的字典键与小节里 <code>Trial.local_args()</code> 的字段一一对应，搜索空间的"接口"就是这四项，扩大搜索空间只需在两端同步加键。</p>
+
+    <p><strong>片段 2：Trial，生命周期与 per-trial 参数覆盖</strong></p>
+    <pre class="code"><code>class Trial:
+    """持有一组超参数及其训练状态，可被逐次减半晋级复用。"""
+
+    def __init__(self, tid, config, args, device):
+        self.tid = tid
+        self.config = config
+        self.args = args
+        self.device = device
+        # 每个试验独立种子：同一搜索种子下可复现，又避免系统性的同一起跑线
+        set_seed(args.seed + 1000 * (tid + 1))
+
+        self.env = gym.make("CartPole-v1")
+        obs, _ = self.env.reset(seed=args.seed + tid)
+        self.net = ActorCritic(self.env.observation_space.shape[0],
+                               self.env.action_space.n).to(device)
+        self.optimizer = torch.optim.Adam(self.net.parameters(), lr=config["lr"])
+        self.obs_t = to_tensor(obs, device)
+        self.returns = []
+        self.steps = 0
+        self.update_idx = 0
+        self.solved_at = None
+        self.pruned = False          # 提前终止标记
+        self.kl_high_streak = 0      # KL 连续超限计数（剪枝依据）
+
+    def local_args(self):
+        """把试验超参数覆盖到参数命名空间上，供 ppo_update 使用。"""
+        local = argparse.Namespace(**vars(self.args))
+        local.lr = self.config["lr"]
+        local.clip = self.config["clip"]
+        local.ent_coef = self.config["ent_coef"]
+        local.epochs = self.config["epochs"]
+        return local</code></pre>
+    <p>解读：<code>Trial</code> 是"可晋级的试验对象"，两个方法都值得展开。<strong>（1）</strong>构造函数的种子方案 <code>args.seed + 1000 * (tid + 1)</code> 是刻意的折中：所有试验共享搜索种子（实验可复现），但试验之间种子不同（避免"同一起跑线"导致的系统性偏差）；<code>+1000*tid</code> 的间隔让任意两个试验的随机流互不重叠。<strong>（2）</strong><code>local_args()</code> 用 <code>argparse.Namespace(**vars(args))</code> 浅拷贝全局参数后覆盖四个超参数：<code>ppo_update</code> 读到的永远是本试验的配置，不会被别的试验污染过的全局值带偏。<strong>（3）</strong><code>kl_high_streak</code> 与 <code>pruned</code> 两个字段是搜索与监控的接线口，剪枝状态属于试验自身，刷新、晋级、评估都不丢失。</p>
+
+    <p><strong>片段 3：train_until，增量训练与 KL 剪枝</strong></p>
+    <pre class="code"><code>    def train_until(self, target_steps):
+        """训练到 target_steps（增量式：已训练过的不重跑）。"""
+        local = self.local_args()
+        while self.steps &lt; target_steps and not self.pruned and self.solved_at is None:
+            batch, ep_returns, self.obs_t = collect_rollout(
+                self.env, self.net, self.args.steps_per_update, self.obs_t,
+                self.device, self.args.gamma, self.args.lam)
+            self.steps += self.args.steps_per_update
+            self.returns.extend(ep_returns)
+
+            stats = ppo_update(self.net, self.optimizer, batch, local)
+            self.update_idx += 1
+
+            # 提前终止：KL 连续两次超限，不再浪费预算（单次尖峰不算）
+            if stats["approx_kl"] &gt; self.args.prune_kl:
+                self.kl_high_streak += 1
+            else:
+                self.kl_high_streak = 0
+            if self.args.prune and self.kl_high_streak &gt;= 2:
+                self.pruned = True
+                print(f"    [T{self.tid:02d}] 提前终止：KL 连续超限（步数 {self.steps}）")
+
+            if len(self.returns) &gt;= 100 and \
+                    np.mean(self.returns[-100:]) &gt;= self.args.target_reward:
+                self.solved_at = self.steps</code></pre>
+    <p>解读：这个方法是"增量 + 剪枝"的双重体现。<strong>（1）</strong>循环条件 <code>self.steps &lt; target_steps</code> 用<strong>实例状态</strong>（不用局部变量）：这次调用只跑"还差的部分"，下一次晋级时继续累加，逐次减半省预算的全部机制就在这一行。<strong>（2）</strong>剪枝逻辑两段式：KL 超限则 streak 加一、否则清零；达到 2 才触发终止。为什么采用"连续两次"口径？累计会把训练早期正常的偶发波动也攒成误杀；连续两次才是"持续失稳"的信号。<strong>（3）</strong><code>self.args.prune and ...</code> 让 <code>--no-prune</code> 时整个剪枝分支静默跳过，对照实验零成本。<strong>（4）</strong>达标检查用滑窗与 <code>target_reward</code>，达标后该试验在后续 rung 不再训练，但仍可参加评估排名。</p>
+
+    <p><strong>片段 4：淘汰循环，训练、评估、排序、减半</strong></p>
+    <pre class="code"><code>    for rung in rungs:
+        print(f"Rung: 训练到累积 {rung} 步（存活 {len(alive)} 个试验）")
+        for t in alive:
+            before = t.steps
+            t.train_until(rung)                  # 增量训练到本档（已训部分不重跑）
+            total_search_steps += t.steps - before
+
+        # 评估并排名（提前终止的试验直接排在最后）
+        scored = []
+        for t in alive:
+            score = t.evaluate(args.eval_episodes)
+            scored.append((t, score))
+        scored.sort(key=lambda x: (not x[0].pruned, x[1]), reverse=True)
+
+        # 逐次减半：保留前 keep_frac（至少 1 个），其余关闭
+        if rung != rungs[-1]:
+            n_keep = max(1, int(len(scored) * args.keep_frac))
+            alive = [t for t, _ in scored[:n_keep]]
+            for t, _ in scored[n_keep:]:
+                t.close()</code></pre>
+    <p>解读：主循环把"资源分配"写得非常直白。<strong>（1）</strong>成本核算是 <code>t.steps - before</code>：每个试验在这一档<strong>新增</strong>的步数，被淘汰的试验之后不再产生任何费用，这就是逐次减半比全量训练省一半以上的账本来源。<strong>（2）</strong>排序键 <code>(not pruned, score)</code> 是"双键排序"：未剪枝的排前面（<code>not pruned</code> 为 True=1），同组内按分数降序；被剪枝的试验无条件垫底，保证它们不占晋级名额。<strong>（3）</strong><code>n_keep = max(1, ...)</code> 的兜底很重要：<code>keep_frac</code> 小、存活试验少时（如 2×0.5=1）至少要留 1 个，否则搜索会"团灭"。<strong>（4）</strong>末档 <code>rung == rungs[-1]</code> 不再淘汰，存活者全体进入"搜索最优"评选，最后再评一次分，选出冠军配置。</p>
+
+    <p>完整可运行脚本（附录）：<a href="../code/ch029.py" download>code/ch029.py</a></p>
+    <pre class="sh"><code>python code/ch029.py            # 8 试验 × 3 档 + 两次终训：CPU 约 4–8 分钟
+python code/ch029.py --quick    # 快速跑通：40–80 秒
+python code/ch029.py --no-prune # 关闭剪枝，对照总步数与结果</code></pre>
+    <p>以实跑为准：<strong>搜索通常找到与默认配置相当、偶尔略好的组合（评估差 0～15 分）</strong>，CartPole 默认超参本就在甜蜜区；逐次减半把 8 个配置的探索压缩到约 10 万步（全量训到 3 万步需 24 万步）；<strong>提前终止一般砍掉 0～2 个早期 KL 爆表的试验</strong>。换到更敏感的任务或更大的搜索空间，收益才会明显放大。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>用训练滑窗当搜索分数</strong>：滑窗回报既偏乐观（探索噪声被计入）又方差大，会让排名不稳。<strong>修复</strong>：搜索排名统一用独立评估回合。</li>
+      <li><strong>晋级时从零重训</strong>：每档都重建网络重头训练，逐次减半省下的预算全被浪费，还引入新的种子噪声。<strong>修复</strong>：必须是增量续训。</li>
+      <li><strong>学习率线性采样</strong>：lr 是跨数量级参数，线性采样会让区间高端过度采样、低端几乎被忽略。<strong>修复</strong>：对数均匀。</li>
+      <li><strong>种子安排留暗坑</strong>：所有试验用同一个 <code>set_seed</code> 会让淘汰赛变成"比谁在这条特定轨迹上幸运"；完全不固定又不可复现。<strong>修复</strong>：用"搜索种子 + 试验编号"的派生种子。</li>
+      <li><strong>忘了关被淘汰试验的环境</strong>：淘汰只从 <code>alive</code> 列表移除还不够，必须 <code>close()</code> 释放 gym 环境，否则长搜索会积累大量资源占用。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把 <code>--eval-episodes</code> 从 5 加大到 20 重跑搜索，对比两个 rung 的排名变化，说明评估噪声对"谁是第一"的影响。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>评估方差随回合数下降约 1/√n。若加大后前几名顺序明显改变，说明原来的排名里噪声占主导。</div></details>
+      </li>
+      <li>用 <code>--no-prune</code> 跑一次，对比搜索总步数与最终结果，统计被剪枝的试验数量，判断剪枝是"省钱"还是"误杀"。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>看日志里"提前终止"出现的次数与被终止试验的最终配置。若某个被剪枝的 lr 很高（本身就该淘汰），剪枝就是纯赚。</div></details>
+      </li>
+      <li>实现同预算的网格搜索：固定 lr 取 {1e-4, 3e-4, 1e-3, 3e-3}、其余沿用默认，其他维度不动；比较网格与随机搜索在相同总步数下的最优成绩，并解释随机搜索的采样优势在哪。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>把 <code>sample_config</code> 换成按 rng 依次取网格点的生成器即可。网格的 lr 轴是线性的，几乎全部点挤在高区，这正是要证明的问题。</div></details>
+      </li>
+      <li>把晋级排名键从"最终评估均分"换成"学习曲线 AUC"（参考第 027 章）：在 <code>Trial</code> 里按步数记录滑窗均值，rung 时算部分 AUC 排名。比较两种键选出的最优配置是否一致。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>AUC 对"慢热但上限高"的配置更宽容；评估均分更看重当下水平。两种键各有偏袒，用一次实验找出来。</div></details>
+      </li>
+      <li>实现多目标排名：分数 = 评估均分 − λ × 警告率（警告率来自第 028 章的阈值判定），λ 取 100。比较加不加稳定性项时冠军配置的差异，讨论"性能优先"与"稳定优先"的现实取舍。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>需要在 <code>Trial</code> 里累计每次更新的状态（KL、裁剪比例超阈值的次数）。加 λ 项后，那些"评估略高但 KL 常爆"的试验排名会下降。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>随机搜索 + 对数采样在低有效维度的超参数空间里优于网格；四维空间用 8～12 个样本就能覆盖大部分区域。</li>
+      <li>逐次减半把预算当资源：N 个试验先跑小档、保留前 50% 增量续训，总成本约为全量训练的一半。</li>
+      <li>第 028 章的 KL 诊断在搜索里化身剪枝规则（连续两次超限即停），但阈值要放宽，避免误杀慢热配置。</li>
+      <li>在 CartPole 上搜索通常只能与默认配置打平或小胜，简单任务别期待搜参奇迹，收益要到大空间/敏感任务里找。</li>
+      <li>PPO 部分到此收束：下一章把实现从离散动作扩展到连续控制，在三类环境上做统一基准测试，为 SAC 的登场铺垫。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch028.html">← 第 028 章：PPO的稳定性指标监控</a>
+    <a class="next" href="ch030.html">第 030 章：PPO的连续控制基准测试 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

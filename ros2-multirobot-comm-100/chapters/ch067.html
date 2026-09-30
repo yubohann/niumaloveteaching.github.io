@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第067章 多机器人协同任务分配 | 多机器人协同学习课程 · ROS2 通信与系统集成</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第四篇 · 系统集成与工程化</span>
+    <span class="sep">/</span>
+    <span>第 067 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第四篇 · 系统集成与工程化</div>
+    <h1>第 067 章：多机器人协同任务分配</h1>
+    <p class="lead">把中心节点拿掉：机器人用出价"竞标"任务，再通过邻居间的一致性协商解决冲突，拍卖与一致性捆绑算法（CBBA）如何在无中心的条件下达成接近最优的分配。</p>
+    <ul class="meta">
+      <li>主题：系统集成 / 分布式任务分配</li>
+      <li>关键机制：序列拍卖、竞价、边际增益、CBBA 捆绑构建与一致性消解</li>
+      <li>预计学时：65 分钟</li>
+      <li>前置章节：第 066 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>说清集中式分配（第 066 章）与分布式协商的适用边界，会按"中心可靠性、通信条件、车队规模"三条线索做选择。</li>
+      <li>理解拍卖机制的核心设计：出价怎么算、先价格与第二价格拍卖的激励差异、为什么需要出价截止时间。</li>
+      <li>掌握一致性捆绑算法（Consensus-Based Bundle Algorithm, CBBA）的两阶段结构与收敛条件。</li>
+      <li>会设计分布式分配的 ROS2 消息契约（任务公告、出价、赢家列表、确认）与 QoS。</li>
+      <li>能实现"边际增益递减 + 赢家列表消解"的核心逻辑，并处理同时投标与平局。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>上一章的集中式分配器在实验室里无往不利，但真实车队经常遇到三种场景：<strong>（1）</strong>没有可靠的协调者，野外作业中指挥车时通时断；<strong>（2）</strong>规模与地域跨度大，跨厂区的机器人到分配器的网络时延超过任务窗口；<strong>（3）</strong>组织上不允许单点，任何一台机器人离线都不应让整个分配停摆。这些场景需要机器人自己协商：<strong>每个成员只有局部信息，靠消息交换收敛到一个互不冲突、质量接近最优的分配方案</strong>。</p>
+    <p>本章讲两种机制：入门级的"序列拍卖"（一次一个任务、出价高者得）与进阶的 CBBA（先各自组包、再交换赢家列表消解冲突）。它们在协议层大量复用第 002–004 章的通信原语，在概念上是 066 章的分布式镜像，对比学习能同时看清两种范式的本质。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 从中心到协商：问题变难在哪里</h3>
+    <table>
+      <tr><th>维度</th><th>集中式（066 章）</th><th>分布式（本章）</th></tr>
+      <tr><td>信息</td><td>全局状态一表在握</td><td>每台只知邻居与自身状态</td></tr>
+      <tr><td>最优性</td><td>单轮全局最优</td><td>收敛到"共识解"，通常次优但差距可控</td></tr>
+      <tr><td>鲁棒性</td><td>中心故障 = 分配停摆</td><td>任何成员故障，其余继续协商</td></tr>
+      <tr><td>通信量</td><td>与任务数线性相关（下游单播）</td><td>与协商轮数 × 邻接度相关，可能更多</td></tr>
+      <tr><td>调试</td><td>日志集中，一眼可见</td><td>需要消息追踪与回放，调试成本高</td></tr>
+    </table>
+    <p><strong>选择准则：有稳定中心、追求最优，用 066；无中心条件或要求抗单点，用本章方法。</strong>两者也可以混搭：中心在线时走集中式，心跳丢失超过阈值自动降级为拍卖（这正是 074/075 章"故障切换与重构"的演练场）。</p>
+
+    <h3>2. 序列拍卖：一口价拍单个任务</h3>
+    <p>最简单的分布式机制是<strong>序列拍卖</strong>：拍卖者（可以是任务发布方，也可以是轮换的机器人）对每个任务依次开拍，机器人按自己的执行代价出价，最"便宜"的出价者赢得任务并把它加入自己的执行队列（同时更新后续出价的成本，带着已有任务绕路当然更贵）。</p>
+    <ul>
+      <li><strong>出价怎么算</strong>：b<sub>ij</sub> = 预计执行代价（空驶时间 + 任务时长 + 电量风险修正），与 066 章代价矩阵同一套口径，但必须<strong>包含"加入现有队列后的增量代价"</strong>，否则任务全被最闲的机器人抢走，队伍反而更长。</li>
+      <li><strong>先价格 vs 第二价格</strong>：先价格拍卖中赢家按自己的出价成交，理论上会诱发偏离真实代价的报价（报高价博差额或报低价赌中标）；第二价格（按第二低的出价结算）在单物品场景下让"如实出价"成为最优策略。机器人系统中没有真实"付款"，但<strong>用第二价格确定"赢家排序的信任度"仍有意义</strong>，它让出价激励与真实代价对齐。</li>
+      <li><strong>截止时间</strong>：出价需要一个截止窗口（例如公告后 300 ms），否则永远等不到"最后一个出价者"。截止时间同时也是丢包容忍机制：没赶上就参与下一轮。</li>
+    </ul>
+
+    <h3>3. CBBA：先组包，后消解</h3>
+    <p>序列拍卖一次只处理一个任务，任务多了开拍轮数线性增长；而且它无法表达"这两个任务我一起做更划算"（组合效应）。<strong>一致性捆绑算法</strong>把分配拆成两阶段交替执行：</p>
+    <ol>
+      <li><strong>捆绑构建（bundle building）</strong>：每台机器人维护一个<strong>捆绑包</strong>（bundle，候选任务有序列表）和一个<strong>执行路径</strong>（path，实际执行顺序）。机器人反复在包上做贪心插入：对每个未赢得任务 j 计算<strong>边际增益</strong>，把增益最大的任务插入到使其增益最大的位置；增益非正就停止。</li>
+      <li><strong>一致性消解（consensus）</strong>：机器人把"我赢下的任务列表 + 我的出价 + 时间戳"广播给邻居；收到邻居信息后按规则比较：<strong>同一任务，出价低者得（代价小者胜）；出价相同比时间戳，小者优先；再相同比机器人 ID，字典序小者优先</strong>。冲突消解后释放输掉的任务并重新组包，直到两轮之间没有变化，收敛。</li>
+    </ol>
+    <div class="formula">
+      边际增益 s<sub>ij</sub> = v<sub>j</sub> − c<sub>ij</sub> − λ·t<sub>i</sub>(插入后的队列时长变化)
+      <span class="note">v<sub>j</sub> 为任务价值，λ 为时间惩罚系数；插入位置不同 → 增量代价不同，"插到队尾最省"是常见结论但要搜索验证</span>
+    </div>
+    <p>为什么"出价高者得"能收敛？因为每次消解都会让每个任务的胜出出价（代价）单调下降或保持不变，而候选机器人集合有限，系统的"能量"有下界，不可能无限上升，最终稳定。工程上再加一道保险：<strong>单任务协商轮数上限</strong>（如 20 轮），超限就按当前赢家列表冻结并执行，避免极端情况下无休止协商。</p>
+
+    <h3>4. 通信契约：消息怎么设计</h3>
+    <table>
+      <tr><th>消息</th><th>方向</th><th>内容</th><th>QoS</th></tr>
+      <tr><td><code>/auction/announce</code></td><td>拍卖者→全员</td><td>任务 ID、位姿、价值、截止时间戳</td><td>Reliable + Transient-local（晚到者也要参与）</td></tr>
+      <tr><td><code>/auction/bid</code></td><td>成员→拍卖者</td><td>任务 ID、出价、机器人 ID、时间戳</td><td>Reliable（出价丢失 = 白白输掉）</td></tr>
+      <tr><td><code>/cbba/list</code></td><td>成员↔成员（邻居）</td><td>赢家列表（任务→机器人→出价→时间戳）</td><td>Best-effort（周期性重发，丢一轮下次补）</td></tr>
+      <tr><td><code>/fleet/assignment_log</code></td><td>旁观</td><td>每轮收敛后的最终分配（供监控/回放）</td><td>Best-effort</td></tr>
+    </table>
+    <p>注意 <code>/cbba/list</code> 与拍卖消息的 QoS 差异：赢家列表是"周期性重发直到收敛"的软状态，丢一条下一轮补上，Best-effort 足够，把它设成 Reliable 反而在链路抖动时堆积重传。<strong>软状态 + 周期重发（anti-entropy）是分布式协商对抗丢包的通用手法</strong>，与第 021 章状态同步同源。</p>
+
+    <h3>5. 数值算例：λ 如何决定每台机器人接几个任务</h3>
+    <p>用一组整齐的参数把边际增益公式算穿：任务价值 20、单个任务执行时长 10 s、行驶时间忽略，插入第 k 个任务时队列完成时间约 10k s，增益 = 20 − λ×10k。λ = 0.05 时增益序列为 19.5、19、18.5……直到第 40 个任务才降到零，也就是说"接单意愿"几乎没有上限，队列会一直加长，任务分配只能靠协商与赢家列表的自然竞争完成；λ = 0.5 时增益依次为 15、10、5，第 4 个任务增益为 0，组包停止，每台机器人恰好接 3 个任务，6 个任务在 2 台机器人之间正好分完。同一批任务、同一套协议，λ 从 0.05 调到 0.5，系统从"少数机器人囤积长队列"变成"主动分摊、每台三个"，这就是参数表把 λ 称为"接单意愿旋钮"的量化含义。部署时的调整方向由此明确：车队空闲、想提高单机吞吐就调小 λ；任务堆积、想强制摊平负载就调大 λ，越接近任务价值除以单任务时长的量级（此处 20/10 = 2 s⁻¹ 是停止组包的临界值），分摊越强。</p>
+    <p>协商的通信量同样可以估个量级：10 台机器人、每台每轮广播约 10 条条目的赢家列表（每条任务 ID + 机器人 ID + 出价 + 时间戳约 40 字节），单机单轮约 400 字节，按 5 Hz 重发计算是 2 kB/s/台、全队 20 kB/s，与一路压缩视频动辄 Mbps 的量级相比可以忽略。收敛轮数受拓扑决定：全连接下信息一轮传遍，2–3 轮收敛；环形拓扑的对角成员要先经 5 跳才能互见，轮数下限约为环上直径，实测 3–6 轮、按 200 ms 一轮算总耗时 0.6–1.2 s，落在任务窗口内。若某次分配超过 20 轮上限仍在变动，先要排查的通常是链路：高频丢包会让"已收敛"的列表在邻居处反复回滚，收敛轮数的分布本身就是链路质量的间接指标。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>以 CBBA 为例的落地步骤：</p>
+    <ol>
+      <li><strong>定义任务价值</strong>：每个任务带 v<sub>j</sub>（收益或优先级折算）；这是协商的"货币"，价值口径全队必须一致（写进消息，不许各自另立口径）。</li>
+      <li><strong>本地组包</strong>：每次收到新任务公告，触发一次插入搜索；不要每次插入都全网广播，攒到消解阶段统一发。</li>
+      <li><strong>消解周期</strong>：每 200–500 ms 广播一次本地赢家列表；收到邻居列表立即消解。周期太短是消息风暴，太长收敛慢（与任务窗口同量级即可）。</li>
+      <li><strong>收敛判定</strong>：连续两轮消解后本机赢家列表无变化 → 进入执行；执行中发现新任务（或任务失败）→ 释放对应条目并重新组包。</li>
+      <li><strong>可观测性</strong>：每台机器人记录自己的决策轨迹（插入顺序、被谁抢走哪些任务、轮数），收敛后发一条汇总到分配日志。</li>
+    </ol>
+    <h3>关键参数表</h3>
+    <table>
+      <tr><th>参数</th><th>建议值</th><th>理由</th></tr>
+      <tr><td>出价截止窗口</td><td>300 ms</td><td>覆盖 2–3 个往返；再长就拖慢任务启动</td></tr>
+      <tr><td>消解广播周期</td><td>0.2–0.5 s</td><td>与任务窗口同量级；丢包由下轮补齐</td></tr>
+      <tr><td>协商轮数上限</td><td>20</td><td>正常 3–6 轮收敛；上限是防御性设计</td></tr>
+      <tr><td>时间惩罚 λ</td><td>0.02–0.1 /s</td><td>把"任务堆积"折算成代价；越大越偏好分摊任务</td></tr>
+      <tr><td>重发次数</td><td>最多 3 次</td><td>赢家列表为软状态，重发有限次后接受当前共识</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：为什么"软状态 + 时间戳"优于分布式锁？</span>
+      <p>直觉上"抢任务"可以类比抢锁：谁先加锁谁得到。但分布式锁在无线链路上极易形成<strong>脑裂</strong>，两台机器人各自以为自己锁成功，同时执行同一任务，或互相等待对方释放而死锁。CBBA 完全绕开锁：允许冲突发生，用一套<strong>确定性规则让冲突必然收敛到同一答案</strong>（出价→时间戳→ID 三级比较）。软状态允许暂时不一致，但收敛保证最终一致。分布式系统里"先允许冲突、再确定性消解"几乎总比"事前加锁"健壮，这条原则会反复出现在后续的调度与资源管理章节。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：边际增益与贪心插入</strong></p>
+    <pre class="code"><code>def marginal_gain(task, robot, path, lam=0.05):
+    """把 task 插入 path 的最佳位置，返回（最佳增益, 插入位置）。
+    path: 机器人计划依次执行的任务列表（含位置与时长）。"""
+    best = (0.0, None)                      # 增益非正则不插入（0 为底线）
+    for pos in range(len(path) + 1):        # 枚举所有插入位置，n ≤ 20 时毫秒级
+        trial = path[:pos] + [task] + path[pos:]
+        t_finish = completion_time(trial, robot)     # 含行驶时间与执行时长
+        gain = task.value - lam * t_finish           # 时间惩罚折算进增益
+        if gain &gt; best[0]:
+            best = (gain, pos)
+    return best
+
+def build_bundle(robot, tasks, path):
+    """反复插入增益最大的任务，直到没有正增益，这就是经典贪心组包。"""
+    bundle = []
+    remaining = [t for t in tasks if not robot.wins(t)]
+    while True:
+        cand = [(marginal_gain(t, robot, path), t) for t in remaining]
+        (gain, pos), task = max(cand, key=lambda c: c[0][0])
+        if gain &lt;= 0.0:                     # 边际增益递减到零：停止组包
+            break
+        path.insert(pos, task)              # 位置对后续任务也最优
+        bundle.append(task)
+        remaining.remove(task)
+    return bundle</code></pre>
+    <p>解读：这段代码是 CBBA 的"本地优化"引擎，两个设计点值得咀嚼。<strong>（1）</strong>增益里减去整个完成时间 <code>lam * t_finish</code>（只减单任务时长会漏掉队列越拖越长的成本），这样"先把近处任务做完"会自然胜出，机器人不会为了高价值任务把队尾的琐事拖到天荒地老。<strong>（2）</strong>只在插入位置枚举并取最大增益，是 O(n²) 的贪心，CBBA 的原始论文证明了在"子模性"（边际增益递减）条件下贪心的近似比有界（约 50% 差距以内），对工程足够。若把 <code>lam</code> 调大，组包会变得"喜新厌旧"：每加一个任务，已有队列的完成时间惩罚都在涨，最终停止插入。所以 <strong>λ 决定每台机器人接多少个任务</strong>，车队空闲时调小、忙时调大，这是不改变协议就能控制负载的旋钮。</p>
+
+    <p><strong>片段 2：赢家列表的确定性消解</strong></p>
+    <pre class="code"><code>def resolve(local, remote):
+    """合并邻居的赢家列表：任务级冲突用三级比较，产出更新后的列表。
+    local/remote: {task_id: (robot_id, bid, stamp)}"""
+    changed = False
+    for tid, (rid, bid, stamp) in remote.items():
+        mine = local.get(tid)
+        if mine is None:
+            local[tid] = (rid, bid, stamp)          # 新任务：直接采纳
+            changed = True
+            continue
+        m_rid, m_bid, m_stamp = mine
+        if (bid, stamp, str_key(rid)) &lt; (m_bid, m_stamp, str_key(m_rid)):
+            local[tid] = (rid, bid, stamp)          # 出价低者得；平局比时间戳；再平比 ID
+            changed = True
+        # 关键：输掉的一方不立即删除条目，释放动作推迟到下一轮组包时执行
+    return local, changed
+
+def str_key(robot_id):
+    """比较键：字符串 ID 本身即可按字典序比较（Python 原生支持），
+    只用确定性规则，绝不使用"先到先得"这类依赖到达顺序的判据。"""
+    return robot_id</code></pre>
+    <p>解读：消解函数必须满足两个性质，否则系统不收敛或不一致。<strong>确定性</strong>：任何两台机器人对同一对冲突应用到同一对 (local, remote) 上，必须得到同样的结果，所以比较规则（出价、时间戳、ID）全部是消息里的确定数据，且顺序固定；元组比较按"越小越优"统一方向（代价小者胜）。<strong>单调性</strong>：只允许"更好的出价顶掉更差的"，赢家列表的每个条目只会向更好方向更新，因此轮数有限。代码里有意不去"删除输掉的条目"：释放动作发生在组包阶段（输家重算捆绑包时发现自己没了该任务），这保证消解函数是纯函数式的比较器，没有隐藏副作用，<strong>纯函数式消解是方便单测和形式化验证的关键</strong>。字符串 ID 的比较要保持确定性：同一语言环境内字典序是稳定的，跨语言实现时要显式定义同一个比较规则。</p>
+
+    <p><strong>片段 3：拍卖者节点的最小实现</strong></p>
+    <pre class="code"><code>class Auctioneer(Node):
+    """对到达的任务发起一轮拍卖：公告 → 收出价 → 截止裁定 → 广播结果。"""
+    def __init__(self):
+        super().__init__("auctioneer")
+        self.bids = {}            # task_id -&gt; [(bid, robot_id, stamp)]
+        self.create_subscription(TaskRequest, "/fleet/task_request", self.on_task, 10)
+        self.create_subscription(Bid, "/auction/bid", self.on_bid, 10)
+        self.announce_pub = self.create_publisher(Announce, "/auction/announce", 10)
+        self.award_pub = self.create_publisher(Award, "/auction/award", 10)
+
+    def on_task(self, msg):
+        self.bids[msg.task_id] = []                 # 为每个任务开一个出价箱
+        ann = Announce()
+        ann.task_id = msg.task_id
+        ann.pose = msg.pose
+        ann.value = msg.value
+        ann.deadline = self.now() + 0.3             # 300 ms 出价窗口
+        self.announce_pub.publish(ann)
+
+    def on_bid(self, msg):
+        box = self.bids.get(msg.task_id)
+        if box is not None and self.now() &lt;= msg_deadline(self, msg):
+            box.append((msg.cost, msg.robot_id, msg.stamp))   # 迟到的出价丢弃
+
+    def close(self, task_id):
+        box = self.bids.pop(task_id, [])
+        if not box:
+            self.get_logger().warn(f"任务 {task_id} 无人出价，转入等待队列")
+            return
+        cost, rid, _ = min(box)                     # 代价最小者得
+        aw = Award()
+        aw.task_id = task_id
+        aw.robot_id = rid
+        self.award_pub.publish(aw)                  # 赢家收到后自行登记</code></pre>
+    <p>解读：拍卖者只做三件事：公告、收票、裁定，保持"轻中心"角色（它可以随时被替换或增设第二个，任务 ID 去重保证重复裁定无害）。三个细节：<strong>迟到出价被丢弃且不报错</strong>，网络抖动下 300 ms 窗口本就意味着部分出价会被牺牲，成员收到 award 时若自己没赢只需更新本地记录，不需要重试；<strong>没人出价的任务转入等待队列</strong>，这正是分布式版的"回队"；<strong>裁定按最小代价</strong>，与 066 章的"最小代价匹配"口径一致，便于混合模式切换时比较两种结果的质量差异。真实系统里更推荐让拍卖消息带递增的 round 编号，防止旧公告与新公告交叉（任务重拍时尤其常见）。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>出价不含"队列增量"</strong>：每台机器人按"当前空载代价"出价，高价值任务被全员重复抢、普通任务没人接；赢了之后队列爆炸。修复：出价 = 插入现有队列产生的边际代价（片段 1 的增量口径）。</li>
+      <li><strong>消解规则依赖到达顺序</strong>：两台机器人 A、B 交换列表，"先收到的一方先赢"，双方看到的顺序不同 → 结果不同 → 永远不收敛。修复：只用消息内数据（出价、时间戳、ID）做确定性比较。</li>
+      <li><strong>协商轮数无上限</strong>：链路抖动导致消息反复"回滚"，系统在几十轮里循环。修复：轮数上限 + 超限冻结当前共识并执行；冻结事件记入日志观察频率。</li>
+      <li><strong>赢家列表用 Reliable 且高频重发</strong>：丢包时 DDS 重传队列堆积，反而把新消息挤住。修复：软状态用 Best-effort + 周期重发（anti-entropy），让新状态自然覆盖旧状态。</li>
+      <li><strong>任务失败后不释放</strong>：被指派机器人中途失败，任务条目仍挂在它的赢家列表里，全队等它一辈子。修复：任务终结（成功/失败）都广播释放消息；释放消息也用"出价 = 负值"或显式 release 字段表达，走同一套消解通道。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>三台机器人 A、B、C 竞拍任务 X：出价分别是 18、15、15，A 的时间戳为 100，B 为 90，C 为 90。按本章规则判断谁是赢家；若 B 与 C 时间戳也相同，结果如何？把比较元组写出来验证。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>出价是代价，越小越好：B、C 同为 15，低于 A 的 18，胜者在 B 与 C 之间；两者时间戳同为 90，最后比 ID，字典序小者得（假设 B 的 ID 更小则 B 胜）。规则必须保证任何观察顺序下结论一致。</div></details>
+      </li>
+      <li>把片段 1 的 <code>lam</code> 从 0.05 调到 0.5，构造 6 个任务、2 台机器人、任务价值均为 20、单任务时长 10 s 的场景，预测每台机器人最终接几个任务，并解释 λ 与车队"主动接单意愿"的关系。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>插入第 k 个任务时完成时间约 10k + 行驶，增益 ≈ 20 − 0.5×(10k+行驶)；k = 3 时已接近零。λ 大 → 早停 → 接单少、负载分散；λ 小 → 队列长、单机吞吐高。</div></details>
+      </li>
+      <li>设计一个 3 台机器人的收敛实验：随机生成 10 个任务，用两两通信的环形拓扑运行 CBBA，记录收敛轮数与消息总数；再把拓扑改成全连接对比。解释拓扑如何影响收敛速度与通信成本。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>环形拓扑信息传播直径大，收敛轮数近似随 N 增长；全连接 2–3 轮收敛但消息数 O(N²)。记录每轮的"变更条目数"曲线，观察它单调下降，这是收敛性的直观证据。</div></details>
+      </li>
+      <li>设计"中心降级"混合方案：正常情况下用 066 章集中分配器，当机器人连续 3 s 收不到分配器心跳时自动进入本章拍卖模式；中心恢复后如何无冲突地切回（提示：用分配器心跳里的 epoch 号与拍卖轮次号做仲裁）。写出状态机与切换判据。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>切换判据：心跳超时 → AUC 模式；切回条件：心跳恢复且 epoch 更新，拍卖冻结 2 个窗口，中心拉取各机当前任务表做一次全量分配。仲裁要点：同一任务在两种模式下只允许一个事实来源，epoch 大者优先。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>分布式分配解决"中心不可靠/不可用"的问题，代价是次优解与更高的调试成本；有稳定中心时集中式仍是首选。</li>
+      <li>序列拍卖三要素：边际代价出价、先/第二价格的选择、截止窗口；适合任务少、快速落地的场景。</li>
+      <li>CBBA = 捆绑构建（边际增益贪心插入）+ 一致性消解（出价→时间戳→ID 的确定性三级比较），软状态周期重发保证最终一致。</li>
+      <li>收敛保障来自"单调上升 + 候选有限"，工程上加轮数上限兜底；λ 是控制接单意愿的旋钮。</li>
+      <li>下一章给任务本身排序：当任务多于机器人时，谁先做、谁能插队，<strong>多机器人任务优先级</strong>。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch066.html">← 第 066 章：多机器人任务分配</a>
+    <a class="next" href="ch068.html">第 068 章：多机器人任务优先级 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

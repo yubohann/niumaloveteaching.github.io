@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第043章 SAC的样本复用与经验回放 | 深度强化学习课程 · PPO、SAC 与多智能体系统</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 离策略方法与 SAC</span>
+    <span class="sep">/</span>
+    <span>第 043 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 离策略方法与 SAC</div>
+    <h1>第 043 章：SAC的样本复用与经验回放</h1>
+    <p class="lead">把 SAC 的数据管道摆上实验台：大回放池、小回放池、"只吃最新一个 batch"的伪在线模式，在 Pendulum-v1 上同种子对照，量化经验回放带来的样本效率，并用数据年龄与保留率解释差异从哪里来。</p>
+    <ul class="meta">
+      <li>主题：SAC 数据管道 / 经验回放机制</li>
+      <li>关键公式：每条经验平均使用次数 ≈ batch_size × 驻留期更新次数 / 池内样本数</li>
+      <li>预计学时：50 分钟</li>
+      <li>前置章节：第 042 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解 off-policy 学习的核心资产，回放池（replay buffer），如何把一条经验的价值放大到成百上千次梯度更新。</li>
+      <li>掌握带"存入时刻"记录的回放池实现，会统计采样批次的平均年龄与数据保留率。</li>
+      <li>设计并运行三组对照（replay / small / noreplay），比较样本效率与训练曲线噪声。</li>
+      <li>会解释回放池容量的权衡：大池子样本多样但陈旧，小池子新鲜但容易"遗忘"。</li>
+      <li>会用"达标步数、保留率、平均年龄"三列数据写出可复现的实验结论。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>PPO 每批数据用几个 epoch 就必须丢掉，而 SAC 可以把每条经验放进"仓库"反复取用。这个差别直接决定样本效率：把 2 万步交互榨出成千上万次梯度更新的 SAC，往往比"数据用一次就扔"的算法快一个量级学会任务。反过来说，如果回放池配置不当，太小、采样有偏、存储出错，它也会悄悄变成性能瓶颈。</p>
+    <p>本章不动算法，<strong>只动数据管道</strong>：把数据年龄与保留率两个指标变成日志里可读的数字，看清"容量"这个参数到底买到了什么、又付出了什么。三组对照的预期是：大池最快且最平滑，伪在线最慢且最抖，小池居中；如果实验跑完发现排序不是这样，先检查数据年龄与保留率两列是否符合预期，再讨论算法层面的原因。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 为什么回放能提高样本效率</h3>
+    <p>SAC 的每个梯度步骤只需要一个 mini-batch (s, a, r, s′)。与环境交互获得一条新经验要花一次物理仿真（昂贵），而从池中抽样几乎免费。设一条经验在池中驻留期间被抽中的平均次数为 k，则同样的环境交互量下，梯度更新次数放大了约 k 倍，这就是"样本复用"的字面含义。</p>
+    <div class="formula">
+      每条经验的平均使用次数 ≈ batch_size × 驻留期内更新次数 ÷ 池内驻留样本数
+      <span class="note">池子越大、更新频率越高，同一批交互被榨出的梯度越多；容量与更新频率是复用倍数的两个杠杆</span>
+    </div>
+    <p>符号说明：batch_size 是每次更新抽取的样本数（本章 256）。可以直观估算：容量 10 万、每步更新一次、跑 2 万步，平均每条交互被用到数百次。把公式在稳态下算精确：一条经验存入后会在池中停留 C 步（C 为容量），期间共发生 C 次更新、每次抽取 256 条，总抽取 256C 次，而池内正好有 C 条样本，因此<strong>每条经验的期望使用次数 ≈ 256C / C = batch_size</strong>。也就是说，在"每步更新一次 + 均匀采样"的配置下，复用倍数约等于批量大小（本章约 256 次），容量并不改变复用次数，它改变的是这些复用发生在多新、多多样的数据上。</p>
+    <p>把复用倍数与第 030 章的 PPO 摆在一起，数字会更有体感。PPO 每次采样 2048 步、更新 10 个 epoch，每条样本在每个 epoch 被消费一次，复用倍数约 10；SAC 在本章配置下约 256，两者相差约 26 倍。这就是"同样一次环境交互能换出多少次梯度更新"的差距，也是第二篇开头"off-policy 用更少交互量达到更好水平"的账面来源。</p>
+
+    <h3>2. 回放还修正了数据分布</h3>
+    <p>RL 数据强相关：连续的 200 步来自同一条轨迹，如果直接用"最近一批"数据做 SGD，梯度噪声里混着"轨迹偏置"，更新方向会随最近几个回合剧烈摇摆。随机抽样近似还原独立同分布（i.i.d.）批次，这是回放池的第一动机：</p>
+    <div class="formula">
+      L<sub>Q</sub> = 𝔼<sub>(s,a,r,s′)~𝒟</sub>[ ( Q(s,a) − ( r + γ·min<sub>j=1,2</sub> Q̄<sub>j</sub>(s′,a′) − α·log π(a′|s′) ) )<sup>2</sup> ]
+      <span class="note">𝒟 是回放池；池子越大，𝒟 越接近策略的长期访问分布</span>
+    </div>
+    <p>符号说明：Q̄<sub>j</sub> 是第 j 个目标网络，a′ 是策略在 s′ 上的采样动作，α 是温度系数。可以看到梯度更新的所有素材都来自 𝒟，𝒟 的质量（多样性、新鲜度）直接决定训练的稳定性。noreplay 模式把 𝒟 压缩到"最近 256 条"，两种性质都变差。</p>
+    <p>把"强相关"具体化：一条 200 步轨迹里相邻状态的观测差异很小，价值也接近，用连续 256 条数据算出的梯度，有效信息量远小于 256 条独立样本。统计学上，强相关序列的等效独立样本数要乘以一个小于 1 的因子，相关长度越长因子越小；均匀随机抽样把相关长度压到接近零，让 256 条的批量真正发挥 256 条的作用。这个因子可以算：对一阶自回归结构（相邻步相关系数 ρ），样本均值的有效样本数约为 n(1−ρ)/(1+ρ)。取 ρ=0.9，256 条连续数据的等效独立样本约 256×0.1/1.9≈13.5 条；ρ=0.99 时只剩约 1.3 条。换句话说，noreplay 名义上批量 256，实际信息量可能只有十几条独立样本，而回放池均匀抽样把批内相关长度压到接近零。这一项差异比"重复抽取 94 条"更本质：重复抽取损失的是计算效率，相关性损失的是梯度的有效信息量。这也是经验回放被称为"离策略学习第一性组件"的原因：它同时解决复用与去相关两个问题。</p>
+
+    <h3>3. 数据年龄与保留率：给数据管道装两个仪表</h3>
+    <p>定义一个样本的<strong>年龄</strong>为"被抽中时的环境步数 − 存入时的环境步数"。均匀采样且池满时，年龄平均值约为容量的一半：256 池约 128 步、2000 池约 1000 步。大池（容量 10 万）在 2 万步预算内不会被写满，年龄随训练线性增长，2 万步结束时约为池内样本数的一半、一万步量级，前几个评估点上还只是几千步。<strong>保留率</strong> = 池内样本数 ÷ 累计收集数，度量"记忆长度"：noreplay 只保留 256 / 20000 ≈ 1.3%，意味着 98% 以上的交互用一次就被丢弃。年龄衡量新鲜度，保留率衡量记忆，二者合起来解释了容量的全部代价与收益。</p>
+    <p>把容量放进更长的预算里，还能看到"大池"的失效场景：若预算放大到 100 万步、容量仍是 10 万，保留率稳定在约 10%，平均年龄约 5 万步，相当于批次里混着"250 个回合之前"的数据。任务分布固定时，这些数据仍然有价值；一旦任务非平稳（课程学习、环境参数漂移），旧数据记录的是旧策略下的回报，Q 回归会被系统性拖偏，典型症状是前期学得快、后期停滞甚至回退。判断方法依旧是年龄列：当平均年龄超过你估计的"策略明显改进的间隔步数"时，就该考虑缩小容量或做数据淘汰。</p>
+
+    <div class="box key">
+      <span class="box-title">数值例子：2 万步预算下三个模式的账本</span>
+      <p>统一条件：预算 20000 环境步、每步一次更新、批量 256。总抽取次数 = 20000 × 256 = 512 万次；累计收集 20000 条经验；按上节推导，每条经验平均被使用约 256 次，三种模式在这项上一致。</p>
+      <table>
+        <tr><th>指标</th><th>replay（10 万）</th><th>small（2000）</th><th>noreplay（256）</th></tr>
+        <tr><td>池内样本数（训练末）</td><td>20000</td><td>2000</td><td>256</td></tr>
+        <tr><td>保留率</td><td>100%（未写满）</td><td>10%</td><td>约 1.3%</td></tr>
+        <tr><td>采样平均年龄（训练末）</td><td>约 10000 步</td><td>约 1000 步</td><td>约 128 步</td></tr>
+        <tr><td>批次内数据的来源跨度</td><td>横跨几乎整场训练</td><td>最近约 10 个回合</td><td>最近 1.3 个回合</td></tr>
+      </table>
+      <p>解读：复用次数相同，三者的差别集中在"批次里的数据来自多宽的时间跨度"。replay 的每个批次混合了早期探索与近期改进的样本，接近策略的长期访问分布；noreplay 的批次几乎全部来自最近一两个回合，连续性强相关，梯度方向随回合内容摇摆。这也解释了为什么 noreplay 的保留率只有约 1.3%：98% 以上的交互在写入后 256 步内就被覆盖，历史信息被彻底丢弃。</p>
+      <p>把"多样性"再精确一格：从容量为 n 的池子里均匀抽 256 条，期望抽到的<strong>不同样本数</strong>为 n·(1−(1−1/n)<sup>256</sup>)。代入三档容量：n=256 时约 162 条，即一个批次里有约 94 条是重复样本；n=2000 时约 240 条；n=20000 时约 254.4 条。noreplay 批次的近四成抽取是同一条数据的重复消费，这也是它梯度噪声大的结构性原因，与抽样运气无关。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+
+    <h3>三种模式的定义</h3>
+    <table>
+      <tr><th>模式</th><th>池容量</th><th>行为与预期表现</th></tr>
+      <tr><td><code>replay</code></td><td>100000</td><td>标准经验回放，约 500 个回合历史；样本多样、曲线平滑，达标最快</td></tr>
+      <tr><td><code>small</code></td><td>2000</td><td>小池，只记住最近约 10 个回合；前期快，后期受遗忘与多样性不足拖累</td></tr>
+      <tr><td><code>noreplay</code></td><td>256</td><td>伪在线：只保留最近一个 batch，数据高度相关、用一次即扔，最慢且抖</td></tr>
+    </table>
+
+    <p>容量取值的说明：replay 的 10 万容量在 2 万步预算内不会被写满，它实际提供的是"全历史保留"；若把预算放大到 20 万步以上，同一容量就会开始环形覆盖，年龄停止增长、保留率降到 50% 附近，行为从"记住一切"切换为"记住最近 10 万步"。small 的 2000 对应约 10 个回合，刚好覆盖一个策略改进周期，用来观察"遗忘开始拖后腿"的临界点；noreplay 的 256 等于一个 batch，是"有池子但等于没有"的极限对照。</p>
+
+    <h3>数据流</h3>
+    <p>每个模式的完整流程：环境步进 → <code>buffer.add(..., step)</code> 写入（带出生时刻）→ 每步从池中均匀抽样并做一次 SAC 更新，同时记录该批次的平均年龄 → 每 4000 步评估并打印<strong>近 20 回合回报、评估回报、保留率、数据年龄</strong>四列 → 首次评估回报达到阈值 −400 时记录达标步数。三种模式共用随机种子与全部超参数，只有池容量不同。</p>
+
+    <h3>复用倍数的两个杠杆与口径</h3>
+    <p>把公式再推一遍，可以厘清两个容易混淆的杠杆。均匀采样、稳态下，一条经验的期望使用次数等于"批量 × 每步更新次数"，与容量无关：update_every=1 时约 256 次，改成 2 时约 512 次，三种模式同步变化。容量决定的是另一件事，经验在池里停留多少步：环形覆盖一轮需要写入 C 条新数据，所以驻留步数约等于容量。大池的样本被反复取用但发生在很长的时间窗里，小池的取用密集但样本很快消失。两个杠杆在日志上的表现也不同：把 update_every 翻倍，保留率与年龄不变（容量与写入速率都没变），更新次数与训练耗时翻倍；把容量翻倍，更新次数不变，年龄分布整体后移。</p>
+
+    <h3>模块划分</h3>
+    <table>
+      <tr><th>组件</th><th>职责</th><th>关键点</th></tr>
+      <tr><td><code>ReplayBuffer</code></td><td>环形缓冲 + 均匀采样 + 存入时刻记录</td><td>新增 <code>stamp</code> 数组；<code>sample</code> 返回平均年龄</td></tr>
+      <tr><td><code>SAC</code></td><td>与第 042 章相同的标准实现（min 双 Q）</td><td>本章不动算法，只动数据管道</td></tr>
+      <tr><td><code>train_mode()</code></td><td>按模式配置容量，完整跑一轮训练</td><td>三种模式同种子同预算，控制变量</td></tr>
+      <tr><td>汇总表</td><td>打印达标步数、保留率、平均年龄等</td><td>达标定义：评估回报首次不低于 −400</td></tr>
+    </table>
+
+    <h3>关键超参数</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用与取值理由</th></tr>
+      <tr><td><code>--buffer-size</code></td><td>100000</td><td>replay 模式容量，约 500 个 Pendulum 回合的历史</td></tr>
+      <tr><td><code>--small-capacity</code></td><td>2000</td><td>small 模式容量，约 10 个回合，故意制造"遗忘"</td></tr>
+      <tr><td><code>--max-steps</code></td><td>20000</td><td>每种模式的环境步数预算，三种模式完全相同</td></tr>
+      <tr><td><code>--target-return</code></td><td>−400</td><td>"解决"阈值，用于统计达标步数（Pendulum 上较宽松）</td></tr>
+      <tr><td><code>--update-every</code></td><td>1</td><td>每环境步做一次更新；调大它等于提高数据寿命</td></tr>
+      <tr><td><code>--batch-size</code> / <code>--lr</code></td><td>256 / 3e-4</td><td>批量与学习率，延续第 042 章设置</td></tr>
+    </table>
+
+    <h3>与前一章的差异点</h3>
+    <ul>
+      <li>第 042 章改的是 Q 值组合方式，数据管道全线共用；本章反过来，<strong>算法保持标准 min 双 Q，只改回放池容量</strong>。</li>
+      <li>回放池新增 <code>stamp</code> 与 <code>sample(current_step)</code>，把"数据新鲜度"变成可观测量。</li>
+      <li>主流程从"依次训练三种估计器"改为"依次训练三种回放模式"，汇总达标步数、保留率、平均年龄。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：给回放池装上"出生时刻"</strong></p>
+    <pre class="code"><code>class ReplayBuffer:
+    """定长回放池；额外记录每条经验存入时的环境步数，便于统计数据新鲜度。"""
+
+    def __init__(self, capacity: int, obs_dim: int, act_dim: int):
+        self.capacity = capacity
+        self.obs = np.zeros((capacity, obs_dim), dtype=np.float32)
+        self.next_obs = np.zeros((capacity, obs_dim), dtype=np.float32)
+        self.act = np.zeros((capacity, act_dim), dtype=np.float32)
+        self.rew = np.zeros((capacity, 1), dtype=np.float32)
+        self.done = np.zeros((capacity, 1), dtype=np.float32)
+        self.stamp = np.zeros(capacity, dtype=np.int64)  # 存入时的环境步数
+        self.ptr = 0
+        self.size = 0
+
+    def add(self, obs, act, rew, next_obs, done, step: int) -&gt; None:
+        i = self.ptr                         # 环形指针：写到哪、下一轮先覆盖谁
+        self.obs[i] = obs
+        self.act[i] = act
+        self.rew[i] = rew
+        self.next_obs[i] = next_obs
+        self.done[i] = done                  # 只记录真实终止，截断不入库
+        self.stamp[i] = step                 # 记下"出生时刻"，供年龄统计
+        self.ptr = (self.ptr + 1) % self.capacity
+        self.size = min(self.size + 1, self.capacity)
+
+    def sample(self, batch_size: int, current_step: int = 0) -&gt; dict:
+        """均匀采样；current_step 用于计算被采样数据的平均年龄。"""
+        idx = np.random.randint(0, self.size, size=batch_size)
+        age = float(np.mean(current_step - self.stamp[idx])) if current_step else 0.0
+        return {
+            "obs": torch.as_tensor(self.obs[idx]),
+            "act": torch.as_tensor(self.act[idx]),
+            "rew": torch.as_tensor(self.rew[idx]),
+            "next_obs": torch.as_tensor(self.next_obs[idx]),
+            "done": torch.as_tensor(self.done[idx]),
+            "age": age,
+        }</code></pre>
+    <p>解读：三个设计点值得记住。<strong>（1）</strong>预分配 numpy 数组 + 环形指针 <code>ptr</code>：<code>add</code> 是 O(1) 的纯内存写入，<code>ptr</code> 回绕后自动覆盖最旧样本，"遗忘"就发生在这一行。容量 256 的 noreplay 模式因此只保留最近一个 batch。<strong>（2）</strong><code>done</code> 只写 <code>float(terminated)</code>：时间截断不入库，bootstrap 语义才正确。<strong>（3）</strong><code>sample</code> 用 <code>current_step − stamp[idx]</code> 的均值算年龄：一行代码把"数据新鲜度"变成可观测量；返回 dict 里带 <code>age</code>，训练循环顺手就能把它记进日志。</p>
+
+    <p><strong>片段 2：三种模式只差一个容量</strong></p>
+    <pre class="code"><code>def train_mode(mode: str, args):
+    """mode: replay（大池）/ small（小池）/ noreplay（只用最新 batch）。"""
+    set_seed(args.seed)                      # 三种模式同种子，做控制变量对比
+    if mode == "replay":
+        capacity = args.buffer_size          # 大池：约 500 个回合的历史，样本多样
+    elif mode == "small":
+        capacity = args.small_capacity       # 小池：只记住最近约 10 个回合
+    else:
+        capacity = args.batch_size           # 伪在线：容量恰好一个 batch
+
+    env = make_env(args.env, args.seed)
+    eval_env = make_env(args.env, args.seed + 100)   # 评估环境独立，互不干扰
+    obs_dim = env.observation_space.shape[0]
+    act_dim = env.action_space.shape[0]
+    action_scale = float(env.action_space.high[0])
+    agent = SAC(obs_dim, act_dim, action_scale, args)
+    buffer = ReplayBuffer(capacity, obs_dim, act_dim)
+
+    min_size = args.start_steps if mode != "noreplay" else args.batch_size
+    obs, _ = env.reset(seed=args.seed)
+    solved_at = None</code></pre>
+    <p>解读：<strong>（1）</strong>三种模式的差异全部集中在这一个 <code>if/elif</code> 里，这正是本章想证明的观点：数据管道是纯工程改动，算法一行不动。<strong>（2）</strong>noreplay 把容量设成 <code>batch_size</code>，环形缓冲自动退化成"只装最新 256 条"；<code>min_size</code> 也跟着放宽到 batch_size，因为池子小、必须尽早开始更新。<strong>（3）</strong>评估环境用 <code>seed + 100</code> 独立种子：训练环境每回合被重置和扰动，评估环境保持固定初始分布，两条数据流互不污染。</p>
+
+    <p><strong>片段 3：训练循环里的采样、年龄与保留率</strong></p>
+    <pre class="code"><code>    for step in range(1, args.max_steps + 1):
+        if step &lt;= args.start_steps:
+            action = env.action_space.sample()            # 预热期纯随机，铺开状态覆盖
+        else:
+            action = agent.act(obs, deterministic=False)
+        next_obs, rew, terminated, truncated, _ = env.step(action)
+        buffer.add(obs, action, rew, next_obs, float(terminated), step)
+        collected += 1
+        obs = next_obs
+        ep_ret += rew
+
+        if terminated or truncated:                       # 两种结束都重置环境
+            ep_returns.append(ep_ret)
+            ep_ret = 0.0
+            obs, _ = env.reset()
+
+        if step % args.update_every == 0 and buffer.size &gt;= min_size:
+            batch = buffer.sample(args.batch_size, step)  # 采样带上 step 才能算年龄
+            agent.update(batch, args)
+            n_updates += 1
+            ages.append(batch["age"])                     # 年龄序列留给评估点打印
+
+        if step % args.eval_every == 0:
+            eval_ret = evaluate(agent, eval_env, args.eval_episodes)
+            mean_age = float(np.mean(ages[-200:])) if ages else 0.0
+            history.append((step, eval_ret, mean_age))
+            recent20 = np.mean(ep_returns[-20:]) if ep_returns else float("nan")
+            retention = buffer.size / max(collected, 1)   # 保留率 = 驻留 / 累计收集</code></pre>
+    <p>解读：这几行的逻辑是"每环境步一条数据、一次更新"，<code>update_every=1</code> 意味着数据被复用的机会最大。<strong>（1）</strong><code>buffer.add</code> 与 <code>buffer.sample</code> 都传了 <code>step</code>：前者记出生时刻，后者算年龄，两个参数串起整套新鲜度统计。<strong>（2）</strong><code>ages[-200:]</code> 取最近 200 次更新的平均年龄，避免受早期波动干扰。<strong>（3）</strong>保留率用"当前池内样本 ÷ 累计收集"计算，随训练单调下降并稳定在容量与总步数的比值附近，noreplay 稳定在约 1.3%，小池约 10%，大池继续走低。想知道另外两个模式谁达标更快，看 <code>solved_at</code> 与评估列即可。</p>
+
+    <p>完整可运行脚本（附录）：<a href="../code/ch043.py" download>code/ch043.py</a></p>
+    <pre class="sh"><code>python code/ch043.py            # 三种模式各 20000 步，CPU 约 4–6 分钟
+python code/ch043.py --quick    # 快速跑通：4000 步/模式，约 1 分钟
+python code/ch043.py --modes replay,noreplay --small-capacity 1000   # 自定义对照</code></pre>
+    <p>预期：<strong>replay 达标最快、曲线最平滑；noreplay 最慢甚至跑不到阈值，近 20 回合回报抖动明显更大；small 居中</strong>。年龄一栏近似恒定：256 池约 128 步、2000 池约 1000 步、大池随训练线性增长到几千步。达标步数以实跑为准，换种子时绝对回报有 ±50 左右波动，相对次序通常稳定。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>把 truncated 写进 done</strong>：Pendulum 每回合 200 步是时间截断。若把它当终止写入回放池，所有回合边界的目标值都被砍成单步奖励，Q 值系统性偏低，策略会"怕结束"而不做长程规划。修复：只存 <code>float(terminated)</code>。</li>
+      <li><strong>容量小于 batch_size</strong>：采样反复抽到同几条数据，多样性名存实亡。修复：保证容量至少是一个 batch。</li>
+      <li><strong>以为回放池越大越好</strong>：容量翻倍意味着平均年龄线性增长，在非平稳任务（课程、迁移）里会大量使用"旧策略下的次优数据"，表现为前期快、后期停滞。修复：先看年龄指标，再决定容量。</li>
+      <li><strong>三组对照其实不同种子</strong>：改了容量却忘了固定种子，"结论"可能只是随机波动。修复：像 <code>train_mode</code> 这样每次训练开头 <code>set_seed</code>，并保持预算一致。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把 <code>--small-capacity</code> 依次设为 <code>500</code>、<code>5000</code>、<code>20000</code> 跑 <code>--modes small</code>，找出"容量-样本效率"曲线的拐点大约在哪。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>只改一个参数，看达标步数与最终评估。容量小到不足一两个回合（400 步/回合）的数据量时，轨迹多样性会先成为瓶颈。</div></details>
+      </li>
+      <li>把 <code>--update-every</code> 从 1 改成 2，三种模式再跑一次。noreplay 的相对劣势变大还是变小？预测并验证。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>更新频率减半后，noreplay 里一条经验的"寿命"也翻倍（平均被用到两次）。先写清楚：更新次数少了，每次更新依据的数据分布没变，猜想再跑。</div></details>
+      </li>
+      <li>为什么 <code>eval_env</code> 要用 <code>seed + 100</code>、与训练环境分开？如果训练和评估共用环境实例，日志会出现什么异常？<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>评估时的 <code>env.reset()</code> 会打断训练轨迹的连续性，训练统计（ep_returns）与评估互相污染；从"数据流隔离"的角度分析。</div></details>
+      </li>
+      <li>在 <code>ReplayBuffer.sample()</code> 里改成"只保留最近 50% 数据再均匀采样"，重跑 replay 模式，比较达标步数与平均年龄，讨论有偏采样的利弊。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>最简单的实现：池满时用 <code>(self.ptr + k) % capacity</code> 推算最新半区起点再采样。年龄应减半，注意环形指针下"最新的一半"是 <code>ptr</code> 附近的索引。</div></details>
+      </li>
+      <li>把对比口径从"固定环境步数"换成"固定总梯度更新次数"（例如 8000 次），重新对比 replay 与 noreplay。说明两种口径下结论的差别，以及为什么真实工程里更常用"固定环境步数"。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>把两种模式的 max_steps 换算到更新次数一致。思考：梯度计算的边际成本几乎为零，样本效率应以谁为分母。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>经验回放把一条交互放大的梯度次数可以提高一到两个数量级，是 SAC 样本效率的主要来源。</li>
+      <li>容量的收益是"多样性 + 不遗忘"，代价是"数据变旧"；本章用<strong>保留率</strong>与<strong>数据年龄</strong>两个仪表把它量化。</li>
+      <li>伪在线（noreplay）实现简单、样本新鲜，但数据强相关且历史全扔，达标更慢、曲线更抖。</li>
+      <li>回放池是纯数据结构改动，<strong>换容量不改算法即可复现全部结论</strong>，这是 off-policy 方法的工程魅力。</li>
+      <li>复用倍数在稳态下约等于批量大小（每步更新、均匀采样时约 256 次），容量真正改变的是数据的时间跨度与多样性。</li>
+      <li>保留率与年龄是一对互补仪表：保留率说明"历史被丢了多少"，年龄说明"手上数据有多旧"，两者都要看才能解释训练曲线。</li>
+      <li>下一章给回放池装上"优先级"：把均匀抽样换成"TD 误差大的样本获得更高被抽中概率"，用同样的计算量换更快的收敛。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch042.html">← 第 042 章：SAC的Q网络过估计分析</a>
+    <a class="next" href="ch044.html">第 044 章：SAC的优先级经验回放 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

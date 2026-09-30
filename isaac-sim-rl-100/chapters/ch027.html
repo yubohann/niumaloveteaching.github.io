@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第027章 实现基于像素的观察 | 机器人仿真学习课程 · Isaac Sim 强化学习训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · 仿真环境与训练框架</span>
+    <span class="sep">/</span>
+    <span>第 027 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · 仿真环境与训练框架</div>
+    <h1>第 027 章：实现基于像素的观察</h1>
+    <p class="lead">让策略"看"世界：一张 128×128 的图像如何变成 49152 维观测、CNN 怎样把它压回可用维度、帧堆叠与归一化各自解决什么问题。</p>
+    <ul class="meta">
+      <li>主题：观测设计 / 视觉模态</li>
+      <li>相关组件：Isaac Sim（相机传感器 / 渲染）、PyTorch（CNN）</li>
+      <li>预计学时：50 分钟</li>
+      <li>前置章节：第 026 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>建立像素观测的量化直觉：分辨率、通道数、帧数如何共同决定观测维度与显存开销。</li>
+      <li>理解 CNN 作为视觉编码器的两个核心性质（局部连接、平移等变），以及它为什么比全连接更适合图像。</li>
+      <li>掌握帧堆叠的必要性：为什么单帧观测不是马尔可夫的，速度信息从哪里来。</li>
+      <li>会在 Isaac Sim 中配置环境相机、批量采集图像并做正确的归一化与色彩空间处理。</li>
+      <li>会设计"视觉 + 状态"的不对称 actor-critic 观测字典，理解训练的取巧与部署的现实约束。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>在此之前，你的观测都是真值向量：关节角、目标位置、接触标志，仿真里随手可得。但真机上你拿不到这些：老板不会给'目标物体的精确三维坐标'标上价签发给你，而相机是便宜、通用、信息量最大的传感器。视觉策略的价值在于三件事：<b>更接近真实部署（不依赖特权信息）、能表达难以建模的特征（纹理、遮挡、变形）、统一处理"看得到就懂"的任务</b>（从抓取到装配，同一套视觉前端复用）。</p>
+    <p>代价也直白：<strong>像素观测把输入的维度从几十膨胀到几万，把采样吞吐砍掉一个数量级。</strong>第 022 章你还在为 4096 环境欢呼，一上相机可能只剩 256–1024 个还能跑得动。本章要做的就是在这条约束下把视觉观测设计正确的每一块拼图：分辨率、帧堆叠、归一化、编码器、训练技巧。你做对了，"看图操作"就是一次正常的训练；做错了，就是烧几小时显卡换来一条平线。</p>
+  </section>
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 维度账本：像素观测到底有多"贵"</h3>
+    <p>先算账。一张 RGB 图像的原始维度是 H×W×C：</p>
+    <div class="formula">
+      128 × 128 × 3 = 49,152 维，  84 × 84 × 3 = 21,168 维，  64 × 64 × 1 = 4,096 维
+      <span class="note">对比：Franka 全状态观测约 30 维，像素观测是它的 1000 倍</span>
+    </div>
+    <p>如果直接接全连接网络，第一层权重就是 49152×256 ≈ 1260 万参数，而且<strong>每个像素位置的权重都要独立学习</strong>，图像平移一个像素，输入就完全变了，网络必须重新学。更早的灾难是样本效率：每一帧要几十 KB，回放缓冲、并行批大小、策略推理耗时全部随维度爆炸。所以像素观测的核心命题在于<b>如何编码降维</b>：用一个带强先验的结构把 49152 维压回几百维特征。</p>
+
+    <h3>2. CNN 的两个先验：局部连接与平移等变</h3>
+    <p>卷积层用两个假设把参数量压下来：<b>(a) 局部性</b>，像素只与邻居相关，卷积核只看 k×k 邻域（如 5×5）；<b>(b) 平移等变</b>，同一个卷积核在整张图上滑动，同一模式出现在任何位置都用同一组权重识别。参数量对比：</p>
+    <div class="formula">
+      全连接首层：W×H×C × 256 ≈ 1260 万；卷积首层：5×5×C × 32 = 2400
+      <span class="note">相差约 5000 倍；再加上跨位置共享，样本效率天差地别</span>
+    </div>
+    <p>层数决定"感受野"：3 层 3×3 卷积（stride 1）后，每个特征点看到 7×7 原始像素；配两次 stride 2 下采样，是经典的"特征金字塔"结构。更深的层看到更大范围、更抽象的语义：<strong>浅层抓边缘与色块，中层抓部件，深层抓"目标在哪、夹爪张没张开"</strong>。实践中 3–4 层卷积、通道 16→32→64、每两次卷积后下采样，就足够机器人操作任务；网络再深，收益递减且训练变慢。</p>
+
+    <h3>3. 马尔可夫性：为什么必须帧堆叠</h3>
+    <p>单帧图像缺少动态信息：一个球静止与一个球向相机飞来，单帧上长得一模一样；夹爪的"正在闭合"与"已经夹紧"在单帧里也难分。MDP 假设要求观测包含决定未来的全部信息，而单帧视觉观测不是马尔可夫的，<strong>解决方案是把最近 k 帧沿通道维堆叠</strong>：</p>
+    <div class="formula">
+      obs<sub>t</sub> = concat( I<sub>t−k+1</sub>, …, I<sub>t−1</sub>, I<sub>t</sub> )，  通道数 C′ = k × C
+      <span class="note">k=2–4 常用：两帧给出速度的近似（差分），四帧覆盖完整运动包络；k 再大收益很小</span>
+    </div>
+    <p>k 的选择是精度与开销的折中：k=1 只适合目标静止、动作直接改变可视状态的任务（如纯定位）；k=2 能表示一阶运动；k=4 是连续控制任务的经典值（Atari 系列与研究文献的天花板经验值）。<b>堆叠的代价不只是输入变 k 倍，还包括维护环形缓冲与处理回合边界的"补帧"逻辑</b>，回合开始时还没有历史帧，要么把首帧重复 k 次，要么直接用零填充；<strong>重复首帧比补零更好，因为补零会给策略一个"从黑色深渊里突然出现画面"的虚假运动信号。</strong></p>
+
+    <h3>4. 渲染的真实成本：相机是吞吐的头号杀手</h3>
+    <p>第 022 章的吞吐公式在视觉任务里要加一项：每环境每步的渲染与读回时间。量级感受：一张 128×128 RGB 图，在批量渲染下每帧约几十微秒到几百微秒；512 个环境 × 60 Hz × 4 帧堆叠 = 每秒 12.3 万次图像更新。这解释了为什么视觉任务要：<b>(1) 降分辨率</b>（128→64 省 4 倍像素）、<b>(2) 降相机更新频率</b>（图像每 2–4 个控制步更新一次，中间帧复制，物理与控制保持 60 Hz）、<b>(3) 关不必要的渲染通道</b>（不需要 RGB 就渲染灰度或深度）。此外，渲染分辨率是"每环境渲染目标"的尺寸之和，并行渲染的显存占用近似按环境数线性增长，256 个 128×128 相机的显存预算要先算进去。</p>
+
+    <h3>5. 不对称 actor-critic：训练阶段的合理"作弊"</h3>
+    <p>视觉训练收敛慢的一个补救是<b>不对称 actor-critic</b>：策略（actor）只看图像，价值函数（critic）额外看真值状态。合理性在于：critic 只在训练时存在，它的优势是给转瞬即逝的成功事件提供低方差的信用分配；部署时只需要 critic 不用出现的 actor。这在 Isaac 系生态里是标配技巧（RL-Games 的 <code>central_value</code>、rsl_rl 的 privileged critic）。<strong>注意两条纪律：actor 的观测在训练与部署时必须一致（不能训练看状态、部署看图像）；critic 的特权信息只许加不许改 actor 的通路。</strong></p>
+
+    <h3>6. 完整算例：渲染帧率上限与环境的可行组合</h3>
+    <p>视觉任务的吞吐瓶颈通常从物理迁移到渲染，用一个帧率账把它算清。设单帧批量渲染加读回的等效成本为 100 µs（落在"几十微秒到几百微秒"区间的中段），则渲染管线的帧率上限约 1/100 µs = 10 000 帧/秒。再看需求侧：512 环境、相机 30 Hz 时每秒需要 512×30 = 15 360 帧，<strong>超出上限 54%，渲染成为系统瓶颈</strong>，此时加环境只会让所有环境一起等渲染。三组合法配置都能把渲染预算压回一半以内：</p>
+    <table>
+      <tr><th>配置</th><th>帧需求（帧/s）</th><th>渲染占用</th><th>备注</th></tr>
+      <tr><td>128×128、512 环境、30 Hz</td><td>15 360</td><td>154%（超载）</td><td>不可行，需降一档</td></tr>
+      <tr><td>64×64、512 环境、30 Hz</td><td>15 360</td><td>38%</td><td>像素量 1/4，等效单帧成本降到 25 µs</td></tr>
+      <tr><td>128×128、256 环境、15 Hz</td><td>3 840</td><td>38%</td><td>环境数减半、更新率减半</td></tr>
+    </table>
+    <p>这张表把"降分辨率、降频率、减环境"三个旋钮变成可比较的数字：前两者按线性比例省渲染，环境数是乘性因子。选择顺序建议：先降到任务允许的最低分辨率，再把相机频率砍到控制频率的 1/2 到 1/4，最后按渲染预算倒推环境数。<strong>注意渲染与物理兜底的预算关系</strong>：物理批处理每控制步约 5 ms（022 章），而渲染按帧计费：512 环境在 30 Hz 下每秒消耗约 1.5 s 的渲染机时，摊到每个控制步约 26 ms；物理与渲染相加才是单步的真实开销。</p>
+
+    <h3>7. 卷积算量核算：推理不是瓶颈</h3>
+    <p>同一个配置的 CNN 前向算量可以精确数出来。设输入 k×3=12 通道、128×128，编码器为片段 3 的结构，逐层乘加（MAC）数如下：</p>
+    <table>
+      <tr><th>层</th><th>输出尺寸</th><th>MAC 数（每帧）</th></tr>
+      <tr><td>Conv 5×5×(k·3=12)→32, stride 2（k=4 堆叠）</td><td>64×64×32</td><td>3932 万</td></tr>
+      <tr><td>Conv 3×3×32→64, stride 2</td><td>32×32×64</td><td>1887 万</td></tr>
+      <tr><td>Conv 3×3×64→64, stride 2</td><td>16×16×64</td><td>944 万</td></tr>
+      <tr><td>Linear 1024→256</td><td>256</td><td>26 万</td></tr>
+      <tr><td>合计</td><td></td><td>约 6790 万 MAC ≈ 135.8 MFLOPs</td></tr>
+    </table>
+    <p>折算：512 个环境一次批量前向约 69.5 GFLOPs；按现代 GPU 50 TFLOPS 的保守有效算力估计，约 1.4 ms。<strong>结论：卷积推理在批量下很便宜，视觉任务的钱主要花在渲染与数据搬运上</strong>，这也解释了为什么"减分辨率"永远比"减网络层数"更优先。表里的方法可迁移：把每层输出尺寸乘通道数再乘卷积核参数量，就是你自己的算量账。顺带可见 k 的代价：堆叠帧数从 4 降到 2，首层算量同步减半，这是"帧堆叠不是免费"的算量侧证明。</p>
+
+    <h3>8. 分辨率与像素足迹：128 到底能看清什么</h3>
+    <p>"128 能分辨 1 cm 级物体"需要一个距离限定。单像素的角分辨率约等于视场角除以像素数：水平视场 60° 时每像素 0.0082 rad。乘以距离得到像素足迹：</p>
+    <table>
+      <tr><th>距离</th><th>60° 视场（cm/像素）</th><th>70° 视场（cm/像素）</th></tr>
+      <tr><td>0.5 m</td><td>0.41</td><td>0.48</td></tr>
+      <tr><td>1.0 m</td><td>0.82</td><td>0.95</td></tr>
+      <tr><td>1.5 m</td><td>1.23</td><td>1.43</td></tr>
+    </table>
+    <p>读法：1 m 距离上，128 分辨率下一个像素覆盖约 0.8–1 cm，一个 1 cm 的物体只有 1–2 个像素，足以"发现存在"，不足以判断姿态与接触状态。因此"128 够用"成立的条件是：关键物体常出现在 0.5 m 以内（0.4 cm 像素足迹，1 cm 物体占 2–3 像素），或成功判据只依赖粗略位置。若任务需要在 1.5 m 处分辨 1 cm 特征，就得上 256 分辨率或拉近相机，代价是前面算过的渲染账翻四倍。<strong>设计顺序：先用像素足迹表确定分辨率，再用 6 节的帧率账确定环境数与频率。</strong></p>
+    <p>再补一条帧率的边界：相机 30 Hz、控制 60 Hz 时，相邻两个控制步可能读到同一帧，"帧间差分"给出的速度估计会间歇性为零；相机降到 15 Hz 时，速度感知的时间分辨率退化到 66 ms，快速运动物体在这期间可移动数厘米。修复思路可以避开无脑提高帧率：把"帧重复标志"放进观测（哪怕一维），让策略知道当前差分是否可信。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p><strong>路线图："装相机 → 抠图归一化 → 环形缓冲堆帧 → CNN 编码 → 观测字典交给策略"。</strong>每一级都有明确的量化选择：</p>
+    <ol>
+      <li><strong>装相机</strong>：在每个环境模板里放一台固定相机（眼在手外）或随动相机（眼在手内）。眼在手外建议安装高度 1.2 m、俯角 30°，同时看到机械臂与工作面；眼在手内能看到局部细节但要处理晃动。</li>
+      <li><strong>取图与归一化</strong>：Isaac 的相机数据输出为 float32 的 RGBA，取 RGB 三通道除以 255 归一到 [0,1]；<b>不要保留 alpha 通道</b>，它全是 1，白占 1/4 显存还稀释梯度。</li>
+      <li><strong>帧堆叠</strong>：维护每环境的环形缓冲（k 帧），回合开始时全部填首帧。缓冲区用 GPU 张量实现，避免每步往返 CPU。</li>
+      <li><strong>CNN 编码</strong>：卷积 → 下采样 → 池化 → 展平 → 线性投影到 128–256 维特征；投影结果与本体状态向量拼接后再进策略网络。</li>
+      <li><strong>观测字典</strong>：<code>{"policy": 图像堆叠, "critic": 图像堆叠+真值状态}</code> 的不对称结构；维度、归一化方式在环境与训练器两侧必须一致。</li>
+    </ol>
+    <table>
+      <tr><th>设计点</th><th>推荐值</th><th>理由</th></tr>
+      <tr><td>分辨率</td><td>128×128（眼在手外）/ 64×64（简单任务）</td><td>128 能分辨 1 cm 级物体；64 只够粗定位</td></tr>
+      <tr><td>通道</td><td>RGB 3 通道或灰度 1 通道</td><td>颜色区分物体时用 RGB；纯几何任务灰度省 3 倍带宽</td></tr>
+      <tr><td>堆叠帧数 k</td><td>2–4</td><td>2 帧给速度，4 帧保运动包络；再大收益小</td></tr>
+      <tr><td>相机更新率</td><td>每 2 个控制步 1 次</td><td>图像变化速度低于控制频率；省一半渲染开销</td></tr>
+      <tr><td>并行环境数</td><td>256–1024（128×128）</td><td>渲染目标显存与吞吐的实测量级；先小后大</td></tr>
+      <tr><td>CNN 输出维</td><td>128–256</td><td>与本体状态（30 维）拼接后总维数百量级</td></tr>
+    </table>
+    <div class="box warn">
+      <span class="box-title">警告：图像归一化的两种"正确"</span>
+      <p>PyTorch 生态常用 ImageNet 均值方差归一化，Isaac 输出是 [0,1] 原始像素，<strong>用错归一化（如按 255 尺度再除一次）会把所有像素压到 0 附近，CNN 看不到任何纹理</strong>。统一纪律：环境侧负责"输出 [0,1] 的 RGB"，策略侧负责"不再缩放，直接进第一层卷积"，两端的 255 尺度约定写进文档。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：环境相机与批量取图</strong></p>
+    <pre class="code"><code>from isaacsim.sensors.camera import Camera   # 老版本路径为 omni.isaac.sensor，类名一致
+
+class PixelObsEnv:
+    def _create_camera(self, prim_path, resolution=(128, 128)):
+        cam = Camera(
+            prim_path=prim_path,                     # 每个环境模板下各挂一台
+            resolution=resolution,                   # (宽, 高)：128×128 = 49152 个 float
+            frequency=30,                            # 相机 30 Hz：比控制 60 Hz 低，够用且省一半渲染
+            clipping_range=(0.05, 4.0),              # 近裁剪 5 cm：太近会把机械臂切掉；太远损失深度精度
+        )
+        cam.initialize()
+        return cam
+
+    def _grab_images(self):
+        # 一次调用拿回全部环境的图像张量：形状 (N, H, W, 4)，float32，RGBA
+        frames = self.camera.get_rgba()              # 批量接口：不要逐环境 for 循环
+        rgb = frames[..., :3]                        # 丢掉 alpha：恒为 1，白占显存且无信息
+        rgb = rgb.permute(0, 3, 1, 2)                # (N,H,W,C) → (N,C,H,W)：PyTorch 卷积约定
+        rgb = rgb.clamp(0.0, 1.0).float()            # 环境侧唯一的归一化：[0,1]；上层不许再缩放
+        return rgb</code></pre>
+    <p>解读：三个决定值得展开。<b>frequency=30 不是随手写的</b>：相机是异步更新的，它按自己的频率渲染，控制循环按 60 Hz 读最近一帧。这意味着"图像每两控制步更新一次"是白送的性能红利，不必手动降频，只要接受半帧延迟。<b>clipping_range 为什么重要？</b>近裁剪面把 5 cm 以内的东西直接"透明化"。相机装得太近或机器人贴过来时，机械臂会在画面里消失，策略突然失去反馈，表现为"莫名猛冲"。<b>批量接口 <code>get_rgba()</code> 是吞吐生命线</b>：逐环境抓图的写法在 256 环境时就要多花几十毫秒，直接吃掉一半吞吐。</p>
+
+    <p><strong>片段 2：帧堆叠环形缓冲</strong></p>
+    <pre class="code"><code>import torch
+
+class FrameStack:
+    """每环境维护 k 帧历史的环形缓冲；全体操作留在 GPU 上"""
+    def __init__(self, num_envs, k, c, h, w, device):
+        self.k = k                               # 堆叠帧数：2-4
+        self.buf = torch.zeros(num_envs, k, c, h, w, device=device)
+        self.done = torch.ones(num_envs, dtype=torch.bool, device=device)
+
+    def reset(self, env_ids):
+        self.done[env_ids] = True                # 打上"需要初始化"标记，下一帧统一处理
+
+    def push(self, frame):                       # frame: (N, C, H, W)
+        init_ids = self.done.nonzero(as_tuple=False).squeeze(-1)
+        if init_ids.numel() &gt; 0:
+            # 回合开始的补帧策略：把首帧复制 k 份，不做补零
+            # 补零会让策略看到"从黑屏突然出现画面"的虚假运动
+            self.buf[init_ids] = frame[init_ids].unsqueeze(1).repeat(1, self.k, 1, 1, 1)
+            self.done[init_ids] = False
+        roll_ids = (init_ids.numel() == 0)       # 非初始化环境才滚动
+        self.buf[roll_ids] = torch.roll(self.buf[roll_ids], shifts=-1, dims=1)
+        self.buf[roll_ids, -1] = frame[roll_ids]
+        return self.buf.reshape(self.buf.shape[0], -1)   # (N, k*C*H*W) 展平给卷积接口</code></pre>
+    <p>解读：环形缓冲本身是教科书结构，但这两个工程细节是踩坑重灾区。<b>(1) 重置与滚动必须二选一</b>：刚重置的环境如果先把历史帧复制好、"再"滚动一次，最新的图像会被滚掉、零帧重现，错误行为是"每次重置后第一帧画面发黑"。代码里用 <code>roll_ids</code> 明确区分两类环境，正是为了避免这种交叉污染。<b>(2) 返回展平还是保持 (N, k, C, H, W)？</b>取决于消费端：如果 CNN 把帧通道合并处理（k×C 当输入通道），展平后 4D 张量直接可用；如果要"逐帧编码再融合"（时序卷积或注意力结构），就保持 5D。本章采用前者，因为参数更少、与 CnnPolicy 类接口通用。显存账：N=512、k=4、3×128×128 的缓冲 = 512×4×3×128×128×4 字节 ≈ 400 MB，这也是视觉任务环境数上不去的直接原因之一。</p>
+
+    <p><strong>片段 3：CNN 编码器与不对称观测</strong></p>
+    <pre class="code"><code>import torch.nn as nn
+
+class VisionEncoder(nn.Module):
+    """3 层卷积把 (k*3, 128, 128) 压成 256 维特征"""
+    def __init__(self, in_channels, feature_dim=256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_channels, 32, 5, stride=2, padding=2), nn.ELU(),   # 128→64
+            nn.Conv2d(32, 64, 3, stride=2, padding=1), nn.ELU(),            # 64→32
+            nn.Conv2d(64, 64, 3, stride=2, padding=1), nn.ELU(),            # 32→16
+            nn.AdaptiveAvgPool2d(4),                                        # 任意输入尺寸→4×4
+            nn.Flatten(),                                                   # 64×4×4 = 1024
+            nn.Linear(1024, feature_dim), nn.ELU(),                         # 压到 256 维
+        )
+
+    def forward(self, img):
+        return self.net(img)                 # (N, k*3, 128, 128) → (N, 256)
+
+class ActorCritic(nn.Module):
+    def __init__(self, img_channels, state_dim, act_dim):
+        super().__init__()
+        self.encoder = VisionEncoder(img_channels)          # actor 与 critic 共享编码器
+        self.actor = nn.Sequential(nn.Linear(256 + state_dim, 256), nn.ELU(),
+                                   nn.Linear(256, act_dim))
+        # 不对称设计：actor 只看图像；critic 额外得到真值状态（仅训练期存在）
+        self.critic = nn.Sequential(nn.Linear(256 + state_dim, 256), nn.ELU(),
+                                    nn.Linear(256, 1))
+        self.state_dim = state_dim
+
+    def forward(self, obs_dict):
+        feat = self.encoder(obs_dict["image"])              # 共用视觉特征
+        a_in = feat                                    # actor：只有视觉特征
+        c_in = torch.cat([feat, obs_dict["privileged"]], dim=-1)  # critic：视觉+真值
+        return self.actor(a_in), self.critic(c_in)</code></pre>
+    <p>解读：编码器结构里每个数字都有依据。<b>首层 5×5、stride 2</b>：一张 128 图第一层就砍半，卷积算量立刻降 4 倍，机器人图像的低频结构足够识别场景，不需要在原始分辨率上做精细滤波。<b>AdaptiveAvgPool 到 4×4</b>：把空间信息聚合成 16 个区域的平均激活，让网络对物体出现位置有一定不变性，同时支持任意输入分辨率（换相机参数时不用改网络）。<b>actor 与 critic 共享编码器</b>：视觉特征学习是最贵的部分，共享让 critic 的梯度也能改进编码器，这也是不对称结构能加速收敛的原因之一。但注意 <code>c_in</code> 里拼接的是归一化之后的完整真值状态：真值状态进入 critic 前同样经过归一化管线，否则 critic 的输出尺度会失衡。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>单帧当观测</strong>：不做帧堆叠（或 k=1），策略无法感知速度与运动方向。症状：能走到目标附近但会过冲、对运动物体无反应。修复：k≥2，且回合起始用首帧填充。</li>
+      <li><strong>颜色通道布局混乱</strong>：Isaac 输出 HWC、PyTorch 要 CHW，漏了 <code>permute</code> 后 128×128 的图像被当成 128 个通道的 1×N 张量，卷积核看到的是"颜色的横向条纹"。症状：训练完全不动。修复：环境出口统一 (N,C,H,W)，在代码里断言形状。</li>
+      <li><strong>归一化双重缩放</strong>：环境已除 255，训练侧又按 255 尺度处理一次，全图趋近 0。症状：CNN 输出恒定，策略只看本体状态。修复：全流程单一约定。</li>
+      <li><strong>相机近裁剪切掉机械臂</strong>：眼在手外装得太近，机械臂抬起到某高度就在画面里消失。症状：策略在固定高度附近"失去控制"。修复：clipping_range 近端 ≤ 5 cm，或把相机拉远换角度。</li>
+      <li><strong>忘记渲染与训练的分频</strong>：按控制频率 60 Hz 全速渲染图像，吞吐直接腰斩。症状：训练步数远低于预期、GPU 渲染占用 100%。修复：相机频率 30 Hz 或更低，训练侧读最近帧。</li>
+      <li><strong>超载的渲染预算</strong>：512 环境 128×128 相机开 30 Hz，帧需求 15 360 帧/秒超过渲染管线约 10 000 帧/秒的上限，全部环境一起等渲染。症状：加环境不再提速、单步耗时随渲染抖动。修复：按 6 节的三种可行组合降分辨、降频、减环境。</li>
+      <li><strong>速度估计被重复帧污染</strong>：相机频率是控制频率的整数分之一时，堆叠帧里会出现相邻的完全相同的帧，帧间差分间歇性为零。症状：策略对移动目标的追及忽快忽慢。修复：把"本步是否新帧"作为一维观测，或按 8 节的方法评估时间分辨率是否够用。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>定量计算：128×128 RGB、k=4 堆叠、512 环境时，观测张量在显存中占多少（float32）？把分辨率改成 64×64 后呢？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>512×4×3×128×128×4B ≈ 402 MB；64×64 时降到约 100 MB，这也是视觉任务环境数能否翻四倍的分水岭。</div></details>
+      </li>
+      <li>实验设计题：k=1 与 k=4 各训练一个"追移动目标"的任务，预测并验证两者在"跟上移动目标"上的差异；再从观测构造角度解释为什么单帧理论上就不够。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>马尔可夫性论证：静止球与迎面飞来的球在单帧上无法区分。实验观察前 50 个 update 的追及成功率。</div></details>
+      </li>
+      <li>把相机频率从 30 Hz 改成 60 Hz，记录每秒训练步数与策略成功率的变化。什么条件下提高渲染频率是"值"的？<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>快速运动或需要高精度对准的任务可能值得更高帧率；若任务慢速、成功率不变，多出来的渲染就是纯浪费。</div></details>
+      </li>
+      <li>实现"灰度化"消融：把 RGB 转成单通道灰度（0.299R+0.587G+0.114B），保持其他不变训练，对比显存、吞吐与成功率。什么任务会明显掉点？<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>靠颜色区分的任务（红蓝方块）会大幅掉点；纯几何任务几乎无损。转换放在环境侧做，训练侧接口不变。</div></details>
+      </li>
+      <li>思考题：不对称 actor-critic 在部署时"只部署 actor"，请论证：为什么这种训练期特权不会导致"部署时性能悬崖"？在哪些任务上这个论证会失效？<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>actor 的通路从未见过特权信息，它学到的映射本身是纯视觉的；但若奖励设计让 actor 依赖 critic 过度乐观的价值估计，策略会学到"冒险等你兜底"的行为，部署时失效。</div></details>
+      </li>
+      <li>预算题：任务要求在 1.2 m 距离分辨 1.5 cm 的物体姿态，相机水平视场 60°，问最低需要多大分辨率（按每维至少 3 像素估算）？再用 6 节的帧率账判断这个分辨率下能开多少环境。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>1 m 处单像素 0.82 cm，1.2 m 处约 1 cm；要 3 像素覆盖 1.5 cm 需要约 0.5 cm/像素，分辨率需加倍到 256；256 下帧成本约为 128 的 4 倍，按 6 节 38% 的渲染预算反推，环境数约 32。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul>
+      <li>像素观测的维度是状态的千倍；CNN 用局部连接与平移等变把参数量压了几千倍，这是视觉可训的前提。</li>
+      <li>帧堆叠 k=2–4 恢复马尔可夫性；回合起始把首帧复制 k 份，不做补零。</li>
+      <li>渲染是吞吐头号成本：降分辨率、降相机频率、关多余通道、批量取图，四条都要用上。</li>
+      <li>观测字典 + 不对称 actor-critic 是视觉任务的标配：actor 纯视觉、critic 加真值，编码器共享。</li>
+      <li>下一章换第二种模态：点云，比图像更稀疏、更几何、更接近真机 LiDAR / 深度相机的输出格式。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch026.html">← 第 026 章：实现连续动作空间</a>
+    <a class="next" href="ch028.html">第 028 章：实现基于点云的观察 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

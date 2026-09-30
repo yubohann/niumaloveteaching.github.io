@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第064章 实现多模态融合 | 机器人仿真学习课程 · Isaac Sim 强化学习训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第三篇 · 高级强化学习专题</span>
+    <span class="sep">/</span>
+    <span>第 064 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第三篇 · 高级强化学习专题</div>
+    <h1>第 064 章：实现多模态融合</h1>
+    <p class="lead">机器人同时"看、感觉、听命令"：本章把本体感知、视觉、力反馈、语言指令四种采样率与量纲完全不同的信号，在特征层对齐成一条统一的策略输入。</p>
+    <ul class="meta">
+      <li>主题：观测设计 / 多传感器融合</li>
+      <li>相关组件：Isaac Sim / Isaac Lab / PyTorch / Stable-Baselines3</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 063 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>说清早融合、晚融合、中间融合三种策略的差异与适用场景，理解为什么中间融合是机器人策略的默认选择。</li>
+      <li>掌握多模态在<strong>时间频率、量纲、时延</strong>三个维度上的失配问题，会设计对齐与陈旧度补偿机制。</li>
+      <li>会为每个模态写独立编码器，并用模态嵌入 + 注意力做特征层融合。</li>
+      <li>会用模态丢弃（modality dropout）训练出对传感器掉线鲁棒的策略，并正确区分训练/推理行为。</li>
+      <li>能评估融合效果：单模态消融、掉线鲁棒性曲线、部署延迟预算。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 027–029 章你已经分别实现了基于像素、点云、力传感器的观测。但真实机器人从不同时只依靠一种传感器：视觉告诉你桌上有个杯子，本体验觉告诉你手臂现在什么姿态，力反馈告诉你指尖是否已经捏住，语言指令告诉你"把它放到左边"，任何单一模态在关键时刻都可能失效（视觉被遮挡、力传感器漂移、指令含糊），<strong>多模态的价值在于交叉验证与互补</strong>。</p>
+    <p>难点在于这些信号的"物理形态"完全不同：关节角 60 Hz 且连续光滑，相机 30 Hz 且高维，力传感器常常 240 Hz 以上且带尖峰，语言指令只在任务开始时出现一次。直接拼接（把图像展平塞进 MLP）几乎必然失败，量纲、频率、延迟三重失配会让训练不稳定或退化成"只用一个模态"。本章用独立编码 + 特征对齐 + 注意力融合的组合拳解决它。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 三种融合位置：早、晚、中间</h3>
+    <table>
+      <tr><th>方案</th><th>做法</th><th>问题</th></tr>
+      <tr><td>早融合（early）</td><td>原始数据直接拼接后进同一个网络</td><td>量纲/频率失配；高维模态（图像）淹没低维模态</td></tr>
+      <tr><td>晚融合（late）</td><td>每个模态各出一个策略，输出层加权</td><td>模态间的互补关系（"力大说明视觉误差大"）无法交互</td></tr>
+      <tr><td>中间融合（intermediate）</td><td>各模态先编码成同维特征，再交互融合</td><td>需要设计对齐机制；训练稍复杂</td></tr>
+    </table>
+    <p>机器人策略几乎都选中间融合：编码器负责把"苹果、橘子"都翻译成同一种语言（比如 128 维特征），融合层再用注意力决定这一刻信任谁。<strong>关键在于：模态之间的"信任权重"应该是状态相关的、能学习的</strong>，视觉被遮挡时自动加重力反馈；预先写死的常数权重做不到这一点。</p>
+
+    <h3>2. 失配之一：频率与陈旧度</h3>
+    <p>控制循环 60 Hz 时，相机两帧之间隔了 1 帧没有新图像。最朴素的做法是"保持上一帧"（零阶保持），但策略收到的是<strong>已经过期最多 33 ms 的视觉信息</strong>，如果它在高速运动，这期间的图像已经偏了。解决方案是把"陈旧度"本身作为特征：</p>
+    <div class="formula">
+      s<sub>age</sub> = t<sub>now</sub> − t<sub>stamp</sub>　（单位：秒，截断到 [0, 0.2]）
+      <span class="note">把 s<sub>age</sub> 附在该模态特征后，网络可以学会"图像越旧越不信"</span>
+    </div>
+    <p>同理，高频力信号要先降采样：240 Hz → 60 Hz 用 4 帧均值，均值同时起低通滤波作用，抑制尖峰。反过来低频命令要升采样：语言编码一次，整回合保持不变，并把"这是当前指令"的位置编码一起写入。</p>
+
+    <h3>3. 失配之二：量纲与归一化</h3>
+    <p>关节角范围约 ±π，相机特征经归一化在 ±1，力信号可能到 ±50 N。如果全部拼进同一个线性层，梯度会被大力信号主导。正确做法是<strong>每个模态各用独立编码器</strong>：编码器内做模态专属归一化（力信号除以量程、图像除以 255 再标准化、关节角除以 π），输出统一维度后，量纲在特征层已经无关紧要。这也解释了为什么第 029 章强调"观测归一化要在模态内部完成"。</p>
+
+    <h3>4. 注意力融合：让模态互相解释</h3>
+    <p>把每个模态编码成 1 个（或多个）token，加模态嵌入（modality embedding，告诉网络"我是谁"），送入一层跨模态注意力：</p>
+    <div class="formula">
+      z = Attention( X<sub>proprio</sub> ⊕ X<sub>vision</sub> ⊕ X<sub>force</sub> ⊕ X<sub>cmd</sub> )
+      <span class="note">⊕ 表示沿序列维拼接；注意力权重会逐状态地决定"此刻听谁的"</span>
+    </div>
+    <p>这本质上复用了第 062 章的机制：模态就是"时间句子"里的 token，只不过这次序列维是模态维。注意力权重可视化的价值在这里尤其大，抓取实验中你能直接看到接触瞬间力 token 的权重从 0.1 跳到 0.6。</p>
+
+    <h3>5. 模态丢弃：对掉线鲁棒</h3>
+    <p>训练时以概率 p（常用 0.1–0.2）把某个模态的特征置零并附一个"缺失标志位"，逼网络学会在缺任何一个模态时也能工作。这是与第 065 章 Sim2Real 直接呼应的一步：真机上相机黑屏、力传感器断线是常态。<strong>注意两点</strong>：丢弃必须与"缺失标志"一起给（否则网络分不清"特征真是 0"还是"没数据"）；推理时概率归零，但缺失标志通道保留，真掉线时置 1。语言这类"每回合一次"的模态不要丢，丢了等于任务定义丢失，策略会退化成无目标行为。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>以"看指令抓取"任务为例：Franka 机械臂 + 腕部 RGB + 六维力 + 12 维本体 + 8 维目标指令。融合管线分五步：</p>
+    <ol>
+      <li><strong>逐模态编码</strong>：本体（45 维）→ MLP(128)；图像（128×128×3）→ 小型 CNN 卷积到 30×30×32 再展平 → FC(128)；力（每控制步 4 帧 × 6 维）→ 均值池化 + MLP(64)；指令（8 维）→ MLP(64)。统一投影到 d=128。</li>
+      <li><strong>对齐与陈旧度</strong>：视觉缓冲保留最近 2 帧及时间戳，控制步取最近帧并计算 s<sub>age</sub>，与模态嵌入相加（用一个小 MLP 把标量映射进 128 维）。</li>
+      <li><strong>融合</strong>：4 个模态 token + 1 个学习出来的"汇总 token"，2 层跨模态注意力（复用第 062 章编码器），输出取汇总 token。</li>
+      <li><strong>鲁棒化</strong>：训练期 p=0.15 模态丢弃（力与视觉各掉 15%，本体不丢），附缺失标志；frozen 评估时先全模态跑 100 回合，再逐模态置零跑掉线测试。</li>
+      <li><strong>训练</strong>：PPO 端到端联合训练，图像编码器与策略同步更新；学习率对视觉编码器单独设 1e-4（其余 3e-4），避免高维参数主导更新。</li>
+    </ol>
+    <div class="box key">
+      <span class="box-title">设计思维：为什么不用"预训练视觉 + 冻结"？</span>
+      <p>冻结预训练视觉编码器（如 ResNet 特征）能加快早期收敛，但抓取任务的关键视觉线索往往是"指尖与物体的相对关系"这种任务特异信息，通用特征未必包含。<strong>在仿真里你有无限数据，端到端联合训练上限更高</strong>；预训练更适合真机微调数据稀缺的场景（第 076 章策略蒸馏会再讨论这种取舍）。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：多模态编码器与注意力融合网络</strong></p>
+    <pre class="code"><code>import torch
+import torch.nn as nn
+
+class FusionPolicy(nn.Module):
+    """四个模态各自编码成 128 维 token，外加汇总 token，做 2 层跨模态注意力。"""
+    def __init__(self, d=128, act_dim=7):
+        super().__init__()
+        self.prop = nn.Sequential(nn.Linear(45, d), nn.ELU(), nn.Linear(d, d))   # 本体：轻量 MLP
+        self.force = nn.Sequential(nn.Linear(6, 64), nn.ELU(), nn.Linear(64, d)) # 力：先池化再编码
+        self.cmdc = nn.Sequential(nn.Linear(8, 64), nn.ELU(), nn.Linear(64, d))  # 指令：低频但关键
+        cnn = [nn.Conv2d(3, 16, 5, stride=2), nn.ELU(), nn.Conv2d(16, 32, 3, stride=2),
+               nn.ELU(), nn.Flatten(), nn.Linear(32 * 30 * 30, d), nn.ELU()]     # 128px 简化 CNN
+        self.vis = nn.Sequential(*cnn)
+        self.mod_emb = nn.Parameter(torch.zeros(4, d))        # 模态嵌入：告诉注意力"我是谁"
+        self.age_mlp = nn.Sequential(nn.Linear(1, 32), nn.ELU(), nn.Linear(32, d))
+        enc = nn.TransformerEncoderLayer(d, nhead=4, dim_feedforward=4 * d,
+                                         dropout=0.0, batch_first=True, norm_first=True)
+        self.fuse = nn.TransformerEncoder(enc, num_layers=2)
+        self.cls = nn.Parameter(torch.zeros(1, 1, d))         # 可学习汇总 token
+        self.mu = nn.Linear(d, act_dim)
+        self.log_std = nn.Parameter(torch.full((act_dim,), -0.5))
+
+    def forward(self, prop, vis, force, cmd, vis_age, mask):
+        # mask: [B, 4] 0/1，标记模态是否可用；被丢弃的 token 置零并附缺失标志
+        toks = torch.stack([self.prop(prop), self.vis(vis), self.force(force), self.cmd(cmd)], dim=1)
+        toks = toks + self.mod_emb[None]                      # 加模态身份
+        age = self.age_mlp(vis_age.unsqueeze(-1)).unsqueeze(1)  # 陈旧度只作用于视觉 token
+        toks[:, 1:2] = toks[:, 1:2] + age
+        toks = toks * mask.unsqueeze(-1)                      # 缺失模态清零，等价于"没听见"
+        seq = torch.cat([self.cls.expand(toks.shape[0], -1, -1), toks], dim=1)
+        z = self.fuse(seq)[:, 0]                              # 汇总 token 读全序列
+        return self.mu(z), self.log_std.exp().expand(toks.shape[0], -1)</code></pre>
+    <p>解读：<code>stack</code> 把四个模态排成序列 [B, 4, d]，模态嵌入让同一个注意力层能区分"我是第几个 token 的角色"（没有它，网络要靠值分布反推模态身份，训练慢且脆）。<code>age</code> 只加在视觉 token 上，因为只有周期性传感器有明显陈旧问题。<code>mask</code> 与"清零"是配套的：清零让注意力权重自然流向其他模态；要把"这个模态挂了"这一信息显式告知网络，还需把缺失标志一并拼进特征（见常见坑），本片段只演示清零。汇总 token 是第 062 章"取末位 token"的复用，但此处序列无序，用专门的汇总量更干净，训练后它的注意力分布就是一张"此刻信任谁"的热力图。动作头输出 7 维（6 关节 + 1 夹爪），log_std 共享参数是轻量近似。</p>
+
+    <p><strong>片段 2：跨频率对齐器，把 30 Hz、240 Hz、60 Hz 汇到一条控制线上</strong></p>
+    <pre class="code"><code>import numpy as np
+from collections import deque
+
+class MultiRateAligner:
+    """控制步调用一次 align()：取出与当前时刻对齐的各模态数据。"""
+    def __init__(self, dt=1.0 / 60.0):
+        self.dt = dt
+        self.vis_buf = deque(maxlen=2)      # 视觉只存最近 2 帧：再多也过期，浪费内存
+        self.force_buf = deque(maxlen=8)    # 力 240 Hz：一个控制周期攒 4 帧，留 2 个余量
+
+    def push_vision(self, img, t):          # 由相机回调以 ~30 Hz 调用
+        self.vis_buf.append((t, img))
+
+    def push_force(self, f, t):             # 由力传感器回调以 ~240 Hz 调用
+        self.force_buf.append((t, f))
+
+    def align(self, t_now):
+        t_v, img = self.vis_buf[-1]         # 零阶保持：取最近一帧
+        age = np.clip(t_now - t_v, 0.0, 0.2)  # 陈旧度作为显式特征，截断防异常值
+        recent = [f for tt, f in self.force_buf if t_now - tt &lt;= 2 * self.dt]
+        f_mean = np.mean(recent, axis=0) if recent else np.zeros(6)
+        # 4 帧均值 = 降采样 + 低通：力尖峰被平均掉，策略看到的是"这 67 ms 的平均受力"
+        return img, f_mean, np.float32(age)</code></pre>
+    <p>解读：<code>deque(maxlen=...)</code> 用固定容量避免无限增长，且自动淘汰过期数据。<strong>视觉只留 2 帧</strong>是刻意的：第 3 帧之前的图像在 60 Hz 控制下早已过期，保留只会引入误用风险。力信号从"时间窗内取均值"：万一传感器回调抖动，时间窗定义比"取最后 4 个"更稳。<code>age</code> 截断到 0.2 s 是因为运行初期时钟不同步会产生离谱值，不截断会把特征分布打乱。真实部署时还要做偏置校正：先用同一事件（如接触瞬间）对齐两条时间戳线，再把固定偏移写进标定表，这一步在第 068 章的差距分析里会详细讲。</p>
+
+    <p><strong>片段 3：模态丢弃训练与掉线评测</strong></p>
+    <pre class="code"><code>import torch
+
+def sample_modality_mask(batch, device, p_vis=0.15, p_force=0.15):
+    """训练期随机丢弃视觉/力模态；本体与指令永不丢（丢了任务就没了）。"""
+    mask = torch.ones(batch, 4, device=device)
+    drop_v = torch.rand(batch, device=device) &lt; p_vis
+    drop_f = torch.rand(batch, device=device) &lt; p_force
+    mask[drop_v, 1] = 0.0    # 视觉列
+    mask[drop_f, 2] = 0.0    # 力列
+    return mask
+
+@torch.no_grad()
+def evaluate_outage(policy, env, keep):
+    """keep: 长度为 4 的 0/1 列表，1=该模态在线；跑 100 回合回传成功率。"""
+    total = 0.0
+    for _ in range(100):
+        obs = env.reset()
+        done, ep_ret = False, 0.0
+        while not done:
+            # 评测时不再随机丢弃，只按剧本固定关断某个模态
+            mask = torch.tensor(keep, dtype=torch.float32)[None].to(policy.device)
+            action = policy.act(obs, mask)
+            obs, reward, done, info = env.step(action)
+            ep_ret += reward
+        total += float(info["success"])
+    return total / 100</code></pre>
+    <p>解读：<code>sample_modality_mask</code> 每步重新采样，等价于"同一回合内随机黑屏/掉线"，比整回合丢弃更能模拟真实传感器闪断。<strong>为什么本体与指令不丢</strong>：本体缺失会让状态估计完全失真（属于不可观测问题，不能按鲁棒性问题处理），指令缺失直接抹掉任务目标；对这两者要做的是"降噪/降级"设计（第 070 章），模态丢弃留给其他传感器。<code>evaluate_outage</code> 的关键是"评测时关掉随机性，只做固定剧本掉线"，否则你分不清性能下降来自策略还是评测噪声。建议流程：全在线基线 → 单模态掉线（视觉、力各一次）→ 双掉线 → 对比报告写成表格，这一列就是"传感器鲁棒性曲线"。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>时间戳单位混用</strong>：相机回调给的是秒（float），仿真侧用步数（int），换算错一步就是 16.7 ms 的系统偏差。症状是陈旧度特征恒为 0 或恒为 0.2。修复：全链路统一用仿真秒，push 时统一格式化，并加断言检查 age 分布。</li>
+      <li><strong>用同一套归一化处理所有模态</strong>：把力信号和图像特征一起做全局标准化，力信号的尖峰把统计量拉偏，图像特征被压扁。症状是视觉消融后性能几乎不变（说明网络没在用视觉）。修复：每个模态独立归一化，消融测试作为验收环节。</li>
+      <li><strong>模态丢弃忘了缺失标志</strong>：只清零不给标志，网络学不会"如何降级"。症状是单模态掉线性能断崖。修复：缺失标志位与 mask 一起进网络，评测时保留该通道。</li>
+      <li><strong>注意力被高频模态主导</strong>：token 不加模态嵌入或位置隔离，层数一深所有注意力集中到某一个大数值模态。症状是权重热图恒定偏向一角。修复：模态嵌入 + 每模态独立编码器 + 权重正则（可选）。</li>
+      <li><strong>评测在训练模式</strong>：忘了把 policy 切到 eval（丢弃关闭）就跑掉线评测，结果把训练期随机性算进性能。症状是同一策略两次评测方差极大。修复：评测统一 <code>policy.eval()</code> + <code>torch.no_grad()</code>，丢弃只由显式 mask 控制。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把 modality dropout 概率从 0.15 调到 0.3 与 0，比较三条"掉线鲁棒性曲线"，解释鲁棒性与全模态性能之间的取舍。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>p=0 时全模态性能最好但掉线崩；p=0.3 时全模态略降但掉线平缓。画成"在线模态数 vs 成功率"的两条折线最直观。</div></details>
+      </li>
+      <li>去掉陈旧度特征 age，让视觉保持最新帧强行对齐，预测高速运动时的性能变化并设计实验验证。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>末端速度 0.5 m/s 时 33 ms 误差约 1.7 cm，接近指尖抓取余量；让物体以两种速度移动做对照。</div></details>
+      </li>
+      <li>实现"晚融合"对照：四个模态各接一个价值头，动作取加权平均。对比中间融合，说明晚融合在哪个任务阶段明显吃亏。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>关注接触瞬间：晚融合下力模态无法"改写"视觉模态的动作，只能靠输出加权折中。</div></details>
+      </li>
+      <li>把融合注意力权重导出并可视化：绘制回合内四个模态 token 的权重曲线，找出接触时刻与指令时刻的权重变化。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>用汇总 token 对所有 token 的注意力行向量；再按时间对齐接触事件（夹爪合拢指令时刻）。</div></details>
+      </li>
+      <li>设计一个"力传感器延迟 50 ms + 视觉掉线 30% 概率"的联合评估协议，写出评估表格的列定义，并说明为什么这两个工况必须一起测。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>单一工况可以通过另一种模态补偿；联合工况考察的是"补偿能力耗尽"后的失败模式，是 Sim2Real 前的压力测试。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>三种融合位：早融合量纲冲突、晚融合无法互补、<strong>中间融合（独立编码 + 特征交互）是机器人策略的默认解</strong>。</li>
+      <li>多模态三失配：频率（用陈旧度与均值降采样）、量纲（每模态独立归一化）、时延（标定 + 显式补偿）。</li>
+      <li>模态嵌入让注意力知道"我是谁"，汇总 token 给出状态相关的信任权重，还附带可解释性。</li>
+      <li>模态丢弃训练 + 显式缺失标志 = 对传感器掉线的鲁棒性；本体与指令不丢弃，改用降噪与降级设计。</li>
+      <li>下一章进入 Sim2Real 四连的第一站：这些在仿真里训练的多模态策略，如何跨过"仿真与真实"的鸿沟部署到真机上，本章的陈旧度、掉线与延迟问题，正是迁移时要逐条核对的清单。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch063.html">← 第 063 章：实现图神经网络策略</a>
+    <a class="next" href="ch065.html">第 065 章：实现仿真到现实迁移 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

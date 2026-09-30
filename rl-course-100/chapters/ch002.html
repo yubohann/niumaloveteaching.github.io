@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第002章 PPO的广义优势估计（GAE）实现 | 深度强化学习课程 · PPO、SAC 与多智能体系统</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · 策略梯度与 PPO</span>
+    <span class="sep">/</span>
+    <span>第 002 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · 策略梯度与 PPO</div>
+    <h1>第 002 章：PPO的广义优势估计（GAE）实现</h1>
+    <p class="lead">把 GAE 从训练循环里拆出来单独做实验：先用定义式对递推实现做数值自检，再固定种子与预算扫描 λ ∈ {0, 0.8, 0.95, 1.0}，观察偏差-方差权衡如何体现在优势尺度与样本效率上。</p>
+    <ul class="meta">
+      <li>主题：优势估计 / 偏差-方差权衡</li>
+      <li>关键公式：Â<sub>t</sub> = Σ<sub>l</sub> (γλ)<sup>l</sup> δ<sub>t+l</sub>，Â<sub>t</sub> = δ<sub>t</sub> + γλ(1−d<sub>t</sub>)Â<sub>t+1</sub></li>
+      <li>预计学时：50 分钟</li>
+      <li>前置章节：第 001 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解广义优势估计（Generalized Advantage Estimation, GAE）在 TD 与蒙特卡洛之间的插值含义，以及 λ 如何控制偏差与方差。</li>
+      <li>掌握 <code>compute_gae</code> 的后向递推写法，并会用定义式参考实现与两个退化端点（λ=0、λ=1）做数值自检。</li>
+      <li>能搭建受控对比实验：固定随机种子与步数预算，只改变 λ，记录优势原始标准差、样本效率与最终回报。</li>
+      <li>从日志中读出"λ 越大优势尺度越大、训练越激进"的现象，并解释为什么 PPO 默认 λ 取 0.95 附近。</li>
+      <li>掌握终止掩码（termination mask）的正确写法：真实终止切断未来项，时间截断仍要 bootstrap。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 001 章把 λ 固定成 0.95 直接跑了训练，但优势估计其实是 PPO 里<strong>最值得单独调试的旋钮</strong>：策略梯度用的是 Â<sub>t</sub>，它的尺度直接决定梯度尺度；它的偏差决定策略朝哪个方向走，它的方差决定走得稳不稳。λ 就是控制这件事的参数，λ=0 只看眼前一步，方差小但忽略长远；λ=1 一直看到回合结束，准确但波动大。</p>
+    <p>这一章把 GAE 从训练循环里"拆出来"做两件事：<strong>第一，验证实现是对的</strong>，用穷举未来项的定义式做数值对照，把 λ=0 和 λ=1 两个端点分别对到单步 TD 和蒙特卡洛；<strong>第二，做一次受控的 λ 扫描</strong>，同一随机种子、同一步数预算，只变 λ，横向比较优势尺度与学习速度。搞清这一点后，第 009 章会把它扩展成 TD 与蒙特卡洛估计器的完整谱系。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 从 TD 残差到指数衰减累加</h3>
+    <p>GAE 的基本构件是<strong>时序差分残差</strong>（TD residual）：</p>
+    <div class="formula">
+      δ<sub>t</sub> = r<sub>t</sub> + γ(1 − d<sub>t</sub>) V(s<sub>t+1</sub>) − V(s<sub>t</sub>)
+      <span class="note">r<sub>t</sub>：t 时刻奖励；γ：折扣因子（默认 0.99）；V(s)：状态价值估计；d<sub>t</sub> ∈ {0,1}：真实终止标志</span>
+    </div>
+    <p>δ<sub>t</sub> 衡量"这一步比预期好多少"。单步 TD 只用当前 δ<sub>t</sub> 当优势，偏差大：价值函数不准时它跟着错。蒙特卡洛用整条轨迹的实际回报 G<sub>t</sub>，方差大：一条轨迹的噪声全进来。GAE 的做法是把未来所有 δ 按 (γλ) 衰减后累加：</p>
+    <div class="formula">
+      Â<sub>t</sub> = Σ<sub>l=0</sub><sup>T−t−1</sup> (γλ)<sup>l</sup> δ<sub>t+l</sub>
+      <br>等价递推：Â<sub>t</sub> = δ<sub>t</sub> + γλ(1 − d<sub>t</sub>) Â<sub>t+1</sub>，Â<sub>T</sub> = 0
+      <span class="note">λ ∈ [0,1]：衰减速度；l：向前看的步数；T：本批数据的最后一步</span>
+    </div>
+    <p>λ 越小，远处的 δ 衰减越快，估计越依赖价值函数（偏差↑、方差↓）；λ 越大，越接近真实回报（偏差↓、方差↑）。两个端点恰好是两个经典估计器：</p>
+    <div class="formula">
+      λ = 0：Â<sub>t</sub> = δ<sub>t</sub>（单步 TD）<br>
+      λ = 1：Â<sub>t</sub> = G<sub>t</sub> − V(s<sub>t</sub>)（蒙特卡洛回报减基线）
+    </div>
+    <p>把这两个恒等式写进自检，就能确认递推方向、终止掩码、回报拼接三处都没写错，这是本章代码的第一段主线。</p>
+    <p>两个端点各有一个边界细节值得单独强调。λ=0 时优势只剩单步残差，它对价值函数误差的敏感度是 100%：V 错多少，优势就错多少，只不过误差只被 γ 衰减一次，训练早期价值网络粗糙时这会让策略跟着错误方向走。λ=1 时理论上对回报无偏，但本实现里"回看无穷远"实际止步于批次尾部：末尾样本的剩余回报用 <code>last_value</code> 自举，仍然携带价值函数误差，所以 λ=1 的优势仍带残余偏差，只是把误差压缩到了序列尾部；批次切得越碎，尾部占比越高，这也是采样批量不能太小的又一理由。两个端点合起来给出一条工程判据：<strong>价值网络准，就往 λ 小的一端靠；价值网络难训，就往 λ 大的一端靠。</strong></p>
+
+    <h3>2. 优势的方差为什么随 λ 变大</h3>
+    <p>如果把每个 δ 粗略看成独立同分布、方差为 σ<sup>2</sup>，则 Â<sub>t</sub> 的方差近似为 σ<sup>2</sup> 乘上一个几何级数。把推导补全：Var[Â]<sub>t</sub>] = Σ<sub>l</sub> (γλ)<sup>2l</sup>·σ<sup>2</sup>，而 Σ<sub>l=0</sub><sup>L−1</sup> (γλ)<sup>2l</sup> = (1 − (γλ)<sup>2L</sup>) / (1 − (γλ)<sup>2</sup>)，当有效回看长度 L 足够大（(γλ)<sup>2L</sup> 可忽略）时收敛到</p>
+    <div class="formula">
+      Var[Â<sub>t</sub>] ≈ σ<sup>2</sup> / (1 − γ<sup>2</sup>λ<sup>2</sup>)
+      <span class="note">γ=0.99：λ=0 时倍率 1.000，λ=0.95 时 8.661，λ=1 时 50.251</span>
+    </div>
+    <p>把扫描用到的四档 λ 全部算出来（γ=0.99），一张表看清"λ 的最后一小步有多贵"：</p>
+    <table>
+      <tr><th>λ</th><th>γλ</th><th>方差倍率 1/(1−γ<sup>2</sup>λ<sup>2</sup>)</th><th>等效回看 1/(1−γλ)（步）</th><th>备注</th></tr>
+      <tr><td>0.0</td><td>0.000</td><td>1.000</td><td>1.0</td><td>单步 TD，方差基准</td></tr>
+      <tr><td>0.5</td><td>0.495</td><td>1.325</td><td>2.0</td><td>只回看两步</td></tr>
+      <tr><td>0.8</td><td>0.792</td><td>2.683</td><td>4.8</td><td>短回看、较稳</td></tr>
+      <tr><td>0.95</td><td>0.9405</td><td>8.661</td><td>16.8</td><td>PPO 默认，回看约 17 步</td></tr>
+      <tr><td>1.0</td><td>0.990</td><td>50.251</td><td>100.0</td><td>蒙特卡洛，方差是 0.95 档的 5.80 倍</td></tr>
+    </table>
+    <p>两个数字值得记住：λ 从 0.95 挪到 1.0 只差 0.05，方差倍率却从 8.66 涨到 50.25（约 5.80 倍）；有限回看也有修正，但在 CartPole 这种几十到几百步的回合里 (γλ)<sup>2L</sup> 已经很小（L=100 时 (0.9405)<sup>200</sup> ≈ 4.7×10<sup>−6</sup>），修正可以忽略。实际数据里看不到 50 倍的差距，因为相邻 δ 高度相关、回合远短于无穷远，散度被相关结构抵消了一大半，但"λ 越大优势尺度越大"的方向一定成立，这正是代码里要打印 <code>adv_raw_std</code> 的原因。换任务时这张表还能当预算用：想让优势主要看未来 5 步，选 λ=0.8；看重未来 50 步以上的长程结构，才考虑 λ→1。</p>
+
+    <h3>3. 优势标准化：不同 λ 之间能比较的前提</h3>
+    <p>PPO 更新前会把优势标准化：</p>
+    <div class="formula">
+      Â ← (Â − mean(Â)) / (std(Â) + 1e−8)
+      <span class="note">在"每个更新周期的那一批数据内部"做，减均值除标准差</span>
+    </div>
+    <p>标准化之后，梯度尺度与 λ 无关，λ 只影响"优势的相对排序"：λ 小时看起来每一步都差不多好，λ 大时会明显偏向带来高回报的动作。所以扫描实验比较的是<strong>排序质量</strong>；绝对尺度只作为诊断量记录，不参与比较。</p>
+    <p>把 γ 与 λ 的分工分开记能避免一类常见混淆：γ 是<strong>任务属性</strong>，它定义回报本身，决定有效时域 1/(1−γ)=100 步；λ 是<strong>估计器参数</strong>，决定用多少未来信息去估计这个回报定义下的优势。两者相乘 γλ=0.9405 才是真正的回看衰减率，等效回看约 16.8 步。调整 λ 之前先确认 γ 与任务匹配：γ=0.9 时（时域 10 步）长程信用在定义层面就已经丢失，此时把 λ 调到 1 也补不回来；γ 固定后再调 λ 才有清晰含义。本章扫描固定 γ=0.99、只动 λ，正是为了不混淆这两个自由度；扫描结果会显示默认值 0.95 恰好落在"回看约 17 步够长"与"方差倍率 8.66 可控"的交点上，这就是它成为文献默认值的数量理由。</p>
+    <p>同种子配对对比还有一个统计学上的好处：四个 λ 从同一条随机流出发，环境重置与动作采样序列一致，两条曲线的差异里剔除了"运气"这个共同项，这等价于方差缩减中的共同随机数（common random numbers）技术，通常把区分两个设置所需的种子数从五个以上降到一两个。配对只在"同起点、同步数预算"时有效：任何一个设置提前停或多跑，序列都会错位，配对优势立刻消失，这也是 <code>train_one</code> 里"达标只记录、不提前停"的另一层原因。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+
+    <h3>模块划分</h3>
+    <table>
+      <tr><th>组件</th><th>职责</th><th>与第 001 章的关系</th></tr>
+      <tr><td><code>compute_gae</code></td><td>后向递推 GAE(γ, λ)</td><td>与 001 相同，λ 变为外部传入的参数</td></tr>
+      <tr><td><code>gae_reference</code></td><td>按定义式 O(T²) 穷举求和</td><td><strong>新增</strong>：只在自检时用</td></tr>
+      <tr><td><code>self_test_gae</code></td><td>三项数值对照：递推 vs 定义式、λ=1 vs 蒙特卡洛、λ=0 vs 单步 TD</td><td><strong>新增</strong>：训练前先证明实现正确</td></tr>
+      <tr><td><code>collect_rollout</code></td><td>采样并返回批数据 + 原始优势统计量</td><td>新增 <code>adv_raw_std</code> / <code>adv_raw_mean</code> 字段</td></tr>
+      <tr><td><code>train_one</code></td><td>在给定预算与种子下训练一个 λ</td><td><strong>新增</strong>：把一次训练封装成可重复调用的函数</td></tr>
+      <tr><td><code>main</code></td><td>遍历 λ 列表，打印对比总结表并写文件</td><td><strong>新增</strong>：从"跑一次"变成"扫参数"</td></tr>
+    </table>
+
+    <h3>关键超参数</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用与取值理由</th></tr>
+      <tr><td><code>--lams</code></td><td>0.0 0.8 0.95 1.0</td><td>被扫描的 λ；两端点分别对应 TD 与蒙特卡洛，中间两个是常用区</td></tr>
+      <tr><td><code>--max-steps</code></td><td>60000</td><td>每个 λ 的预算。6 万步不足以全部达标，但足以拉开样本效率的差距</td></tr>
+      <tr><td><code>--steps-per-update</code></td><td>1024</td><td>比 001 章的 2048 小：短预算下保证有足够多次更新</td></tr>
+      <tr><td><code>--epochs</code></td><td>8</td><td>略小于 001 的 10，减少过拟合单批数据的风险</td></tr>
+      <tr><td><code>--seed</code></td><td>0</td><td>所有 λ 复用同一随机流，保证对比公平</td></tr>
+      <tr><td><code>lr</code> / <code>clip</code></td><td>3e-4 / 0.2</td><td>与 001 保持一致，本章只把 λ 当变量</td></tr>
+    </table>
+
+    <h3>数据流</h3>
+    <p>每个更新周期：<strong>采样 1024 步</strong> → 用<strong>采样时刻的</strong> rewards/values/terminated 调 <code>compute_gae</code> → 得到优势与回报目标，同时记录<strong>标准化之前的</strong>优势标准差 → 采样批内标准化优势 → <strong>8 epochs × 16 个 minibatch</strong> 更新 → 丢弃数据。对比时：同一 seed 下依次跑完 4 个 λ，最后汇总成一张表。</p>
+
+    <div class="box key">
+      <span class="box-title">数值算例：扫描前先估算每档 λ 的方差倍率</span>
+      <p>动手跑实验之前，用上节的公式对四个 λ 做一次纸上估算（γ=0.99，设单样本 TD 残差标准差 σ=1.0）：λ=0 的预测优势标准差约 √1.000 = 1.00；λ=0.8 约 √2.683 ≈ 1.64；λ=0.95 约 √8.661 ≈ 2.94；λ=1 约 √50.251 ≈ 7.09。朴素模型预测四条曲线的原始优势 std 排序是 1.0、1.6、2.9、7.1，相邻档位之间差 1.6～2.4 倍。</p>
+      <p>实跑数值会明显低于这个预测（相关结构与有限回合都会压低倍数），但排序应当保持一致。拿到日志后按两件事核对：其一，<strong>排序</strong>若出现档位颠倒，优先检查该档的终止掩码与 λ 传递是否写错；其二，<strong>量级</strong>若 λ=1 与 λ=0.95 的标准差几乎相等，多半是回合太短、优势里没有积累起足够多的 δ 项，此时两个档位在本任务上可以互换，不能据此下"λ=1 更难训"的结论。这份预估与实测的对照，就是把诊断量当成实验设计工具来用的过程，比事后盯着曲线猜原因高效得多。</p>
+    </div>
+
+    <div class="box key">
+      <span class="box-title">本章为何要做受控对比</span>
+      <p>超参数实验最容易犯的错是"每个设置跑一次、排序看结果"。环境随机性带来的方差往往比参数本身影响还大。本章用三重控制：<strong>同一随机种子</strong>（网络初始化、环境重置、动作采样序列一致）、<strong>同一预算</strong>（每个 λ 都是 6 万环境步）、<strong>同一套其余超参数</strong>（只动 λ）。这样差异才能归因到优势估计本身。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：GAE 的后向递推</strong></p>
+    <pre class="code"><code>def compute_gae(rewards, values, terminateds, last_value, gamma: float, lam: float):
+    """从后向前递推 GAE(γ, λ)。terminateds 只记真终止，截断回合仍需 bootstrap。"""
+    T = len(rewards)
+    advantages = np.zeros(T, dtype=np.float32)
+    last_gae = 0.0                          # Â_{t+1} 的滚动缓存，从序列末尾的 0 开始
+    for t in reversed(range(T)):            # Â_t 依赖未来项，必须逆序递推
+        next_value = last_value if t == T - 1 else values[t + 1]
+        # 最后一拍的 V(s_{t+1}) 不在 buf 里，用采样结束后的 bootstrap 值补上
+        non_terminal = 1.0 - terminateds[t] # 真终止→0：未来项清零；时间截断→1：保留
+        delta = rewards[t] + gamma * next_value * non_terminal - values[t]
+        # δ 用采样时刻的价值快照计算；用更新后的网络重算 V 会破坏优势的定义
+        last_gae = delta + gamma * lam * non_terminal * last_gae
+        # 掩码要同时作用在 γ 和 λ 上；漏乘 λ 会让终止后的 δ 以 γ^l 泄漏进来
+        advantages[t] = last_gae
+    returns = advantages + np.asarray(values, dtype=np.float32)
+    # 价值回归目标 = 优势 + 旧价值：GAE 反推的回报，比纯蒙特卡洛方差小
+    return advantages, returns</code></pre>
+    <p>解读：递推体只有三行，但每行都有讲究。<strong>（1）</strong><code>reversed(range(T))</code>：Â<sub>t</sub> 的定义是"当前 δ + 衰减后的未来 δ"，所以必须从后往前算，把 Â<sub>t+1</sub> 缓存在 <code>last_gae</code> 里复用，这就是 O(T) 递推与 O(T²) 定义式的区别。<strong>（2）</strong><code>non_terminal</code> 同时乘在 δ 的 bootstrap 项和递推项上：真终止后 V(s<sub>t+1</sub>) 没有意义（应为 0），未来的 Â 也必须清零；而时间截断（CartPole 的 500 步上限）虽然也触发 reset，但"未来还在"，必须保留。<strong>（3）</strong><code>returns = advantages + values</code> 是全局一致性关系式：一旦优势里漏了掩码，回报目标也跟着错，价值网络会学到错误的长回合估值。换种写法（比如从 δ 直接累加成回报、再单独算优势）容易在两处引入不同的掩码处理，这种"一个式子推两个量"的写法最不容易错，还能让自检一次性覆盖两者。</p>
+
+    <p><strong>片段 2：定义式自检，三种视角看同一个 GAE</strong></p>
+    <pre class="code"><code>    # 检查 1：递推实现 vs 定义式，逐元素最大误差应小于 1e-6
+    adv_rec, _ = compute_gae(rewards, values, terminateds, last_v, gamma, lam)
+    adv_ref = gae_reference(rewards, values, terminateds, last_v, gamma, lam)
+    err1 = float(np.max(np.abs(adv_rec - adv_ref)))
+
+    # 检查 2：λ=1 必须等于蒙特卡洛回报 G_t 减去 V(s_t)（手工折扣累加）
+    adv_mc, _ = compute_gae(rewards, values, terminateds, last_v, 1.0, 1.0)
+    mc_target = np.zeros(T)
+    running = last_v                      # 从 bootstrap 值出发，逆序折扣累加
+    for t in reversed(range(T)):
+        running = rewards[t] + gamma * running * (1.0 - terminateds[t])
+        mc_target[t] = running - values[t]
+    err2 = float(np.max(np.abs(adv_mc - mc_target)))
+
+    # 检查 3：λ=0 必须逐项等于单步 TD 残差 δ_t
+    adv_td, _ = compute_gae(rewards, values, terminateds, last_v, gamma, 0.0)
+    td_target = np.zeros(T)
+    for t in range(T):
+        nv = last_v if t == T - 1 else values[t + 1]
+        td_target[t] = rewards[t] + gamma * nv * (1.0 - terminateds[t]) - values[t]
+    err3 = float(np.max(np.abs(adv_td - td_target)))</code></pre>
+    <p>解读：<code>gae_reference</code> 是"直译公式"的实现，对每个 t 起一个累加器，把未来所有 δ 乘上 (γλ)<sup>l</sup> 加进去，遇到终止把系数清零。它复杂度 O(T²)，但<strong>逻辑与公式一一对应，几乎不可能"错得和递推一样"</strong>，这正是参考实现的价值：两条独立路径算出同一个数，才有资格说"实现是对的"。检查 2 与检查 3 进一步把 λ 推到端点，对到教科书里的两个极端（MC 回报减基线、单步 TD 残差），用 1e-5 / 1e-6 的阈值卡住。注意合成轨迹里 <code>terminateds[5] = 1.0</code>，故意放了一次真实终止，这样掩码写错（漏乘 λ、掩码位置放反、截断当终止）都会被三项检查里的至少一项直接抓出来。这段自检的另一种用法是放进 CI：改动 GAE 后先跑它，再谈训练效果。</p>
+
+    <p><strong>片段 3：采样时把"原始优势尺度"存进批次</strong></p>
+    <pre class="code"><code>    ep_ret = 0.0
+    obs_after = obs_t
+    for _ in range(steps):
+        a, logp, v = net.act(obs_t)          # act() 带 no_grad，返回采样时刻快照
+        next_obs, r, terminated, truncated, _ = env.step(a)
+
+        obs_buf.append(obs_t.squeeze(0).cpu().numpy())
+        act_buf.append(a)
+        logp_buf.append(logp)                # logp 快照：PPO 比率的分母
+        rew_buf.append(r)
+        val_buf.append(v)                    # 价值快照：δ 里的 V(s_t)
+        term_buf.append(float(terminated))   # 只记真终止；truncated 不计入
+
+        ep_ret += r
+        obs_t = to_tensor(next_obs, device)
+        obs_after = obs_t                    # 记住最后观测，用它做 bootstrap
+        if terminated or truncated:
+            ep_returns.append(ep_ret)        # 回合计分不区分终止与截断
+            ep_ret = 0.0
+            reset_obs, _ = env.reset()
+            obs_t = to_tensor(reset_obs, device)
+
+    last_value = net.value(obs_after)        # 采样结束后的 V(s_T)，GAE 末项要用
+    advantages, returns = compute_gae(rew_buf, val_buf, term_buf, last_value, gamma, lam)
+
+    batch = {
+        "adv": torch.as_tensor(advantages, dtype=torch.float32, device=device),
+        "ret": torch.as_tensor(returns, dtype=torch.float32, device=device),
+        # 标准化之前的优势尺度：GAE 方差的可观测代理量，λ 对比的核心指标
+        "adv_raw_std": float(np.std(advantages)),
+        "adv_raw_mean": float(np.mean(advantages)),
+    }</code></pre>
+    <p>解读：这段是"数据采集的纪律"现场。<strong>（1）</strong><code>val_buf</code> 存的是每个时刻采样网络的 V(s)，不是更新后的价值，GAE 是"用旧价值估计旧数据的优势"，快照错位会让 δ 系统性偏移。<strong>（2）</strong><code>term_buf</code> 只记 <code>terminated</code>：截断回合的下一状态是新的 reset 状态，如果把它当终止，价值学习就丢掉了"回合末端还有价值"的信息；如果反过来把真终止当截断，δ 里会混入一个与当前回合无关的 V(reset_state)。<strong>（3）</strong><code>adv_raw_std</code> 记录在 compute_gae 之后、标准化之前，代表"这一批数据在采样策略下的优势离散程度"。搞混它和更新里的标准化（那是按批临时算的）就失去了诊断意义，后者恒等于 1，前者才有信息量。</p>
+
+    <p><strong>片段 4：受控扫描，同一随机流跑每个 λ</strong></p>
+    <pre class="code"><code>def train_one(lam: float, args):
+    """在固定预算下训练一次 GAE(λ)，返回统计结果。"""
+    set_seed(args.seed)          # 每个 λ 都从同一条随机流重新开始：受控对比的关键
+    env = gym.make("CartPole-v1")
+    obs, _ = env.reset(seed=args.seed)
+
+    all_returns, adv_stds, kl_list = [], [], []
+    total_steps, obs_t = 0, to_tensor(obs, device)
+    solved_at = None
+    snapshots = []               # 每 10 次更新记录一次滑窗回报，供曲线对比
+    while total_steps &lt; args.max_steps:
+        batch, ep_returns, obs_t = collect_rollout(
+            env, net, args.steps_per_update, obs_t, device, args.gamma, lam)
+        total_steps += args.steps_per_update
+        all_returns.extend(ep_returns)
+
+        stats = ppo_update(net, optimizer, batch, args)
+        adv_stds.append(batch["adv_raw_std"])     # 累计原始优势尺度
+        kl_list.append(stats["approx_kl"])
+
+        if len(all_returns) &gt;= 20:
+            snapshots.append((total_steps, float(np.mean(all_returns[-20:]))))
+
+        if solved_at is None and len(all_returns) &gt;= 100 and np.mean(all_returns[-100:]) &gt;= args.target_reward:
+            solved_at = len(all_returns)          # 达标只记录、不提前停：各 λ 预算必须一致</code></pre>
+    <p>解读：<strong>（1）</strong><code>set_seed(args.seed)</code> 放在函数入口（不放全局）：无论跑第几个 λ，网络初始化、环境重置、采样序列统统重置到同一条随机流。对比实验里"运气"的方差常常比 λ 本身还大，这一步把噪声源掐掉。<strong>（2）</strong><code>solved_at</code> 只记录第一次达到阈值的回合数，<strong>不提前终止训练</strong>，如果 λ=1 在 2 万步达标就停，而 λ=0 跑了 6 万步，最终回报的对比就不公平了。<strong>（3）</strong><code>adv_stds</code> 把每次更新的原始 std 收进来做平均，最后进对比表，直接支撑"λ 与优势尺度正相关"这一结论。换种写法，比如在 <code>ppo_update</code> 里记录标准化后的 std，这个指标就废了，因为标准化后恒为 1。</p>
+
+    <p>完整可运行脚本（附录）：<a href="../code/ch002.py" download>code/ch002.py</a></p>
+    <pre class="sh"><code>python code/ch002.py            # 完整实验：4 个 λ，每个 6 万步，CPU 约 3–6 分钟
+python code/ch002.py --quick    # 快速跑通：只跑 λ=0 与 0.95，各 8000 步，约 30–60 秒</code></pre>
+    <p>启动时先打印三项自检（应全部 PASS，如 <code>[PASS] 递推 vs 定义式 最大误差 3.7e-08</code>）；训练日志每 10 次更新一行，形如 <code>λ=0.95 步数 30720 | 回合 950 | 近20均 410.2 | 优势std 16.5 | KL 0.0084</code>。预期趋势（<strong>以实跑为准</strong>，趋势比绝对值重要）：λ=0 前期明显慢、优势 std 最小（约 3～6）；λ=0.8 与 0.95 通常 3 万步内进入 300～450 区间；λ=1 早期可能涨得更快，但后期滑窗波动和优势 std 更大。6 万步预算下各 λ 的近 100 均大致落在 350～470 区间分化。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>终止掩码只乘在 γ 上、忘了乘 λ</strong>：递推里终止之后的项应当整体归零，正确写法是 <code>last_gae = delta + gamma * lam * non_terminal * last_gae</code>。若写成 <code>gamma * last_gae</code>，终止后的 δ 会以 γ<sup>l</sup> 继续泄漏进优势，回合越短错得越狠。症状：训练早期异常稳定但没有起色。自检里的 λ=1 与蒙特卡洛对照能直接抓住。</li>
+      <li><strong>把 λ 扫描跑成了非受控实验</strong>：不同 λ 用不同种子（或忘了在 <code>train_one</code> 里重设种子）时，排序里混进环境噪声，结论完全不可信。修复：每个设置开头重设种子，同预算、同其余超参数，一次只动一个变量。</li>
+      <li><strong>用新策略重新计算 values 再算 GAE</strong>：<code>values</code>、<code>rewards</code> 必须是采样时刻的快照；若在更新之后重新前向取 V(s)，优势与回报目标的定义被破坏（<code>returns = adv + values</code> 也不再自洽）。症状：价值损失居高不下、KL 忽大忽小。</li>
+      <li><strong>以为"优势 std 大就是坏"</strong>：<code>adv_raw_std</code> 只是方差诊断量，PPO 更新前会把优势标准化。λ=1 的 std 最大，但早期学习反而可能最快。真正要比较的是样本效率与稳定性，别把诊断量当目标。</li>
+      <li><strong>把 truncated 当成 terminated 记进掩码</strong>：CartPole 500 步上限触发时环境被重置，但"未来还在"。若在 <code>term_buf</code> 里记 <code>float(terminated or truncated)</code>，价值函数会系统性低估长回合的末段价值，长回合任务直接学不动。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把 <code>--max-steps</code> 提高到 <code>120000</code>，重新扫描四个 λ。哪个 λ 最早触发 475？优势 std 的排序是否和 6 万步时一致？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>只需改命令行。观察对比表里的"首达100回合"列；优势 std 看"平均优势std"列，注意它衡量的是原始尺度，不是标准化之后的。</div></details>
+      </li>
+      <li>把自检合成轨迹里的 <code>terminateds[5] = 1.0</code> 改成 <code>0.0</code>（即当成时间截断），预测三项误差会怎么变，再运行确认。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>三处实现里对终止的处理是同构的，所以"截断仍 bootstrap"的场景下三项误差应该照样通过，这正好说明掩码逻辑只影响真实终止。也可以把某个 <code>non_terminal</code> 写反，看自检能否抓住。</div></details>
+      </li>
+      <li>给 <code>train_one</code> 增加"价值函数拟合误差"日志：每个更新周期结束后计算 <code>ret</code> 与 <code>V(obs)</code> 的均方误差，比较 λ=0 与 λ=0.95 谁的价值目标更难拟合。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>在 <code>ppo_update</code> 返回的 stats 里加一项，或在 <code>train_one</code> 里用 <code>net(batch["obs"])</code> 再前向一次算 MSE。λ 越大，return 目标越接近蒙特卡洛回报、方差越大，价值网络越难压误差。</div></details>
+      </li>
+      <li>实现一个"按回合截断 GAE"变体：在 <code>compute_gae</code> 里遇到 <code>terminated OR truncated</code> 都把 <code>non_terminal</code> 置零，与默认版本对比 6 万步内的表现，并解释差异。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>给 <code>compute_gae</code> 加一个 <code>cut_truncated=False</code> 开关，<code>collect_rollout</code> 传入 <code>term_buf or trunc_buf</code>。CartPole 回合上限 500 步，截断很常见，这个开关会系统性改变价值目标，观察价值损失与近 20 均的变化。</div></details>
+      </li>
+      <li>把 λ 扫描改成"同一批数据、不同 λ 的优势相关性分析"：用固定策略采一批轨迹，计算 GAE(λ=0)、GAE(0.5)、GAE(0.95)、GAE(1) 与蒙特卡洛优势的相关系数和相对误差，不训练。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>复用 <code>collect_rollout</code> 采样一次（把 rewards/values 存下来即可，不需要更新），对同一组数据依次调用 <code>compute_gae</code> 得到四组优势；相关系数用 <code>np.corrcoef</code>。你会看到 λ 越大、与 MC 的相关性越高，同时标准差也越大，这就是偏差-方差的实测版本。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>GAE 把优势写成未来 TD 残差的 (γλ) 指数衰减和：λ=0 是单步 TD，λ=1 是"蒙特卡洛回报减基线"，λ 在偏差与方差之间插值。</li>
+      <li>递推实现的关键是终止掩码：<code>δ = r + γ(1−d)V(s′) − V(s)</code>，<code>Â = δ + γλ(1−d)Â_next</code>；用定义式与两个端点做数值自检，一次排除方向、掩码、回报三处错误。</li>
+      <li>受控对比要求同种子、同预算、只动一个变量；优势原始 std 随 λ 上升，是偏差-方差权衡最直观的量化指标。</li>
+      <li>CartPole 短预算下 λ=0 学得最慢，λ≈0.8～0.95 综合最稳，λ=1 波动更大，这解释了 PPO 默认 λ=0.95 的来源。但排序可能随任务改变，选 λ 前先做受控扫描。</li>
+      <li>下一章转向另一个控制更新步长的机制：把 PPO 的裁剪目标与 KL 惩罚目标放进同一训练框架对比，观察两种约束各自的稳定性与调参代价。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch001.html">← 第 001 章：PPO在CartPole上的首次实现</a>
+    <a class="next" href="ch003.html">第 003 章：PPO的裁剪目标与KL惩罚对比 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

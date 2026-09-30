@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第011章 实现简单的重置逻辑 | 机器人仿真学习课程 · Isaac Sim 强化学习训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · 仿真环境与训练框架</span>
+    <span class="sep">/</span>
+    <span>第 011 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · 仿真环境与训练框架</div>
+    <h1>第 011 章：实现简单的重置逻辑</h1>
+    <p class="lead">回合制的另一半：每次回合结束后把世界恢复成干净、一致的初始状态。讲清"重置什么、按什么顺序重置"，以及状态泄漏为什么是 RL 里最阴险的一类 bug。</p>
+    <ul class="meta">
+      <li>主题：仿真环境 / 回合与状态复位</li>
+      <li>相关组件：Isaac Sim（World.reset、对象级 reset、状态写入）</li>
+      <li>预计学时：50 分钟</li>
+      <li>前置章节：第 010 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解回合（episode）在强化学习中的语义：每个回合从初始状态分布采样开始，重置就是"重新采样并写入物理世界"。</li>
+      <li>能列出重置的完整状态清单：物理状态（关节、位姿、速度）加上软件状态（滤波器、历史缓存、计数器）。</li>
+      <li>掌握 <code>world.reset()</code> 与对象级 reset 的区别与代价，会按场景选择。</li>
+      <li>会实现带"稳定期"（warm-up）的重置流程，并解释它解决什么问题。</li>
+      <li>会写状态泄漏的检测方法：两次重置的一致性校验。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>强化学习按回合组织经验：策略从某个初始状态出发，交互若干步，直到成功、失败或超时，然后"翻篇"重来。翻篇的动作就是重置（reset）。听起来只是"放回去"，但它是最容易出错、后果最隐蔽的环节之一：漏掉任何一个状态量，残留就会污染下一回合，策略在隐藏信息上过拟合、部署时崩塌。</p>
+    <p>本章实现一个确定性的简单重置：固定初始位姿 + 清空所有缓存 + 稳定期。它是 012 章"随机化初始状态"的地基，随机化只是把"写死初值"换成"采样初值"，流程与清单完全复用。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 回合与初始状态分布</h3>
+    <p>RL 的目标是最大化期望折扣回报：</p>
+    <div class="formula">
+      J(θ) = E<sub>τ∼π<sub>θ</sub></sub> [ Σ<sub>t=0</sub><sup>T</sup> γ<sup>t</sup> · r<sub>t</sub> ]，τ = (s<sub>0</sub>, a<sub>0</sub>, s<sub>1</sub>, a<sub>1</sub>, …)
+      <span class="note">轨迹 τ 的第一个状态 s_0 是从初始状态分布 ρ_0 中采样的</span>
+    </div>
+    <p>重置逻辑实现的正是"从 ρ<sub>0</sub> 采样并写入引擎"。本章的简单版本取 ρ<sub>0</sub> 为确定的单点（固定初始姿态与位置）；012 章把它换成带随机性的分布。<strong>评估与训练必须共享同一个 ρ<sub>0</sub></strong>，否则你评估的是另一个任务，这也是重置逻辑要写成可复用函数、集中管理的原因。</p>
+
+    <h3>2. 完整状态清单：物理 + 软件</h3>
+    <p>重置的陷阱在于"状态"比想象的多。把清单列全，逐项检查：</p>
+    <table>
+      <tr><th>类别</th><th>具体项</th><th>遗漏的后果</th></tr>
+      <tr><td>物理状态</td><td>关节角、关节速度、机器人位姿、物体位姿</td><td>带着残余动量开始新回合；初始状态不可复现</td></tr>
+      <tr><td>控制器状态</td><td>位置目标缓存、变化率限制器内部值、力矩平滑器</td><td>首个动作被"上一回合的目标"拖拽，行为不可预期</td></tr>
+      <tr><td>观测缓存</td><td>EMA 滤波器值、帧堆叠队列、动作历史</td><td>前几帧观测混着上一回合数据（最隐蔽的一类泄漏）</td></tr>
+      <tr><td>计数与标志</td><td>回合步数、终止标志、成功计数器</td><td>超时判定错乱、统计口径错误</td></tr>
+    </table>
+    <p>一句话准则：<strong>凡是"跨物理步携带信息"的东西，都在重置清单里</strong>。物理引擎只负责清单的第一行，其余全靠你的代码。</p>
+
+    <h3>3. 两种重置接口：world.reset() 与对象级 reset</h3>
+    <p><code>world.reset()</code> 重置整个场景：所有登记对象回到各自初始状态，物理视图重新初始化。它最省心也最贵，每次调用都要重建一批内部句柄与缓存，典型耗时是毫秒到几十毫秒量级。对象级重置（对机器人或某个刚体单独调用 reset/状态写入接口）只动指定对象，快得多，但要求你手动保证其他部分不受影响。</p>
+    <p>怎么选：单环境脚本用 <code>world.reset()</code> 先跑通；并行（022 章）或高频重置必须用对象级，否则重置开销会吃掉一半吞吐。注意 <code>world.reset()</code> 后部分句柄（传感器、视图）需要重取，保守做法是重置后立即重取所有引用。</p>
+
+    <h3>4. 稳定期：让接触解算收敛再开始</h3>
+    <p>瞬移后物理并不"安静"：接触求解器要若干步才能让穿深与接触力收敛。若立刻开始决策与计奖励，前几步是"物理自我调整"的瞬态，数据脏且不可复现。解法是<strong>稳定期</strong>：重置后空跑几步（通常 5–20 步），期间不决策、不计奖励、不收集经验，直到状态变化足够小（如关节速度模长小于 0.01 rad/s）再交还给策略。</p>
+    <p>这个数值可以量化：60 Hz 下 10 步 = 0.17 秒；若回合长度是 5 秒，稳定期开销约 3%，换取的是每个回合初始状态的一致性，对成功率类指标来说非常划算。</p>
+
+    <h3>5. 重置成本的量化：两种接口差两个数量级</h3>
+    <p>把"world.reset() 更贵"落到数字。典型量级：世界级重置单次 5–30 ms（重建视图与句柄），对象级状态写入单次 0.05–0.2 ms。以 5 秒回合（300 RL 步、decimation=2）、单环境 RTF = 100 估算：</p>
+    <div class="formula">
+      回合墙钟 ≈ 仿真时长 / RTF = 5 s / 100 = 50 ms
+      <span class="note">世界级重置占比 ≈ 20 / (50 + 20) ≈ 29%；对象级占比 ≈ 0.1 / 50 ≈ 0.2%</span>
+    </div>
+    <p>数值对号：如果回合只有 1 秒（RTF = 100 时墙钟 10 ms），世界级重置 20 ms 会让"重置比回合本身还贵"，吞吐减半以上。这就是 022 章并行训练必须走对象级或引擎级批量重置的原因。测量方法沿用本章纪律：<code>time.perf_counter()</code> 各跑 200 次，把两个均值写进实验记录，不同机器与场景版本下重新测。</p>
+
+    <h3>6. 稳定期步数的量化选择</h3>
+    <p>稳定期太短，初始状态带着瞬态速度；太长，训练预算被空跑吃掉。经验上"首帧速度模长"随稳定期步数近似指数衰减，每步约衰减 20%：</p>
+    <div class="formula">
+      v<sub>k</sub> ≈ v<sub>0</sub> · 0.8<sup>k</sup>
+      <span class="note">v_0 ≈ 0.1 rad/s 时，k = 10 步降到约 0.011 rad/s；k = 16 步降到约 0.002 rad/s</span>
+    </div>
+    <p>两条使用建议：把"稳定期结束时速度模长小于 0.01 rad/s"作为验收判据（Franka 量级对应 10–16 步）；稳定期成本是每回合 0.17–0.27 s 仿真时间（RTF = 100 时墙钟 2–3 ms），相对 5 秒回合可以忽略，属于"便宜的确定性"。若接触密集场景在稳定期后仍有振荡，先查初始位姿是否与场景重叠，再考虑加长。</p>
+
+    <h3>7. 泄漏检测矩阵：每个状态项对应一个检查量</h3>
+    <table>
+      <tr><th>状态项</th><th>快照检查量</th><th>泄漏时的症状</th></tr>
+      <tr><td>关节位置</td><td><code>get_joint_positions()</code></td><td>两次重置初态不同，评估方差变大</td></tr>
+      <tr><td>关节速度</td><td><code>get_joint_velocities()</code></td><td>新回合起步"弹一下"，首帧速度非零</td></tr>
+      <tr><td>基座位姿</td><td><code>get_world_pose()</code></td><td>机器人位置漂移，任务空间判定错位</td></tr>
+      <tr><td>观测缓存</td><td>滤波器值与帧栈长度</td><td>前几帧观测混着上一回合数据</td></tr>
+      <tr><td>计数器</td><td><code>episode_steps</code></td><td>超时提前触发或永不触发</td></tr>
+    </table>
+    <p>把矩阵补进一致性校验的 <code>snapshot()</code>，一次运行就能扫过全部项；新增状态缓存时先登记再写扫描代码。这套矩阵与"软件状态集中容器"的设计互补：一个管源头，一个管验收。</p>
+
+    <h3>8. 重置验收的四条数字判据</h3>
+    <p>把"重置写对了"变成可测量的事实，四条判据全部通过才算完成：</p>
+    <ul>
+      <li><strong>速度残差</strong>：稳定期结束时关节速度模长小于 0.01 rad/s（对应第 6 节衰减表里的 10–16 步）。</li>
+      <li><strong>一致性</strong>：连续两次重置后快照逐位差异小于 1e-6（片段 3 的校验）。</li>
+      <li><strong>成本</strong>：单次重置墙钟耗时与方式匹配（对象级 0.05–0.2 ms、世界级 5–30 ms），并记录在案。</li>
+      <li><strong>接触静默</strong>：稳定期内接触力与穿深单调收敛，无量级跳变。</li>
+    </ul>
+    <p>四条判据放进环境的自检模式（构造参数打开），每次改场景后自动跑一遍。成本都不高，其中一致性校验与速度残差最能提前拦住后来难查的训练异常。一条配套经验：初始位置与场景的重叠深度控制在毫米级是安全的；厘米级重叠会让解算器首帧产生巨大排斥冲量，现象是"道具突然弹飞"，属于最常见的重置事故。四条判据与任务性能没有直接关系，但它们是"评估数字可信"的前置条件；在并行训练里，重置损坏会以"成功率随机波动"的形式出现，早期花一次验收的时间，能省下多轮定位的成本。</p>
+
+    <h3>9. 并行训练中的重置预算：掩码重置与稳定期占比</h3>
+    <p>把重置搬到并行场景里，先算一笔分散账。设 N = 1024 个环境、回合长度约 300 步，按成功与失败交错估算，每步大约有 1% 的环境需要重置，即每步平均 10.2 次对象级重置。单次对象级重置取 0.1 ms 时，每步多出约 1.02 ms 的重置开销；在 T<sub>wall</sub> = 3 ms 的步进预算上，这等于额外支付约 34%。把单次成本压到 0.05 ms（只写关节状态、不重建视图），开销降到约 0.5 ms，占比约 17%。两个数字说明：<strong>重置不是"偶尔发生的小事"，并行规模下它是一笔按频率摊进来的固定成本</strong>。</p>
+    <p>对照"整批同步重置"的口径：若所有环境在同一个 300 步边界一起重置，瞬间要处理 1024 次重置，合计约 102 ms，是正常步长的 34 倍。均值摊到整回合与掩码方式相同（102 ms / 300 步 ≈ 0.34 ms/步），但尖峰会让物理流水线与显存回收周期性空转，训练曲线的步时抖动肉眼可见。排期结论：<strong>重置按环境掩码分散执行，任何单步的重置数量控制在环境总数的百分之一以内</strong>，超出的部分排队到后续步。</p>
+    <p>稳定期的占比同样用乘法算：每次重置配 10 步稳定期时，1% 的重置率意味着稳态下有约 10.2% 的环境步花在"空跑稳定"上（10.2 次 × 10 步 / 1024）。把稳定期减半到 5 步可把占比压到约 5%，前提是首帧速度残差仍在 10⁻² rad/s 量级（第 6 节的衰减表给出依据）；两者是一笔可以直接用数字决策的交换。失效边界要留一句：稀疏奖励任务早期回合极短，重置率可能达到 5%–10%/步，此时每步重置次数升到 51–102 次，按 0.1 ms 单价折算 5–10 ms，已经超过单步物理预算，吞吐会被重置拖垮。遇到这种训练形态，要么接受前期的低吞吐，要么把环境级重置进一步轻量化（只写必要状态、跳过视图重建），两者选一并在实验记录里写明。</p>
+    <p>掩码重置的实现结构只有三个部件：每个环境一个"距上次重置的步数"计数（数组长度 N，几个字节的整数即可）、一个"重置中"标志位、以及一个在重置期间下发的保持动作。向量化写法是每步计算布尔掩码，用 <code>np.where</code> 一次性选出需要改变的环境索引，避免 Python 逐环境循环（1024 次判断每秒执行约 6 万次，看似不多，但叠上采样与状态写入就容易挤占预算）。与 012 章的衔接点也在这里：随机化采样器为每个环境维护独立的种子流，重置时按环境索引取样本，评估环境的种子集与训练完全隔离，这条纪律在并行形态下保持不变。</p>
+    <p>最后把"重置正确性"与"重置成本"两张账合并成一条维护规则：每次改动场景或状态清单后，先跑 011 节的四条验收判据（速度残差、一致性、成本、接触静默），再测一次并行下的重置预算（每步重置次数、单次耗时、稳定期占比）。两组数字都记录在案，任何一次训练吞吐的异常波动，都可以在五分钟内回答"是重置变了，还是物理变了"。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>重置流程的实现顺序（顺序本身是设计的一部分）：</p>
+    <ol>
+      <li><strong>静默控制器</strong>（先发"零增益/保持"动作或停止下发，避免重置过程中驱动器还在追旧目标）。</li>
+      <li><strong>写物理状态</strong>（关节位置、关节速度清零；这里速度清零与位置写入必须成对，理由见 002 章）。</li>
+      <li><strong>复位对象位姿</strong>（场景物体的位姿同样要回位，别忘了被推动的道具）。</li>
+      <li><strong>清软件状态</strong>（滤波器、帧栈、动作历史、计数器，按 2 节清单逐项过）。</li>
+      <li><strong>稳定期</strong>（空跑 N 步，期间物理照常步进但策略"静默"）。</li>
+      <li><strong>产出初始观测</strong>（稳定期结束后读一次观测返回给训练循环；它必须与之后步內的观测使用同一套读取与预处理函数）。</li>
+    </ol>
+    <div class="box key">
+      <span class="box-title">设计思维：为什么重置函数要"返回观测"？</span>
+      <p>Gymnasium 风格的环境接口约定 <code>reset()</code> 返回初始观测 <code>obs</code>。这个约定背后是 RL 算法的需求：训练循环需要"由 reset 开始的完整轨迹"，TD 学习的第一步就是从 obs 出发选动作。若 reset 不返回观测、训练循环自己去读，容易出现"读的时机在稳定期之前/之后不一致"的隐性错误。把观测产出放进 reset 的最后一步，时机唯一、可控、可测试。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：带终止判定与稳定期的回合循环</strong></p>
+    <pre class="code"><code>import numpy as np
+
+SETTLE_STEPS = 10          # 稳定期：60 Hz 下约 0.17 秒，占 5 秒回合的 3%
+MAX_EPISODE_STEPS = 300    # 超时长度：5 秒；超时也是一种终止
+
+def run_episode(env, policy):
+    """跑一个完整回合：reset → 决策循环 → 终止。返回回合回报与步数。"""
+    obs = env.reset_state()                    # 重置 + 稳定期 + 返回初始观测
+    total_reward, steps = 0.0, 0
+    while True:
+        action = policy(obs)                   # 策略决策（示意）
+        obs, reward, terminated, truncated, info = env.step(action)
+        total_reward += reward
+        steps += 1
+        # 两类结束条件分开：terminated 是任务判定（成功/失败），truncated 是超时
+        if terminated or truncated:
+            break
+    return total_reward, steps
+
+# 训练循环：回报按回合组织，重置逻辑只在 run_episode 里出现一次</code></pre>
+    <p>解读：注意 <code>terminated</code> 与 <code>truncated</code> 的区分，这是 Gymnasium 规范对"回合怎么结束"的两种语义：前者表示任务自身的终态（倒了、成功了、掉出边界了），后者表示人为截断（超时）。区别在价值引导：真终态之后没有未来（bootstrap 为零），超时之后任务理论上继续。两者都要传给学习算法，合并成一个 done 标志会丢掉这个区别。<code>run_episode</code> 的封装也让"重置只发生在一处"成为结构上的保证。</p>
+
+    <p><strong>片段 2：确定性重置的完整实现</strong></p>
+    <pre class="code"><code>import numpy as np
+
+class EnvState:
+    """软件状态的集中容器：所有跨步携带的信息都放这里，便于整体清空。"""
+    def __init__(self, num_joints):
+        self.ema_contact = np.zeros(3)          # 接触力滤波器（007 章）
+        self.frame_stack = None                 # 帧堆叠队列（008 章），首次采集时分配
+        self.action_history = []                # 动作历史（005 章观测用到）
+        self.episode_steps = 0                  # 回合内步数计数
+
+    def clear(self):
+        self.ema_contact[:] = 0.0               # 就地清零：保持对象引用不变
+        self.frame_stack = None                 # 让下次采集重新初始化队列
+        self.action_history.clear()
+        self.episode_steps = 0
+
+def reset_state(env):
+    """确定性重置：固定初始姿态 + 清空软件状态 + 稳定期。"""
+    robot, world = env.robot, env.world
+    env.state.clear()                           # 1) 先清软件状态，之后写入的数据才纯净
+    robot.set_joint_positions(env.INITIAL_ARM_POSE)   # 2) 关节位置回初值
+    robot.set_joint_velocities(np.zeros(robot.num_dofs))  # 3) 速度必须清零（成对写入）
+    env.task_object.set_world_pose(env.OBJECT_INIT_POSE)  # 4) 道具也回位
+    obs = None
+    for i in range(SETTLE_STEPS):               # 5) 稳定期：物理照常步进
+        world.step(render=False)                #    但不决策、不计奖励、不采集经验
+    obs = env.build_observation()               # 6) 稳定后读初始观测，与后续用同一函数
+    return obs</code></pre>
+    <p>解读：这段代码的两个结构设计值得学习。第一，<strong>软件状态集中到 <code>EnvState</code> 一个容器里</strong>：新增缓存天然属于这个容器，清空逻辑只需审查 <code>clear()</code> 一处。第二，<strong>清状态放在写物理状态之前</strong>：如果先写物理状态再清软件状态，而 <code>clear()</code> 里的某个实现又读取了物理状态（比如重建帧栈），就会记录到"半重置"的世界；先清后写消除了这个时序风险。稳定期循环里<strong>刻意不调用策略</strong>：这是它区别于正式交互的本质。</p>
+
+    <p><strong>片段 3：状态泄漏检测，两次重置的一致性校验</strong></p>
+    <pre class="code"><code>import numpy as np
+
+def snapshot(env):
+    """把'应该被重置'的状态冻结成一个向量，用于比较。"""
+    return {
+        "q": env.robot.get_joint_positions().copy(),          # 关节角
+        "qd": env.robot.get_joint_velocities().copy(),        # 关节速度
+        "pose": np.asarray(env.robot.get_world_pose()[0]),    # 基座位姿
+        "ema": env.state.ema_contact.copy(),                  # 滤波器值
+        "steps": env.state.episode_steps,                     # 步数计数
+    }
+
+def check_reset_consistency(env):
+    """连续两次重置后比较快照：确定性重置应当逐位一致。"""
+    env.reset_state()
+    snap_a = snapshot(env)
+    # 中途做一些'会污染状态'的操作：模拟一个短回合
+    for i in range(20):
+        env.step(np.zeros(env.action_dim))
+    env.reset_state()
+    snap_b = snapshot(env)
+    for key in snap_a:
+        a, b = snap_a[key], snap_b[key]
+        diff = np.abs(np.asarray(a) - np.asarray(b)).max() if not np.isscalar(a) else abs(a - b)
+        status = "OK" if diff &lt; 1e-6 else "泄漏!"
+        print(f"{key:8s} 最大差异 {diff:.2e}  {status}")</code></pre>
+    <p>解读：这个测试把"状态是否归位"从主观判断变成了逐项可打印的数字。要点是<strong>快照覆盖物理与软件两类状态</strong>：只比关节角的话，滤波器与计数器的泄漏会悄悄积累到"训练指标诡异"时才暴露。测试流程里故意先跑 20 个污染步再重置，如果重置不完整，差异必然出现；阈值取 1e-6 是因为确定性重置下两次快照应当逐位相同，任何非零差异都意味着某个量没有被正确清理。把它放进 CI（改环境代码自动跑），能拦住绝大多数重置类回归。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>只重置位置不重置速度</strong>：回合开始带着残余动量，初始状态不可复现。修复：位置与速度成对写入（002 章的习惯），快照校验兜底。</li>
+      <li><strong>忘记清观测缓存</strong>：帧栈、EMA、动作历史带着上一回合数据，前几帧观测"见鬼"。修复：把软件状态集中管理（片段 2），逐项进 <code>clear()</code>。</li>
+      <li><strong>稳定期里采集数据</strong>：把物理自我调整的瞬态当作正常经验训练，初期成功率评估失真。修复：稳定期只步进不决策不计数；把它写成循环里显式可见的结构。</li>
+      <li><strong>world.reset() 后旧句柄失效</strong>：某些视图/传感器引用需要重取，症状是重置后第一次读取报错或返回旧值。修复：重置后重新获取引用，或统一走对象级重置。</li>
+      <li><strong>重置太快导致"掉落穿透"</strong>：把道具瞬移到与桌面/机械臂重叠的位置，解算器瞬间产生巨大排斥力。修复：初始位姿留出安全间隙；稳定期步数按接触力收敛情况调。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>列出你当前任务的重置清单（物理 + 软件两类），逐项写出恢复方法与验证方式。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>从 2 节的表格开始：关节、位姿、控制器缓存、观测缓存、计数标志；每项问"上次的值放在哪个变量里"。</div></details>
+      </li>
+      <li>实现片段 3 的一致性检查，并故意注释掉 <code>set_joint_velocities</code> 一行，验证检查能否抓住泄漏。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>不写速度清零时，第二次快照的 qd 应显著非零；注意污染步要用非零动作才能留下可观测的速度。</div></details>
+      </li>
+      <li>测量重置成本：用 <code>time.perf_counter()</code> 对比 200 次 <code>world.reset()</code> 与 200 次对象级状态写入的耗时，计算在"回合长度 5 秒"下重置开销占比。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>world.reset() 涉及场景与句柄重建，通常比对象级慢一到两个数量级；结论会直接支持 022 章的并行环境设计。</div></details>
+      </li>
+      <li>稳定期实验：设置 SETTLE_STEPS = 0、5、20 三组，记录每个回合"首次决策时"的关节速度模长，并设计实验观察其对成功率评估的影响。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>0 步时首帧速度可能达到 0.1 rad/s 量级（瞬移引起的解算波动）；20 步时接近 0.001 量级，但每回合多花 0.33 秒。</div></details>
+      </li>
+      <li>实验设计：让重置故意不清动作历史，构造一个"上回合的动作影响本回合初始观测"的场景，预测训练曲线的异常形态并给出检测方法。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>泄漏会让策略学到"观测里藏着上一回合信息"的伪规律，训练回报虚高、评估（干净重放）时骤降，最典型的过拟合症状。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>重置 = 从初始状态分布 ρ<sub>0</sub> 采样并写入引擎；训练与评估必须共用同一套重置逻辑。</li>
+      <li>完整状态清单=物理状态 + 控制器缓存 + 观测缓存 + 计数器；<strong>凡跨步携带信息的东西都要清</strong>。</li>
+      <li><code>world.reset()</code> 省心但慢，对象级重置快但要自己保证完整性；选择取决于并发规模与回合频率。</li>
+      <li>稳定期（5–20 步、不决策不计奖励）让接触解算与驱动器收敛，保证初始状态一致可复现。</li>
+      <li>下一章：012 实现随机化初始状态，把本章的固定初值换成采样分布，让策略见过足够多样的开局。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch010.html">← 第 010 章：设置激光雷达并获取点云</a>
+    <a class="next" href="ch012.html">第 012 章：实现随机化初始状态 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

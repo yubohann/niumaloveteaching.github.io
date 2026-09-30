@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第029章 多机器人定位融合 | 多机器人协同学习课程 · ROS2 通信与系统集成</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 数据分发与协同感知</span>
+    <span class="sep">/</span>
+    <span>第 029 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 数据分发与协同感知</div>
+    <h1>第 029 章：多机器人定位融合</h1>
+    <p class="lead">两台机器人的定位结果该听谁的？本章用卡尔曼滤波与协方差交叉回答"按不确定度加权"，并揭开多机融合最阴险的错误：悄悄重复计数同一份信息。</p>
+    <ul class="meta">
+      <li>主题：状态估计 / 分布式融合</li>
+      <li>关键机制：EKF 更新、测距观测模型、协方差交叉（CI）、马氏距离门限</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 028 章（多机器人SLAM协同）</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>掌握卡尔曼更新的数学形式与直觉：预测先验、观测似然、按不确定度分配权重。</li>
+      <li>会写多机器人测距/相对观测的观测模型与雅可比，并把它用于 EKF 更新。</li>
+      <li>理解相关性陷阱：为什么"直接平均两个定位结果"会过度自信，协方差交叉如何给出一致估计。</li>
+      <li>会用马氏距离门限剔除离群测距（NLOS 场景），知道门限的选择依据。</li>
+      <li>能设计一套多机器人定位融合架构：联合状态 EKF 还是分布式 CI、频率与通信量如何安排。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>上一章的协同 SLAM 优化的是"地图与历史轨迹"，而实时的任务，编队保持、协同避障、目标交接，需要的是<strong>此刻每台机器人在哪</strong>。单机的定位方案（激光定位、轮式里程计、视觉）都有盲区：里程计会漂移，激光在长廊里退化，视觉受光照摆布。多机器人系统有一个独特的资源：<strong>机器人之间可以互相观测</strong>，UWB 测距、共享地标、直接识别对方。这些"相对观测"把整支车队的位姿关联成一张约束网，任何一台的高精度定位都可以通过网"救济"其他成员。</p>
+    <p>但"救济"不是免费的：融合算法必须诚实对待不确定度，还必须警惕一个教科书级的陷阱，<strong>两台机器人的估计如果来自共同的信息源（比如同一张地图、同一批地标），它们的误差是相关的，朴素融合会重复计数导致过度自信</strong>。过度自信的滤波器会拒绝正确的观测、接受错误的观测，最终发散。本章把这条主线讲透，它也是第 032 章感知融合、第 041 章编队控制的数学地基。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 卡尔曼更新：用不确定度说话</h3>
+    <p>把机器人位姿的估计写成"均值 + 协方差"：x̂（最优猜测）与 P（对这个猜测有多不确定）。EKF 的一次更新分两步：</p>
+    <div class="formula">
+      预测：x̂⁻ = f(x̂, u)，P⁻ = F P F<sup>t</sup> + Q
+      <br>更新：K = P⁻ H<sup>t</sup> (H P⁻ H<sup>t</sup> + R)<sup>−1</sup>，x̂ = x̂⁻ + K(z − h(x̂⁻))，P = (I − K H) P⁻
+      <span class="note">K 是卡尔曼增益：观测越准（R 越小）就越信观测，越信观测则 P 收得越紧</span>
+    </div>
+    <p>直觉版：<strong>你有先验（预测）和观测两个"证词"，谁的方差小就多听谁的</strong>。卡尔曼增益 K 就是这个配比系数；更新后的协方差 P 永远不大于先验协方差，这就是"融合带来的信息增益"。多机器人场景里，观测 z 就是相对量：两机间距（UWB/激光）、相对方位，或"共享地标在本机系下的位置"。</p>
+
+    <h3>2. 测距观测模型与雅可比</h3>
+    <p>设状态只含两机位置 x = [p<sub>A</sub>, p<sub>B</sub>]（各 2 维），UWB 测距观测 h(x) = ‖p<sub>A</sub> − p<sub>B</sub>‖。EKF 需要 h 对状态的雅可比 H：</p>
+    <div class="formula">
+      H = ∂h/∂x = [ −u<sup>t</sup>, +u<sup>t</sup> ]，u = (p<sub>A</sub> − p<sub>B</sub>) / ‖p<sub>A</sub> − p<sub>B</sub>‖
+      <span class="note">u 是两机连线方向的单位向量：测距只约束连线方向的位置差，垂直方向"看不见"</span>
+    </div>
+    <p>这个 H 的形状说明一个深刻的事实：<strong>一次测距只提供"沿连线方向"的一维信息</strong>。几何上分布良好的多对测距（不同方向、非共线）才能把两机的位置完全约束住；只有一条连线方向的测距，垂直方向的不确定度不受任何改善。设计观测布局时（比如 UWB 基站与机器人互测的拓扑），要保证方向多样性，这与第 025 章标定的"点要铺开"是同一个数学现象。</p>
+
+    <h3>3. 相关性陷阱与协方差交叉</h3>
+    <p>假设两台机器人各自用"同一张地图 + 同一批地标"定位，得到两个估计 (x̂<sub>1</sub>, P<sub>1</sub>)、(x̂<sub>2</sub>, P<sub>2</sub>)。它们看起来独立，其实误差<strong>同源相关</strong>。如果对它们的<strong>相对位姿</strong>做朴素融合（把两个绝对估计直接相减），相关误差会抵消，结果是"相对位姿比实际准得不真实"；反之如果对绝对位姿做朴素加权平均，相关部分被重复计入，协方差被压得过小。两种方向都会让下游滤波器过度自信。</p>
+    <p>安全做法是<strong>协方差交叉（Covariance Intersection, CI）</strong>：不做独立性假设，用一个混合权重 ω 拼接信息矩阵：</p>
+    <div class="formula">
+      P<sub>CI</sub><sup>−1</sup> = ω P<sub>1</sub><sup>−1</sup> + (1 − ω) P<sub>2</sub><sup>−1</sup>，x̂<sub>CI</sub> = P<sub>CI</sub> ( ω P<sub>1</sub><sup>−1</sup>x̂<sub>1</sub> + (1 − ω) P<sub>2</sub><sup>−1</sup>x̂<sub>2</sub> )
+      <span class="note">P<sub>CI</sub> 的"体积"（行列式/迹)不小于真实协方差：一致但保守，保守是可接受的，过度自信是致命的</span>
+    </div>
+    <p>ω 在 [0, 1] 上网格搜索，取使 det(P<sub>CI</sub>) 或迹最小的值（最不保守的一致估计）。CI 的哲学值得记住：<strong>在无法断言独立性时，宁可要"略保守但永远不撒谎"的协方差，也不要"精确但可能撒谎"的协方差</strong>。工程里联邦滤波器（每个子系统一个局部滤波器 + 主滤波器周期重置）就是分布式 CI 思想的工程化。</p>
+
+    <h3>4. 离群观测：马氏距离门限与 NLOS</h3>
+    <p>UWB 在金属货架旁会给出"多径正偏差"（NLOS 误差，典型 +0.3–1 m），激光互扫在遮挡时会给出错误方位。这些离群必须在上车前拦掉：</p>
+    <div class="formula">
+      d<sup>2</sup> = (z − h(x̂⁻))<sup>t</sup> (H P⁻ H<sup>t</sup> + R)<sup>−1</sup> (z − h(x̂⁻))，d<sup>2</sup> &gt; γ<sup>2</sup> 则拒收
+      <span class="note">马氏距离把"残差"用不确定性归一：γ² 常取 9（3σ 门）或 16（4σ 门）</span>
+    </div>
+    <p>门限选择是灵敏与稳健的权衡：<strong>太小（如 1σ）会把正常的尾部观测大量拒收，滤波器"饿死"；太大（如 6σ）几乎不拒收任何东西，离群照吞</strong>。经验做法：先按 3σ 起步，统计拒收率，健康系统里拒收率应低于几个百分点；如果拒收率很高，先怀疑模型参数（R 估计不准），此时放宽门限只会掩盖病灶。</p>
+
+    <h3>5. 数值算例：测距更新与不确定度的收敛节奏</h3>
+    <p>设两机位置各带 10 cm 的标准差（各向同性），一次 UWB 视距测距的标准差为 0.15 m。测距只作用在连线方向，所以只看该方向：相对位置先验方差 = 0.10² + 0.10² = 0.020 m²（σ = 141 mm），观测方差 R = 0.15² = 0.0225 m²。一维信息相加：</p>
+    <div class="formula">
+      1 / P⁺ = 1 / 0.020 + 1 / 0.0225 = 50 + 44.4 = 94.4 → P⁺ = 0.0106 m²，σ⁺ = 103 mm
+      <span class="note">相对距离不确定度从 141 mm 降到 103 mm；垂直方向不受影响，仍是 141 mm</span>
+    </div>
+    <p>如果视线良好、把测距标准差降到 0.05 m（R = 0.0025 m²），同一步得到 1/P⁺ = 50 + 400 = 450 → σ⁺ = 47 mm，比先验改善 67%。若两机位置退化到几乎重合，连线方向未定义，观测无效（片段 1 里有专门的重合保护）。</p>
+    <p>再把单次更新放到 10 Hz 的节奏上看收敛过程。同一几何下每收到一次独立测距，信息累加一次：第 n 次观测后 1/P = 50 + n × 44.4，代入时间点：0.1 s 时 σ ≈ 103 mm，0.2 s 时 85 mm，0.5 s 时 61 mm，1 s 时 45 mm。<strong>第一，不确定度按 1/√n 收缩，前几次观测收益最大，之后越来越平；第二，1 秒后原地继续多测的边际收益很低，移动去建立"方向多样"的新观测更值</strong>。这也是第 2 小节"方向多样性"的定量注脚：原地 10 Hz 只能压连线方向，垂直方向的不确定度需要新的几何才能改善。</p>
+
+    <h3>6. 数值算例：相关性让"平均"产生的虚假精度</h3>
+    <p>用两个最简单的场景看清 CI 与朴素融合的差别。场景一：两台机器人各报告 σ = 10 cm 的定位结果，但两者用的是同一条定位链路转发的同一份估计（数据完全相同）。朴素平均会宣称 σ = 10 / √2 ≈ 7.07 cm，而真实不确定度仍是 10 cm，<strong>凭空多出 41% 的自信</strong>。若通过中继链把同一份估计转发 4 次再平均，朴素结果号称 5 cm，真实值仍是 10 cm，虚假精度放大到 2 倍，转发 9 次放大到 3 倍。CI 对这个场景免疫：两个相同的 P 无论取什么 ω，P<sub>CI</sub><sup>−1</sup> = ωP<sup>−1</sup> + (1−ω)P<sup>−1</sup> = P<sup>−1</sup>，输出与单源完全一致，不会宣称任何额外精度。</p>
+    <p>场景二：两个估计的形状不同且高度可信，P₁ = diag(1 cm², 400 cm²)（x 方向准、y 方向差），P₂ = diag(400 cm², 1 cm²)（正好相反）。若两者确实独立，朴素融合给出每轴 σ ≈ 1.0 cm；CI 取 ω = 0.5 给出每轴 σ ≈ 1.41 cm，保守了 41%，换来的是"对任意相关性都成立"。<strong>两者数值的差，就是"独立性假设"的价格标签</strong>：独立时可省下这 41%，不独立时这 41% 恰恰是防止发散的保险。工程上把"朴素融合"和"CI 融合"的协方差并列记录，两者差距突然变大，说明系统里的信息共享正在增强（例如两机开始长时间并肩工作），是相关性升高的预警信号，比事后发现滤波器发散早得多。</p>
+
+    <h3>7. 失效模式与边界条件</h3>
+    <ul>
+      <li><strong>中继重复计数</strong>：A 的估计传给 B，B 融合后又传回 A，A 再次融合，形成环路时同一份信息被反复计入。对策：消息携带来源标识与融合历史摘要，环路识别后拒绝回灌；分布式场景默认用 CI，避免朴素融合。</li>
+      <li><strong>共同模式误差不可观测</strong>：两机共享同一张先验地图或同一套地标，地图本身的整体偏移会同时进入两者，相对观测无法把它区分出来。边界：必须保留至少一个绝对参考（全局定位或已知锚点），相对观测只保证"队形一致"，不保证"世界正确"。</li>
+      <li><strong>快速运动下的门限误拒</strong>：剧烈机动时新息分布变厚尾，3σ 门会误拒真实观测，滤波器反而失控。边界动作：机动阶段临时放大 R 或放宽门限，并恢复后重新收紧。</li>
+      <li><strong>一致性检验缺位</strong>：只看误差数字下降，不看协方差是否诚实。做法：统计 NEES（归一化估计误差平方）或新息 χ²，均值应落在状态维数附近；持续偏大说明过度自信，偏小说明过度保守或观测噪声标定过大。</li>
+      <li><strong>协方差传播的数值退化</strong>：高频率小修正下 P 逐渐失去正定性（特征值趋于零或负）。边界动作：用 Joseph 形式更新、定期对称化并加上下限，必要时用平方根滤波。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>多机器人定位融合架构的两个范式与选择依据：</p>
+    <table>
+      <tr><th>范式</th><th>结构</th><th>适用</th><th>代价</th></tr>
+      <tr><td>联合状态 EKF</td><td>一个节点维护全队状态 [p<sub>1</sub>…p<sub>N</sub>]，所有相对观测集中处理</td><td>N 小（≤ 5）、有中心计算/通信</td><td>状态维数 N 倍；通信集中</td></tr>
+      <tr><td>分布式 CI 融合</td><td>各机本地滤波器 + 邻居交换估计，成对做 CI</td><td>无中心、N 大、通信稀疏</td><td>保守（协方差偏大），需要邻居管理</td></tr>
+    </table>
+    <p>实施步骤：</p>
+    <ol>
+      <li><strong>定状态与观测</strong>：状态 = 各机位姿（平面 3 维常用）；观测 = 测距、相对方位、共享地标。为每种观测写 h 与 H。</li>
+      <li><strong>定融合模式</strong>：先联合 EKF 跑通正确性，再按需演进为分布式 CI（小心保持两版行为一致）。</li>
+      <li><strong>定通信</strong>：位姿估计消息 = 均值 + 协方差（约 100–200 字节），10–20 Hz；测距观测就近广播。</li>
+      <li><strong>加防护</strong>：马氏门限拒收离群；时间对齐（观测与状态时刻匹配，第 030 章）；协方差下限（防止数值坍塌到"过度自信"）。</li>
+      <li><strong>验收</strong>：用 <strong>NEES/一致性检验</strong>，统计归一化误差是否落在理论分布内；误差下降的同时一致性不能崩。</li>
+    </ol>
+    <table>
+      <tr><th>参数</th><th>起点值</th><th>依据</th></tr>
+      <tr><td>融合频率</td><td>10–20 Hz</td><td>定位是控制的上游，低于控制环一个量级即可</td></tr>
+      <tr><td>UWB 测距噪声 R</td><td>σ ≈ 0.1–0.3 m</td><td>视距/非视距分开标定，分开设 R</td></tr>
+      <tr><td>马氏门限 γ</td><td>3σ（γ² = 9）</td><td>拒收率监控：健康系统 &lt; 5%</td></tr>
+      <tr><td>CI 的 ω 搜索</td><td>0.05 步长</td><td>20 次试算，成本可忽略</td></tr>
+      <tr><td>协方差下限</td><td>位置 1 cm²</td><td>数值防坍塌，避免过度自信</td></tr>
+    </table>
+    <p>通信量顺手算一笔：10 台机器人两两之间的位姿估计交换共 C(10, 2) = 45 条边，每条消息（均值 + 协方差）约 150 B，20 Hz 下合计 45 × 150 × 20 = 135 KB/s，约为千兆链路可用容量的 0.1%。<strong>定位融合的通信开销与图像流相比可以忽略，瓶颈同样在"何时能看到对方"的观测机会</strong>。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：EKF 测距更新，把一次 UWB 观测变成信息</strong></p>
+    <pre class="code"><code>import numpy as np
+
+def ekf_range_update(x, P, i, j, z_range, sigma=0.15):
+    """联合状态 EKF 的单次测距更新。
+    x: (2N,) 各机位置；P: (2N,2N)；i,j: 机器人在状态中的索引（0 基）。
+    z_range: 观测距离；sigma: 测距标准差（视距/非视距应分别标定）。"""
+    pa, pb = x[2*i:2*i+2], x[2*j:2*j+2]
+    diff = pa - pb
+    r = float(np.linalg.norm(diff))
+    if r &lt; 1e-6:
+        return x, P                            # 重合退化：方向未定义，跳过
+    u = diff / r                               # 连线方向单位向量
+    h = r                                      # 观测模型：预测距离
+    H = np.zeros((1, len(x)))
+    H[0, 2*i:2*i+2] = u                        # 对 p_i 的导数
+    H[0, 2*j:2*j+2] = -u                       # 对 p_j 的导数
+    S = float(H @ P @ H.T) + sigma ** 2        # 新息协方差（含观测噪声 R）
+    resid = z_range - h
+    if resid ** 2 / S &gt; 9.0:                   # 3σ 马氏门：GLOS/NLOS 离群拦截
+        return x, P                            # 拒收：保持先验，不当"证据"
+    K = (P @ H.T) / S                           # 卡尔曼增益（标量 S 的简化写法）
+    x = x + (K.flatten() * resid)               # 状态修正
+    P = P - K @ (H @ P)                         # 协方差收缩（P 单调变小）
+    return x, P</code></pre>
+    <p>解读：这个函数把 EKF 的每个环节都摆在了明面上。<strong>（1）</strong>雅可比 H 只有两处非零（±u）：代码结构本身就在提醒你"测距只约束连线方向"，如果多对测距的方向都差不多，P 的某些方向不会被收窄，这从 P 的演化里一眼可见。<strong>（2）</strong>门限检验放在计算 K 之前：拒收的观测不参与任何状态/协方差更新，保证离群"零污染"。<strong>（3）</strong><code>P = P − K(H P)</code> 是 Joseph 形式的简化写法（数值上更稳的写法是 <code>(I−KH)P(I−KH)ᵗ + K R Kᵗ</code>），生产代码建议用后者。<strong>（4）</strong>参数 sigma 强调"视距/非视距分开标定"：同一 UWB 在走廊与货架区的噪声差几倍，用一个 sigma 是常见的精度损失来源；工程上可按观测质量切换多套 R，或让观测自带质量标志。</p>
+
+    <p><strong>片段 2：协方差交叉，不假设独立的融合</strong></p>
+    <pre class="code"><code>def covariance_intersection(x1, P1, x2, P2, n_grid=21):
+    """CI 融合两个位姿估计：不假设独立，给出保守但一致的结果。
+    x1,x2: (d,) 均值；P1,P2: (d,d) 正定协方差。"""
+    I1, I2 = np.linalg.inv(P1), np.linalg.inv(P2)
+    best = None
+    for w in np.linspace(0.0, 1.0, n_grid):
+        Info = w * I1 + (1.0 - w) * I2         # 信息形式拼接
+        P = np.linalg.inv(Info)
+        x = P @ (w * I1 @ x1 + (1.0 - w) * I2 @ x2)
+        score = float(np.linalg.det(P))        # 目标：最小化保守程度
+        if best is None or score &lt; best[0]:
+            best = (score, x, P)
+    _, x_ci, P_ci = best
+    # 一致性自检：CI 结果的信息量不会超过任一单源（不会凭空"变准"）
+    assert np.trace(P_ci) &gt;= max(np.trace(P1), np.trace(P2)) - 1e-9
+    return x_ci, P_ci</code></pre>
+    <p>解读：这段代码的价值在于把"独立性假设"这件事显式化。<strong>（1）</strong>CI 从不使用 P₁、P₂ 的独立性，它只用两者的信息矩阵做加权平均，这是对任意相关性都成立的保守组合。<strong>（2）</strong>目标函数选 det(P) 最小：在"所有一致估计"的集合里挑最不保守的那个；滑窗 <code>n_grid=21</code> 是精度与成本的折中（CI 目标函数对 ω 是单峰的，粗网格足够）。<strong>（3）</strong>末尾的断言是给未来自己留的护栏：如果 CI 结果"比两个输入都更准"，一定是代码写错了（或 P 被错误地当成了独立），<strong>让不可能的状态在代码里直接崩溃，比在生产里静默发散好</strong>。实践中还要注意 P 的数值稳定性：多次 CI 循环后信息矩阵可能病态，建议定期用观测重置，避免无限迭代。</p>
+
+    <p><strong>片段 3：观测调度的优先级，同一时刻只信最强的证据</strong></p>
+    <pre class="code"><code>def update_cycle(state, obs_queue, max_per_cycle=4):
+    """每周期最多处理 4 条观测：按信息量（1/S）排序，高价值观测优先。
+    obs_queue: [(kind, i, j, z, sigma), ...] 多种观测混排。"""
+    scored = []
+    for kind, i, j, z, sigma in obs_queue:
+        r = predict(kind, state, i, j)         # 预测观测值 h(x)
+        S = innovation_cov(kind, state, i, j, sigma)
+        scored.append((1.0 / S, kind, i, j, z, sigma))   # 信息量 ≈ 1/新息方差
+    scored.sort(reverse=True, key=lambda t: t[0])
+    used = 0
+    for _, kind, i, j, z, sigma in scored:
+        if used &gt;= max_per_cycle:
+            break                              # 限量：计算与通信预算的边界
+        state = apply_update(state, kind, i, j, z, sigma)
+        used += 1
+    return state</code></pre>
+    <p>解读：为什么采用"限量+排序"？因为多机系统的观测是突发性的：一次会合瞬间可能涌进几十条测距+方位观测，全部处理会让单个融合周期超过实时预算。<strong>（1）</strong>按 1/S（新息方差倒数）排序：S 小意味着"这条观测最可能带来新信息"（状态当前对它没把握、而它本身很准），优先消化。<strong>（2）</strong><code>max_per_cycle</code> 是全局节拍器：处理不完的观测留在队列（但要设过期时间，第 030 章），保证每周期计算时间可预测。<strong>（3）</strong>换一种思路（全部都处理、但降频率）在系统快速运动时会积累旧观测，反而更糟：<strong>实时融合里"新鲜"比"完整"重要</strong>，与第 022 章大消息链路的原则一致。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>直接平均两个定位结果</strong>：不按不确定度加权，差估计把好估计拖下水。修复：信息形式加权（片段 2），或直接跑 EKF。</li>
+      <li><strong>忽略相关性做融合</strong>：两机共享历史观测时朴素 Kalman 融合导致协方差塌陷、滤波器变"傲慢"。修复：CI；对"确知独立"的观测才用标准 KF。</li>
+      <li><strong>NLOS 测距不设门限</strong>：金属环境下一次 +1 m 的假测距把整个状态拽偏，且协方差还变小（噪声证据被"吸收"）。修复：马氏门 + 视距/非视距分开的 R。</li>
+      <li><strong>用旧观测更新新状态</strong>：观测时间戳与状态时刻不匹配，运动中的机器人被"拉回过去"。修复：观测缓存 + 回滚更新，或先做时间对齐（第 030 章）。</li>
+      <li><strong>协方差没有下限</strong>：长期稳定观测让 P 数值坍缩到 1e−6 量级，新观测几乎无法修正（增益趋近 0），滤波器"僵死"。修复：设定合理下限（位置 1 cm² 量级），保持可修正性。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>两机初始各 10 cm 不确定度，做一次 σ=5 cm 的测距（连线方向），手算更新后的连线方向不确定度。它垂直方向变了吗？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>用一维公式 σ²₊ = (σ⁻² + R⁻²)⁻¹ 估算连线方向：约 (100+25)⁻¹ → σ₊ ≈ 4.5 cm；垂直方向完全不变，H 在那里是零。</div></details>
+      </li>
+      <li>把 CI 的 ω 固定为 0.5（简单平均信息），与最小化 det(P) 的结果对比，指出差异在什么场景下会显著。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>两者 P 不同量级（如 10 倍）时差异最大：等权会明显浪费好估计的信息；相当接近时几乎无差。</div></details>
+      </li>
+      <li>设计实验：在马氏门限取 1σ、3σ、6σ 三种值时统计拒收率与定位误差，找出你的场地上的折中点，解释拒收率与门限的关系。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>理论上正态新息下 1σ 门会拒收约 32% 的正常观测（对比 χ² 分布），远超健康系统应有的水平；3σ 约 0.3%。实验值偏离理论值说明模型参数不准。</div></details>
+      </li>
+      <li>设计题：为 4 台机器人设计定位融合方案，选联合 EKF 还是分布式 CI；给出状态定义、观测清单、频率、通信量估算与"过度自信"的检验方法。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>4 台 × 2 维 = 8 维状态，联合 EKF 仍可行；通信量估算 = 消息大小 × 频率 × 邻居边数。一致性检验用 NEES：对 M 次实验统计归一化误差。</div></details>
+      </li>
+      <li>思考：为什么"保守"在分布式估计里是可接受的缺陷，而"过度自信"是不可接受的？各举一个会导致系统级失败的具体例子。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>保守 → 多融合几次就恢复、影响精度；过度自信 → 拒收正确观测、吸收错误观测、最终发散，并可能把错误传播给依赖融合结果的编队/避障。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>EKF 更新的本质是按不确定度分配权重；测距的雅可比 ±u 说明它只约束连线方向。</li>
+      <li>多机相对观测选项：UWB 测距、相对方位、共享地标；每种都要写清观测模型与噪声模型。</li>
+      <li>相关性陷阱是分布式融合的第一号大敌；协方差交叉以"保守但一致"为代价免疫它。</li>
+      <li>防护三件套：马氏门限拒离群、时间对齐防旧观测、协方差下限防僵死。</li>
+      <li>下一章把"时间"这条暗线正式拿出来讲：<strong>多传感器数据时间对齐</strong>，融合的全部精度都建立在"同一时刻"这个前提上。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch028.html">← 第 028 章：多机器人SLAM协同</a>
+    <a class="next" href="ch030.html">第 030 章：多传感器数据时间对齐 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

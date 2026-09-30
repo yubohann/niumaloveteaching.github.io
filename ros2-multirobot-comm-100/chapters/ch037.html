@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第037章 多机器人数据记录与回放 | 多机器人协同学习课程 · ROS2 通信与系统集成</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 数据分发与协同感知</span>
+    <span class="sep">/</span>
+    <span>第 037 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 数据分发与协同感知</div>
+    <h1>第 037 章：多机器人数据记录与回放</h1>
+    <p class="lead">把整支车队的时间轴录下来：记录什么、压缩多狠、时间怎么算；回放时又怎样让所有节点"回到同一条时间线"复盘与回归测试。</p>
+    <ul class="meta">
+      <li>主题：工程闭环 / 数据持久化</li>
+      <li>关键机制：rosbag2（MCAP/SQLite）、白名单与压缩、双时间戳、sim time 回放、多 bag 联合回放</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 036 章（网络分区下的数据一致性）</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解 rosbag2 的组成：存储插件、元数据、分片，以及 MCAP 与 SQLite 的取舍。</li>
+      <li>掌握记录策略设计：白名单、频率、压缩、分片大小，能用带宽公式估算存储需求。</li>
+      <li>理解双时间戳（接收时间/消息时间）的语义，以及回放为什么必须与 <code>use_sim_time</code> 严格配套。</li>
+      <li>会做多机器人回放：命名空间重映射、多 bag 对齐、倍速与循环。</li>
+      <li>会把回放用于回归测试与故障复盘：同一段数据重放 N 次，系统行为应可复现。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>多机器人系统的问题大多"只在现场出现一次"：多机时序错位、偶发丢包、地图闪烁，事后靠日志和记忆根本无法复现。数据记录与回放（record &amp; replay）是把"一次性现场"变成"可反复研究的实验"的唯一手段：<strong>录下一次真实运行，之后可以无限次重放、调参、对比，甚至注入故障做压力测试</strong>（第 077 章）。它也是回归测试的地基，每次改代码后重放相同的场景包，比对行为差异。</p>
+    <p>多机器人的记录有独特的两个难点：<strong>（1）容量</strong>，未压缩图像每台每秒几十 MB，四台车半小时就是几百 GB，不设计记录策略必然写爆磁盘；<strong>（2）时间</strong>，回放时所有节点必须切换到仿真时间，否则 TF、消息时间戳、定时器互相打架。本章围绕这两个难点给出完整方案。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. rosbag2 的组成：存储、元数据、分片</h3>
+    <p>rosbag2 的核心是"写入器 + 存储插件"：写入器订阅话题（每个话题一个订阅端点），把消息按到达顺序交给存储插件持久化。主流存储插件：</p>
+    <ul>
+      <li><strong>SQLite3</strong>：传统默认，成熟稳定；单文件、索引清晰，但追加性能与压缩支持一般。</li>
+      <li><strong>MCAP</strong>：自描述的现代容器格式，支持分块压缩与追加写，跨工具（Web 查看器、离线分析）友好；新项目优先考虑（插件可用性以发行版为准）。</li>
+    </ul>
+    <p>元数据（metadata.yaml）记录每个话题的消息数、频率与起止时间，<strong>回放/分析工具先读元数据再决定怎么读数据</strong>，所以"记录结束后不要手工删改目录"（元数据与数据必须一致）。分片（split）把长时间记录切成多个文件：单文件过大会让拷贝/上传/分析都难受，典型分片 512 MB–2 GB。</p>
+
+    <h3>2. 记录策略：白名单、频率与压缩的三重预算</h3>
+    <p>先算账再配置。以未压缩 720p 图像为例：2.7 MB × 15 Hz ≈ 40 MB/s/台；四台机器人录半小时：40 × 4 × 1800 ≈ <strong>288 GB</strong>。同一场景只录"状态 + 压缩图 + 扫描"：约 2 MB/s，半小时 ≈ 4.3 GB，差 60 倍。三条杠杆：</p>
+    <table>
+      <tr><th>杠杆</th><th>典型收益</th><th>代价</th></tr>
+      <tr><td>白名单（只录需要的）</td><td>数倍到数十倍</td><td>录少了没得回放：清单要按"调试与验收需要"设计</td></tr>
+      <tr><td>压缩（zstd）</td><td>3–10 倍</td><td>写盘与回放时 CPU 开销；压缩档位可调</td></tr>
+      <tr><td>降频录制（工具/代理话题）</td><td>按比例</td><td>需要额外节点整形（第 014 章）</td></tr>
+    </table>
+    <p>还有一个属于多机器人系统的关键决策：<strong>在哪台机器上录</strong>。集中录（网关订阅所有机器人的话题）会产生"抄送流量"，每条数据在网络上多走一遍到网关，在带宽紧张的系统里这是不可接受的；<strong>分布式录（每台机器人本地录自己的话题，事后汇总）是默认方案</strong>，代价是需要一套"各机时间同步 + 汇总命名"的流程。</p>
+
+    <h3>3. 时间语义：两个时间戳与一个开关</h3>
+    <p>bag 里每条消息带两个时间：<strong>接收时间</strong>（写入器收到它的时刻，必然单调）与<strong>消息时间</strong>（header 里的测量时刻，可能乱序、可能有空洞）。分析延迟用两者之差；回放排序默认按消息时间。回放的正确姿势：</p>
+    <ul>
+      <li>回放器发布 <code>/clock</code>（仿真时间），从 bag 的时间轴推进；</li>
+      <li>所有参与回放的节点设置 <code>use_sim_time = true</code>，它们的定时器、TF 查询、消息时间戳全部跟随仿真时间；</li>
+      <li>回放时间基于"消息时间"，所以 bag 里时间戳的一致性直接决定回放的质量，这也是第 030 章"打戳要打测量时刻"的又一笔回报。</li>
+    </ul>
+    <div class="formula">
+      回放时间线 = bag 内消息时间轴；节点本地时间 := /clock
+      <span class="note">忘开 use_sim_time 的节点会以墙钟运行：TF 查询超窗、定时器与数据节奏脱节，"回放时间坍缩"的常见签名</span>
+    </div>
+    <p>双时间戳的用法可以定量：一条消息的接收时间减消息时间就是"传输加排队"的总延迟，有线链路正常在 2–5 ms、无线在 5–20 ms，持续偏大说明链路拥塞或记录器调度滞后；差值为负说明消息时间超前于接收时刻，只有时钟异常或录制器用错时基才会出现，属于必须告警的异常。回放排序用消息时间，于是"录制时打戳诚实"的 bag 回放出来的世界才是真实世界的忠实重演，这也是第 030 章打戳纪律的又一份回报。</p>
+
+    <h3>4. 多机器人回放：命名空间重映射与多 bag 对齐</h3>
+    <p>每台机器人本地录的 bag 话题名带自己的命名空间（<code>/robot1/...</code>）。回放方案：</p>
+    <ul>
+      <li><strong>单 bag 重映射</strong>：把录制时的绝对话题名重映射到回放环境（如 <code>/robot1/scan</code> → <code>/replay/robot1/scan</code>），避免与在线系统冲突。</li>
+      <li><strong>多 bag 联合回放</strong>：各机 bag 同时用多个 play 实例启动，<strong>以同一仿真时钟起点对齐</strong>（按各 bag 记录的绝对时间偏移启动），或先合并成一个大 bag 再放。<strong>关键是"同一时间轴"：两个独立 play 各自从零开始，就会得到两台机器人各说各话的"平行宇宙"回放。</strong></li>
+      <li><strong>回放倍速</strong>：0.5×–2× 用于分阶段观察；倍速过高时下游节点可能算不过来（回放不受网络限制，但 CPU 仍会瓶颈），出现"回放掉帧"，它反映的是算力问题，不是数据问题。</li>
+    </ul>
+    <p>倍速上限可以提前估算：某融合节点在 1× 回放时 CPU 占用 80%，它的处理能力上限约 1.25 倍实时，2× 回放会让它的队列在几十秒内积压到内存上限。回归测试的常规做法是先用 1× 跑通基线，再把倍速提高仅用于观察类节点（可视化、录制转发），计算类节点保持 1×。</p>
+
+    <h3>5. 回放的两种用途：复盘与回归</h3>
+    <ul>
+      <li><strong>故障复盘</strong>：冻结现场数据，反复观察"事故前 3 秒"的各机状态；可视化工具（第 038 章）离线分析。</li>
+      <li><strong>回归测试</strong>：把回放当"确定性输入"，同一 bag + 同一算法版本 = 应有可复现的输出（误差在容差内）；改代码后自动重放场景集，比对关键指标（地图冲突率、跟踪误差、任务完成时间）。<strong>回放是让"协同算法"进入工程节奏的关键工具：没有它，每次改动都只能去场地重测。</strong></li>
+    </ul>
+
+    <h3>6. 数值算例：录制清单与存储预算的完整账</h3>
+    <p>把第 2 小节的账做成一张可评审的表。设定一支 4 机器人车队，记录 30 分钟，每台的"复盘最小集"如下：</p>
+    <table>
+      <tr><th>话题</th><th>单条大小</th><th>频率</th><th>单机带宽</th></tr>
+      <tr><td>状态</td><td>2 KB</td><td>50 Hz</td><td>100 KB/s</td></tr>
+      <tr><td>压缩图</td><td>15 KB</td><td>5 Hz</td><td>75 KB/s</td></tr>
+      <tr><td>激光扫描</td><td>150 KB</td><td>5 Hz</td><td>750 KB/s</td></tr>
+      <tr><td>检测与地图更新</td><td>约 2–10 KB</td><td>1–10 Hz</td><td>30 KB/s</td></tr>
+    </table>
+    <p>单机合计约 0.96 MB/s；四台、30 分钟的总量约 6.9 GB，zstd 压缩按 0.5 系数再折半到约 3.5 GB，一张 64 GB 存储卡可以保留十几次运行。对照"全录原始数据"：仅 720p 原始图按 15 Hz 就是 40 MB/s/台，四台半小时 288 GB，<strong>而多数存储卡的持续写入只有 20–40 MB/s，原始录制的第一分钟就会因写不过来而丢帧</strong>。还要注意缓存参数的量级：<code>--max-cache-size 64 MB</code> 在 0.96 MB/s 的写入下可以吸收约 60 秒的磁盘卡顿，在 40 MB/s 下只能撑 1.6 秒；缓存从来救不了"清单失控"，它只平滑瞬时抖动。</p>
+
+    <h3>7. 多 bag 对齐的数值账与回放的可复现性</h3>
+    <p>多 bag 联合回放的质量由"起始对齐精度"决定。设 robot1 的 bag 从 12:00:00.000 开始、robot2 从 12:00:03.500 开始：回放时 robot2 的播放实例相对 robot1 延后 3.5 s 启动，两条时间轴才重合。对齐后残余误差等于两台机器人录制时的时钟同步残差：做过协议级同步的系统在 1 ms 量级，只依赖周期校时的系统在几毫秒到几十毫秒。把残差换成物理量：100 ms 的错位在 1 m/s 的机器人上就是 10 cm 的假位移，会直接污染"会车轨迹为什么这样走"的复盘结论；<strong>多机 bag 的可用性上限，在录制那一刻就被时间同步质量锁死了，回放工具再好也补不回来</strong>。</p>
+    <p>回归测试还有一个"确定性"的账要算：回放给出的是确定性输入，但算法侧仍有三类非确定源，多线程执行器的调度顺序、依赖墙钟的定时器、未固定种子的随机过程。工程做法是：回归时把节点执行器降为单线程、禁掉墙钟定时器、固定随机种子，并把指标容差设为"真机复现方差的 2–3 倍"。容差不是妥协，它是承认"确定性回放"只覆盖输入侧，输出侧只能做到统计一致。</p>
+
+    <h3>8. 失效模式与边界条件</h3>
+    <ul>
+      <li><strong>录制中途磁盘写满</strong>：记录器异常退出，bag 尾部的元数据可能不完整。边界动作：磁盘水位 80% 告警、90% 停录并落盘元数据；录制前用上节的表预估单次容量。</li>
+      <li><strong>回放环境与录制环境不一致</strong>：参数文件、模型版本、坐标系定义不同，回放出"另一个系统"的行为。边界动作：bag 旁记录环境清单（代码版本、参数摘要、标定版本），回放前校验。</li>
+      <li><strong>时间戳跨域混用</strong>：bag 里的消息时间来自仿真时间而接收时间来自墙钟，分析延迟时两套时基相减得到荒唐值。边界动作：分析脚本显式声明用哪套时基，接收时间只用于写入顺序与延迟估计。</li>
+      <li><strong>循环回放的状态污染</strong>：循环播放时节点内部状态（滤波器、地图）没有复位，第二轮的行为与第一轮不同。边界动作：每次循环重启节点，或提供显式的复位接口。</li>
+      <li><strong>保留策略失效</strong>：磁盘上堆积数百次运行，检索与备份成本失控。边界动作：保留"最近 N 次加事故标记永久"，自动清理与标记流程写入运维脚本。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <ol>
+      <li><strong>定录制清单</strong>：列出复盘/验收需要的话题（状态、TF、检测、地图、关键指令），标注频率与是否压缩。</li>
+      <li><strong>定录制方式</strong>：每台机器人本地录（推荐）；网关录仅用于小带宽场景；两类都写进部署配置。</li>
+      <li><strong>定存储参数</strong>：压缩 zstd 中等档位、分片 1 GB、磁盘水位告警（第 039 章）、保留最近 N 次运行。</li>
+      <li><strong>定回放流程</strong>：重映射到 <code>/replay</code> 命名空间 + <code>use_sim_time</code> 全节点开启；多 bag 用统一时间偏移对齐。</li>
+      <li><strong>建回归场景集</strong>：把典型场景（会车、分区、目标丢失）录成"金标准 bag"，写自动重放脚本输出指标报告。</li>
+    </ol>
+    <table>
+      <tr><th>参数</th><th>起点值</th><th>依据</th></tr>
+      <tr><td>分片大小</td><td>1 GB</td><td>拷贝/上传友好，单文件不过大</td></tr>
+      <tr><td>压缩</td><td>zstd 中等档</td><td>3–10 倍收益，CPU 可接受</td></tr>
+      <tr><td>录制频率</td><td>原始频率（白名单替代降频）</td><td>录制端整形会破坏"原貌"</td></tr>
+      <tr><td>磁盘水位</td><td>80% 告警、90% 停录</td><td>写满磁盘会拖垮整机（日志、地图保存全挂）</td></tr>
+      <tr><td>回放命名空间</td><td><code>/replay</code> 前缀</td><td>与在线系统隔离，可同时在线+回放对比</td></tr>
+    </table>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：车队录制命令（白名单 + 压缩 + 分片）</strong></p>
+    <pre class="code"><code># 每台机器人本地执行：只录复盘需要的话题；{rid} 由部署脚本替换为机器人编号
+export ROS_DOMAIN_ID=42
+ros2 bag record \
+  -o /data/bags/robot{rid}_$(date +%Y%m%d_%H%M%S) \
+  -s mcap \
+  -b 268435456 \
+  --max-cache-size 67108864 \
+  -z zstd \
+  --compression-queue-size 4 \
+  --include-hidden-topics \
+  /robot{rid}/status /robot{rid}/tf /robot{rid}/tf_static \
+  /robot{rid}/detections /robot{rid}/scan /robot{rid}/map_updates \
+  /robot{rid}/cmd_ack
+# 说明：-s 存储插件、-b 单文件分片字节、--max-cache-size 写盘缓存、
+#       -z 压缩算法；各参数名以对应发行版 ros2 bag record --help 为准</code></pre>
+    <p>解读：这条命令是"白名单哲学"的落地。<strong>（1）</strong>白名单显式列举每台机器人自己的话题，不用 <code>-a</code> 全录：全录会把其他机器人的话题也扫进来（制造抄送流量），还录下一堆与复盘无关的调试话题。<strong>（2）</strong>输出文件名包含机器人 id 与时间戳：多机汇总时一眼可辨"谁的、什么时候的"，这是分布式录制的第一需求。<strong>（3）</strong>分片与缓存参数控制写入行为：<code>-b</code> 控制分片大小（拷贝传输友好），缓存大小控制内存换 I/O 平滑；I/O 差的平台（SD 卡）上缓存过大反而造成写盘尖峰。<strong>（4）</strong>注释里提醒参数名以发行版为准：rosbag2 的 CLI 参数在 Humble→Iron→Jazzy 之间换过名字（压缩与缓存相关尤甚），照抄旧博客的教程是常见的出错来源。</p>
+
+    <p><strong>片段 2：回放 launch，重映射与仿真时间配套</strong></p>
+    <pre class="code"><code>from launch import LaunchDescription
+from launch.actions import ExecuteProcess, DeclareLaunchArgument
+from launch.substitutions import LaunchConfiguration
+from launch_ros.actions import Node
+
+def generate_launch_description():
+    bag = LaunchConfiguration("bag")          # 运行时传入 bag 路径
+    return LaunchDescription([
+        DeclareLaunchArgument("bag"),
+        # play 节点：--clock 发布 /clock；--rate 控制倍速；-l 循环
+        ExecuteProcess(
+            cmd=["ros2", "bag", "play", bag, "--clock", "--rate", "1.0"],
+            output="screen"),
+        # 所有参与节点显式开启 use_sim_time：跟随 /clock 的统一时间轴
+        Node(package="fleet_mapping", executable="fusion_node",
+             parameters=[{"use_sim_time": True}], output="screen",
+             # 重映射到 /replay 命名空间：与在线系统隔离，可并行对比
+             remappings=[("/robot1/map_updates", "/replay/robot1/map_updates"),
+                         ("/robot1/detections", "/replay/robot1/detections")]),
+        # 可视化：回放时把 rviz 也切到仿真时间，否则 TF 显示"未来/过去"
+        Node(package="rviz2", executable="rviz2",
+             parameters=[{"use_sim_time": True}], output="screen"),
+    ])</code></pre>
+    <p>解读：回放 launch 的每一行都在对抗同一个隐形敌人，"时间分裂"。<strong>（1）</strong><code>--clock</code> 让 play 发布仿真时钟；<strong>没有 <code>use_sim_time</code> 的节点会继续用墙钟</strong>，于是"数据来自过去、节点活在现在"，TF 查询报外推、定时器与数据节奏全乱。<strong>（2）</strong>重映射到 <code>/replay</code> 前缀有两个收益：与可能同时运行的在线系统隔离（防止回放数据被在线节点当真）；同时可以两边并行对比（在线 + 回放各自可视化）。<strong>（3）</strong>rviz 也要开 <code>use_sim_time</code>，它是"节点"，自然受同一条纪律约束；忘记这一点时表现为"rviz 里什么都看不到，但数据都在"的经典幻觉。<strong>（4）</strong>把 bag 路径做成 launch 参数：回放是最容易被脚本化的操作，参数化是自动回归测试的第一步。</p>
+
+    <p><strong>片段 3：bag 体检，回放之前的质量检查</strong></p>
+    <pre class="code"><code>from rosbag2_py import SequentialReader, StorageOptions, ConverterOptions
+from collections import defaultdict
+import statistics
+
+def inspect_bag(path):
+    """读 bag 统计每个话题的条目数、时间跨度与最大空档：录坏了先知道。"""
+    reader = SequentialReader()
+    reader.open(StorageOptions(uri=path, storage_id="mcap"),
+                ConverterOptions(input_serialization_format="cdr",
+                                 output_serialization_format="cdr"))
+    stats = defaultdict(list)                # topic -> [消息时间戳(秒)]
+    while reader.has_next():
+        topic, _data, t_ns = reader.read_next()
+        stats[topic].append(t_ns * 1e-9)
+    for topic, ts in sorted(stats.items()):
+        ts.sort()
+        gaps = [b - a for a, b in zip(ts, ts[1:])] or [0.0]
+        rate = len(ts) / max(ts[-1] - ts[0], 1e-9)
+        # 最大空档 &gt; 3 倍中位周期 = "疑似丢段"：回放前先解释它的来路
+        print(f"{topic:40s} {len(ts):7d} 条 {rate:7.1f} Hz "
+              f"最大空档 {max(gaps)*1000:7.1f} ms "
+              f"中位间隔 {statistics.median(gaps)*1000:7.1f} ms")</code></pre>
+    <p>解读：这个体检脚本解决"录完不知道好坏、回放时才发现缺数据"的被动局面。<strong>（1）</strong>按话题统计条目数与实际频率：记录器漏收（QoS 不兼容！）、话题中途停发、频率与预期不符，三类问题都会在这里显形。<strong>（2）</strong>用"最大空档 vs 中位间隔"识别丢段：单看平均频率会掩盖"平均正常但中间断了一分钟"的灾难（例如记录器磁盘写满后卡了 60 秒）。<strong>（3）</strong>读 bag 的 API（SequentialReader + StorageOptions）跨发行版相对稳定，但 storage_id 与序列化格式参数要与你录制时一致，用 mcap 录的包要用 mcap 插件读，插件缺失时要安装对应支持包。<strong>（4）</strong>把这个脚本接进流水线：每次录制完成自动体检，不合格的 bag 直接标记隔离，别让"坏数据"进入回归测试集。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>全录（-a）不改</strong>：磁盘半天写满，还把别人的话题抄了一遍产生额外流量。修复：白名单 + 压缩 + 分片 + 磁盘水位告警。</li>
+      <li><strong>回放忘开 use_sim_time</strong>：部分节点跟随仿真时间、部分用墙钟，TF 与数据互相对不上。修复：回放 launch 里给"每个"节点显式参数（片段 2），包括可视化工具。</li>
+      <li><strong>多 bag 各自 play</strong>：两台机器人的回放不在同一时间轴，交互全错。修复：按录制起止时间对齐仿真时钟起始点，或先合并 bag。</li>
+      <li><strong>记录器与话题 QoS 不兼容</strong>：某些话题（如 transient_local 的静态 TF）录不进去，回放时"少了骨架"。修复：用体检脚本核对条目数；必要时调整记录器 QoS 覆盖策略。</li>
+      <li><strong>拿接收时间当测量时间做分析</strong>：分析延迟时会得到"网络抖动"混入的假分布。修复：分析时区分双时间戳：延迟 = 接收 − 消息；排序/回放用消息时间。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>算账：3 台机器人，每台录压缩图（15 KB/帧 @10 Hz）+ 扫描（150 KB @10 Hz）+ 状态（2 KB @50 Hz）。半小时的 bag 大约多大（未压缩统计，再乘 0.3 的压缩系数）？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>每台 ≈ (150+1500+100) KB/s ≈ 1.75 MB/s；×3 台 ×1800 s ≈ 9.4 GB；压缩后 ≈ 3 GB 量级。</div></details>
+      </li>
+      <li>把回放倍速从 1.0 改到 2.0，预测哪些模块可能"跟不上"以及它们的表现；说明如何区分"回放掉帧"与"真实系统掉帧"。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>高倍速下 CPU 密集模块（压缩、融合）可能处理不过来；表现是输出频率低于输入、队列积压。判别：同一 bag 用 1.0× 重放，若恢复正常则是回放负载问题，与算法在真机的行为无关。</div></details>
+      </li>
+      <li>设计回归测试流程：给定 5 个"金标准 bag"与一套指标（地图冲突率、检测延迟、任务完成时间），写出自动重放与比对脚本的骨架（含失败判定阈值）。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>骨架：for bag in 集合: 起隔离域回放 → 收集指标 → 与基线的允许偏差比较 → 生成报告。阈值按"真机复现方差"的 2–3 倍起步。</div></details>
+      </li>
+      <li>设计题：为"跨楼层多机器人系统"设计录制与汇总方案：谁录、什么时候传、断网期间怎么办、存储保留策略。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>本地录制 + 回到网关后上传；断网期间本地磁盘缓存并降级（只录关键话题）；保留策略按"最近 N 次 + 事故标记永久"。</div></details>
+      </li>
+      <li>思考：为什么说 bag 里"消息时间戳的诚实度"决定了回放的价值？把第 030 章的打戳原则与本章的回放机制串起来讲一次。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>回放时间轴就是消息时间戳的拼合；打戳不诚实的 bag 回放出的是"错误的物理世界"，所有基于它的调试结论都会误导。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>rosbag2 = 写入器 + 存储插件（MCAP/SQLite）+ 元数据 + 分片；记录结束别手工改目录。</li>
+      <li>存储预算三杠杆：白名单、压缩、分片；多机器人默认分布式录制（各自本地），事后汇总。</li>
+      <li>双时间戳：接收时间看延迟、消息时间看世界；回放必须 <code>--clock</code> + 全节点 <code>use_sim_time</code>。</li>
+      <li>多 bag 回放的生命线是"同一时间轴"；用 <code>/replay</code> 命名空间与在线系统隔离。</li>
+      <li>下一章把回放与在线调试都交给"眼睛"：<strong>通信可视化：rqt 与 Foxglove</strong>，工具选型、读图方法与可视化流量治理。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch036.html">← 第 036 章：网络分区下的数据一致性</a>
+    <a class="next" href="ch038.html">第 038 章：通信可视化：rqt与Foxglove →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第019章 RLlib自定义模型 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · RLlib 核心接口与训练</span>
+    <span class="sep">/</span>
+    <span>第 019 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · RLlib 核心接口与训练</div>
+    <h1>第 019 章：RLlib自定义模型</h1>
+    <p class="lead">默认全连接网络对结构化观测并不总是够用。本章讲清模型接口的输入输出契约、注册与配置注入方式，并把"共享主干加双头"的经典结构亲手搭出来。</p>
+    <ul class="meta">
+      <li>主题：RLlib 训练 / 网络结构扩展</li>
+      <li>关键机制：模型接口（forward 契约）、模型目录注册、双头结构、设备放置</li>
+      <li>预计学时：65 分钟</li>
+      <li>前置章节：第 018 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>明确自定义模型的适用场景：何时默认网络足够、何时值得引入自定义结构。</li>
+      <li>掌握模型接口契约：构造签名、前向调用的输入字典与输出张量、状态字段的约定。</li>
+      <li>会通过模型目录注册自定义网络，并用配置注入结构参数。</li>
+      <li>会搭建"共享主干加策略头与价值头"的双头结构，理解它与算法损失的关系。</li>
+      <li>能诊断四类问题：输出维度不匹配、观测未拉平、设备放置错误、配置未随副本传递。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>默认网络把观测视为扁平的数值向量，逐层全连接。这个假设在不少任务上成立，但遇到两类情形就会吃力：观测具有结构（多路输入、时序片段、空间模式），或任务需要特定归纳偏置（平移不变性、特征分组）。<strong>自定义模型让网络结构与任务结构对齐，用更少的参数达到同样的表达能力</strong>。</p>
+    <p>对强化学习还有一层动机：策略与价值通常共享底层特征。默认配置会分别构造两个网络，参数与计算量翻倍；双头结构让两者共享主干，只在末端分岔。这个模式在后续算法章节（第 045 章循环结构、第 033 章图像输入）中是标准做法，本章先把最基础的版本讲透。</p>
+    <p>自定义模型有明确的代价：接口契约比配置项复杂，出错时的报错信息也更晦涩。<strong>判断标准是先问"默认网络差在哪"，用数据回答（参数量、收敛速度、最终回报），再决定是否自定义</strong>。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 模型接口：三个签名与一条数据流</h3>
+    <p>自定义模型类继承框架对应的模型基类，接口由三部分组成：</p>
+    <table>
+      <tr><th>接口点</th><th>签名要素</th><th>语义</th></tr>
+      <tr><td>构造方法</td><td>观测空间、动作空间、输出维度、模型配置、名称</td><td>建立网络结构；输出维度由动作空间与算法共同决定</td></tr>
+      <tr><td>前向调用</td><td>输入字典、隐藏状态、序列长度</td><td>从观测张量产出分布输入与（可选的）新状态</td></tr>
+      <tr><td>配置注入</td><td>模型配置字典</td><td>把结构参数（层宽、深度）从配置传到副本进程</td></tr>
+    </table>
+    <p>前向调用的输入是字典，键名约定包括原始观测与拉平后的观测。<strong>自定义层应优先使用拉平后的观测张量，并显式校验形状</strong>：形状错误在分布式训练里表现为远端异常，报错信息不含调用现场，提前断言能大幅缩短排查时间。</p>
+    <div class="formula">
+      前向输出维度 = num_outputs；动作分布据其构造
+      <span class="note">连续动作维 d 的独立高斯分布需要 2d 个数（均值与对数标准差各 d），算法层按需解释，模型只需产出约定维度</span>
+    </div>
+
+    <h3>2. 双头结构：共享主干，分岔输出</h3>
+    <p>策略梯度类算法同时需要动作分布参数与状态价值。双头结构把计算组织为：</p>
+    <ol>
+      <li><strong>共享主干</strong>：若干层特征提取，两个任务共用，是参数节省的主要来源。</li>
+      <li><strong>策略头</strong>：从主干特征映射到动作分布参数。</li>
+      <li><strong>价值头</strong>：从主干特征映射到单值估计。</li>
+    </ol>
+    <p>实现上，策略头输出拼接到前向结果中供算法构造分布，价值头作为模型的附加输出部件，由算法在需要时读取。<strong>共享尺度要设计得当</strong>：主干过深会让两个任务的梯度互相干扰，过浅则节省有限；一般从"两个任务各自所需深度中较小者"起步，按训练曲线的稳定性调整。</p>
+
+    <h3>3. 注册与配置：模型如何抵达副本</h3>
+    <p>模型类定义在驱动进程，训练发生在采样与学习进程，中间靠注册表传递：<strong>注册表把模型名映射到类对象，配置里只写名字与结构参数</strong>。副本进程的构造路径是"读配置、查注册表、实例化模型"，与前几章的环境注册完全同构。</p>
+    <p>两个传递纪律：结构参数必须放进模型配置字典，<strong>写死在类定义里的常量对副本不可见也不可调</strong>；注册动作要在构建算法之前完成，且每条训练路径（训练脚本、恢复脚本、评估脚本）都要注册，遗漏会以"模型名未知"的报错形式出现。</p>
+
+    <h3>4. 设备放置：模型与张量必须在同一设备</h3>
+    <p>资源声明中有显卡时，模型会被放到显卡上执行。此时两类错误高发：</p>
+    <ul>
+      <li><strong>缓存张量落在处理器上</strong>：构造时创建了常驻张量（位置编码、掩码表），前向时与显卡上的激活相加，触发设备不一致错误。修复：常驻张量在构造后按模型设备迁移。</li>
+      <li><strong>前向中新建张量未指定设备</strong>：中间计算创建的新张量默认落在处理器上。修复：从输入张量派生新张量（沿用其设备），或显式指定设备。</li>
+    </ul>
+    <p><strong>最稳妥的写法是"一切从输入派生"</strong>：新张量的形状与设备跟随输入，不做假设。这套纪律在第 028 章的显卡训练与第 029 章的多卡扩展中会再次强调。</p>
+
+    <h3>5. 共享主干与独立双网的参数账</h3>
+    <p>共享主干省下多少参数，可以按层逐一算清。取观测 8 维、主干两层、宽度 128、连续动作 1 维（分布需要均值与对数标准差共 2 个输出）：</p>
+    <ul>
+      <li>主干第一层：8 × 128 + 128 = 1152；第二层：128 × 128 + 128 = 16512；主干合计 17664。</li>
+      <li>策略头：128 × 2 + 2 = 258；价值头：128 × 1 + 1 = 129。</li>
+      <li>共享方案整体：17664 + 258 + 129 = 18051。</li>
+    </ul>
+    <div class="formula">
+      每层参数量 = 前层宽度 × 本层宽度 + 本层宽度（含偏置）
+      <span class="note">线性层参数含偏置项；把每个分支的层依次求和即得该分支总量，两分支共享的层只计一次</span>
+    </div>
+    <p>同样规模拆成两套独立网络时，策略分支为 8→128→128→2，参数量 1152 + 16512 + 258 = 17922；价值分支为 8→128→128→1，参数量 17793；合计 35715。共享方案省下 17664 个参数，节省比例约 49.5%。<strong>节省来自输入层与主干被两分支重复计算的部分，与两个头部的大小关系不大：</strong>价值头在共享方案里只占 129 / 18051 ≈ 0.7%。</p>
+    <table>
+      <tr><th>主干宽度</th><th>共享方案</th><th>独立双网</th><th>节省比例</th></tr>
+      <tr><td>32</td><td>1443</td><td>2787</td><td>约 48.2%</td></tr>
+      <tr><td>128</td><td>18051</td><td>35715</td><td>约 49.5%</td></tr>
+      <tr><td>256</td><td>68867</td><td>136963</td><td>约 49.7%</td></tr>
+    </table>
+    <p>读表可得两条配置经验。<strong>其一，主干宽度翻倍时主干参数按约四倍增长，</strong>宽度是全模型参数的第一主导项，选型影响远大于头部设计。<strong>其二，节省比例在宽度变化时稳定在五成附近，</strong>因为重复部分始终是两分支共同需要的输入层与主干。主干从两层加到三层时，新增一层的参数为 128 × 128 + 128 = 16512，共享方案整体升到 34563；同一改动在独立方案里要付两份。深度与宽度的取舍由此量化：加一层 128 宽约等于多出一万六千余个参数，加深收益递减在简单任务上最先显现。</p>
+    <p>参数账同时给出两个失效边界。主干过窄（宽度 32 量级）时，两任务共享的容量不足，症状是价值拟合长期滞后于策略改进，训练曲线上价值损失缓慢下移而不见收敛拐点；修复是加宽主干，或让价值与策略在主干之后各接一段独立映射。共享范围过大（主干四层以上）时，两个目标的梯度互相干扰，症状是策略熵与价值误差同步震荡；修复是缩短共享段，把两分支的分歧移到更靠后的层。</p>
+
+    <h3>6. 前向计算量：参数之外的另一笔账</h3>
+    <p>参数量决定显存与拟合容量，计算量决定迭代速度，两者不等价。线性层每样本前向的乘加数等于该层权重个数（偏置只做加法）：共享方案每样本前向约 17792 次乘加，恰等于参数量 18051 减去全部偏置 259。批量 8192 的一轮训练里，学习侧对每个样本做一次前向与一次反向，反向约为前向的两倍，合计约 8192 × 17792 × 3 ≈ 4.4 亿次乘加；主干加宽到 256 后升至约 16.8 亿次，倍数与参数账一致。<strong>采样侧每个环境步还要一次前向推理：</strong>256 宽主干在每秒十二万步的采样吞吐下约消耗 82 亿次乘加每秒，这一项在处理器上执行时往往比学习侧更早成为瓶颈，正是第 028 章讨论推理与学习分工的量化背景。独立双网方案在这两笔账上都接近翻倍，共享主干的收益同时体现在显存与时间两个口径上。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>引入自定义模型的步骤：</p>
+    <ol>
+      <li><strong>基线对照</strong>：先用默认网络跑出基线曲线，记录参数量与收敛轮数，作为自定义结构的对照。</li>
+      <li><strong>设计结构</strong>：按观测结构设计主干；确定策略头输出维度；决定是否共享主干。</li>
+      <li><strong>实现与注册</strong>：写模型类（构造加前向），写形状断言；在训练脚本中注册。</li>
+      <li><strong>配置接线</strong>：结构参数进模型配置字典，训练配置引用模型名。</li>
+      <li><strong>冒烟验证</strong>：用小批次跑通前向与一轮训练，核对参数量与输出维度。</li>
+      <li><strong>对照实验</strong>：与基线对比曲线，确认自定义结构带来真实收益后再保留。</li>
+    </ol>
+    <table>
+      <tr><th>参数</th><th>典型取值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>主干层宽</td><td>64–256</td><td>特征容量</td><td>观测维度与任务复杂度的折中</td></tr>
+      <tr><td>主干层数</td><td>2–4</td><td>非线性深度</td><td>加深收益递减，从浅试起</td></tr>
+      <tr><td>价值头层宽</td><td>主干的一半量级</td><td>价值分支容量</td><td>价值是标量回归，容量需求低</td></tr>
+      <tr><td>激活函数</td><td>整流线性单元族</td><td>非线性</td><td>按任务与框架惯例选，保持全模型一致</td></tr>
+    </table>
+    <div class="box tip">
+      <span class="box-title">与上一章的差异点</span>
+      <p>第 018 章把训练编排做到完备；本章替换编排中的一个部件（网络）。替换后评估与检查点机制原样适用，这正是分层设计的收益：改动局部，验证手段不变。</p>
+    </div>
+    <p><strong>冒烟验证用三个数字收口：</strong>参数量、策略头输出维度与一次前向的耗时。参数量按本讲公式手算，例如 8 维观测、128 宽两层主干的共享模型应为 18051；实测偏大约一倍时，先怀疑默认网络没有被置空。策略头输出维度应等于动作分布参数数（连续 1 维动作为 2），不等则维度契约有误。前向耗时用随机批次测三次取中值，与手算的每样本乘加数（约 1.8 万次）对照；数量级偏离且无报错时，优先检查是否落回默认网络或观测未拉平。三个数字全部对齐之后再启动对照实验，可以避免把配置错误误读成结构优劣。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>以下片段采用 Ray 2.x 时期的通用写法；接口随版本演进，以对应版本官方文档为准。</p>
+    <p><strong>片段 1：自定义共享主干双头模型</strong></p>
+    <pre class="code"><code>import torch
+import torch.nn as nn
+from ray.rllib.models.torch.torch_modelv2 import TorchModelV2
+from ray.rllib.models import ModelCatalog
+
+class SharedTrunkModel(TorchModelV2, nn.Module):
+    """共享主干加双头：策略头输出动作分布参数，价值头输出状态价值。"""
+    def __init__(self, obs_space, action_space, num_outputs, model_config, name):
+        TorchModelV2.__init__(self, obs_space, action_space,
+                              num_outputs, model_config, name)
+        nn.Module.__init__(self)
+        cfg = model_config.get("custom_model_config", {})
+        hidden = cfg.get("hidden", 128)               # 结构参数经配置注入
+        trunk_layers = cfg.get("trunk_layers", 2)
+        obs_dim = int(torch.prod(torch.tensor(obs_space.shape)))
+
+        trunk = []                                    # 主干：两个任务共享
+        last = obs_dim
+        for _ in range(trunk_layers):
+            trunk += [nn.Linear(last, hidden), nn.ReLU()]
+            last = hidden
+        self.trunk = nn.Sequential(*trunk)
+
+        self.policy_head = nn.Linear(hidden, num_outputs)   # 策略头
+        self.value_head = nn.Linear(hidden, 1)              # 价值头
+        self._value_out = None                        # 缓存价值：供价值函数读取
+
+    def forward(self, input_dict, state, seq_lens):
+        obs = input_dict["obs_flat"].float()          # 统一精度并拉平
+        h = self.trunk(obs)
+        self._value_out = self.value_head(h).squeeze(-1)    # 价值头前向即缓存
+        return self.policy_head(h), state             # 策略头输出作为模型输出
+
+    def value_function(self):
+        assert self._value_out is not None, "必须先前向再取价值"
+        return self._value_out
+
+ModelCatalog.register_custom_model("shared_trunk", SharedTrunkModel)</code></pre>
+    <p>解读：这份实现把接口契约逐条落实。<strong>构造方法从模型配置读取结构参数</strong>，同一份代码可通过配置组装不同规模，副本进程收到的配置与驱动一致。前向返回"策略头输出与新状态"的二元组：状态为空列表表示无记忆结构，约定留到第 045 章的循环网络再填。<strong>价值缓存是双头的关键实现细节</strong>：价值必须在同一次前向中算出并缓存，价值函数接口只做读取，两次前向会破坏梯度与计算图的对应关系。形状断言（价值缓存非空）把调用顺序错误转成清晰的本地报错。</p>
+
+    <p><strong>片段 2：注册与配置接线</strong></p>
+    <pre class="code"><code>from ray.rllib.algorithms.ppo import PPOConfig
+
+config = (
+    PPOConfig()
+    .environment(env="line_tracker", env_config={"max_steps": 200, "goal": 5.0})
+    .env_runners(num_env_runners=4)
+    .training(
+        train_batch_size=8192, minibatch_size=1024, num_epochs=6, lr=3e-4,
+        model={                              # 模型段落：引用注册名并注入结构参数
+            "custom_model": "shared_trunk",
+            "custom_model_config": {"hidden": 128, "trunk_layers": 2},
+            "fcnet_hiddens": [],             # 关闭默认网络，避免双重构造
+        },
+    )
+    .resources(num_gpus=0)
+)
+
+algo = config.build()          # 构建时副本进程按名字查注册表实例化模型
+policy = algo.get_policy()
+print("模型参数量:", sum(p.numel() for p in policy.model.parameters()))
+print("策略头输出维度:", policy.model.policy_head.out_features)   # 应等于动作分布维度</code></pre>
+    <p>解读：配置接线的三个要点：模型名与注册名逐字一致；结构参数与实际模型类读取的键名一致；<strong>默认网络参数置空，防止框架再叠一层默认全连接</strong>。参数量与输出维度的打印是最便宜的冒烟验证：参数量异常偏小说明主干未生效（常见为配置键写错落入默认分支），输出维度与动作分布不符会在训练首轮报维度错误。检查策略对象的内部模型引用还顺带确认了"配置确实抵达了运行进程"。</p>
+
+    <p><strong>片段 3：与基线的对照记录</strong></p>
+    <pre class="code"><code>import time
+
+def run_short(config, tag, iters=15):
+    """短程对照：同一批次规模与种子下比较默认网络与自定义网络。"""
+    algo = config.build()
+    curve = []
+    t0 = time.perf_counter()
+    for it in range(iters):
+        result = algo.train()
+        rew = result.get("env_runners", {}).get(
+            "episode_return_mean", result.get("episode_reward_mean", 0.0))
+        curve.append(float(rew))
+    dt = time.perf_counter() - t0
+    params = sum(p.numel() for p in algo.get_policy().model.parameters())
+    print(f"[{tag}] 参数量 {params:7d} 末段均值 "
+          f"{sum(curve[-5:]) / 5:7.2f} 耗时 {dt:.1f}s")
+    return curve
+
+def base_config():
+    """基线配置工厂：两组对照各自独立构建，避免共享引用互相污染。"""
+    return (PPOConfig()
+            .environment(env="line_tracker",
+                         env_config={"max_steps": 200, "goal": 5.0})
+            .env_runners(num_env_runners=4)
+            .training(train_batch_size=8192, minibatch_size=1024,
+                      num_epochs=6, lr=3e-4, seed=7)   # 固定种子，对照才公平
+            .resources(num_gpus=0))
+
+base = base_config()
+custom = base_config().training(               # 只改模型段落，其余保持一致
+    model={"custom_model": "shared_trunk",
+           "custom_model_config": {"hidden": 128, "trunk_layers": 2},
+           "fcnet_hiddens": []})
+
+run_short(base, "默认网络")
+run_short(custom, "共享主干")</code></pre>
+    <p>解读：对照实验的纪律在配置层面执行：种子固定、批次一致、只改模型段落。输出三列信息各有用途：参数量验证结构规模差异，末段均值反映学习效果，耗时反映计算代价。<strong>自定义结构的收益必须"效果除以代价"综合评估</strong>：参数量减少且末段均值不降是理想结果；参数量相当但收敛更快亦可接受；代价与收益均不显著时，回到默认网络，把复杂度留给真正需要的任务。短程对照的轮数按"能看出趋势"设置，最终结论用完整训练复核。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>输出维度与动作分布不匹配</strong>：策略头输出维度与算法要求的分布参数数不符，训练首轮报维度错误。修复：从动作空间推导期望维度，打印核对后再训练。</li>
+      <li><strong>观测未拉平或精度不符</strong>：直接使用原始嵌套观测或双精度张量，网络输入形状与前向假设不一致。修复：使用拉平后的观测键并转为单精度，前向开头做形状断言。</li>
+      <li><strong>常驻张量设备不匹配</strong>：显卡训练时缓存张量留在处理器上，前向时触发设备错误。修复：常驻张量在构造后按模型设备迁移，新张量一律从输入派生。</li>
+      <li><strong>结构参数写死在类里</strong>：层宽直接写入类定义，副本进程无法感知配置，实验参数形同虚设。修复：全部结构参数经模型配置字典注入，键名与读取处一一核对。</li>
+      <li><strong>训练脚本注册而恢复脚本忘注册</strong>：恢复路径未注册模型名，加载时报未知模型。修复：把注册动作封装为公共导入，所有入口统一调用。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把片段 1 的 <code>hidden</code> 从 128 改为 32 与 256，保持其他参数不变，预测参数量与末段均值的变化方向，运行片段 3 验证。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>参数量近似随层宽线性增长；容量过小时末段均值下降，过大的容量在简单任务上收益饱和甚至因优化变慢而短期下降。</div></details>
+      </li>
+      <li>预测题：给模型加第三层主干（trunk_layers 从 2 到 3），参数量增加多少？在简单任务上训练轮数与末段均值如何变化？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>每层增加"层宽乘层宽加层宽"的参数量；深度收益递减，简单任务上末段均值通常持平，收敛速度可能略慢。</div></details>
+      </li>
+      <li>设计题：为"观测含两路输入（位置向量加一组传感器读数）"的任务设计模型：给出主干结构、两路融合位置与参数量估算，并说明与简单拼接相比的收益点。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>两路各接一个小型编码器再拼接进主干，融合位置放在编码之后；收益在于每路获得独立的特征尺度，避免量纲差异导致的优化困难。</div></details>
+      </li>
+      <li>分析：某自定义模型训练正常但评估回报始终低于基线。给出三个排查方向（提示：前向数据路径、价值缓存、参数量验证），写出各自的验证动作。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>数据路径看 obs_flat 形状与预处理一致性；价值缓存看 value_function 是否被正确调用（价值估计偏差会拖累优势估计）；参数量看结构是否真的生效。</div></details>
+      </li>
+      <li>设计：为共享主干模型设计一份单元测试清单：构造测试、前向形状测试、价值缓存顺序测试、设备一致性测试，写明每个测试的输入与断言。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>构造测试用假空间验证参数量；前向形状用随机观测断言输出维度；顺序测试在前向之前调用价值函数应触发断言；设备测试在显卡环境核对参数与中间张量设备一致。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>自定义模型的引入标准是任务结构或归纳偏置，先用默认网络建立基线再对照。</li>
+      <li>接口契约三点：构造签名接收结构参数，前向返回"分布输入与新状态"，价值函数只读缓存。</li>
+      <li>双头结构共享主干节省参数与计算；<strong>价值必须在同一次前向中缓存，两次前向破坏计算图对应</strong>。</li>
+      <li>注册表加模型配置完成跨进程传递；所有入口脚本统一注册，防止恢复路径遗漏。</li>
+      <li>下一章再往上走一层：<strong>自定义训练器</strong>，改写训练循环本身，网络结构保持本章配置。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch018.html">← 第 018 章：RLlib策略评估与检查点</a>
+    <a class="next" href="ch020.html">第 020 章：RLlib自定义训练器 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

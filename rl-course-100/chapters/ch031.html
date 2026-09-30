@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第031章 SAC在Pendulum上的首次实现 | 深度强化学习课程 · PPO、SAC 与多智能体系统</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 离策略方法与 SAC</span>
+    <span class="sep">/</span>
+    <span>第 031 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 离策略方法与 SAC</div>
+    <h1>第 031 章：SAC在Pendulum上的首次实现</h1>
+    <p class="lead">换一条技术路线：离策略的经验回放、双 Q 抑制过估计、tanh 压缩高斯策略、自动温度，用不到 3 万步把 PPO 磨蹭不动的 Pendulum 摆到接近优秀策略的水平。</p>
+    <ul class="meta">
+      <li>主题：SAC 基础闭环 / on-policy 到 off-policy 的切换</li>
+      <li>关键公式：y = r + γ(1−done)·[ min(Q<sub>1</sub><sup>tgt</sup>, Q<sub>2</sub><sup>tgt</sup>) − α·log π(a′|s′) ]</li>
+      <li>预计学时：75 分钟</li>
+      <li>前置章节：第 030 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>说清 SAC 与 PPO 的范式差异：on-policy 的一批一丢 vs off-policy 的经验回放。</li>
+      <li>从最大熵目标推导软贝尔曼方程的 TD 目标，理解"Q 减去 α·log π"每一项的来源。</li>
+      <li>实现完整的 SAC 四件套：回放缓冲、双 Q + 目标网络、重参数化策略、自动温度。</li>
+      <li>在 <code>Pendulum-v1</code> 上把评估回报训练到 −300 ~ −150 区间，并与第 030 章的 PPO 曲线对照。</li>
+      <li>掌握 SAC 的常见稳定化细节：软更新系数 τ、log_std 夹紧、目标熵取 −dim(A)。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 030 章的基准表把 PPO 的处境摆得很清楚：CartPole 算主场，到 Pendulum 只能到中等水平，MountainCarContinuous 干脆跑不出成功回合。问题不在实现，而在范式，<strong>PPO 的每一份数据只被使用十几个 epoch 就永久丢弃</strong>。环境交互是最贵的资源，离策略（off-policy）算法则可以把每一步交互存进经验回放（experience replay），让同一份数据在之后几千次更新里反复出镜。这就是切换到 SAC 的第一动机。</p>
+    <p>SAC（Soft Actor-Critic，2018）是目前离策略连续控制的代表算法。它和 PPO 有本质区别：改为学两个 Q 网络并直接回归软贝尔曼目标，不估计优势函数、不做比率裁剪；探索由<strong>最大熵目标</strong>承担，把策略自然推向"高回报且保持随机"，不依赖外部噪声；熵的权重 α 还能自动调整，奖励尺度变了也不需要人工重调。第二动机藏在细节里：连续控制的探索尺度（σ）在 PPO 里要手动退火或夹紧，而 SAC 把它交给温度参数自学习。本章在 Pendulum 上实现完整 SAC 作为第二篇的起点，后面 30 章的所有变体都从这份代码生长出来。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 最大熵目标：奖励之外还要"留一手"</h3>
+    <p>普通 RL 只最大化累计奖励；SAC 的目标里额外加一项策略熵，希望策略在拿高分的同时保持尽可能多的随机性：</p>
+    <div class="formula">
+      J(π) = Σ<sub>t</sub> 𝔼<sub>(s<sub>t</sub>,a<sub>t</sub>)~π</sub>[ r(s<sub>t</sub>,a<sub>t</sub>) + α · H(π(·|s<sub>t</sub>)) ]
+      <span class="note">α 是温度系数：控制"探索"相对于"得分"的权重</span>
+    </div>
+    <p>直觉：多峰奖励地形里，过早收缩到单一动作会掉进局部最优；保留熵等价于同时维护多条可能的策略路线。这个目标推导出的<strong>软贝尔曼方程</strong>正是实现的核心：</p>
+    <div class="formula">
+      Q(s,a) = r + γ · 𝔼<sub>s′,a′~π</sub>[ Q(s′,a′) − α · log π(a′|s′) ]
+    </div>
+    <p>注意 TD 目标里多出的 <strong>−α·log π</strong> 项：它惩罚"目标动作概率过高"的选择，这就是 SAC 探索机制的数学来源：价值函数本身偏好"既好又不太确定"的动作，不依赖外部加噪声。对比 PPO：那里探索写在损失函数的熵奖励里、且随数据一起被丢弃的经验无法复用；这里探索写进了价值目标，每次从回放里采样都在生效。</p>
+
+    <h3>2. 双 Q 与目标网络：给价值估计上双保险</h3>
+    <p>TD 学习天然会过估计：用被高估的价值去回归，误差滚雪球。SAC 用两个独立 Q 网络、<strong>取较小者</strong>构造目标（clipped double-Q）：</p>
+    <div class="formula">
+      y = r + γ(1−done) · [ min( Q<sub>1</sub><sup>tgt</sup>(s′,a′), Q<sub>2</sub><sup>tgt</sup>(s′,a′) ) − α·log π(a′|s′) ]
+    </div>
+    <p>目标网络（<code>q1_target / q2_target</code>）用 Polyak 软更新缓慢跟随在线网络：θ<sup>tgt</sup> ← τθ + (1−τ)θ<sup>tgt</sup>，τ 取 0.005 意味着目标网络要几百次更新才追上一步，这是抑制自举发散的关键。它对应 PPO 体系里"目标值由 GAE 反推"的角色，但机制完全不同。</p>
+
+    <h3>3. 重参数化 + tanh 压缩：策略怎么出连续动作</h3>
+    <p>策略从高斯采样 u，再压缩到动作区间，并对 log 概率做雅可比修正：</p>
+    <div class="formula">
+      u = μ<sub>θ</sub>(s) + σ<sub>θ</sub>(s) ⊙ ε，&nbsp; ε ~ N(0,I) &nbsp;（重参数化：梯度穿过采样）<br>
+      a = shift + scale · tanh(u)<br>
+      log π(a|s) = log N(u; μ, σ) − Σ log( scale · (1 − tanh<sup>2</sup>(u)) )
+    </div>
+    <p>与第 030 章 PPO 的连续策略相比，公式长得一样，用途完全不同：PPO 只把 u 当比率的分母基准，SAC 的 log π 要<strong>直接参与策略损失与温度损失的梯度</strong>，所以雅可比修正这次不能省，低估 log π 会让温度调节失真。另外动作进回放缓冲区时必须是<strong>环境空间的 a</strong>，因为 Q 网络学的是 Q(环境状态, 环境动作)。</p>
+
+    <h3>4. 自动温度：α 也是可学习参数</h3>
+    <p>固定 α 是 SAC 早期版本的做法，调它比调 PPO 的熵系数还麻烦（奖励尺度一变就失效）。现代 SAC 把 α 参数化为 log_alpha 并让它自己学，损失为：</p>
+    <div class="formula">
+      L(α) = − log α · ( log π(a|s) + H<sub>target</sub> ).detach()，&nbsp; H<sub>target</sub> = −dim(A)
+      <span class="note">策略太确定（log π 高）→ 括号为正 → α 上升；策略太随机 → α 下降</span>
+    </div>
+    <p>H<sub>target</sub> = −1（Pendulum 动作 1 维）是策略熵要收敛到的目标值；连续空间的微分熵可以为负，−1 nat 折算成 u 空间的 σ 约 0.045（见本节第 6 小节算例），对应"动作噪声约 ±0.09 力矩"的半确定策略。α 会自己找到与奖励尺度匹配的水平，第 032 章会专门解剖它的行为。</p>
+
+    <h3>5. 软贝尔曼方程是怎么推出来的</h3>
+    <p>最大熵目标写在整条轨迹上，要做实现必须把它改写为一步递归。先定义软价值与软 Q：</p>
+    <div class="formula">
+      V(s) = 𝔼<sub>a~π</sub>[ Q(s,a) − α log π(a|s) ]<br>
+      Q(s,a) = r(s,a) + γ · 𝔼<sub>s′</sub>[ V(s′) ]
+    </div>
+    <p>第一式把状态价值定义为"Q 对动作求期望、再扣掉熵项"；第二式就是普通贝尔曼方程。把第一式代入第二式消去 V，得到实现里直接使用的软贝尔曼方程：</p>
+    <div class="formula">
+      Q(s,a) = r + γ · 𝔼<sub>s′,a′~π</sub>[ Q(s′,a′) − α log π(a′|s′) ]
+    </div>
+    <p>逐项交代来源：r 与 γ 折扣照旧；Q(s′,a′) 是自举项；−α log π 是熵红利，对采样到的 a′ 而言，策略给它的概率越低（log π 越小），在目标值里得到的补偿越大，价值目标因此会主动拉抬少见动作，避免 Q 被"当前偏好"压死。把这项对 a′ 的采样求期望，恰好得到 α·H(π)，与最大熵目标里的熵项闭合。改动任一假设都会变形：若把动作期望换成确定性最优（a′ 取 argmax Q 的位置），−α log π 项整体消失，算法退化为普通 Q 学习；若熵权重固定且不随策略调整，σ 会停在某个固定水平，收敛点偏向随机策略一侧。</p>
+
+    <h3>6. 数值算例：TD 目标、温度步长与软更新半衰期</h3>
+    <p>取一次 Pendulum 转移的具体数值：即时奖励 r=−1.0，折扣 γ=0.99，该步未真实终止（done=0），两个目标 Q 网络对 (s′,a′) 的估计都为 −3.5，目标动作的对数概率 log π=−0.8，当前温度 α=0.2。代入 TD 目标公式：</p>
+    <div class="formula">
+      y = −1.0 + 0.99 × [ −3.5 − 0.2×(−0.8) ] = −1.0 + 0.99×(−3.34) = −4.3066
+    </div>
+    <p>若把 α 置零，目标为 −1.0 + 0.99×(−3.5) = −4.4650，熵红利把目标抬高了 0.1584，相对幅度约 3.5%。若同一步的策略更随机（log π=−2.0），公式给出 −4.0690，抬升扩大到 0.396。两张数字合起来说明：策略越随机，价值目标被抬高得越多，这就是"探索写进价值学习"的算术面目。再看温度更新的步长：对数空间的单步位移为 学习率×|log π + H<sub>target</sub>| = 3e-4×1.8 ≈ 5.4e-4，即每步移动约万分之五，指望 α 在几十步内调到合适位置并不现实，它本质上是一个慢变量。</p>
+    <p>软更新的时间尺度同样可以算。τ=0.005 时每次更新保留 99.5% 的旧目标权重，差距按 (1−τ)<sup>n</sup> 衰减：降到一半需要约 138 次更新，200 次后还剩 36.7%，1000 次后只剩 0.67%。warmup 之后每个环境步做一次更新，所以约 140 步就能把目标网络"换掉一半"，几千步内完全追平，这是目标网络既能抑制自举噪声、又不会长期滞后的数量级依据。最后核对目标熵：压缩高斯策略的熵为 H(U) + 𝔼[log|da/du|]，其中基础高斯熵 H(U)=log σ + 1.4189；若策略均值靠近 0，雅可比项平均约 log 2≈0.6931，令总熵等于 −1 得 log σ≈−3.112，即 σ≈0.0445，折算到 Pendulum 的 ±2 力矩区间上是约 ±0.089 的动作噪声。训练后期策略带一点随机性正是这个来源，读公式时要注意 −1 是熵的目标值，不是"保持 1 nat"。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+
+    <h3>模块划分</h3>
+    <table>
+      <tr><th>组件</th><th>职责</th><th>与第 030 章（PPO）的关系</th></tr>
+      <tr><td><code>ReplayBuffer</code></td><td>环形数组存 (obs, act, rew, next_obs, done)，随机批量采样</td><td><strong>全新</strong>：PPO 没有的数据结构</td></tr>
+      <tr><td><code>SquashedGaussianPolicy</code></td><td>重参数化采样 + tanh 压缩 + 雅可比修正的 log π</td><td>与 PPO 连续策略同源，但用于熵目标与确定性评估</td></tr>
+      <tr><td><code>QNet</code></td><td>输入 (s, a) 输出标量 Q 值</td><td><strong>全新</strong>：PPO 用 V(s)，SAC 用 Q(s,a)</td></tr>
+      <tr><td><code>Agent</code></td><td>双 Q + 目标网络 + 策略 + 三个优化器 + log_alpha</td><td><strong>全新</strong>：SAC 的组件装配</td></tr>
+      <tr><td><code>update_agent</code></td><td>一次完整更新：TD 目标 → 双 Q → 策略 → 温度 → 软更新</td><td><strong>全新</strong>：替代 GAE + 裁剪损失</td></tr>
+      <tr><td><code>soft_update</code></td><td>Polyak 平均 θ ← τθ + (1−τ)θ</td><td><strong>全新</strong>：目标网络的关键</td></tr>
+      <tr><td><code>sparkline</code></td><td>评估曲线文本可视化（编码降级）</td><td>沿用第 026 章思路</td></tr>
+    </table>
+
+    <h3>关键超参数</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用与取值理由</th></tr>
+      <tr><td><code>--max-steps</code></td><td>25000</td><td>离策略的样本效率目标：2.5 万步内达到中上水平</td></tr>
+      <tr><td><code>--warmup</code></td><td>1000</td><td>先用随机动作把缓冲区填到多样，避免早期过拟合噪声</td></tr>
+      <tr><td><code>--batch-size</code></td><td>128</td><td>每次更新的批量；比 PPO 的 64 大，因为要估计 Q 的方差</td></tr>
+      <tr><td><code>--buffer-size</code></td><td>100000</td><td>远超训练步数，保证数据分布始终丰富</td></tr>
+      <tr><td><code>--lr</code> / <code>--alpha-lr</code></td><td>3e-4 / 3e-4</td><td>Q、策略、温度共用常用学习率</td></tr>
+      <tr><td><code>--tau</code></td><td>0.005</td><td>目标网络软更新：越小越稳、越大越"新鲜"</td></tr>
+      <tr><td><code>--init-alpha</code></td><td>0.2</td><td>初始温度；自动调节会把它推到合适水平</td></tr>
+      <tr><td>目标熵</td><td>−dim(A) = −1</td><td>SAC 论文对连续控制的推荐默认值</td></tr>
+      <tr><td>log_std 夹紧</td><td>[−20, 2]</td><td>防止策略方差退化或爆炸</td></tr>
+    </table>
+
+    <h3>与第 030 章的结构性差异</h3>
+    <table>
+      <tr><th>维度</th><th>PPO（030）</th><th>SAC（031）</th></tr>
+      <tr><td>数据来源</td><td>当前策略现采现用（on-policy）</td><td>经验回放，旧数据反复使用（off-policy）</td></tr>
+      <tr><td>每步交互的学习量</td><td>0（攒满一整批才更新）</td><td>warmup 后每步一次更新</td></tr>
+      <tr><td>价值学习</td><td>V(s) + GAE 优势</td><td>双 Q(s,a) + 软贝尔曼目标</td></tr>
+      <tr><td>探索机制</td><td>策略熵 + 外部动作噪声，σ 需人工管理</td><td>最大熵目标 + 自动温度 α</td></tr>
+      <tr><td>稳定性工具</td><td>比率裁剪、KL 早停</td><td>双 Q 取小、目标网络、软更新</td></tr>
+    </table>
+
+    <h3>缓冲区与梯度步的量级核算</h3>
+    <p>三组默认数字放在一起，能看出这套配置的尺度：<strong>（1）</strong>回放容量 10 万，而总交互量只有 2.5 万，整个训练历史都能留下，不存在旧数据被挤掉导致的分布漂移；若把容量改成 5000，最早的随机 warmup 数据会被逐步覆盖，缓冲区内的动作分布随之从"均匀覆盖"过渡到"策略附近"。<strong>（2）</strong>warmup 1000 步按 128 的批量折算约 7.8 个批次，只够让 Q 网络粗略见一遍动作区间的覆盖，首批梯度依赖的数据相当同质，这也是 warmup 不能取得太小的原因。<strong>（3）</strong>warmup 之后 update_every=1，梯度更新约 2.4 万次，与环境步数之比接近 1:1；对 Pendulum 这种需要精细力矩调节的任务，更新频率减半（改成每两步一次）曲线会明显变慢，加倍则墙钟时间几乎翻倍，第 043 章会专门解剖这个复用率与代价的取舍。</p>
+
+    <div class="box key">
+      <span class="box-title">数据流：采样与更新彻底解耦</span>
+      <p>PPO 是"采样一整批 → 更新十几个 epoch → 丢弃"的节奏；SAC 的主循环是"<strong>每一步交互都入回放，warmup 之后每一步都做一次梯度更新</strong>"。两件事只在缓冲区相遇：采样负责补充燃料，更新负责消耗随机批次。判断实现是否正确有一条试纸：如果训练在跑但评估曲线纹丝不动，先检查<strong>环境动作有没有原样存进缓冲区</strong>，存成压缩前的 u，Q 与策略就会在不同的动作坐标系里相互拆台。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：SquashedGaussianPolicy，重参数化 + 雅可比修正</strong></p>
+    <pre class="code"><code>    def forward(self, obs: torch.Tensor):
+        """返回 (动作, 对数概率)；用重参数化采样，两项都可导。"""
+        h = self.body(obs)
+        mu = self.mu(h)
+        # log_std 夹紧后再取 exp：防止策略方差退化或爆炸
+        log_std = self.log_std(h).clamp(LOG_STD_MIN, LOG_STD_MAX)
+        std = log_std.exp()
+        dist = torch.distributions.Normal(mu, std)
+
+        u = dist.rsample()                       # 重参数化：梯度可穿过采样
+        tanh_u = torch.tanh(u)
+        action = self.act_shift + self.act_scale * tanh_u
+
+        # log π(a) = log N(u) - Σ log|da/du|；雅可比含 scale 与 tanh 导数
+        logp = dist.log_prob(u)
+        logp -= torch.log(self.act_scale * (1.0 - tanh_u.pow(2)) + 1e-6)
+        return action, logp.sum(dim=-1)</code></pre>
+    <p>解读：这段是 SAC 策略输出的核心，与 030 章 PPO 连续策略的最大差别是<strong>梯度必须能穿过采样</strong>。<strong>（1）</strong><code>rsample()</code> 是重参数化采样：u = μ + σ·ε 的形式让 ε 成为无参数噪声源，梯度可以沿 μ、σ 反传，这是"策略损失对动作求导"成立的前提（PPO 用 <code>sample()</code> 就够，因为它不需要对动作求导）。<strong>（2）</strong>雅可比修正 <code>−log(scale·(1−tanh²u))</code> 这次必须显式写出：SAC 的策略损失里 <code>log π</code> 带着梯度，漏掉修正相当于优化一个"错误的密度"。<code>+1e-6</code> 防止 u 饱和时 log(0) 发散。<strong>（3）</strong>多维动作的 logp 用 <code>.sum(dim=-1)</code> 合成联合密度；<code>action</code> 与 <code>logp</code> 都返回，供不同调用者各取所需。</p>
+
+    <p><strong>片段 2：TD 目标，双 Q 取小 + 目标熵</strong></p>
+    <pre class="code"><code>    # ---- 1) 计算 TD 目标：双 Q 取小 + 目标策略熵 ----
+    with torch.no_grad():
+        next_action, next_logp = agent.policy(next_obs)
+        q1_next = agent.q1_target(next_obs, next_action)
+        q2_next = agent.q2_target(next_obs, next_action)
+        # 取小者构造目标：抑制过估计；减去 α·logπ：鼓励"好而不过确定"的动作
+        q_next = torch.min(q1_next, q2_next) - agent.alpha * next_logp
+        target = rew + args.gamma * (1.0 - done) * q_next
+
+    # ---- 2) 双 Q 损失：两个网络都向同一个目标回归 ----
+    q1 = agent.q1(obs, act)
+    q2 = agent.q2(obs, act)
+    q_loss = F.mse_loss(q1, target) + F.mse_loss(q2, target)
+    agent.q_opt.zero_grad()
+    q_loss.backward()
+    agent.q_opt.step()</code></pre>
+    <p>解读：软贝尔曼方程在代码里的逐字翻译。<strong>（1）</strong>整个目标计算包在 <code>no_grad</code> 里：目标值是"回归的靶子"，靶子不需要也不应该带梯度（否则会同时改造目标本身，自举发散）。<strong>（2）</strong><code>torch.min(q1_next, q2_next) - agent.alpha * next_logp</code> 一行浓缩两个机制：双 Q 取小（悲观下界，一致地对抗过估计）与熵奖励（−α·log π，把"不确定"当成价值的一部分）。注意 <code>agent.alpha</code> 是 detach 过的标量缓存，不从这里污染温度梯度。<strong>（3）</strong><code>(1.0 - done)</code> 是终止掩码：Pendulum 的回合结束是时间截断，<code>done</code> 只对真实终止置 1，写错这一列，所有截断处的价值都会被砍掉尾巴。<strong>（4）</strong>q1、q2 共享一个优化器、各自向<strong>同一个</strong>目标回归：两个网络的差异来自初始化与梯度噪声，取小才有"保守估计"的意味（后续章节会专门分析）。</p>
+
+    <p><strong>片段 3：策略损失、温度损失与软更新，更新的后三步</strong></p>
+    <pre class="code"><code>    # ---- 3) 策略损失：最大化 Q - alpha * log π（alpha 不参与策略梯度）----
+    pi_action, pi_logp = agent.policy(obs)
+    q_pi = torch.min(agent.q1(obs, pi_action), agent.q2(obs, pi_action))
+    pi_loss = (agent.alpha.detach() * pi_logp - q_pi).mean()
+    agent.pi_opt.zero_grad()
+    pi_loss.backward()
+    agent.pi_opt.step()
+
+    # ---- 4) 自动温度：让平均 log π 靠近目标熵（-动作维度）----
+    # pi_logp 必须 detach：温度只从自己的损失里学，不能顺策略梯度搭便车
+    alpha_loss = -(agent.log_alpha * (pi_logp + agent.target_entropy).detach()).mean()
+    agent.alpha_opt.zero_grad()
+    alpha_loss.backward()
+    agent.alpha_opt.step()
+
+    # ---- 5) 目标网络软更新 ----
+    soft_update(agent.q1_target, agent.q1, args.tau)
+    soft_update(agent.q2_target, agent.q2, args.tau)</code></pre>
+    <p>解读：SAC 更新的后三步，每一处的 detach 都有明确职责。<strong>（1）</strong>策略损失 <code>α·logπ − Q</code>：梯度只流进策略参数，对 <code>q_pi</code> 求导会推着 Q 网络"抬高被选中的动作"，但 Q 的改造是第二步的事，所以策略损失里的 Q 虽然在图里，实际只提供动作方向的梯度（Q 参数被 pi_opt 排除在外，天然不更新）。<code>alpha.detach()</code> 则防止温度随策略一起漂移。<strong>（2）</strong>温度损失用<strong>同一个</strong> <code>pi_logp</code>，但全体 <code>.detach()</code>：log α 是唯一可学参数，梯度只告诉它"策略比目标熵更确定还是更随机"。这就是自动温度的全部机制，第 032 章会看到它引发的震荡与对策。<strong>（3）</strong><code>soft_update</code> 用 <code>tp.data.copy_(τ·sp + (1−τ)·tp)</code> 在 <code>no_grad</code> 下逐参数混合：目标网络永远不会被优化器碰，只被这个公式缓慢拖动。<strong>（4）</strong>注意第 3、4 步用的 <code>pi_logp</code> 是<strong>同一次前向</strong>的结果：温度看到的就是策略损失刚用过的那个样本，口径一致。</p>
+
+    <p><strong>片段 4：主循环，采样与更新解耦</strong></p>
+    <pre class="code"><code>    for step in range(1, args.max_steps + 1):
+        # ---- 采样：warmup 用随机动作，之后用当前策略 ----
+        if step &lt;= args.warmup or buffer.size &lt; args.batch_size:
+            action = env.action_space.sample()
+        else:
+            with torch.no_grad():
+                action = agent.policy.act(to_tensor(obs, device))
+
+        next_obs, r, terminated, truncated, _ = env.step(action)
+        # 入回放的是"环境动作"（不是 tanh 前的 u）：Q 学的就是环境动作空间
+        buffer.add(obs, np.asarray(action, dtype=np.float32), r, next_obs,
+                   float(terminated))          # 只标记真实终止
+        ep_ret += r
+        obs = next_obs
+        if terminated or truncated:
+            ep_returns.append(ep_ret)
+            ep_ret = 0.0
+            obs, _ = env.reset()
+
+        # ---- 更新：off-policy，每次环境步都能学习（不等任何一批到齐）----
+        if buffer.size &gt;= max(args.warmup, args.batch_size):
+            for _ in range(args.update_every):
+                batch = buffer.sample(args.batch_size, rng)
+                last_stats = update_agent(agent, batch, args, device)
+                agent.refresh_alpha()</code></pre>
+    <p>解读：这段主循环就是"切换范式的现场"。<strong>（1）</strong>对比 PPO 的"采样 2048 步 → 更新 10 epochs"：这里<strong>每一个环境步都触发一次随机批量更新</strong>，数据刚入缓冲区就可能被抽中，warmup 前的旧数据也不会过期。样本利用率天差地别的主因就在这 6 行。<strong>（2）</strong>warmup 分支用 <code>env.action_space.sample()</code> 纯随机动作：让缓冲区先装满"均匀覆盖动作区间"的经验，避免 Q 网络早期只见过策略输出附近的动作。<code>buffer.size &lt; batch_size</code> 的兜底保证采样批量永远足够。<strong>（3）</strong><code>buffer.add(obs, action, ...)</code> 存入的是环境动作的 numpy 副本，<code>obs = next_obs</code> 就地推进；<code>float(terminated)</code> 与截断语义再次出现，这是 SAC 里最容易写错、后果最隐蔽的一处。<strong>（4）</strong><code>refresh_alpha()</code> 每次更新后把 <code>log_alpha.exp().detach()</code> 同步到缓存，供下一轮 TD 目标使用。</p>
+
+    <p>完整可运行脚本（附录）：<a href="../code/ch031.py" download>code/ch031.py</a></p>
+    <pre class="sh"><code>python code/ch031.py            # 2.5 万步：CPU 约 3–6 分钟
+python code/ch031.py --quick    # 快速跑通：30–60 秒
+python code/ch031.py --init-alpha 0.05   # 从更低初始温度出发</code></pre>
+    <p>以实跑为准：<strong>评估回报通常在 2 万～2.5 万步进入 −300 ~ −150 区间</strong>（随机策略约 −1200，优秀策略 −200 ~ −150），曲线"先陡后缓"；α 从 0.2 缓慢下降稳定在 0.05～0.15。对照第 030 章：<strong>PPO 用 6 万步停在 −260 ~ −200 且仍在缓慢爬坡，SAC 用不到一半的交互量走到更好的水平</strong>，这就是 off-policy + 经验回放的账面收益。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>缓冲区里存"压缩前的 u"</strong>：Q 网络必须学习环境动作空间上的价值；存 u 会让 Q(s,u) 与策略输出 a 不在同一坐标系，策略梯度方向全错。<strong>修复</strong>：回放存 a，训练用 a。</li>
+      <li><strong>把 truncated 当 terminated 写进 done</strong>：Pendulum 的回合结束几乎都是时间截断，<code>done</code> 置 1 会让 TD 目标丢掉"截断后的未来"，价值被系统性低估。<strong>修复</strong>：只对真实终止置位。</li>
+      <li><strong>忘记软更新目标网络</strong>：target 网络永远是初始权重时，学习目标静止，训练看起来"在跑"但 Q 学不动。<strong>修复</strong>：检查 <code>update_agent</code> 最后两步的 <code>soft_update</code>。</li>
+      <li><strong>温度损失没 detach log π</strong>：温度参数会顺着策略梯度一起被推走，α 与策略互相带偏。<strong>修复</strong>：温度损失里的 <code>pi_logp</code> 必须 <code>.detach()</code>。</li>
+      <li><strong>采样误用 sample() 代替 rsample()</strong>：普通采样切断计算图，策略损失对 μ、σ 的梯度传不过去，策略永远学不动。<strong>修复</strong>：确认重参数化路径。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把自动温度关掉：把 <code>update_agent</code> 里温度损失那步跳过、<code>alpha</code> 固定为 0.2 或 0.02，各跑一次，比较评估曲线，固定温度下哪种值更接近自动调节的结果？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>最省事的做法：加一个 <code>--fixed-alpha</code> 参数，在 <code>Agent</code> 里把 <code>log_alpha</code> 的 <code>requires_grad</code> 设为 False 并跳过 optimizer.step。问自己：奖励尺度如果放大 10 倍，固定值还合适吗？</div></details>
+      </li>
+      <li>把 <code>--warmup</code> 改成 100 与 5000 各跑一次，观察早期评估曲线的差异，解释 warmup 在离策略算法里的作用。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>warmup 太短：Q 网络用少量高度相关的数据起步，早期评估可能更差或更飘；warmup 太长：白白浪费随机数据，曲线抬升更晚。</div></details>
+      </li>
+      <li>把 <code>--tau</code> 从 0.005 改成 0.05 与 0.0005 各跑一次，观察 Q 损失与评估曲线的稳定性，解释软更新系数与自举方差的关系。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>τ 太大目标追得太快，容易自激震荡；太小则学习信号滞后。对比两次运行的 Q 均值曲线与评估波动幅度。τ 的经典区间是 0.001～0.01。</div></details>
+      </li>
+      <li>把 <code>--update-every</code> 改成 2（每个环境步做两次梯度更新），比较相同环境步数下的评估曲线，说明"梯度步预算"如何影响离策略算法的样本效率。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>更新更频繁通常收敛更快，但有过拟合当前缓冲区的风险（尤其缓冲区还小时）。注意墙钟时间也几乎翻倍，这是计算换样本的典型交易。</div></details>
+      </li>
+      <li>实现"单 Q"版本（只用 q1、目标也用 q1 目标网络），与双 Q 版本各跑一次，记录训练末段 <code>Q 均值</code>与真实评估回报的差距，用它的变化说明过估计的存在与双 Q 的作用。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>把 <code>min(q1_next, q2_next)</code> 换成 <code>q1_next</code>，策略损失同理。单 Q 的 Q 均值通常系统性高于真实回报（过估计），双 Q 会把差距拉近，但别指望完全相等。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>SAC 用经验回放把"每份数据只用一遍"变成"反复使用"，这是对 PPO 样本效率短板的结构性回答。</li>
+      <li>最大熵目标产生的软贝尔曼方程多出 −α·log π 项：探索被写进价值学习内部，外部动作噪声不再是必需品。</li>
+      <li>稳定化三件套：双 Q 取小抑制过估计、目标网络隔离自举噪声、自动温度让 α 跟随奖励尺度。</li>
+      <li>Pendulum 上 2.5 万步即可到 −300 ~ −150，明显优于第 030 章同预算甚至更大预算的 PPO。</li>
+      <li>下一章专攻温度：目标熵怎么选、α 为什么会震荡、不同初始化与学习率对它的影响，把自动调节从"能用"变成"懂用"。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch030.html">← 第 030 章：PPO的连续控制基准测试</a>
+    <a class="next" href="ch032.html">第 032 章：SAC的自动温度系数调整 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第030章 多传感器数据时间对齐 | 多机器人协同学习课程 · ROS2 通信与系统集成</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 数据分发与协同感知</span>
+    <span class="sep">/</span>
+    <span>第 030 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 数据分发与协同感知</div>
+    <h1>第 030 章：多传感器数据时间对齐</h1>
+    <p class="lead">融合、标定、协同感知都有一个共同前提，"同一时刻"。本章讲清时间误差的来源与谱系，给出时间戳、同步器、插值三层对齐工具箱。</p>
+    <ul class="meta">
+      <li>主题：数据协同 / 时间对齐</li>
+      <li>关键机制：message_filters 近似同步、时间戳原则、位姿插值（线性 + SLERP）、对齐窗口调参</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 029 章（多机器人定位融合）</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>能拆解时间误差的四个来源：时钟偏移、钟漂、传输抖动、语义错误（打戳时刻不对），并知道各自的对策。</li>
+      <li>掌握"用测量时刻打戳"的原则，以及为什么用接收时刻打戳会系统性破坏对齐。</li>
+      <li>会用 <code>message_filters</code> 的近似时间同步器把两路（或多路）数据配成对，并理解队列与 slop 的取舍。</li>
+      <li>掌握位姿在时间轴上的插值方法：平移线性插值、姿态球面插值（SLERP），以及插值的适用边界。</li>
+      <li>能为跨机器人数据流设计对齐方案，并给出对齐延迟的时间预算。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>前面的章节里，"时间"一直以暗线的形式出现：TF 查询要按时刻插值（024）、标定要静止采样（025）、EKF 要拒绝旧观测（029）。现在是时候把这条暗线拎到台面上了，<strong>数据融合在数学上是"同一时刻多个观测"的贝叶斯更新，输入数据差 50 ms，融合结果就不再是"略有噪声"，而会系统性出错</strong>。两台机器人各以 1.5 m/s 相向而行，50 ms 的时间差对应 15 cm 的相对位移，比很多传感器的精度还差。</p>
+    <p>更麻烦的是，多传感器、多机器人的时间误差来源各不相同：相机驱动与激光驱动打戳习惯不同，网络传输让到达时刻与观测时刻脱节，分布式时钟自带偏移与漂移。本章给出一套从"打戳"到"配时"到"插值"的三层工具箱，让你拿到任何两路数据都能回答："怎么把它们放到同一时间轴上，代价是多少延迟？"</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 时间误差四来源：分别诊断，分别下药</h3>
+    <table>
+      <tr><th>来源</th><th>量级（典型）</th><th>表现</th><th>对策</th></tr>
+      <tr><td>时钟偏移（offset）</td><td>1–100 ms</td><td>两台机器人的时间戳系统性相差一个常数</td><td>时间同步（第 009 章）：NTP/PTP/协议级同步</td></tr>
+      <tr><td>钟漂（drift）</td><td>10–100 ppm</td><td>偏移随时间缓慢增大；一小时可达百毫秒</td><td>持续校时；在线估计偏移速率</td></tr>
+      <tr><td>传输抖动（jitter）</td><td>1–50 ms</td><td>到达间隔忽长忽短，端到端延迟不稳定</td><td>不做实时假设；时间戳取测量时刻，不用到达时刻</td></tr>
+      <tr><td>语义错误</td><td>可达任意大</td><td>打戳时刻不是观测时刻（收到才打、批量缓存后打）</td><td>改驱动/节点打戳逻辑：源头打"测量时刻"</td></tr>
+    </table>
+    <p>注意最后一行：<strong>前三者是物理限制，第四者是工程错误</strong>。一个用"接收时刻"打戳的驱动，即使两台机器时钟完美同步，也会给每条数据附加随机传输延迟。诊断顺序：先排除语义错误，再处理同步，最后才谈插值，很多"同步效果不好"的抱怨，根子在打戳就错了。</p>
+    <p>钟漂的账可以手算：1 ppm 等于每秒偏差 1 微秒；100 ppm 的晶振运行 1 小时后累积偏差 360 ms，足以让几十毫秒量级的对齐容差彻底失效。这解释了为什么"开机校一次时"不够：偏移会随时间线性增长，系统需要持续校时，或在线估计偏移速率并补偿。</p>
+
+    <h3>2. 对齐策略谱系：从硬件到外推</h3>
+    <p>把可用手段按"精度与成本的比值"排个序：</p>
+    <ol>
+      <li><strong>硬件触发/PTP 级同步</strong>（微秒级）：相机与激光同一脉冲触发，PTP 硬件时间戳。精度最高，需要硬件支持，是高端平台的做法。</li>
+      <li><strong>时间戳配对 + 近似同步器</strong>（毫秒级）：两路数据各带测量时刻，等待窗口内凑成一对。软件通用方案，本章重点。</li>
+      <li><strong>插值到任意时刻</strong>（毫秒级精度，依赖模型）：用时间上相邻的两帧位姿插出目标时刻的值（TF 的缓冲区就是这么做的）。</li>
+      <li><strong>最近邻取用</strong>（误差 = 采样间隔的一半）：10 Hz 数据取最近帧，最大偏差 50 ms，只适合慢变量（地图、静态参数）。</li>
+      <li><strong>外推</strong>（危险）：用速度模型推测未来/缺失时刻的值。只在极短间隔（&lt; 1 个采样周期）且模型可信时使用；融合/控制链路应禁止。</li>
+    </ol>
+    <p><strong>对齐的本质是用"等待"换取"配对"</strong>：近似同步器要在窗口内等两路数据都到齐才发布配对。等待窗口（slop）越大，配对成功率越高，但引入的附加延迟也越大，这个交换是本章最重要的调参决策。</p>
+
+    <h3>3. message_filters：近似时间同步器怎么工作</h3>
+    <p>ROS2 的 <code>message_filters</code> 提供两种同步器：<strong>ExactTime</strong> 要求时间戳严格相等（只有共享时钟的同一批触发数据才可能）；<strong>ApproximateTime</strong> 允许时间戳在容差内接近，用"最大化配对数量、最小化时间差"的策略在各自队列里找匹配。关键参数：</p>
+    <ul>
+      <li><code>queue_size</code>：每条输入各自缓存多少条。太小 → 网络一抖动就丢配对；太大 → 内存与延迟上升。经验起点：输入频率 × 1 秒。</li>
+      <li><code>slop</code>：允许的最大时间差。设为 0 等于退化成 Exact；设得比采样周期还大没有意义（不如直接降频）。经验起点：采样周期的 1–2 倍。</li>
+      <li><code>allow_headerless</code>：允许无 header 的消息（用到达时间凑）。<strong>不建议在融合链路里开启</strong>，它把"语义错误"合法化。</li>
+    </ul>
+    <p>同步器发布的是<strong>配对消息</strong>（各输入的最新匹配帧），时间轴取哪一路为准？常见做法是取较慢/较关键传感器的时间，或对每对消息取时间差最小的组合。无论怎么选，<strong>下游必须知道"这对数据的时间差是多少"</strong>，把 Δt 作为融合权重或一致性检查的输入，绝不假装它们同时。</p>
+
+    <h3>4. 插值原理：平移与旋转要用不同的公式</h3>
+    <p>要在两个时刻之间查询位姿，平移和旋转的插值方式必须分开处理：</p>
+    <div class="formula">
+      p(u) = (1 − u)·p<sub>0</sub> + u·p<sub>1</sub>，u = (t − t<sub>0</sub>) / (t<sub>1</sub> − t<sub>0</sub>)
+      <br>q(u) = q<sub>0</sub> · ( q<sub>0</sub><sup>−1</sup> q<sub>1</sub> )<sup>u</sup>（球面插值 SLERP 的指数形式，<b>非</b>逐分量线性）
+      <span class="note">旋转是流形上的量：两帧四元数直接线性混合会得到"经过内部"的短路径假象；SLERP 沿测地线走</span>
+    </div>
+    <p>为什么旋转不能用简单线性？因为四元数（或旋转矩阵）不是在向量空间里自由取值，把两个旋转"平均"出非单位四元数，归一化后虽然能用，但角速度不再是常数，快速旋转时会带来超过线性误差的抖动。SLERP 沿球面测地线插值，保证角速度恒定，是位姿插值的正确选择。工程上还有一个实用细节：<strong>插值只能用于"两个已知时刻之间"</strong>（t 落在 [t₀, t₁] 内）；超出范围就是外推，应报错处理。</p>
+
+    <h3>5. 跨机器人对齐：网络在两边附加了不同的延迟</h3>
+    <p>同一台机器人内部的两路传感器，传输路径短且对称；跨机器人时，A 到 B、B 到 A 的网络延迟可能相差数毫秒到数十毫秒（不对称路由、无线重传）。这意味着：<strong>即使时钟同步得很好，"配对等待"也要为最慢的那条路径留余量</strong>。跨机对齐的工程措施：</p>
+    <ul>
+      <li>先做时间同步（第 009 章），再谈配对；未同步的两机数据配对毫无意义。</li>
+      <li>把 slop 设为"本地采样周期 + 单程网络延迟上界"的量级（如 20–50 ms），并监控配对拒绝率。</li>
+      <li>对时间敏感的融合（如编队），宁可用"本机最新 + 邻居稍旧"并显式做时间外推检查，也不要把两路"等待配对"引入不确定延迟（第 041 章会看到延迟如何影响编队稳定）。</li>
+    </ul>
+
+    <h3>6. 数值算例：时间差如何变成空间错位</h3>
+    <p>把本章开头的 15 cm 算完整。机器人以 1.2 m/s 平移、60°/s 旋转，两路观测的时间差 Δt 分别取 10、20、40、80、100 ms，错位量化如下：</p>
+    <table>
+      <tr><th>Δt</th><th>位置错位（v·Δt）</th><th>朝向错位（ω·Δt）</th><th>4 m 外目标横向误差</th></tr>
+      <tr><td>10 ms</td><td>1.2 cm</td><td>0.60°</td><td>4.2 cm</td></tr>
+      <tr><td>20 ms</td><td>2.4 cm</td><td>1.20°</td><td>8.4 cm</td></tr>
+      <tr><td>40 ms</td><td>4.8 cm</td><td>2.40°</td><td>16.8 cm</td></tr>
+      <tr><td>80 ms</td><td>9.6 cm</td><td>4.80°</td><td>33.5 cm</td></tr>
+      <tr><td>100 ms</td><td>12.0 cm</td><td>6.00°</td><td>41.8 cm</td></tr>
+    </table>
+    <p>读表的要点：<strong>错位与 Δt 严格成正比，而横向误差的放大系数是观测距离</strong>（4 m 处约为朝向弧度值乘 4）。20 ms 以内（配合同步与配对）、4 m 距离上的横向误差约 8 cm，与激光定位精度同量级；超过 80 ms 后误差进入几十厘米，行人尺度的目标会被融合端误判为两个。这条曲线也解释了 slop 的上限由"物理运动可接受度"决定；"配对率越高越好"是个陷阱。</p>
+
+    <h3>7. 延迟预算与插值精度的边界</h3>
+    <p>对齐不是免费的，它的成本是延迟。一次跨机配对的端到端预算可以拆成三段：网络单程延迟约 5 ms（有线）到 20 ms（无线）、等待窗口最多一个 slop（取 50 ms）、处理约 5 ms，合计约 60 ms。对照第 015 章的实时预算：50 Hz 控制环的周期是 20 ms，<strong>对齐延迟是控制周期预算的 3 倍，因此"等待配对"绝不能放进控制环</strong>。控制环应当使用本机最新状态加显式预测，把跨机配对数据用在感知与决策这类允许几十毫秒延迟的环节，这是第 031 与 041 章共同的分工依据。</p>
+    <p>插值本身的精度也有边界。用数值实验测一遍"线性四元数插值（nlerp）相对 SLERP 的最大角度偏差"：插值区间 3° 时约为 0.00004°、10° 时 0.0012°、30° 时 0.033°、60° 时 0.27°。<strong>角度偏差一直很小，真正的问题在角速度均匀性</strong>：nlerp 的角速度在区间中部快、两端慢，对"用位姿差分求角速度"的模块会引入抖动；SLERP 保证角速度恒定。因此工程判断是：低频、小角度的可视化链路用 nlerp 足够；凡是位姿差分会进入控制或融合的链路，一律 SLERP，代价是一次三角函数与几次乘法，可以忽略。</p>
+    <p>还有两个必须承认的边界：<strong>其一，插值不能造出新信息</strong>，两个 10 Hz 采样点之间的运动细节（比如一次轻微碰撞）插不出来，插值结果永远平滑，这是模型假设（区间内匀速）的产物；<strong>其二，外推窗口再短也是假设</strong>，tf2 的默认策略是拒绝外推（第 024 章），调用方若确需外推（可视化补帧），应显式限时限速并打标记，不能让它悄悄进入融合链路。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>时间对齐方案按五步设计：</p>
+    <ol>
+      <li><strong>审计打戳</strong>：逐节点检查时间戳来源。标准：传感器驱动在拿到数据的第一现场打"测量时刻"；转发节点不重新打戳（压缩、转发都保留原 header）。</li>
+      <li><strong>建立时间基准</strong>：全系统统一时钟源（第 009 章）；回放场景统一用 sim time，并让所有节点开 <code>use_sim_time</code>。</li>
+      <li><strong>选对齐策略</strong>：对照谱系表，为每条数据流选"配对/插值/最近邻"；融合链路优先插值或配对，可视化链路可用最近邻。</li>
+      <li><strong>定参数并量化</strong>：queue_size、slop 按上节经验值起步；用"配对成功率、配对平均 Δt、对齐引入延迟"三个指标观察。</li>
+      <li><strong>把时间差带进下游</strong>：融合模块接收 Δt 或两路时间戳，自行决定加权/拒绝，对齐模块不替它做主。</li>
+    </ol>
+    <table>
+      <tr><th>参数</th><th>起点值</th><th>依据</th></tr>
+      <tr><td>queue_size</td><td>输入频率（Hz）数值</td><td>缓存约 1 秒数据，抗抖动</td></tr>
+      <tr><td>slop（机内）</td><td>采样周期 × 1–2</td><td>10 Hz 数据取 0.1–0.2 s</td></tr>
+      <tr><td>slop（跨机）</td><td>本地周期 + 网络延迟上界</td><td>WiFi 典型 20–50 ms，重传时更大</td></tr>
+      <tr><td>插值适用范围</td><td>[t₀, t₁] 内</td><td>之外为外推：拒绝并计数</td></tr>
+      <tr><td>配对健康度</td><td>成功率 &gt; 95%，平均 Δt &lt; 半个周期</td><td>低于此为参数或同步问题</td></tr>
+    </table>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：两路传感器近似同步配对</strong></p>
+    <pre class="code"><code>import message_filters
+from sensor_msgs.msg import LaserScan, Image
+
+class FusionPair(Node):
+    """把 10 Hz 激光与 15 Hz 图像按时间戳配对，只处理"近同时"的样本。"""
+    def __init__(self):
+        super().__init__("fusion_pair")
+        # queue_size 各给 20：约 1–2 秒缓存，足以吸收调度抖动
+        sub_scan = message_filters.Subscriber(self, LaserScan, "scan")
+        sub_img = message_filters.Subscriber(self, Image, "image")
+        self.sync = message_filters.ApproximateTimeSynchronizer(
+            [sub_scan, sub_img],
+            queue_size=20,
+            slop=0.08,        # 80 ms ≈ 采样周期的 1–2 倍：配对率与延迟的折中
+        )
+        self.sync.registerCallback(self.on_pair)
+        self.paired = 0
+        self.rejected = 0
+
+    def on_pair(self, scan, img):
+        # 纳秒级差值：秒字段与纳秒字段分开相减会丢进位，必须先合成总纳秒
+        dt_ns = ((scan.header.stamp.sec - img.header.stamp.sec) * 10**9
+                 + (scan.header.stamp.nanosec - img.header.stamp.nanosec))
+        dt = abs(dt_ns) * 1e-9
+        # 同步器不保证"完全同时"：把真实时间差显式算出来传给下游
+        self.paired += 1
+        if self.paired % 100 == 0:
+            self.get_logger().info(
+                f"配对 {self.paired} 对，最近一对 Δt={dt*1e3:.1f} ms")</code></pre>
+    <p>解读：这段代码的三个设计点都围绕"诚实"。<strong>（1）</strong><code>slop=0.08</code> 不是拍脑袋：激光 10 Hz（周期 100 ms）、图像 15 Hz（周期 67 ms），窗口取 80 ms 能让多数帧找到候选，同时保证配对的两帧物理上确实"差不太多"。<strong>（2）</strong>回调里重新计算 Δt（假设它为零是大忌）：同步器只保证"窗口内"，不保证"完全同时"；<strong>下游融合必须知道真实时间差</strong>，才能按时间差加权或拒绝。真实的差要用消息时间戳精确算（纳秒分量不能丢），不要用秒级整数相减。<strong>（3）</strong>配对率的统计（本片段打印，生产版本应发成健康指标）是调参的循环信号：成功率明显低于 95% 时依次检查，打戳来源、时钟同步、slop 是否过小、是否有路数据实际停发。</p>
+
+    <p><strong>片段 2：位姿时间插值（平移线性 + 旋转 SLERP）</strong></p>
+    <pre class="code"><code>import numpy as np
+
+def slerp(q0, q1, u):
+    """四元数球面插值：(x,y,z,w) 格式，u∈[0,1]。
+    先处理双覆盖（q 与 −q 表示同一旋转），再沿测地线插值。"""
+    q0 = q0 / np.linalg.norm(q0)
+    q1 = q1 / np.linalg.norm(q1)
+    dot = float(np.dot(q0, q1))
+    if dot &lt; 0.0:                  # 取短路径：否则会绕"远路"转 360°
+        q1, dot = -q1, -dot
+    if dot &gt; 0.9995:               # 夹角极小：线性插值 + 归一化足够稳
+        return (1.0 - u) * q0 + u * q1
+    theta = np.arccos(np.clip(dot, -1.0, 1.0))
+    s = np.sin(theta)
+    return (np.sin((1.0 - u) * theta) / s) * q0 + (np.sin(u * theta) / s) * q1
+
+def pose_at(t, t0, pose0, t1, pose1):
+    """在 [t0,t1] 内插值位姿；超出区间抛错，外推必须由调用者显式决定。"""
+    if not (t0 &lt;= t &lt;= t1):
+        raise ValueError("请求时刻在插值区间之外（外推被拒绝）")
+    u = 0.0 if t1 == t0 else (t - t0) / (t1 - t0)
+    p = (1.0 - u) * np.asarray(pose0[:3]) + u * np.asarray(pose1[:3])
+    q = slerp(np.asarray(pose0[3:]), np.asarray(pose1[3:]), u)
+    return np.concatenate([p, q / np.linalg.norm(q)])   # 输出保持单位四元数</code></pre>
+    <p>解读：插值代码里的每一行都在处理"旋转不是普通向量"这一事实。<strong>（1）</strong><code>dot &lt; 0</code> 的短路径处理：四元数 q 与 −q 表示同一旋转，若不做这个翻转，SLERP 会沿球面走远路，得到"绕一圈"的错误姿态，这是位姿插值最常见的 bug。<strong>（2）</strong><code>dot &gt; 0.9995</code> 的退化分支不是可有可无的优化：夹角趋近 0 时 sin(θ) → 0，公式出现 0/0 数值不稳定，用线性插值加归一化（nlerp）在该区域精度完全够用。<strong>（3）</strong>区间检查抛异常，拒绝悄悄 clamp：<strong>"外推"在融合链路里必须是显式的错误</strong>，调用者要么扩大缓冲区等待新数据，要么降低该观测的权重，绝不接受库替你做决定。生产环境中这段逻辑通常由 tf2 的 Buffer 承担（第 024 章），手写版的价值在于理解 tf2 报 <code>ExtrapolationException</code> 时到底发生了什么。</p>
+
+    <p><strong>片段 3：跨机器人检测缓存与最近邻配对</strong></p>
+    <pre class="code"><code>from collections import deque
+
+class CrossRobotMatcher:
+    """把邻居机器人的检测与本机检测按时间戳对齐（容差内最近邻）。
+    缓存带过期：对齐窗口之外的数据一律丢弃，防止"陈年证据"入融合。"""
+    def __init__(self, tolerance=0.05, ttl=0.5):
+        self.tolerance = tolerance     # 容差：跨机场景取 50 ms 量级
+        self.ttl = ttl                 # 缓存存活时间：0.5 s 后作废
+        self.remote = deque()          # 远端 (stamp, payload) 队列，按时间有序
+
+    def push_remote(self, stamp, payload):
+        self.remote.append((stamp, payload))
+        self.drop_expired(stamp)       # 顺手清理过期，避免缓存无限增长
+
+    def drop_expired(self, now):
+        while self.remote and now - self.remote[0][0] &gt; self.ttl:
+            self.remote.popleft()      # 队首过期：时间有序保证只清队首
+
+    def match(self, local_stamp, local_payload):
+        """找容差内最近的远端样本；返回 (payload, dt) 或 (None, None)。"""
+        best, best_dt = None, self.tolerance
+        for stamp, payload in self.remote:
+            dt = abs(stamp - local_stamp)
+            if dt &lt;= best_dt:          # 严格容差内取最近，超容差视为无配对
+                best, best_dt = payload, dt
+        if best is None:
+            return None, None
+        return best, best_dt           # dt 留给融合端：立即配对 vs 稍旧配对</code></pre>
+    <p>解读：跨机对齐是"带过期策略的最近邻配对"。<strong>（1）</strong>容差 50 ms 的选择逻辑：跨机数据先经时间同步（否则连这个数都无从谈起），50 ms 覆盖 WiFi 抖动与调度延迟的常见量级；对编队这类快速控制，被拒绝的配对要么降权使用要么等待下一帧，都比"凑合配对"安全。<strong>（2）</strong>TTL 清理是关键防御：没有 TTL 的缓存会把几秒前的检测拿来与当前帧配对，产生"幽灵目标"（物体早走了）；TTL 让"宁缺毋滥"成为默认行为。<strong>（3）</strong>返回值带上 dt：融合端需要知道这对数据差多少毫秒，<strong>把时间差一直传递到用它做决策的地方</strong>，是本章反复强调的纪律，也是第 032 章融合权重的输入。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>用接收时刻打戳</strong>：节点收到消息时打 now()，等于把网络抖动写进数据。症状：机内传感器"怎么对都对不齐"。修复：在驱动/源头打测量时刻，转发保留原戳。</li>
+      <li><strong>slop 设为 0</strong>：以为"精确同步"更严谨，实际两路独立时钟下永远配不上，系统静默无输出。修复：按采样周期给 slop，配合配对率监控。</li>
+      <li><strong>回放时忘开 use_sim_time</strong>：bag 里的消息时间是仿真时间，节点用系统时间，TF 查询全部超窗。修复：回放时所有节点统一 <code>use_sim_time</code>，用 <code>--clock</code> 播放。</li>
+      <li><strong>跨机器人没同步就对时间戳</strong>：两机时钟差 80 ms，slop 0.05 永远配不上；或配上了但内容错位。修复：先第 009 章再本章。</li>
+      <li><strong>队列太小遇突发卡顿全丢配对</strong>：CPU 一次调度抖动 300 ms，queue_size=5 的两路数据错位丢弃。修复：队列覆盖 1–2 秒；配合监控区分"参数不足"与"数据源停发"。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>两路 10 Hz 传感器在 slop=0.05 s 与 0.15 s 下，预测配对成功率与平均附加延迟的变化趋势。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>10 Hz 周期 100 ms。无抖动、无丢帧的理想情形下，两路等周期流之间的最大相位差是半个周期（50 ms），因此 slop 取 0.05 s 就足以让多数帧找到伙伴；成功率对窗口的敏感性主要来自抖动与丢帧，窗口收紧后率先失配。代价端：窗口越大，最坏附加延迟越大，0.15 s 窗口的最坏延迟升到 150 ms 量级。这就是"等待换配对"的定量形态。</div></details>
+      </li>
+      <li>改成 slop=0.5 s（大于采样周期），预测会发生什么，为什么"更宽松"反而错配？<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>同步器会跨过好几个周期去凑对：拿 t 的扫描配 t±0.4 s 的图像，动作快的机器人上几何错位可达几十厘米。slop 上限应该由"物理运动在这段时间内的位移可接受度"决定。</div></details>
+      </li>
+      <li>推导：机器人以 1.2 m/s、60°/s 运动，跨机配对时间差 40 ms，位置与朝向的错位各是多少？对 4 m 外目标的位置误差多大？<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>位置 ≈ 4.8 cm，朝向 ≈ 2.4°；目标误差 ≈ 4×sin(2.4°) ≈ 17 cm，超过很多场景的目标尺度。</div></details>
+      </li>
+      <li>设计题：为"本机激光 + 邻居机器人检测"设计对齐方案：打戳规范、同步前提、配对容差、Δt 如何进入融合权重、失败降级策略，并估算端到端对齐延迟预算。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>对齐延迟 ≈ 网络单程延迟 + 等待窗口 + 处理时间；失败降级可以是"用稍旧配对但降权"或"仅用本机数据维持跟踪"（对应第 031 章）。</div></details>
+      </li>
+      <li>思考：为什么说"语义错误（打戳时刻不对）比时钟偏移更致命"？举一个"时钟全同步但数据仍错位"的场景。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>时钟偏移可统一同步消除；打戳错误把随机延迟写进时间轴，无法靠同步修正。例：驱动把 3 帧数据攒在缓冲里一次性打戳发出，时钟再准，三条数据"同一时刻"。 </div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>时间误差四来源：偏移、钟漂、传输抖动、打戳语义错误；先修语义，再做同步，最后才谈插值。</li>
+      <li>对齐策略谱系：硬件触发 &gt; 时间戳配对 &gt; 插值 &gt; 最近邻 &gt; 外推（融合链路禁外推）。</li>
+      <li>近似同步器用"等待"换"配对"：queue_size 覆盖 1 秒，slop 取采样周期的 1–2 倍，并把真实 Δt 传给下游。</li>
+      <li>插值要分开处理：平移线性、旋转 SLERP（含短路径与退化分支）；超出区间必须报错处理。</li>
+      <li>下一章把时间与空间两块基石合起来用：<strong>多机器人协同感知</strong>，共享"谁看到了什么"，让车队拥有超越单机视角的认知。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch029.html">← 第 029 章：多机器人定位融合</a>
+    <a class="next" href="ch031.html">第 031 章：多机器人协同感知 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

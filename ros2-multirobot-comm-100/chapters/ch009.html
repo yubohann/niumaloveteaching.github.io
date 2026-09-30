@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第009章 多机器人时间同步 | 多机器人协同学习课程 · ROS2 通信与系统集成</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · 通信基础与系统搭建</span>
+    <span class="sep">/</span>
+    <span>第 009 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · 通信基础与系统搭建</div>
+    <h1>第 009 章：多机器人时间同步</h1>
+    <p class="lead">两台机器人的时钟不统一，融合、TF、日志排序全部失真。本章把 NTP 与 PTP 的原理、误差量级和 ROS2 时间体系一次讲清。</p>
+    <ul class="meta">
+      <li>主题：通信基础 / 时间基础设施</li>
+      <li>关键机制：时钟漂移、NTP 偏移估计、PTP 硬件时间戳、ROS 时钟与时间戳</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 002 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解时钟漂移的物理来源与数量级（ppm 与秒/天的换算），能判断你的应用能容忍多大偏差。</li>
+      <li>掌握 NTP 的四时间戳偏移估计原理与局域网/公网精度差异，会用 chrony 搭车队的时间服务器。</li>
+      <li>理解 PTP（IEEE 1588）为什么能做到微秒级：硬件时间戳与主从同步机制。</li>
+      <li>掌握 ROS2 时间体系：ROS 时钟、<code>use_sim_time</code> 与 <code>/clock</code>、消息时间戳与接收时刻的正确用法。</li>
+      <li>会做时间同步验收：跨机偏差测量、跳变检测、以及在 TF 与数据融合链路上验证"时间真的统一"。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>多机器人系统的第一基础设施是网络，第二个就是时间。道理很直接：<strong>两个传感器、两台机器人的数据要被"合并"使用，前提是它们的时间戳在同一个时间轴上</strong>。1 号机器人的激光帧打了它自己的钟，2 号的地图节点拿自己的钟去比较，如果两台时钟差 300 ms，而机器人以 1 m/s 移动，相当于用"30 cm 错位的位姿"去融合，地图会重影、TF 会拉伸、轨迹会跳变。</p>
+    <p>这类故障的阴险之处在于：它<strong>不报任何错</strong>，只是精度悄悄劣化。等到有人发现"地图总有鬼影"时，排查往往从算法一路翻到硬件，最后才怀疑到时间。本章按"物理事实（漂移）→ 协议（NTP/PTP）→ ROS 时间系统 → 工程落地"的顺序把这条链路讲透，它是第 024 章 TF、第 025 章标定、第 030 章多传感器时间对齐的前置条件。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 时钟为什么不准：漂移的物理与数量级</h3>
+    <p>每台计算机的时钟来自石英晶振（或更稳定的 TCXO/OCXO）。晶振频率存在制造误差与环境漂移（温度、老化、电压），约定用 <strong>ppm（百万分之一）</strong> 描述：1 ppm 的时钟每天快慢约 <strong>0.0864 秒</strong>。常见量级：</p>
+    <div class="formula">
+      时钟漂移 ≈ 频率误差 × 时间：100 ppm → 0.1 ms/s → 8.6 s/天
+      <span class="note">两块 20 ppm 的晶振最坏相向漂移 40 ppm：一小时后相差约 144 ms，足够让 1 m/s 的机器人"被看见"错位 14 cm</span>
+    </div>
+    <p>更麻烦的是两种"时间的符号"要分清：<strong>墙上时钟（wall clock）</strong>表示"现在几点"，可以被校时（包括向后跳）；<strong>单调时钟（monotonic clock）</strong>只保证"一直向前走"，用于测量间隔。用墙上时钟算时间差，遇到校时跳变会得到负数；用单调时钟记"现在几点"则毫无意义，<strong>"测间隔用单调、标事件用墙上"是分布式时间的第一条纪律</strong>。ROS2 的 ROS 时钟默认跟随系统墙上时钟（可被重定向），间隔测量另有稳态时钟可用。</p>
+
+    <h3>2. NTP：四时间戳的偏移估计</h3>
+    <p>网络时间协议（NTP）用一次报文往返估计"我与服务器差多少"，t0 客户端发送、t1 服务器接收、t2 服务器发送、t3 客户端接收，忽略路径不对称时：</p>
+    <div class="formula">
+      偏移 offset ≈ ( (t1 − t0) + (t2 − t3) ) / 2；往返延迟 delay = (t3 − t0) − (t2 − t1)
+      <span class="note">直觉：如果没有别的信息，就假设"去程和回程一样长"，用两种极端假设的平均值逼近真实偏移</span>
+    </div>
+    <p>注意 offset 的误差上界是 delay/2：<strong>网络越对称越稳，NTP 越准</strong>。有线局域网典型精度 1–10 ms；经过 WiFi 与多层路由，抖动大时可退化到几十毫秒。NTP 还刻意"缓慢拨针"（slew）：每次只微调速度，避免时间跳变破坏应用，这带来收敛时间，也让"开机后前几分钟"成为精度未达标的窗口期。生产车队常在工控机里跑一个本地 NTP 服务器（stratum 1/2，可接 GPS/GNSS 授时），各机器人作为客户端同步到它。</p>
+    <p><strong>算例：四时间戳走一遍（含不对称误差）。</strong>真值：服务器比客户端快 50 ms，去程 30 ms、回程 20 ms、服务器处理耗时 0。客户端发送 t0 = 0；服务器接收 t1 = 0 + 30 + 50 = 80 ms；立即回发所以 t2 = 80 ms；客户端收到 t3 = 0 + 30 + 20 = 50 ms。代入公式：offset = ((80 − 0) + (80 − 50)) ÷ 2 = <strong>55 ms</strong>，比真值多出 5 ms；delay = (50 − 0) − (80 − 80) = 50 ms。多出的 5 ms 恰好等于 (去程 − 回程) ÷ 2，把这两条式子联立可以证明：<strong>offset 估计的偏差 = (d<sub>去</sub> − d<sub>回</sub>) ÷ 2，上界就是 RTT/2</strong>。若回程更长，偏差符号反转。这解释了为什么"同一条网线、同一台交换机"的对称环境精度最好，也解释了跨界路由与无线接入为什么把 NTP 精度拖垮。</p>
+    <p>缓慢拨针不是免费的：拨针速率有上限（具体值由实现配置），一个较大的偏差可能要花几分钟到几十分钟才收敛，期间系统一直带着误差运行。因此工程上采用两段式纪律：开机阶段的较大偏差允许步进（趁应用还没启动），运行期只允许微调；若运行期真发生了大步进（例如管理员手动校时），下游时间敏感应用必须能检测并处理它，这正是第 4 节"跳变检测"存在的理由。</p>
+
+    <h3>3. PTP：为什么能做到微秒级</h3>
+    <p>IEEE 1588 精确时间协议（PTP）把精度做到微秒级的两个关键：</p>
+    <ul>
+      <li><strong>硬件时间戳</strong>：收发包的瞬间由网卡/PHY 打戳，绕开操作系统协议栈的不可预测延迟（那是 NTP 软件打戳的主要误差源）。</li>
+      <li><strong>主从体系与逐跳同步</strong>：域内用最佳主时钟算法（BMCA）选出主时钟，从时钟不仅与主时钟同步，交换机若支持透明时钟还能补偿报文在设备内的驻留时间。</li>
+    </ul>
+    <p>误区提醒：<strong>PTP 不是"装了软件就快"</strong>，没有网卡硬件打戳、交换机不配合，精度优势会大打折扣，甚至不如调好的 NTP。多机器人实验室的常见配置是"有线骨干 + 支持 PTP 的交换机"，精度目标 1 毫秒以内到 100 微秒级；是否上 PTP 取决于你的融合算法与 TF 对偏差的容忍度，别为了工具而工具。常见授时方式的量级对比：</p>
+    <table>
+      <tr><th>授时方式</th><th>典型精度</th><th>基础设施要求</th><th>适用场景</th></tr>
+      <tr><td>公网 NTP</td><td>10–100 ms</td><td>普通联网</td><td>日志比对、非实时协同</td></tr>
+      <tr><td>局域网 NTP</td><td>1–10 ms</td><td>本地时间服务器</td><td>状态共享、协同感知</td></tr>
+      <tr><td>PTP 软件打戳</td><td>0.1–1 ms</td><td>有线网络与较好交换机</td><td>中等精度融合</td></tr>
+      <tr><td>PTP 硬件打戳</td><td>1–100 μs</td><td>支持 PTP 的网卡与交换机</td><td>紧耦合控制与抓取协同</td></tr>
+      <tr><td>GNSS + PPS</td><td>微秒及以下</td><td>天线、模块与秒脉冲接入</td><td>作为时间基准源，供 NTP/PTP 之上</td></tr>
+    </table>
+
+    <h3>4. ROS2 的时间体系：ROS 时钟与时间戳纪律</h3>
+    <p>ROS2 节点不直接调用 <code>time.time()</code>，统一使用节点时钟：<code>self.get_clock().now()</code>。它有三种形态：系统时间（跟随境内外校时）、ROS 时间（受 <code>use_sim_time</code> 与 <code>/clock</code> 控制）、稳态时间（测间隔）。语义要点：</p>
+    <ul>
+      <li><strong>消息时间戳</strong>：数据"被产生"的时刻，由生产者写入 header，融合、TF、回放全部基于它。它必须是 ROS 时钟的读数；"发送前随手取的墙上时间"会破坏融合与回放的一致性。</li>
+      <li><strong>接收时刻</strong>：只用于统计传输延迟，不参与数据对齐（第 015 章展开）。</li>
+      <li><strong>仿真</strong>：所有节点设 <code>use_sim_time=true</code>，由仿真器发布 <code>/clock</code>；忘记设置的节点时间轴与仿真器错位，TF 立刻出现"找不到时间点的变换"。</li>
+    </ul>
+    <p>还有一个分布式的老问题：<strong>时间戳来自各自的钟，仍要先做本节的第 2/3 节</strong>（操作系统级同步），再靠 ROS 时钟表达。ROS 不会、也无法替你完成物理时钟对齐，它只是忠实地把各家的读数写进消息。</p>
+    <p><strong>把"接收时刻当时间戳用"的代价可以算出来：</strong>WiFi 排队与重传抖动通常在数毫秒到数十毫秒，若下游用接收时刻替代消息时间戳做融合，10 ms 抖动配上 1 m/s 的机器人就是 1 cm 的位姿错位，而且这种误差在同一段拥塞里成批出现，具有相关性，比独立测量噪声更难被滤波器平均掉。时间戳纪律因此不是审美问题：<strong>产生时刻只有一个，接收时刻每经过一跳就变一次，用它等于把路径抖动永久焊进数据</strong>。</p>
+
+    <h3>5. 验收指标：把"时间同步好了"变成数字</h3>
+    <p>同步做没做好，用数字说话。常用的三类量与参考阈值：</p>
+    <table>
+      <tr><th>指标</th><th>测量方法</th><th>NTP（局域网）</th><th>PTP（硬件打戳）</th></tr>
+      <tr><td>跨机时钟偏差</td><td>带时间戳的往返探测估 offset</td><td>1–10 ms</td><td>1–100 μs</td></tr>
+      <tr><td>偏差抖动（标准差）</td><td>多次采样的分布</td><td>亚毫秒–数毫秒</td><td>微秒级</td></tr>
+      <tr><td>应用可容忍偏差</td><td>由"速度 × 允许错位"倒推</td><td colspan="2">1 m/s × 5 ms 目标 → 错位 5 mm；1 m/s × 50 ms → 5 cm（开始伤融合）</td></tr>
+    </table>
+    <p>判断标准：<strong>先算你的错位预算（速度 × 时间偏差），再选同步方案</strong>。慢速巡检机器人（0.3 m/s）容忍 10 ms 偏差只错位 3 mm；高速协同（2 m/s）要求 1–2 ms 甚至更好。这比"别人用 PTP 我也上"理性得多。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>给"4 台机器人 + 1 台工作站"的融合系统做时间同步，五步：</p>
+    <ol>
+      <li><strong>算需求</strong>：列出所有跨机对齐场景（点云融合、TF、协同触发），每项给出"速度 × 允许错位"的偏差预算，取最严的一项作为系统指标（如 5 ms）。</li>
+      <li><strong>选方案</strong>：预算 ≥ 5 ms：NTP 足够（简单、成熟）；预算 ≤ 1 ms：核对网络与硬件是否支持 PTP，再决定投入。</li>
+      <li><strong>搭基础设施</strong>：选一台固定不动的工控机做工控时间源（NTP server 或 PTP 主时钟），其余设备做客户端；时间源尽量接 GNSS 或有稳定铷钟，避免"以漂制漂"。</li>
+      <li><strong>统一 ROS 时间纪律</strong>：真机全队 <code>use_sim_time=false</code>；仿真全队 <code>true</code>；所有消息时间戳出自节点时钟；禁止在业务代码里出现裸系统时间。</li>
+      <li><strong>验收与监控</strong>：部署后跑跨机偏差测量脚本，记录基线；运行期把"时钟跳变"和"偏差超阈"接入监控（第 006、018 章）。</li>
+    </ol>
+
+    <h3>方案选择表</h3>
+    <table>
+      <tr><th>场景</th><th>偏差预算</th><th>方案</th><th>备注</th></tr>
+      <tr><td>独立机器人，无跨机融合</td><td>不敏感</td><td>不需要专门同步</td><td>仍建议开启基础 NTP 便于日志比对</td></tr>
+      <tr><td>状态共享、协同感知（本章批次）</td><td>1–10 ms</td><td>局域网 NTP（本地服务器）</td><td>chrony + 本地 stratum 源，收敛比公网快</td></tr>
+      <tr><td>紧耦合融合 / 抓取协同</td><td>≤ 1 ms</td><td>PTP（有线、硬件打戳）</td><td>交换机与网卡都要支持，验收微秒级偏差</td></tr>
+      <tr><td>仿真环境</td><td>由仿真器定义</td><td><code>use_sim_time</code> + <code>/clock</code></td><td>不算"同步"，是"统一时间源"</td></tr>
+    </table>
+
+    <div class="box key">
+      <span class="box-title">设计决策：为什么时间服务器要"固定不动、靠近网络中心"？</span>
+      <p>两个理由。<strong>（1）</strong>时间服务器若自己也经常移动/切换网络，它的时钟虽然准，但"从它的网线到各机器人的路径延迟"在变，客户端估偏移的假设（路径对称稳定）被破坏，精度下降。<strong>（2）</strong>同步质量随网络跳数衰减：把服务器放在交换机旁边、机器人都在同一广播域，通常能拿到最佳结果。<strong>实践模板：选一台有线接入核心交换机的工控机当时间源（甚至就是那台日志/调度服务器）。</strong>时间基础设施的网络位置与它的时钟质量同等重要。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：chrony 时间源配置，服务端与客户端</strong></p>
+    <pre class="code"><code># /etc/chrony/chrony.conf（时间服务器：接了 GNSS 的工控机）
+# 优先本地 GNSS/PPS 源；没有硬件源时退回公网池（质量下降但可用）
+refclock PPS /dev/pps0 refid PPS            # 秒脉冲：毫秒乃至微秒级校准
+pool ntp.aliyun.com iburst                  # 备用水源：iburst 加快首轮收敛
+allow 192.168.1.0/24                        # 只服务本车队网段：收敛快且安全
+local stratum 10                            # 即使上游全断，也以内网自洽时间继续服务
+
+# /etc/chrony/chrony.conf（各机器人：同步到车载时间的源头）
+server 192.168.1.10 iburst                  # 车队时间服务器（固定 IP 工控机）
+makestep 0.1 3                              # 开机前 3 次校准允许步进，之后只缓慢拨针
+driftfile /var/lib/chrony/drift             # 记录漂移率：重启后更快收敛</code></pre>
+    <p>解读：<strong>（1）</strong><code>makestep 0.1 3</code> 是"开机允许跳、运行中不跳"的取舍：开机时几十毫秒的偏差直接跳过去（快），运行中 0.1 s 以内的偏差用慢速拨针（不破坏应用的时间连续性），这正是第 1 节"墙上时钟可跳、应用怕跳"的工程化。<strong>（2）</strong><code>local stratum 10</code> 保证断网时内网仍有一致的时间轴（大家共同地慢/快，好过各跳各的），车载/野外车队很实用。<strong>（3）</strong>服务器限定网段（<code>allow</code>）既减少放大攻击面，也避免被无关流量打扰。<code>ibrust</code> 用更密的初始报文把首轮收敛从分钟级压到秒级，机器人开机即工作场景值得打开。</p>
+
+    <p><strong>片段 2：节点里的时间纪律，时间戳与跳变检测</strong></p>
+    <pre class="code"><code>class StampedSensor(Node):
+    """传感器节点的正确时间用法：一切时间出自 ROS 时钟，并监视跳变。"""
+    def __init__(self):
+        super().__init__("lidar")
+        # use_sim_time 由 launch 声明；节点内统一通过 get_clock 取时间
+        self.declare_parameter("use_sim_time", False)
+        self.pub = self.create_publisher(LaserScan, "scan", QoSProfile(depth=5))
+        self.last_stamp = None
+        self.create_timer(0.1, self.tick)
+
+    def tick(self):
+        now = self.get_clock().now()                  # 唯一合法的时间来源
+        msg = LaserScan()
+        msg.header.stamp = now.to_msg()               # 数据"产生时刻"：融合/对齐的锚点
+        # 跳变检测：正常运行时时间只应向前走，回退或大跳跃都要告警
+        if self.last_stamp is not None:
+            dt = (now - self.last_stamp).nanoseconds / 1e9
+            if dt &lt; 0.0 or dt &gt; 1.0:                  # 回退或超过 1 s 的跨越
+                self.get_logger().warn(
+                    f"时钟跳变: dt={dt:.3f}s（检查校时配置）")
+        self.last_stamp = now
+        self.pub.publish(msg)</code></pre>
+    <p>解读：<strong>（1）</strong>时间戳只用 <code>get_clock().now()</code>：真机跟随系统校时、仿真跟随 <code>/clock</code>，同一行代码适配两种世界；一旦混入 <code>time.time()</code>，仿真下全部时间轴崩塌。<strong>（2）</strong>"跳变检测"是廉价而高价值的健康检查：正常时间只前进，发现回退（典型是校时步进）或超过 1 s 的跨越（挂起恢复、时钟重置）立即告警，这类问题在事后看日志时几乎无法逆向重建，只能靠在线捕获。<strong>（3）</strong>注意判断用的是<strong>墙上时钟的差值</strong>且明确容许小抖动；如果这段代码要"测间隔"（如控制周期），应改用稳态时钟（<code>get_clock().get_clock_type()</code> 相关稳态时钟或系统单调时钟），第 1 节的纪律在代码里的落点。</p>
+
+    <p><strong>片段 3：跨机偏差测量，用往返探测估时钟差</strong></p>
+    <pre class="code"><code>def estimate_offset(cli, cli_clock, timeout=0.2):
+    """通过一次往返（ping-pong）估计两台机器的时钟偏差。
+    假设去/回程延迟对称：offset ≈ 本地中点 - 对端时间戳。"""
+    t0 = cli_clock.now()                 # 本地发送前时刻（墙上时钟）
+    req = Ptime.Request()
+    req.stamp = t0.to_msg()              # 带上本地时间戳，供对端原样回送
+    fut = cli.call_async(req)            # 服务调用：第 003 章的重试语义按需叠加
+    rclpy.spin_until_future_complete(cli, fut, timeout_sec=timeout)
+    if not fut.done():
+        return None                      # 探测失败：上层做多次采样取中位数
+    t3 = cli_clock.now()                 # 本地收到响应的时刻
+    t0n = t0.nanoseconds / 1e9
+    t3n = t3.nanoseconds / 1e9
+    t_mid = (t0n + t3n) / 2.0            # 本地"中点时刻"
+    remote = fut.result().stamp.sec + fut.result().stamp.nanosec / 1e9
+    offset = t_mid - remote              # 正值：本地比对方快这么多秒
+    rtt = t3n - t0n                      # 往返时间：offset 误差上界 = rtt/2
+    return offset, rtt
+
+# 采样 50 次取中位数与分布 95 分位：单次结果只能作参考，分布才是验收证据</code></pre>
+    <p>解读：<strong>（1）</strong>这个脚本把第 2 节的 NTP 公式用"服务调用"复现了一遍，理解它的最好方式是亲手实现一遍。注意对端只把收到的时间戳<strong>原样回送</strong>：它不比较、不计算，定向判断完全在发起端完成，因为"对称假设"只能建立在发起端视角。<strong>（2）</strong>误差上界是 RTT/2：有线局域网 RTT 0.2 ms 时单次偏差估计误差可达 0.1 ms；WiFi 抖动大，单次结果毫无意义，所以最后一行纪律：<strong>多次采样取中位数与 95 分位，并记录分布作为验收基线</strong>。<strong>（3）</strong>用它作日常巡检：各机器人定时探测到时间服务器的 offset，超阈值（如 NTP 方案 5 ms）进告警，时间健康第一次有了数字化的守护。</p>
+
+    <p><strong>片段 4：CLI 速查，时间状态一眼看</strong></p>
+    <pre class="code"><code>timedatectl status                 # 看系统时间与 NTP 服务是否激活
+chronyc sources -v                 # 时间源列表：每行的 offset/延迟/抖动，收敛后看 offset
+chronyc tracking                   # 本机偏差估计与频率修正，验收时记录 baseline
+# PTP 场景（装了 linuxptp 时）：看主从选择与偏差
+pmc -u -b 0 'GET TIME_STATUS_NP'   # 从时钟视角的 offsetFromMaster 等关键量
+# ROS 侧：仿真下确认时钟话题在流动，真机上确认没有被误开
+ros2 topic hz /clock               # 仅仿真：/clock 应稳定在仿真步频
+ros2 param get /robot1/lidar use_sim_time   # 真机应为 false；true 会把时间轴错位</code></pre>
+    <p>解读：<code>chronyc tracking</code> 输出的 "System time" 行就是本机相对时间源的偏差估计，把它抄进部署验收单，下次升级网络或换交换机后重新对比，能发现"同步质量悄悄劣化"的回归。<code>pmc</code> 是 PTP 的探查工具，重要字段是从时钟视角的 <code>offsetFromMaster</code>。ROS 侧的两条命令专治两类高频事故：仿真忘了发 <code>/clock</code>（时间停住）、真机误开了 <code>use_sim_time</code>（时间不动或错位）。<strong>时间问题永远先查"谁在给时间"，再查"谁在用时间"。</strong></p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>业务代码混用裸系统时间</strong>：某个节点用 <code>time.time()</code> 打戳，其余节点用 ROS 时钟，仿真下时间轴错位，真机下校时跳变后该节点数据"穿越"。修复：全局静态检查禁止业务代码直接取系统时间；时间只从 <code>get_clock()</code> 出。</li>
+      <li><strong>仿真没开 use_sim_time</strong>：Gazebo 里机器人飞驰，但订阅端收到的 TF 时间戳与仿真时间差了几个小时，报 "extrapolation into the future"。修复：全队统一 <code>use_sim_time=true</code>，并确认 <code>/clock</code> 在发布。</li>
+      <li><strong>用墙上时钟测间隔</strong>：计算控制周期差时遇到校时回拨，得到负的时间差，控制环逻辑崩坏。修复：间隔测量一律用稳态/单调时钟。</li>
+      <li><strong>以为 NTP 装好就一切完美</strong>：开机后前几分钟还在收敛（offset 未达标），此时启动融合会出现短暂但真实的精度窗口。修复：启动编排里等待"时间就绪"（offset 达标）再启动协同（第 019 章生命周期编排）。</li>
+      <li><strong>PTP 用了普通交换机</strong>：指望微秒级精度，但路径上没有透明时钟支持，实际偏差退到毫秒级。修复：先用 <code>pmc</code> 验收再依赖它；不达标就现实地退回 NTP 并调整算法容忍度。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>换算题：两块晶振各有 +15 ppm 和 −25 ppm 的误差，开机 2 小时后两者相差多少毫秒？以 0.8 m/s 的机器人速度，相当于多少厘米的位姿错位？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>相对漂移 40 ppm = 40 μs/s；2 小时 = 7200 s → 288 ms；0.8 m/s × 0.288 s ≈ 23 cm。这就是"不校时就没有协同"的量化答案。</div></details>
+      </li>
+      <li>预测题：把片段 2 的 tick 周期从 0.1 s 改成 0.01 s，跳变检测的灵敏度与误报各如何变化？再分析：仅检测"回退"不检测"大步前进"会漏掉什么故障？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>采样更密→更早发现跳变，但对正常抖动也更敏感（阈值 1 s 不变时误报几乎不变）；只查回退会漏掉"时钟被大步拨快"和"挂起恢复后直接跳"这两类。</div></details>
+      </li>
+      <li>推导题：用片段 3 的往返法，在某 WiFi 网络测得 RTT 中位数 8 ms、95 分位 60 ms。讨论：(a) 单次 offset 估计的误差上界；(b) 为什么中位数比均值更适合代表"真实偏差"；(c) 这个网络做 5 ms 精度的融合是否现实。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>(a) 单次误差 ≤ RTT/2，即 4 ms（中位）～30 ms（尾部）；(b) 分布是重尾的，均值被少量大 RTT 拉偏；(c) NTP 在 8 ms 抖动网络上难以稳定给到 5 ms，考虑有线化或 PTP 或放松预算。</div></details>
+      </li>
+      <li>设计题：为"双机协同搬运"设计时间方案：列出跨机对齐场景、偏差预算（推导）、同步方案与验收指标；说明为什么这类任务的预算比"地图共享"更严。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>协同搬运里两臂的错位直接施加在工件上（毫米级要求），1 m/s × 1 ms = 1 mm；大幅严于地图的厘米级容忍度，所以这类任务是有线 + PTP 的典型客户。</div></details>
+      </li>
+      <li>排障题：地图建成后总有 5–15 cm 的双层重影，日志显示两机激光都已上线、标定已完成。列出三条与时间相关的怀疑点，并按排查成本从低到高排序。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>① chronyc tracking 看两机偏差与抖动；② 用片段 3 实测跨机 offset；③ 检查消息时间戳是否被下游覆盖成"接收时刻"（第 015 章有专门工具）。低成本先做数字验收，再动算法。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>晶振漂移用 ppm 度量：100 ppm = 8.6 s/天；跨机错位 = 速度 × 时间偏差，先算容忍度再选方案。</li>
+      <li>NTP 用四时间戳估偏移，误差上界 RTT/2；局域网 1–10 ms，靠本地服务器与 iburst 提升质量。</li>
+      <li>PTP 靠硬件打戳与主从体系到微秒级，但需要网卡与交换机配合，先用现场验收说话。</li>
+      <li>ROS 时间纪律：时间只从 <code>get_clock()</code> 出；仿真全队 <code>use_sim_time=true</code>；间隔测量用单调时钟。</li>
+      <li>验收数字化：跨机 offset 分布（中位数/95 分位）进基线，日常巡检超阈告警。</li>
+      <li>下一章进入 DDS 深水区：<strong>发现协议配置</strong>，有线能连、WiFi 连不上这类"玄学"的根治方案。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch008.html">← 第 008 章：话题重映射实现机器人间通信</a>
+    <a class="next" href="ch010.html">第 010 章：使用DDS发现协议配置 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

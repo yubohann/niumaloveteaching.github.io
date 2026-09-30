@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第062章 实现Transformer策略 | 机器人仿真学习课程 · Isaac Sim 强化学习训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第三篇 · 高级强化学习专题</span>
+    <span class="sep">/</span>
+    <span>第 062 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第三篇 · 高级强化学习专题</div>
+    <h1>第 062 章：实现Transformer策略</h1>
+    <p class="lead">把机器人最近十几帧的状态当成一段"时间句子"，用自注意力（self-attention）让策略自己决定该回看哪几帧，本章从注意力数学讲到 Isaac Sim 中的序列观测组装与策略网络落地。</p>
+    <ul class="meta">
+      <li>主题：策略网络 / 序列建模</li>
+      <li>相关组件：Isaac Sim / Isaac Lab / PyTorch / Stable-Baselines3</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 061 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解缩放点积注意力（scaled dot-product attention）的公式，说清"除以 √d<sub>k</sub>"的方差原因。</li>
+      <li>说清 Transformer 策略相比 MLP 与 RNN 的取舍：为什么长程依赖、并行训练和可解释权重值得付出 O(K²) 的代价。</li>
+      <li>掌握把 Isaac Sim 逐帧观测组装成 [K, D] 序列的方法（环形缓冲、回合重置、拷贝语义）。</li>
+      <li>会用 PyTorch 写一个因果掩码的 Transformer 策略，并把它接入 Stable-Baselines3 的自定义特征提取器。</li>
+      <li>会为机器人任务选上下文长度 K、模型维度 d<sub>model</sub>、头数，并核算推理延迟是否满足控制周期。</li>
+      <li>能排查"训练指标虚高、部署崩盘"这类由信息泄漏与位置编码缺失引起的问题。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>前面两章你已经见过两种策略骨架：MLP 只看当前帧，遇到"速度看不清"的问题只能靠帧堆叠硬扛；RNN（第 061 章）用隐状态压缩历史，但压缩是有损的，一条 45 维的观测塞进 128 维隐向量，几十帧后早期细节基本被覆盖。而机器人任务里恰恰有大量"关键事件在几百毫秒前"的场景：抓取时接触力变化发生在合拢手指之后、足式行走时落脚点选择发生在抬腿之前。</p>
+    <p>Transformer 的思路截然不同：<strong>不压缩历史，改为保留最近 K 帧原文，让网络自己学一个"检索权重"去回看</strong>。这在 Isaac Sim 的并行训练里代价可控，K 取 16 时注意力矩阵只有 16×16，GPU 上单次推理 1–2 ms，远低于 60 Hz 控制周期（16.7 ms）。本章就把这条路线完整落地：先把观测变成序列，再写策略网络，最后接进训练框架。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 缩放点积注意力：一次可学习的软检索</h3>
+    <p>注意力把输入序列拆成三套线性投影：查询 Q（query，我想找什么）、键 K（key，我能提供什么）、值 V（value，我实际携带的信息）。第 t 帧的查询去和所有帧的键做内积，得分越大表示"越相关"；经 softmax 归一化成权重后，对所有帧的值做加权求和：</p>
+    <div class="formula">
+      Attention(Q, K, V) = softmax( QK<sup>T</sup> / √d<sub>k</sub> ) · V
+      <span class="note">Q、K、V 均由同一输入 X 经三组可学习矩阵投影而来，这就是"自"注意力</span>
+    </div>
+    <p>把它想成一次<strong>可微分的最近邻检索</strong>：如果当前帧想问"上一帧关节速度是多少"，网络可以学出一组 Q/K 投影，让当前帧的查询与上一帧的键内积最大，softmax 后权重集中在上一帧上。检索内容（看哪几帧、看哪几个维度）全部由梯度自动学出来，不需要你手工设计"记忆里存什么"。</p>
+
+    <h3>2. 为什么除以 √d<sub>k</sub>，一个方差问题</h3>
+    <p>设查询与键的各维独立、零均值、单位方差，则内积 q·k = Σ<sub>i=1..d<sub>k</sub></sub> q<sub>i</sub>k<sub>i</sub> 的方差是 d<sub>k</sub>。d<sub>k</sub>=64 时内积标准差约 8，logits 动辄 ±20；softmax 在这种量级下会变成"赢者通吃"的近似 one-hot，输出对绝大多数参数的梯度接近 0。除以 √d<sub>k</sub> 把 logits 方差拉回约 1，softmax 停在梯度良好的区间，<strong>这不是玄学，是保持训练信号不消失的标准做法</strong>。</p>
+    <div class="formula">
+      Var(q·k) = d<sub>k</sub> · σ<sup>4</sup> ⟹ 除以 √d<sub>k</sub> 后 Var ≈ 1（σ 为单维标准差）
+      <span class="note">d<sub>k</sub> 越大，不缩放时 softmax 越饱和、梯度越接近消失</span>
+    </div>
+
+    <h3>3. 位置编码：注意力本身不知道"先后"</h3>
+    <p>交换输入序列的任意两帧，注意力输出只会跟着交换，它是置换等变的（permutation equivariant），天生没有时间概念。机器人状态的时序恰恰是核心信息（速度就是位置的时间差），所以必须显式注入顺序：用可学习的位置向量 P ∈ R<sup>K×d</sup> 逐帧相加，或用正弦位置编码。K 固定为 16 时，可学习编码最省事，参数只有 16×d 个。经验上<strong>机器人任务用可学习位置编码比正弦版本收敛略快</strong>，因为时间尺度不需要外推到训练窗口之外。</p>
+
+    <h3>4. 因果掩码：训练与部署必须同口径</h3>
+    <p>部署时策略只有"现在和过去"，没有未来帧。但训练时如果整段序列一起送进网络，第 5 帧的注意力可以瞄到第 12 帧，这就是信息泄漏，会训练出一个"作弊"的策略，仿真指标漂亮，真机直接失效。因果掩码（causal mask）把注意力矩阵的右上三角置为 −∞，softmax 后这些位置权重为 0：<strong>第 t 帧只能看见第 ≤ t 帧</strong>。接入 SB3 时这一点尤其容易被忽略：自定义特征提取器拿到的是整段观测，掩码必须由网络自己实现，框架不会代劳。</p>
+
+    <h3>5. 与 RNN 的对比：瓶颈 vs 检索</h3>
+    <table>
+      <tr><th>维度</th><th>RNN（LSTM/GRU）</th><th>Transformer</th></tr>
+      <tr><td>历史表示</td><td>定长隐状态，有损压缩</td><td>保留 K 帧原文，按需检索</td></tr>
+      <tr><td>计算复杂度</td><td>O(K · d²)，逐步递推</td><td>O(K² · d)，可整段并行</td></tr>
+      <tr><td>长程依赖</td><td>数百步后衰减</td><td>K 窗口内任意两帧直连</td></tr>
+      <tr><td>可解释性</td><td>隐状态难解读</td><td>注意力权重可直接可视化</td></tr>
+      <tr><td>部署开销</td><td>每步一次递推，恒定</td><td>每步 O(K²)，K 不能太大</td></tr>
+    </table>
+    <p>结论是：<strong>窗口在 8–32 帧量级、需要精细时序分辨率的任务选 Transformer；需要记住跨越数秒的事件（如"两秒前门被推开"）则 RNN 或混合结构更合适</strong>。第 064 章的多模态融合还会用到本章的编码器作为视觉/状态混合的骨架。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>落地分四步：观测序列化 → 网络结构 → 训练接入 → 延迟核算。</p>
+    <ol>
+      <li><strong>观测序列化</strong>：每帧观测约 45 维（12 个关节角 + 12 个关节速度 + 末端位姿 7 维 + 上一帧动作 12 维 + 目标偏置 2 维）。保留最近 K=16 帧，即 16×45=720 维。为什么是 16 帧？60 Hz 下约 266 ms，覆盖一次抓取从启动到接触的典型尺度；K=8 太短（130 ms），K=32 则注意力计算量按 K² 增长 4 倍。</li>
+      <li><strong>token 化</strong>：整帧作为一个 token（每步 1 个 token，序列长 16）是最省算力的方案；也可以按语义分组（例如每条腿的 3 个关节合成一个 token，一帧 4 个 token），让注意力在更细粒度上选择。本章用整帧方案，练习里让你实现分组版本。</li>
+      <li><strong>网络</strong>：Linear 嵌入到 d<sub>model</sub>=128 → 加位置编码 → 2 层 TransformerEncoder（4 头，前馈 512）→ 取最后一个 token 的表示 → LayerNorm + MLP(256) → 输出动作均值；log_std 用独立可学习参数（对角高斯）。选择取"最后一个 token"，是为了保持与 RNN 一样的因果接口：部署时每新来一帧就更新一次表示。</li>
+      <li><strong>训练接入</strong>：用 SB3 的 <code>BaseFeaturesExtractor</code> 把 [B, K×D] 的展平观测还原成 [B, K, D] 再编码；策略与价值网络各自接 256×2 的 MLP 头。PPO 超参沿用：clip 0.2、γ=0.99、GAE λ=0.95、学习率 3e-4。</li>
+      <li><strong>延迟核算</strong>：K=16、d=128、2 层的推理在单卡 GPU 上约 1–2 ms；Isaac Sim 并行环境里按 batch 推理更便宜。若控制周期 10 ms（100 Hz），注意力预算是 K≤32；超过就上 KV 缓存或稀疏注意力。</li>
+    </ol>
+    <div class="box key">
+      <span class="box-title">设计思维：为什么取最后一帧的输出？</span>
+      <p>平均池化会让策略输出随时间"平滑漂移"，且部署时无法做增量计算；取因果序列最后一个 token，使输出只依赖当前及过去帧整体，接口与 RNN 完全同构，也便于训练时把 K 当作超参扫描。<strong>因果掩码 + 末帧读取 = 一个可以逐帧部署的"软记忆"</strong>。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：把逐帧观测堆成 [K, D] 序列的环形缓冲</strong></p>
+    <pre class="code"><code>import numpy as np
+
+class HistoryBuffer:
+    """维护最近 K 帧观测：策略拿到的是一条"时间线"，包含单帧快照缺失的时序信息。"""
+    def __init__(self, k=16, obs_dim=45):
+        self.k, self.d = k, obs_dim
+        self.buf = np.zeros((k, obs_dim), dtype=np.float32)  # 预分配：避免每步新建大数组
+
+    def reset(self, first_obs):
+        # 回合开始时用第一帧铺满整段历史：
+        # 零帧会被误读为"静止的极限状态"，污染注意力的时序特征
+        self.buf[:] = first_obs
+        return self.get()
+
+    def push(self, obs):
+        # 整体左移一格再写入新帧：K=16、D=45 时约 700 次浮点搬运，耗时微秒级
+        self.buf[:-1] = self.buf[1:]
+        self.buf[-1] = obs
+        return self.get()
+
+    def get(self):
+        # 必须返回拷贝：经验回放会异步保存，原地视图会被后续 push 悄悄改写
+        return self.buf.copy()</code></pre>
+    <p>解读：这段代码的三个设计点都直接服务于训练正确性。<strong>整段铺满</strong>：回合前几帧如果填 0，网络会看到"从静止突跳"的假动态；<strong>返回拷贝</strong>是序列观测最常见的隐性 bug，SB3 的 <code>ReplayBuffer</code> 默认不拷贝观测，如果你把缓冲区的视图存进去，后一步的 push 会改写已经入库的经验，训练数据整体错位；<strong>预分配</strong>则是因为这段代码每秒被调用 60 × 环境数次，Python 层分配开销会累积成瓶颈。K=16、D=45 时总线上传的是 720 个 float32，约 2.9 KB/步，经验缓冲 100 万步约 2.9 GB，这也是 K 不能随便取 64 的原因之一。</p>
+
+    <p><strong>片段 2：因果 Transformer 策略网络</strong></p>
+    <pre class="code"><code>import torch
+import torch.nn as nn
+
+class TransformerPolicy(nn.Module):
+    def __init__(self, obs_dim=45, k=16, d_model=128, nhead=4, layers=2, act_dim=12):
+        super().__init__()
+        self.embed = nn.Linear(obs_dim, d_model)              # 每帧观测投影为一个 token
+        self.pos = nn.Parameter(torch.zeros(1, k, d_model))   # 可学习位置编码：顺序信息显式注入
+        layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead, dim_feedforward=4 * d_model,
+            dropout=0.0, batch_first=True, norm_first=True)   # norm_first（pre-norm）训练更稳
+        self.encoder = nn.TransformerEncoder(layer, num_layers=layers)
+        self.trunk = nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, 256), nn.ELU())
+        self.mu = nn.Linear(256, act_dim)                     # 动作均值头
+        self.log_std = nn.Parameter(torch.full((act_dim,), -0.5))  # 初始 std≈0.61，保留适度探索
+
+    def forward(self, seq):                                   # seq: [B, K, obs_dim]
+        x = self.embed(seq) + self.pos                        # 广播相加：每个位置获得专属向量
+        T = seq.shape[1]
+        mask = torch.triu(torch.ones(T, T, dtype=torch.bool), diagonal=1)  # 上三角为 True
+        h = self.encoder(x, mask=mask)                        # 因果掩码：第 t 帧只能看 ≤t 帧
+        feat = self.trunk(h[:, -1])                           # 只取当前时刻 token 做决策
+        mu = self.mu(feat)
+        return mu, self.log_std.exp().expand_as(mu)           # 返回 (均值, 标准差)，供高斯策略采样</code></pre>
+    <p>解读：<code>mask</code> 的 True 位置在 PyTorch 里表示"被屏蔽"，右上三角恰好是"未来帧"，语义正确。<strong>为什么 <code>dropout=0</code></strong>：机器人状态数据由仿真无限生成，没有过拟合压力；注意力里的随机丢弃会额外破坏时序一致性，影响部署的可重复性。<strong>为什么 <code>norm_first=True</code></strong>：pre-norm 结构把 LayerNorm 放在子层输入侧，梯度可以沿残差直通，深一点的编码器也能稳定训练（post-norm 在 4 层以上常见发散）。<code>log_std</code> 用 <code>expand_as</code> 广播共享，是状态相关标准差的简化版；若任务不同阶段探索需求差异大，可把它换成一个小网络输出。初始值 −0.5 对应 std≈0.61，对归一化后的动作空间是"明显探索但不出格"的起点。</p>
+
+    <p><strong>片段 3：接入 Stable-Baselines3 的特征提取器接口</strong></p>
+    <pre class="code"><code>from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+
+class SeqFeatureExtractor(BaseFeaturesExtractor):
+    """把展平的 K×D 观测还原成序列再编码，可作为 PPO/SAC 的特征骨干。"""
+    def __init__(self, observation_space, k=16, d_model=128, nhead=4, layers=2):
+        super().__init__(observation_space, features_dim=d_model)
+        self.k = k
+        self.d = observation_space.shape[0] // k   # 单帧维度由总维度反推，避免手工不同步
+        self.net = TransformerPolicy(obs_dim=self.d, k=k, d_model=d_model,
+                                     nhead=nhead, layers=layers, act_dim=1)
+
+    def forward(self, obs):                        # obs: [B, K*D]，SB3 总是给展平观测
+        seq = obs.view(obs.shape[0], self.k, self.d)  # [B, K*D] → [B, K, D]
+        h = self.net.embed(seq) + self.net.pos
+        T = seq.shape[1]
+        mask = torch.triu(torch.ones(T, T, dtype=torch.bool, device=obs.device), diagonal=1)
+        return self.net.encoder(h, mask=mask)[:, -1]  # 输出 [B, d_model]，交给策略头
+
+# 训练端注册方式（PPO 与 SAC 通用）：
+# policy_kwargs = dict(
+#     features_extractor_class=SeqFeatureExtractor,
+#     features_extractor_kwargs=dict(k=16, d_model=128, nhead=4, layers=2),
+#     net_arch=dict(pi=[256, 256], vf=[256, 256]))</code></pre>
+    <p>解读：SB3 的约定是<strong>特征提取器输出一个定长向量</strong>，策略头与价值头再各接自己的 MLP，所以这里只复用嵌入与编码器，不返回动作分布。反推单帧维度 <code>observation_space.shape[0] // k</code> 是个小技巧：环境侧改观测时（比如加一路力传感器），只要同步改 K 与总维度，网络不需要手动改数字。<code>device=obs.device</code> 让掩码跟随观测所在的设备，避免 CPU/GPU 混用报错，这个细节在 Isaac Sim 大规模并行训练里很常见：部分张量在 CPU 生成、部分在 GPU。最后注意环境回调里要保证：<code>reset()</code> 重建历史缓冲、<code>step()</code> 返回的观测是 <code>push</code> 之后的序列拷贝。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>缺因果掩码导致信息泄漏</strong>：训练时第 t 帧能看见未来帧，仿真回报曲线异常漂亮（例如抓取任务 5 万步就到 95%），部署时策略"等不到未来"而失效。症状是训练-评测性能差距巨大。修复：网络内固定写死因果掩码，并把"用最后帧推理、逐步喂帧"做一次一致性测试。</li>
+      <li><strong>忘记位置编码</strong>：没有位置信息的注意力置换等变，网络学到的"时序"其实是帧内容的多重集，对速度、时序因果完全失明。症状是训练能收敛但行为抖动、对延迟不敏感。修复：加可学习或正弦位置编码，并做一次打乱实验验证性能退化。</li>
+      <li><strong>K 取太大拖垮控制周期</strong>：K=64 时注意力计算约为 K=16 的 16 倍，60 Hz 下推理一旦超过 16.7 ms，仿真里的"实时策略"实际变成滞后控制，训练分布偏移。修复：用 <code>torch.profiler</code> 量推理耗时，K 控制在 8–32，必要时上 KV 缓存。</li>
+      <li><strong>序列缓冲跨回合污染</strong>：回合切换时忘记 <code>reset(first_obs)</code>，上一回合末帧被当成本回合历史。并行环境共用缓冲实例时尤其严重。症状是回合开头的动作抽搐。修复：把缓冲放进每个环境实例，reset 时铺满首帧。</li>
+      <li><strong>归一化统计失效</strong>：序列观测的均值方差统计应在单帧维度上做（[D] 形状）；按整个 720 维做则毫无迁移性，改 K 后旧统计全部作废。症状是换 K 之后训练不收敛。修复：归一化层按单帧维度广播，改 K 重新累积统计。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把 K 从 16 改为 4 与 32 各训一次，记录收敛所需环境步数与单步推理延迟，并解释两者的权衡。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>用同一随机种子跑 3 次取中位数；延迟用 <code>torch.cuda.synchronize()</code> 前后打点，别用 CPU 计时器直接量异步执行。</div></details>
+      </li>
+      <li>删掉位置编码再训练，观察回报曲线与最终行为。设计一个"打乱最近 4 帧顺序"的测试来验证你的解释。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>置换等变的网络对帧顺序不敏感：打乱后性能不应该变化，如果你观察到性能几乎不变，说明位置编码没生效或没被用上。</div></details>
+      </li>
+      <li>实现"按语义分 token"版本：把 12 个关节按腿分成 4 组、每帧产生 4 个 token（序列长 64），预测量化后的性能与延迟变化。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>序列变长、K² 项从 256 变成 4096，延迟会明显上升；收益是注意力可以只关注"状态异常的那条腿"。</div></details>
+      </li>
+      <li>做一个信息泄漏对照实验：训练时取消因果掩码、部署时照旧用最后帧推理，量化性能差距并解释为什么这种"作弊"策略在部署时必然失效。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>允许看未来帧等价于给策略开了一个"预言通道"，学到的最优行为往往依赖未来信息（例如提前泄力）。指标对比建议以真实成功率为准。</div></details>
+      </li>
+      <li>导出注意力权重并可视化 16×16 的平均注意力矩阵，判断策略在决策时最常回看哪几个时间窗口，并与任务的时间常数对照。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>取 <code>softmax(QK<sup>T</sup>/√d)</code> 的实例值在测试回合内平均；接触类任务常出现"固定回看约 5–8 帧前"的对角带结构。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>自注意力 = 可学习的软检索：QK<sup>T</sup> 算相关度、√d<sub>k</sub> 控方差、softmax 出权重、加权 V 出输出。</li>
+      <li>机器人状态序列用 Transformer 的价值在于：保留 K 帧原文、窗口内直连长程依赖、权重可视化，代价是 O(K²) 的注意力。</li>
+      <li>两个不可省略的部件：位置编码（时间顺序）与因果掩码（训练部署同口径），缺谁都会"仿真虚高、部署崩盘"。</li>
+      <li>落地尺寸参考：K=16、d<sub>model</sub>=128、4 头、2 层，GPU 推理 1–2 ms，匹配 60–100 Hz 控制。</li>
+      <li>下一章换一幅骨架看问题：当智能体是多个关节链、多个机器人时，把状态组织成<strong>图</strong>，用图神经网络做消息传递，本章的"邻域加权聚合"思想会在那里以另一种形式出现。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch061.html">← 第 061 章：实现循环神经网络策略</a>
+    <a class="next" href="ch063.html">第 063 章：实现图神经网络策略 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

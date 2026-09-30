@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第018章 RLlib策略评估与检查点 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · RLlib 核心接口与训练</span>
+    <span class="sep">/</span>
+    <span>第 018 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · RLlib 核心接口与训练</div>
+    <h1>第 018 章：RLlib策略评估与检查点</h1>
+    <p class="lead">训练曲线的可信度由评估流程背书，训练进度的安全性由检查点背书。本章把评估副本、检查点结构、恢复流程三件事一次讲全，形成实验闭环。</p>
+    <ul class="meta">
+      <li>主题：RLlib 训练 / 评估流程与状态持久化</li>
+      <li>关键机制：独立评估副本、评估指标口径、检查点结构、恢复与推理</li>
+      <li>预计学时：65 分钟</li>
+      <li>前置章节：第 017 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解评估流程与训练采样的隔离设计：独立副本、独立回合配置、独立指标命名空间。</li>
+      <li>掌握评估参数的口径：间隔、时长单位、探索开关，以及评估样本量与估计噪声的关系。</li>
+      <li>理解检查点的内容结构与保存时机，能设计检查点频率与保留策略。</li>
+      <li>会执行两条恢复路径：从检查点继续训练、从检查点做纯推理验证。</li>
+      <li>能诊断三类问题：评估指标与训练指标混淆、评估开销拖慢训练、检查点与配置不一致。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>训练回报曲线有两个先天缺陷：它来自带探索噪声的采样过程，而且随策略更新不断漂移的分布让前后轮次不可比。<strong>用训练数据自我评价，等于让考生自己出题</strong>。独立评估流程用固定条件重测策略表现，给出一条可信度更高的曲线，同时把"过拟合训练分布"这类问题显性化。</p>
+    <p>检查点解决另一个方向的问题：训练的进展必须以可恢复的形式固化，否则任何中断都意味着从零再来。检查点的内容比"模型权重"四个字复杂得多：优化器状态、归一化统计量、步数计数器都参与"恢复后的行为一致性"。<strong>恢复是否成功，判据是续训后的曲线与未中断时有可比性；程序能跑起来只是最低要求</strong>。</p>
+    <p>本章把两条线合在一起交付：评估配置与指标读取、检查点保存与双路恢复。它们共同构成实验模板的最后两块拼图，之后第 019、020 章进入模型与训练器的自定义。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 隔离评估：独立副本与固定条件</h3>
+    <p>评估流程与训练采样有三处隔离，逐条对应一个可信度来源：</p>
+    <table>
+      <tr><th>隔离点</th><th>实现方式</th><th>消除的偏差</th></tr>
+      <tr><td>执行资源隔离</td><td>独立评估副本组</td><td>评估流量干扰训练采样节奏</td></tr>
+      <tr><td>行为策略隔离</td><td>评估关闭探索（确定性动作）</td><td>探索噪声拉低或拉高回报估计</td></tr>
+      <tr><td>指标命名隔离</td><td>结果字典中的独立命名空间</td><td>训练指标与评估指标混用</td></tr>
+    </table>
+    <p><strong>评估回合数不足会引入估计噪声</strong>：回合回报的方差决定均值估计的置信区间，样本量小到个位数时，评估曲线的波动可能大于策略的真实进步。评估时长参数支持按回合数或按步数两种口径设置，回合长度方差大的任务适合步数口径，短回合任务适合回合口径。评估副本数占用真实资源，与训练副本共享集群容量，规模要纳入第 008 章的资源总账，避免评估开启后训练吞吐莫名下降。</p>
+
+    <h3>2. 评估指标：读法决定结论</h3>
+    <p>评估结果同样以回报均值为核心指标，但解读方式与训练指标不同：</p>
+    <ul>
+      <li><strong>对齐评估点是关键</strong>：评估每 N 轮执行一次，两条曲线比较时应按采样步数对齐；按迭代序号对齐在批次不同时不可比。</li>
+      <li><strong>训练与评估的背离是信号</strong>：训练回报持续上升而评估回报走平，通常指向过拟合或环境分布差异；两者同向上升才是健康的收敛形态。</li>
+      <li><strong>极值指标辅助判断</strong>：除均值外，回合回报的最大最小值反映策略行为的稳定性，方差骤增往往是更新过猛的早期征兆。</li>
+    </ul>
+    <p>背离的判读可以借助噪声带：把评估标准误画成均值曲线的上下包络，真实改进要超出带宽才立案；两条曲线同向上升且评估点落在带外，才是可以宣告的收敛形态。极值指标与均值并排看：方差骤增时先怀疑学习率，再怀疑批次规模。</p>
+    <div class="formula">
+      评估均值估计误差 ≈ 回合回报标准差 ÷ √评估回合数
+      <span class="note">回合数 5 时噪声约为标准差的一半；提至 20 以上再下结论，评估噪声与真实改进才可区分</span>
+    </div>
+
+    <h3>3. 检查点：内容比路径重要</h3>
+    <p>一份完整的检查点由四类内容构成：</p>
+    <ol>
+      <li><strong>策略参数</strong>：策略与价值网络的权重、优化器动量等训练状态，决定续训的起点。</li>
+      <li><strong>运行统计</strong>：步数计数、累计回合数，决定监控曲线在恢复后是否连续。</li>
+      <li><strong>环境相关状态</strong>：观测归一化统计量、采样分布参数这类随训练演化的状态。缺失它们会让恢复后的输入分布与训练时不一致。</li>
+      <li><strong>配置快照</strong>：第 017 章落盘的生效配置，恢复时据此重建算法对象，并校验与检查点是否配套。</li>
+    </ol>
+    <p>保存时机与频率遵循第 009 章的四问框架：按迭代轮数定期保存，间隔按"可容忍丢失的进度"反推；收尾保存一次兜底。检查点目录会占用可观存储，<strong>保留策略通常是"保留最近若干份加历史最优一份"</strong>：环形保留控制体积，最优留存服务后续部署与对比。存储规模可估：保留 5 份、每份 1 MB 时单实验约 5 MB；换成千万参数的网络，每份约 40 MB，同样保留数升到 200 MB 量级，保留策略需要随模型规模重估。</p>
+
+    <h3>4. 两条恢复路径</h3>
+    <ul>
+      <li><strong>续训恢复</strong>：从检查点重建算法对象，继续调用训练接口。判据包括步数计数器连续、评估曲线与中断前可比。</li>
+      <li><strong>推理恢复</strong>：只加载策略参数，构造推理接口用于评估或部署。这条路径在第 012 章的服务化与第 050 章的蒸馏部署中反复出现。</li>
+    </ul>
+    <p><strong>恢复时必须校验配置一致性</strong>：用检查点配套的配置快照重建对象；直接套用当前脚本里的配置属于配置漂移。用错配置的常见症状是恢复成功但行为异常，例如网络结构参数不同导致权重映射错位，或者环境参数不同导致续训分布漂移。</p>
+
+    <h3>5. 数值算例：评估噪声、选择偏差与检查点成本</h3>
+    <p>评估噪声按平方根关系量化。设回合回报标准差为 50：评估 5 个回合时均值标准误约 22.4，20 个回合约 11.2，50 个回合约 7.1，要分辨 5 分左右的真实进步需要数百个回合量级。更隐蔽的是"挑最好"偏差：从 K 次评估里选最高值作为成绩，即便每次评估都无偏，选中值也会系统性偏高，20 次选择的平均虚高约 1.87 个标准误，按 11.2 的标准误折算接近 21 分。历史最优检查点的评选要配合足够大的评估样本量，并给"最优"标签留出噪声余地。</p>
+    <table>
+      <tr><th>评估回合数</th><th>均值标准误（标准差 50）</th><th>可分辨的最小真实进步量级</th></tr>
+      <tr><td>5</td><td>约 22.4</td><td>40 分以上</td></tr>
+      <tr><td>20</td><td>约 11.2</td><td>20 分以上</td></tr>
+      <tr><td>50</td><td>约 7.1</td><td>15 分以上</td></tr>
+    </table>
+    <p>第二笔账是检查点成本。单份检查点按 1 MB 量级估（6.7 万参数加优化器与运行统计），写入耗时约 0.1 秒；单轮墙钟 3 秒时，每 10 轮保存一次的开销占比约 0.33%，每轮保存升到约 3.3%。丢失上界等于间隔乘以单轮耗时：10 轮约半分钟，50 轮约 2.5 分钟。选间隔的定性准则由此清楚：写入占比控制在一个百分点以内，丢失上界落在可接受范围。</p>
+    <table>
+      <tr><th>评估时长口径</th><th>适合任务</th><th>方差来源</th><th>对齐方式</th></tr>
+      <tr><td>按回合数</td><td>短回合、长度稳定</td><td>回合内随机性</td><td>固定评估回合数</td></tr>
+      <tr><td>按步数</td><td>长回合、长度波动大</td><td>总步数的随机性</td><td>固定评估步数</td></tr>
+    </table>
+
+    <h3>6. 边界与失效模式</h3>
+    <p>评估的时钟边界容易被忽视：评估副本在发起时取的权重快照，评估进行中训练继续推进，监控点对应的策略以发起时刻为准；评估耗时越长，该点与"当前策略"的距离越远。评估与训练共享集群时，这条距离会随资源占用一起放大。</p>
+    <p>最优检查点的选择还有分布边界：评估在训练环境的固定条件下进行，最优标签服务的是部署条件；两者不一致时，训练条件下的最优未必是部署条件下的最优。动作是让评估环境的覆盖项尽量贴近部署条件，部署前再用独立环境复测一次，把分布差异的成本前置发现。</p>
+    <p>版本漂移对恢复的破坏最直接：权重名映射随库版本变化，报错还算幸运，静默错位更难察觉。恢复脚本要把库版本记录纳入验收，固定观测的动作一致性核对作为最后防线。评估计数在恢复后的连续性同样要检查：评估轮次统计若归零，监控曲线会出现断点，容易被误读成策略震荡，验收清单里应把评估计数连续性列为固定检查项。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>把评估与检查点接入实验模板的步骤：</p>
+    <ol>
+      <li><strong>评估参数入配置</strong>：评估间隔、时长、副本数写进配置文件，与训练组并列管理。</li>
+      <li><strong>指标提取弥合命名差异</strong>：编写一个小函数统一从结果字典提取训练回报与评估回报，供打印与曲线绘制复用。</li>
+      <li><strong>检查点策略定档</strong>：确定保存间隔、保留数量与命名规则（含步数标签），与实验目录结构对齐。</li>
+      <li><strong>恢复路径脚本化</strong>：写独立的恢复脚本，输入检查点路径，输出续训或推理两种模式。</li>
+      <li><strong>中断演练</strong>：人为终止训练并从最近检查点恢复，核对步数连续性与曲线可比性，把演练纳入流程。</li>
+    </ol>
+    <table>
+      <tr><th>参数</th><th>典型取值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>evaluation_interval</td><td>5–20 轮</td><td>评估频率</td><td>评估开销占比与监控灵敏度折中</td></tr>
+      <tr><td>evaluation_duration</td><td>10–30 回合</td><td>评估样本量</td><td>按噪声公式反推，短回合任务取上限</td></tr>
+      <tr><td>评估副本数</td><td>1–4</td><td>评估吞吐</td><td>占总预算小头，不与训练争抢</td></tr>
+      <tr><td>检查点间隔</td><td>每 10–50 轮</td><td>进度保留</td><td>可容忍丢失量决定间隔上界</td></tr>
+      <tr><td>保留份数</td><td>最近 3–5 份</td><td>存储控制</td><td>加一份最优留存</td></tr>
+    </table>
+    <div class="box tip">
+      <span class="box-title">与上一章的差异点</span>
+      <p>第 017 章解决"参数从哪里来"；本章解决"结果到哪里去"：评估指标流向监控，检查点流向存储与部署。配置快照是两章之间的接缝，恢复流程依赖它把参数与产出重新配对。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>以下片段采用 Ray 2.x 时期的通用写法；接口随版本演进，以对应版本官方文档为准。</p>
+    <p><strong>片段 1：评估配置与指标提取</strong></p>
+    <pre class="code"><code>from ray.rllib.algorithms.ppo import PPOConfig
+
+config = (
+    PPOConfig()
+    .environment(env="line_tracker", env_config={"max_steps": 200, "goal": 5.0})
+    .env_runners(num_env_runners=8)
+    .training(train_batch_size=16384, minibatch_size=2048, num_epochs=6, lr=3e-4)
+    .evaluation(
+        evaluation_interval=10,          # 每 10 轮评估一次
+        evaluation_duration=20,          # 20 个回合：压低均值估计噪声
+        evaluation_num_env_runners=2,    # 独立副本：与训练采样互不干扰
+        evaluation_config={"explore": False},   # 关闭探索：评估确定性策略
+    )
+    .resources(num_gpus=0)
+)
+
+def extract_returns(result):
+    """统一提取训练与评估回报，弥合版本间的命名差异。"""
+    train = result.get("env_runners", {}).get(
+        "episode_return_mean", result.get("episode_reward_mean", float("nan")))
+    ev = result.get("evaluation", {})
+    eval_mean = ev.get("env_runners", {}).get(
+        "episode_return_mean", ev.get("episode_reward_mean", float("nan")))
+    return train, eval_mean
+
+algo = config.build()
+for it in range(20):
+    result = algo.train()
+    train_ret, eval_ret = extract_returns(result)
+    if eval_ret == eval_ret:             # 非评估轮次返回空值，跳过打印
+        print(f"轮 {it:02d} 训练回报 {train_ret:7.2f} 评估回报 {eval_ret:7.2f}")</code></pre>
+    <p>解读：评估组的四个参数各有明确分工：间隔控制频率，时长控制样本量（20 个回合把估计噪声压到标准差的四分之一以下），独立副本隔离资源，评估覆盖项关闭探索。<strong>提取函数把命名差异挡在一处</strong>：训练回报与评估回报分别位于各自命名空间，回退链兜住版本差异，打印与绘图共用同一实现。非评估轮次不输出评估指标，用自比较判空的方式跳过，避免把缺失值当零打印进曲线。</p>
+
+    <p><strong>片段 2：定期检查点与保留策略</strong></p>
+    <pre class="code"><code>from pathlib import Path
+from collections import deque
+
+def checkpoint_path_for(exp_dir, step):
+    """命名含步数标签：靠文件名即可定位版本，无需翻日志。"""
+    return str(Path(exp_dir) / f"ckpt_{step:09d}")
+
+exp_dir = "/data/experiments/line_tracker_eval/r01"
+Path(exp_dir).mkdir(parents=True, exist_ok=True)
+kept = deque(maxlen=5)                   # 环形保留：最近 5 份，自清理
+
+algo = config.build()
+for it in range(40):
+    result = algo.train()
+    step = result.get("num_env_steps_sampled_lifetime",
+                      result.get("timesteps_total", 0))
+    if it % 10 == 9:                     # 每 10 轮保存一次
+        path = algo.save(checkpoint_path_for(exp_dir, step))
+        kept.append(path)
+        print(f"轮 {it:02d} 保存检查点: {path}")
+    old = kept[0] if len(kept) == kept.maxlen else None
+
+print("保留的检查点:", list(kept))
+
+# 收尾兜底：最后一轮无论是否到间隔点都保存一份
+final = algo.save(checkpoint_path_for(exp_dir, step))
+print("收尾检查点:", final)</code></pre>
+    <p>解读：检查点命名的步数标签让"从哪个版本恢复"变成一次目录浏览。<strong>环形队列实现最近若干份的自动保留</strong>，无需手工清理，容量有常数上界；生产流程通常再加一份"评估最优"的独立留存，供对比与部署使用。收尾兜底解决的经典问题是：训练恰好在两次定期保存之间结束时，最近的进度只存在于内存中，收尾保存把它固化。<code>algo.save</code> 返回实际路径，直接记录返回值；自行拼接路径会因内部命名规则变化产生错位。</p>
+
+    <p><strong>片段 3：从检查点恢复的两条路径</strong></p>
+    <pre class="code"><code>import json
+from pathlib import Path
+from ray.rllib.algorithms.ppo import PPOConfig, PPO
+
+def resume_training(ckpt_path):
+    """路径一：续训。用配套快照重建配置，防止配置漂移。"""
+    snap = Path(ckpt_path).parent / "effective_config.json"
+    base = PPOConfig.from_dict(json.loads(snap.read_text(encoding="utf-8")))
+    algo = PPO.from_checkpoint(ckpt_path, config=base)      # 校验并加载全部状态
+    result = algo.train()                                   # 立即续训一轮验证
+    step = result.get("num_env_steps_sampled_lifetime",
+                      result.get("timesteps_total", 0))
+    print("续训成功，累计步数:", step)                       # 步数应从断点连续
+    return algo
+
+def resume_for_inference(ckpt_path):
+    """路径二：纯推理。只取策略，用于评估与行为核对。"""
+    algo = PPO.from_checkpoint(ckpt_path)
+    policy = algo.get_policy()                              # 策略对象持有网络权重
+    obs = [0.0, 5.0]                                        # 单条观测示例
+    action = policy.compute_single_action(obs, explore=False)
+    print("检查点推理动作:", action)
+    return action
+
+algo = resume_training("/data/experiments/line_tracker_eval/r01/ckpt_000131072")
+resume_for_inference("/data/experiments/line_tracker_eval/r01/ckpt_000065536")</code></pre>
+    <p>解读：两条路径共享同一个加载入口，差别在加载后如何使用。<strong>续训路径先读配置快照再加载</strong>：快照与检查点同址携带，保证"用当时的结构恢复当时的权重"；立即跑一轮训练是最直接的验收动作，累计步数连续与损失量级正常，说明恢复闭环成立。<strong>推理路径只取策略对象</strong>，关掉探索对固定观测做动作核对，适合部署前的快速验证与行为回归测试（例如升级库版本后动作是否保持一致）。两条路径都与第 009 章的恢复纪律呼应：恢复是有验收标准的流程，加载动作与验收动作同等重要。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>混淆训练与评估指标</strong>：把训练回报当效果结论，评估指标长期被忽略。症状是上线后发现真实表现与曲线不符。修复：监控面板固定展示两条曲线，按采样步数对齐。</li>
+      <li><strong>评估样本量过小</strong>：评估回合数个位数，曲线抖动的幅度掩盖真实趋势，误判策略退化。修复：评估回合数提到两位数，或改用步数口径稳定样本量。</li>
+      <li><strong>评估开销挤占训练</strong>：评估副本数配置过大或评估间隔过密，评估流量与训练争抢资源。症状是开启评估后训练吞吐明显下降。修复：评估副本数保持总预算的一成以内，间隔服从监控需求即可。</li>
+      <li><strong>检查点恢复时配置漂移</strong>：用当前脚本配置恢复、未读取配套快照，网络结构或环境参数不一致时行为异常。修复：恢复流程强制读取配套快照，并对关键结构参数做校验。</li>
+      <li><strong>检查点只保权重不保运行统计</strong>：恢复后步数归零、归一化统计量丢失，曲线断裂且输入分布漂移。修复：使用完整检查点保存接口，验收时核对步数连续与输入统计一致。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把片段 1 的评估回合数从 20 改成 5 与 50，各运行同一训练并绘制评估曲线，用噪声公式解释曲线的差异。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>5 回合时评估曲线毛刺明显，噪声约为标准差的二分之一量级；50 回合平滑但评估时长增加。曲线平滑度与样本量的平方根成反比。</div></details>
+      </li>
+      <li>预测题：把评估间隔从 10 轮改成 2 轮，训练吞吐与评估曲线密度各如何变化？给出兼顾两者的参数建议。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>评估更频繁则曲线点更密，但评估开销占比上升、训练吞吐下降。建议间隔取总轮数的十分之一左右，重要阶段临时加密。</div></details>
+      </li>
+      <li>设计题：为"训练中断后从检查点续训"设计验收清单：至少包含步数连续性、评估可比性、输入统计一致性三项的检查方法与判据。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>步数连续性看训练结果中的累计计数；评估可比性看恢复后首轮评估与中断前最后评估的差值是否落在噪声范围内；输入统计一致性对比归一化统计量或观测分布直方图。</div></details>
+      </li>
+      <li>分析：某实验保留最近 5 份检查点，磁盘占用仍持续增长。列出两个可能原因（提示：保留逻辑、检查点内部体积），并给出排查动作。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>原因一：保留队列只记录不删除，需在淘汰时清理旧目录；原因二：单份检查点内部保留了历史快照或采样数据，检查目录清单与体积构成即可定位。</div></details>
+      </li>
+      <li>推导：设单轮耗时 T、检查点写入耗时 C、保留份数 K，写出检查点体系的平均存储占用与写入开销占比；讨论间隔 n 增大时两者的此消彼长，给出选 n 的定性准则。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>存储约 K 份乘单份体积（与网络规模相关，与 n 无关）；写入占比约 C/nT。n 增大则开销占比下降但丢失上界上升，准则：让 C/nT 低于百分之一量级，同时 nT 不超过可容忍的丢失工作量。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>评估流程三处隔离：资源、行为策略、指标命名空间；<strong>样本量与估计噪声按平方根关系反推</strong>。</li>
+      <li>训练与评估曲线的背离是重要信号，两条曲线按采样步数对齐观察。</li>
+      <li>检查点四类内容：策略参数、运行统计、环境相关状态、配置快照；缺任何一类都会削弱恢复的一致性。</li>
+      <li>恢复两条路径共享加载入口：续训以步数连续验收，推理以固定观测动作核对；<strong>恢复必须使用配套配置快照</strong>。</li>
+      <li>下一章深入网络层：<strong>RLlib 自定义模型</strong>，把默认全连接结构换成任务定制的网络。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch017.html">← 第 017 章：RLlib配置与命令行训练</a>
+    <a class="next" href="ch019.html">第 019 章：RLlib自定义模型 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

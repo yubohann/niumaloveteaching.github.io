@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第061章 自定义搜索空间 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第四篇 · Ray Tune 超参搜索</span>
+    <span class="sep">/</span>
+    <span>第 061 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第四篇 · Ray Tune 超参搜索</div>
+    <h1>第 061 章：自定义搜索空间</h1>
+    <p class="lead">搜索空间（Search Space）定义每个试验可以从哪里取值，它决定搜索问题的形状，也决定任何搜索算法能触及的解的上界。本章讲透分布 API 族的选择依据、对数尺度与量化分布的适用条件、条件参数的表达方式，以及提交大规模搜索前的空间检验方法。</p>
+    <ul class="meta">
+      <li>主题：Ray Tune 调优 / 搜索空间设计</li>
+      <li>关键机制：分布组合、对数尺度、条件采样、空间体检</li>
+      <li>预计学时：50 分钟</li>
+      <li>前置章节：第 060 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解搜索空间在“空间定义、搜索算法、调度器”三分工中的位置，明确它决定了可解域的上界。</li>
+      <li>掌握 Tune 分布 API 族（<code>choice</code>、<code>grid_search</code>、<code>uniform</code>、<code>loguniform</code>、<code>quniform</code>、<code>qloguniform</code>、<code>randint</code>、<code>sample_from</code>）的语义与适用条件。</li>
+      <li>会为跨数量级参数（学习率、熵系数、KL 目标）选择对数均匀分布（Log-Uniform Distribution），并能用数学理由说明必要性。</li>
+      <li>能用 <code>sample_from</code> 表达条件参数与层级结构，避免无效组合占用试验预算。</li>
+      <li>会为搜索空间做干跑检验（Dry Run），抽查配置判断可行率、边界命中与组合合法性。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>调优流程由三个部件构成：<strong>搜索空间负责定义试验的取值来源，搜索算法负责在空间中提案，调度器负责把算力分配给有希望的试验。</strong>第 057 章的网格与随机搜索、第 058 章的贝叶斯优化、第 060 章的 ASHA 调度器都作用在同一个对象上：空间。范围设窄时，最优值落在边界之外；范围设宽时，预算散落在无意义的区域；条件依赖被忽略时，大量试验消耗在不可行组合上。</p>
+    <p>搜索空间是调优问题的定义，算法与调度器只是这个定义上的求解过程。定义出错时，再精巧的建议机制与再激进的早停策略都无法补救。本章聚焦定义本身，给出可操作的分布选择判据、条件结构的表达方式与提交前的检验流程。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 搜索空间是分布的组合</h3>
+    <p>参数空间记作 Θ = Θ<sub>1</sub> × Θ<sub>2</sub> × … × Θ<sub>d</sub>，每个 Θ<sub>i</sub> 是一个概率分布（连续、离散或分类），采样器从联合分布中抽取一个配置 θ。网格搜索是其中的退化情形：每个 Θ<sub>i</sub> 退化为有限点集，采样失去随机性。Tune 的实现里，搜索算法内部统一调用空间的采样接口，因此<strong>自定义分布的关键约束是实现可采样性，且采样结果能被序列化进试验配置</strong>。</p>
+    <p>采样路径统一后还有一条工程收益：搜索算法、干跑脚本与人工抽查走的是同一条采样代码路径，分布行为的任何偏差都会在体检阶段暴露，避免等到正式搜索跑掉半个预算才发现；把体检脚本固定为提交前的关卡，成本可以忽略，收益是把错误拦在昂贵的阶段之前。</p>
+
+    <h3>2. 尺度与对数均匀分布</h3>
+    <p>学习率这类参数跨多个数量级，用线性均匀分布会产生与直觉不符的采样质量。以 <code>uniform(1e−5, 1e−2)</code> 为例，取值大于 1e−3 的概率约为 90%，而实际有效区间常集中在 1e−4 至 1e−3 一带，多数样本被浪费。</p>
+    <p>逐段份额可以列表核对：区间跨 10<sup>−5</sup> 到 10<sup>−2</sup> 三个数量级，对数均匀下每段概率 1/3；线性均匀下，大于 10<sup>−3</sup> 的部分占约 90.1%，而常被关心的 10<sup>−4</sup> 到 10<sup>−3</sup> 段只有约 9%。三十个样本时两分布给该有效段带来的样本数分别约为 10 个与 3 个，搜索分辨率相差三倍以上。这份份额表可以作为分布选型的检查单：先写出关心的取值段，再算两种分布各自分到多少样本。</p>
+    <div class="formula">
+      θ = e<sup>u</sup>, &nbsp; u ∼ Uniform(ln a, ln b)
+      <span class="note">对数均匀：a=1e−5、b=1e−2 时，区间 [1e−4, 1e−3] 被命中的概率为 1/3，每个数量级机会均等</span>
+    </div>
+    <p><strong>判据：若参数“乘 10”的语义与“加 0.1”的语义同样自然，它是尺度参数，用对数均匀；若绝对变化才有意义（折扣因子、损失权重、比例），用线性均匀或离散候选。</strong>折扣因子接近 1 时高度敏感，常用 <code>choice</code> 给定少量候选点，既控制敏感区又避免搜索算法在平坦区浪费样本。</p>
+
+    <h3>3. 量化分布族与端点偏置</h3>
+    <p>批量、并行环境数这类参数必须取整数或特定粒度，量化分布族（Quantized Distributions）把连续区间映射到网格：<code>quniform(low, high, q)</code> 先把采样区间吸附到步长的整数倍（下界向上取、上界向下取），再按线性均匀采样并就近舍入到 q 的倍数；<code>qloguniform</code> 先按对数均匀采样再量化；<code>randint(low, high)</code> 直接给整数。量化会引入<strong>端点偏置</strong>：网格两端的取值只能收到半个步长的概率质量，原区间两端不足一格的部分被整体丢弃，搜索算法看到的是与名义区间不同的失真分布。</p>
+    <p>端点偏置的数值例子：<code>quniform(32, 512, 100)</code> 的采样区间先被吸附到 [100, 500]，实际取值有 100、200、300、400、500 五个，各值质量依次为 0.125、0.25、0.25、0.25、0.125；两端权重只有中段的一半，且 32 至 100、500 至 512 两段完全不会被采样到。这种偏置来自就近舍入本身，与范围能否被步长整除无关（步长取 96 时同样如此）。修正方向是把候选值直接写成枚举：换成 2 的幂列表（如 128、256、512），让每个候选值等概率出现，同时与硬件规整计算对齐。判断是否需要修正的口径：把量化后的取值列出并统计频次，两端频次约为中段的一半，一条除法即可确认。</p>
+
+    <h3>4. 条件结构与 sample_from</h3>
+    <p>独立参数的组合是笛卡尔积，条件依赖使空间变成树形结构：只有 optimizer 取 adam 时，beta 参数才有意义。<code>sample_from(func)</code> 接收已采样的部分配置，返回具体数值，用于两类场合：<strong>联动</strong>（小批量由训练批量派生，保证整除）与<strong>先验注入</strong>（按优化器类别给定不同学习率中心）。条件结构在采样期消灭无效组合，比事后过滤更省预算，因为被过滤的试验已经消耗过资源。</p>
+    <p>需要注意，条件结构对搜索算法是透明的：贝叶斯优化度量的是被采样出的数值，空间内部的树形分支不会改变它的维度计数。因此条件参数在建议机制眼里仍然是独立维度，维度收益要靠“少而精”的参数清单获得。</p>
+
+    <h3>5. 维数与样本预算</h3>
+    <p>随机搜索的覆盖成本随维数指数上升：要让每个维度都落入各自最优值的 ρ 邻域（按相对位置），单个样本的命中概率为 ρ<sup>d</sup>，期望样本数约为 ρ<sup>−d</sup>。</p>
+    <div class="formula">
+      E[样本数] ≈ ρ<sup>−d</sup>
+      <span class="note">d=6、ρ=0.3 时约 1372 个试验；d=6、ρ=0.5 时约 64 个。缩维与分层搜索是控制成本的直接手段</span>
+    </div>
+    <p>本课程的试验预算按 20 至 200 量级规划，这意味着<strong>同时开放的搜索维度宜控制在 4 至 8 个</strong>，其余参数先固定为经验值，待关键维度收敛后再逐批放开。期望样本数的几组读数：d=4、ρ=0.3 时约 124 个；d=5、ρ=0.4 时约 98 个；d=6、ρ=0.3 时约 1372 个；d=6、ρ=0.5 时约 64 个；d=8、ρ=0.4 时约 1526 个。四个维度以内预算还能覆盖，六维以上就迅速越过 200 的上限，这就是"逐批放开维度"的算术依据。</p>
+
+    <h3>6. 边界设计：可行域与有效域</h3>
+    <p>可行域保证配置合法（整除关系、显存可容纳、被算法接口接受），有效域保证训练有意义的收敛行为。范围过宽时预算浪费在已知劣区；范围过窄时出现“贴边”现象：前若干名配置的某参数集中在边界，无法判断边界外是否还有更优解。判读规则很简单：<strong>若 top-K 配置的某参数向边界聚集，下一轮搜索把该边界外扩一档；若集中在中部，适度内收以加密采样。</strong></p>
+    <p>判读的数值口径：第一轮搜索后取 top-K（K 取试验总数的一成），检查每个参数的分布位置。某参数在 top-K 中的中位数落在区间上端 10% 以内时，把上界外扩一档重新搜索；落在下端 10% 以内则外扩下界；中位数回到区间中部且两端都有取值时维持范围。外扩时保留原区间作为对照，避免外扩后有效采样被摊薄。<strong>把这条判读写成每轮搜索后的固定动作，空间迭代就有了统一的节奏：通常两到三轮即可收敛到稳定范围。</strong></p>
+    <p>条件参数对搜索算法的代价也要先算清楚：建议机制按名义维度计数，派生量同样占一个维度，十个名义维度里若有四个是条件派生，实际覆盖成本仍按十维估算；按 ρ<sup>−d</sup> 计算，ρ=0.4、d=10 时约需 9500 个样本，远超本课程的预算区间。因此条件结构只用于表达必要性约束，不承担"缩小维度"的职责，维度收益要靠精简参数清单获得。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>设计搜索空间的标准流程分五步：<strong>列参数、分类别、定分布、处理依赖、干跑检验。</strong>与上一章的差异在于，第 060 章解决“算力分配给谁”，本章解决“样本从哪里来”。</p>
+    <p>干跑检验的通过线建议提前写死：可行率 100%；任一参数落在区间端点 5% 范围内的样本占比低于两成；完全相同取值的重复配置占比为零（离散候选很少时允许少量重复）。三条中任何一条不达标，先修正空间再提交正式搜索，修正记录标注空间版本号，后续分析按版本分层引用。</p>
+    <ol>
+      <li><strong>列参数</strong>：从算法配置出发列出全部可调量，按“对结果的影响预期”排序，先保留前 6 个左右。</li>
+      <li><strong>分类别</strong>：尺度类（学习率、熵系数）归对数组；绝对量类（权重、比例）归线性组；名义类（激活函数、优化器）归分类组；粒度类（批量、环境数）归量化组。</li>
+      <li><strong>定分布</strong>：按下表选择分布并写下范围依据；范围的初始值可以宽，价值区间要靠第一轮搜索的边界判读来收紧。</li>
+      <li><strong>处理依赖</strong>：凡是有整除、包含、互斥关系的参数，一律用 <code>sample_from</code> 在采样期联动，杜绝不可行组合。</li>
+      <li><strong>干跑检验</strong>：抽取 100 至 200 个配置，检查可行率、边界命中率与重复率，通过后再提交正式搜索。</li>
+    </ol>
+    <table>
+      <tr><th>参数类别</th><th>推荐分布</th><th>典型取值</th><th>依据</th></tr>
+      <tr><td>学习率</td><td><code>loguniform</code></td><td>1e−5 至 1e−2</td><td>相对变化有意义，需覆盖三个数量级</td></tr>
+      <tr><td>熵系数</td><td><code>loguniform</code></td><td>1e−4 至 1e−2</td><td>有效值常分布在低端，对数采样在低端更密</td></tr>
+      <tr><td>折扣因子</td><td><code>choice</code></td><td>0.99 / 0.995 / 0.999</td><td>接近 1 时敏感，离散候选控制敏感区</td></tr>
+      <tr><td>训练批量</td><td><code>choice</code></td><td>2048 至 16384（2 的幂）</td><td>与硬件规整计算对齐，避免尾块低效</td></tr>
+      <tr><td>SGD 小批量</td><td><code>sample_from</code></td><td>训练批量除以 4</td><td>整除关系在采样期保证</td></tr>
+      <tr><td>并行环境数</td><td><code>randint</code></td><td>2 至 16</td><td>整数且有资源含义，与集群容量联动</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：把约束写进空间，替代事后过滤</span>
+      <p>事后过滤发生在试验启动之后：一个不可行组合会占用一次 trial 名额，训练到失败或被剔除，才把资源还给调度器。把整除、互斥这类结构约束改用 <code>sample_from</code> 联动后，每个被采样的配置天然合法，搜索算法获得的统计信号也来自同质样本。约束越早进入采样环节，预算利用率越高。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：按参数类别构建基础搜索空间</strong></p>
+    <pre class="code"><code>from ray import tune
+
+# 搜索空间按“参数类别”分组书写：尺度类用对数、名义类用 choice、粒度类用整数
+search_space = {
+    # 学习率跨三个数量级：loguniform 让每个数量级获得均等采样概率
+    "lr": tune.loguniform(1e-5, 1e-2),
+    # 折扣因子接近 1 时敏感，离散候选比连续均匀更可控
+    "gamma": tune.choice([0.99, 0.995, 0.999]),
+    # 训练批量取 2 的幂：与 GPU 规整计算对齐，避免尾块拉低吞吐
+    "train_batch_size": tune.choice([2048, 4096, 8192, 16384]),
+    # 评论家损失权重是比例量，绝对变化有意义，用线性均匀
+    "vf_loss_coeff": tune.uniform(0.5, 2.0),
+    # SGD 小批量与训练批量存在整除约束，用 sample_from 在采样期联动
+    "sgd_minibatch_size": tune.sample_from(
+        lambda spec: spec["train_batch_size"] // 4),
+    # GAE 的 lambda 在接近 1 的区间变化剧烈，用少量高密度网格点近似
+    "lambda": tune.choice([0.9, 0.95, 0.98, 1.0]),
+}</code></pre>
+    <p>解读：这段空间同时演示了四类分布的选型逻辑。<strong>（1）</strong>学习率与 lambda 分别代表“跨数量级”与“敏感区集中”两种情形，前者用对数均匀摊平每个数量级的概率，后者用离散候选把采样密度直接压在敏感区。<strong>（2）</strong><code>train_batch_size</code> 用有限候选点，理由是批量与硬件线程、显存对齐；<code>randint</code> 的任意整数没有实际收益，还会扩大无效域。<strong>（3）</strong><code>sgd_minibatch_size</code> 用 <code>sample_from</code> 联动，把“必须整除”这一结构约束放在采样期，搜索算法看不到任何非法组合。Ray Tune 的分布接口在 2.x 各版本间有演进，具体参数名以对应版本的官方文档为准。</p>
+
+    <p><strong>片段 2：条件参数与先验注入</strong></p>
+    <pre class="code"><code>from ray import tune
+
+def lr_prior(spec):
+    # 该函数在每个试验采样时求值，spec 已包含先采样的 optimizer 值
+    if spec["optimizer"] == "adam":
+        return 3e-4   # Adam 自适应步长，有效学习率区间偏小
+    return 3e-3       # 动量 SGD 固定步长，需要更大的学习率区间中心
+
+conditional_space = {
+    # 先声明条件变量，sample_from 求值时才能读到它
+    "optimizer": tune.choice(["adam", "sgd"]),
+    # 先验注入：按优化器类别把学习率中心放在经验点“附近”
+    "lr_center": tune.sample_from(lr_prior),
+    # 在中心附近按对数尺度展开 ±1 个数量级，保留局部探索
+    "lr": tune.sample_from(lambda spec: spec["lr_center"] * tune_sample_scale()),
+    "clip_param": tune.uniform(0.05, 0.4),
+}
+
+def tune_sample_scale():
+    # 用固定的离散倍数表代替外部随机数：保持采样结果可复现
+    import random
+    return random.choice([0.1, 0.3, 1.0, 3.0, 10.0])</code></pre>
+    <p>解读：这里展示<b>条件先验注入</b>的完整结构。<strong>（1）</strong><code>sample_from</code> 的求值顺序与字典声明顺序一致，因此 <code>optimizer</code> 必须放在 <code>lr_center</code> 之前，否则读取会失败。<strong>（2）</strong>把优化器的领域经验编码为“中心点 + 倍数表”，既缩小了学习率的有效域，又保留了局部探索能力，比直接固定一个常数更适合与调度器配合。<strong>（3）</strong><code>tune_sample_scale</code> 使用 <code>random.choice</code> 属于外部随机源，会让同一试验配置在复现时发生变化；正确做法是把倍数表本身交给 <code>tune.choice</code>，或从已采样的量派生确定值。随机性分层管理是第 074 章的主题。<b>（4）</b>替代方案是用字典枚举优化器及其专属参数（两个子空间各自成表），适合分支数少且每支参数集差异大时使用。</p>
+
+    <p><strong>片段 3：提交前的空间干跑检验</strong></p>
+    <pre class="code"><code>from ray import tune
+
+def dry_run_space(n=200):
+    """空间体检：抽查 n 个配置，检查可行率与边界命中率。"""
+    space = {
+        "lr": tune.loguniform(1e-5, 1e-2),
+        "train_batch_size": tune.choice([2048, 4096, 8192, 16384]),
+        # 故意混入 768：与 2 的幂组合时必然出现不可行搭配
+        "sgd_minibatch_size": tune.choice([128, 256, 512, 768]),
+    }
+    feasible, lr_hi = 0, 0
+    for _ in range(n):
+        # 分布对象自带 sample()，搜索算法与手工体检走同一条采样路径
+        cfg = {k: v.sample() for k, v in space.items()}
+        # 可行域检查：小批量必须整除训练批量，否则切分阶段无法进行
+        if cfg["train_batch_size"] % cfg["sgd_minibatch_size"] == 0:
+            feasible += 1
+        # 尺度检查：统计落在 1e-3 以上的比例，验证对数分布带来的直觉
+        if cfg["lr"] &gt; 1e-3:
+            lr_hi += 1
+    print(f"可行率 {feasible}/{n}，lr&gt;1e-3 比例 {lr_hi}/{n}")
+
+dry_run_space()</code></pre>
+    <p>解读：干跑检验用 200 次采样就把三类问题暴露在提交之前。<strong>（1）</strong>可行率若不足 100%，说明约束尚未进入空间，应把相应参数改成 <code>sample_from</code> 联动；这正是把 <code>768</code> 混进候选的用意。<strong>（2）</strong>学习率落在 1e−3 以上的比例若远高于 1/3，说明选错了分布尺度。<strong>（3）</strong>体检还能顺带观察每个参数的实际取值分布，为下一轮的边界外扩或内收提供依据。抽样函数只调用各分布的 <code>sample()</code>，不使用搜索算法对象，因此可在训练开始前独立运行，代价可以忽略。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>对数分布下界取 0 或负数</strong>：对数在 0 处无定义，采样报错或退化为常数。症状是试验配置全部相同。修复：下界取正数，并在注释中记录量级依据。</li>
+      <li><strong>网格轴与随机轴混用导致组合爆炸</strong>：<code>grid_search</code> 轴会与其他参数做笛卡尔展开，一个 4 值网格叠加 <code>num_samples=50</code> 就是 200 个试验，瞬间超出集群容量。修复：网格轴只保留必需因素，其余全部使用分布。</li>
+      <li><strong>量化步长与范围不匹配</strong>：<code>quniform(32, 512, 100)</code> 的实际取值只有 5 个，两端权重减半，原区间两端不足一格的部分被丢弃，分布严重失真。修复：改用 2 的幂枚举列表，让候选值等概率出现。</li>
+      <li><strong>在 <code>sample_from</code> 中调用外部随机数</strong>：用全局随机模块生成数值，同一份配置无法通过种子复现，复验时结果漂移。修复：随机量交给 <code>tune.choice</code> 等分布对象管理，联动函数只做确定性派生。</li>
+      <li><strong>按经验值设窄边界后不再外扩</strong>：top-K 配置的参数向边界聚集仍不收手，漏掉边界外的更优解。修复：把边界判读纳入每轮搜索的固定流程，外扩后保留原区间作为对照。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>为四个参数选择分布并说明理由：学习率、折扣因子、并行环境数、KL 目标值。要求写清“尺度类 / 绝对量类 / 名义类 / 粒度类”的归类依据。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>学习率与 KL 目标偏尺度类可考虑对数刻度；折扣因子用离散候选；并行环境数用整数分布并与集群核数联动。理由要落到“采样概率与敏感区是否匹配”。</div></details>
+      </li>
+      <li>预测题：把学习率的 <code>loguniform(1e−5, 1e−2)</code> 改成 <code>uniform(1e−5, 1e−2)</code> 后，取值大于 1e−3 的采样比例约为多少？对 100 个试验的搜索效果有什么影响？<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>约 90%。有效区间在 1e−4 至 1e−3 时，绝大多数样本落在过大的学习率上，搜索集中在“训练发散的角落”，前几十个试验可能无一条可用曲线。</div></details>
+      </li>
+      <li>覆盖估计：用 ρ<sup>−d</sup> 估算 d=5、ρ=0.4 时“每维都进入最优邻域”的期望样本数，并解释为什么实际搜索可以低于这个数字。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>0.4<sup>5</sup>≈0.0102，期望约 98 个。实际搜索中参数之间有主次之分、目标函数对多数维度不敏感，有效性维数低于名义维数，所以用缩维与分层可以显著降低实际成本。</div></details>
+      </li>
+      <li>设计题：写出一个含“优化器选择 + 联动参数”的完整条件空间，其中至少两条先验以 <code>sample_from</code> 编码，并说明每条先验的领域依据与它对搜索预算的影响。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>参考片段 2 的“中心 + 倍数表”结构：优化器类别决定学习率中心，学习率中心决定实际采样区间。先验越强，有效域越小，收敛越快；先验错误时也会更快地困在错误区域，需要靠边界判读纠偏。</div></details>
+      </li>
+      <li>动手题：仿照片段 3 写一个空间体检脚本，输出每个参数的 10 分位与 90 分位取值，判断哪些参数出现“边界聚集”，并给出下一轮外扩或内收的结论。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>用 <code>statistics.quantiles</code> 或先排序再取下标即可；重点是把分布输出与上一轮 top-K 配置的位置对照，形成“采样分布与结果分布”的双重判读。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>搜索空间是调优问题的定义：空间决定可解域，算法只是定义上的求解过程；三分工中它排在流程最前端。</li>
+      <li>尺度参数用对数均匀，绝对量用线性均匀，敏感区用离散候选，粒度参数用量化分布并注意端点偏置。</li>
+      <li>结构约束（整除、互斥、包含）用 <code>sample_from</code> 在采样期联动，比事后过滤节省预算。</li>
+      <li>覆盖成本按 ρ<sup>−d</sup> 增长，本课程预算下同时开放的维度宜控制在 4 至 8 个。</li>
+      <li>提交搜索前先做干跑检验：可行率、边界命中率、取值分布三项通过后再进入正式实验。</li>
+      <li>下一章进入调度器内部机制：试验的状态机、暂停与恢复的接口约定、自定义调度器的实现要点。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch060.html">← 第 060 章：早停与ASHA调度器</a>
+    <a class="next" href="ch062.html">第 062 章：调度器机制深入 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

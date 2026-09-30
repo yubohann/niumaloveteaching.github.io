@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第022章 RLlib与环境向量化 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · RLlib 核心接口与训练</span>
+    <span class="sep">/</span>
+    <span>第 022 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · RLlib 核心接口与训练</div>
+    <h1>第 022 章：RLlib与环境向量化</h1>
+    <p class="lead">环境向量化（Vectorized Environment）把同一进程内的多个环境副本合成批量步进，摊薄每步固定开销。本章讲清它与多进程并行的分工、自动包装机制与吞吐模型。</p>
+    <ul class="meta">
+      <li>主题：RLlib 训练 / 采样吞吐</li>
+      <li>关键机制：向量化环境、批量步进、自动包装、吞吐模型、并行度规划</li>
+      <li>预计学时：50 分钟</li>
+      <li>前置章节：第 021 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解环境步进固定开销的来源，说明向量化提升吞吐的系统原因与适用边界。</li>
+      <li>掌握两类并行度的分工：单进程环境副本数（num_envs_per_env_runner）与进程数（num_env_runners）的配合方式。</li>
+      <li>理解自动向量化包装的触发条件，以及自定义向量化环境的接口契约。</li>
+      <li>会用吞吐模型估算副本扩展的收益上限，判断瓶颈在采样侧还是学习侧。</li>
+      <li>会规划总并行环境数与观察批量化带来的内存开销。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>环境步进的大部分开销来自解释器调度与对象管理，单个 Python 环境副本的步频通常在每秒数百到数千步量级，与训练侧的消耗速度存在数量级差距。向量化环境把 N 个副本的 step 合并为一次批量调用，RLlib 侧的调度、批次记录与观测打包开销被摊薄 N 份，样本产出速度随副本数近似线性上升。</p>
+    <p>向量化与多进程并行解决不同层面的问题：向量化提高单个进程内的吞吐效率，多进程并行扩展可用的 CPU 核心数；两者组合构成采样侧的完整并行结构。本章先讲进程内容量，第 024 章再讲进程间编排。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p>向量化的收益来自固定开销摊薄；收益上限由环境自身的计算量与学习侧的消耗速度共同决定。</p>
+
+    <h3>1. 两类并行度的分工</h3>
+    <p>进程级并行（num_env_runners）提供多核并行与内存隔离，采样数据经对象存储（Object Store）汇总，单进程故障可被调度层替换；进程内并行（num_envs_per_env_runner）让一个进程持有多个环境副本，批量步进，副本间共享内存，无跨进程通信。<strong>总并行环境数等于两者相乘，例如 8 个采样进程、每个持有 4 个副本，合计 32 个并行环境。</strong></p>
+    <p>经验顺序：先用副本数把单核吞吐推高，再用进程数扩展核心数；副本数受单核计算上限约束，进程数受物理核心数与序列化开销约束。</p>
+
+    <h3>2. 自动向量化与接口契约</h3>
+    <p>当 num_envs_per_env_runner 大于 1 时，RLlib 默认对传入的环境类做自动向量化包装：内部构造 N 份副本，把一批动作分发给各副本并收集结果，对上层呈现批量语义。若环境本身支持原生批量仿真（例如引擎提供并行实例接口），也可以直接传入自定义向量化环境类，接口契约（随版本演进，以对应 Ray 版本的官方文档为准）要求 reset 返回带批量维度的观测，step 接收批量动作并返回批量观测、奖励与终止标志。</p>
+    <div class="formula">
+      环境侧吞吐 ≈ B / (t + c)，B 为副本数，t 为单副本单步计算时间，c 为摊到每副本的固定开销
+      <span class="note">自动包装场景下，c 随 B 摊薄趋近于零，t 不随 B 减小；吞吐上限由单核计算能力与学习侧消耗速度共同决定</span>
+    </div>
+
+    <h3>3. 收益递减与瓶颈判定</h3>
+    <p>训练循环由采样与学习交替构成。增加副本数只提高样本供给速度，<strong>一旦采样侧的供给超过学习侧的消耗，训练迭代时间由学习阶段决定，多余的样本在批次组装处等待，扩展副本不再缩短迭代周期。</strong>判定方法是对比 sample_throughput 与学习阶段耗时：若采样吞吐远高于 train_batch_size 除以学习耗时，瓶颈在学习器一侧，应调整学习批次或模型规模。</p>
+
+    <h3>4. 内存与随机性</h3>
+    <p>每个环境副本持有状态、观测缓冲与回合记录，内存开销随总环境数线性增长；图像类观测下单副本缓冲可达数兆字节，规划副本数时要把内存与显存预算一并计入。随机性方面，RLlib 为每个副本调度独立种子，自行在环境中固定种子的做法会让全部副本产生相同轨迹，需要保持种子来自 reset 的传入参数。</p>
+
+    <h3>5. 吞吐模型的数值演算</h3>
+    <p>把单副本计算时间 t = 0.2 毫秒、摊薄前固定开销 c = 0.3 毫秒代入吞吐模型 B/(t + c/B)，逐档算出下列结果：</p>
+    <table>
+      <tr><th>副本数 B</th><th>摊薄后每副本代价（毫秒）</th><th>总吞吐（样本/秒）</th><th>平均每副本产出（样本/秒）</th><th>相对上一档增益</th></tr>
+      <tr><td>1</td><td>0.500</td><td>2000</td><td>2000</td><td>基准</td></tr>
+      <tr><td>4</td><td>0.275</td><td>14545</td><td>3636</td><td>约 7.3 倍</td></tr>
+      <tr><td>8</td><td>0.2375</td><td>33684</td><td>4210</td><td>约 2.3 倍</td></tr>
+      <tr><td>16</td><td>0.21875</td><td>73143</td><td>4571</td><td>约 2.2 倍</td></tr>
+    </table>
+    <p>读表可得三条结论。<strong>其一，</strong>单副本步频 2000 步每秒，与 Python 环境的实测量级吻合。<strong>其二，</strong>随着副本数增大，平均每副本产出从 2000 升到 4571，向理论上界 1/t = 5000 逼近，总吞吐的增长率趋近线性。<strong>其三，</strong>模型中假设单副本计算时间不随副本数变化，实际单核上多副本共享缓存与执行单元会让 t 缓慢上升，实测曲线比理想模型更早转平。是否继续加副本以学习侧需求为判据：学习侧每轮消耗 8000 样本、按每秒 10000 样本的速度复算参数，单进程 4 副本的供给 14545 样本每秒已经超过该需求，此时继续翻倍副本不再缩短迭代周期。</p>
+
+    <h3>6. 进程与副本配比的对比</h3>
+    <p>总环境数固定为 32 时，进程数与副本数的四种配比对采样路径的影响如下：</p>
+    <table>
+      <tr><th>组合（进程 × 副本）</th><th>跨进程通信量</th><th>单核计算压力</th><th>进程故障隔离</th><th>适用环境类型</th></tr>
+      <tr><td>32 × 1</td><td>高（32 份碎片汇总）</td><td>低</td><td>强</td><td>单步计算重的物理仿真</td></tr>
+      <tr><td>16 × 2</td><td>中</td><td>中</td><td>较强</td><td>通用起点</td></tr>
+      <tr><td>8 × 4</td><td>低</td><td>高</td><td>一般</td><td>单步计算轻的网格与组合任务</td></tr>
+      <tr><td>4 × 8</td><td>低</td><td>很高</td><td>弱</td><td>环境极轻且物理核心数有限的场合</td></tr>
+    </table>
+    <p>配比选择的判断顺序：先按物理核心数确定进程数上限，再按单核吞吐曲线确定副本数，最后核对两者乘积能否整除训练批次。<strong>进程数多则隔离性好、通信与内存开销高；副本数多则单核压力大、故障影响范围广。</strong>单步计算重的环境选偏进程的配比，单步计算轻的环境选偏副本的配比。</p>
+
+    <h3>7. 自动包装的触发条件与边界</h3>
+    <p>自动包装在副本数大于 1 时默认启用，包装层对上层呈现单个环境的接口，内部持有一组副本：reset 返回带批量维度的观测，step 接收批量动作并分发。触发条件是环境类本身未实现批量语义；环境已原生支持批量仿真时，把它当作单副本再包装会产生两层批量，形状校验随即失败。判断方法：逐项核对 reset 与 step 的输出是否带批量维度，带批量维度的环境按官方文档注册为向量化类型，并把副本数设为 1 直接使用。包装层同时承担副本重启职责：某副本进入吸收态后，包装层自动调用该副本的 reset 并把新观测写回批量数组的对应位置；自定义向量环境需要自行实现这一重启语义，否则终止后的副本会停留在吸收态继续产生零价值样本。</p>
+
+    <h3>8. 内存预算的估算示例</h3>
+    <p>内存开销分三部分列账：环境状态、观测缓冲与回合记录。以 84×84 灰度观测为例，uint8 存储时每帧 7056 字节，双帧堆叠缓冲区约 14 KB；转为 float32 后每副本约 56 KB，32 个副本合计约 1.8 MB，属于可控量级。环境状态才是大头：加载碰撞模型或物理场景的副本单份可达数兆字节，32 份副本按线性放大，必须把这份开销计入规划。显存只与策略网络和训练批次相关，与环境副本数解耦，两部分分开估算后再汇总。</p>
+
+    <h3>9. 批量步进的同步等待惩罚</h3>
+    <p>解析模型假设各副本步耗相等，批量步进的等待由最慢副本决定，等耗假设在真实环境上不成立。设单副本单步耗时在 0.1 至 0.3 毫秒之间均匀分布（均值 0.2 毫秒），B 个副本批量推进一轮的期望耗时等于 B 个独立样本最大值的期望：B = 1 时为 0.2 毫秒，B = 4 时升到 0.26（比均值高 30%），B = 8 时 0.278（高 39%）。<strong>批量越宽，最慢副本的拖尾越明显，这部分等待在解析模型中没有计账。</strong></p>
+    <div class="formula">
+      有效单步时间 ≈ E[max<sub>1..B</sub> 步耗] + c / B（c 为摊薄前的固定开销）
+      <span class="note">代入上文 c = 0.3 毫秒：B = 4 时 0.26 + 0.075 = 0.335 毫秒，吞吐约 11944 样本每秒，比解析值 14545 低约 18%；B = 8 时 0.278 + 0.0375 = 0.315 毫秒，吞吐约 25397，比解析值 33684 低约 25%</span>
+    </div>
+    <p>读这组数可得两条修正。<strong>其一，副本数的扩展曲线比解析模型更早转平：</strong>实测偏差从 B = 4 的约 18% 扩大到 B = 8 的约 25%，继续加宽的边际收益比纸面计算更差。<strong>其二，惩罚大小取决于步耗分布的离散程度。</strong>把 0.1 至 0.3 的区间收窄到 0.15 至 0.25，B = 4 的最大值期望降到 0.23，单步时间 0.305 毫秒，吞吐回到约 13118，偏差收缩到约 10%。缓解手段因此落在两处：让同进程内副本负载尽量一致（同构环境、同样参数），以及用多个进程摊薄副本数，不无限加宽单进程批量。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>向量化配置围绕三个数量关系展开：总环境数、碎片长度（rollout_fragment_length）与训练批次大小。</p>
+    <table>
+      <tr><th>参数</th><th>示例值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td><code>num_env_runners</code></td><td>8</td><td>采样进程数</td><td>物理核心数减一到二，留出学习与系统余量</td></tr>
+      <tr><td><code>num_envs_per_env_runner</code></td><td>4</td><td>单进程环境副本数</td><td>先测单核吞吐随副本数的上升曲线，取拐点附近</td></tr>
+      <tr><td><code>rollout_fragment_length</code></td><td>"auto"</td><td>每个副本单次采样的步数上限</td><td>由 train_batch_size 与总环境数反推，保证整除</td></tr>
+      <tr><td><code>train_batch_size</code></td><td>8000</td><td>每轮训练消耗的样本数</td><td>总环境数 32 时每副本约 250 步，覆盖若干完整回合</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：碎片长度为什么影响学习质量？</span>
+      <p>碎片长度是单个副本两次批次提交之间推进的步数。取太短，回合被频繁切断，优势估计方差上升；取太长，单次批次膨胀，参数更新延迟增大。取 "auto" 让 RLlib 按训练批次与并行环境数推算，是大多数场景的起点；truncate_episodes（按长度截断）批次节奏整齐，complete_episodes 适合需要完整回合统计的任务。</p>
+    </div>
+    <p><strong>评估并行度单独规划。</strong>训练用 8 个采样进程、每进程 4 个副本时总并行 32，评估环境数取训练环境数的四分之一到一半，例如 32 个训练环境配 8 个评估环境；评估进程与训练进程共享核心时，把两部分负载之和与核数预算核对，越界时缩减评估规模或改用独立资源池，否则评估轮次的耗时会拖长。评估频率与训练迭代数绑定，常用每若干轮评估一次；评估环境数与评估频率都不参与训练批次的整除关系，独立调整即可。</p>
+    <p><strong>碎片长度的手算与不整除的代价：</strong>总环境 32、训练批次 8000 时，自动推算的碎片长度为 250 步。把批次改成 10000 后 10000 / 32 = 312.5，框架取整并补齐，实际每轮样本数与设定值偏差约 16 步（0.16%），但各副本的进度不再一致，组装时间从固定值变为浮动。批次与总环境数保持整数倍关系时，每轮样本数、每副本步数与组装耗时三者同步可预测。选配比时先用整除关系筛掉不可控的组合，再上机测吞吐。</p>
+    <p>与上一章差异：第 021 章保证单副本接口正确；本章把副本数量变成吞吐旋钮，并引入批量维度的观测语义。下一章在此基础上替换采样器本身，处理非标准数据源的采样需求。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：并行度配置与批次数量关系</strong></p>
+    <pre class="code"><code>from ray.rllib.algorithms.ppo import PPOConfig
+
+config = (
+    PPOConfig()
+    .env_runners(
+        num_env_runners=8,               # 进程级并行：接近物理核心数，留系统余量
+        num_envs_per_env_runner=4,       # 进程内容量：每进程 4 个环境副本
+        rollout_fragment_length="auto",  # 按训练批次与总环境数反推碎片长度
+        batch_mode="truncate_episodes",  # 碎片到长度即截断，批次节奏可预测
+    )
+    .training(train_batch_size=8000)     # 总环境 8*4=32，每副本约 250 步
+)
+algo = config.build_algo()
+result = algo.train()
+# 通过吞吐指标判断瓶颈：采样富余说明扩展副本已无收益
+print(result["sample_throughput"],  # 环境侧每秒产出的样本数
+      result["episode_return_mean"])</code></pre>
+    <p>解读：几个数量关系彼此耦合。<strong>总环境数由两个参数相乘得到，</strong>碎片长度取 "auto" 时由训练批次除以总环境数推算，训练批次又决定每轮参数的更新幅度，修改任何一项都应检查另外两项是否仍然匹配。批量模式选 truncate_episodes 让副本在固定步数后提交碎片，组装时间稳定，代价是回合边界被切断；追求完整回合统计时改用 complete_episodes，碎片长度随回合长度浮动。</p>
+
+    <p><strong>片段 2：手写最小向量化环境</strong></p>
+    <pre class="code"><code>import numpy as np
+from gymnasium.spaces import Box
+
+
+class BatchLineGoalEnv:
+    """最小向量化环境：一次推进 B 个一维直线副本。
+
+    接口形态随版本演进，这里示意批量步进的核心语义：
+    观测与动作都带批量维度，一次调用推进全部副本。
+    """
+
+    def __init__(self, env_config=None):
+        cfg = env_config or {}
+        self.n = int(cfg.get("num_copies", 4))    # 批量宽度 B，与配置保持一致
+        self.horizon = int(cfg.get("horizon", 120))
+        # 空间在副本维度上扩一维：RLlib 依据它校验批量形状
+        self.observation_space = Box(low=-np.inf, high=np.inf,
+                                     shape=(self.n, 2), dtype=np.float32)
+        self.action_space = Box(low=-1.0, high=1.0,
+                                shape=(self.n, 1), dtype=np.float32)
+
+    def reset(self, *, seed=None, options=None):
+        # 种子由 RLlib 按副本调度后传入；自行固定种子会让副本轨迹相同
+        self.rng = np.random.default_rng(seed)
+        self.pos = self.rng.uniform(-1.0, 0.0, size=self.n).astype(np.float32)
+        self.vel = np.zeros(self.n, dtype=np.float32)
+        self.steps = np.zeros(self.n, dtype=np.int64)
+        # 用数组同时保存全部副本状态，是批量步进的前提
+        return np.stack([self.pos, self.vel], axis=1), {}
+
+    def step(self, actions):
+        # 一次批量步进：NumPy 向量运算替代逐副本 Python 循环
+        self.vel = 0.9 * self.vel + 0.1 * actions[:, 0]
+        self.pos += self.vel
+        self.steps += 1
+        rewards = -np.abs(1.0 - self.pos)
+        terminated = np.abs(1.0 - self.pos) &lt; 0.02
+        truncated = self.steps &gt;= self.horizon
+        obs = np.stack([self.pos, self.vel], axis=1)
+        return obs, rewards, terminated, truncated, {}</code></pre>
+    <p>解读：批量步进的关键在于状态也向量化：位置、速度、步数全部用数组保存，一次 NumPy 运算推进全部副本，把逐副本解释器循环转化为数组运算。<strong>观测空间与动作空间的形状都带批量维度，RLlib 在批处理前用它们做形状校验。</strong>随机性从 reset 的 seed 参数流入，保证副本间轨迹不同；若环境内部持有固定的模块级种子，全部副本的行为将完全一致，探索覆盖形同单副本。真实 RLlib 向量化环境的返回值形态更复杂（含掩码与重启语义），以对应版本的官方文档为准。</p>
+
+    <p><strong>片段 3：吞吐与瓶颈的快速估算</strong></p>
+    <pre class="code"><code>def env_throughput(n_copies, sec_per_step, fixed_overhead):
+    """估算环境侧每秒样本产出：固定开销被 n_copies 份副本摊薄。"""
+    return n_copies / (sec_per_step + fixed_overhead / n_copies)
+
+
+for b in (1, 4, 8, 16):
+    supply = env_throughput(b, 2e-4, 3e-4)
+    # 学习侧需求：每 0.8 秒训练 8000 样本，约 10000 样本每秒
+    print(f"副本 {b:2d}: 供给 {supply:8.0f} 样本/秒，学习需求约 10000 样本/秒")</code></pre>
+    <p>解读：这个估算回答一个问题：副本加到多少之后继续扩展不再缩短迭代。供给明显超过学习需求时，训练周期由学习阶段决定，应把资源转向增大 train_batch_size 或调整模型规模。<strong>实测时直接读取训练结果里的 sample_throughput 字段，用估算模型对照实测值，可以分辨瓶颈位于环境侧还是学习侧。</strong></p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>副本数放大而环境初始化昂贵</strong>：物理引擎类环境加载模型数秒，32 个副本的启动时间与内存成倍增长。症状是训练启动缓慢、内存占用飙升。修复：控制单进程副本数，或改用环境池复用实例。</li>
+      <li><strong>自定义向量环境批量维度错位</strong>：把批量维度放在最后一维。症状是形状校验失败或策略输出与动作对不齐。修复：统一把批量维度放在第零维，与空间声明的 shape 一致。</li>
+      <li><strong>副本种子重复</strong>：在环境构造函数中写死随机种子。症状是各副本轨迹高度相似，探索收益消失。修复：种子经 reset 传入，构造函数中不预设随机状态。</li>
+      <li><strong>碎片长度与批次不整除</strong>：碎片乘总环境数无法拼出训练批次。症状是日志出现批次补齐提示，采样节奏抖动。修复：取 "auto" 或手工选择能整除的组合。</li>
+      <li><strong>评估沿用训练并行度</strong>：评估进程与训练进程争抢核心，症状是评估轮次的迭代耗时变长。修复：单独设置评估并行度，取训练进程数的三分之一到一半。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>8 个采样进程、每进程 4 个副本，单副本步频 4000 步每秒，估算环境侧最大样本产出；学习侧每轮训练 8000 样本耗时 0.8 秒，判断瓶颈在哪一侧。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>环境侧上限约 32×4000=128000 样本每秒，学习侧需求约 10000 样本每秒，采样供给远超需求，训练周期由学习阶段决定。</div></details>
+      </li>
+      <li>把 num_envs_per_env_runner 从 4 改为 8，预测 sample_throughput 与进程内存占用的变化方向，并说明何时收益开始衰减。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>样本吞吐上升但斜率渐缓，内存近似翻倍；当环境侧供给超过学习侧需求或单核计算饱和时，继续加副本不再缩短迭代时间。</div></details>
+      </li>
+      <li>推导固定开销摊薄模型：说明自动包装场景下吞吐上界为何无法通过增大副本数突破单核计算上限。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>吞吐 = B/(t + c/B)，B 增大时 c/B 趋近零，t 项不变，上界为 1/t 乘以批量宽度带来的并行度，单核计算量本身不减少。</div></details>
+      </li>
+      <li>设计对比实验：总环境数固定为 32，比较 32×1、16×2、8×4、4×8 四种组合的 sample_throughput 与迭代耗时，给出选择建议。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>进程数越多通信与调度开销越大，副本数越多单核计算越饱和；记录每轮迭代的采样耗时与学习耗时，按最小值判断组合优劣。</div></details>
+      </li>
+      <li>为支持批量仿真的物理引擎设计原生向量化方案：说明与自动包装在计算路径上的差别，以及需要向 RLlib 暴露的接口要素。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>原生方案把仿真循环收进引擎内部一次调用，省去逐副本 Python 调用；需要批量空间声明、批量 reset 与 step、按副本的状态重启语义。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>向量化把多个环境副本的步进合并为批量调用，摊薄解释器与调度层的固定开销。</li>
+      <li>两类并行度相乘构成总环境数：进程数扩展核心，副本数放大单核吞吐。</li>
+      <li>自动包装在副本数大于 1 时生效；自定义向量环境需要批量维度的空间声明与批量 reset/step。</li>
+      <li>吞吐上界由单核计算与学习侧消耗共同决定，供给超过需求后继续加副本收益为零。</li>
+      <li>内存随总环境数线性增长，种子由调度层分配，环境内部不得固定随机状态。</li>
+      <li>下一章进入采样器（Sampler）：把标准环境采样替换为自定义数据源的机制与接口。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch021.html">← 第 021 章：RLlib自定义环境与奖励设计</a>
+    <a class="next" href="ch023.html">第 023 章：RLlib自定义环境采样器 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

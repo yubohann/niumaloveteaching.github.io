@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第009章 Ray故障恢复与容错 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · Ray 基础与分布式编程</span>
+    <span class="sep">/</span>
+    <span>第 009 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · Ray 基础与分布式编程</div>
+    <h1>第 009 章：Ray故障恢复与容错</h1>
+    <p class="lead">训练跑得越久，遇到故障越是确定性事件。本章按"任务、对象、Actor、驱动"四类实体梳理失效行为与恢复手段，并把检查点设计成恢复机制的地基。</p>
+    <ul class="meta">
+      <li>主题：Ray 核心 / 容错机制与恢复设计</li>
+      <li>关键机制：血缘重建、重试策略、Actor 重启、检查点（Checkpoint）</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 008 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>建立失效分类学：应用异常、进程崩溃、节点失效、驱动终止、头节点失效五类故障的差异。</li>
+      <li>理解任务恢复的两条路径：系统级自动重试与血缘（Lineage）重建，以及两者的适用边界。</li>
+      <li>掌握 Actor 的容错配置：重启次数、任务重试、分离生命周期（Detached Lifetime），能解释重启后为什么会丢状态。</li>
+      <li>会设计检查点（Checkpoint）方案：频率、内容、原子写入与恢复路径。</li>
+      <li>能诊断三类问题：重试放大副作用、检查点损坏、依赖链重建失败。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>分布式训练里，故障是运行时间乘以节点数的必然产物：几十个节点连续运行数天，硬件失效、进程崩溃、外部服务抖动都会出现。<strong>容错设计的目标是把故障的代价从"训练从头再来"降到"回退若干轮"，故障无法消灭，代价可以压缩</strong>。</p>
+    <p>Ray 为不同实体提供了不同的恢复语义：无状态任务可以自动重试甚至从血缘重建，有状态 Actor 的重启则必须面对状态丢失的现实，对象存储中的结果在拥有者失效后的可用性也有明确边界。把这些语义逐个讲清，才能在训练代码里正确地放置检查点、设计幂等写入、编写恢复循环。</p>
+    <p>本章按实体分类展开：任务、对象、Actor、驱动与头节点，最后落到工程模式：检查点、幂等、监督循环，这些模式将在第 090 章的容错策略中再次升级。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 失效分类：五类故障的边界</h3>
+    <table>
+      <tr><th>故障类型</th><th>触发情形</th><th>默认行为</th><th>恢复手段</th></tr>
+      <tr><td>应用异常</td><td>函数体抛出异常</td><td>异常封装进对象引用，取回时抛出</td><td>应用层捕获处理，不自动重试</td></tr>
+      <tr><td>进程崩溃</td><td>工作进程被终止</td><td>任务标记失败</td><td>系统级重试（声明后）、血缘重建</td></tr>
+      <tr><td>节点失效</td><td>机器宕机或失联</td><td>该节点任务全部失败</td><td>心跳检测、任务重建、自动缩放补齐节点</td></tr>
+      <tr><td>驱动终止</td><td>主程序退出或崩溃</td><td>依赖驱动持有的 Actor 与对象被回收</td><td>分离生命周期、集群内托管驱动</td></tr>
+      <tr><td>头节点失效</td><td>控制面所在机器故障</td><td>全局状态失去协调</td><td>检查点重启、编排层重建集群</td></tr>
+    </table>
+    <p>这张表最重要的信息是<strong>异常与崩溃的恢复责任不同</strong>：应用异常属于业务语义，运行时无法判断重试是否安全；系统崩溃导致的中断属于基础设施事件，运行时默认按任务无状态假设进行重试。把二者混为一谈的设计，要么让该重试的中断直接失败，要么让不该重试的副作用重复执行。</p>
+    <p>把各实体的"损失口径"与"耗时口径"分开记录，才能给恢复目标定量：</p>
+    <table>
+      <tr><th>实体</th><th>恢复手段</th><th>数据损失口径</th><th>恢复耗时口径</th></tr>
+      <tr><td>任务</td><td>系统级重试</td><td>无，重算得到等价结果</td><td>单任务时长</td></tr>
+      <tr><td>对象</td><td>血缘重建</td><td>无，结果等价</td><td>依赖链重算总时长</td></tr>
+      <tr><td>Actor</td><td>重启加检查点加载</td><td>距最近检查点的状态</td><td>构造加加载时长</td></tr>
+      <tr><td>驱动</td><td>作业重启加检查点</td><td>距最近检查点的工作量</td><td>作业重新拉起时长</td></tr>
+      <tr><td>头节点</td><td>编排层重建集群</td><td>控制面增量状态</td><td>受编排平台重建速度约束</td></tr>
+    </table>
+    <p>允许丢失的轮数与可接受的恢复时长一旦写明，检查点频率与重试上限就有了推导依据，量化的写法在第 5 小节给出。</p>
+
+    <h3>2. 任务与对象：重试加血缘</h3>
+    <p>第 004 章已经介绍过血缘（Lineage）：每个对象记录产生它的任务与输入引用，节点失效导致对象丢失时，系统沿依赖链重算。与血缘配套的是重试上限参数，例如 <code>max_retries</code> 声明任务在系统级失败后的重试次数。<strong>血缘重建的隐含前提是任务无副作用且结果由输入唯一决定</strong>：若任务在外部系统写了数据，重算会产生重复写入。</p>
+    <div class="formula">
+      重建代价 ≈ 依赖链上所有任务重算时间之和
+      <span class="note">链越长代价越高；检查点与中间物化用于截断链长</span>
+    </div>
+    <p>对象层面还有一条容易忽略的规则：对象的生命周期由拥有者（Owner）进程的账目管理，通常为创建它的驱动进程或 Actor。拥有者进程退出后，它名下对象的可访问性随之变化，<strong>对象存储里的字节不等于持久化备份</strong>。需要跨进程、跨会话保留的数据，必须显式落盘或写入外部存储，并接受副本机制的约束。</p>
+
+    <h3>3. Actor：重启与状态重建</h3>
+    <p>Actor 的默认容错配置是不重启：进程崩溃即实体消失，后续调用失败。可以通过参数声明重启策略，语义要点如下：</p>
+    <ul>
+      <li><strong>重启是"重新构造"</strong>：重启触发 <code>__init__</code> 再执行一遍，实例变量回到初始值。累积的采样进度、缓冲区内容不会自动恢复。</li>
+      <li><strong>状态恢复是应用责任</strong>：正确的模式是 Actor 定期把状态写入检查点，<code>__init__</code> 时尝试加载最新检查点，实现"重启即续跑"。</li>
+      <li><strong>任务重试与 Actor 重启是两套参数</strong>：方法调用失败的重投递由各自的重试参数控制，不要混用。</li>
+    </ul>
+    <p>对于作为长期服务的 Actor（需要独立于驱动进程存活），可以使用分离生命周期（Detached Lifetime）并赋予名称，此后它的存活与任何持有者无关，靠显式终止或命名空间管理来结束。<strong>分离生命周期改变了责任主体：没有了驱动的自动回收，遗忘的分离 Actor 会长期占用资源</strong>，需要纳入命名与清理规范。</p>
+
+    <h3>4. 检查点：恢复机制的通用地基</h3>
+    <p>所有恢复路径最终汇聚到检查点：任务重试依赖输入可重放，Actor 重启依赖状态可重建，作业重启依赖进度可续跑。设计检查点要回答四个问题：</p>
+    <ol>
+      <li><strong>存什么</strong>：模型权重与优化器状态是必需项；随机数状态决定训练轨迹可复现性；环境进度决定采样从哪里继续。</li>
+      <li><strong>存多频</strong>：频率与丢失工作量成反比，与写入开销成正比。训练一轮耗时越长，检查点间隔应越小（以轮为单位）。</li>
+      <li><strong>怎么写</strong>：先写临时文件再原子重命名，避免写入中途崩溃留下半个文件；并发写入者用文件名或目录隔离。</li>
+      <li><strong>怎么用</strong>：启动流程统一为"有检查点则加载、无则初始化"，让恢复与首次启动走同一条路径，减少分支差异。</li>
+    </ol>
+    <p>这四条构成后续所有训练脚本的固定骨架。RLlib 的 <code>save()</code>、Tune 的试验恢复、Serve 的版本回退都在这个骨架上实现。</p>
+
+    <h3>5. 数值算例：检查点间隔的最优化与重试放大的副作用</h3>
+    <p>把检查点频率问题写成可求极小的代价函数。设单轮训练耗时 t = 120 秒，一次检查点写入耗时 c = 15 秒，故障按每轮 λ = 0.02 的概率随机发生（平均每 50 轮一次）。检查点间隔为 k 轮时，故障点距最近检查点平均 k ÷ 2 轮，期望丢失工作量折算为 λ × k × t ÷ 2 秒/轮；每个检查点的写入开销摊到每轮为 c ÷ k。总代价对 k 求极小，得最优间隔：</p>
+    <div class="formula">
+      k* = 根号(2c ÷ (λ t)) = 根号(2 × 15 ÷ (0.02 × 120)) ≈ 3.5 轮
+      <span class="note">检查点写入越贵（c 越大）间隔越长；故障越频繁（λ 越大）间隔越短</span>
+    </div>
+    <table>
+      <tr><th>间隔 k（轮）</th><th>期望丢失折算（秒/轮）</th><th>写入开销折算（秒/轮）</th><th>合计</th></tr>
+      <tr><td>1</td><td>1.2</td><td>15.0</td><td>16.2</td></tr>
+      <tr><td>3.5（最优）</td><td>4.2</td><td>4.3</td><td>8.5</td></tr>
+      <tr><td>10</td><td>12.0</td><td>1.5</td><td>13.5</td></tr>
+      <tr><td>50</td><td>60.0</td><td>0.3</td><td>60.3</td></tr>
+    </table>
+    <p>代入核对最优行：丢失项 0.02 × 3.5 × 120 ÷ 2 = 4.2 秒/轮，写入项 15 ÷ 3.5 = 4.3 秒/轮，两项在最优间隔处大致相等（极值点处两项导数互相抵消），合计约 8.5 秒/轮。敏感性同样可算：写入耗时升到 60 秒时 k* 升为约 7 轮，故障率翻倍到 0.04 时 k* 降为 2.5 轮。<strong>平稳期把间隔设得过密（k = 1）反而最贵，写入开销全量叠加</strong>，这与"检查点越勤越安全"的直觉相反，练习 5 的推导与此处模型一致。</p>
+    <p>重试放大的副作用可以定量。设任务有 p = 0.3 的概率因瞬时故障失败，最多尝试 4 次（首次加 3 次重试）。期望尝试次数为 (1 − p<sup>4</sup>) ÷ (1 − p) = (1 − 0.0081) ÷ 0.7 ≈ 1.417，即每个逻辑任务平均多出 0.417 次重复执行；按 100 万任务规模折算约 41.7 万次重复写入。零副作用要求不现实，正确目标是让副作用可安全重复：<strong>外部写入改成"临时路径加原子替换"或带幂等键的覆盖写之后，重复执行只浪费算力，不污染数据</strong>。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>为训练作业设计容错方案的步骤：</p>
+    <ol>
+      <li><strong>列出有状态实体</strong>：逐一点名（采样 Actor、回放缓冲、训练进程、驱动），标注各自状态的体积与重建代价。</li>
+      <li><strong>给每类实体定恢复目标</strong>：允许丢失的工作量上限（以轮数为单位），由它反推检查点频率与重试上限。</li>
+      <li><strong>设计幂等写入</strong>：所有外部写入采用"临时路径加原子替换"，重试不产生重复副作用。</li>
+      <li><strong>搭监督循环</strong>：驱动进程对关键实体做存活检查，失效时按"重建、加载检查点、续跑"三步恢复，并限制总重试次数防止故障循环。</li>
+      <li><strong>演练验证</strong>：主动终止进程与节点，验证恢复路径真实可用；未经验证的恢复流程等同于不存在。</li>
+    </ol>
+    <p>演练分两级执行。进程级演练向某个采样 Actor 对应的工作进程发送终止信号，观察监督循环是否重建实例、检查点是否把进度接回；节点级演练停掉一台工作节点，核对缩放器补齐容量、受影响对象是否触发血缘重建。演练要在测试环境周期性重复，因为恢复路径会随代码演进悄悄失效：新加入的状态变量没有写进检查点、新引入的副作用破坏了幂等性，都只有在真演练中才会暴露。</p>
+    <table>
+      <tr><th>参数</th><th>典型取值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>max_retries（任务）</td><td>2–4</td><td>系统级失败重试上限</td><td>覆盖瞬时故障，避免掩盖持续性错误</td></tr>
+      <tr><td>max_restarts（Actor）</td><td>2–4</td><td>重启上限</td><td>超过说明故障系统性，应终止并告警</td></tr>
+      <tr><td>检查点间隔</td><td>每 10–50 轮</td><td>丢失工作量上界</td><td>按单轮耗时与写入开销折中</td></tr>
+      <tr><td>监督循环重试</td><td>3–5 次后放弃</td><td>防止故障循环</td><td>重试间隔可指数退避</td></tr>
+    </table>
+    <div class="box tip">
+      <span class="box-title">与上一章的差异点</span>
+      <p>第 008 章讨论"资源不够时加机器"，本章讨论"机器或进程失效后怎么补"。自动缩放补齐的是容量，血缘重算与检查点补齐的是数据与状态，两者在节点失效场景中协同工作：容量由缩放器恢复，状态由恢复流程恢复。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>以下片段采用 Ray 2.x 时期的通用写法；接口随版本演进，以对应版本官方文档为准。</p>
+    <p><strong>片段 1：任务重试与异常边界</strong></p>
+    <pre class="code"><code>import ray
+import random
+
+ray.init(num_cpus=4)
+
+@ray.remote(num_cpus=1, max_retries=3)
+def fetch_remote_chunk(url_id):
+    """模拟读取远端数据：瞬时故障抛异常，业务错误抛出不同异常。"""
+    if random.random() &lt; 0.4:
+        # 瞬时故障：网络抖动。注意异常类型用于区分可重试与不可重试
+        raise ConnectionError(f"chunk {url_id} transient failure")
+    if url_id &lt; 0:
+        raise ValueError("invalid url id")     # 业务错误：重试无意义
+    return url_id * 10
+
+# 系统级重试由 max_retries 兜底；业务错误应在应用层判定并处理
+results, failed = [], []
+for cid in range(8):
+    try:
+        results.append(ray.get(fetch_remote_chunk.remote(cid), timeout=30))
+    except ValueError as e:
+        failed.append((cid, str(e)))
+print("成功:", len(results), "业务失败:", failed)</code></pre>
+    <p>解读：这段代码划出了两层防线。<strong>系统级防线</strong>由 <code>max_retries</code> 与血缘重建负责，覆盖进程崩溃、节点失效这类与业务无关的中断。<strong>应用级防线</strong>由调用方的异常分类负责：读取超时、校验不符这类需要业务判断的情况，在 <code>ray.get</code> 外层按异常类型决定重试、跳过还是终止。把两类异常混用会让重试逻辑失控，例如对参数错误反复重试三次再失败。<code>timeout</code> 参数是另一道保险：等待超时后驱动进程取回控制权，可以决定放弃或重投，避免无限等待。</p>
+
+    <p><strong>片段 2：带检查点恢复的 Actor</strong></p>
+    <pre class="code"><code>import os
+import tempfile
+import pickle
+import ray
+
+ray.init(num_cpus=4)
+
+CKPT_DIR = tempfile.mkdtemp(prefix="actor_ckpt_")
+
+@ray.remote(max_restarts=3, max_task_retries=2)
+class TrainWorker:
+    def __init__(self, worker_id):
+        self.worker_id = worker_id
+        self.step = 0
+        # 构造时统一走恢复路径：有检查点则续跑，没有则从零开始
+        self.ckpt_path = os.path.join(CKPT_DIR, f"worker_{worker_id}.pkl")
+        if os.path.exists(self.ckpt_path):
+            with open(self.ckpt_path, "rb") as f:
+                self.step = pickle.load(f)["step"]
+
+    def train(self, n_rounds):
+        for _ in range(n_rounds):
+            self.step += 1
+        return self.step
+
+    def save_checkpoint(self):
+        # 原子写入：先写临时文件再替换，防止半截文件污染恢复流程
+        tmp = self.ckpt_path + ".tmp"
+        with open(tmp, "wb") as f:
+            pickle.dump({"step": self.step}, f)
+        os.replace(tmp, self.ckpt_path)
+        return self.step
+
+worker = TrainWorker.remote(0)
+for round_id in range(3):
+    worker.train.remote(10)
+    if round_id % 1 == 0:
+        print("检查点步数:", ray.get(worker.save_checkpoint.remote()))</code></pre>
+    <p>解读：<code>__init__</code> 里的恢复逻辑是整个模式的核心：<strong>重启后的新实例自动加载最新检查点，外部完全感知不到中间发生过重启</strong>。检查点内容只有步数，真实训练中扩展为模型权重、优化器状态与随机数状态。原子写入用 <code>os.replace</code> 实现，替换操作在同一文件系统内是原子的，恢复流程永远读到完整文件。<code>max_task_retries</code> 让方法调用在 Actor 重启后可以重投，与 <code>max_restarts</code> 配合形成"重启加续调"的完整闭环；两个参数设得过大则会掩盖系统性故障，取值应保持在个位数量级。</p>
+
+    <p><strong>片段 3：驱动端监督循环</strong></p>
+    <pre class="code"><code>import ray
+import time
+
+ray.init(num_cpus=4)
+
+@ray.remote
+class Sampler:
+    def __init__(self, seed):
+        self.seed = seed
+        self.produced = 0
+
+    def produce(self, n):
+        self.produced += n
+        return self.produced
+
+def run_with_supervision(max_attempts=3):
+    sampler = Sampler.remote(seed=42)     # 首次创建：走正常路径
+    last_ok = 0
+    for attempt in range(max_attempts):
+        try:
+            for _ in range(4):
+                last_ok = ray.get(sampler.produce.remote(1000))
+            return last_ok                 # 正常收敛：返回累计产量
+        except ray.exceptions.RayActorError as e:
+            # Actor 失效：重建实例并从最近进度重新出发
+            print(f"尝试 {attempt + 1} 失败: {e.__class__.__name__}")
+            sampler = Sampler.remote(seed=42)   # 重建后状态归零
+            time.sleep(2 ** attempt)            # 指数退避：给系统恢复时间
+    raise RuntimeError("超过重试上限，人工介入")
+
+print("最终产物:", run_with_supervision())</code></pre>
+    <p>解读：监督循环把"重建、重试、退避、上限"四件事收在一个函数里。<code>RayActorError</code> 是 Actor 失效的统一信号，捕获它比捕获具体底层异常更稳健。指数退避让瞬时性系统故障有时间自愈，同时避免重建风暴。<strong>重建后的状态归零问题必须正视</strong>：没有检查点的 Actor 恢复属于带损失的恢复，累积进度回到起点；真实训练中监督循环应与片段 2 的检查点模式组合，让重建从最新进度继续。超过重试上限后终止并告警，比无限重试更负责任：持续失败说明存在系统性病因，需要人工诊断。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>误以为 Actor 默认自动重启</strong>：默认配置下崩溃即消失，训练中途调用报失效错误。修复：显式声明重启与重试参数，并配套状态恢复逻辑。</li>
+      <li><strong>重试放大非幂等副作用</strong>：任务向外写过数据或发过消息，崩溃重试后重复执行。修复：外部写入改为幂等操作（临时文件加原子替换、带幂等键的写入）。</li>
+      <li><strong>检查点写入非原子</strong>：直接原地覆写文件，写入中途中断留下损坏文件，恢复时读到无效状态。修复：临时文件加原子替换；加载时校验完整性，损坏时回退上一版本。</li>
+      <li><strong>把对象存储当持久化备份</strong>：需要跨会话保留的结果留在对象存储，拥有者退出后被回收。修复：明确持久化的数据一律落盘或写入外部存储。</li>
+      <li><strong>无上限重试掩盖系统故障</strong>：重试次数设得过大，长期运行的作业在故障循环中空转。修复：重试上限保持个位数量级，配合退避与告警，超限即终止并保留现场。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把片段 1 的 <code>max_retries</code> 从 3 调到 0，预测瞬时故障下的成功数变化，解释系统级重试与血缘重建分别在什么条件下生效。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>重试归零后瞬时故障直接暴露为失败。重试覆盖进程崩溃与节点失效等系统中断；业务异常始终需要应用层判断。</div></details>
+      </li>
+      <li>预测题：片段 2 中若删除 <code>__init__</code> 的检查点加载逻辑，Actor 在第三次训练循环前被终止并重启，最终步数会发生什么变化？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>重启后回到零起点，累积步数出现回落或停滞。这正是"重启可恢复"与"重启丢状态"的差别，检查点加载决定恢复质量。</div></details>
+      </li>
+      <li>设计题：为"采样 Actor 池加训练进程"的作业设计一套检查点方案：条目清单、写入频率、原子性与回退策略，并说明每个条目丢失后的重建代价。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>模型权重与优化器状态为核心条目，采样进度与环境随机数状态决定恢复起点；全部走临时文件加原子替换，保留最近两份用于回退。</div></details>
+      </li>
+      <li>分析：某作业把 <code>max_task_retries</code> 设为 100，节点故障后作业表面上持续运行，但产出停滞。解释重试参数过大与故障循环的关系，并给出诊断信号。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>方法不断重投但依赖的资源或 Actor 持续失效，形成空转。诊断信号：重试计数指标持续上升而进度指标不动，两者背离即系统故障。</div></details>
+      </li>
+      <li>推导：设单轮训练耗时 t，检查点写入耗时 c，故障在随机时刻等概率发生。写出期望丢失工作量与检查点间隔 k 的关系式，并求使期望总代价最小的间隔量级。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>期望丢失约 k·t/2 轮的工作量；每 k 轮付出一次写入代价 c/k 的摊薄成本。两者之和对 k 求极小，得到 k 与 c 的平方根关系，检查点越贵间隔越大。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>五类失效的恢复责任不同：应用异常交业务判断，系统中断可自动重试，节点与头节点失效依赖检测与外部重建。</li>
+      <li>任务恢复靠重试与血缘重建，隐含前提是幂等；<strong>对象存储不是持久化备份，跨会话数据必须显式落盘</strong>。</li>
+      <li>Actor 重启是重新构造，状态恢复是应用责任；检查点加载写进 <code>__init__</code>，让恢复与首次启动同路径。</li>
+      <li>检查点四问（存什么、多频、怎么写、怎么用）是全部恢复流程的骨架，原子写入防止损坏。</li>
+      <li>下一章转向生态全景：<strong>Ray 与机器学习生态集成概览</strong>，看数据、训练、调优、服务各库的分工与组合方式。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch008.html">← 第 008 章：Ray资源管理与自动缩放</a>
+    <a class="next" href="ch010.html">第 010 章：Ray与机器学习生态集成概览 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

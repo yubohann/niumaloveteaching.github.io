@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第025章 PPO的异步优势更新 | 深度强化学习课程 · PPO、SAC 与多智能体系统</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · 策略梯度与 PPO</span>
+    <span class="sep">/</span>
+    <span>第 025 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · 策略梯度与 PPO</div>
+    <h1>第 025 章：PPO的异步优势更新</h1>
+    <p class="lead">去掉同步屏障：采集线程各自用参数快照采数据、本地算好 GAE 就投递，learner 从有界队列持续消费。用"陈旧度、丢弃、队列等待"三把尺子看清异步的收益与代价。</p>
+    <ul class="meta">
+      <li>主题：异步 actor-learner / 陈旧度控制</li>
+      <li>关键公式：staleness = v<sub>now</sub> − v<sub>snap</sub></li>
+      <li>预计学时：70 分钟</li>
+      <li>前置章节：第 024 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解同步数据并行与异步 actor-learner 的本质区别：屏障 vs 版本化数据流。</li>
+      <li>实现"参数快照 + 有界队列 + 陈旧度丢弃"的异步采集管线（线程版教学简化）。</li>
+      <li>理解异步优势更新：worker 在本地计算 GAE，learner 只负责网络更新。</li>
+      <li>掌握陈旧度（staleness）、丢弃率、队列等待三个指标，并会调节 chunk / 队列容量 / 丢弃阈值。</li>
+      <li>能解释为什么 PPO 的裁剪比率让"轻度陈旧"的数据仍然可用。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 024 章的同步方案有个结构性缺陷：<strong>所有环境必须等最慢的那个</strong>。真实集群里机器性能、网络延迟参差不齐，同步屏障会把整体节奏拖到最慢节点的水平；环境本身如果有的回合长有的回合短，等待还会更明显。</p>
+    <p>异步方案把"采集"和"更新"彻底解耦：每个采集器拿一份当前参数快照就出发，采完随手算好优势、把数据包投进队列；learner 不等任何人，谁的数据先到就先学。代价是数据可能来自"几个版本之前"的策略，这就是<strong>陈旧度</strong>问题。本章用线程 + 有界队列搭一条教学级异步管线，重心放在把异步系统的三个核心旋钮（chunk 大小、队列容量、陈旧度上限）变成可测量、可调参的对象上；单进程受 GIL 限制，速度本身不是本章的目标。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 陈旧度：异步系统的第一指标</h3>
+    <p>learner 每更新一次，参数版本号 v 加一。采集器在版本 v<sub>snap</sub> 上采出的数据包，被消费时 learner 版本已是 v<sub>now</sub>，定义：</p>
+    <div class="formula">
+      staleness = v<sub>now</sub> − v<sub>snap</sub>
+      <span class="note">0 表示数据完全新鲜；越大表示更新用的是越旧的行为策略数据</span>
+    </div>
+    <p>陈旧度不可能为负（数据不会来自未来），它是异步系统一切权衡的度量单位：吞吐想高就要容忍大 staleness，训练质量想稳就要压低它。</p>
+
+    <div class="box key">
+      <span class="box-title">数值算例：队列动力学与陈旧度的来源</span>
+      <p>用本章参数做一次流量估算：8 个 worker、chunk 256 步、每 chunk 采集约 0.2 s，生产速率约 40 包/秒；learner 每次更新消费 8 包、更新耗时按 0.5 s 计，消费速率 16 包/秒。生产比消费快 24 包/秒，多出来的只能靠两种方式消化：队列塞满后的阻塞（背压，生产者被掐住）与超龄丢弃。这就是"异步系统里陈旧度不可避免"的算术形态：只要生产快于消费，在途数据就会变旧。</p>
+      <p>队列等待可以按 Little 定律估算：平均队长 4、消费速率 16 包/秒时，一个包的平均等待约 4/16 = 0.25 s；在这 0.25 s 里 learner 大约完成半次更新（每次 0.5 s），于是平均陈旧度落在 0.5～1 的量级，与实验读数 0.2～1.5 吻合。想压低陈旧度，要么减慢生产（chunk 更大、worker 更少），要么加快消费（批更小、更新更快），要么缩短等待（队列更浅）；三个旋钮的作用在这条估算里各自可见。</p>
+    </div>
+
+    <h3>2. 为什么 PPO 能吃掉一部分陈旧数据</h3>
+    <p>PPO 的比率本身就是一个隐式的重要性纠正：数据由快照策略 π<sub>old</sub> 产生，更新时用当前策略重新评价同一批 (s, a)：</p>
+    <div class="formula">
+      r<sub>t</sub> = π<sub>θ_new</sub>(a<sub>t</sub>|s<sub>t</sub>) / π<sub>θ_old</sub>(a<sub>t</sub>|s<sub>t</sub>)，&nbsp; L = 𝔼[ min(r<sub>t</sub>Â<sub>t</sub>, clip(r<sub>t</sub>, 1±ε)·Â<sub>t</sub>) ]
+    </div>
+    <p>当数据来自"几个版本前"的策略时，比率会自然偏离 1 并修正分布差异；裁剪把过大的修正封顶，防止旧数据把策略带偏。但这份容忍<strong>不是无限的</strong>：staleness 越大，比率方差越大、被裁剪的比例越高，梯度信号被大量浪费。因此工程上要么靠<strong>背压</strong>限制在途数据量，要么直接<strong>丢弃</strong>过旧的数据包。</p>
+    <p>容忍度可以和 KL 预算对齐着算：设每次更新让策略移动的平均近似 KL 约 0.015（target_kl=0.02 的常规水平），陈旧 k 个版本的数据与当前策略的分布距离约为 k×0.015。k=2 时约 0.03，恰好等于 KL 早停阈值 1.5×0.02；所以 max_staleness=2 的含义是"数据仍在信任域的边缘之内"。阈值放到 5 以上，距离约 0.075，远超信任域，比率大面积越界、被裁剪吃掉，更新效率会明显下滑。这条换算解释了默认值为什么取 2，也给调参一个起点：先量本机每次更新的实际 KL，再定阈值。</p>
+    <p>还要区分平均陈旧度与陈旧度分布：平均值 0.2～1.5 的读数背后，尾部偶尔会出现 5 以上的包（突发流量、锁竞争、更新变慢），破坏主要由尾部承担。max_staleness 的作用就是把尾巴剪掉，因此评价它要同时看两列：丢弃数与丢弃后的平均陈旧度。丢弃率接近 0，说明阈值没起作用、可以收紧；丢弃率长期居高，说明生产远快于消费，应先去调 chunk 大小或队列容量；继续放宽阈值只会让更多旧数据留在系统里。</p>
+
+    <h3>3. 异步优势更新的两条流水线</h3>
+    <p>本章把 Actor-Critic 的责任拆开：<strong>worker（actor 侧）</strong>持快照网络，采集 chunk 步、就地完成 bootstrap 与 GAE，产出"观测/动作/logp/优势/回报"五件套；<strong>learner（critic + 更新侧）</strong>把多个数据包拼成一批（默认 2048 样本），跑裁剪损失并递增版本号。这一结构对应 A3C / IMPALA 系列的核心思想：<strong>优势估计与采样并行化，学习集中化</strong>。</p>
+
+    <h3>4. 三个控制陈旧度的旋钮</h3>
+    <ul>
+      <li><strong>chunk 大小</strong>：每次采集的步数。越大，吞吐越高（减少调度），但采集中途参数变化被累积得越多；</li>
+      <li><strong>队列容量</strong>：<code>Queue(maxsize)</code> 让投递端在满时阻塞，这是背压（backpressure），防止旧数据无限堆积；</li>
+      <li><strong>陈旧度上限</strong>：消费时若 staleness 超过阈值直接丢弃，用数据损耗换训练质量。</li>
+    </ul>
+
+    <h3>5. 三个指标的读法</h3>
+    <table>
+      <tr><th>指标</th><th>含义</th><th>本章典型区间</th><th>异常时的排查顺序</th></tr>
+      <tr><td>平均陈旧度</td><td>消费时刻与出生版本的差</td><td>0.2～1.5</td><td>队列等待 → 更新耗时 → chunk 大小</td></tr>
+      <tr><td>丢弃数</td><td>超龄被丢的数据包</td><td>随 max_staleness 单调变化</td><td>接近 0 说明阈值偏松；居高说明生产过剩</td></tr>
+      <tr><td>队列等待</td><td>入队到取出的间隔</td><td>0.02～0.2 s</td><td>升高说明 learner 忙不过来或队列太深</td></tr>
+    </table>
+    <p>三列要合起来读：陈旧度是结果，丢弃与等待是原因侧的两扇窗口。只看陈旧度会误判（丢弃多也会把平均值压低），三列一起看才能区分"系统健康"与"靠丢数据维持表面新鲜"。再补一个读表习惯：把三列连同"有效更新数"一起导出，丢弃率高时有效更新数会明显低于名义值，用有效更新数对齐两臂的训练进度，比较才公平。</p>
+
+    <h3>6. 线程版的天花板</h3>
+    <p>单进程线程受 GIL 与参数锁限制：快照与更新共用一把锁，更新期间 worker 无法取新快照，吞吐提升有限，甚至可能低于同步版本。请把本章当作<strong>数据流与指标的教学实现</strong>：真部署时 worker 会换成独立进程或独立机器，锁换成参数服务器或共享内存，而陈旧度、背压、丢弃这三件事一字不变。</p>
+    <p>把 GIL 的账算细一点：torch 的大算子计算期间会释放 GIL，但环境步进、numpy 搬运、Python 循环都在解释器里排队，CPU 只有一块时，线程化并不创造算力，只是把等待时间重新分配。另外，快照锁的占用时长等于克隆 <code>state_dict</code> 的时间（小网络约几毫秒），相对 0.5 s 的更新占比不到 1%，锁竞争不是主要瓶颈；真正拖慢的是"更新期间 worker 拿不到新快照"这个串行化窗口。这也解释了实测"async 吞吐常打平甚至略慢"：收益被 GIL 与串行窗口吃掉了，留下的是数据流结构的价值。</p>
+    <p>异步还有一条实验方法论上的注意事项：<strong>线程调度顺序不确定，数据包的到达顺序、每批的组成都带随机性</strong>，固定种子只能保证单线程内的可复现，整体运行不可逐位复现。报告异步实验结果时，建议每个配置跑三次、报中位数与极差，结论只建立在跨运行稳定的差异上；把"某一次 async 更快"当结论，是这类实验最常见的误判来源。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+
+    <h3>模块划分</h3>
+    <table>
+      <tr><th>组件</th><th>职责</th><th>与第 024 章的关系</th></tr>
+      <tr><td><code>SingleEnv</code></td><td>一个环境 + 当前观测 + 累计回报；<code>collect()</code> 采一段并就地算 GAE</td><td><strong>新增</strong>：把"采样+优势"打包成数据包</td></tr>
+      <tr><td><code>Learner</code></td><td>全局网络 + 优化器 + 版本号；<code>publish()</code> 发快照、<code>apply()</code> 更新</td><td><strong>新增</strong>：参数服务器的最小形态</td></tr>
+      <tr><td><code>AsyncWorker</code></td><td>线程：取快照 → 采 chunk → 投队列 → 报步数</td><td><strong>新增</strong>：异步采集器</td></tr>
+      <tr><td><code>run_sync</code> / <code>run_async</code></td><td>两条管线的完整训练循环与指标统计</td><td><strong>重构</strong>：024 的同步逻辑保留为对照</td></tr>
+      <tr><td><code>finish_arm</code></td><td>评估、保存、汇总（含陈旧度/丢弃/队列等待）</td><td><strong>扩展</strong>：新增异步指标</td></tr>
+    </table>
+
+    <h3>关键超参数</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用与取值理由</th></tr>
+      <tr><td><code>--workers</code></td><td>8</td><td>采集线程数；与 024 的 8 环境对齐</td></tr>
+      <tr><td><code>--chunk-steps</code></td><td>256</td><td>每个数据包的步数；太小投递频繁、太大数据变旧</td></tr>
+      <tr><td><code>--steps-per-update</code></td><td>2048</td><td>learner 凑够多少样本更新一次（约 8 个包）</td></tr>
+      <tr><td><code>--queue-size</code></td><td>4</td><td>有界队列容量：背压的核心，防止旧数据堆积</td></tr>
+      <tr><td><code>--max-staleness</code></td><td>2</td><td>超过即丢弃；设为 0 可观察"只吃新鲜数据"的代价</td></tr>
+      <tr><td><code>--max-steps</code></td><td>80000（每臂）</td><td>两臂总采集预算一致，吞吐才可比</td></tr>
+    </table>
+
+    <h3>数据流</h3>
+    <p>异步臂的完整链路：<strong>worker 取快照</strong>（锁内克隆参数 + 版本号）→ <strong>本地采集 chunk 并算 GAE</strong>（段尾用同一快照 bootstrap）→ <strong>投递有界队列</strong>（满则阻塞重试，背压）→ <strong>learner 取包</strong>：算陈旧度，超限丢弃，否则放入 pending 缓冲 → <strong>凑够一批就 apply</strong>：拼接、更新、版本号 +1 → 达标或预算耗尽后收尾。<code>sync</code> 臂复用同样的 <code>SingleEnv.collect</code> 与 <code>Learner</code>，只是由主线程轮流采集、全部到齐才更新，作为对照。</p>
+
+    <h3>与第 024 章的差异点</h3>
+    <ul>
+      <li><strong>调度方式</strong>：024 是所有环境到齐后更新；025 改成"谁先到谁先入队、凑批即更新"。</li>
+      <li><strong>数据带版本</strong>：每个数据包记录快照版本号；新增陈旧度统计与超限丢弃。</li>
+      <li><strong>并行原语</strong>：从单线程多环境变成"多线程 + 队列 + 锁"；新增背压概念。</li>
+      <li><strong>指标</strong>：新增平均陈旧度、丢弃数、队列等待时间三列，取代 024 的加速比叙事。</li>
+    </ul>
+
+    <div class="box key">
+      <span class="box-title">快照与更新必须互斥</span>
+      <p><code>Learner.publish()</code> 与 <code>Learner.apply()</code> 共用一把 <code>threading.Lock</code>：前者锁内克隆 <code>state_dict()</code>，后者锁内完成整个 PPO 更新。少了这把锁，worker 可能读到"更新到一半"的参数，训练会出现无法复现的随机崩坏，这是异步实现的第一号红线。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：Learner，最小参数服务器</strong></p>
+    <pre class="code"><code>class Learner:
+    def __init__(self, obs_dim, act_dim, args, device):
+        self.net = ActorCritic(obs_dim, act_dim).to(device)
+        self.optimizer = torch.optim.Adam(self.net.parameters(), lr=args.lr)
+        self.version = 0
+        self.lock = threading.Lock()   # 保护参数快照与更新不互相踩踏
+
+    def publish(self):
+        """返回 (当前版本号, 参数快照)；worker 拿到后立刻释放锁去采集。"""
+        with self.lock:
+            snapshot = {k: v.detach().clone() for k, v in self.net.state_dict().items()}
+            return self.version, snapshot
+
+    def apply(self, items):
+        """把若干个数据包拼成一批，做一次 PPO 更新，版本号 +1。"""
+        obs = np.concatenate([it["obs"] for it in items], axis=0)
+        act = np.concatenate([it["act"] for it in items], axis=0)
+        logp_old = np.concatenate([it["logp_old"] for it in items], axis=0)
+        adv = np.concatenate([it["adv"] for it in items], axis=0)
+        ret = np.concatenate([it["ret"] for it in items], axis=0)
+
+        d = self.device
+        batch = {
+            "obs": torch.as_tensor(obs, dtype=torch.float32, device=d),
+            "act": torch.as_tensor(act, dtype=torch.long, device=d),
+            "logp_old": torch.as_tensor(logp_old, dtype=torch.float32, device=d),
+            "adv": torch.as_tensor(adv, dtype=torch.float32, device=d),
+            "ret": torch.as_tensor(ret, dtype=torch.float32, device=d),
+        }
+        with self.lock:                    # 更新期间 worker 无法取快照，保证一致性
+            stats = ppo_update(self.net, self.optimizer, batch, self.args)
+            self.version += 1
+        return stats</code></pre>
+    <p>解读：<code>Learner</code> 是"参数服务器"的最小形态，只对外暴露两个方法。<strong>（1）</strong><code>publish()</code> 在锁内做 <code>detach().clone()</code> 深拷贝：detach 切断计算图、clone 隔离存储，worker 拿到的快照与全局网络再无共享内存。<strong>（2）</strong>版本号与快照在同一次加锁中返回，两者严格配对，若分两次拿，版本号可能对应不上参数。<strong>（3）</strong><code>apply()</code> 的锁粒度是<strong>整次 PPO 更新</strong>：宁可让 worker 短暂等待，也不允许"半新半旧"的参数被采走。这是吞吐与正确性之间刻意选择的保守方案。</p>
+
+    <p><strong>片段 2：AsyncWorker 的四步循环</strong></p>
+    <pre class="code"><code>    def run(self):
+        while not self.stop_event.is_set():
+            # 1) 取一份"当前最新参数"的快照，本次采集全程使用它
+            version, snapshot = self.learner.publish()
+            if self.local_net is None:
+                self.local_net = ActorCritic(
+                    self.state.obs_dim, self.state.act_dim).to(self.device)
+            self.local_net.load_state_dict(snapshot)   # 快照装进线程私有的网络
+
+            # 2) 采集一段 chunk，并在本地算 GAE（异步优势更新）
+            item, finished = self.state.collect(
+                self.local_net, self.args.chunk_steps, self.device,
+                self.args.gamma, self.args.lam)
+            item["version"] = version              # 数据包"出生版本"
+            item["put_time"] = time.time()
+            with self.counter_lock:
+                self.counter["ep_returns"].extend(finished)
+
+            # 3) 投递到有界队列；队列满则阻塞重试（背压）
+            while not self.stop_event.is_set():
+                try:
+                    self.q.put(item, timeout=0.2)
+                    break
+                except queue.Full:
+                    continue
+
+            # 4) 上报步数；达到预算就通知全体停下
+            with self.counter_lock:
+                self.counter["steps"] += self.args.chunk_steps
+                if self.counter["steps"] &gt;= self.args.max_steps:
+                    self.stop_event.set()</code></pre>
+    <p>解读：四步循环就是异步采集器的全部。<strong>（1）</strong>快照装进<strong>线程私有</strong>的 <code>local_net</code>：采集与 GAE 全程用这份冻结参数，worker 之间、worker 与 learner 之间没有任何共享张量的读写，这是异步正确性的前提。<strong>（2）</strong>数据包同时打上 <code>version</code>（出生版本，用于算陈旧度）和 <code>put_time</code>（入队时刻，用于算队列等待）。<strong>（3）</strong><code>q.put(..., timeout=0.2)</code> 是背压的落点：队列满时生产者被"掐住"，采得再快也无法把更多旧数据塞进系统。<strong>（4）</strong>计数用 <code>counter_lock</code> 保护；<code>&gt;= max_steps</code> 触发 <code>stop_event</code>，所有线程（包括 learner 主循环）看到它后开始收尾。</p>
+
+    <p><strong>片段 3：数据包里有什么，优势在 worker 端算</strong></p>
+    <pre class="code"><code>        # 段尾 bootstrap：用同一个快照网络估值（等价于"时间截断"处理）
+        obs_last = torch.as_tensor(self.obs, dtype=torch.float32, device=device).unsqueeze(0)
+        _, value_last = net(obs_last)
+        advantages, returns = compute_gae(
+            rew_buf, val_buf, term_buf, float(value_last.item()), gamma, lam)
+
+        item = {
+            "obs": np.asarray(obs_buf, dtype=np.float32),
+            "act": np.asarray(act_buf, dtype=np.int64),
+            "logp_old": np.asarray(logp_buf, dtype=np.float32),
+            "adv": advantages,          # 优势与回报已在本地算好
+            "ret": returns,
+            "n": chunk_steps,
+        }
+        return item, finished</code></pre>
+    <p>解读：这是 <code>SingleEnv.collect</code> 的收尾，也是"异步优势更新"名字的由来：<strong>GAE 不在 learner 端算，而在 worker 采完立刻算</strong>。<strong>（1）</strong>段尾 bootstrap 用同一个快照网络对当前观测估值，chunk 边界等价于一次"时间截断"，此处必须做 bootstrap，置零会截断未来的价值。<strong>（2）</strong>数据包是纯 numpy 的"五件套 + 样本数"：跨线程传递不携带任何 torch 计算图或共享存储，队列可以安全搬运。<strong>（3）</strong>优势一旦随包冻结，之后 learner 更新多少次都与它无关，这样 learner 的工作被压缩成纯网络更新，职责边界非常干净。</p>
+
+    <p><strong>片段 4：learner 主循环，陈旧度与丢弃</strong></p>
+    <pre class="code"><code>        item = q.get(timeout=0.2)
+        version_now = learner.version
+        staleness = version_now - item["version"]
+        if staleness &gt; args.max_staleness:
+            dropped += 1                     # 数据太旧：丢弃，保护训练质量
+            continue
+
+        queue_delay_log.append(time.time() - item["put_time"])
+        staleness_log.append(staleness)
+        pending.append(item)
+        pending_samples += item["n"]
+
+        if pending_samples &gt;= args.steps_per_update:
+            stats = learner.apply(pending)   # 凑满一批：更新并让版本号前进
+            update_idx += 1
+            pending = []
+            pending_samples = 0
+        if solved_at is None and len(all_returns) &gt;= 100 and \
+                np.mean(all_returns[-100:]) &gt;= args.target_reward:
+                solved_at = counter["steps"]</code></pre>
+    <p>解读：主循环把异步系统的三个指标全部显式化。<strong>（1）</strong><code>staleness = version_now - item["version"]</code>：出生版本与消费时刻版本的差，超限就丢弃，<code>dropped</code> 计数直接暴露"丢弃换质量"的代价。<strong>（2）</strong><code>queue_delay</code> 记录包从入队到被取出的等待：它升高说明 learner 忙不过来（或队列太深），是观察背压是否起效的窗口。<strong>（3）</strong><code>pending</code> 凑批（不做逐包更新）：小批量单包更新噪声太大，凑到 <code>steps_per_update</code>（约 8 个包）再拼批，让每批覆盖多个采集线程的数据，梯度更平滑。<strong>（4）</strong>注意日志里的 <code>all_returns</code> 是从共享计数器拷贝出来的，回合回报由 worker 线程写入，读时同样要拿锁。</p>
+    <p>还有一个容易被忽略的语义问题：<code>pending</code> 里的包可能来自不同快照版本，严格说这一批没有唯一的 π<sub>old</sub>，PPO 的"单策略"假设被打破。实践中的处理有三档：接受它，用 clip 兜底（本章做法，也是 IMPALA 一类系统的常态）；按版本分组、各自单独更新（更严格，但更新更碎）；或用 V-trace 之类带截断的重要性权重做显式纠正。理解这一点的价值在于：回答"异步为什么能工作"时，答案是"每次更新都在信任域约束下做近似校正"；理论上的完全精确在这里并不成立。</p>
+
+    <p>完整可运行脚本（附录）：<a href="../code/ch025.py" download>code/ch025.py</a></p>
+    <pre class="sh"><code>python code/ch025.py            # sync vs async：各 8 万步，CPU 约 2–5 分钟
+python code/ch025.py --quick    # 快速跑通：30–60 秒
+python code/ch025.py --arms async --max-staleness 0   # 零容忍，观察丢弃潮</code></pre>
+    <p>以实跑为准：<strong>async 平均陈旧度通常在 0.2～1.5 之间</strong>（背压 + 丢弃共同压住），学习曲线与评估成绩和 sync 同量级（典型 480～500）；<strong>吞吐未必更高</strong>，单进程线程受 GIL 与参数锁限制，两臂步/秒常打平甚至 async 略慢，这是教学实现的真实边界。稳定可复现的差异是异步指标本身：队列等待 0.02～0.2 s、丢弃数随 <code>--max-staleness</code> 单调变化。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>快照不加锁</strong>：在别的线程执行 <code>optimizer.step()</code> 的同时克隆 <code>state_dict()</code>，可能读到部分更新的参数，训练随机崩坏且无法复现。<strong>修复</strong>：克隆与更新共用一把锁。</li>
+      <li><strong>用无界队列</strong>：<code>Queue()</code> 不设上限时，采得快就跑得远，队列里可能积压几十个版本的旧数据，吞吐好看，训练实际在"考古"。<strong>修复</strong>：必须设置 maxsize 形成背压。</li>
+      <li><strong>数据包不带版本号</strong>：没有版本号就无法度量陈旧度、无法执行丢弃策略，异步系统失去唯一的质量旋钮。<strong>修复</strong>：数据包里加一个 <code>version</code> 字段，成本极低。</li>
+      <li><strong>忘记清理线程</strong>：daemon 线程不 join、环境不 close，进程退出时的资源释放顺序不可控。<strong>修复</strong>：用 <code>stop_event</code> + <code>join(timeout)</code> + <code>close()</code> 走完正常收尾流程。</li>
+      <li><strong>把 worker 的 GAE 理解成"用最新参数"</strong>：段尾 bootstrap 和优势递推用的是<strong>快照网络</strong>；用全局网络会在两线程间引入数据竞争，且破坏"一批数据只对应一个行为策略"的一致性。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>运行 <code>--arms async --max-staleness 0</code>，记录丢弃数与用时，和默认 <code>--max-staleness 2</code> 对比，解释为什么"零容忍"不可行。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>版本号在每次更新后加一，快照几乎不可能落在"当前版本"。看日志里的"丢弃"列与有效更新数的变化。</div></details>
+      </li>
+      <li>固定其他参数，把 <code>--chunk-steps</code> 分别设为 64 / 256 / 1024，观察平均陈旧度与平均队列等待的变化，找出本机上平衡的两档。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>chunk 越大，投递频率越低、队列越少堆积，但每个包在采集期间"变旧"的窗口更长。对比三组汇总表的陈旧度与吞吐。</div></details>
+      </li>
+      <li>把 <code>--queue-size</code> 设为 1 与 16 各跑一次：小队列如何通过背压压低陈旧度？大队列是否真的带来更高吞吐？<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>队列是消费者与生产者之间的缓冲：容量大能吸收突发，但旧包会在里面排队。观察"队列等待"与"丢弃"两列的联动。</div></details>
+      </li>
+      <li>给 worker 增加"本地连续采集"模式：一个数据包采完后不重新取快照，直接继续采下一个 chunk（相当于增大有效 chunk、降低锁竞争），对比陈旧度分布与吞吐。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>把快照动作从"每 chunk 一次"降为"每 K 个 chunk 一次"，K 用新参数控制。<code>staleness</code> 会上升，但参数锁的竞争显著减少。</div></details>
+      </li>
+      <li>在现有管线上实现"合并更新"：learner 累积两次包再一次性更新，比较吞吐与陈旧度，写下结论：本机环境下异步到底值不值得？<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>合并会降低更新频率、拉长每包等待。用 <code>time.perf_counter</code> 分别统计 worker 的采集时间、队列阻塞时间与 learner 的更新总时长，先定位瓶颈到底在采样、更新还是锁。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>异步的核心是解耦：worker 持快照采集并在本地算好优势，learner 用版本化数据流持续更新，不再等待屏障。</li>
+      <li>陈旧度是异步的第一指标；背压（有界队列）与丢弃（max_staleness）是控制它的两个旋钮，快照锁是正确性的底线。</li>
+      <li>PPO 的比率 + 裁剪能吸收轻度陈旧的数据，但陈旧度过大时比率方差与被裁比例都会失控。</li>
+      <li>单进程线程版受 GIL 限制，吞吐提升有限；本章的稳定产出是把异步系统"可测量化"。</li>
+      <li>采样架构的同步、异步两章告一段落。下一章回到单机单环境，用可视化手段把"信任域约束"的几何直觉画出来。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch024.html">← 第 024 章：PPO的分布式实现</a>
+    <a class="next" href="ch026.html">第 026 章：PPO的信任域约束可视化 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

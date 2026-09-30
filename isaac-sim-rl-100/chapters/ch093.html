@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第093章 实现多机器人协同搬运 | 机器人仿真学习课程 · Isaac Sim 强化学习训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第五篇 · 机器人系统集成</span>
+    <span class="sep">/</span>
+    <span>第 093 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第五篇 · 机器人系统集成</div>
+    <h1>第 093 章：实现多机器人协同搬运</h1>
+    <p class="lead">一台搬不动就上四台：多机器人共抬一件负载，难点在于没有"总指挥"时，力怎么分、队怎么走、谁在偷懒，本章讲透分布式协调与负载分配。</p>
+    <ul class="meta">
+      <li>主题：系统集成 / 多智能体协同与负载分配</li>
+      <li>相关组件：Isaac Sim / Isaac Lab / Stable-Baselines3</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 092 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解多机器人协同搬运与双臂协作的异同：同样是"闭链 + 物体"，但多了分布式决策与负载分配。</li>
+      <li>掌握负载分配的基本约束（合力 = 重力、力矩平衡）与"力均衡"为何是稳定搬运的关键。</li>
+      <li>会说清集中式与分散式两种协调架构的取舍，以及"通过物体隐式通信"的机理。</li>
+      <li>会设计参数共享的多智能体训练：观测用相对量、全局奖励 + 局部约束、课程从少到多。</li>
+      <li>能诊断"偷懒"、力不均、通信假设过强等常见问题。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>一台服务机器人搬不动餐桌，四台小机器人可以，这是协同搬运（cooperative transport）最朴素的动机。与第 091 章的双臂不同，多机器人系统没有共同的机械基座：每台机器人是独立个体，靠<strong>分布式决策</strong>协调，彼此之间可能只有低带宽通信，甚至完全没有通信。</p>
+    <p>这个设定把问题从"控制"推向"系统"：负载必须被合理分配（否则某台打滑、某台空转），队形必须保持一致（否则物体被拧），个体还要处理自己的底盘约束（非完整、避障）。它同时是第 059 章多智能体强化学习（MARL）的物理版本，你会看到 CTDE 架构、信用分配这些概念第一次落在真实力矩上。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 静力学：抬起来需要满足什么</h3>
+    <p>设 n 台机器人在接触点 i 施加三维力 f<sub>i</sub>，物体质量为 m，重心位置 r<sub>c</sub>。静力平衡要求：</p>
+    <div class="formula">
+      Σ<sub>i</sub> f<sub>i</sub> = (0, 0, mg)，&nbsp; Σ<sub>i</sub> (r<sub>i</sub> − r<sub>c</sub>) × f<sub>i</sub> = 0
+      <span class="note">第一式：竖直分力之和托住重力；第二式：各接触力矩平衡，防止物体翻转</span>
+    </div>
+    <p>数字感：20 kg 负载、4 台机器人，总竖直力需 ≥196 N，平均每台 49 N；若接触点布置不当（比如 4 个点几乎共线），第二式会强迫位置靠边的机器人出更多力，<strong>负载分配与接触几何强耦合</strong>。这就是"力的均衡"要解决的问题：让每台机器人的竖直力接近目标值 f* = mg/n × 1.2（安全裕度），即约 59 N。</p>
+
+    <h3>2. 力分配的欠定性与冗余解</h3>
+    <p>每个接触点能施加的是三维力，n 个点共 3n 个未知量；静力平衡只有 6 个方程。解空间巨大（3n−6 维），不同的解意味着不同的"内部力"（互相推挤却不改变物体运动的力）。内部力过大会：让机器人底盘打滑、轮子空转、物体承受应力。工程上常用的解：</p>
+    <ul>
+      <li><strong>均匀分配</strong>：所有 f<sub>i</sub> 的竖直分力相同，简单、可预测，但重载机器人可能被闲置；</li>
+      <li><strong>能力加权</strong>：按各台的最大驱动力/摩擦限制分配，更高效，但需要知道彼此的"能力"，通信要求高；</li>
+      <li><strong>学习分配</strong>：把力误差写进奖励，让策略在训练中自学分工，本章主线。</li>
+    </ul>
+
+    <h3>3. 通过物体"隐式通信"</h3>
+    <p>一个漂亮的物理事实：机器人抓住物体时，物体受到的合力与运动状态是各机器人动作的"总和"；每台机器人从自己接触点感受到的力/位移变化里，就能部分推断同伴在做什么。例如物体开始上倾，说明身后有同伴抬得更快，不必通信即可做出反应。这种<strong>经由共享物理媒介的隐式协调</strong>（stigmergy 的机械版本）让"零通信策略"在很多任务里也能收敛，只是效率低于有通信的版本。</p>
+    <p>但它有盲区：如果物体本来就"将倾未倾"（接近失稳临界），反馈会显著滞后，猝不及防。所以安全设计上不能只靠隐式协调，需要显式的队形/力约束作为硬护栏（第 091 章的相对约束思想在这里依然适用）。</p>
+
+    <h3>4. 架构：中心式、分散式与 CTDE</h3>
+    <table>
+      <tr><th>架构</th><th>决策方式</th><th>优点</th><th>风险</th></tr>
+      <tr><td>中心式</td><td>主机给全体下发目标轨迹与力分配</td><td>协调最优、实现简单</td><td>通信中断即瘫痪；单点故障</td></tr>
+      <tr><td>分散式（无通信）</td><td>各自观测局部 + 物体反馈</td><td>鲁棒、易扩展</td><td>效率低；近失稳时滞后</td></tr>
+      <tr><td>CTDE（第 059 章）</td><td>训练时用全局信息（集中 critic），执行只用局部观测</td><td>兼顾可学性与部署性</td><td>需要为每台定义"局部观测+邻居信息"</td></tr>
+    </table>
+    <p>本章采用 CTDE：训练时 critic 看全体状态与物体状态，actor 只看"我 + 我感知到的邻居 + 物体运动反馈"；四条同构机器人共享同一套策略参数（参数共享），因为它们的角色对称，共享能显著加速样本效率。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <ol>
+      <li><strong>任务</strong>：4 台差速机器人共抬 20 kg 的板（接触点分布为矩形四角），从起点搬运到目标位姿（位置 ±5 cm、朝角 ±5°），全程不打滑、不翻转。</li>
+      <li><strong>局部观测</strong>（每台）：自身位姿/速度；自身接触点相对物体中心的偏移（局部一维描述即可）；物体速度（共享或估计）；最近 1–2 台邻居的相对位置；自己接触力各分量，<strong>全部用相对量，不用世界系绝对值</strong>。</li>
+      <li><strong>动作</strong>：底盘速度 (v, ω) 2 维 + 抬升/下压力指令 1 维（或升降关节速度），共 3 维。动作经限幅（v≤0.3 m/s，力 ≤80 N）。</li>
+      <li><strong>奖励</strong>：全局项 −‖e<sub>obj</sub>‖（物体到目标）+ 成功 +1；局部项 −0.1·(f<sub>i,z</sub> − f*)²（力均衡）− 0.05·‖a − a<sub>prev</sub>‖²（平滑）+ 打滑惩罚（轮速与地速不一致时）。</li>
+      <li><strong>防"偷懒"</strong>：全局奖励除以 n 不足以抑制搭便车，加"力均衡"局部项后，任何一台不出力都会直接违反 f* 目标；再用接触力的历史方差做"出力考核"，极其偷懒的个体会因物体倾斜被整体惩罚。</li>
+      <li><strong>课程</strong>：1 台搬小件 → 2 台搬杆 → 4 台搬板；接触点几何从"近似共线"逐步展开到矩形（训练对几何的泛化）。</li>
+      <li><strong>评估</strong>：成功率、物体位姿误差、各台竖直力的标准差（越小越均衡）、打滑次数、以及"零通信 vs 有通信"的对照实验。</li>
+    </ol>
+    <div class="box key">
+      <span class="box-title">设计思维：为什么奖励要"全局 + 局部"两层？</span>
+      <p>只用全局奖励（物体到没到），多智能体系统会陷入信用分配困境：个体不知道自己的贡献，训练极慢。加局部约束项（力均衡、平滑、自身打滑）把"个体该做什么"讲清楚，全局项只负责"往哪走"，这种<strong>"全局目标 + 局部纪律"的组合是协同搬运用得最广的奖励结构</strong>，第 094 章的编队控制用的是同一配方（编队误差为局部纪律）。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：单台机器人的局部观测组装（全相对量）</strong></p>
+    <pre class="code"><code>import torch
+
+def build_local_obs(robot_state, neighbor_states, obj_state, contact_force,
+                    f_star=59.0):
+    """为第 k 台机器人构造观测：一切以"我"为中心，避免世界系绝对坐标。
+    robot_state: dict，含 pose(B,3)、vel(B,3)、; obj_state: 物体位姿/速度。"""
+    pose, vel = robot_state["pose"], robot_state["vel"]
+    # 1) 物体相对我的位置（转到我自己的车头系；泛化关键，见第 092 章）
+    dx = obj_state["pos"][:, :2] - pose[:, :2]
+    th = pose[:, 2]
+    c, s = torch.cos(-th), torch.sin(-th)
+    rel_obj = torch.stack([c * dx[:, 0] - s * dx[:, 1],
+                           s * dx[:, 0] + c * dx[:, 1]], dim=-1)   # (B,2)
+    # 2) 邻居信息：只取最近一台的"相对位置 + 相对朝向"（通信受限假设）
+    if neighbor_states is not None:
+        nb = neighbor_states                                # (B, kn, 3)
+        d = nb[:, :, :2] - pose[:, :2].unsqueeze(1)
+        dist = d.norm(dim=-1)
+        idx = dist.argmin(dim=-1)                           # 最近的邻居
+        near_d = torch.gather(d, 1, idx.view(-1, 1, 1).expand(-1, 1, 2)).squeeze(1)
+        near_dth = (torch.gather(nb[:, :, 2], 1, idx.view(-1, 1)) - th.unsqueeze(-1))
+        near_dth = torch.atan2(torch.sin(near_dth), torch.cos(near_dth))
+        neighbor_feat = torch.cat([near_d, near_dth], dim=-1)   # (B,3)
+    else:
+        neighbor_feat = torch.zeros_like(rel_obj.new_zeros(pose.shape[0], 3))
+    # 3) 自身受力与"力偏差"：不喂绝对值，喂"离目标力还差多少"
+    f_err = contact_force[:, 2] - f_star                # 竖直力误差 (B,)
+    # 4) 打滑指标：轮速与地面速度估计之差（越高越危险）
+    slip = robot_state.get("slip", torch.zeros_like(f_err))
+    return torch.cat([rel_obj, obj_state["vel"][:, :2],       # 物体相对/速度
+                      neighbor_feat,                          # 最近邻居相对特征
+                      vel[:, :2], f_err.unsqueeze(-1),
+                      slip.unsqueeze(-1)], dim=-1)
+</code></pre>
+    <p>解读：（1）物体位置转到自身车头系（复用第 092 章的坐标变换），四台机器人共享策略参数，只有相对量才能让"同一策略适配不同位置的角色"；（2）邻居特征只取最近的 1 台，模拟低带宽通信；<code>None</code> 分支就是"零通信"对照实验的开关；（3）观测量取力偏差 <code>f_err</code>：策略关心的是"我比目标出力多还是少"，这直接对应负载分配的误差，比裸力值好学得多；（4）打滑指标 <code>slip</code> 是轮速与地速估计之差，真实系统可由轮编码器 + 视觉里程计获得，仿真里直接读。</p>
+
+    <p><strong>片段 2：负载均衡与打滑惩罚（局部纪律）</strong></p>
+    <pre class="code"><code>class TransportReward:
+    """协同搬运奖励：全局目标 + 局部纪律（力均衡/打滑/平滑）。"""
+
+    def __init__(self, num_agents=4, f_star=59.0, w_bal=0.1, w_slip=0.5, w_smooth=0.05):
+        self.n = num_agents
+        self.f_star = f_star                # 每台目标竖直力：mg/n × 1.2 安全系数
+        self.w_bal = w_bal                  # 力均衡权重：与全局项同量级标定
+        self.w_slip = w_slip
+        self.w_smooth = w_smooth
+
+    def compute(self, e_obj, f_z, slip, action_prev, action, success):
+        # 全局项：物体到目标（所有个体共享同一个值，即协作的"共同利益"）
+        r_global = -torch.linalg.norm(e_obj, dim=-1) + 1.0 * success.float()
+        # 局部项 1：力偏差平方；不出力（f≈0）与过度出力都被罚
+        r_balance = -self.w_bal * (f_z - self.f_star) ** 2
+        # 局部项 2：打滑惩罚（轮子空转既失效又伤机器）
+        r_slip = -self.w_slip * slip.clamp(min=0.0)
+        # 局部项 3：动作平滑（第 083 章的手法，多机系统里抖动会互相激励）
+        r_smooth = -self.w_smooth * ((action - action_prev) ** 2).sum(dim=-1)
+        return r_global + r_balance + r_slip + r_smooth
+</code></pre>
+    <p>解读：（1）<code>f_star = mg/n × 1.2</code>：20 kg → 196 N ÷ 4 = 49 N，乘 1.2 得 59 N，1.2 是"出力裕度"，用于对抗物体运动时的惯性力与力控波动；（2）<code>r_balance</code> 用平方形式：欠力（f 小）与过力（f 大）同罚，且这个项让"偷懒"不再是无风险行为，全局项除以 n 后偷懒的收益约为 0.25 单位，但力偏差的惩罚对有纪律的策略是 0；<strong>局部纪律项是抑制搭便车的直接手段</strong>；（3）<code>r_slip</code> 只罚正滑移（<code>clamp(min=0)</code>）：反向滑移（被同伴拖着走）不是这台机器人的过错，系统会自动由全局项惩罚那个"拖人"的个体。</p>
+
+    <p><strong>片段 3：参数共享的多智能体训练循环（CTDE 简化版）</strong></p>
+    <pre class="code"><code># 伪代码风格：与 SB3 搭配时可用自定义多智能体包装，或迁移到 MAPPO 实现
+for it in range(5000):
+    obs_all = env.observe()                      # dict: {"robot0": ..., ...}
+    actions = {}
+    with torch.no_grad():
+        for k, obs in obs_all.items():
+            actions[k] = policy(obs)             # 参数共享：同一个 policy
+    next_obs, rewards, done, info = env.step(actions)
+    # 集中式 critic：训练时看全体状态（含物体），估计联合价值 V(s_all)
+    v_all = critic(torch.cat([next_obs[k] for k in env.agent_ids]
+                             + [env.object_state()], dim=-1))
+    # 每个个体用自己的回报 + 全局优势更新共享策略（简化版 IPPO 形式）
+    for k in env.agent_ids:
+        policy.update(obs_all[k], actions[k], rewards[k],
+                      v_all.detach(), done)
+    if it % 500 == 0:
+        # 关键监控：竖直力的跨机器人标准差，均衡性的直接度量
+        f_std = info["f_z"].std(dim=-1).mean()
+        print(f"iter {it} 力标准差 {f_std:.1f} N 成功率 {info['success'].mean():.2f}")
+</code></pre>
+    <p>解读：（1）"参数共享"<code>policy</code> 在循环里被所有机器人使用，同构系统里这是最有效的样本复用；（2）critic 拼接全体观测与物体状态，是 CTDE 的"集中"部分；执行时只有 actor 的局部观测被使用，部署不需要全局信息；（3）<code>f_std</code>（各台竖直力的标准差）是最值得监控的指标：它从训练早期的 20–30 N 降到后期的 5–10 N 的过程，就是"学会分担"的完整证据链。若它长期不降而成功率上升，说明策略学会了"靠个别机器人硬扛"，真机上这会烧电机。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>观测用世界系绝对坐标</strong>：四台同构机器人共享策略、位置却各不同，网络只能死记"我在世界坐标 (3, 4) 时该做什么"。修复：全部相对量（片段 1）。</li>
+      <li><strong>力不均衡导致个别打滑</strong>：某台竖直力远超 f*，轮子摩擦不够就空转，物体跟着倾斜。修复：力均衡项 + 打滑惩罚 + 把卡死的动作限幅放进环境。</li>
+      <li><strong>搭便车（free rider）</strong>：全局奖励均分弱化了"谁不出力"的信号。修复：局部力偏差项（片段 2）；严重时按贡献分配全局奖励。</li>
+      <li><strong>通信假设过强</strong>：训练时给全体状态，部署时只有局部观测，性能断崖。修复：训练就用"局部 + 邻居"的观测结构（CTDE 的执行侧一致），别用 full observation 训练再截断。</li>
+      <li><strong>接触点几何退化</strong>：四台机器人挤成近似共线，静力学第二式不满足、物体反复翻转。修复：课程里强制接触点几何多样化，或在奖励里惩罚"接触点近乎共线"的构型。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>计算：15 kg、3 台机器人，安全系数 1.3 时的 f* 是多少？为什么安全系数随机器人数量减少而应加大？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>15×9.8/3×1.3 ≈ 63.7 N。台数少时单台失效的影响占比更大（3 台中一台失效 = 失去 33% 承载力），裕度必须更保守。</div></details>
+      </li>
+      <li>把力均衡权重 w_bal 从 0.01、0.1、1.0 各训练一次，记录力标准差 f_std 与成功率的联合变化。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>w_bal 太小：偷懒与过载并存；太大：个体只顾"出力到 59 N"而忽视物体去哪（全局项被淹没）。找两者都好的中间档。</div></details>
+      </li>
+      <li>做"零通信"对照实验：把邻居特征置零训练，比较成功率与队形误差随训练步数的收敛速度。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>零通信组靠物体反馈隐式协调（理论第 3 节），预期收敛更慢但仍可学，这是"物体作为通信媒介"的实证。</div></details>
+      </li>
+      <li>设计"单人搬运 vs 四人搬运"的样本效率对比：1 台搬 5 kg 与 4 台搬 20 kg，哪个任务先达到 80% 成功率？解释差异来源。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>单台任务状态空间小、无协调维度，收敛快；四台任务有信用分配 + 负载均衡两个额外维度。曲线差距就是"协同的额外学习成本"。</div></details>
+      </li>
+      <li>在仿真里把一台机器人的最大驱动力降低 30%（模拟磨损），观察策略是否学会了"自动让弱机上少出力"，用各台 f_z 的均值证明。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>若训练中包含驱动能力随机化，策略通常会学到"弱机少扛"；没有随机化则往往直接失败，这是域随机化在协同系统里的价值。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>协同搬运 = 静力学（Σf = 重力、Σ力矩 = 0）+ 负载分配（3n−6 维欠定解空间）+ 分布式协调。</li>
+      <li>力均衡的量化：各台竖直力围绕 f* = mg/n × 1.2–1.3；f_std 是最直接的"是否学会分担"指标。</li>
+      <li>架构主线用 CTDE + 参数共享：critic 看全局、actor 只看"自身 + 最近邻居 + 物体反馈"；通过物体的隐式协调是免费但滞后的信道。</li>
+      <li>奖励"全局目标 + 局部纪律"：全局项指方向，力均衡/打滑/平滑项管秩序，附防搭便车。</li>
+      <li>下一章把"搬运一个物体"扩展成"保持一种队形"：没有共同负载，纯靠邻居间的关系约束维持几何结构，群体编队，见第 094 章。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch092.html">← 第 092 章：实现移动机械臂操作</a>
+    <a class="next" href="ch094.html">第 094 章：实现群体机器人编队 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

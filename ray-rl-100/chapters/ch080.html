@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第080章 超参搜索实战：激活函数与优化器 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第五篇 · 训练工程与系统进阶</span>
+    <span class="sep">/</span>
+    <span>第 080 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第五篇 · 训练工程与系统进阶</div>
+    <h1>第 080 章：超参搜索实战：激活函数与优化器</h1>
+    <p class="lead">激活函数塑造网络的输出尺度与曲率，优化器决定参数更新的方式与状态开销。本章讲清四类激活的特性差异、三种优化器的自适应机制、避免“共享学习率域”造成的不公平对比，以及分组判读与 lr 敏感性的度量方法。</p>
+    <ul class="meta">
+      <li>主题：超参搜索实战 / 激活与优化器参数族</li>
+      <li>关键机制：饱和与死区、自适应步长、条件学习率中心、公平对比、状态显存</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 079 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>掌握 ReLU、tanh、Swish 三类激活的特性差异：饱和区、零中心、平滑性与梯度流。</li>
+      <li>理解 Adam、动量 SGD、RMSProp 的更新机制差异、对学习率的敏感度与状态显存开销。</li>
+      <li>会设计“条件学习率中心”的优化器搜索空间，消除共享学习率域造成的不公平对比。</li>
+      <li>会用分组表判读（激活，优化器）组合：回报水平、稳定性与学习率敏感性三个视角。</li>
+      <li>会把优化器状态显存纳入资源核对，与网络结构的参数预算联动评估。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>激活函数与优化器是结构参数族的收尾两块：上一章确定了网络的形状，本章确定网络的“非线性形态”与“参数怎么走”。<strong>两者都属于“效应通常小于学习率与批量、但能改变训练稳定性与资源开销”的参数：搜索它们的价值在于排除灾难性组合、确认默认选择，大幅拉升回报不宜寄望于它们。</strong></p>
+    <p>本章有一个方法论级别的重点：优化器对比必须给每个优化器配自己的学习率中心。<strong>共享一个学习率范围去比较 Adam 与动量 SGD，等于让两类步长机制在对方的地盘上比赛：Adam 在适合 SGD 的大步长下发散，SGD 在适合 Adam 的小步长下停滞，结论必然是“Adam 更好”，但它测的其实是学习率的失配。</strong>这个不公平对比在文献与工程实践中反复出现，本章用条件空间把它消掉。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 激活函数的特性轴</h3>
+    <p>三类常用激活各有取舍：<strong>ReLU</strong> 在正区无饱和、计算极快，负区输出为零；代价是“死神经元”（负区梯度恒零，部分单元永久失效）与输出非零中心（给后续层带来偏置漂移）。<strong>tanh</strong> 零中心、输出有界，小网络与连续控制任务上表现稳定；代价是两端饱和区梯度趋零，初始权重与学习率偏大时容易卡住。<strong>Swish 类（含 SiLU）</strong>平滑、负区保留细小梯度，缓解死区并改善梯度流；代价是计算量略高，收益任务依赖。</p>
+    <div class="formula">
+      ReLU(x)=max(0,x)；tanh 饱和区 |x|≳3 时梯度 &lt; 0.01；Swish(x)=x·σ(x) 负区有非零小梯度
+      <span class="note">输出尺度影响策略 logits 与价值头的初始分布；激活与初始化、学习率三者失配时表现为早期熵塌缩或价值爆炸</span>
+    </div>
+    <p>对策略优化，激活的选择还会影响输出层的初始尺度：<strong>tanh 的两端饱和让策略 logits 初始更温和，探索期的采样更均匀；ReLU 系的无界输出在价值头上更容易出现尖峰，配合过大的学习率会放大早期震荡。</strong>这些差异是搜索激活时的主要判读依据，回报的最终差异往往不大。</p>
+
+    <h3>2. 优化器的三种更新机制</h3>
+    <p><strong>动量 SGD</strong>：按固定学习率沿动量累积的方向更新；步长不随梯度尺度自适应，因此存在一个较窄的可用学习率窗口，低于窗口训练停滞、高于窗口发散。它的状态只有动量缓冲（与参数量同为一份），显存开销最小。<strong>Adam</strong>：维护一阶与二阶矩估计，按历史梯度尺度缩放每个参数的步长；对学习率的敏感性低、起步快，代价是状态约为参数量的两份（一阶矩与二阶矩），总显存约为“参数、梯度、状态”三份。<strong>RMSProp</strong>：仅维护二阶矩尺度，介于两者之间。</p>
+    <div class="formula">
+      状态显存 ≈ n<sub>params</sub> × 4 字节 × k：SGD k=1，RMSProp k=1，Adam k=2
+      <span class="note">加参数与梯度各一份，Adam 结构的总驻留约为参数量四倍；结构搜索放大参数量时该开销同步放大</span>
+    </div>
+    <p>学习率敏感度差异直接决定搜索空间结构：<strong>Adam 的有效学习率窗口大约跨越一个数量级（如 1e−4 至 1e−3），SGD 的窗口在更大数值处且更窄（如 1e−3 至 1e−2），RMSProp 居中。</strong>再叠加第 079 章的结论：优化器状态显存与结构大小联动，大结构上换用 SGD 系同时在计算与显存两个方向收缩开销。</p>
+
+    <h3>3. 条件学习率中心与公平对比</h3>
+    <p>公平对比的实现是条件学习率中心：<strong>优化器先采样，学习率中心根据优化器类型取不同的经验值，再在中心附近用离散尺度因子展开。</strong>这样每个优化器都在自己的有效区间内获得同等的搜索密度，比较测到的是机制差异，窗口错位被消掉。动量、epsilon 这类专属参数同样用条件注入：只在对应优化器取非零值，避免无效组合占预算。</p>
+    <p>对比纪律还有一条：<strong>激活搜索阶段固定优化器（用 Adam 起点），优化器搜索阶段固定激活（用上一阶段的胜出档）。</strong>两个维度同时放飞时，组合数翻倍且两者的效应相互纠缠（激活的曲率影响最优学习率，学习率又影响优化器的表现），归因成本高于收益。</p>
+
+    <h3>4. 分组判读的三个视角</h3>
+    <p>（激活，优化器）组合的判读表并排三个视角：<strong>回报水平</strong>（尾段均值，回答“哪个组合学得好”）、<strong>稳定性</strong>（尾段波动率或崩溃次数，回答“训练过程可靠吗”）、<strong>学习率敏感性</strong>（组内学习率对数与回报的秩序相关，回答“这个优化器的窗口有多宽”）。</p>
+    <p>三个视角的典型结论形态：Adam 组敏感性低、稳定性好、水平居中偏上；SGD 组敏感性高、窗口窄，但处在窗口内时水平可与 Adam 组持平且状态开销小；Swish 与 ReLU 的差异通常体现在稳定性上，水平差异有限。<strong>最终建议的取舍标准是任务诉求：追求最省心的起点选 Adam 居中档；资源受显存约束且愿意承担调参成本时，SGD 系在窗口内是可行替代。</strong></p>
+
+    <h3>5. 预算与阶段的分配</h3>
+    <p>本族的搜索预算宜小：它的效应量级低于前三族，20 至 30 个试验足以完成“排除灾难组合加确认默认选择”的目标。<strong>预算分配的纪律是把大头留给学习率与批量（第 076 章），本族用小块预算收尾；报告中的结论措辞也应与之匹配：给出“在本次任务与预算下没有观察到显著差异”这类限定性结论；宣称某个激活普遍更优超出了证据范围。</strong></p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>设计流程按“定顺序、配条件、控规模、立不变量、出分组表”五步执行。与上一章的差异在于，第 079 章确定网络形状，本章确定非线性形态与更新机制，两章共同构成完整结构参数族。</p>
+    <ol>
+      <li><strong>定顺序</strong>：先固定优化器搜激活（小规模），再固定激活搜优化器（条件学习率中心）。</li>
+      <li><strong>配条件</strong>：学习率中心与专属参数（动量、epsilon）按优化器类型条件注入。</li>
+      <li><strong>控规模</strong>：本族预算控制在总搜索量的两成以内；激活候选不超过四个。</li>
+      <li><strong>立不变量</strong>：结构沿用上一章结论，学习率与批量族参数固定；改动视为跨族实验。</li>
+      <li><strong>出分组表</strong>：回报、稳定性、敏感性三视角齐全后进入复验与交付。</li>
+    </ol>
+    <table>
+      <tr><th>组件</th><th>候选</th><th>搜索要点</th><th>代价提示</th></tr>
+      <tr><td>激活函数</td><td>choice {relu, tanh, swish}</td><td>固定 Adam，小范围学习率联动</td><td>计算量差异可忽略</td></tr>
+      <tr><td>优化器</td><td>choice {adam, sgd, rmsprop}</td><td>条件学习率中心 + 专属参数</td><td>状态显存 1 至 2 份参数量</td></tr>
+      <tr><td>动量</td><td>sample_from：仅 SGD 取 0.9</td><td>避免无效组合</td><td>无额外显存</td></tr>
+      <tr><td>学习率</td><td>中心 × 尺度因子（0.33 至 3.0）</td><td>各优化器在自己的窗口内探索</td><td>跨组数值不可直接比较</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：为什么跨优化器比较时要写下“数值不可直接比较”？</span>
+      <p>不同优化器的学习率语义不同：Adam 的 3e−4 与 SGD 的 3e−3 都在各自窗口的中间位置，但数值相差十倍。结论表若只列学习率数值，读者会误以为“SGD 用了更大的学习率所以更好”，真实含义是“两者各自处于适配窗口”。报告应写出中心与尺度因子的相对位置，把绝对值保留在原始配置中即可。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：激活搜索（固定优化器）</strong></p>
+    <pre class="code"><code>from ray import tune
+
+# 第一阶段：固定 Adam 与上一章结构，只放飞激活维度
+activation_space = {
+    # 名义参数：训练函数把名称映射到模型配置的激活字段
+    "activation": tune.choice(["relu", "tanh", "swish"]),
+    # 学习率在 Adam 的稳定窗口内小范围扫，与激活的曲率差异联动
+    "lr": tune.loguniform(1e-4, 1e-3),
+    # 结构沿用第 079 章结论；优化器族参数本阶段冻结
+    "arch": "s128x2",
+    "optimizer": "adam",
+    "train_batch_size": 4096,
+    "gamma": 0.995,
+    # 16 个试验：3 个激活 × 学习率连续采样，足以排除灾难组合
+}
+
+tune.run(train_fn, config=activation_space, num_samples=16,
+         name="act_stage", storage_path="/shared/tune_results")</code></pre>
+    <p>解读：第一阶段空间体现“单维度放飞”纪律。<strong>（1）</strong>激活用三个名义候选，覆盖饱和型（tanh）、死区型（ReLU）与平滑型（Swish）三类形态；候选数不宜再扩，效应量级不支持更大规模的展开。<strong>（2）</strong>学习率保持小范围对数均匀：激活改变曲率，最优学习率会随激活轻微移动，这一维度的联动是必要的；但它不承担比较优化器的职责。<strong>（3）</strong>16 个试验的规模与本节“本族预算宜小”的原则一致；若某激活在三类形态上都出现灾难性表现（如早期持续崩），可在阶段门控中直接排除，不必等满额预算。</p>
+
+    <p><strong>片段 2：条件优化器空间</strong></p>
+    <pre class="code"><code>from ray import tune
+
+def lr_center(spec):
+    """按优化器给出学习率中心：各优化器在自己的有效窗口内探索。"""
+    centers = {"adam": 3e-4, "sgd": 3e-3, "rmsprop": 1e-3}
+    return centers[spec["optimizer"]]
+
+optimizer_space = {
+    # 优化器名称：三个候选覆盖自适应与非自适应两类机制
+    "optimizer": tune.choice(["adam", "sgd", "rmsprop"]),
+    # 条件中心：sample_from 在 optimizer 采样之后求值
+    "lr_center": tune.sample_from(lr_center),
+    # 尺度因子：中心上下约三倍范围，覆盖各自窗口的主要区域
+    "lr_scale": tune.choice([0.33, 1.0, 3.0]),
+    "lr": tune.sample_from(lambda s: s["lr_center"] * s["lr_scale"]),
+    # 动量是 SGD 的专属参数：条件注入，其它优化器取零
+    "momentum": tune.sample_from(
+        lambda s: 0.9 if s["optimizer"] == "sgd" else 0.0),
+    # 激活固定为上一阶段胜出档；结构沿用上一章结论
+    "activation": "tanh",
+    "arch": "s128x2",
+}</code></pre>
+    <p>解读：条件空间把公平对比的四条要点全部落实。<strong>（1）</strong>中心函数是唯一的“经验值表”，修改窗口只需改一处；三个中心值对应于各优化器的常用中间档。<strong>（2）</strong>尺度因子离散三档（三分之一、一、三倍）覆盖中心上下各约半个数量级，跨优化器保持相同的相对探索密度。<strong>（3）</strong>动量条件注入消除了“Adam 配动量”这类无效组合；若所用框架对 epsilon 等参数也有专属取值，按同一模式扩展。<strong>（4）</strong>优化器名称是名义参数，训练函数负责映射到框架的优化器类与参数，字段名以对应版本的 RLlib 文档为准。</p>
+
+    <p><strong>片段 3：三视角分组判读表</strong></p>
+    <pre class="code"><code>def group_read(df, metric="episode_return_mean", tail=10):
+    """分组判读：回报、稳定性、lr 敏感性三个视角。"""
+    final = (df.sort_values("epoch").groupby("trial_id").tail(tail)
+               .groupby("trial_id").agg(
+                   act=("activation", "first"),
+                   opt=("optimizer", "first"),
+                   lr=("lr", "first"),
+                   ret=(metric, "mean"),
+                   # 尾段波动率：标准差除以均值，越小越稳
+                   cv=(metric, lambda v: v.std()
+                       / max(abs(v.mean()), 1e-9))))
+    table = final.groupby(["act", "opt"]).agg(
+        ret=("ret", "mean"), cv=("cv", "mean"), n=("ret", "size"))
+    print(table.round(3))
+    # lr 敏感性：组内学习率（对数尺度）与回报的秩序相关
+    sens = {}
+    for opt, g in final.groupby("opt"):
+        rho = g[["lr", "ret"]].corr(method="spearman").iloc[0, 1]
+        sens[opt] = round(float(rho), 2)
+    print("lr 敏感性（秩序相关，越负越说明小 lr 更优）：", sens)
+    return table, sens
+
+table, sens = group_read(stage2_df)</code></pre>
+    <p>解读：判读表把三个视角压进一次聚合。<strong>（1）</strong>波动率用尾段标准差除以均值：跨任务量纲可比，且对回报水平差异不敏感。<strong>（2）</strong>敏感性用组内学习率与回报的秩序相关：强负相关说明该优化器在大学习率区间受损，窗口偏窄；接近零说明窗口宽、对学习率不挑。<strong>（3）</strong>三个视角的阅读顺序建议为先稳定性、再水平、后敏感性：稳定性差（如 cv 显著偏高）的组合直接排除，再在剩余的稳定组合里比水平，最后用敏感性决定该组合推广时的调参成本。<strong>（4）</strong>样本数 n 一并输出；小样本组合结论只作线索，按第 071 章的纪律降级表述。优化器与激活的配置字段以对应版本的官方文档为准。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>共享学习率域比较优化器</strong>：SGD 在 Adam 的小步长窗口内停滞，结论必然是“Adam 更好”。修复：条件学习率中心，各优化器在自己的窗口内探索，报告注明跨组数值不可直接比较。</li>
+      <li><strong>激活与学习率、初始化失配</strong>：tanh 配大步长在饱和区卡住，ReLU 配大初始化出现大量死单元。症状是早期曲线平死或价值爆炸。修复：激活搜索与学习率小范围联动，把早期形态纳入阶段门控。</li>
+      <li><strong>忽略优化器状态显存</strong>：大结构配 Adam 时状态显存约为参数两份，与参数、梯度合计近四倍，超出预算导致进程被杀。修复：显存核算公式纳入结构选择流程，必要时换 SGD 系或缩小结构。</li>
+      <li><strong>把激活效应当主要矛盾</strong>：把大块预算投给激活网格，挤占学习率与批量的搜索量。修复：本族预算控制在总搜索量两成以内，结论使用限定性措辞。</li>
+      <li><strong>全因子展开激活 × 优化器 × 学习率</strong>：组合数倍增且效应纠缠，归因困难。修复：两阶段顺序搜索，每阶段只放飞一个维度，其余作为不变量。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>算一算：参数量 6.9 万的网络，Adam 的结构总驻留（参数、梯度、一阶与二阶矩，各 4 字节）约是多少 MB？换成动量 SGD 后约是多少 MB？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>Adam 约 4 份共 27.6 万参数当量 × 4 字节 ≈ 1.1 MB；SGD 约 3 份 ≈ 0.83 MB。小网络差异可忽略，结构放大到百万级参数时差异达到数 MB 量级。</div></details>
+      </li>
+      <li>预测题：把优化器从 Adam 换成动量 SGD 但保留 Adam 中心的学习率（3e−4），曲线形态与分组判读结果各会如何表现？换成 SGD 中心 3e−3 后呢？<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>保留 3e−4 时 SGD 停滞、敏感性判读出现强正相关（lr 越大越好、窗口整体偏大）；换到 3e−3 后水平追上，敏感性近似归零，这才是公平对比的形态。</div></details>
+      </li>
+      <li>设计题：为一次完整搜索的收尾设计本族两阶段计划：给出阶段一、二的试验数、空间、阶段门控与复验安排，并写出公平对比检查清单。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>阶段一 12 至 16 个试验搜激活；阶段二 18 个试验搜优化器（3 优化器 × 3 尺度因子 × 2 种子）；复验给胜出组合与默认组合各 5 个种子；检查清单覆盖条件中心、专属参数、显存核算、不变量声明四项。</div></details>
+      </li>
+      <li>推导题：写出动量 SGD 与 Adam 的更新式各一遍，指出两式中“步长自适应”出现在哪一项，并解释 epsilon 在梯度接近零时的作用。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>SGD：v←βv+g，θ←θ−αv；Adam：m←β₁m+(1−β₁)g，v←β₂v+(1−β₂)g²，θ←θ−α·m̂/(√v̂+ε)。自适应在 m̂/√v̂ 的逐参数缩放；ε 防止 √v̂ 趋零时步长爆炸。</div></details>
+      </li>
+      <li>实践题：对一次已完成搜索用片段 3 输出分组表，选出一个“水平不显著但稳定性更好”的组合，设计复验来确认稳定性差异是否真实。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>复验给两组各 5 个配对种子，主指标仍为回报，稳定性统计量用尾段波动率或崩溃次数；差值区间与波动率差异同时报告，任一口径跨零则标注“未确认”。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>激活函数的特性轴是饱和、零中心与平滑性；选择主要影响稳定性和输出尺度，回报差异通常有限。</li>
+      <li>优化器差异在步长机制与状态开销：Adam 窗口宽、状态两份；SGD 窗口窄且偏大、状态一份。</li>
+      <li>公平对比靠条件学习率中心与专属参数条件注入；跨优化器的学习率数值不可直接比较。</li>
+      <li>两阶段顺序搜索：固定优化器搜激活，固定激活搜优化器；全因子展开会放大纠缠与预算。</li>
+      <li>判读三视角：回报水平、稳定性（尾段波动率）、学习率敏感性（组内秩序相关）。</li>
+      <li>本族预算控制在总搜索量两成以内，结论使用限定性措辞；下一章进入损失函数组合的搜索。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch079.html">← 第 079 章：超参搜索实战：网络层数与宽度</a>
+    <a class="next" href="ch081.html">第 081 章：超参搜索实战：损失函数组合 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

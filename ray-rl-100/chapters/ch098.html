@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第098章 复现性控制：种子、环境与版本 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第五篇 · 训练工程与系统进阶</span>
+    <span class="sep">/</span>
+    <span>第 098 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第五篇 · 训练工程与系统进阶</div>
+    <h1>第 098 章：复现性控制：种子、环境与版本</h1>
+    <p class="lead">一句话：本章把复现性拆成版本、种子与执行三层控制，给出种子派生树、确定性开关与版本标识的可操作设计。</p>
+    <ul class="meta">
+      <li>主题：训练工程 / 复现性（Reproducibility）</li>
+      <li>关键机制：三层控制、种子派生、确定性开关、版本标识</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 097 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解复现性的三级目标：位级一致、统计一致与功能一致，并会为任务声明所需级别。</li>
+      <li>掌握三层控制结构：版本层锁定计算环境，种子层派生随机流，执行层约束非确定性来源。</li>
+      <li>会设计种子派生树，避免简单递增种子带来的误差流相关，以及多进程共用种子导致的轨迹重复。</li>
+      <li>了解深度框架确定性开关的代价与边界，能区分"可消除的非确定性"与"硬件层面的非确定性"。</li>
+      <li>会采集与校验版本标识，把种子与标识随检查点一同保存，使恢复流程能够校验环境一致性。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>前几章建立的比较、报告与容错流程都依赖一个前提：同样的配置与输入产生可解释的结果。<strong>缺少复现性控制时，实验之间的差异无法归因：策略差异、数据差异与随机差异混在一起，调优工作退化为猜测。</strong>强化学习训练对随机性尤其敏感：种子同时影响环境轨迹、策略采样、网络初始化与数据顺序，任何一处不受控，种子间方差就会吞掉配置间的真实差异。</p>
+    <p>复现性还有两个具体用途：其一是恢复验证，第 090 章的检查点恢复要求恢复到与未中断训练相同的轨迹，这依赖随机流状态的精确保存与还原；其二是审计追溯，数月后复查一条实验结论时，需要从记录中还原当时的代码、依赖与环境版本。<strong>本章的三层控制分别回应这三类需求：种子层服务恢复，版本层服务追溯，执行层服务比较。</strong></p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p><strong>复现性控制的本质是把"随机"从不可控的自由变量变成有编号的输入：每一个随机源都有确定的名字与种子，整条随机流由这些输入完全决定。</strong>本节按目标层级、三层结构、种子派生与版本标识依次展开。</p>
+
+    <h3>1. 复现性的三级目标</h3>
+    <table>
+      <tr><th>级别</th><th>含义</th><th>成本</th><th>适用场景</th></tr>
+      <tr><td>位级一致</td><td>同输入同硬件下逐步输出完全一致</td><td>最高：需确定性算子与固定线程</td><td>调试数值异常、恢复验证</td></tr>
+      <tr><td>统计一致</td><td>多次运行的指标分布稳定可比</td><td>中：多种子加固定协议</td><td>比较与报告（第 097 章）</td></tr>
+      <tr><td>功能一致</td><td>同协议下结论方向可复现</td><td>低：记录完整配置与版本</td><td>日常实验与迭代</td></tr>
+    </table>
+    <p>声明所需级别是第一步：<strong>训练任务通常不需要位级一致，追求它会把大量算力花在算子约束上；但恢复验证场景例外，检查点恢复的正确性依赖随机流逐位还原。</strong>级别的选择写入实验配置，避免不同成员对"可复现"理解不一。</p>
+
+    <h3>2. 三层控制结构</h3>
+    <p><strong>版本层</strong>锁定计算环境：代码提交标识、依赖清单、容器镜像摘要、运行时与加速库版本、环境（仿真器）版本。版本漂移是"代码没改但结果变了"的头号来源，依赖升级改变算子实现与默认参数，加速库升级改变浮点归约顺序。<strong>种子层</strong>为每个随机源派生独立种子（下节展开）。<strong>执行层</strong>约束非确定性来源：确定性算子开关、线程数与工作线程池固定、数据加载顺序固定、评估过程与训练过程隔离随机流。</p>
+
+    <h3>3. 种子派生树</h3>
+    <p>直接给所有随机源同一个种子，会让环境轨迹与网络初始化使用同一序列，产生难以察觉的相关；用"基础种子加进程编号"这类简单递增，则相邻种子序列在弱随机数生成器下可能相关。<strong>标准做法是基于摘要函数的派生：把基础种子、工作单元标识与随机流名称拼接，经摘要函数压成定长输出，取该输出作为流的种子。</strong>输出近似独立，且派生过程与工作单元编号、流名称一一对应，任何一处变化只影响对应流。</p>
+    <div class="formula">
+      seed(stream) = Digest( base_seed ‖ unit_id ‖ stream_name ) mod 2<sup>31</sup>
+      <span class="note">unit_id 为采样单元编号，stream_name 区分环境重置、策略采样、数据增强等流；同一流在重跑中稳定一致</span>
+    </div>
+    <p>流隔离的必要性来自恢复语义：训练中断恢复时，策略采样流需要从保存状态继续，环境重置流只需要保证"剩余回合的种子可复现"，两者独立性越高，部分恢复的正确性越容易论证。<strong>每个流的状态单独保存，是第 090 章检查点清单在种子维度的展开。</strong></p>
+
+    <h3>4. 环境复现的细节</h3>
+    <p>环境侧的三个常见失守点：<strong>一是包装器的随机流</strong>，帧跳与动作重复包装、观测噪声包装各自持有随机状态，需要纳入种子派生，仅设置环境本身并不足够；<strong>二是重置语义</strong>，任务随机化在每次重置时抽样，评估与训练使用相同重置种子集才能比较，评估端要显式传入固定种子列表；<strong>三是版本浮动</strong>，仿真器补丁版本可能改变默认参数或终止判定，依赖清单必须锁定到补丁级。<strong>记录每回合使用的种子值，是把环境侧随机变为可回放的最直接手段。</strong></p>
+
+    <h3>5. 执行层：确定性开关与代价</h3>
+    <p>深度框架提供确定性模式：约束卷积与归约算法选择、禁用非确定算子。开启后同一输入在同型硬件上得到一致输出，代价是部分算子回退到较慢实现、吞吐下降，且个别算子无确定性实现时需要显式替代。<strong>实践的分层策略：调试与恢复验证开启确定性；性能基准与长时间训练关闭，用统计一致保障可比较性。</strong>加速层面的非确定性（原子加法顺序、多流并发）通常无法完全消除，报告应写明"同硬件统计一致"这一级别的承诺。</p>
+
+    <h3>6. 版本标识与校验</h3>
+    <p>版本标识把计算环境压缩成一串可比对的字符串：代码提交、依赖清单摘要、容器镜像摘要、加速库与驱动版本、仿真器版本。采集时机为任务启动时，保存位置为运行清单、检查点与报告数据戳（与第 096、097 章衔接）。<strong>版本标识的用处有两个：恢复时校验"当前环境与检查点写入环境一致"，不一致时拒绝自动恢复并告警；审计时按标识重建环境。</strong>采集时应过滤无关的易变字段（如时间戳），保证同一环境重复采集得到稳定摘要。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>复现性控制的落实分六步，产物是一份种子规范、一份确定性开关集与一个版本标识采集器。</p>
+    <ol>
+      <li><strong>声明目标级别</strong>：按任务用途选择位级、统计或功能一致，写入实验配置。</li>
+      <li><strong>枚举随机源</strong>：环境重置、包装器、策略采样、网络初始化、数据顺序与增强，逐一登记。</li>
+      <li><strong>实现种子派生</strong>：摘要派生函数加流名称约定；禁止在代码中直接使用全局随机。</li>
+      <li><strong>配置确定性开关</strong>：按场景开关，记录开关状态到实验配置。</li>
+      <li><strong>采集版本标识</strong>：启动与检查点写入时采集，恢复时校验。</li>
+      <li><strong>验证</strong>：同种子重跑对照、种子敏感性分析（不同种子组的结论方向）。</li>
+    </ol>
+    <h3>随机源登记表（示例）</h3>
+    <table>
+      <tr><th>流名称</th><th>用途</th><th>恢复行为</th></tr>
+      <tr><td>env_reset</td><td>环境重置与任务随机化</td><td>按回合种子列表复现</td></tr>
+      <tr><td>env_wrapper</td><td>包装器噪声与跳帧抽样</td><td>状态随检查点保存</td></tr>
+      <tr><td>policy_sample</td><td>策略动作采样</td><td>状态随检查点保存</td></tr>
+      <tr><td>init</td><td>网络初始化</td><td>仅在新建时使用</td></tr>
+      <tr><td>shuffle</td><td>批顺序与缓冲抽样</td><td>重建或记录种子</td></tr>
+    </table>
+    <div class="box warn">
+      <span class="box-title">与上一章的差异</span>
+      <p>第 097 章在报告层量化不确定性（多种子聚合），本章在运行层控制不确定性（种子与版本）。前者回答"结论有多稳"，后者回答"结论能否被再次产生"；两章合起来构成完整证据链：可复现的运行产生可信的比较。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>以下片段基于 Ray 2.x 时期的通用写法，接口随版本演进，以对应版本的官方文档为准。</p>
+
+    <p><strong>片段 1：基于摘要函数的种子派生</strong></p>
+    <pre class="code"><code>import hashlib
+
+def derive_seed(base_seed, unit_id, stream_name, mod=2**31 - 1):
+    """种子派生：拼接后取摘要再取模，替代简单递增。
+    简单递增（seed+worker_id）在弱随机源下可能相关；
+    摘要派生让同一基础种子下各流与各单元近似独立。"""
+    payload = f"{base_seed}|{unit_id}|{stream_name}".encode("utf-8")
+    digest = hashlib.sha256(payload).hexdigest()
+    # 取摘要前 8 个十六进制字符即 32 位整数，再折叠到合法种子范围
+    return int(digest[:8], 16) % mod
+
+# 采样单元 3 的三个独立流：编号与流名都参与派生，任一处变化只影响该流
+s_env = derive_seed(1234, unit_id=3, stream_name="env_reset")
+s_pol = derive_seed(1234, unit_id=3, stream_name="policy_sample")
+s_shf = derive_seed(1234, unit_id=3, stream_name="shuffle")
+# 复核：不同流与不同单元的种子在可观察范围内互不相同
+assert len({s_env, s_pol, s_shf}) == 3</code></pre>
+    <p>解读：派生函数把"随机源治理"变成接口约定。<strong>（1）</strong>输入三要素固定：基础种子代表实验身份，单元标识区分并行实例，流名称区分用途；三者任一变即得到全新种子，变更可追踪。<strong>（2）</strong>摘要输出天然均匀，避免了递增种子的序列相关；取模后仍是整数，可直接传入环境的种子参数。<strong>（3）</strong>断言演示了基本自检：同一单元的三个流互不相同；工程上还可把全部派生出（种子、流名）对照表随实验配置保存，供事后重放。</p>
+
+    <p><strong>片段 2：确定性开关的分层配置</strong></p>
+    <pre class="code"><code>import os
+import random
+import numpy as np
+import torch
+
+def set_determinism(level="statistical", base_seed=1234):
+    """按目标级别配置确定性：级别越高约束越多、代价越大。
+    位级一致用于调试与恢复验证；长时训练用统计一致即可。"""
+    random.seed(base_seed)
+    np.random.seed(base_seed % (2 ** 32))
+    torch.manual_seed(base_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(base_seed)
+    if level != "bit_exact":
+        return                          # 统计一致到此为止：不启用算子约束
+    # 位级一致：约束卷积算法选择并禁用非确定算子
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.use_deterministic_algorithms(True)
+    # 固定线程工作池：线程数变化会改变归约顺序，从而改变浮点结果
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"  # 约束工作区分配</code></pre>
+    <p>解读：开关函数把级别映射到具体配置。<strong>（1）</strong>三个库的全局种子一次设定，作为"无流控制代码"的兜底；派生子流在各自模块内覆盖使用。<strong>（2）</strong>统计级别直接返回，避免为不需要的场景支付确定性开销；位级分支集中配置算子与线程约束。<strong>（3）</strong>注释写明代价与适用边界：确定性开关会限制算子选择进而影响吞吐，同时在多进程环境中线程数须显式固定，否则归约顺序仍会漂移。</p>
+
+    <p><strong>片段 3：版本标识采集与恢复校验</strong></p>
+    <pre class="code"><code>import json
+import platform
+import subprocess
+
+def collect_fingerprint(packages=("ray", "torch", "gymnasium", "numpy")):
+    """版本标识：把计算环境压缩为可比对的标识。
+    过滤易变字段（时间戳等），同一环境重复采集得到相同摘要。"""
+    versions = {}
+    for pkg in packages:
+        try:
+            out = subprocess.run(["pip", "show", pkg], capture_output=True,
+                                 text=True, check=True).stdout
+            versions[pkg] = next(l.split(": ", 1)[1] for l in out.splitlines()
+                                 if l.startswith("Version:"))
+        except Exception:
+            versions[pkg] = "absent"     # 缺失依赖记为显式值，避免键消失
+    fingerprint = {
+        "python": platform.python_version(),
+        "git": subprocess.run(["git", "rev-parse", "HEAD"],
+                              capture_output=True, text=True).stdout.strip(),
+        "packages": versions,
+        "cuda": torch.version.cuda if torch.cuda.is_available() else None,
+    }
+    return fingerprint
+
+def assert_compatible(current, saved):
+    """恢复校验：当前环境与检查点写入环境不一致时拒绝自动恢复。
+    不一致可能改变数值行为，静默续跑的轨迹不会被承认。"""
+    if current != saved:
+        raise RuntimeError(f"版本标识不一致，恢复被拒绝")
+    return True</code></pre>
+    <p>解读：标识采集与校验构成可追溯性的两端。<strong>（1）</strong>过滤采集范围到关键包与解释器、代码、加速层，摘要稳定且覆盖主要漂移来源；缺失依赖记为"absent"使字段集合固定，便于全量比对。<strong>（2）</strong>恢复校验采用严格相等：任何一项变化都会拒绝自动恢复并调用人工判断，宁可中断也不进入"未知环境续跑"。<strong>（3）</strong>版本标识随运行清单与检查点一同保存（与第 090、096 章衔接），审计场景可以据此重建当时的运行环境。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>所有并行单元共用一个种子</strong>：各单元产生相同轨迹，样本多样性丧失。修复：用派生函数为每个单元分配独立种子并登记。</li>
+      <li><strong>只设置全局种子不控制流</strong>：第三方库内部随机流不受控，重跑结果漂移。修复：显式枚举随机源，逐流派发并写入配置。</li>
+      <li><strong>评估使用训练随机状态</strong>：评估顺序改变导致结果变化。修复：评估端固定种子集并冻结随机状态，评估前后重置。</li>
+      <li><strong>依赖版本浮动</strong>：未锁定补丁版本，升级后默认参数变化。修复：容器镜像或锁定清单固定到补丁级，版本标识随检查点校验。</li>
+      <li><strong>种子未随检查点保存</strong>：恢复后随机流从前不连续，轨迹与未中断训练不匹配。修复：随机流状态纳入检查点清单（第 090 章）。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>计算题：base_seed = 7，单元 0 与 1 的 env_reset 流种子由同一摘要函数派生。说明为什么二者近似独立，而 7 与 8 作为单一种子直接使用时相关性更高。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>摘要输出的比特近似均匀独立；相邻整数作为种子在部分生成器下低位相关，初始化序列可能重叠。</div></details>
+      </li>
+      <li>预测题：在统计级别下重跑同一配置两次，预测指标数值与报告结论的一致性程度，并说明与位级一致级别的差别。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>统计级别下两次运行指标不同但分布一致，聚合结论方向稳定；位级级别下逐步数值完全一致但吞吐下降。</div></details>
+      </li>
+      <li>设计题：为"8 采样单元、图像输入、含数据增强"的训练设计种子与版本控制方案：流清单、派生输入、版本标识字段与恢复校验流程。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>流含 env/policy/augment/shuffle；派生输入含单元号与流名；标识含容器摘要与仿真器版本；恢复比对失败即人工处理。</div></details>
+      </li>
+      <li>分析题：讨论"同硬件统计一致"这一承诺为什么不包含跨硬件可复现，以及跨硬件比较实验应如何设计控制变量。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>浮点归约顺序与算子实现随硬件变化；跨硬件比较应固定种子集与协议，把硬件差异作为独立变量记录并做多种子聚合对照。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>复现性分位级、统计与功能三级；先声明目标级别，再选择控制强度。</li>
+      <li>三层控制：版本层锁环境，种子层派生随机流，执行层约束非确定来源。</li>
+      <li>种子派生用摘要函数从拼接输入生成；简单递增存在序列相关风险。每个随机源有名称与状态，状态随检查点保存。</li>
+      <li>确定性开关按场景分层启用；跨硬件复现不在承诺范围内，比较实验需控制变量。</li>
+      <li>版本标识随清单与检查点保存，恢复时严格校验。下一章建立性能与成本的度量体系。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch097.html">← 第 097 章：训练平台化：结果对比与报告生成</a>
+    <a class="next" href="ch099.html">第 099 章：性能基准与成本分析 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

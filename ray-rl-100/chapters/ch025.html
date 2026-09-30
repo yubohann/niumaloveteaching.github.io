@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第025章 RLlib回调函数机制 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · RLlib 核心接口与训练</span>
+    <span class="sep">/</span>
+    <span>第 025 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · RLlib 核心接口与训练</div>
+    <h1>第 025 章：RLlib回调函数机制</h1>
+    <p class="lead">回调函数（Callback）是训练生命周期上的插桩点。本章讲清各回调点的触发时机、执行位置、自定义指标从采样进程汇聚到训练结果的数据路径，以及插桩开销的控制方法。</p>
+    <ul class="meta">
+      <li>主题：RLlib 训练 / 生命周期插桩</li>
+      <li>关键机制：回调点、自定义指标、跨进程聚合、插桩开销</li>
+      <li>预计学时：50 分钟</li>
+      <li>前置章节：第 024 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解回调点在训练生命周期中的位置与执行进程。</li>
+      <li>掌握自定义指标的产生、聚合与呈现路径：从回合对象到训练结果字典。</li>
+      <li>会编写回调完成指标注入、轨迹过滤与告警触发，并控制每步插桩的开销。</li>
+      <li>理解回调与训练器、采样器的职责边界，能做出正确的扩展点选择。</li>
+      <li>能根据版本差异核对回调基类与注册方式，避免接口迁移带来的静默失效。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>训练过程会产生大量过程信息：每回合的路径长度、自定义任务指标、策略行为的中间统计。把信息落到日志、把异常变成告警、把分析逻辑挂到训练结果上，都需要在训练循环的固定位置插入代码。回调函数提供这些插桩点，不修改算法实现即可扩展训练行为。</p>
+    <p>回调与采样进程结构直接相关：回合级回调在采样进程内执行，各进程分别触发；训练结果级回调在主进程执行，看到聚合后的全局视图。<strong>理解回调的执行位置，才能正确解释指标的聚合口径与消费方式。</strong>上一章解决了并行采样的编排，本章在编排之上插入观测与分析逻辑。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p>回调机制的本质是把训练循环切开若干切口，让外部代码在切口处读取状态、写入指标。</p>
+
+    <h3>1. 回调点与触发时机</h3>
+    <p>常用回调点按生命周期排列：回合创建、开始、每步、回合结束、样本批次结束、训练结果、评估结束。其中每步回调触发频率最高，回合级回调在环境回合边界触发，训练结果回调每轮迭代触发一次。接口历经版本演进：早期通过默认回调基类（DefaultCallbacks）的子类注入，新 API 栈中回调基类与部分事件名称有过调整（以对应 Ray 版本的官方文档为准）。<strong>命名虽有迁移，回调点的语义稳定：事件发生时携带上下文对象供读取与修改。</strong></p>
+
+    <h3>2. 执行位置与数据可见性</h3>
+    <p>回合级回调在采样进程内执行，只看到本进程采集的回合；训练结果回调在主进程执行，看到聚合后的全局结果。回合对象提供用户数据字典（user_data）与自定义指标字典（custom_metrics）两个容器：前者在单回合内随步累积，用于依赖历史量的统计；后者在回合结束时写入，由框架跨进程聚合后出现在训练结果中。</p>
+    <div class="formula">
+      聚合指标 = Σ<sub>i</sub> w<sub>i</sub> · x<sub>i</sub> / Σ<sub>i</sub> w<sub>i</sub>，i 为回合索引
+      <span class="note">回合级自定义指标按回合加权平均；分子分母的权重口径由框架统一处理，回调侧只需保证数值可比，跨进程聚合无需手工求和</span>
+    </div>
+
+    <h3>3. 插桩开销的传播</h3>
+    <p>每步回调在采样热路径上执行，其耗时直接计入采样时间。单个回调增加零点几毫秒，在每秒数万步的吞吐下会被放大为可观的占比。<strong>控制原则：每步回调只做常数时间记录，求和与开方留到回合结束一次性完成；</strong>对象构造与字符串格式化移出热路径。回调内的异常在部分版本中会向上传播并终止采样进程，调试期应暴露，上线期应加保护。</p>
+
+    <h3>4. 与相邻扩展点的边界</h3>
+    <p>环境包装器改变数据本身，采样器改变数据来源，回调只观察与记录，附带有限的干预能力（例如过滤轨迹、提前终止训练）。<strong>选择顺序是：能观察解决的不干预，能回合级解决的不进每步路径。</strong>需要改变训练编排用自定义训练器，改变数据来源用自定义采样器；两者与回调可以在同一训练流程中并用。</p>
+
+    <h3>5. 插桩开销的定量模型</h3>
+    <p>设单环境步的基准耗时为 t，每步回调附加耗时 f，每步挂 k 个回调，则步周期变为 t + k·f，吞吐保留比例与损失比例分别为：</p>
+    <div class="formula">
+      r = t / (t + k·f)，损失比例 = 1 − r
+      <span class="note">t = 0.25 毫秒、k = 1、f = 0.05 毫秒时 r ≈ 0.833，吞吐损失约 16.7%；回调开销按环境步数放大，总开销随并行环境数线性增长</span>
+    </div>
+    <p>数值验证：单副本步频 4000 步每秒对应步周期 0.25 毫秒；加 0.05 毫秒的每步回调后周期变成 0.3 毫秒，步频降到约 3333 步每秒。32 个副本合计从 128000 步每秒降到约 106667 步每秒，损失约 21333 步每秒。若同时挂载两个 0.05 毫秒的每步回调，周期变为 0.35 毫秒，保留比例降到 0.714，吞吐损失约 28.6%。<strong>同一份统计逻辑若放到回合结束回调执行，调用次数从每步一次降到每回合一次，回调总耗时按回合长度的倍数缩减；</strong>回合越长，低频汇总的收益越明显。</p>
+
+    <h3>6. 聚合口径与加权平均</h3>
+    <p>自定义指标跨进程聚合时按回合数加权。数值示例：进程 A 上报 8 个回合、指标均值 10；进程 B 上报 2 个回合、指标均值 40。对两个均值直接取算术平均得到 25，按回合加权的结果为 (8 × 10 + 2 × 40) / (8 + 2) = 16，两者相差过半，回合数分布不均时偏差不可忽略。<strong>回调侧只负责写入口径一致的可比数值，权重由框架按回合数处理；手工在回调内先做平均会让权重信息丢失，聚合结果无法还原。</strong>同一指标在所有写入点必须保持相同的数值类型与量纲，混入字符串会导致聚合阶段直接报错。</p>
+
+    <h3>7. 三类数据容器的对比</h3>
+    <table>
+      <tr><th>容器</th><th>作用域</th><th>写入时机</th><th>聚合方式</th><th>典型用途</th></tr>
+      <tr><td>user_data</td><td>单回合</td><td>任意回合级回调点</td><td>不聚合，随回合销毁</td><td>回合内中间量，如动作变化计数</td></tr>
+      <tr><td>custom_metrics</td><td>回合级，跨进程可见</td><td>回合结束回调</td><td>按回合数加权聚合</td><td>训练结果与日志消费的统计量</td></tr>
+      <tr><td>结果字典改写</td><td>整轮迭代</td><td>训练结果回调</td><td>主进程直接写入</td><td>告警标记、早停信号、派生指标</td></tr>
+    </table>
+    <p>选择依据：只在回合内使用的中间量放 user_data；需要跨进程与跨回合汇总的统计放 custom_metrics；对整轮结果的判断与标记放结果字典。<strong>容器的选择决定数据的生命周期与可见范围，选错容器会造成统计缺失或聚合口径混乱。</strong>多个回调类可以同时注册并按注册顺序依次执行，前一个回调对回合对象的修改对后一个可见；执行顺序影响结果时应在配置中固定顺序并记录。回调内抛出的异常在部分版本中会终止采样进程，调试期保留崩溃行为以暴露问题，稳定期把非关键统计包进异常保护，让主训练流程不受告警逻辑影响。数值与量纲断言在写入前执行，断言失败按缺失处理并计数，避免错误数值进入聚合通道。训练结果回调看到的指标是聚合后的值，原始分片在上报前已被加权合并；需要按采样器分组分析时，在配置中固定分组标签并把标签写入指标键，聚合视图即可按标签还原。</p>
+
+    <h3>8. 三种挂载频率的总量对照</h3>
+    <p>同一份诊断信息挂在哪个回调点，总开销相差两个数量级。取总采样量 100 万环境步、平均回合长度 200 步、训练批次 8000 步三个规模常量，逐档核算：</p>
+    <table>
+      <tr><th>挂载点</th><th>调用次数</th><th>单次预算</th><th>累计耗时</th></tr>
+      <tr><td>每步回调</td><td>100 万次</td><td>0.05 毫秒</td><td>约 50 秒</td></tr>
+      <tr><td>回合结束回调</td><td>5000 次（100 万除以 200）</td><td>0.5 毫秒</td><td>约 2.5 秒</td></tr>
+      <tr><td>训练结果回调</td><td>125 次（100 万除以 8000）</td><td>2 毫秒</td><td>约 0.25 秒</td></tr>
+    </table>
+    <p>读表可得两条设计规则。<strong>其一，挂载点后移一级，单次预算可以放宽到十倍而累计耗时仍缩小十倍：</strong>每步回调只配得上两三个加法的操作预算，回合级可以承担除法与排序，迭代级可以承担小规模聚合与字符串处理。<strong>其二，调用次数由规模常量决定，调参先调这三个常量：</strong>回合变短会让回合级调用次数上升，训练批次变小会让迭代级次数上升，挂载点的成本随规模漂移。</p>
+    <div class="formula">
+      累计开销 ≈ 调用次数 × 单次耗时；调用次数 = 总步数 / 每次调用覆盖的步数
+      <span class="note">真实代价还要计入回调对采样线程的调度干扰；单次耗时进入微秒量级后测量误差接近信号量级，评估开销需要多次重复取中值</span>
+    </div>
+    <p>最后一条边界与口径有关：评估进程组同样会触发回合级与结果级回调，评估回合的统计量如不区分来源，会与训练口径混在一起。需要分开时有两种做法：在回调内按来源打标并写入不同键，或在消费端按结果字典的训练与评估分组读取。选择依据是下游分析需要什么口径：只看训练过程时按来源过滤，关注两条曲线差异时保留双份并分别聚合。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>回调的设计流程：确定指标口径，选择触发点，控制开销，验证聚合结果。</p>
+    <table>
+      <tr><th>回调点</th><th>执行位置</th><th>典型用途</th><th>开销约束</th></tr>
+      <tr><td>回合开始</td><td>采样进程</td><td>初始化回合级统计容器</td><td>每回合一次，开销可忽略</td></tr>
+      <tr><td>每步</td><td>采样进程</td><td>累积常数时间统计量</td><td>热路径，只做加法与赋值</td></tr>
+      <tr><td>回合结束</td><td>采样进程</td><td>汇总统计并写入自定义指标</td><td>每回合一次，可做开方与分组</td></tr>
+      <tr><td>样本批次结束</td><td>采样进程</td><td>抽样审计、字段校验</td><td>每批次一次，不做全量扫描</td></tr>
+      <tr><td>训练结果</td><td>主进程</td><td>告警、早停信号、结果改写</td><td>每轮一次，可执行较重逻辑</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：为什么每步回调只做累积，不做汇总？</span>
+      <p>每步回调位于采样热路径，调用次数等于环境步数乘以副本数。开方、排序、格式化等操作放在每步，等于在每秒数万次的频率上重复执行；集中到回合结束回调后，调用频率降到每回合一次，差异直接体现在 sample_throughput 上。<strong>热路径只累积原始量，汇总放到低频回调，是插桩开销控制的基本模式。</strong></p>
+    </div>
+    <p>插桩点的选择遵循频次原则：能放到每回合的就不放每步，能放到训练结果的就不放回合级。频率越低，允许的操作越重：每步回调只允许赋值与加法，回合结束回调允许除法与排序，训练结果回调允许调用外部告警与结果改写。<strong>回调挂载数量本身也是设计变量：一次遍历能完成的统计不要拆成多个回调，遍历次数按回调个数成倍增加。</strong>自定义指标写入前做类型与量纲检查，检查成本低，能避免聚合阶段的类型冲突。</p>
+    <p><strong>注册验证的通过标准按数量级设：</strong>开启与关闭回调各跑 20 轮，样本吞吐偏差在百分之一以内说明开销可接受；custom_metrics 的目标键在每个回合至少出现一次，聚合值与单进程手工抽样的数值同量级。两项同时满足才进入正式训练。</p>
+    <p>与上一章差异：第 024 章调整了采样进程的编排结构，本章在这些结构之上插入观测与干预逻辑，不改动采样与学习的主流程。下一章把同样的视角带到评估流程：评估的编排结构、指标口径与并行配置。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：回合级指标回调</strong></p>
+    <pre class="code"><code>from ray.rllib.algorithms.callbacks import DefaultCallbacks
+
+
+class TaskMetricsCallbacks(DefaultCallbacks):
+    """回合级回调：统计动作平滑度与越界次数，写入自定义指标。
+
+    基类路径与事件名称随 Ray 版本演进，以官方文档为准。
+    """
+
+    def on_episode_start(self, *, episode, **kwargs):
+        # 回合级容器只初始化常数项，热路径不分配新对象
+        episode.user_data["action_changes"] = 0
+        episode.user_data["last_action"] = None
+        episode.user_data["out_of_range"] = 0
+
+    def on_episode_step(self, *, episode, **kwargs):
+        # 每步回调位于采样热路径：只做加法与比较，不做格式化
+        last = episode.user_data["last_action"]
+        action = episode.last_action_for()
+        if last is not None and abs(action - last) &gt; 0.5:
+            episode.user_data["action_changes"] += 1
+        if abs(action) &gt; 1.0:
+            episode.user_data["out_of_range"] += 1
+        episode.user_data["last_action"] = action
+
+    def on_episode_end(self, *, episode, **kwargs):
+        # 回合结束再汇总：调用频率降到每回合一次
+        length = max(episode.length, 1)
+        episode.custom_metrics["action_change_rate"] = (
+            episode.user_data["action_changes"] / length)
+        episode.custom_metrics["out_of_range_count"] = (
+            episode.user_data["out_of_range"])</code></pre>
+    <p>解读：三个回调点对应三级频率：回合开始与结束每回合一次，每步回调每个环境步一次。动作平滑度用"动作变化率"表达，分子在热路径累积，除法在回合结束执行，避免每步重复计算。<strong>自定义指标写入 custom_metrics 后由框架跨进程聚合并进入训练结果的对应字段，回调侧无需手工求和。</strong>越界计数用整数累积，跨回合与跨进程求和口径稳定。字符串格式化或日志输出放进每步回调会让采样吞吐直接受损。</p>
+
+    <p><strong>片段 2：训练结果回调与告警信号</strong></p>
+    <pre class="code"><code>class TrainGuardCallbacks(DefaultCallbacks):
+    """训练结果回调：在主进程执行，可访问聚合后的全局指标。"""
+
+    def on_train_result(self, *, algorithm, result, **kwargs):
+        # custom_metrics 的每个键在部分版本中是聚合值或列表，
+        # 取值时做类型兜底，避免跨版本行为差异导致回调报错
+        metrics = result.get("custom_metrics", {})
+        rate = metrics.get("action_change_rate")
+        if isinstance(rate, list):
+            rate = sum(rate) / max(len(rate), 1)
+        # 退化行为告警：变化率跌到阈值以下说明策略趋于僵化
+        if rate is not None and rate &lt; 0.02:
+            result["health_warning"] = "动作变化率过低，检查探索配置"
+        # 也可写入训练结果供 TensorBoard 与日志消费
+        result.setdefault("analysis", {})
+        result["analysis"]["guard_checked"] = True</code></pre>
+    <p>解读：训练结果回调在主进程执行，看到所有采样进程聚合后的指标，适合跨进程告警与决策。取值时的类型兜底应对版本差异：聚合字段可能是标量、列表或均值加标准差结构。<strong>把告警写回结果字典（result），</strong>可以让下游的日志器与回调链共同消费这些信息；只打印日志的告警仅存在于控制台，无法进入消费链；若算法支持，也可以在结果上挂接终止训练的条件。回调对结果的改写应在算法内部消费之前完成。</p>
+
+    <p><strong>片段 3：注册回调</strong></p>
+    <pre class="code"><code>from ray.rllib.algorithms.ppo import PPOConfig
+
+# 通过 callbacks 入口注册回调类；类对象经序列化分发到每个采样进程，
+# 进程内实例化，因此回调状态默认是进程本地的
+config = (
+    PPOConfig()
+    .environment(env=LineGoalEnv)
+    .env_runners(num_env_runners=4, num_envs_per_env_runner=2)
+    .callbacks(TaskMetricsCallbacks)
+)
+# 需要多个回调行为时，用一个子类组合继承，或按版本支持的方式串联；
+# 注册后先跑二至三轮，检查结果中的 custom_metrics 字段是否出现</code></pre>
+    <p>解读：注册入口把回调类交给算法，由框架分发到采样进程与主进程。<strong>回调状态默认进程本地：在回调里维护跨进程计数器不会自动合并，需要跨进程共享的量应通过回合指标或结果字段传递。</strong>验证方式是训练数轮后检查 custom_metrics 是否出现预期键；键缺失通常意味着回调未注册成功或事件名称随版本变化。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>每步回调做重计算</strong>：在 on_episode_step 中执行开方、排序或日志格式化。症状是采样吞吐下降而学习指标不变。修复：热路径只累积原始量，汇总移到回合结束回调。</li>
+      <li><strong>指标口径不统一</strong>：部分回合写字符串、部分写数值，聚合时类型冲突。症状是聚合报错或数值异常。修复：固定指标的数值类型与量纲，写入前做检查。</li>
+      <li><strong>把跨进程状态放在回调实例上</strong>：在回调对象里维护全局计数器，期望跨进程合并。症状是各进程各自计数。修复：通过回合指标上送，由框架聚合。</li>
+      <li><strong>事件名称随版本迁移失效</strong>：升级后回调方法名不再被调用且无报错。症状是指标字段消失。修复：对照官方文档核对事件名称，训练首轮验证字段存在。</li>
+      <li><strong>在回调中阻塞训练</strong>：训练结果回调里做无超时的网络请求。症状是迭代时间周期性拉长。修复：告警上报改为带超时的非阻塞调用。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>设计一个回合级指标：统计每回合奖励的变异系数，说明分子分母分别放在哪个回调点计算以及理由。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>每步累积奖励的平方和与和，回合结束计算方差与均值；平方与除法均放回合结束时执行，热路径只做两次加法。</div></details>
+      </li>
+      <li>训练结果回调里读到 action_change_rate 为列表形式，说明版本间聚合口径的差异原因，并写出兼容取值代码。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>版本间聚合口径不同，有的给出各进程原始值列表，有的给出均值与标准差字典；兼容代码先判类型再统一为标量。</div></details>
+      </li>
+      <li>每步回调增加 0.05 毫秒开销，单副本基准步频 4000 步每秒，总并行环境 32，估算损失比例与每秒损失的采样步数。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>步周期从 0.25 毫秒升到 0.3 毫秒，单副本步频降到约 3333 步每秒；32 个副本合计损失约 21333 步每秒，损失比例约 16.7%。</div></details>
+      </li>
+      <li>把下列需求分配到合适的扩展点：奖励缩放、轨迹长度统计、示范数据注入、跨回合的成功率告警。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>奖励缩放在环境包装器；长度统计与告警在回调（回合级与训练结果级）；示范注入在采样器或数据管道。</div></details>
+      </li>
+      <li>设计实验验证回调开销：同配置下开启与关闭每步回调各跑一组，对比 sample_throughput，给出保留与否的判据。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>固定其余参数跑两组，比较吞吐下降比例与诊断收益；吞吐损失在百分之一以内且指标有效时通常值得保留。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>回调把训练循环切成若干插桩点：回合级回调在采样进程执行，训练结果回调在主进程执行。</li>
+      <li>自定义指标经 custom_metrics 写入，由框架跨进程聚合后进入训练结果。</li>
+      <li>每步回调位于热路径，只累积原始量；汇总与格式化放到回合结束等低频回调。</li>
+      <li>回调状态默认进程本地，跨进程统计必须通过框架的指标通道传递。</li>
+      <li>接口命名随版本演进，升级时核对事件名称并验证指标字段是否仍然出现。</li>
+      <li>下一章深入策略评估流程：评估的独立编排、指标口径与并行配置。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch024.html">← 第 024 章：RLlib多环境并行训练</a>
+    <a class="next" href="ch026.html">第 026 章：RLlib策略评估流程深入 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

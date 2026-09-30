@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第066章 资源分配与GPU使用调优 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第四篇 · Ray Tune 超参搜索</span>
+    <span class="sep">/</span>
+    <span>第 066 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第四篇 · Ray Tune 超参搜索</div>
+    <h1>第 066 章：资源分配与GPU使用调优</h1>
+    <p class="lead">资源声明是调优实验的“装箱单”：包络声明与实际内部结构错位，超占与饥饿立刻出现。本章讲透 Tune 层与 RLlib 层两级资源声明的关系、分数 GPU 的共享核算、放置策略对采样带宽的影响，以及用时间分解判读“该加 GPU 还是加采样并行”。</p>
+    <ul class="meta">
+      <li>主题：Ray Tune 调优 / 资源与 GPU 分配</li>
+      <li>关键机制：资源包络、分数 GPU、显存核算、放置策略、瓶颈判读</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 065 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>分清两级资源声明：Tune 的试验包络与 RLlib 的内部结构，会校对两者的一致性。</li>
+      <li>掌握分数 GPU 的语义：算力可分时共享、显存不可超卖，会按显存核算每卡可容纳的试验数。</li>
+      <li>理解放置策略（PACK、SPREAD、严格打包）对采样带宽与试验迁移的影响，会按试验拓扑选择策略。</li>
+      <li>会用时间分解判读训练瓶颈：学习侧占比高还是采样侧占比高，对应不同的扩容动作。</li>
+      <li>会识别资源碎片与饥饿：混合资源声明的排队现象与对齐关系。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 065 章决定“同时跑多少个试验”，本章决定“每个试验内部的资源怎么摆”。一个强化学习试验同时包含采样进程与学习进程：采样吃 CPU 与网络，学习吃 GPU 与显存，两者的资源需求在同一个包络里共存。<strong>声明层与实现层脱节是资源问题的高发区：Tune 按声明装箱，训练函数按代码实际占用，两者不一致时资源池要么被悄悄超占，要么出现“有卡没人用、有试验排不上”的悖论。</strong></p>
+    <p>GPU 的分配比 CPU 多一层约束：核可以分时复用到任意小的份额，显存只能整体划出。两个试验声明各 0.5 块 GPU 时，算力时间片可以切换，显存则是两份占用叠加在同一张卡上。显存核算因此成为 GPU 调优的第一道门槛，失败表现是进程被杀；变慢只是次要症状。本章从声明一致性开始，依次讲共享核算、放置策略与瓶颈判读。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 两级资源声明与包络一致性</h3>
+    <p>Tune 层在每个试验启动前收集资源声明（包络），满足后才允许运行；RLlib 层在试验内部创建采样进程与学习器，实际占用由算法配置决定。<strong>包络必须不小于内部结构之和，且不应远大于它。</strong>包络偏小导致物理超占，调度器的账目与实际占用脱节；包络偏大导致装箱保守，集群利用率下降。校对口径：包络 CPU = 采样进程数 × 每进程核数 + 驱动与管理开销；包络 GPU = 学习器占用 + 可能存在的 GPU 采样进程占用。</p>
+    <div class="formula">
+      包络 CPU = W × cpu<sub>worker</sub> + o，&nbsp; 包络 GPU = g<sub>learner</sub> + n<sub>gpu-worker</sub> × g<sub>worker</sub>
+      <span class="note">W 为采样进程数，o 为驱动与管理开销（通常 1 至 2 核）；GPU 采样进程常见于图像输入场景，纯向量环境通常不需要</span>
+    </div>
+
+    <h3>2. 分数 GPU：算力可分、显存不能超卖</h3>
+    <p>声明 0.5 块 GPU 的试验获得该卡一半的时间片，多个试验轮流使用同一张卡。时间片切换有上下文切换开销，份额越小切换越频繁，单步计算效率越低。<strong>显存的行为完全不同：每个进程的显存配额是叠加的，两个 12 GB 的试验不可能同时放进一张 20 GB 的卡。</strong>共享核算按显存进行：每卡可容纳的份额数 = ⌊可用显存 / 单试验显存峰值⌋，其中可用显存先乘安全系数，给框架开销与碎片留余量。份额的倒数就是分数声明值。</p>
+    <div class="formula">
+      shares<sub>card</sub> = ⌊ VRAM<sub>card</sub> × s / VRAM<sub>trial</sub> ⌋, &nbsp; g<sub>trial</sub> = 1 / shares<sub>card</sub>
+      <span class="note">s 为安全系数（常用 0.8）；24 GB 卡、单试验 7 GB、s=0.8 时每卡 2 个份额，声明 gpu=0.5</span>
+    </div>
+
+    <h3>3. 放置策略与数据本地性</h3>
+    <p>多进程试验的放置决定进程间数据路径。放置组的打包策略有三档语义：<strong>打包（PACK）</strong>尽量填满节点再换下一台，<strong>分散（SPREAD）</strong>平摊到各节点，<strong>严格打包</strong>要求全部进程落在同一节点。强化学习试验的采样数据要经过对象存储传给学习器：同节点内走共享内存，跨节点走网络。<strong>采样密集型、单试验多进程的配置宜严格打包到单节点，避免把采样吞吐压在网络带宽上；以显存为约束的大模型试验可以分散放置，让每张卡只服务一个学习器。</strong></p>
+    <p>放置策略同时影响故障域：严格打包让试验与节点同生共死，节点掉线即整个试验迁移；分散放置下单节点故障只损失部分进程，但恢复要走跨节点重建。第 064 章的恢复机制在两种情形下的重算量不同，选型时一并评估。</p>
+
+    <h3>4. 资源碎片与饥饿</h3>
+    <p>混合声明会在资源池里留下无法拼合的碎片：池中空闲 8 核 0 卡，而队首试验需要 3 核 1 卡，它必须等待某张卡释放。<strong>碎片来自声明粒度不齐：声明粒度越细，可拼合的组合越多；声明之间成整数倍关系时，碎片最少。</strong>近期实践是把单试验声明统一到小粒度（如 2 核 + 分数 GPU），把“单个试验做得大”的诉求转移给调度器根据反馈动态决定；超大静态声明会加剧碎片，不再采用。</p>
+
+    <h3>5. 瓶颈判读：时间分解</h3>
+    <p>单看 GPU 利用率会误导：利用率低可能因为学习器在等待采样数据，也可能因为批量太小算不满。可靠判据是时间分解：<strong>把每个迭代的墙钟时间拆成采样段与学习段，学习段占比超过六成时扩容方向是 GPU 或减小更新批量；占比低于三成时扩容方向是采样进程。</strong>两侧都接近一半时，小幅增量单侧，观察比例移动方向，避免一次同时改动两侧造成归因困难。第 085 章会对吞吐做系统化分析，本章先建立两段式分解的口径。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>资源方案按四步给出：<strong>先写包络，再核显存，再选放置，最后留余量并试运行验证。</strong>与上一章的差异在于，第 065 章给出并发总数，本章给出单个试验内部的资源结构。</p>
+    <ol>
+      <li><strong>写包络</strong>：按内部结构公式计算 CPU 与 GPU 声明，包络写入 <code>tune.with_resources</code>。</li>
+      <li><strong>核显存</strong>：用共享核算公式确定每卡份额与分数声明值；异构卡按最小显存卡核算。</li>
+      <li><strong>选放置</strong>：单试验多采样进程用严格打包；学习器独占卡的大试验用分散放置。</li>
+      <li><strong>试运行验证</strong>：用一个覆盖若干完整迭代的小规模试验核对三项：进程实际占用与包络偏差、显存峰值与核算余量、时间分解的初始比例。</li>
+    </ol>
+    <table>
+      <tr><th>试验规格</th><th>声明示例</th><th>适用场景</th><th>风险点</th></tr>
+      <tr><td>纯 CPU 小试验</td><td>cpu=4, gpu=0</td><td>小网络、快速筛参</td><td>学习侧慢，只适合粗筛</td></tr>
+      <tr><td>单卡学习器 + 采样</td><td>cpu=7, gpu=1</td><td>标准训练与中规模调优</td><td>包络与内部结构必须对齐</td></tr>
+      <tr><td>分数 GPU 共享</td><td>cpu=4, gpu=0.5</td><td>显存余量大的多试验并发</td><td>时间片切换开销、显存峰值核算</td></tr>
+      <tr><td>多节点大试验</td><td>cpu=32, gpu=4</td><td>大模型长训练</td><td>碎片与饥饿，需独立资源池</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：为什么用“小声明 + 动态回收”替代“大声明”？</span>
+      <p>超大静态声明把灵活性锁死在起点：试验一旦声明 32 核，中途即便只需要 8 核，多余的 24 核也无法还给池子。小声明配合调度器的暂停回收，让算力在试验之间流动：早期试验按小份额评估，表现好的试验通过晋级获得更多资源。这种“先小后大”的分配与 ASHA 的分档思想同构，也降低碎片概率。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：两级声明的一致性写法</strong></p>
+    <pre class="code"><code>from ray import tune
+from ray.rllib.algorithms.ppo import PPOConfig
+
+def train_fn(config):
+    # 试验内部结构：6 个采样进程 + 学习器；字段名随版本演进
+    algo = (
+        PPOConfig()
+        .environment(config["env"])
+        .env_runners(num_env_runners=6, num_cpus_per_env_runner=1)
+        .learners(num_learners=1, num_gpus_per_learner=1)
+        .build()
+    )
+    run_training_loop(algo, config)
+
+# 包络声明与内部结构对齐：CPU = 6 采样 + 1 驱动；GPU = 1 学习器
+trainable = tune.with_resources(
+    train_fn,
+    resources={"cpu": 7, "gpu": 1},
+)
+
+tune.run(trainable, config=search_space, num_samples=40,
+         name="resource_aligned_sweep")
+</code></pre>
+    <p>解读：一致性是这段代码的全部要点。<strong>（1）</strong>内部创建 6 个采样进程，包络就必须包含 6 核；少写一核会形成“每试验超占一核”的累积偏差，40 个试验并发 4 个时偏差达到 4 核。<strong>（2）</strong>学习器声明 1 块 GPU，包络同步声明 1 块；若算法配置未请求 GPU 而包络声明了 GPU，试验独占一块卡却闲置，属于隐性浪费。<strong>（3）</strong>校验方法是在试运行中读取进程级资源占用，与包络逐项对照；偏差超过管理开销就修正声明。RLlib 的资源字段在 2.x 演进中调整过命名（旧版本为 <code>num_workers</code> 与 <code>resources(num_gpus=...)</code>），以对应版本的官方文档为准。</p>
+
+    <p><strong>片段 2：分数 GPU 的显存核算</strong></p>
+    <pre class="code"><code>def gpu_share_plan(total_gpu=8, vram_per_card=24.0,
+                   vram_per_trial=7.0, safety=0.8):
+    """按显存核算每卡可共享的试验数；算力可分时，显存不能超卖。"""
+    usable = vram_per_card * safety          # 预留 20% 给框架与碎片
+    shares = int(usable // vram_per_trial)   # 每卡份额数（向下取整）
+    if shares == 0:
+        raise ValueError("单试验显存已超过安全余量，先缩小模型或批量")
+    gpu_per_trial = 1.0 / shares             # 分数声明值
+    total = total_gpu * shares               # 全集群的试验并发上限
+    used = shares * vram_per_trial
+    print(f"每卡 {shares} 份；声明 gpu={gpu_per_trial:.2f}；"
+          f"并发上限 {total}；显存 {used:.1f}/{vram_per_card} GB")
+    return shares, gpu_per_trial
+
+gpu_share_plan()                          # 24GB 卡、7GB 试验：每卡 2 份
+gpu_share_plan(vram_per_trial=4.0)        # 4GB 试验：每卡 4 份，声明 0.25
+</code></pre>
+    <p>解读：核算函数的三个设计点值得注意。<strong>（1）</strong>安全系数作用在卡级可用显存上：碎片与框架开销是卡级现象，统一从卡里扣除更贴近实际。<strong>（2）</strong>份额向下取整后转换为分数声明值，份额数与声明值互为倒数，写进实验记录时保存份额数更稳定（声明值在小数运算里容易漂移）。<strong>（3）</strong>两次调用的对照展示了“试验显存减半、共享份额翻倍”的关系，同时提醒另一侧的代价：份额从 2 增到 4 后，时间片切换更频繁，学习步效率可能下降，需要回到时间分解验证。核算给出的是上限，最终份额还要由学习效率判读确认。</p>
+
+    <p><strong>片段 3：时间分解的瓶颈判读</strong></p>
+    <pre class="code"><code>def diagnose_bottleneck(iter_metrics):
+    """按迭代时间分解判断扩容方向；字段名以对应版本的训练结果为准。"""
+    sample_s = iter_metrics["time_sampling_s"]     # 采样段墙钟时间
+    learn_s = iter_metrics["time_training_s"]      # 学习段墙钟时间
+    total = sample_s + learn_s
+    if total &lt;= 0:
+        raise ValueError("时间分解为零，检查计时字段是否采集")
+    ratio = learn_s / total
+    if ratio &gt; 0.6:
+        advice = "学习侧瓶颈：加 GPU 份额或减小更新批量"
+    elif ratio &lt; 0.3:
+        advice = "采样侧瓶颈：加环境运行器或缩短单步开销"
+    else:
+        advice = "两侧接近：单侧小幅增量，观察比例移动方向"
+    # 同时输出采样吞吐，作为比例之外的绝对量参照
+    print(f"学习占比 {ratio:.0%}；采样吞吐 {iter_metrics['env_steps_per_s']:.0f} 步/秒"
+          f" -> {advice}")
+    return ratio
+
+diagnose_bottleneck({"time_sampling_s": 6.0, "time_training_s": 14.0,
+                     "env_steps_per_s": 5200})</code></pre>
+    <p>解读：判读函数把“经验”固化为两个阈值与一条处置路径。<strong>（1）</strong>六成与三成是起点阈值，用于首次分诊；稳定运行后建议按任务的历史分布替换成相对阈值。<strong>（2）</strong>采样吞吐作为绝对量并行输出：比例健康但吞吐远低于预期时，问题在单步效率（环境步进、观测处理），加进程只会同比例放大低效。<strong>（3）</strong>“两侧接近”的处置刻意保守：同时改两侧会让归因失效，单侧增量再观察比例移动方向，是成本最低的定位方式。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>包络与内部结构错位</strong>：声明 4 核而内部创建 8 个采样进程，物理超占。症状是并发试验数比资源账目多出几个，吞吐整体下滑。修复：按包络公式逐项对齐，并在试运行中核对实际占用。</li>
+      <li><strong>显存按算力份额核算</strong>：看到 0.5 块 GPU 就认为“一半资源”，忽略显存是两份叠加。症状是共享卡上的试验随机被杀。修复：按显存公式核算份额，安全系数不低于 0.8。</li>
+      <li><strong>跨节点放置拖慢采样</strong>：采样进程与学习器分居两节点，采样数据走网络，学习段等待变长。症状是时间分解中学习段占比虚高。修复：采样密集的试验采用严格打包，或让采样进程与学习器同节点。</li>
+      <li><strong>声明粒度不齐造成碎片</strong>：池中零散空闲凑不出队首试验所需组合，出现“总占用不高、试验却排队”的现象。修复：统一小粒度声明，或让声明值成整数倍关系。</li>
+      <li><strong>只看利用率判瓶颈</strong>：GPU 利用率低就加卡，实际卡在采样侧，加卡后比例继续恶化。修复：改用时间分解判读，利用率只作为辅助信号。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>算一算：4 张 40 GB 卡，单试验显存峰值 9 GB，安全系数 0.8。每卡份额数、分数声明值与全集群并发上限各是多少？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>40×0.8=32 GB 可用，32//9=3 份，声明 gpu≈0.33，集群上限 4×3=12 个共享试验。份额值建议记录为整数 3，0.333 这类声明值在小数运算中容易漂移。</div></details>
+      </li>
+      <li>预测题：把训练批量从 4k 步翻倍到 8k 步，学习段显存峰值与时间占比如何变化？时间分解的比例会向哪一侧移动？<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>激活显存随批量近似线性上升，学习段时长上升；采样量不变，采样段基本不动，学习占比上移。若接近或超过 60%，下一步动作应是检查显存余量并考虑加卡或减小更新批量。</div></details>
+      </li>
+      <li>设计题：为 64 核、8 卡、40 GB 的集群设计两套发布方案：方案 A 追求“单位时间完成试验数最大”，方案 B 追求“单个试验最快完成”。给出声明、并发与预期差异，并说明两套方案的适用阶段。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>方案 A：小声明（如 cpu=3、gpu=0.33）、高并发，适合粗筛与宽搜索；方案 B：大声明（cpu=15、gpu=1）、低并发，适合决赛阶段对少数候选做精确评估。两套方案对应搜索流程的不同阶段，可先后使用。</div></details>
+      </li>
+      <li>实现题：扩展片段 2 支持异构卡：入参为显存列表（如 [40, 40, 24, 24]），输出逐卡份额与总并发上限，并说明为什么总并发按逐卡求和，取最小值乘卡数会低估。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>逐卡独立核算再求和，避免“最小卡决定全部”的保守估计；声明值取各卡份额的最小公分母以保证同一分数能在任何卡上放下，或接受按卡分层的声明策略。</div></details>
+      </li>
+      <li>判读题：给定一组迭代数据：采样段 5 秒、学习段 9 秒、采样吞吐 4800 步/秒。判断瓶颈方向，并写出一条加进程、一条加 GPU 的具体动作及验证点。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>学习占比 64%，超过六成阈值，方向是学习侧：动作一为增加学习器 GPU 份额，动作二为减小更新批量；验证点是占比下降且采样吞吐不因数据积压而变形。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>资源声明分两层：Tune 包络与 RLlib 内部结构，包络必须按公式与内部结构对齐。</li>
+      <li>分数 GPU 的算力可分时共享，显存按份额叠加；核算公式以显存为准，安全系数不低于 0.8。</li>
+      <li>放置策略影响数据本地性与故障域：采样密集型严格打包，独占卡的大试验分散放置。</li>
+      <li>碎片来自声明粒度不齐；小声明配合调度器动态回收，比大静态声明更灵活。</li>
+      <li>瓶颈判读用时间分解：学习段占比超过六成扩 GPU，低于三成扩采样，接近时单侧小步验证。</li>
+      <li>下一章把视角扩展到多节点集群：分布式调优的初始化、同步与伸缩。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch065.html">← 第 065 章：并行实验与并发度控制</a>
+    <a class="next" href="ch067.html">第 067 章：分布式超参调优 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

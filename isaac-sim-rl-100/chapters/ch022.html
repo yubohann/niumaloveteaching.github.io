@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第022章 实现多环境并行训练 | 机器人仿真学习课程 · Isaac Sim 强化学习训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · 仿真环境与训练框架</span>
+    <span class="sep">/</span>
+    <span>第 022 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · 仿真环境与训练框架</div>
+    <h1>第 022 章：实现多环境并行训练</h1>
+    <p class="lead">把数千个机器人塞进同一张 GPU：用环境克隆 + 张量视图 + 批量步进，让采样吞吐从每秒几十步跳到每秒几十万步。</p>
+    <ul class="meta">
+      <li>主题：训练吞吐 / 向量化环境</li>
+      <li>相关组件：Isaac Sim（Cloner / Articulation / PhysX GPU）、Stable-Baselines3</li>
+      <li>预计学时：50 分钟</li>
+      <li>前置章节：第 021 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解并行环境为什么是 GPU 强化学习的核心杠杆：吞吐、样本多样性、GPU 利用率三件事一次解决。</li>
+      <li>掌握 Isaac Sim 里克隆 N 个环境的做法：模板 prim、<code>Cloner</code>、环境路径正则与 <code>replicate_physics</code> 的含义差异。</li>
+      <li>会用张量视图（<code>Articulation</code> / <code>RigidPrim</code>，旧称 <code>ArticulationView</code> / <code>RigidPrimView</code>）做批量读写，彻底消除逐环境的 Python 循环。</li>
+      <li>会实现"只重置已完成环境"的 autoreset 语义，并说清它与 VecEnv 契约的关系。</li>
+      <li>能根据显存、物理耗时与策略网络开销估算合理的并行环境数 N。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>先算一笔账。<strong>单环境、实时速度下，一秒只能采 60 个决策步</strong>；PPO 训练一个灵巧操作策略通常需要 5000 万到 2 亿个决策步，照这个速度要跑 10 到 40 天。而 Isaac Sim 在一张 RTX 4090 上把 4096 个环境并行推进，一秒能采 20 万步以上，同样的训练量压缩到几小时。</p>
+    <p>并行不只是"快"。它同时解决了强化学习的两个隐痛：其一，on-policy 算法要求一个 batch 内的数据足够新鲜且多样，N 越大，单次更新覆盖的状态分布越广，梯度方差越低；其二，强化学习的瓶颈经常不在算法而在数据管线，GPU 算物理只要几毫秒，CPU 却还在用 Python 循环逐个环境读写状态。<strong>多环境并行训练的本质，是把"逐环境循环"整个消灭掉。</strong>本章之后的所有训练章节都以这套并行机制为底座。</p>
+  </section>
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 吞吐公式：并行度从哪里来</h3>
+    <p>设一个控制步（decision step）里，物理引擎耗时 t<sub>phys</sub>、策略网络推理耗时 t<sub>policy</sub>，两者在 GPU 上依次执行，则每秒采样吞吐约为：</p>
+    <div class="formula">
+      Throughput ≈ N / (t<sub>phys</sub> + t<sub>policy</sub> + t<sub>cpu</sub>)
+      <span class="note">N 为并行环境数；t<sub>cpu</sub> 是数据搬运与控制逻辑开销，向量化做的就是把 t<sub>cpu</sub> 压到接近 0</span>
+    </div>
+    <p>关键认识：<strong>物理阶段和推理阶段都是批处理，耗时几乎不随 N 线性增长</strong>。4096 个环境的物理步进与 1024 个相比，主要差别体现在 GPU 线程占用率上，时间并不会翻四倍，这正是 GPU 物理引擎（PhysX GPU pipeline）的用武之地：一万个刚体、几千个关节可以在一次内核调用里全部积分完。所以把 N 从 64 提到 4096，吞吐往往能提升一到两个数量级。</p>
+
+    <h3>2. 同步模型：所有环境"齐步走"</h3>
+    <p>Isaac 系训练框架采用<b>同步并行</b>（synchronous parallelism）：每个决策步里，N 个环境同时接收动作、同时推物理、同时返回观测。<strong>数据天然排成 (N, dim) 的二维张量</strong>，第 0 维就是 batch 维，学习器不需要任何重组就能把它当 mini-batch 用。三个必须想透的细节：</p>
+    <ul>
+      <li><strong>回合长度不齐</strong>：某个环境到达终止条件时，其余环境还有进度。解法是 autoreset，把已结束环境原地重置成新回合，其余环境状态原封不动。这样"环境"这个维度永远是满的，学习器看不到空洞。</li>
+      <li><strong>终止帧的双重身份</strong>：一个环境结束的那一步，既是旧回合的最后一条 transition，又是新回合的第一步观测。正确做法是把"旧 transition 入缓冲区"和"重置"分成两步执行，否则 new-obs 会张冠李戴地填进旧 transition。</li>
+      <li><strong>引导（bootstrap）语义</strong>：回合因超时结束时，值函数估计不能当 0，要按 V(s<sub>T</sub>) 截断；因真正失败（如落地摔倒）结束才当 0。批量实现时用 done 与 timeout 两个布尔张量区分。</li>
+    </ul>
+
+    <h3>3. 为什么"张量视图"比 Cloner 更关键</h3>
+    <p>克隆出来的 N 个环境如果还用逐环境 API 读写，瓶颈立刻转移到 Python：4096 次调用 × 每步 0.1 ms ≈ 0.4 s，物理只要 3 ms，慢的完全是胶水代码。张量视图（View）把这一层解决掉：<code>get_joint_positions()</code> 一次返回 (N, n<sub>j</sub>) 的 tensor，<strong>CPU 与 GPU 之间一次拷贝完成全部环境的读写</strong>。记住这个量级：消除循环前，t<sub>cpu</sub> 可能比 t<sub>phys</sub> 大 100 倍。</p>
+
+    <h3>4. N 怎么选：三条约束线</h3>
+    <p>N 不是越大越好，它有三条约束线：显存（每个环境都有物理缓冲区，像素观测时还有渲染目标）、物理耗时（接触复杂场景下 t<sub>phys</sub> 随 N 缓慢上升）、以及每回合交互步数。经验值：状态类观测的开箱任务，4096 环境在 24 GB 显存上余量充足；带 128×128 相机的观测，通常降到 512–1024；若 t<sub>phys</sub> 超过单步预算的 60%，再加 N 只会拖长每步时间，此时应优化场景碰撞体数量；硬加环境只会更慢。</p>
+
+    <h3>5. 完整算例：4096 环境的单步时间预算</h3>
+    <p>用 2 万步/s 的采样吞吐做锚点：4096 个环境合计 20 万步/s 时，整个批次的单控制步预算是 4096 / 200000 = 20.5 ms。把这份预算拆开（剖面的示意值，你的机器要按实测替换）。</p>
+    <table>
+      <tr><th>阶段</th><th>耗时（ms）</th><th>说明</th></tr>
+      <tr><td>物理步进（GPU）</td><td>5.0</td><td>decimation=4 个子步合计；4096 环境同一次内核</td></tr>
+      <tr><td>策略推理（GPU）</td><td>2.0</td><td>批量前向：(4096, obs_dim) 一次过网络</td></tr>
+      <tr><td>观测搬运（GPU→CPU）</td><td>4.0</td><td>每控制步 1 次拷贝；写进子步会翻几倍</td></tr>
+      <tr><td>奖励/终止/缓冲区</td><td>4.0</td><td>向量化计算与 transition 入库</td></tr>
+      <tr><td>日志与杂项</td><td>5.5</td><td>统计、TensorBoard、带余量的波动</td></tr>
+      <tr><td>合计</td><td>20.5</td><td>对应吞吐 20 万步/s</td></tr>
+    </table>
+    <p>四组对照配置把"瓶颈迁移"讲清楚：</p>
+    <table>
+      <tr><th>配置</th><th>单步耗时（ms）</th><th>吞吐（步/s）</th><th>相对损失</th></tr>
+      <tr><td>向量化 + 状态观测（基准）</td><td>20.5</td><td>200 000</td><td>1×</td></tr>
+      <tr><td>观测在物理子步内读（同步 ×4）</td><td>29.5</td><td>139 000</td><td>掉 31%</td></tr>
+      <tr><td>128×128 像素观测（渲染约 32 ms）</td><td>50.0</td><td>82 000</td><td>掉 59%</td></tr>
+      <tr><td>逐环境 Python 读写（0.1 ms × 4096）</td><td>430.0</td><td>9 500</td><td>掉 95%（慢 21 倍）</td></tr>
+    </table>
+    <p>读法与两个换算。第一，只要存在逐环境循环，单步时间立刻被 CPU 侧 410 ms 的主导项吃掉，GPU 物理的 5 ms 占预算不足 1.2%；这组数字把"消灭循环"从风格偏好升级为吞吐前提。第二，把锚点换算回训练时长：<strong>5 千万步</strong>，采样吞吐 20 万步/s 时纯推进只要 250 s（约 4 分钟），<strong>2 亿步</strong>约 17 分钟。这与"压缩到几小时"并不矛盾：20 万步/s 是纯采样峰值，端到端还要叠加 PPO 反传更新、评估、日志等阶段，实际端到端吞吐常在 2–10 万步/s 区间；按 2 万步/s 计，2 亿步约 2.8 小时。<strong>报告吞吐时必须写明口径</strong>（纯采样还是端到端），否则两组数字能差出一个数量级。</p>
+
+    <h3>6. 显存账：像素观测的真实瓶颈在哪</h3>
+    <p>把 128×128 像素观测的显存算清楚。单帧 RGBA8 是 128×128×4 = 64 KB；渲染管线通常同时持有颜色、深度与双缓冲，按 3 张算约 0.2 MB；4096 个环境合计约 0.8 GB。物理状态与网络参数在 24 GB 卡上属于零头，因此<strong>容量本身不是把像素环境压回 512–1024 的原因</strong>。真正的限制是时间：渲染 4096 路相机把单步预算从 20.5 ms 推到 50 ms 量级（见上表），吞吐反而低于"减少环境数、提高单步频率"的配置。选择顺序因此固定：先测单步时间随 N 的曲线找拐点，再看显存是否成为第二约束；两张卡都撑得下却更慢时，减 N、加相机分辨率或共享材质纹理才是正确方向。</p>
+
+    <h3>7. 同步并行与异步并行的对照</h3>
+    <p>本章的机制属于同步并行，把它与经典的异步并行对照，能看清各自的适用面。</p>
+    <table>
+      <tr><th>维度</th><th>同步并行（本章）</th><th>异步并行（A3C 类）</th></tr>
+      <tr><td>数据新鲜度</td><td>同一组策略参数下采样，天然符合 on-policy 假设</td><td>各 worker 策略版本不同，梯度带陈旧性</td></tr>
+      <tr><td>实现方式</td><td>单进程、批量内核，无跨进程序列化</td><td>多进程/多机，通信开销常成为主导</td></tr>
+      <tr><td>主要瓶颈</td><td>GPU 内核效率与渲染吞吐</td><td>CPU 通信、参数同步与锁</td></tr>
+      <tr><td>复现性</td><td>高：时序确定，同种子可复算</td><td>低：执行顺序随机</td></tr>
+      <tr><td>典型搭配</td><td>PPO、SAC（配重放缓冲）</td><td>IMPALA 类、大规模分布式训练</td></tr>
+    </table>
+    <p>Isaac 系框架默认同步，原因在算力结构：一张 GPU 的批处理已经提供了数千路并行，异步多进程的收益被通信成本抵消，还额外引入复现困难。只有当单机 GPU 已跑满、任务规模需要跨机器时，异步方案才重新进入选项。</p>
+
+    <h3>8. 评估统计的边界：按步还是按回合</h3>
+    <p>并行环境把评估的统计口径问题放大了。用 100 个并行环境做评估、回合上限 200 步，策略每回合成功概率 30%，成功的回合平均 150 步结束。若统计"每步成功频率"，数字是 0.3 /（0.3×150 + 0.7×200）= 0.3/185 ≈ 0.0016，即 0.16%，与真实的 30% 相差 185 倍；失败回合占用的步数把分母撑大了。<strong>正确口径只有一个：在 done 发生的时刻记录成功布尔值，按回合聚合</strong>，训练日志里同时保留回合长度分布（成功与失败分别统计）。同理，按步平均的回报会让长回合获得更大权重（上例中失败回合 200 步对成功回合 150 步），跨配置比较时要按回合回报。评估协议与 020 章一致：固定评估种子、多种子重复、只报任务指标。</p>
+    <p>评估规模也要算一把：要在 95% 置信度下分辨 5 个百分点的成功率差异，每个变体至少需要 n = 1.96²×0.25/0.05² ≈ 384 个回合（最坏情形方差 p=0.5）。并行环境让这条要求变得廉价：4096 个环境跑一轮就是 4096 个回合，一轮评估的统计精度已经超过多数论文的对照组。反过来讲，若评估只收集几十个回合，两组变体间 5% 的差距完全可能被抽样噪声吞掉，多种子重复的意义正在于此。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p><strong>整体路线是"模板化 → 克隆 → 张量化 → 批量步进 → 对接学习器"五步。</strong>每一步都围绕同一个目标：让"环境数"成为张量的一个维度，同时消灭代码里的逐环境循环。</p>
+    <ol>
+      <li><strong>搭模板环境</strong>：先在 <code>/World/envs/env_0</code> 下把一个完整环境（地面、机器人、物体、传感器）搭好。模板只搭一次，避免 N 份场景手工拼装。</li>
+      <li><strong>克隆 N 份</strong>：用 <code>Cloner</code> 沿网格布局复制。<code>replicate_physics=True</code> 的作用是同时在 PhysX 侧注册 N 套物理表示；若只复制 USD 外观而漏掉物理副本，会出现"看得见但碰不到"的幽灵环境。</li>
+      <li><strong>建张量视图</strong>：对机器人建 <code>Articulation</code>，对物体建 <code>RigidPrim</code>，路径用正则 <code>env_.*/Robot</code> 一把抓。</li>
+      <li><strong>写批量 step</strong>：每个控制步 = 策略推理一次 + 物理推 decimation 次 + 奖励/终止向量化计算 + autoreset。</li>
+      <li><strong>对接学习器</strong>：把批量环境包成 SB3 的 <code>VecEnv</code>（<code>step_async</code> / <code>step_wait</code>），学习器就把 N 当成它的 batch 维。</li>
+    </ol>
+    <table>
+      <tr><th>参数</th><th>建议值</th><th>理由</th></tr>
+      <tr><td>num_envs</td><td>4096（状态观测）/ 512（像素）</td><td>显存与物理耗时的折中；先翻倍试探，吞吐不再涨就回退</td></tr>
+      <tr><td>decimation</td><td>4（物理 240 Hz / 控制 60 Hz）</td><td>控制频率过高会放大动作噪声；过低丢接触细节</td></tr>
+      <tr><td>环境间距</td><td>≥ 1.5 m（伸手半径的 2 倍）</td><td>防止跨环境碰撞；间距也是地图大小与渲染范围</td></tr>
+      <tr><td>数据搬运</td><td>每控制步 1 次，物理子步内不重复</td><td>物理步内不读状态，观察/奖励只按控制周期计算</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计思维：先定 N，再定 batch</span>
+      <p>PPO 的 minibatch 大小、GAE 的 horizon 都应以 N 为基准推导：若 N=4096、horizon=16，则一个 update 收集 65536 条 transition，minibatch 取 4096 的整数倍（如 16384）即可整除。反过来先定 minibatch 再凑 N，会得到大量不能整除的边角料。<strong>并行度是这套系统的一号自由变量。</strong></p>
+    </div>
+  </section>
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：克隆 N 个环境并建立张量视图</strong></p>
+    <pre class="code"><code>from isaacsim.core.cloner import GridCloner  # 老版本路径为 omni.isaac.cloner，类名保持一致
+
+NUM_ENVS = 4096                            # 一号自由变量：先定并行度，再推导 batch 设计
+cloner = GridCloner(spacing=3.0)           # 网格间距 3 m，大于机器人臂展，杜绝跨环境碰撞
+
+cloner.define_base_env("/World/envs")      # 声明环境根路径，克隆器按它组织层级
+env_paths = cloner.generate_paths("/World/envs/env", NUM_ENVS)  # 生成 env_0 到 env_N-1 的路径表
+cloner.clone(
+    source_prim_path="/World/envs/env_0",  # 模板：地面、机器人、物体都已摆好在 env_0 里
+    prim_paths=env_paths,
+    replicate_physics=True,                # 关键开关：PhysX 侧同样复制 N 份物理表示
+)                                          # 漏掉它会出现"看得见、碰不到"的幽灵环境
+
+from isaacsim.core.prims import Articulation  # 新版类名为 Articulation（老版本为 omni.isaac.core.articulations.ArticulationView）
+robots = Articulation(prim_paths_expr="/World/envs/env_.*/Robot", name="robots")
+robots.initialize()                        # 建立 (N, n_joints) 张量后端，之后无 Python 循环</code></pre>
+    <p>解读：这段代码里有三个"为什么"。<b>为什么模板要放在 env_0？</b>克隆器需要一个完整的源场景，且路径规律（env_N 编号连续）是后续正则批量选中的前提。<b>为什么用网格而不用原点重叠？</b>物理引擎按世界坐标解算，重叠环境下机器人会互相碰撞，等于把 N 个任务耦合成了一个；间距取 3 m 是 Franka 臂展（约 0.85 m 工作半径）的安全倍数。<b>为什么 replicate_physics 是开关级的重要参数？</b>USD 复制与物理复制是两条独立管线，PhysX 只认自己注册过的刚体，忘了注册这步，模型能渲染、能显示，但没有任何碰撞与接触力，这是并行训练最隐蔽的事故之一。</p>
+
+    <p><strong>片段 2：批量步进与 autoreset 核心循环</strong></p>
+    <pre class="code"><code>obs = build_obs(robots)                      # (N, obs_dim)：一次拷贝取回全部环境的观测
+for t in range(horizon):                     # horizon=16：每个 update 收集 N×16 条 transition
+    actions = policy(obs)                    # 批量推理：(N, obs_dim) 进，(N, act_dim) 出
+    robots.set_joint_position_targets(actions)
+
+    for _ in range(decimation):              # 控制 60 Hz、物理 240 Hz：内部推 4 次物理
+        world.step(render=False)             # 4096 个环境在同一次 GPU 物理管线里被推进
+
+    next_obs = build_obs(robots)             # 先读新观测，再判断终止：顺序不能反
+    rew, fail = compute_reward(robots)       # (N,) 与 (N,)，全部向量化，无逐环境分支
+    timeout = (t % episode_len) == 0         # 超时截断与真失败在引导时处理不同
+    done = fail | timeout
+
+    buffer.add(obs, actions, rew, done, next_obs)   # 旧回合的最后一条 transition 原样入库
+
+    done_ids = done.nonzero(as_tuple=False).squeeze(-1)
+    if done_ids.numel() &gt; 0:                 # 只重置结束的环境，其余环境进度不受影响
+        fresh = reset_sampler.sample(done_ids.numel())
+        robots.set_joint_positions(fresh, indices=done_ids)      # 原地重置（autoreset）
+        robots.set_joint_velocities(torch.zeros_like(fresh), indices=done_ids)
+
+    obs = next_obs                           # 指针交换：新观测成为下一步的输入</code></pre>
+    <p>解读：循环里有<b>两处顺序问题最容易被写反</b>。第一处是"先读 next_obs 再算 done"：如果先重置再读观测，入库的 next_obs 就已经是重置后的新状态，值函数会学到"失败后突然出现在随机位置"的虚假转移。第二处是 <code>done</code> 的语义拆分：<code>fail</code> 用于把回报截断为 0（真失败没有未来价值），<code>timeout</code> 只截断不归零（后续仍有价值），混合使用会让 PPO 的 GAE 在长回合任务上系统性低估价值。另外注意 <code>set_joint_positions(..., indices=done_ids)</code> 的 <code>indices</code> 参数，张量视图都支持按行索引写入，<strong>autoreset 的"只动一部分环境"靠的就是它，整个场景无需重建</strong>。</p>
+
+    <p><strong>片段 3：包装成 SB3 的同步 VecEnv</strong></p>
+    <pre class="code"><code>from stable_baselines3.common.vec_env import VecEnv
+
+class IsaacVecEnv(VecEnv):
+    """把 Isaac 批量环境翻译成 SB3 协议：batch 维 = 环境维，协议里没有逐环境循环"""
+    def __init__(self, isaac_env):
+        super().__init__(num_envs=isaac_env.num_envs,
+                         observation_space=isaac_env.obs_space,
+                         action_space=isaac_env.act_space)
+        self.isaac_env = isaac_env
+
+    def reset(self):
+        self._obs = self.isaac_env.reset_all()       # 一次性重置全部环境
+        return self._obs                             # (N, obs_dim)
+
+    def step_async(self, actions):
+        self._pending = actions                      # SB3 两段式协议：先登记动作
+        # 真实训练时这里可以触发 GPU 上已排队的异步推理，掩盖部分延迟
+
+    def step_wait(self):
+        obs, rew, done, infos = self.isaac_env.batch_step(self._pending)
+        for i in np.flatnonzero(done):               # VecEnv 契约：done 的环境立即自动重置
+            obs[i], infos[i] = self.isaac_env.reset_one(int(i))
+        return obs, rew, done, infos                 # 四个量第 0 维都等于 num_envs
+
+    def close(self):
+        self.isaac_env.shutdown()                    # 显式释放 Kit 与 GPU 资源</code></pre>
+    <p>解读：<b>为什么坚持 VecEnv 协议、不自造接口？</b>因为 SB3 的 PPO、SAC 以及回调、评估、日志系统全部建立在这套协议上：只要你的环境满足"batch 维打头、done 自动重置、step 两段式"，就能直接复用整个生态；将来换用 RL-Games（第 023 章）或 OmniIsaacGymEnvs（第 024 章）时，换个适配层即可，环境逻辑不用重写。<b>为什么 step_async 里只有一次赋值？</b>SB3 的语义只要求把动作暂存，真正的计算允许发生在 step_wait；把 GPU 推理挂到哪一段是性能调优的自由度。注意 <code>reset_one</code> 只重置单个环境并返回它的首帧观测，契约允许你选择"新回合第一帧"作为该环境返回的观测，常见做法是返回重置后的真实观测，这样自回归数据链不会断。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>只复制 USD 没复制物理</strong>：<code>replicate_physics=False</code>（或漏设）时，N 个环境里只有一个是真刚体，其余"悬浮幽灵"。症状：训练能跑但奖励永远是初始值附近。修复：克隆时打开物理复制，或核对 <code>robots.num</code> 是否等于 N。</li>
+      <li><strong>环境间距太近</strong>：机器人手臂伸出 0.8 m，间距却只给了 1 m，相邻环境互相碰撞。症状：某几个固定编号的环境奖励显著异常。修复：间距取臂展两倍以上，或在克隆后用碰撞过滤组隔离环境。</li>
+      <li><strong>在物理子步里读观测</strong>：把 <code>build_obs</code> 写进了 decimation 内层循环，CPU-GPU 同步从每控制步 1 次变成 4 次，吞吐直接掉一半以上。修复：观测与奖励只在控制步边界计算。</li>
+      <li><strong>reset 用错语义</strong>：用 <code>world.reset()</code> 做 autoreset，会把全部 N 个环境状态清零。症状：随机环境的成绩永远学不上去。修复：对 View 按 <code>indices</code> 原地重置。</li>
+      <li><strong>N 与 batch 不整除</strong>：horizon 或 minibatch 与 N 不匹配时，PPO 每个 epoch 丢掉一批尾部数据，不同随机种子间方差变大。修复：三者取整倍关系（如 N=4096、horizon=16、minibatch=16384）。</li>
+      <li><strong>用每步成功频率当成功率</strong>：失败回合占用的步数稀释分母，真实的 30% 会被算成 0.16%。修复：在 done 发生的时刻记录成功布尔值并按回合聚合，同时保留成功/失败的回合长度分布。</li>
+      <li><strong>吞吐口径混报</strong>：把纯采样峰值 20 万步/s 当作端到端吞吐去估训练时长，结果会差一个数量级。修复：报告时标注口径（纯步进/含更新与评估），时长换算一律用端到端吞吐。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把 <code>NUM_ENVS</code> 从 256 逐步提高到 4096，记录每秒采样步数（steps/s）与每步墙钟耗时，画出吞吐随 N 的变化。在哪个 N 上边际收益开始明显下降？<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>吞吐 = N / 单步时间。前段单步时间近似不变，吞吐随 N 线性上升；后段单步时间开始爬升（物理饱和、显存带宽、Python 开销），两条曲线相交处就是性价比拐点。</div></details>
+      </li>
+      <li>故意把 <code>replicate_physics</code> 设为 <code>False</code>，训练 100 个 update。描述你观察到的奖励曲线特征，并解释为什么"幽灵环境"对 PPO 的梯度是灾难。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>只有一部分环境有真实物理，另外一些永远停在初始状态，batch 里混入大量无效轨迹，优势估计被系统性稀释。</div></details>
+      </li>
+      <li>写一个最小实验：对比"每控制步读一次观测"与"代入 decimation 内层循环读观测"的吞吐，给出一条量化结论。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>用 <code>time.perf_counter()</code> 包住 1000 个控制步。注意每次张量读取都会触发一次同步，频率越高，GPU 越常在等待 CPU。</div></details>
+      </li>
+      <li>在本章 autoreset 的基础上，设计"回合结束后延迟 2 步再重置"的变体（提示：用两个掩码区分 reset 与 observing），并说明什么场景需要它。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>有些任务希望失败后的现场被"看过一眼"再清场，例如评估碰撞后的姿态。用 <code>pending_reset</code> 布尔掩码记录待重置集合，分两帧执行。</div></details>
+      </li>
+      <li>估算题：若 t<sub>phys</sub>=4 ms、t<sub>policy</sub>=1 ms，N 从 1024 增到 8192 时吞吐理论上提升几倍？若实测只提升 2 倍，最可能的瓶颈在哪里？<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>理论上约 8 倍（每步时间近似不变）。实测低于理论，先怀疑 CPU 侧数据拷贝与 Python 控制逻辑，把观测搬运次数降到每控制步一次再测。</div></details>
+      </li>
+      <li>混合实现估算：若一半环境（2048 个）仍走逐环境 Python 读写（0.1 ms/个），另一半走向量化（合计 20.5 ms），复用 5 节的其余开销，估算批次吞吐，并解释"串行相加"为什么让收益远低于一半。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>逐环境部分约 205 ms，叠加向量化路径的其余耗时后总单步约 225 ms，吞吐约 4096/0.2255 ≈ 1.8 万步/s，远低于全向量的 20 万；瓶颈由最慢的一段决定。</div></details>
+      </li>
+    </ol>
+  </section>
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>并行策略的吞吐公式：Throughput ≈ N /（物理 + 推理 + CPU 开销）；GPU 物理与批量推理让前两项近似与 N 无关。<strong>提高 N 是目前最有效的提速手段。</strong></li>
+      <li>环境搭建三件套：模板 prim（env_0）、<code>Cloner</code> 克隆（网格排布 + <code>replicate_physics</code>）、张量视图（一次性 (N, dim) 读写）。</li>
+      <li>autoreset 的核心是"按 indices 原地重置"；终止帧要先入库再加 reset，超时与失败在引导时区别对待。</li>
+      <li>N 的推荐起点：状态观测 4096、像素观测 512；batch 设计以 N 为基准取整倍关系。</li>
+      <li>下一章：这套批量环境的接口正好是 RL-Games 的训练入口，你会看到 NVIDIA 官方训练库如何以极高吞吐消费这些 (N, dim) 张量。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch021.html">← 第 021 章：使用域随机化增强泛化能力</a>
+    <a class="next" href="ch023.html">第 023 章：使用RL-Games训练机器人 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

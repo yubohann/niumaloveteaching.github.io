@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第054章 实现元强化学习 | 机器人仿真学习课程 · Isaac Sim 强化学习训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第三篇 · 高级强化学习专题</span>
+    <span class="sep">/</span>
+    <span>第 054 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第三篇 · 高级强化学习专题</div>
+    <h1>第 054 章：实现元强化学习</h1>
+    <p class="lead">不仅学会任务，还学会"学习任务本身"：本章搭建任务分布与 trial 结构，讲清 MAML 的双层梯度与 RL² 的隐状态适应，并用适应曲线衡量"几个回合能否上手新环境"。</p>
+    <ul class="meta">
+      <li>主题：高级专题 / 元学习与快速适应</li>
+      <li>相关组件：Isaac Sim / Isaac Lab / PyTorch（手写元优化）/ Stable-Baselines3</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 053 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>能写出元 RL 的目标：在任务分布上最大化"适应 k 个回合后的回报"，并区分内环与外环。</li>
+      <li>掌握 MAML 的更新公式 θ′ = θ − α∇L(θ)，理解外层梯度为什么要"穿过"内环更新（二阶项）。</li>
+      <li>知道 Practice 中 FOMAML 一阶近似省了什么、损失了什么，以及什么时候够用。</li>
+      <li>理解 RL² 的思路：把"适应"外包给循环网络的隐状态，训练时任务就是一串回合。</li>
+      <li>会设计 trial 结构与适应曲线评估：第 1 回合 vs 第 k 回合的回报差就是"元能力"的度量。</li>
+      <li>能给元学习选择合适的任务分布：隐藏参数必须影响动力学，且任务间要有"可共享的学习结构"。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 051 章的在线适应解决"环境缓慢变化"，第 053 章的多任务解决"一个策略会很多事"。但两者都有前提：变化要在训练分布内、任务要是训练时见过的。元强化学习（meta-RL）把目标再推高一层：<strong>训练时不只优化策略，还优化"策略的学习过程"</strong>，让它在面对一个从未见过的新任务时，用几个回合的交互就能调出好行为。</p>
+    <p>这在机器人上非常自然：每台机器的摩擦、负载、磨损都略有不同，你无法为每台单独训练；但如果策略"懂怎么快速试探和学习"，部署后跑三五个回合就能适应当前这台。本章以"变载荷搬运"为载体，走一遍元训练的完整流程：任务分布怎么定、双层梯度怎么求、隐状态怎么当适应器、以及最关键的，怎么证明"元"这件事真的起作用了。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 元 RL 的目标：优化"适应之后"的性能</h3>
+    <p>普通 RL 优化单个 MDP 上的期望回报；元 RL 在任务分布 p(T) 上优化"用 k 个回合适应之后"的回报：</p>
+    <div class="formula">
+      max<sub>θ</sub> E<sub>T~p(T)</sub> [ J<sub>T</sub>( Adapt<sub>k</sub>(θ, T) ) ]
+      <span class="note">Adapt<sub>k</sub> 表示"用策略 θ 在 T 上交互 k 个回合做适应"的过程</span>
+    </div>
+    <p>这个目标和第 051 章的"在线估计隐藏参数"有本质区别：那里适应机制是人设计的（编码器 + 历史窗口），网络只学"用估计值决策"；这里连"怎么适应"都是学出来的。Adapt 的两种主流实现对应两类算法：<strong>基于梯度</strong>（MAML：适应 = 在自己的数据上做几步梯度更新）与<strong>基于记忆</strong>（RL²：适应 = 循环网络的隐状态随回合累积信息）。</p>
+
+    <h3>2. MAML：双层梯度与它的代价</h3>
+    <p>MAML（model-agnostic meta-learning）把"适应"定义为一步梯度下降：</p>
+    <div class="formula">
+      内环：θ′<sub>i</sub> = θ − α·∇<sub>θ</sub> L<sub>Ti</sub>(θ) &nbsp;&nbsp;|&nbsp;&nbsp; 外环：θ ← θ − β·∇<sub>θ</sub> Σ<sub>i</sub> L<sub>Ti</sub>(θ′<sub>i</sub>)
+    </div>
+    <p>读法：对每个任务先"试着学一步"（内环），再用学完之后在验证数据上的表现来评价这一步（外环）。外层梯度需要对内环的更新求导，展开后包含 Hessian 项，这就是二阶梯度。直觉解释：MAML 想找到一组初始化参数，使得"从这里出发、往任意任务的方向走一步"都能到达好区域；二阶项在告诉它"这一步迈出去会不会有效"。代价是计算图要穿过内环，显存与算力约 2–3 倍。</p>
+    <p>工程上常用一阶近似（FOMAML）：直接忽略二阶项，把内环更新后的参数当作常数求外层梯度。当内环步数少（1–3 步）、步长小时，一阶近似与原版的差距通常只有几个百分点，而实现难度天壤之别。另一条路是干脆放弃"梯度内环"，用 RL²。</p>
+
+    <h3>3. RL²：隐状态即适应器</h3>
+    <p>RL² 的洞见与第 052 章一脉相承：如果用循环网络（RNN）训练策略，并且把"同一任务的连续多个回合"串成一条长序列来训练，那么 RNN 的隐状态会自动成为一个"任务状态的估计器"，它在第一个回合里试错，把学到的任务信息压进 h，在第二个回合就表现出来。数学上它优化的是：</p>
+    <div class="formula">
+      max<sub>θ</sub> E<sub>T</sub> [ Σ<sub>k=1..K</sub> R<sub>k</sub> ]，策略 π<sub>θ</sub>(a | s, h), h ← f<sub>θ</sub>(h, s, a, r)
+      <span class="note">进入新任务时重置 h；任务内回合之间不重置，这就是"跨回合记忆"</span>
+    </div>
+    <p>RL² 没有内环梯度，用的是普通 PPO 的目标，只是数据组织方式不同：rollout 要按"任务 → 回合 → 步"三层结构编排。实现难度主要在一本流水账上：隐状态的保存、跨回合传递、以及 minibatch 不能破坏序列结构（第 061 章会把这件事系统讲透）。</p>
+
+    <h3>4. 任务分布：元学习的地基</h3>
+    <p>选任务比选算法重要。三个条件：<strong>（1）任务差异必须体现在动力学或奖励上</strong>（载荷质量、摩擦、电机增益），只改外观/观测的任务学不到"适应"；<strong>（2）任务之间要有可共享的学习结构</strong>（"重了就更用力"这类规律跨任务通用），否则元训练退化成多任务平均；<strong>（3）任务要能被少量交互区分</strong>（推一下就能感觉出质量），否则 k 个回合不够用。此外隐藏参数的变化必须在策略的"控制带宽内"，质量从 1 kg 变到 100 kg，任何当前策略都推不动，元学习也无能为力（先修机器人再说）。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>以"变载荷搬运"为例的元训练系统：</p>
+    <ol>
+      <li><strong>任务分布</strong>：载荷质量 m ~ U(0.5, 2.0) kg（隐藏，不进观测），摩擦系数固定。任务采样每个 trial 一次，trial 内 5 个回合共享同一 m。</li>
+      <li><strong>Trial 结构</strong>：一个 trial = 5 个连续回合；回合边界不重置策略隐状态（RL² 版）或用于内环适应（MAML 版）。第 1 回合的表现反映"先验"，第 5 回合反映"适应后"。</li>
+      <li><strong>算法选择</strong>：第一版用 RL²（PPO + GRU，按 trial 序列训练）；如果内环适应质量不够，再试 MAML 一步内环（本任务动作空间 7 维、网络 2×256，一阶版即可）。</li>
+      <li><strong>观测</strong>：与 051 章一致，但<strong>不含任何质量线索</strong>，适应必须依赖"动手试"造成的动力学响应。</li>
+      <li><strong>评估基线</strong>：域随机化 + 无记忆 MLP（鲁棒策略）作对照；再补一个"域随机化 + 无跨回合记忆的 GRU"对照，分离"记忆"与"元适应"两个因素。</li>
+      <li><strong>核心指标</strong>：适应曲线，平均回报对 trial 内回合序号（1–5）作图。理想形状：第 1 回合偏低（先验一般）、2–3 回合快速抬升（在适应）、4–5 回合趋平（收敛）。</li>
+      <li><strong>纪律</strong>：评估任务从训练分布中<strong>独立重采样</strong> 50 个，不用训练时出现过的参数组合；同时报告"分布内/分布内边缘（质量 1.9–2.0）"两档。</li>
+    </ol>
+    <table>
+      <tr><th>算法</th><th>实现难度</th><th>算力开销</th><th>适用</th></tr>
+      <tr><td>RL²（PPO+GRU）</td><td>中（序列数据管理）</td><td>1×</td><td>首选起步；trial 短、任务少时效果好</td></tr>
+      <tr><td>MAML（一阶）</td><td>中高（函数式参数）</td><td>2–3×</td><td>需要"少样本快速适应"、任务梯度方向一致时</td></tr>
+      <tr><td>MAML（二阶）</td><td>高</td><td>3–5×</td><td>研究场景，工程少见</td></tr>
+      <tr><td>PEARL（隐变量）</td><td>高</td><td>2×（off-policy 更省样本）</td><td>样本宝贵、任务维度高时</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计思维：为什么评估元学习要看"适应曲线"？</span>
+      <p>平均回报看不出"适应"是否发生：一个直接背下全部任务的策略也能拿高分，但它没有元能力。适应曲线把"第 1 回合"与"第 k 回合"的差距变成可见信号，<strong>这个落差才是元学习的产出</strong>。工程验收标准应写成"第 5 回合回报 ≥ 第 1 回合的 1.5 倍，且与单任务训练上限的差距小于 15%"。同理，训练日志里要按"trial 内回合序号"分桶统计回报，混在一起平均会永远看不到这个落差。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：任务分布与 trial 结构</strong></p>
+    <pre class="code"><code>import numpy as np
+
+class MetaTaskSuite:
+    # 元学习的"教材"：任务分布 + trial 结构（同一任务连续 k 个回合）
+    def __init__(self, rng, episodes_per_task=5, mass_range=(0.5, 2.0)):
+        self.rng = rng
+        self.k = episodes_per_task               # trial 内回合数
+        self.mass_range = mass_range
+        self.task = None
+        self.ep_idx = 0
+
+    def sample_task(self):
+        # 隐藏参数只影响动力学（载荷质量），不进观测；适应必须靠交互
+        self.task = {"mass": float(self.rng.uniform(*self.mass_range))}
+        self.ep_idx = 0
+        return self.task
+
+    def next_episode(self):
+        # trial 内回合之间保持同一任务；超过 k 个回合才换新任务
+        self.ep_idx += 1
+        if self.ep_idx &gt;= self.k:
+            return "new_task"        # 训练器据此重新采样任务并重置隐状态
+        return "same_task"           # 隐状态跨回合保留，充当适应的载体</code></pre>
+    <p>解读：这个类定义了元学习的"节奏"，节奏错了后面全错。第一，<code>mass_range</code> 的选择要匹配策略的"可适应区间"：0.5–2.0 kg（4 倍变化）时，一个未适应的策略成功率约 40–60%，适应该后能到 90% 以上，落差足够大，学习信号强。如果范围太窄（1.0–1.2 kg），落差只有几个百分点，元学习没有存在感；太宽（0.5–20 kg）则任何试探策略都无法在 5 个回合内确定量级，任务不可元学习。第二，<code>next_episode</code> 的两种返回值代表着两种隐状态管理：<code>same_task</code> 时策略的 GRU 隐状态跨回合保留（这就是适应），<code>new_task</code> 时重置隐状态并重新采样质量。第三，务必在训练日志里打印"当前任务 id 与质量"，调试元训练时最常见的 bug 是任务切换逻辑写反（每回合都换任务），此时每个回合都是"第 1 回合"，适应永远不会发生，而日志不打印的话你很难发现。</p>
+
+    <p><strong>片段 2：MAML 双层梯度的最小实现（函数式内环）</strong></p>
+    <pre class="code"><code>import torch
+
+def inner_loop(policy, support_batch, alpha=0.1):
+    # 内环：在"支持集"（该任务的少量数据）上做一步梯度更新
+    # 关键：参数更新必须是"函数式"的：不能就地修改 policy 的参数，
+    # 否则外层求导时计算图断裂，MAML 会退化成"只学先验"的普通训练
+    params = list(policy.named_parameters())
+    logits = policy.forward_with(dict(params), support_batch.obs)
+    loss = policy.loss(logits, support_batch.actions)
+    grads = torch.autograd.grad(loss, [p for _, p in params], create_graph=True)
+    fast = {name: p - alpha * g for (name, p), g in zip(params, grads)}
+    return fast
+
+def meta_step(policy, meta_optimizer, task_batch, beta=0.001):
+    # 外层：用"适应后"的参数在查询集上评估，梯度穿内环回传（二阶）
+    meta_loss = 0.0
+    for task in task_batch:                      # 一批多个任务，降低方差
+        fast = inner_loop(policy, task.support)  # 内环适应
+        logits = policy.forward_with(fast, task.query.obs)
+        meta_loss = meta_loss + policy.loss(logits, task.query.actions)
+    meta_loss = meta_loss / len(task_batch)
+
+    meta_optimizer.zero_grad()
+    meta_loss.backward()                         # 这里有 Hessian-vector 乘积项
+    meta_optimizer.step()
+    # 一阶近似（FOMAML）的开关：上面 create_graph=False 并 detach 外层梯度即可，
+    # 实现省一半显存，效果在内环 1-3 步、步长小时通常只差几个百分点</code></pre>
+    <p>解读：这段代码的核心是"函数式参数"的概念。<code>inner_loop</code> 里不使用 optimizer.step()，改用手工计算 <code>fast = p - alpha * g</code>，这是一个纯函数式映射（新参数字典），原策略参数保持不动。<code>create_graph=True</code> 让内环更新本身可导，外层 <code>meta_loss.backward()</code> 才能沿着"先更新、再评估"的完整路径回传。如果偷懒写成就地更新（<code>p.data -= alpha * g</code>），外层梯度只剩下"评估损失对参数的直接梯度"，元学习的"优化学习过程"就丢了。代价也要认识到：计算图随内环步数线性增长，2–3 步已是工程上限；<code>task_batch</code> 里放 4–16 个任务降方差，于是单次 meta_step 的开销是全批量内环之和。最后的口诀：<strong>MAML 的每次外层更新 = "在几十个任务上各学一步，然后问：哪组初始参数能让这一步学得最好"</strong>。</p>
+
+    <p><strong>片段 3：适应曲线评估</strong></p>
+    <pre class="code"><code>import numpy as np
+
+def adaptation_curve(policy, suite, env, n_tasks=50):
+    # 元学习的专属评估：回报对"trial 内第几回合"作图
+    # 期望形状：第 1 回合低（先验一般）-> 第 2~3 回合陡升 -> 之后渐平
+    curve = np.zeros(suite.k)
+    for _ in range(n_tasks):
+        task = suite.sample_task()          # 每次评估都用新采样的任务
+        env.set_hidden_params(task)
+        policy.reset_hidden()               # 进入新任务：重置隐状态
+        for k in range(suite.k):
+            ret = rollout(policy, env)      # 一个回合的完整回报
+            curve[k] += ret / n_tasks
+            # 注意：这里不重置隐状态；回合之间的记忆就是"适应"
+    return curve
+
+# 基线对照：
+#   domain_rand + MLP   -> 曲线全程平（没有适应，只是鲁棒）
+#   domain_rand + GRU   -> 第 1 回合较好但曲线同样平（记忆没用对地方）
+#   meta（RL2/MAML）    -> 曲线明显抬头，第 k 回合接近单任务上限</code></pre>
+    <p>解读：评估函数的三个动作值得逐条理解。<code>sample_task()</code> 每次评估重新采样，确保考的是"没背过的任务"；<code>policy.reset_hidden()</code> 进入新任务时清零隐状态，这一行忘了，GRU 会把上一个任务的记忆带进来，评估虚高（第 052 章讲过同款 bug）。回合循环里<strong>刻意不重置</strong>隐状态：这正是"适应"发生的机制；如果你在 MAML 版里评估，对应操作是"用第 k 回合之前的交互数据做内环更新"。曲线对照最有信息量：鲁棒策略的曲线从头到尾平直（它对所有任务都是同一个水平），元策略的曲线明显抬头，<strong>抬头幅度就是元能力的量化</strong>。工程验收时还可以再加一条线：任务内在线微调（普通 PPO 在新任务上现场训 1000 步）的曲线，它代表"如果允许慢慢学"的上限，元学习的目标就是把这 1000 步压缩到 5 个回合。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>任务切换逻辑写反</strong>：本来一个 trial 应共享同一任务，实际每回合都换，适应永远发生不了。症状是适应曲线全程平直。修复：打印任务参数与 episode 计数，把"第几个回合、当前任务是什么"写进日志。</li>
+      <li><strong>MAML 内环就地更新</strong>：用 optimizer 直接改参数，二阶路径断裂，MAML 退化为普通预训练。症状是"元训练后第 1 回合就很好但曲线不抬头"。修复：函数式参数副本（片段 2），并用"改一个任务的 query 数据，检查梯度是否依赖内环"做单元测试。</li>
+      <li><strong>隐藏参数泄露进观测</strong>：质量写进了某个传感器通道，策略不需要适应就能看穿。修复：同 052 章的体检，用"无跨回合记忆"的策略跑评估，如果曲线照样好，说明有泄露。</li>
+      <li><strong>评估任务和训练任务重叠</strong>：从训练时的任务池里抽参数评估，"元能力"被"记忆力"污染。修复：评估用独立采样的参数集，并额外报告分布边缘档（如质量 1.9–2.0）。</li>
+      <li><strong>任务分布过宽/过窄</strong>：过窄没有学习信号，过宽无法在 k 个回合内适应。修复：先做一个"参数扫描实验"，用单任务策略逐一测各参数下的性能差,选那些"策略存在但打折扣"的参数范围作为任务分布。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把 episodes_per_task 从 5 调到 1 与 10，观察适应曲线的形状变化与训练稳定性。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>k=1 时模型无法学习"跨回合适应"，退化成普通域随机化；k=10 时序列变长、优势估计噪声增大。观察曲线是否有"回落"（长序列下梯度传播困难）。</div></details>
+      </li>
+      <li>对比 RL² 与 FOMAML 在本任务上的适应曲线与训练成本（墙钟时间、显存），给出你的选型结论。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>RL² 通常更快收敛且实现简单；FOMAML 在大参数网络上的显存开销明显。记录"达到第 5 回合 80% 成功率"的总时间。</div></details>
+      </li>
+      <li>去掉隐藏质量对动力学的实际影响（只改观测不改变行为），验证元学习退化成普通训练。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>动力学不变时"适应"没有可适应的对象，曲线与鲁棒基线重合。这是"任务必须影响动力学"原则的直接验证。</div></details>
+      </li>
+      <li>设计一个"混合任务"实验：80% trial 是质量变化，20% 是摩擦变化。预期元策略会学到什么共享结构？写出验证方案。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>"用力"和"小心打滑"两种适应共享"试探-辨识"结构；可以在评估中交叉测试（训练只有质量变、评估摩擦变）看零样本迁移。</div></details>
+      </li>
+      <li>把"任务内在线 PPO 微调"作为基线加进适应曲线，讨论元学习相对"现场学"的真正优势在哪个环节。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>现场 PPO 需要数千步与环境交互与多次梯度更新，且不能保证每次成功；元学习的优势是"交互步数少且稳定"，在安全关键或人机共存的场景更重要。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>元 RL 优化"适应 k 个回合之后的回报"，把"学习过程本身"当作优化对象；两大流派：梯度内环（MAML）与隐状态适应（RL²）。</li>
+      <li>MAML 内环 θ′ = θ − α∇L（必须函数式、保持计算图），外环梯度穿过内环形成二阶项；FOMAML 一阶近似省算力且损失可控。</li>
+      <li>RL² 把适应交给 GRU 隐状态：trial 内回合间不重置、换任务时重置；实现核心是序列数据的正确编排。</li>
+      <li>任务分布三条件：差异在动力学/奖励上、存在可共享学习结构、能被少量交互辨认；trial 与评估协议是实验设计的核心。</li>
+      <li>评估看适应曲线（第 1 回合 vs 第 k 回合的落差），不看平均回报；标准对照是鲁棒域随机化与任务内在线微调。</li>
+      <li>下一章换一层抽象：<strong>分层强化学习</strong>把"做什么"和"怎么做"分开，用时间抽象应对长程任务。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch053.html">← 第 053 章：实现多任务学习</a>
+    <a class="next" href="ch055.html">第 055 章：实现分层强化学习 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第076章 超参搜索实战：学习率与批量 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第五篇 · 训练工程与系统进阶</span>
+    <span class="sep">/</span>
+    <span>第 076 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第五篇 · 训练工程与系统进阶</div>
+    <h1>第 076 章：超参搜索实战：学习率与批量</h1>
+    <p class="lead">学习率与批量是回报最高的两个搜索对象，也是耦合最紧的一对参数。本章给出两者的缩放关系与有效步长原理、PPO 三层批量参数的分工、搜索范围与联动先验的设计逻辑，以及早期斜率与交互表两种判读方法。</p>
+    <ul class="meta">
+      <li>主题：超参搜索实战 / 优化参数族</li>
+      <li>关键机制：梯度噪声、缩放规则、批量三层分工、交互判读</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 075 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解学习率与批量的耦合来源：梯度噪声随批量下降，有效步长同时受两者影响。</li>
+      <li>掌握 PPO 三层批量参数的分工：训练批量、SGD 小批量、数据复用轮数，以及它们的约束关系。</li>
+      <li>会为学习率设计对数范围的搜索空间，并用联动先验把批量维度的影响编码进采样。</li>
+      <li>会用早期斜率与交互表判读学习率的样本效率与批量耦合效应，识别贴边与噪声干扰。</li>
+      <li>会处理学习率调度与搜索的关系：搜索起点、固定调度形状，保持配置间可比。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>学习率决定每步更新走多远，批量决定梯度估计的噪声，两者共同刻画“有效步长”。<strong>它们单独看都是敏感参数，合起来看则是强耦合对：同样的学习率配小批量会震荡，配大批量却平稳；独立搜索这一对参数时，大量预算消耗在无效组合上。</strong>这是把它们放在实战系列第一位的理由：这对参数的处理方式，决定了后续每一个参数族的搜索设计。</p>
+    <p>上一章的完整流程把这对参数作为粗搜的主角，本章拆开讲内部逻辑：为什么学习率的覆盖要跨数量级、批量的候选为什么取 2 的幂、联动先验如何抑制无效组合、判读时为什么以早期斜率为主、只看最终值会漏掉什么。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 梯度噪声与有效步长</h3>
+    <p>随机梯度是全量梯度的噪声估计，噪声的方差随批量增大近似按 1/B 衰减。参数更新的有效行进量由学习率与噪声共同决定：<strong>学习率固定时，批量增大让梯度估计更准，但每次更新的“随机扰动”减弱，单位数据带来的参数移动下降，可能拖慢样本效率；批量固定时，学习率增大会放大噪声方向上的漂移，超过曲率容忍度后训练震荡甚至发散。</strong>两者需要协同调整，这种协同的经典近似是缩放规则：批量乘 k 时，学习率也乘 k（线性规则）或乘 √k（平方根规则），使有效步长的量级大致不变。</p>
+    <div class="formula">
+      梯度噪声 ∝ 1/B；协同先验：lr ∝ B<sup>1/2</sup>（平方根规则）至 lr ∝ B（线性规则）
+      <span class="note">批量乘 k 时，学习率按 √k 至 k 之间的比例缩放；具体落在哪一档由交互表判读校准</span>
+    </div>
+    <p>缩放规则有适用边界：批量超过某个水平后，增大批量对梯度质量的改善趋于饱和（进入边际收益递减区），此时按线性规则同步抬升学习率会破坏稳定。搜索设计因此采用中心加局部探索的弱先验形式，避开严格线性联动的失效区。</p>
+
+    <h3>2. PPO 的三层批量参数</h3>
+    <p>策略优化中的“批量”实际是三个不同粒度的参数：<strong>训练批量</strong>（每迭代采样多少环境步，决定策略更新的间隔与采样成本）；<strong>SGD 小批量</strong>（训练批量切分成多大的梯度步，决定梯度噪声与显存峰值）；<strong>数据复用轮数</strong>（同一批数据被 SGD 遍历多少遍，决定单位采样的更新强度）。三者的约束是整除关系：训练批量 = 小批量 × 每轮切分数，复用轮数独立。</p>
+    <p>搜索视角下三者的角色不同：<strong>训练批量与复用轮数共同决定“单位采样被利用的强度”，是主效应候选；小批量主要影响梯度噪声与显存，通常在固定比例（训练批量的 1/4 至 1/8）下作为约束联动，不做独立大范围搜索。</strong>把三层混成一个“批量”概念搜，会产生大量语义重复或不可行的组合。</p>
+
+    <h3>3. 搜索范围的设计逻辑</h3>
+    <p>学习率是尺度参数，直接全局采样时范围取三个数量级（1e−5 至 1e−2）对数均匀，覆盖从“几乎不学”到“立即发散”的整段；批量的候选取 2 的幂（2048 至 16384），与硬件规整计算对齐。<strong>联动先验的形式是“中心 + 尺度因子”：以经验中心（例如 2048 批量对应 1e−4）按批量的平方根缩放得到各档中心，再在中心上下各一个数量级内用离散尺度因子采样。</strong>先验的作用是把二维搜索压成一维加小扰动：批量选好后，学习率集中在合理邻域，不再均匀地浪费在远处；局部探索仍保留跳出先验的能力。</p>
+
+    <h3>4. 判读方法：早期斜率与交互表</h3>
+    <p>两种判读回答两个不同问题。<strong>早期斜率</strong>度量样本效率：取每条曲线前 40% 预算做最小二乘拟合，斜率大表示单位样本的回报增长快，适合判断“学习率是否偏小”；尾段均值度量最终水平，适合判断“学习率是否偏大导致震荡收敛差”。<strong>组合读法：斜率大且尾段高，落在有效区中部；斜率大但尾段低，可能是学习率过大后的震荡；两者都低，学习率偏小或批量与学习率失配。</strong></p>
+    <p>交互表把结果按（学习率档，批量档）聚合成矩阵，回答耦合方向：<strong>若矩阵中优势格沿对角线分布（大批量配大学习率、小批量配小学习率），说明缩放关系成立，下一轮可沿对角线加密；若优势格集中在单点，说明该组合特殊，需要用复验确认它不是噪声。</strong>矩阵出现大片劣质区时，回到先验设计缩小联动范围。</p>
+
+    <h3>5. 学习率调度与搜索的关系</h3>
+    <p>许多任务使用学习率衰减调度：搜索的“学习率”参数是调度的起点，调度形状（线性、余弦、限幅）作为不变量固定。<strong>形状随配置变化会让两个试验的“学习率”失去可比性：同样的起点配不同的衰减速率，测到的是形状差异，不是起点差异。</strong>需要搜索调度形状时，把它作为独立的名义参数加入空间（例如 choice 枚举三种形状），起点与形状分离成两个维度，联动关系保持显式。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>设计流程按“定结构、设范围、编先验、控约束、定判读”五步执行。与上一章的差异在于，第 075 章组装全流程，本章深入到第一对参数的内部结构。</p>
+    <ol>
+      <li><strong>定结构</strong>：区分三层批量参数，确定哪层进搜索空间、哪层做联动。</li>
+      <li><strong>设范围</strong>：学习率量级覆盖跨三个数量级（后续由联动先验落实采样密度）；批量取 2 的幂候选。</li>
+      <li><strong>编先验</strong>：中心按平方根缩放联动，尺度因子离散候选，覆盖中心上下各一个数量级。</li>
+      <li><strong>控约束</strong>：整除关系用 <code>sample_from</code> 在采样期保证；小批量比例作为固定规则。</li>
+      <li><strong>定判读</strong>：早期斜率与尾段均值双口径；交互表按档位聚合；贴边信号触发范围外扩。</li>
+    </ol>
+    <table>
+      <tr><th>参数</th><th>分布与范围</th><th>判读口径</th><th>设计依据</th></tr>
+      <tr><td>学习率</td><td>联动中心 × 尺度因子（0.1 至 10 倍），等效约 1e−5 至 3e−3</td><td>早期斜率 + 尾段均值</td><td>尺度参数，覆盖迟滞、有效与震荡三区</td></tr>
+      <tr><td>训练批量</td><td>choice {2048, 4096, 8192, 16384}</td><td>按档位分组均值</td><td>2 的幂对齐硬件，控制更新间隔</td></tr>
+      <tr><td>SGD 小批量</td><td>sample_from：训练批量除以 8</td><td>不作为搜索维度</td><td>整除约束，噪声与显存调节量</td></tr>
+      <tr><td>数据复用轮数</td><td>choice {1, 2, 4, 8}</td><td>按档位与回报的单调性</td><td>更新强度，过大易过拟合小批数据</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：平方根缩放与线性缩放如何取舍？</span>
+      <p>线性缩放（lr ∝ B）来自大批量训练的温和场景，它以“有效步长不变”为目标；强化学习的梯度噪声更大、目标非平稳，线性缩放会在大批量档位系统性偏高。平方根缩放把大批量档的中心增长放慢一档，代价是小批量档的中心可能略低，收益是整条对角线上的起点更稳。两类规则都可以作为先验形式，选择后写入实验记录，下一轮按交互表修正。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：联动先验的搜索空间</strong></p>
+    <pre class="code"><code>from ray import tune
+
+def lr_center(spec):
+    """按平方根缩放给出学习率中心：批量翻倍中心乘约 1.41。"""
+    base_lr = 1e-4                     # 2048 批量档的经验中心
+    scale = (spec["train_batch_size"] / 2048.0) ** 0.5
+    return base_lr * scale
+
+search_space = {
+    # 主效应维度之一：批量取 2 的幂，对齐硬件规整计算
+    "train_batch_size": tune.choice([2048, 4096, 8192, 16384]),
+    # 先验联动：中心随批量移动，把二维搜索压成一维加小扰动
+    "lr_center": tune.sample_from(lr_center),
+    # 尺度因子独立采样：覆盖中心上下各一个数量级
+    "lr_scale": tune.choice([0.1, 0.316, 1.0, 3.16, 10.0]),
+    "lr": tune.sample_from(lambda s: s["lr_center"] * s["lr_scale"]),
+    # 整除约束联动：小批量固定为训练批量的八分之一
+    "sgd_minibatch_size": tune.sample_from(
+        lambda s: max(128, s["train_batch_size"] // 8)),
+    # 更新强度维度：复用轮数过大易过拟合同一批数据
+    "num_sgd_iter": tune.choice([1, 2, 4, 8]),
+}</code></pre>
+    <p>解读：空间的四个设计点覆盖了本节的全部原则。<strong>（1）</strong>批量与学习率的主效应由“批量候选 × 尺度因子”表达，等效范围约两个半数量级（1e−5 至 3e−3 的并集），采样密度按批量档位自适应移动。<strong>（2）</strong>所有解析式都写成 <code>sample_from</code> 的确定性函数，没有引入外部随机源，第 074 章的种子纪律在这里被遵守。<strong>（3）</strong>小批量用整除联动，<code>max(128, ...)</code> 保护批量下限；复用轮数保持小候选集，因为它的效应通常单调，不需要宽搜索。<strong>（4）</strong>若实验记录需要“等效范围”的说明，可由中心与因子的乘积上下界直接算出，写入口径卡。</p>
+
+    <p><strong>片段 2：早期斜率与双口径判读</strong></p>
+    <pre class="code"><code>import numpy as np
+
+def early_slope(curve, step_frac=0.4):
+    """早期学习速度：前 40% 预算上的最小二乘斜率（每千迭代）。"""
+    n = max(3, int(len(curve) * step_frac))
+    y = np.asarray(curve[:n], dtype=float)
+    x = np.arange(n, dtype=float)
+    # 最小二乘比首尾差稳定：对起点单点噪声不敏感
+    slope = np.polyfit(x, y, 1)[0] * 1000.0
+    return float(slope)
+
+def judge(lr, slope, tail_mean, slope_ref=40.0, tail_ref=180.0):
+    """双口径判读：斜率与尾段水平组合给出学习率方向。"""
+    fast = slope &gt;= slope_ref
+    good = tail_mean &gt;= tail_ref
+    if fast and good:
+        return "有效区中部：保持并加密邻域"
+    if fast and not good:
+        return "疑似过大：检查震荡，向低学习率微调"
+    if not fast and good:
+        return "偏小后段回升：尝试更高中心或更长预算"
+    return "疑似过小或失配：向高学习率探索并检查批量联动"
+
+print(judge(lr=3e-4, slope=52.0, tail_mean=195.0))</code></pre>
+    <p>解读：判读函数把两条经验曲线合成一个决策表。<strong>（1）</strong>斜率取前 40% 预算：后期曲线趋于平台，取整段会把斜率稀释，早期段的形状才反映学习速度差异。<strong>（2）</strong>两处参考线（斜率 40、尾段 180）是场景依赖的校准值，应来自当前任务的历史分位，按固定常数对待会在换任务时失准；函数把它们参数化，便于按轮次更新。<strong>（3）</strong>四个组合的处置动作都指向“下一轮搜索的方向”，判读的输出直接服务于空间调整，避免只描述现象不给动作。<strong>（4）</strong>“偏小后段回升”是最容易被误读的组合：它可能表示学习率偏低但预算足够，也可能表示调度后段的形状起了作用；需要结合调度不变量确认后再改范围。</p>
+
+    <p><strong>片段 3：学习率与批量的交互表</strong></p>
+    <pre class="code"><code>import numpy as np
+
+def lr_batch_grid(df, metric="episode_return_mean", tail=10, digits=1):
+    """按（对数学习率档, 批量档）聚合：观察缩放关系是否成立。"""
+    last = df.sort_values("epoch").groupby("trial_id").tail(tail)
+    agg = last.groupby("trial_id").agg(
+        lr_log=("lr", lambda v: round(float(np.log10(v.iloc[0])), digits)),
+        batch=("train_batch_size", "first"),
+        score=(metric, "mean"))
+    grid = agg.pivot_table(index="lr_log", columns="batch",
+                           values="score", aggfunc="mean")
+    # 对角优势的快速检查：每行最大值所在列是否随行号右移
+    cols = list(grid.columns)
+    best_cols = [cols[int(np.nanargmax(grid.loc[i].to_numpy()))]
+                 for i in grid.index]
+    diag = all(b &gt;= a for a, b in zip(best_cols, best_cols[1:]))
+    print(grid.round(1))
+    print(f"优势列右移（符合缩放关系）：{diag}")
+    return grid
+
+# 使用前先确认 lr 在结果表中为数值列；交互表只做方向性判读
+grid = lr_batch_grid(results_df)</code></pre>
+    <p>解读：交互表把二维搜索的结果压缩成可读矩阵。<strong>（1）</strong>学习率先取对数再分档：档位按数量级等距，行与行的语义是“10 倍关系”，矩阵因此可读。<strong>（2）</strong>“优势列右移”是一个方向性判据：行按学习率升序排列时，最优批量档应随之增大或不减，符合缩放关系；不满足时说明优势区特殊或噪声大，需要复验。<strong>（3）</strong>矩阵只用于方向判读：单元格样本数少时波动大，任何“最优点”都要回到配对复验确认；这一点与第 071 章的选择偏差纪律一致。RLlib 的批量与学习率配置字段随版本演进，以对应版本的官方文档为准。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>把三层批量当成一个参数</strong>：只调训练批量而小批量与复用轮数固定比例随动，或反过来混淆命名，搜索结论指向了错误的对象。修复：空间与报告都使用三个独立字段名，联动关系写进注释。</li>
+      <li><strong>学习率与批量独立大范围搜索</strong>：无效组合占据预算，交互表呈现大片劣质区。修复：采用中心加因子的联动先验，把探索集中在合理邻域。</li>
+      <li><strong>调度形状随配置变化</strong>：不同试验的衰减速率不同，学习率失去了可比性。修复：形状固定为不变量；需要搜索形状时作为独立名义维度。</li>
+      <li><strong>只看最终水平判读学习率</strong>：把“大学习率前快后崩”误判为好配置。修复：斜率与尾段双口径判读，劣化形态在尾段暴露。</li>
+      <li><strong>大批量等于更快的误判</strong>：批量增大单迭代采样成本上升，墙钟时间可能变长；样本效率也可能下降。修复：报告同时给出样本效率与墙钟口径，按第 072 章的对齐轴纪律选择。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>算一算：2048 批量对应学习率中心 1e−4，按平方根缩放，8192 批量档的中心是多少？与线性缩放的结果差多少倍？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>平方根缩放：1e−4×2=2e−4；线性缩放：1e−4×4=4e−4。两者相差 2 倍，恰为 √4，这就是规则选择对大批量档中心的影响量级。</div></details>
+      </li>
+      <li>预测题：把批量从 4096 提到 8192 并保持学习率不变，训练曲线的震荡程度与早期斜率各会如何变化？<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>梯度噪声下降，震荡减弱；但有效步长随缩放关系失衡而相对变小，早期斜率下降。保持协同需要让学习率随批量上抬一档。</div></details>
+      </li>
+      <li>设计题：为一次两阶段搜索设计学习率与批量的空间：第一阶段探索用联动先验，第二阶段围绕第一阶段最优做局部加密。给出两阶段的范围、分布与联动形式。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>阶段一：批量四档加尺度因子五档；阶段二：固定批量于最优档，学习率以最优中心做 ±0.5 个数量级的对数均匀，并保留一个小批量的对照档验证交互。</div></details>
+      </li>
+      <li>推导题：从梯度噪声 ∝ 1/B 出发，说明平方根缩放“保持信噪比恒定”的推导条件，以及条件失效（边际收益递减区）时缩放规则的表现。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>设噪声标准差 ∝ B<sup>−1/2</sup>，若希望噪声相对更新步长的比例不变，则 lr 与 B<sup>−1/2</sup> 的倒数成比例，即 lr ∝ √B；批量进入饱和区后噪声项不再随 B 下降，√B 规则会高估所需学习率，需要回落到更慢的缩放。</div></details>
+      </li>
+      <li>实践题：对一次已完成搜索用片段 3 生成交互表，判读对角优势是否成立；若不成立，给出先验中心或批量档位的两处修改建议。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>不成对时的常见修正：把平方根缩放的中心整体上移或下移一档；批量候选去掉明显劣势的端点档，把预算集中到中间三档。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>学习率与批量通过梯度噪声耦合；缩放规则（线性或平方根）是两者协同的先验形式。</li>
+      <li>PPO 的批量分三层：训练批量、SGD 小批量、复用轮数；搜索以第一与第三层为主，第二层做整除联动。</li>
+      <li>搜索范围：学习率以“联动中心 × 尺度因子”表达，覆盖约两个半数量级；批量取 2 的幂；联动先验把二维搜索压成一维加小扰动。</li>
+      <li>判读双口径：早期斜率看样本效率，尾段均值看稳定水平；交互表判读缩放关系是否成立。</li>
+      <li>调度形状作为不变量固定，搜索只针对起点；形状需要搜索时提升为独立维度。</li>
+      <li>下一章进入第二对参数：GAE 与折扣因子，两者的有效视野与偏差方差权衡。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch075.html">← 第 075 章：阶段实践：一次完整的超参搜索</a>
+    <a class="next" href="ch077.html">第 077 章：超参搜索实战：GAE与折扣因子 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

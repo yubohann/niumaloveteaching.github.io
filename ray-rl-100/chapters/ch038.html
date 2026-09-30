@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第038章 RLlib实现PPO算法 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第三篇 · RLlib 算法实现</span>
+    <span class="sep">/</span>
+    <span>第 038 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第三篇 · RLlib 算法实现</div>
+    <h1>第 038 章：RLlib实现PPO算法</h1>
+    <p class="lead">PPO（Proximal Policy Optimization）用裁剪代理目标把每轮更新限制在新旧策略比率的有界区间内，兼顾同策略方法的稳定性与数据复用。本章讲清裁剪目标的梯度结构、广义优势估计、多轮小批次更新与 KL 早停。</p>
+    <ul class="meta">
+      <li>主题：RLlib 算法 / 同策略策略梯度</li>
+      <li>关键机制：重要性比率、裁剪代理目标、GAE、多轮小批次、KL 早停</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 037 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解重要性比率与裁剪代理目标的构造，说明裁剪在比率越界时的作用。</li>
+      <li>掌握广义优势估计的计算与参数含义，理解优势标准化对更新幅度的影响。</li>
+      <li>理解多轮小批次更新的机制与代价：同一批数据多次梯度步换取样本效率。</li>
+      <li>掌握 KL 早停与学习率配合的稳定性手段。</li>
+      <li>会配置 PPO 的关键参数并做消融：批次与小批、迭代轮数、裁剪系数、价值裁剪。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>策略梯度的一步更新幅度由学习率与梯度尺度共同决定，步幅过大时策略可能在一次更新中偏离有利区域，回报曲线断崖式下跌且难以恢复。信赖域方法显式约束新旧策略的距离，代价是每步需要计算二阶信息或求解约束问题；PPO 用裁剪把这种约束变成损失函数上的一阶改写，实现简单、超参少、行为可预测。</p>
+    <p>PPO 同时保留了同策略方法的样本新鲜度与多轮复用的效率：一批数据采集后可以执行若干轮小批次梯度更新，更新幅度受裁剪限制。<strong>它把"限制步幅"从优化器技巧变成目标函数的一部分，这是其在各类任务上稳定的核心原因。</strong>上一章的 SAC 属离策略阵营，本章回到同策略阵营讨论其最重要的代表。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p>PPO 的机制可以拆成四层：比率、裁剪目标、优势估计与多轮更新。</p>
+
+    <h3>1. 重要性比率与裁剪代理目标</h3>
+    <p>一批数据由旧策略采集，训练时策略参数已更新，两个策略对同一动作的概率之比即重要性比率：</p>
+    <div class="formula">
+      ρ<sub>t</sub> = π<sub>θ</sub>(a<sub>t</sub>|s<sub>t</sub>) / π<sub>θold</sub>(a<sub>t</sub>|s<sub>t</sub>)，L = min( ρ<sub>t</sub>A<sub>t</sub>, clip(ρ<sub>t</sub>, 1−ε, 1+ε) A<sub>t</sub> )
+      <span class="note">ε 取 0.1 至 0.3；优势为正时比率超过 1+ε 后梯度被截断，优势为负时低于 1−ε 后截断，两个方向都限制"过度自信"的更新</span>
+    </div>
+    <p>裁剪的梯度结构值得单独说明：比率恰好在区间内时，梯度与普通策略梯度一致；越界后梯度归零，更新不再从该样本收益。<strong>它属于"收益封顶"机制（比率仍可能越界），</strong>配合多轮小批次使用，等效于在参数空间里对步幅做了软限制。</p>
+
+    <h3>2. 广义优势估计</h3>
+    <p>优势由第 036 章的 GAE 计算：单步时间差分误差的指数加权累积，λ 控制偏差与方差的折中。GAE 的两个工程细节：末端自举值区分回合终止与片段截断；优势在批次内做标准化（减均值除标准差），把不同任务的回报尺度归一到可比区间。<strong>标准化的统计量随批次变化，</strong>是 PPO 对批次组成敏感的来源之一，批次规模过小或组成突变时更新幅度抖动明显。</p>
+
+    <h3>3. 多轮小批次更新</h3>
+    <p>同一批数据执行若干轮（epoch）梯度更新，每轮把批次切成小批次（minibatch）依次前向与反向。收益是样本效率：数据被利用多次；代价是策略偏离采集分布，比率方差随轮数增长。<strong>轮数与学习率是乘法关系，</strong>轮数多时学习率应更小。小批次的规模同时决定显存占用与梯度噪声：过小噪声大，过大趋近整批更新且显存压力上升。批次、小批与轮数的数量关系应在配置阶段核清，避免整除余数带来的补齐开销。</p>
+
+    <h3>4. KL 早停与价值裁剪</h3>
+    <p>裁剪限制单样本比率，但整批的平均偏离仍可能过大。KL 早停监控新旧策略的平均散度（KL），超过目标值时提前结束本批数据的更新轮次。<strong>它提供的是"更新预算"的刹车，与学习率调节互补：</strong>KL 频繁触发时先降学习率或减少轮数，再考虑放大批次。价值函数侧同样施加裁剪：价值预测与回报的误差超过阈值时按阈值截断，防止少数极端回报把价值网络拽离公共尺度。</p>
+
+    <h3>5. 裁剪目标的数值示例</h3>
+    <p>取 clip_param = 0.2，对四组（比率, 优势）组合计算单样本的代理取值：</p>
+    <table>
+      <tr><th>比率 ρ</th><th>优势 A</th><th>未裁剪 ρA</th><th>裁剪后 ρ̃A</th><th>最终取值</th></tr>
+      <tr><td>1.1</td><td>+2</td><td>2.2</td><td>2.2</td><td>2.2（区间内）</td></tr>
+      <tr><td>1.3</td><td>+2</td><td>2.6</td><td>2.4</td><td>2.4（收益封顶）</td></tr>
+      <tr><td>0.7</td><td>−2</td><td>−1.4</td><td>−1.6</td><td>−1.6（损失封顶）</td></tr>
+      <tr><td>0.9</td><td>−2</td><td>−1.8</td><td>−1.8</td><td>−1.8（区间内）</td></tr>
+    </table>
+    <p>读表：第一行比率仍在区间内，两路取值相同；第二行比率超过 1+ε，正优势的收益被锁定在 2.4；第三行比率低于 1−ε，负优势对应的损失同样被锁定。取最小值的含义是无论优势符号如何，样本影响在越界后都被固定。<strong>裁剪触发比例就是上表后两类样本的占比统计。</strong></p>
+
+    <h3>6. 多轮更新的梯度步核算</h3>
+    <p>批次 4096、小批 128、轮数 10 时，每批数据产生 4096 / 128 × 10 = 320 次梯度步；轮数降到 4 时梯度步降到 128，样本效率下降而偏离风险减小。轮数与学习率的联合调整遵循乘积量级稳定的原则：轮数从 4 升到 10 而学习率不变，等效更新强度同向放大，常见做法是按比例下调学习率或在 KL 触发时联动衰减。</p>
+    <div class="formula">
+      每批梯度步数 = ( train_batch_size / sgd_minibatch_size ) × num_epochs
+      <span class="note">4096 / 128 × 10 = 320；整除关系决定每轮的小批个数，除不尽时最后一批需要补齐或丢弃，更新节奏随之抖动</span>
+    </div>
+
+    <h3>7. KL 早停的触发演算</h3>
+    <p>目标 KL 取 0.02，早停阈值取一点五倍即 0.03。设某批数据的逐轮平均散度为 0.008、0.014、0.022、0.031：前三轮低于阈值继续更新，第四轮超过 0.03 时提前结束，实际完成 4 轮。<strong>若十轮预算下平均完成轮数不到一半，说明学习率或轮数超出更新预算，先降学习率；若几乎总能完成全部轮次且末端散度远低于阈值，说明轮数还有放大空间。</strong>早停计数与轮数完成率应作为常规指标记录。</p>
+
+    <h3>8. 裁剪宽度的档位对比</h3>
+    <table>
+      <tr><th>clip_param</th><th>触发比例走势</th><th>单轮更新保守度</th><th>收敛速度</th><th>适用情形</th></tr>
+      <tr><td>0.1</td><td>上升</td><td>高</td><td>慢</td><td>精细任务、回报崩溃后难以恢复</td></tr>
+      <tr><td>0.2</td><td>基准</td><td>中</td><td>中</td><td>通用默认</td></tr>
+      <tr><td>0.3</td><td>下降</td><td>低</td><td>快</td><td>奖励粗糙、探索充分的任务</td></tr>
+    </table>
+    <p>选择依据：裁剪宽度与学习率、轮数共同决定更新幅度上限，三者一次只调一项；从 0.2 起步，用裁剪触发比例与 KL 曲线判断宽窄是否合适。</p>
+
+    <h3>9. 数值算例：GAE 的指数衰减与批次拼装</h3>
+    <p>用四步片段把 GAE 的加权结构算出来。设 γ = 0.99、λ = 0.95，前四步奖励为 [0, 0, 0, 1]、价值估计全为 0，则时间差分误差只有末端一个非零项，优势等于该误差乘以 (γλ)<sup>l</sup> 的累积。γλ = 0.9405，末端时刻优势为 1.0，往前每退一步乘 0.9405：A<sub>2</sub> ≈ 0.9405、A<sub>1</sub> ≈ 0.8845、A<sub>0</sub> ≈ 0.8319。对照两个极端：λ = 0 时只有最后一步有优势，更早位置全为零（偏差大、方差小）；λ = 1 时优势退化为折扣回报，A<sub>0</sub> ≈ 0.9703（无偏但方差大）。</p>
+    <table>
+      <tr><th>时刻 t</th><th>λ = 0（时间差分）</th><th>λ = 0.95</th><th>λ = 1（蒙特卡洛）</th></tr>
+      <tr><td>3</td><td>1.0000</td><td>1.0000</td><td>1.0000</td></tr>
+      <tr><td>2</td><td>0.0000</td><td>0.9405</td><td>0.9900</td></tr>
+      <tr><td>1</td><td>0.0000</td><td>0.8845</td><td>0.9801</td></tr>
+      <tr><td>0</td><td>0.0000</td><td>0.8319</td><td>0.9703</td></tr>
+    </table>
+    <p>批次拼装也能核算：6 个采样器、每个挂 2 个并行环境、片段长度取 256 时，一轮自然采满 12 × 256 = 3072 步，离 4096 的批次差 1024 步（四个实例片段），训练循环尾部要补采这一小段，批内样本分布随之不均。检查方式是把"批次 ÷（环境数 × 片段长度）"算成整数再启动训练；不整除的组合要么调整片段长度，要么调整环境数。</p>
+
+    <h3>10. 边界与失效模式</h3>
+    <p>裁剪的作用范围是单样本比率，整批的平均偏离不受它直接约束：全部样本都落在区间边缘时，平均更新仍能走得很远，KL 早停与学习率才管这一层。"开启裁剪就不需要监控 KL"是错误推断，两个机制约束的层级不同，缺一不可。</p>
+    <p>多轮更新的失效在轮数末端显现：随轮次推进，同一批数据上的策略偏离增大，裁剪触发比例抬升，梯度信号被逐轮削薄。典型现象是前几轮回报改进明显，后几轮只抬升 KL 不涨回报。诊断动作是画出"轮次对回报增量"的曲线，把轮数砍到增量转平处。轮数与学习率的等效关系同样可以量化：轮数从 4 提到 10（2.5 倍）时，学习率同步下调到约五分之二（3e-4 降到 1.2e-4），等效更新强度才保持稳定。</p>
+    <p>优势标准化的边界与优势分布有关：批内优势高度同质时，除以标准差会把数值噪声放大，更新方向变得随机；启动前先看标准化前优势的标准差，过小时关闭标准化或放大批次。价值侧的边界在回报尺度随时间漂移：价值裁剪阈值按初始回报尺度设定后，训练后期回报整体上移，同一阈值会重新开始截断正常误差，阈值应随回报分布阶段性复核。</p>
+    <p>价值裁剪阈值的量级核算：回报标准差为 50 时，正常拟合误差普遍大于 10，阈值取 10 会把绝大多数样本的误差截断，价值网络失去梯度信号；阈值放大到回报尺度的量级后只拦截极端值。<strong>裁剪对象是极端回报造成的异常误差，正常误差范围必须留在裁剪区间内，这是价值裁剪与比率裁剪在口径上的关键差别。</strong></p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>配置顺序：先定批次的数量关系，再定更新轮数与小批，最后校准裁剪与 KL 阈值。</p>
+    <table>
+      <tr><th>参数</th><th>示例值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td><code>train_batch_size</code></td><td>4096</td><td>每轮采集的样本数</td><td>覆盖若干完整回合，批内可被小批整除</td></tr>
+      <tr><td><code>sgd_minibatch_size</code></td><td>128</td><td>每次梯度步的小批</td><td>整除训练批次，兼顾显存与梯度噪声</td></tr>
+      <tr><td><code>num_epochs</code>（轮数）</td><td>10</td><td>同一批数据的更新轮数</td><td>4 到 15 起步，按 KL 曲线调整</td></tr>
+      <tr><td><code>clip_param</code></td><td>0.2</td><td>比率裁剪宽度</td><td>0.1 到 0.3 扫描，窄裁剪更稳但更慢</td></tr>
+      <tr><td><code>lambda_</code></td><td>0.95</td><td>GAE 折中参数</td><td>0.9 到 0.98，按任务长程性选择</td></tr>
+      <tr><td><code>lr</code></td><td>3e-4</td><td>学习率</td><td>与轮数联立校准，KL 触发时下调</td></tr>
+      <tr><td><code>vf_clip_param</code></td><td>10.0</td><td>价值裁剪阈值</td><td>约回报尺度量级，防极端回报扰动价值网络</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：为什么 PPO 成为通用任务的默认起点？</span>
+      <p>三个工程属性共同作用：同策略的语义简单，不需要回放池与新鲜度管理；裁剪目标把稳定性写进损失，对学习率的容忍区间宽于原始策略梯度；更新轮数与小批次提供清晰的效率旋钮。<strong>它不保证在每个任务上最优，但给出可靠的默认表现，适合作为任务起步的基线算法。</strong>后续任何算法替换，都应与 PPO 基线在相同采样预算下对照。</p>
+    </div>
+    <p>批次规模的档位选择有明确的权衡：4096 的批次每轮产生 32 个小批，梯度噪声与显存压力适中；放大到 8192 时小批个数翻倍、单批方差下降，但每轮采样等待变长，评估间隔内的数据量增大；降到 2048 时更新更频繁、方差上升。<strong>批次、小批与轮数三个量一次只调一个，另外两个固定，才能把回报变化归因到单一因素。</strong>学习率与轮数的组合存在近似等价的配置：轮数减半、学习率加倍与轮数不变、学习率减半相比，等效更新强度相近，前者的 KL 抖动通常更大，优劣由 KL 曲线判定。优势标准化与裁剪协同工作：标准化统一了优势尺度，裁剪行为在不同任务之间才具有可比性。标准化的作用域要按批次层完成后再切小批：若误在小批内标准化，同一样本在不同轮次中的优势值随小批组成漂移，梯度方向不稳定。跨环境拼接批次时按回合边界分段即可，分段计算只依赖边界标志，与样本来自哪个环境无关。KL 早停的阈值系数取 1.5 属于宽松设置，训练初期不稳定时可收紧到 1.2 提前止损，稳定后恢复默认。配置评审时核对四项数字口径：批次被小批整除、总环境数与片段长度拼出批次、轮数与学习率的乘积量级合理、评估间隔与检查点对齐；四项逐项打勾后再启动长训练。</p>
+    <p>与上一章差异：第 037 章的批次来自回放、每条数据只更新少量批次；本章的批次由当前策略采集，允许对同一批数据执行多轮更新，用裁剪与 KL 早停替代双 Q 与温度机制。下一章讨论 APPO：在 PPO 基础上引入异步采样与回放缓冲。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：PPO 配置骨架</strong></p>
+    <pre class="code"><code>from ray.rllib.algorithms.ppo import PPOConfig
+
+config = (
+    PPOConfig()
+    .environment(env=LineGoalEnv)
+    .training(
+        train_batch_size=4096,          # 每轮采集 4096 步，覆盖若干完整回合
+        sgd_minibatch_size=128,         # 4096 除 128 得 32，整除避免补齐开销
+        num_epochs=10,                  # 同一批数据 10 轮更新，样本效率的来源
+        lr=3e-4,                        # 与轮数联立校准；KL 触发时先降它
+        gamma=0.99,
+        lambda_=0.95,                   # GAE 折中参数
+        clip_param=0.2,                 # 比率裁剪宽度
+        vf_clip_param=10.0,             # 价值裁剪：限制极端回报的扰动
+        entropy_coeff=0.01,             # 少量熵正则维持探索
+    )
+    .env_runners(num_env_runners=6, num_envs_per_env_runner=2)
+)
+algo = config.build_algo()
+result = algo.train()</code></pre>
+    <p>解读：参数之间的数量关系是配置的核心：训练批次能被小批整除、总环境数与碎片长度能拼出批次、轮数与学习率保持乘积量级稳定。<strong>kl_coeff 或 KL 目标阈值在部分版本中默认关闭，</strong>启用时需要同时记录 KL 曲线，判断触发频率是否合理。配置键名与默认值随版本演进（新 API 栈的训练项分组有调整），以对应版本文档为准。</p>
+
+    <p><strong>片段 2：裁剪代理损失</strong></p>
+    <pre class="code"><code>import numpy as np
+
+
+def clipped_surrogate_loss(log_probs_new, log_probs_old, advantages,
+                           clip_param=0.2):
+    """裁剪代理损失：对比率做上下限裁剪后取两路损失的较小值。"""
+    # 对数概率相减再取指数，比率在数值上比直接相除稳定
+    ratio = np.exp(log_probs_new - log_probs_old)
+    surrogate = ratio * advantages                  # 未裁剪的一路
+    clipped_ratio = np.clip(ratio, 1.0 - clip_param, 1.0 + clip_param)
+    clipped = clipped_ratio * advantages            # 裁剪后的一路
+    # 取较小值：优势为正时按低位截断收益，为负时按低位截断损失
+    loss = -np.minimum(surrogate, clipped).mean()
+    # 诊断量：裁剪触发比例反映更新"顶到上限"的样本占比
+    clip_fraction = float(np.mean(np.abs(ratio - 1.0) &gt; clip_param))
+    return loss, clip_fraction</code></pre>
+    <p>解读：实现的三个要点：用对数概率之差做指数，避免小概率直接相除的数值放大；取两路最小值保证无论优势符号如何，收益都被"封顶"；返回裁剪触发比例作为诊断量。<strong>触发比例长期接近零说明裁剪几乎不起作用（可缩窄宽度），</strong>长期很高说明每轮更新都在顶格（应降学习率或轮数）。优势已标准化时，比率乘优势的尺度统一，不同任务间的裁剪行为可比。</p>
+
+    <p><strong>片段 3：多轮小批次与 KL 早停</strong></p>
+    <pre class="code"><code>def train_epochs(batch, num_epochs=10, minibatch=128, target_kl=0.02):
+    """示意训练循环：轮次遍历小批，KL 超限提前结束本批更新。"""
+    n = len(batch["obs"])
+    chunk = n // minibatch                    # 小批个数，整除在配置阶段保证
+    for epoch in range(num_epochs):
+        for i in range(chunk):
+            mini = slice(i * minibatch, (i + 1) * minibatch)
+            # 每个小批前向、损失、反向，此处略去具体张量运算
+            kl = estimate_kl(batch, mini)     # 新旧策略在当前小批上的散度
+            if kl &gt; 1.5 * target_kl:
+                # 散度超过目标的一点五倍：停止本批剩余轮次
+                return epoch, "kl_early_stop"
+    return num_epochs, "completed"
+
+
+# 返回值直接进诊断日志：早停频率与轮数曲线共同决定轮数配置是否合适</code></pre>
+    <p>解读：循环结构展示两个关键判断：小批边界按整除切分，整除性在配置阶段保证，运行期不做动态补齐；KL 判定放在每个小批之后，用目标值的一点五倍作为宽松阈值，平衡灵敏度与抖动。<strong>返回的早停原因应写入日志：</strong>连续多批早停说明更新预算长期超限，先降学习率；几乎不触发且轮数未用满，则轮数偏保守。实现中的散度估计与损失计算共享当前小批的前向结果，避免重复计算。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>批次与小批不整除</strong>：出现补齐或截断，更新节奏抖动。症状是每轮梯度步数不稳定。修复：按整除关系重选两值，写进配置校验。</li>
+      <li><strong>轮数与学习率失衡</strong>：轮数增大而学习率不变，等效更新过强。症状是 KL 频繁早停、回报断崖。修复：轮数与学习率乘积量级保持稳定，先降学习率。</li>
+      <li><strong>优势标准化作用域错误</strong>：在小批上做标准化，未在整批层完成，梯度噪声放大。症状是同一配置两次运行差异明显。修复：标准化在批次层完成，小批只做切片。</li>
+      <li><strong>价值裁剪阈值过小</strong>：价值网络被截断信号限制，拟合不足。症状是价值损失长期下不去。修复：阈值按回报尺度取值，或对价值损失做归一口径检查。</li>
+      <li><strong>忽略 KL 曲线</strong>：裁剪看似生效而整批偏离持续扩大。症状是偶发的策略崩溃。修复：启用 KL 记录与早停阈值，把触发频率纳入监控。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>训练批次 4096、小批 128 与 256 两种配置下每轮的小批个数各是多少？说明选择时要同时看哪两个量。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>分别为 32 与 16 个小批；同时看显存占用与梯度噪声，小批过小噪声大，过大显存压力与整批耦合上升。</div></details>
+      </li>
+      <li>把 clip_param 从 0.2 缩窄到 0.1，预测裁剪触发比例、更新幅度与收敛速度的变化。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>触发比例上升、单轮更新更保守，收敛变慢但更稳；粗糙省钱的任务可放宽，精细任务宜缩窄。</div></details>
+      </li>
+      <li>推导：说明裁剪目标在比率处于区间内、以及越界两种情形下的梯度取值，解释"收益封顶"的含义。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>区间内梯度与普通策略梯度一致；越过上界（优势为正）或下界（优势为负）后梯度为零，更新不再从该样本获取收益。</div></details>
+      </li>
+      <li>设计消融实验：轮数取 4、10、20 三档，固定学习率与批次，观察 KL 早停频率与评估回报，给出轮数选择依据。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>记录每档的早停比例与回报曲线；早停频繁说明预算超限，回报无增益说明轮数冗余，取拐点附近。</div></details>
+      </li>
+      <li>设计诊断流程：回报抖动加剧时按比率统计、KL 曲线、优势分布三方向排查，给出判据与调整顺序。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>先看裁剪触发比例与 KL 触发频率，再查优势是否出现极端值；调整顺序是先降学习率、再减轮数、最后放宽批次。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>PPO 用重要性比率与裁剪代理目标把更新幅度限制在软区间内，梯度在越界处归零。</li>
+      <li>GAE 在偏差与方差间折中，优势标准化统一批次内尺度，标准化在批次层完成。</li>
+      <li>多轮小批次更新提供样本效率，轮数与学习率乘积量级需要联合校准。</li>
+      <li>KL 早停监控整批偏离，触发频率是配置调整的第一信号。</li>
+      <li>价值裁剪限制极端回报的扰动；批次、小批与轮数的整除关系在配置阶段核清。</li>
+      <li>下一章讨论 APPO：在 PPO 基础上引入异步采样与回放缓冲的工程变体。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch037.html">← 第 037 章：RLlib实现SAC算法</a>
+    <a class="next" href="ch039.html">第 039 章：RLlib实现APPO算法 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

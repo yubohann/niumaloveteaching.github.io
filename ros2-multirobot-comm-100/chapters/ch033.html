@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第033章 分布式环境表示与全局栅格 | 多机器人协同学习课程 · ROS2 通信与系统集成</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 数据分发与协同感知</span>
+    <span class="sep">/</span>
+    <span>第 033 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 数据分发与协同感知</div>
+    <h1>第 033 章：分布式环境表示与全局栅格</h1>
+    <p class="lead">当环境从一间屋子扩到一个园区，整块大栅格既存不下也传不动。本章把环境表示"分田到户"：块状稀疏存储、按坐标寻址、按需同步与回收。</p>
+    <ul class="meta">
+      <li>主题：环境表示 / 分布式数据结构</li>
+      <li>关键机制：块（chunk）映射表存储、坐标寻址、区域所有权、按需同步与内存回收</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 032 章（多机器人感知数据融合）</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解"整块全局栅格"在规模、内存、带宽三个角度的结构性缺陷。</li>
+      <li>掌握块状稀疏表示：固定尺寸块 + 映射表（字典）+ 世界坐标↔块坐标寻址公式。</li>
+      <li>理解分布式所有权：静态划分与动态协商各自的取舍，以及边界缓冲的意义。</li>
+      <li>会实现块的按需同步：只交换"已加载且变脏"的块，配合版本号与 LRU 回收。</li>
+      <li>能比较栅格块、八叉树、体素映射表、ESDF 等表示的适用场景与代价。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 026/027 章处理的地图是一整块稠密栅格：每个格子都占一个字节，无论它是否被探索过。这个设计在"一层楼、几百平方米"的量级完全够用；但规模一升就撞墙：一个 1 km×1 km 的园区、0.05 m 分辨率，整块栅格是 20000×20000 格 = <strong>4 亿格、400 MB</strong>，还没算多机器人各自的副本与更新流量。而真实使用中，机器人走过的区域只占其中百分之几：<strong>大部分内存都在存"未知"。</strong></p>
+    <p>分布式的另一面：就算内存撑得住，多台机器人共同维护"一张全局栅格"也意味着不断的合并与冲突（027 章解决了协议，但数据还在长）。本章从数据结构层解决根子上的问题，<strong>把环境切成小块，只在需要时加载、只在变化时同步、空间上分给不同机器人负责</strong>。这套表示是第 034 章路由/分发、第 047 章分布式路径规划、第 061 章协同覆盖的共同底座。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 稠密栅格的三个结构性缺陷</h3>
+    <table>
+      <tr><th>缺陷</th><th>量化</th><th>后果</th></tr>
+      <tr><td>内存与"探索比例"脱钩</td><td>1 km²、4 亿格、约 400 MB（每机一份）</td><td>嵌入式端内存吃紧；拷贝/序列化极慢</td></tr>
+      <tr><td>同步单位过大</td><td>整图 400 MB；即使增量协议也要先持有整图</td><td>新机接入、地图对齐的成本随地图线性增长</td></tr>
+      <tr><td>单点聚合</td><td>所有机器人都写同一张图</td><td>写入冲突面大，所有权不清</td></tr>
+    </table>
+    <p>注意第一个缺陷的不对称性质：<strong>地图的"命名空间"（坐标范围）由规划器决定，而实际内容由探索进度决定</strong>。稠密栅格让内存跟着"命名空间"走，这是设计错误；正确做法是让内存跟着"内容"走，这就是稀疏表示。</p>
+
+    <h3>2. 块状稀疏表示：用映射表装下"被探索过的世界"</h3>
+    <p>把世界切成固定尺寸的块（chunk，如 32×32 格 = 1.6 m×1.6 m），每个块的坐标由世界坐标整除得到：</p>
+    <div class="formula">
+      (cx, cy) = ( ⌊x / (N·r) ⌋, ⌊y / (N·r) ⌋ )
+      <span class="note">N 为块边长（格），r 为分辨率；注意负数坐标要用向下取整（floor），否则原点附近块边界会错位</span>
+    </div>
+    <p>内存里只保存"已加载的块"：用映射表（字典）以 (cx, cy) 为键存块数据。<strong>从未探索的区域没有键，零内存。</strong>一个探索了 5% 的园区，内存从 400 MB 降到约 20 MB（加字典开销）；寻址是 O(1) 的映射表查询，性能上完全无感。块尺寸是权衡：块大（如 128×128）→ 寻址与统计简单，但"加载一小区却换来大片内存"；块小（如 16×16）→ 精细，但字典条目多、同步消息头占比高。<strong>32×32 是室内场景常用的中间值。</strong></p>
+    <p>这个表示天然适配第 027 章的增量协议：块就是传送单位，脏块检测就是"哪些已加载块被写过"。区别在于，027 把块当"传输分片"，本章把块当"存储与生命周期的单位"：块可以被加载、卸载、归档，地图的内存随机器人的行进轨迹起伏，不再单调膨胀。</p>
+
+    <h3>3. 分布式所有权：地图也分作业区</h3>
+    <p>多机器人共同维护全局地图时，谁负责哪一块有两种模式：</p>
+    <ul>
+      <li><strong>静态划分</strong>：规划阶段把场地按分区（如 A/B/C 区）分给机器人，每个块的"主写者"唯一。简单、无协商；代价是负载不均（某机忙着，某区没人管）。</li>
+      <li><strong>动态协商</strong>：机器人根据自己的位置与任务"认领"块（如"我在这块区域内活动，我负责它的更新"）。灵活；代价是需要所有权协议（认领、超时、释放），且要处理交接期的双写。</li>
+    </ul>
+    <p>无论哪种模式，都有两个工程必配项：<strong>（1）边界缓冲</strong>，块边界处的观测往往跨越两块（激光打在块边缘），写入时同时更新相邻块，读取时也检查邻居，否则块接缝处出现"数据断线"；<strong>（2）版本号</strong>，所有权可以变、机器人可以重启，块级版本号（027 章）让"谁的最新"永远可判定。所有权只影响"谁主动推送"，不影响"什么是最新"。</p>
+
+    <h3>4. 同步与回收：块的完整生命周期</h3>
+    <p>一个块从生到死的生命周期：</p>
+    <ol>
+      <li><strong>加载</strong>：机器人进入新区域，创建（或向队友请求）该块；</li>
+      <li><strong>更新</strong>：传感器写入，块标脏、版本加一；</li>
+      <li><strong>同步</strong>：按需推送脏块（订阅者关心的区域）或周期摘要（第 027 章协议）；</li>
+      <li><strong>卸载</strong>：机器人离开很久、且该块无人关心的区域，可以释放内存；</li>
+      <li><strong>归档</strong>：需要长期保存的块存盘（或者整体地图），再次进入时按需加载。</li>
+    </ol>
+    <p>"按需同步"的含义值得展开：<strong>机器人只订阅自己周围与任务区域的块更新，全图不在订阅范围</strong>。订阅范围可以是固定半径（如 50 m）或任务驱动（规划器需要的区域）。这让通信量从"全图变化量"降到"相关区域变化量"，在大团队大场地上，这是又一个数量级。<strong>全图一致不是免费的，"局部一致 + 全局可查"通常就够了。</strong></p>
+    <p>把数量级落下来：50 m 半径覆盖 π × 50² ≈ 7854 m²，按每块 2.56 m² 折算约 3000 块；而整张 1 km² 地图有约 39 万块，局部推送与全图推送的规模差约 130 倍。机器人独自跑动时真正需要跟队友同步的块只有全图的千分之几，把同步范围写死在"全图"是架构上的浪费。</p>
+
+    <h3>5. 表示选型：栅格块不是唯一解</h3>
+    <table>
+      <tr><th>表示</th><th>存储特点</th><th>擅长</th><th>代价</th></tr>
+      <tr><td>栅格块（本章）</td><td>映射表 + 固定块</td><td>二维导航栅格、增量传输</td><td>三维信息弱；块粒度固定</td></tr>
+      <tr><td>八叉树</td><td>层级压缩，大块同质区域合并</td><td>三维场景、多分辨率查询</td><td>指针/索引开销；增量更新复杂</td></tr>
+      <tr><td>体素映射表</td><td>稀疏三维体素</td><td>三维避障、机械臂规划</td><td>内存随分辨率立方增长</td></tr>
+      <tr><td>ESDF</td><td>距离场（每格到最近障碍距离）</td><td>轨迹优化、编队避障</td><td>构建与更新成本高，通常需要块化增量</td></tr>
+    </table>
+    <p>选型从任务出发：<strong>二维导航为主 → 栅格块；需要三维避障 → 体素映射表/八叉树；需要梯度信息做平滑规划 → ESDF（通常是栅格块之上再算一层）</strong>。所有表示都可以块化来获得稀疏与增量特性，块化是一种通用的工程模式，适用面覆盖所有表示。</p>
+
+    <h3>6. 数值算例：稀疏化的内存账与块尺寸的定量选择</h3>
+    <p>把 1 km²、0.05 m 分辨率的账算全。整图 20000 × 20000 = 4 亿格，int8 存储 400 MB。块 32×32 格对应 1.6 m × 1.6 m = 2.56 m²，整图共 625 × 625 = 390625 块。探索 5%（50000 m²）时约有 19531 块被创建，数据 19.5 MB，映射表按每条约 100 B 再算约 2 MB，合计约 21.5 MB，相对整图省约 18 倍；探索 1% 时降到约 4 MB。<strong>稀疏表示也有它的开销曲线：当探索接近全覆盖时，字典开销本身达到几十 MB，稀疏化的收益大幅收窄，这正是"归档加重载"策略的用武之地</strong>，让内存跟随近期任务，历史全图交给归档。</p>
+    <p>块尺寸的选择同样有数字依据。同一张 1 km² 地图，四档块尺寸的对比：</p>
+    <table>
+      <tr><th>块边长（格 / 米）</th><th>每块面积</th><th>整图块数</th><th>字典开销（100 B/条）</th><th>加载一间 20 m² 房间</th></tr>
+      <tr><td>16（0.8 m）</td><td>0.64 m²</td><td>约 156 万</td><td>约 156 MB</td><td>约 31 块</td></tr>
+      <tr><td>32（1.6 m）</td><td>2.56 m²</td><td>约 39 万</td><td>约 39 MB</td><td>约 8 块</td></tr>
+      <tr><td>64（3.2 m）</td><td>10.24 m²</td><td>约 9.8 万</td><td>约 9.8 MB</td><td>约 2 块</td></tr>
+      <tr><td>128（6.4 m）</td><td>40.96 m²</td><td>约 2.4 万</td><td>约 2.4 MB</td><td>约 1 块</td></tr>
+    </table>
+    <p>读表：块越小，加载粒度越精细，但字典与消息头开销成平方放大（16 格块在满图上仅字典就可能吃掉 150 MB，比数据还重）；块越大，内存越粗放（128 格块加载一间房等于扛进 41 m² 的数据）。再叠加同步头开销：每次同步的元信息约 100 B，对 16 格块（256 B 数据）约占整条消息的 28%、对 32 格块约 9%、对 64 格块约 2.4%。<strong>32 格（1 KB 数据、约 9% 头开销）位于数据与元信息比例较健康的位置，与本章起点值一致</strong>；场景以稀疏小变化为主时可选 16 格并接受头开销，以整片区域推送为主时可选 64 格。</p>
+
+    <h3>7. 失效模式与边界条件</h3>
+    <ul>
+      <li><strong>LRU 抖动</strong>：两个任务区相距很远、内存上限又设得小，机器人来回跑触发反复"卸载、重载"风暴。边界动作：统计重载速率并列为健康指标；上限至少要覆盖"当前任务工作集加一片余量"。</li>
+      <li><strong>重载风暴的恢复时间</strong>：回到卸载过的区域需要拉回数百块，按每块 1 KB、有效带宽 1 Mbps 估算，100 块约需 0.8 s，期间该区域的决策只能降级使用旧数据。边界动作：为"即将前往的区域"做预取，把恢复时间折叠进路径规划时间。</li>
+      <li><strong>字典键用浮点坐标</strong>：直接用浮点世界坐标做键会在坐标微抖动时产生"同一块两个键"。修复：所有键必须是整数 (cx, cy)。</li>
+      <li><strong>卸载与订阅不同步</strong>：某块仍被订阅者关心时被卸载，接收方下一次比对发现"版本倒退"或直接缺块。边界动作：卸载条件里包含"无订阅者"，订阅表与存储表由同一模块管理。</li>
+      <li><strong>归档格式未版本化</strong>：地图存盘文件不含块格式版本，软件升级后旧档无法读或静默读错。边界动作：文件头写格式版本与坐标系信息，加载时校验。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <ol>
+      <li><strong>定块参数</strong>：分辨率 0.05 m、块 32×32 格（1.6 m）起步；块尺寸向下对齐到寻址公式里的 N·r。</li>
+      <li><strong>实现块字典</strong>：世界坐标↔块坐标换算、块内偏移、懒创建（首次写入才分配）。</li>
+      <li><strong>定所有权模式</strong>：小团队静态划分起步；需要时再加动态认领协议。</li>
+      <li><strong>定同步范围</strong>：每个机器人订阅半径 R（如 50 m）内的块更新；跨区协作任务显式扩大范围。</li>
+      <li><strong>定生命周期策略</strong>：LRU（最近最少使用）卸载阈值（如 10 分钟未访问且无订阅者）；归档接口预留磁盘格式。</li>
+      <li><strong>验收</strong>：内存随探索比例曲线（应近似线性于已探索面积，与命名空间无关）、块接缝的数据连续性、同步带宽。</li>
+    </ol>
+    <table>
+      <tr><th>参数</th><th>起点值</th><th>依据</th></tr>
+      <tr><td>块边长 N</td><td>32 格（1.6 m）</td><td>字典条目数与同步头开销的折中</td></tr>
+      <tr><td>懒创建</td><td>只在首次写入时分配</td><td>探索区域之外零内存的关键</td></tr>
+      <tr><td>同步半径 R</td><td>50 m</td><td>覆盖导航前瞻与局部协同需求</td></tr>
+      <tr><td>LRU 卸载</td><td>10 分钟未访问</td><td>跟随任务节奏，避免抖动卸载</td></tr>
+      <tr><td>版本号</td><td>块级单调递增</td><td>与第 027 章协议一致</td></tr>
+    </table>
+    <p>块尺寸还有一个隐蔽的约束：它与"感知半径"和"膨胀半径"要同量级。激光雷达的有效量程 10–20 m、代价地图膨胀半径 0.3–1.5 m，块边长落在两者之间（1–3 m）时，局部更新的放大率与地图精度比较平衡。块远大于感知半径，每次更新浪费十几倍内存；块远小于膨胀半径，边界缓冲带来的重复写入显著上升。这一点单独看不像关键参数，放到"更新、同步、回收"整条链路上会反复出现。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：块字典，坐标寻址与懒创建</strong></p>
+    <pre class="code"><code>import numpy as np
+
+class ChunkedGrid:
+    """块状稀疏栅格：只保存被写过的块，坐标寻址 O(1)。"""
+    def __init__(self, resolution=0.05, n=32, init=-1):
+        self.r = resolution
+        self.n = n                          # 块边长（格）
+        self.init = init                    # 懒创建时的初值（-1 未知）
+        self.chunks = dict()                # (cx, cy) -> (version, ndarray(n,n))
+        self.versions = dict()              # 供第 027 章协议复用的版本表
+
+    def world_to_key(self, x, y):
+        """世界坐标（米）-> (块键, 块内行列)。负数必须用 floor 向下取整。"""
+        span = self.n * self.r
+        cx, cy = int(np.floor(x / span)), int(np.floor(y / span))
+        ix = int(np.floor((x - cx * span) / self.r))
+        iy = int(np.floor((y - cy * span) / self.r))
+        return (cx, cy), (iy, ix)           # 注意 data 行序：iy 是行，ix 是列
+
+    def get(self, cx, cy, create=False):
+        key = (cx, cy)
+        if key not in self.chunks and create:
+            # 懒创建：首写才分配内存，未探索区域"不存在"
+            self.chunks[key] = (0, np.full((self.n, self.n), self.init,
+                                           dtype=np.int8))
+        return self.chunks.get(key)         # 未创建返回 None：读方自行判"未知"
+
+    def write(self, x, y, value):
+        key, (iy, ix) = self.world_to_key(x, y)
+        ver, block = self.get(*key, create=True)
+        if block[iy, ix] != value:          # 值真变化才动版本号：脏块检测根基
+            block[iy, ix] = value
+            self.chunks[key] = (ver + 1, block)
+            self.versions[key] = ver + 1</code></pre>
+    <p>解读：这个类的每个设计都对应一个工程教训。<strong>（1）</strong><code>np.floor</code> 与 int() 截断的区别：int() 对负坐标向零取整，会让 -0.1 m 与 +0.1 m 落入同一块，原点附近的块边界全部错位，地图在原点两侧"接缝错乱"就是这个 bug 的签名。<strong>（2）</strong>懒创建是稀疏性的兑现处：<code>get(create=False)</code> 让读取方明确处理"块不存在"（等价于整块未知），避免先分配再判断。<strong>（3）</strong>版本号只在值真变化时递增：如果一个写入循环里"写 100 个值其中 3 个不同"，只有 3 次版本变化会在第 027 章的脏块对比里被看见，<strong>版本即变化量，是整条增量链路的信号源</strong>。<strong>（4）</strong>行列序标注（iy 行、ix 列）紧贴代码：地图数据的行优先约定在这里再次出现，注释就是防线。</p>
+
+    <p><strong>片段 2：脏块收集与按需推送</strong></p>
+    <pre class="code"><code>class ChunkSync(Node):
+    """只推送"订阅者范围内"的脏块：把通信量与"相关区域"绑定，全图推送被放弃。"""
+    def __init__(self, grid, self_pos_fn):
+        super().__init__("chunk_sync")
+        self.grid = grid
+        self.self_pos_fn = self_pos_fn       # 回调：返回本机当前位置 (x, y)
+        self.pub = self.create_publisher(ChunkMsg, "map/chunks", 50)
+        self.sub_radius = 50.0               # 队友声明关心的半径
+        self.last_sent = dict()              # key -> 已发送版本
+        self.create_timer(0.5, self.flush)   # 与 027 章一致的整流节奏
+
+    def flush(self):
+        x, y = self.self_pos_fn()
+        span = self.grid.n * self.grid.r
+        rc = int(self.sub_radius / span) + 1
+        ccx, ccy = self.grid.world_to_key(x, y)[0]
+        for cx in range(ccx - rc, ccx + rc + 1):
+            for cy in range(ccy - rc, ccy + rc + 1):
+                got = self.grid.get(cx, cy)          # 未创建的块直接跳过
+                if got is None:
+                    continue
+                ver, block = got
+                if self.last_sent.get((cx, cy)) == ver:
+                    continue                         # 版本没变：不占带宽
+                msg = ChunkMsg()
+                msg.cx, msg.cy, msg.version = cx, cy, ver
+                msg.data = block.ravel().tolist()    # 1024 格 = 1 KB 量级
+                self.pub.publish(msg)
+                self.last_sent[(cx, cy)] = ver       # 记账：下次比对用</code></pre>
+    <p>解读：推送循环的设计把"按需"具体化了。<strong>（1）</strong>遍历范围由"队友关心的半径"决定：无人机可能关心 200 m，地面机器人 30 m；范围之外即使变脏也不发，地图的"全图一致性"被明确降级为"相关区域一致性"，这是规模化的必要条件。<strong>（2）</strong><code>get()</code> 为 None 时连版本判断都省了：稀疏表示让"没有内容"的区域在同步逻辑里也是免费的。<strong>（3）</strong>推送触发条件仍是"版本变化"（第 027 章的脏块协议），本章只是把它的作用域从"全图"收窄到"相关区域"。<strong>（4）</strong>整流节奏 2 Hz 与 027 保持一致：多个机制共用同一节拍，系统行为更可预测。</p>
+
+    <p><strong>片段 3：接收、版本守卫与 LRU 回收</strong></p>
+    <pre class="code"><code>import time
+
+class ChunkStore:
+    """接收远端块并管理生命周期：版本守卫 + LRU 卸载。"""
+    def __init__(self, grid, max_chunks=2000):
+        self.grid = grid
+        self.max_chunks = max_chunks         # 内存上限（块数）：2000 块 ≈ 2 MB
+        self.last_access = dict()            # key -> 最近访问时间
+
+    def on_chunk(self, msg):
+        key = (msg.cx, msg.cy)
+        cur = self.grid.get(*key)            # 本地可能没有：允许直接建
+        cur_ver = cur[0] if cur is not None else -1
+        if msg.version &lt;= cur_ver:
+            return                           # 版本守卫：旧包直接丢（027 章纪律）
+        block = np.array(msg.data, dtype=np.int8).reshape(self.grid.n,
+                                                          self.grid.n)
+        self.grid.chunks[key] = (msg.version, block)
+        self.last_access[key] = time.monotonic()
+        self.evict_if_needed()
+
+    def evict_if_needed(self):
+        if len(self.grid.chunks) &lt;= self.max_chunks:
+            return
+        # LRU：按访问时间排序，卸载最久未用的块（内存随任务起伏）
+        victims = sorted(self.last_access, key=self.last_access.get)
+        for key in victims[: len(self.grid.chunks) - self.max_chunks]:
+            self.grid.chunks.pop(key, None)
+            self.last_access.pop(key, None)  # 卸载后如再需要，走"按需请求"重载</code></pre>
+    <p>解读：接收与生命周期管理的重点都在"纪律"上。<strong>（1）</strong>版本守卫复用了第 027 章的规则但换了作用对象：无论存储怎么组织的，<strong>"版本不前进不应用"是不变式</strong>，它保证乱序/重传不会把地图拉回旧状态。<strong>（2）</strong>收到未创建的块直接建立（<code>cur is None</code> 时版本按 −1 处理）：远端推送本身就是"这里存在内容"的证据，懒创建在接收侧同样适用。<strong>（3）</strong>LRU 卸载让内存随任务起伏：机器人跑完整的园区不现实也不需要，<strong>让"当前任务相关"与"长期归档"分开管理是规模化系统的标志</strong>。卸载时要同步清理 <code>last_access</code>，否则字典会泄漏；卸载后的再次需要走"按需请求"通道重新拉取（幂等操作，可安全重试）。<strong>（4）</strong><code>max_chunks=2000</code> 是量级起点：2000 块 × 1 KB ≈ 2 MB，对嵌入式系统安全；实际值按平台内存与任务需求调整。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>负数坐标取整错误</strong>：用截断代替向下取整，原点负侧块边界错位，地图接缝处出现"错行"。修复：<code>np.floor</code>，并用原点附近的非对称测试用例验证。</li>
+      <li><strong>懒创建被破坏</strong>：初始化时把整个命名空间预分配，内存又回到稠密栅格量级。修复：严格"首写才分配"，并用"探索比例-内存"曲线监控。</li>
+      <li><strong>块边界观测只写一块</strong>：激光打在两块交界，相邻块漏更新，接缝处断续。修复：写入时检查邻近块，读取时也检查邻居（边界缓冲）。</li>
+      <li><strong>无版本守卫的双写</strong>：接手区域的机器人推送旧版本，覆盖新数据。修复：块级版本号，任何写入路径都必须过守卫。</li>
+      <li><strong>LRU 卸载不清理元数据</strong>：只删块、不删访问时间字典，长跑后内存泄漏。修复：卸载操作必须是"原子"的（数据 + 元数据一起走），写测试断言两者大小一致。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>算一算：1 km×1 km、0.05 m 分辨率、块 32×32。整块栅格多少格？若探索 5%，块化后大约占多少内存（块数 × 1 KB + 字典开销）？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>整块 4 亿格 ≈ 400 MB；5% 面积 = 50000 m²，每块 2.56 m²，约 1.95 万块 ≈ 19.5 MB 数据加约 2 MB 字典开销，省约 18 倍。</div></details>
+      </li>
+      <li>把块尺寸从 32 改到 128，预测内存粒度、字典条目数、同步消息头开销与块接缝问题的变化方向。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>块大：字典条目少、头开销占比低；但一次加载/同步换来更大内存块，变化局部性差、接缝相对面积小。反方向类似推理。</div></details>
+      </li>
+      <li>为"机器人 A 把地图边界的块交接给 B"设计一个协议：如何判定交接时机、交接期双写如何处理、失败时怎么回退。写 5–8 条不变量。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>要点：版本号裁决（无论谁写都递增）、交接确认（B 确认后 A 才停推）、超时回退（A 未收到确认则继续负责）。不变量示例："任何时刻每块有且仅有一个负责推送者"。</div></details>
+      </li>
+      <li>设计题：给你的项目选一种环境表示（栅格块/八叉树/体素映射表/ESDF），说明任务需求匹配、内存估算与同步策略，并给出不选其余选项的理由。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>从任务出发：二维导航 + 增量分享 → 栅格块；若还要机械臂避障，评估在栅格块上叠加体素/ESDF 的复合方案。</div></details>
+      </li>
+      <li>思考：为什么说"全图一致"是不必要的强目标，"局部一致 + 全局可查"才是工程平衡点？这个原则还会影响哪些模块（任务分配、覆盖巡逻）？<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>全图一致的通信成本随地图与团队规模膨胀，而任务所需信息总是局部的；任务分配、巡逻安排同样可以"按区域订阅状态"，把一致性需求降到局部。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>稠密全局栅格的问题出在结构上，与精度无关：内存跟着命名空间走、同步单位过大、写入单点。</li>
+      <li>块状稀疏表示 = 固定块 + 映射表 + 懒创建：内存跟着探索内容走，寻址 O(1)。</li>
+      <li>坐标换算切记 floor；版本号贯穿存取与同步，是增量协议的不变式。</li>
+      <li>所有权（静态/动态）决定谁推送；按需订阅半径决定给谁推送；LRU 回收决定内存上限。</li>
+      <li>下一章把"分发"进一步工程化：<strong>自建主题路由与数据分发中间件</strong>，当话题数量爆炸时，如何用应用层路由器重建秩序。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch032.html">← 第 032 章：多机器人感知数据融合</a>
+    <a class="next" href="ch034.html">第 034 章：自建主题路由与数据分发中间件 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

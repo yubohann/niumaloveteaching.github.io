@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第048章 SAC的梯度裁剪 | 深度强化学习课程 · PPO、SAC 与多智能体系统</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 离策略方法与 SAC</span>
+    <span class="sep">/</span>
+    <span>第 048 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 离策略方法与 SAC</div>
+    <h1>第 048 章：SAC的梯度裁剪</h1>
+    <p class="lead">给 SAC 的 Q 网络与策略网络装上可调阈值的"保险丝"：统计每次更新前的梯度范数分布（均值 / p95 / 最大值），对比不裁剪、0.5、5.0 三种阈值下的触发率与学习曲线，学会让数据决定裁剪阈值，不再凭直觉拍板。</p>
+    <ul class="meta">
+      <li>主题：训练稳定化 / 按范数梯度裁剪</li>
+      <li>关键公式：g ← g · min(1, τ / ‖g‖<sub>2</sub>)</li>
+      <li>预计学时：45 分钟</li>
+      <li>前置章节：第 047 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解为什么自举式时序差分学习比监督学习更容易出现梯度尖峰。</li>
+      <li>掌握按范数裁剪（<code>clip_grad_norm_</code>）的数学效果：只缩放幅度、不改变方向。</li>
+      <li>实现裁剪前梯度范数的逐次记录，会统计均值 / p95 / 最大值与触发率。</li>
+      <li>对比三种阈值下的达标步数与曲线稳定性，建立"阈值应对齐梯度分布 p95～max"的工程准则。</li>
+      <li>会区分"裁剪真实生效"与"裁剪形同虚设/过度压制"两种状态，并用触发率判断。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>时序差分学习的回归目标里含着自举项 γ·Q̄(s′,a′)，而 Q̄ 又由 Q 的旧参数构成。当某批样本的回报异常大（比如 Pendulum 里罕见的连续高分轨迹）、或目标网络刚经历一次大幅更新时，Q 损失对参数求导后会出现比平时大得多的梯度。Adam 虽然做逐参数尺度归一化，但<strong>范数极大的整个参数块</strong>仍可能让一次更新把网络推离舒适区，表现为评估回报的断崖式下跌。</p>
+    <p>梯度裁剪就是给这种尖峰兜底：把超过阈值 τ 的梯度整体缩放到范数 τ。它不改变更新方向，只限制步幅。但裁剪不是免费的保险，阈值选小了，<strong>每一次正常更新都会被压缩</strong>，等价于偷偷调低学习率；选大了又形同虚设。本章先跑出一次完整的梯度范数分布，再让数据决定阈值该落在哪里。</p>
+    <p>尖峰的来源可以再拆细一点，便于判断何时该上裁剪：一是目标网络刚经历大幅更新，自举项 γ·Q̄ 突然变化，平方损失的误差放大；二是罕见的高回报轨迹进入 batch，TD 目标比同批其他样本大出一个量级；三是策略与 Q 交替改进的"追逐"阶段，两者误差互相放大。监督学习里标签是固定的，损失曲面也相对平稳；RL 的标签由网络自己产生，这是"右尾梯度"的结构性来源。判据也很直接：如果训练日志里出现过评估回报断崖、随后又缓慢爬回，多半是这类尖峰留下的痕迹。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 按范数裁剪的公式</h3>
+    <p>设参数梯度向量为 g（把所有参数梯度拼成一个大向量），阈值 τ 大于 0，裁剪后的梯度为：</p>
+    <div class="formula">
+      g ← g · min( 1, τ / ‖g‖<sub>2</sub> )
+      <span class="note">‖g‖ ≤ τ 时保持原样；‖g‖ 大于 τ 时整体缩放到范数恰好为 τ</span>
+    </div>
+    <p>符号说明：‖g‖<sub>2</sub> 是梯度的 L2 总范数（所有参数平方和开根），τ 是裁剪阈值。关键性质：缩放因子是<strong>对整段梯度统一的标量</strong>，所以梯度方向完全不变，只把步长掐到上限。这与"逐元素按值裁剪"不同，后者会改变方向，还要单独讨论（见练习）。</p>
+
+    <div class="box key">
+      <span class="box-title">数值例子：一次裁剪的全过程</span>
+      <p>把全部参数梯度看成一个二维向量便于展示。设 g = [3, 4]，则 ‖g‖ = √(9+16) = 5，方向为 atan2(4,3) ≈ 53.13°。</p>
+      <p><strong>阈值 τ=2.5（小于范数，触发裁剪）</strong>：缩放因子 = 2.5/5 = 0.5，裁剪后 g′ = [1.5, 2.0]，‖g′‖ = √(2.25+4) = 2.5，方向仍是 53.13°。幅度被掐到上限，方向分毫未动。</p>
+      <p><strong>阈值 τ=8（大于范数，不触发）</strong>：min(1, 8/5) = 1，梯度保持原样，这正是"只在异常时出手"的含义。</p>
+      <p><strong>对比逐元素按值裁剪（±1.5）</strong>：结果 [1.5, 1.5]，方向变成 45°，与原来差约 8°。解读：按范数裁剪是"等比缩放的绳子"，按值裁剪是"逐维上限的笼子"；后者在个别参数梯度爆炸时更精准，但会引入方向偏差，两者的适用场景不同。另有一个近似换算：设学习率 η=3e-4，裁剪后单步位移上限约为 η·τ = 3e-4×2.5 = 7.5e-4，这就是"步长被钉在 η·τ"的量化含义。</p>
+    </div>
+
+    <h3>2. 为什么用范数统计来选阈值</h3>
+    <p>阈值应该"只在异常时才出手"。把每次更新的梯度总范数记录下来，就得到一条分布：</p>
+    <div class="formula">
+      τ<sub>合理</sub> ≈ p95(‖g‖) ~ max(‖g‖)
+      <span class="note">触发率（‖g‖ 大于 τ 的比例）应控制在 1%～10% 量级；长期高于 50% 说明阈值在常态区内</span>
+    </div>
+    <p>如果触发率接近 1，说明阈值比绝大多数更新的梯度都小，裁剪变成"统一把梯度压到 τ"，学习率被隐式改写；如果触发率接近 0，则完全没有起到保险作用。工程上先用一两万步的基线跑出 p95 与 max，再把阈值设在略低于 p95 的位置，这样只削右尾、不影响主分布。</p>
+
+    <h3>3. 与学习率的关系</h3>
+    <p>裁剪阈值 τ 与学习率 η 共同决定有效步长：常态下步长约为 η·‖g‖；被裁剪时步长被钉在 η·τ。因此<strong>降低学习率和降低裁剪阈值在"步子变小"这件事上有替代性</strong>，但机制不同：前者对所有更新一视同仁，后者只压异常的右尾。这也是"调小 lr"不能完全替代裁剪的原因，裁剪切掉的是分布的右尾，保留高概率区域的分辨率。</p>
+
+    <h3>4. 三档阈值的预期对照</h3>
+    <table>
+      <tr><th>档位</th><th>触发率</th><th>有效步长</th><th>达标步数</th><th>曲线特征</th></tr>
+      <tr><td>none（不裁剪）</td><td>0</td><td>完全由 ‖g‖ 决定</td><td>基准</td><td>偶发尖峰带来的评估波动</td></tr>
+      <tr><td>5.0（温和）</td><td>约 3%～6%</td><td>仅右尾被削</td><td>与基准接近</td><td>与 none 几乎重合，异常点被兜住</td></tr>
+      <tr><td>0.5（激进）</td><td>90% 以上</td><td>长期被钉在 η·0.5</td><td>明显变大</td><td>学习整体变慢，等价于隐式调低学习率</td></tr>
+    </table>
+    <p>三档的读法是"看触发率定位状态"：5.0 档触发率在 10% 以内，属于正常的保险丝；0.5 档触发率超过 90%，说明阈值压进了梯度分布的常态区，裁剪已经变成一种持续的学习率削减。汇总表把"阈值 − 触发率 − 达标步数"三列并排，就是为了让这种"隐式改学习率"的现象直接可见。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+
+    <h3>数据流</h3>
+    <p>训练闭环与第 047 章相同，只在优化器更新之前插入裁剪与统计：Q 反传后先算<strong>裁剪前</strong>的 Q 梯度总范数 → 对 Q1、Q2 分别裁剪并合并触发标志 → <code>step()</code>；策略反传后同样统计并裁剪。每 2000 步评估时打印最近 2000 次更新的范数均值、p95 与触发率。三种阈值（none / 0.5 / 5.0）同种子、同步数、同学习率。这样安排让"裁剪是否改变训练"与"裁剪是否被触发"两件事在日志里同时可见：性能曲线回答前者，触发率回答后者，两者不一致时优先检查统计是否发生在裁剪之前。</p>
+
+    <h3>模块划分</h3>
+    <table>
+      <tr><th>组件</th><th>职责</th><th>关键点</th></tr>
+      <tr><td><code>grad_norm(module)</code></td><td>求参数梯度 L2 总范数</td><td>在 <code>backward()</code> 之后、<code>step()</code> 之前调用</td></tr>
+      <tr><td><code>apply_clip(module, clip)</code></td><td>按阈值调用 <code>clip_grad_norm_</code> 并返回触发标志</td><td>返回 <code>norm &gt; clip</code>，用于统计触发率</td></tr>
+      <tr><td><code>SAC.update(batch, args, clip)</code></td><td>Q 与策略两次反传分别记录、分别裁剪</td><td>Q1、Q2 都要裁；布尔值先算再合并</td></tr>
+      <tr><td><code>train_clip(clip)</code></td><td>按阈值训练并汇总范数统计</td><td>0 表示不裁剪，作为基线</td></tr>
+    </table>
+
+    <h3>关键超参数</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用与取值理由</th></tr>
+      <tr><td><code>--clips</code></td><td>none,0.5,5.0</td><td>基线 + 激进 + 温和三个档位；脚本把 none 解析成 0</td></tr>
+      <tr><td><code>--max-steps</code></td><td>16000</td><td>每种策略的预算，三组共 4.8 万步</td></tr>
+      <tr><td><code>--eval-every</code></td><td>2000</td><td>评估点同时打印最近 2000 次更新的范数均值、p95 与触发率</td></tr>
+      <tr><td><code>--lr</code></td><td>3e-4</td><td>标准学习率；调大它梯度尖峰问题会更突出</td></tr>
+      <tr><td><code>--tau</code> / <code>--batch-size</code></td><td>0.005 / 256</td><td>与前面章节保持一致，避免引入新变量</td></tr>
+    </table>
+
+    <p>统计窗口取"最近 2000 次更新"有两个原因：一是单次范数的波动极大，瞬时值无法判断趋势；二是 2000 次恰好等于一个评估间隔（2000 步、每步更新一次）的更新量，与训练阶段对齐，读到的分布反映"当前阶段"，整场平均由汇总统计承担。汇总时的 p95 与 max 则用全历史统计，因为阈值决策关心的是"最坏情况有多坏"，历史极值不能被窗口平滑掉。两个口径分工明确：窗口看状态，全量定阈值。</p>
+
+    <h3>与前一章的差异点</h3>
+    <ul>
+      <li>第 047 章改网络内部结构（归一化层）；本章网络结构不变，<strong>只在优化器更新前插入裁剪</strong>。</li>
+      <li>新增 <code>grad_norm</code> 与 <code>apply_clip</code> 两个工具函数，Q 网络与策略网络分别裁剪。</li>
+      <li><code>update()</code> 返回 <code>q_grad_norm / p_grad_norm / clipped</code> 三个诊断量，供逐点统计。</li>
+      <li>汇总口径变成"阈值 − 触发率 − 达标步数"的关系表。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：两个小工具，量范数与裁剪</strong></p>
+    <pre class="code"><code>def grad_norm(module: nn.Module) -&gt; float:
+    """参数梯度总范数（L2），在优化器 step 之前调用。"""
+    total = 0.0
+    for p in module.parameters():
+        if p.grad is not None:               # 未参与计算的参数 grad 为 None
+            total += float((p.grad ** 2).sum())   # float() 断开计算图，纯记数
+    return float(np.sqrt(total))
+
+
+def apply_clip(module: nn.Module, clip: float) -&gt; bool:
+    """按阈值裁剪梯度范数，返回是否触发了裁剪。"""
+    norm = grad_norm(module)                 # 先量后裁：量到的是"裸"范数
+    if clip &gt; 0.0:
+        nn.utils.clip_grad_norm_(module.parameters(), clip)
+    return clip &gt; 0.0 and norm &gt; clip        # 触发 = 阈值有效 且 裸范数超限</code></pre>
+    <p>解读：<strong>（1）</strong>统计必须发生在裁剪之前，如果先裁再量，得到的范数恒不超过 τ，分布统计失去意义。<code>p.grad is not None</code> 的判断不能省：某些参数若这一步没有参与计算，<code>grad</code> 为 <code>None</code>。<strong>（2）</strong><code>float(...)</code> 把张量转成 Python 数，顺带断开与计算图的联系，保证统计不干扰反传。<strong>（3）</strong><code>apply_clip</code> 返回布尔触发标志，这是触发率的原始信号；<code>clip=0</code> 表示不裁剪，返回 False。<strong>（4）</strong>PyTorch 的 <code>clip_grad_norm_</code> 内部就是"算总范数 → 缩放"，与手写公式一致，但实现经过优化、就地修改，不要自己重写。</p>
+
+    <p><strong>片段 2：update 里的"先统计、再裁剪"</strong></p>
+    <pre class="code"><code>        q1 = self.q1(obs, act)
+        q2 = self.q2(obs, act)
+        q_loss = F.mse_loss(q1, backup) + F.mse_loss(q2, backup)
+        self.opt_q.zero_grad()
+        q_loss.backward()
+        # 裁剪前的 Q 网络梯度总范数 + 是否触发裁剪
+        q_raw = 0.0
+        for p in list(self.q1.parameters()) + list(self.q2.parameters()):
+            if p.grad is not None:
+                q_raw += float((p.grad ** 2).sum())
+        q_raw = float(np.sqrt(q_raw))
+        c1 = apply_clip(self.q1, clip)       # 先各自裁剪、各自返回标志
+        c2 = apply_clip(self.q2, clip)
+        q_clipped = c1 or c2                 # 合并成"本次更新是否触发过"
+        self.opt_q.step()
+
+        new_act, logp = self.policy.sample(obs)
+        q_pi = torch.minimum(self.q1(obs, new_act), self.q2(obs, new_act))
+        policy_loss = (self.alpha.detach() * logp - q_pi).mean()
+        self.opt_policy.zero_grad()
+        policy_loss.backward()
+        p_raw = grad_norm(self.policy)       # 策略单独统计、单独裁剪
+        apply_clip(self.policy, clip)
+        self.opt_policy.step()</code></pre>
+    <p>解读：<strong>（1）</strong>Q 网络把 Q1、Q2 的参数合并计算"总范数"：两个网络共享一个优化器，范数应作为整体看待；但裁剪要对两个模块分别调用（各自拥有自己的梯度张量）。<strong>（2）</strong><code>c1 = ...</code> 与 <code>c2 = ...</code> 先算好再合并，若写成 <code>apply_clip(q1, clip) or apply_clip(q2, clip)</code>，Python 的短路求值会在 q1 触发时跳过 q2 的裁剪，留下"只裁了一半"的网络，这是非常隐蔽的 bug。<strong>（3）</strong>策略网络单独统计 <code>p_raw</code> 并用同一阈值裁剪：策略损失的梯度也可能突然变大，保险丝要覆盖两个优化器。<strong>（4）</strong>温度系数 <code>log_alpha</code> 的更新幅度天然很小，不裁剪。</p>
+
+    <p><strong>片段 3：把梯度分布变成决策依据</strong></p>
+    <pre class="code"><code>        if step % args.eval_every == 0:
+            eval_ret = evaluate(agent, eval_env, args.eval_episodes)
+            eval_returns.append(eval_ret)
+            recent_norms = q_norms[-2000:]           # 最近 2000 次更新的范数
+            mean_n = float(np.mean(recent_norms))
+            p95_n = float(np.percentile(recent_norms, 95))
+            trig = float(np.mean(clip_flags[-2000:])) # 其中被裁掉的比例
+            recent20 = np.mean(ep_returns[-20:]) if ep_returns else float("nan")
+            print(f"[clip={label}] 步数 {step:6d} | 近20回合回报 {recent20:8.1f} | "
+                  f"评估 {eval_ret:8.1f} | 梯度范数均值 {mean_n:6.2f} | "
+                  f"p95 {p95_n:6.2f} | 触发率 {trig:.3f}")
+
+    elapsed = time.time() - t_start
+    final_eval = evaluate(agent, eval_env, args.eval_episodes)
+    all_evals = eval_returns + [final_eval]
+    best_eval = max(all_evals)
+    eval_std = float(np.std(all_evals[-4:]))     # 后期评估波动
+    mean_n = float(np.mean(q_norms))
+    p95_n = float(np.percentile(q_norms, 95))
+    max_n = float(np.max(q_norms))               # 长尾有多长，全看这里
+    trig = float(np.mean(clip_flags))</code></pre>
+    <p>解读：<strong>（1）</strong>均值、p95、max 三个数回答三个问题：均值说"常态梯度多大"，p95 说"多数尖峰到哪"，max 说"最坏情况多糟"，阈值选择就夹在 p95 与 max 之间。<strong>（2）</strong>触发率用滑窗（最近 2000 次）统计：它是"阈值合适度"的仪表，不是训练曲线，长期高于 0.5 就说明阈值压进了常态区。<strong>（3）</strong>注意对裁剪档位来说，这里统计的范数<strong>始终是裁剪前的</strong>（<code>q_norms</code> 里存的是 <code>q_grad_norm</code>），否则被压到 τ 的读数会让分布看起来完全健康，那是自欺欺人。<strong>（4）</strong>最后把四个统计量与达标步数、后期评估 std 一起进汇总表，形成"阈值 − 触发率 − 性能"的三列对照。</p>
+
+    <p>完整可运行脚本（附录）：<a href="../code/ch048.py" download>code/ch048.py</a></p>
+    <pre class="sh"><code>python code/ch048.py                       # 三种阈值各 16000 步，CPU 约 5–7 分钟
+python code/ch048.py --quick               # 快速跑通：4000 步/策略，约 1 分钟
+python code/ch048.py --clips none,0.2 --max-steps 20000   # 只看两个极端阈值</code></pre>
+    <p>预期：梯度范数<strong>均值在 3～5、p95 在 7～10、max 偶尔冲到 20 以上</strong>；阈值 5.0 的触发率约 3%～6%，评估表现与 none 几乎重合（只在长尾出手）；阈值 0.5 的触发率超过 90%，等于把有效步长锁死在小值上，前期学习明显变慢、达标步数变大。Pendulum 上 none 与 5.0 都能顺利收敛，裁剪的价值要在大学习率或更深网络下才会放大。以实跑为准。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>在 <code>step()</code> 之后统计梯度</strong>：优化器与 <code>zero_grad</code> 会清空或覆盖 <code>grad</code>，量到 0 或旧值。统计与裁剪都必须在 <code>backward()</code> 与 <code>step()</code> 之间完成。</li>
+      <li><strong><code>zero_grad</code> 顺序颠倒</strong>：必须在反传前清零。若梯度跨更新累积，范数统计偏大、裁剪频繁误触发。</li>
+      <li><strong>用 <code>or</code> 合并两次裁剪调用</strong>：Python 短路求值会跳过第二个网络的裁剪，留下半裁剪状态。先把两个布尔值各算出来再合并。</li>
+      <li><strong>把裁剪阈值当成"试出来就行"的参数</strong>：阈值应参照梯度分布 p95 来定；触发率是现成的反馈信号，比反复试回报高效得多。<strong>修复</strong>：先跑一轮 none 档记录分布，再按 p95 设阈值并复跑核对触发率。</li>
+      <li><strong>只裁 Q 网络忘了策略网络</strong>：Q 的尖峰更常见，但策略损失的梯度同样会爆；本章对两个优化器都装了保险丝，统计时应分开看 <code>q_grad_norm</code> 与 <code>p_grad_norm</code>，它们的尺度天然不同。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把 <code>--lr</code> 改成 <code>3e-3</code>，重复三组对照。预测哪个阈值开始真正发挥作用，再验证。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>学习率放大后参数更新与目标网络漂移都变快，梯度尖峰更频繁、max 更大。比较 none 与 5.0 的后期评估 std，再看 0.5 的达标步数。</div></details>
+      </li>
+      <li>实现"动态阈值"：每 2000 步把阈值更新为最近 2000 次梯度范数的 p95。它与固定阈值相比稳定性如何？<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>维护一个范数队列，评估点重算分位数，把结果通过字典传给 <code>update</code>。动态阈值随训练阶段自适应，早期梯度大、后期小，不再依赖一个全局常数。</div></details>
+      </li>
+      <li>给策略网络和 Q 网络设置不同阈值（例如策略 1.0、Q 网络 5.0）。结合日志里两个范数的量级，解释为什么它们的梯度尺度不同。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div><code>p_grad_norm</code> 与 <code>q_grad_norm</code> 可直接比较。策略损失含 <code>α·logπ</code> 与 Q 项，受 tanh 与 log_std 影响；Q 回归是平方损失，量级天然更大。</div></details>
+      </li>
+      <li>实现按值裁剪（<code>clip_grad_value_</code>，逐元素绝对值上限）作为第四档，与按范数裁剪对比。什么场景该用按值裁剪？<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>在 <code>apply_clip</code> 里加一个分支。按值裁剪会改变梯度方向，适合"个别参数梯度爆炸"；按范数裁剪整体缩放，适合"整层梯度放大"。比较两者的触发率读数口径也不同。</div></details>
+      </li>
+      <li>在 MountainCarContinuous-v0 上重复实验，找出该环境的梯度范数 p95，并据此给出一个阈值建议。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div><code>--env MountainCarContinuous-v0 --max-steps 30000</code>。该环境成功回报 +100，早期 TD 目标波动更大，p95 通常显著高于 Pendulum，先跑 none 档看分布，再定建议值。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>自举目标与平方损失让 TD 学习天然带右尾梯度；裁剪用 <strong>g ← g·min(1, τ/‖g‖)</strong> 只压幅度、不改方向，是"等比缩放的绳子"，逐维的笼子留给按值裁剪。</li>
+      <li>阈值选择的工程准则是看梯度范数分布：<strong>p95 附近设阈值、"偶尔触发"最好</strong>；触发率长期高于 50% 等于偷偷改学习率，低于 1% 则保险丝形同虚设。</li>
+      <li>本章实现了逐次梯度范数统计（均值 / p95 / max）与触发率指标，把裁剪从"保险丝"变成可测量、可调优的组件，阈值决策因此有了数据依据，手感让位给统计。</li>
+      <li>Pendulum 上裁剪很难看出好处（任务温和）；真正需要它的是大学习率、深网络、稀疏奖励等梯度尖峰更频繁、右尾更长的场景。</li>
+      <li>裁剪的数值本质：g=[3,4]、τ=2.5 时缩放到 [1.5,2.0]，范数恰好 2.5、方向保持 53.13°；逐元素按值裁剪则会引入约 8° 的方向偏差。</li>
+      <li>统计口径有一条铁律：所有范数都必须是裁剪前的读数，否则分布被自身修改，触发率与 p95 全部失真、阈值决策失去依据。</li>
+      <li>下一章横向扩展训练系统：多环境并行采集 + 共享回放的分布式结构，看吞吐量如何随 worker 数量变化，以及并行化对样本效率的边际收益在哪里开始递减。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch047.html">← 第 047 章：SAC的批量归一化层</a>
+    <a class="next" href="ch049.html">第 049 章：SAC的分布式实现 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

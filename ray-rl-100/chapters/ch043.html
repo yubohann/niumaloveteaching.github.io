@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第043章 RLlib自定义探索策略 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第三篇 · RLlib 算法实现</span>
+    <span class="sep">/</span>
+    <span>第 043 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第三篇 · RLlib 算法实现</div>
+    <h1>第 043 章：RLlib自定义探索策略</h1>
+    <p class="lead">探索决定数据覆盖：熵正则（Entropy Regularization）、ε-贪心（Epsilon-Greedy）退火、高斯噪声（Gaussian Noise）与奥恩斯坦-乌伦贝克噪声（Ornstein-Uhlenbeck Noise）各自的机理与适用条件，以及如何在 RLlib 中接入自定义探索类并保持多 worker 一致。</p>
+    <ul class="meta">
+      <li>主题：RLlib 训练（探索机制）</li>
+      <li>关键机制：熵正则、噪声注入、探索参数退火</li>
+      <li>预计学时：50 分钟</li>
+      <li>前置章节：第 042 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解探索在强化学习里的三重角色：数据覆盖、非凸优化的逃逸、离线评估的保护。</li>
+      <li>掌握熵正则的梯度结构，能解释熵系数过大与过小的具体症状。</li>
+      <li>掌握离散动作的 ε-贪心与连续动作的高斯噪声、OU 噪声的原理差异及适用条件。</li>
+      <li>会在 RLlib 中配置内置探索项，并实现一个带全局步数退火的自定义探索类。</li>
+      <li>能分析多 worker 并行下探索状态的一致性要求，设计不退化为"各自为政"的调度方案。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>强化学习算法在每一步既要利用当前认知选择回报高的动作，又要收集足够多样的数据来修正认知。没有探索的贪心策略会把轨迹锁定在局部最优的狭小区域，价值网络对未访问状态一无所知，策略改进因此失去依据。探索强度还不能恒定：训练早期需要大面积覆盖，接近收敛时过度探索会稀释梯度信号并恶化评估表现。</p>
+    <p>RLlib 把探索组织为策略的一个可插拔组件（Exploration），与算法解耦。掌握它的配置与扩展方式，才能在离散、连续、多智能体等不同任务里控制数据分布，这也是后续奖励归一化与稳定性诊断的前置条件。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p>本节的线索是"探索从哪里来"：先看两类机制的作用位置，再看调度与并行一致性问题。</p>
+
+    <h3>1. 两类探索机制：行为层面的噪声与目标层面的熵</h3>
+    <table>
+      <tr><th>机制</th><th>作用位置</th><th>典型算法</th><th>数据多样性来源</th></tr>
+      <tr><td>ε-贪心、动作噪声</td><td>动作选择层（行为策略）</td><td>DQN、DDPG、SAC 行为侧</td><td>动作被随机扰动，经验分布变宽</td></tr>
+      <tr><td>熵正则、随机策略采样</td><td>损失函数层（优化目标）</td><td>PPO、A3C、SAC 目标侧</td><td>策略分布本身保持弥散</td></tr>
+      <tr><td>参数扰动、计数奖励</td><td>模型参数或奖励层</td><td>NoisyNet、计数式探索</td><td>从参数或内在激励激发新行为</td></tr>
+    </table>
+    <p>两类机制对不同样本生命周期的算法意义不同。同策略（On-policy）算法采完一个批次立即丢弃数据，若行为策略过于尖锐，批次内的动作多样性不足，梯度估计方差大；因此在损失里保留熵项是主要手段，行为噪声是辅助。<strong>异策略（Off-policy）算法把数据存入回放缓冲，探索不足的影响被长期滞留在缓冲里，行为侧噪声的调度因此更为关键。</strong></p>
+
+    <h3>2. 熵正则的数学结构</h3>
+    <p>策略在状态 s 下的熵定义为该状态动作分布的离散程度：</p>
+    <div class="formula">
+      H( π(·|s) ) = − Σ<sub>a</sub> π(a|s) · log π(a|s)
+      <span class="note">离散动作下最大值为 log|A|；连续动作下为微分熵</span>
+    </div>
+    <p>训练目标变为 L = L<sub>task</sub> − β·H(π)，系数 β 即熵系数。熵项的梯度把分布推向均匀：某动作概率趋近于零时，−log π 的梯度趋于无穷，形成防止动作被永久压制的阻力。这解释了两个典型症状：<strong>β 过大时策略长期保持高熵，任务回报上不去且评估方差大；β 趋近于零时策略过早尖锐，熵曲线快速塌缩，之后几乎不再探索，训练提前停滞。</strong></p>
+
+    <h3>3. 退火：从覆盖到精修</h3>
+    <p>常见做法是让探索参数随训练进度衰减，例如 ε 从 1.0 线性降到 0.05（在 10<sup>5</sup> 至 10<sup>6</sup> 环境步区间内），或高斯噪声标准差从 0.3 降到 0.05。衰减的数学动机是偏差与方差的权衡：早期高噪声以高方差换取覆盖，后期低噪声以低方差精修价值函数的局部结构。</p>
+    <p>调度必须绑定<strong>全局环境步数</strong>。RLlib 各采样 worker 各自持有探索状态，若按本地步数递减，不同 worker 会处于不同衰减阶段，最坏情况下部分 worker 已接近贪心、部分仍在全随机，批次内数据分布被人为割裂。正确的做法是从算法层把全局步数下发，或让探索类读取样本批次中的时间戳字段。</p>
+
+    <h3>4. OU 噪声与高斯噪声的差异</h3>
+    <p>连续控制任务里两种噪声常被混用，机理并不相同。高斯噪声每一步独立采样，N(0, σ²)，无记忆；奥恩斯坦-乌伦贝克（Ornstein-Uhlenbeck, OU）过程是均值回复的，噪声在时间上相关：x<sub>t+1</sub> = x<sub>t</sub> + θ(μ − x<sub>t</sub>) + σ·W<sub>t</sub>。<strong>OU 噪声的时序相关性让连续多步动作沿同一方向漂移，适合惯性系统（力矩、舵面）的探索；对位置级平滑控制，高斯噪声足够且参数更少。</strong>两者都作用于动作空间，注入后要注意动作边界裁剪。</p>
+
+    <h3>5. 数值算例：熵水平、采样分布与噪声幅度</h3>
+    <p>二值动作的熵给出一把标尺：p = 0.5（完全不确定）时 H = 0.693 纳特；p = 0.9 时降到 0.325；p = 0.99 时只剩 0.056。熵曲线从 0.69 向 0.3 附近缓慢滑落是健康信号，跌到 0.05 量级说明动作概率已被推到 99% 的尖锐水平，探索基本停止。把熵读数与动作概率对应起来，能避免"熵是高是低"的模糊讨论。</p>
+    <table>
+      <tr><th>最优动作概率 p</th><th>二值熵 H（纳特）</th><th>状态</th></tr>
+      <tr><td>0.50</td><td>0.693</td><td>完全不确定</td></tr>
+      <tr><td>0.90</td><td>0.325</td><td>偏向明确、保留试探</td></tr>
+      <tr><td>0.99</td><td>0.056</td><td>接近贪心</td></tr>
+    </table>
+    <p>采样分布的对照更直观：20 个动作、ε = 0.1 的 ε-贪心下最优动作占 0.905，其余 19 个动作各占 0.005，随机质量完全无视动作排序；温度采样（logits 差 [5, 4, 0…]、τ = 1）给出最优 0.672、次优 0.247、末位约 0.005，排序信息被保留。这就是"ε-贪心把探索质量均摊、温度采样沿排序分配"的定量体现，也解释了练习 4 中两类分布对梯度方差的不同影响。</p>
+    <p>噪声幅度也要按平稳分布核算：OU 过程 x<sub>t+1</sub> = x<sub>t</sub> + θ(μ − x<sub>t</sub>) + σ·w 的平稳标准差为 σ ÷ √(2θ)，θ = 0.15、σ = 0.2 时为 0.365，相关时间约 1 ÷ θ ≈ 6.7 步。对照独立高斯噪声的 σ = 0.2，OU 的稳态抖动幅度接近其两倍且前后步相关，覆盖轨迹呈现成段的漂移，与逐点扰动的独立噪声模型差异明显，选型时要按任务惯性核对。</p>
+    <p>退火时长要与训练预算挂钩核对：8 个采样 worker 各 200 步每秒时，全局步数以 1600 步每秒推进，20 万步的退火计划在约 125 秒墙钟内完成；若总预算是 1000 万步，这段退火只覆盖 2% 的训练窗口，探索收缩得过早。反过来，总预算 50 万步的任务用 50 万步退火，全程都停在高探索区间，末期精度不足。把退火步数控制在总预算的 20% 至 50%，是启动实验前的固定检查。</p>
+    <p>ε 的直觉换算：ε = 0.05、单局 1000 步时平均每局约 50 个随机动作，足以让价值估计持续接触分布边缘；ε = 0.2 时升到约 200 个，数据更宽但策略执行质量下降。早期 ε = 1.0 的对局近乎纯随机，这些数据对学习信号贡献有限却占用训练预算，因此退火通常在前两成预算内完成大部分衰减。回报越稀疏、动作越多，ε 终值应越小（0.01 量级），随机动作清零整局收益的风险更高。</p>
+    <p>探索的第三重角色在评估保护：固定少量探索强度能让价值函数对状态分布边缘保持更新信号，评估与部署路径则必须完全关闭探索，两侧分开管理，任何一侧的改动都进对照记录。监控上把训练期实测动作标准差与配置值对照，可以同时发现重复裁剪与噪声注入点错位这两类问题。</p>
+
+    <h3>6. 探索机制对照</h3>
+    <table>
+      <tr><th>机制</th><th>作用层</th><th>退火方式</th><th>实现成本</th><th>并行一致性要求</th><th>适用</th></tr>
+      <tr><td>ε-贪心</td><td>行为层</td><td>ε 线性衰减</td><td>低</td><td>全局步计数</td><td>离散动作、实现简单</td></tr>
+      <tr><td>温度采样</td><td>行为层</td><td>温度衰减</td><td>低</td><td>全局步计数</td><td>离散动作、需要平滑分布</td></tr>
+      <tr><td>高斯噪声</td><td>行为层</td><td>标准差衰减</td><td>低</td><td>无状态，天然一致</td><td>连续动作、无记忆系统</td></tr>
+      <tr><td>OU 噪声</td><td>行为层</td><td>标准差衰减</td><td>中，需要维护噪声状态</td><td>噪声状态随 worker 独立</td><td>惯性系统</td></tr>
+      <tr><td>熵正则</td><td>目标层</td><td>系数衰减（可选）</td><td>低</td><td>随参数更新，天然一致</td><td>同策略算法的主要手段</td></tr>
+    </table>
+    <p>读表：行为层机制的共同风险是退火调度，目标层机制的共同风险是量纲与回报失配；两类机制可以叠加，但叠加后要有单一主控变量（先定型主机制，另一项只做微调），否则故障无法归因。</p>
+    <p>熵的健康区间还随动作数移动：5 个动作的最大熵约 1.61 纳特，20 个动作约 3.00 纳特；"末期熵 0.3"对 5 动作任务意味着已相当尖锐，对 20 动作任务则仍保留较多随机性。记录熵时同时记录动作数与最大熵参照值，读数才有横向可比性。</p>
+
+    <h3>7. 边界与失效模式</h3>
+    <p>第一类边界在动作压缩与噪声的次序：经双曲正切压缩的动作若在压缩后再加噪声，边界附近的实际扰动被非线性压缩，实测标准差远低于配置值；正确做法是明确注入点，并用动作标准差实测值验证。</p>
+    <p>第二类边界在熵项与回报量纲：熵的数值范围由动作数决定（离散是 log|A|，连续是微分熵且可正可负），与回报量级无关；回报放大十倍时，同一熵系数下熵项的吸引力下降十倍，策略快速尖锐化。熵系数必须随回报尺度重新校准，敏感方向与 SAC 温度机制一致。</p>
+    <p>第三类边界在退火的时钟：按本地步数退火会让各采样 worker 的探索强度分层，批次内分布被割裂；按回合退火则受回合长度波动影响，稀疏奖励任务里退火过快。全局环境步是唯一稳定口径，自定义探索类必须从算法层接收该计数，并把依赖它的内部状态纳入检查点。</p>
+    <p>计数式探索的边界在状态规模：以访问计数驱动内在奖励的机制需要维护计数表，连续观测下必须离散化或使用密度模型，内存与查询开销随状态覆盖增长；高维观测上计数信号过稀，收益衰减，因此计数式探索只适合低维任务，不宜作为通用配置。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>选择与接入探索机制按以下四步。</p>
+    <ol>
+      <li><strong>按动作空间定型</strong>：离散动作首选 ε-贪心或随机策略采样；连续动作用高斯噪声，惯性强的系统考虑 OU 噪声。</li>
+      <li><strong>按算法生命周期定型</strong>：同策略算法优先配置熵系数，噪声作为补充；异策略算法的回放数据依赖行为噪声，退火计划必须覆盖数据生成时段。</li>
+      <li><strong>配置或实现</strong>：内置类型通过 <code>exploration_config</code> 声明；非标需求继承 <code>Exploration</code> 类实现 <code>get_exploration_action</code>。</li>
+      <li><strong>校准与验证</strong>：记录动作分布熵或噪声强度的实际取值，确认评估路径关闭探索。</li>
+    </ol>
+    <h3>探索参数表</h3>
+    <table>
+      <tr><th>参数</th><th>典型值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td><code>epsilon</code> 起始 / 终止</td><td>1.0 → 0.05</td><td>随机动作比例</td><td>动作数越多、回报越稀疏，终止值取越小</td></tr>
+      <tr><td>高斯噪声 std</td><td>0.1–0.3</td><td>连续动作扰动幅度</td><td>约为动作范围 10%–30%</td></tr>
+      <tr><td>OU 参数 θ, σ</td><td>0.15, 0.2</td><td>回复速度与噪声强度</td><td>系统惯性时间常数越小取 θ 越大</td></tr>
+      <tr><td>熵系数 β</td><td>0.001–0.02</td><td>损失中熵项权重</td><td>回报量级越大取越小；按回报尺度换算</td></tr>
+      <tr><td>退火步数</td><td>1e5–1e6 环境步</td><td>探索衰减时长</td><td>约为总训练预算的 20%–50%</td></tr>
+    </table>
+    <p>与上一章的差异：042 章的噪声与温度服务于搜索树的多样性，作用在根节点先验上；本章把探索抽回策略层，作为所有算法的通用组件，调度与并行一致性成为主要工程问题。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：内置探索项配置（DQN 与 SAC）</strong></p>
+    <pre class="code"><code>from ray.rllib.algorithms.dqn import DQNConfig
+from ray.rllib.algorithms.sac import SACConfig
+
+# DQN：离散动作，ε-贪心 + 随机策略采样作为兜底
+dqn_cfg = (
+    DQNConfig()
+    .environment("CartPole-v1")
+    .exploration(
+        exploration_config={
+            "type": "EpsilonGreedy",
+            "initial_epsilon": 1.0,     # 起始全随机，先把状态空间铺开
+            "final_epsilon": 0.05,      # 终止仍保留少量随机，防止价值估计僵化
+            "epsilon_timesteps": 200000,  # 按全局环境步退火
+        }
+    )
+)
+
+# SAC：连续动作，目标侧用熵正则，行为侧叠加高斯噪声
+sac_cfg = (
+    SACConfig()
+    .environment("Pendulum-v1")
+    .training(
+        tau=0.005,
+        lr=3e-4,
+        target_entropy="auto",   # 熵目标自动跟随动作维度，避免手工按尺度调参
+    )
+    .exploration(
+        exploration_config={
+            "type": "GaussianNoise",
+            "stddev": 0.2,        # 约为动作范围的 20%，覆盖需要兼顾精度
+        }
+    )
+)</code></pre>
+    <p>解读：两点设计意图需要说清。<strong>（1）</strong>ε 的终止值不取零：保留 5% 的随机动作让价值估计对边缘状态仍有更新信号，工程上比零探索稳健。<strong>（2）</strong><code>epsilon_timesteps</code> 按全局环境步计时，由 RLlib 统一维护计数，各 worker 读取同一进度，这正是并行一致性要求下的正确处理方式。<code>target_entropy="auto"</code> 让 SAC 的熵目标跟随动作维度自动设定，避免按动作量纲手工换算。</p>
+
+    <p><strong>片段 2：自定义探索类（温度化随机采样 + 全局退火）</strong></p>
+    <pre class="code"><code>from ray.rllib.algorithms.algorithm_config import AlgorithmConfig
+from ray.rllib.core.rl_module.rl_module import RLModule
+from ray.rllib.utils.exploration.exploration import Exploration
+from ray.rllib.utils.torch_utils import convert_to_torch_tensor
+import numpy as np
+
+class TemperatureSampling(Exploration):
+    """对动作分布做温度缩放后采样：温度从 T0 线性退到 T1。
+    比 ε-贪心更平滑：对完整分布做缩放，不再把动作替换成均匀随机。"""
+    def __init__(self, action_space, *, framework, T0=1.0, T1=0.1,
+                 anneal_steps=200000, **kwargs):
+        super().__init__(action_space, framework=framework, **kwargs)
+        self.T0, self.T1, self.anneal_steps = T0, T1, anneal_steps
+
+    def get_exploration_action(self, *, action_dist_inputs, timestep, explore=True):
+        if not explore:
+            return None, None                      # 评估路径交回贪心动作
+        frac = min(1.0, float(timestep) / self.anneal_steps)
+        temperature = self.T0 + frac * (self.T1 - self.T0)
+        logits = convert_to_torch_tensor(np.asarray(action_dist_inputs)) / temperature
+        dist_inputs = logits.numpy()               # 温度升高让分布更接近均匀
+        return self.action_dist_class.from_logits(dist_inputs), []
+
+    def get_state(self):
+        # 温度只依赖全局 timestep，无内部状态需要随检查点保存
+        return {}
+
+    def set_state(self, state):
+        return None
+
+# 注册后可像内置类型一样在配置里引用
+AlgorithmConfig.register_exploration("TemperatureSampling", TemperatureSampling)</code></pre>
+    <p>解读：逐块说明。<strong>（1）</strong>温度化采样与 ε-贪心的机理差别：ε-贪心以 ε 概率替换为均匀随机、以 1−ε 概率保持贪心，分布是双峰的；温度缩放把整个 logits 除以 T，分布平滑过渡，训练信号更连续。<strong>（2）</strong><code>timestep</code> 由算法层注入，是全局步计数，保证多 worker 同温，这是把退火放对位置的关键。<strong>（3）</strong>探索类无自有可学习状态，<code>get_state</code> 返回空字典即可；若实现状态相关的探索（如计数式），必须完整实现这两个方法以保证检查点可恢复。接口随版本演进，以对应版本的官方文档为准。</p>
+
+    <p><strong>片段 3：熵系数与探索强度的联合监控</strong></p>
+    <pre class="code"><code>result = algo.train()
+info = result["info"]["learner"]["default_policy"]["learner_stats"]
+
+# 熵持续升高：熵系数压过了任务梯度，策略无法收窄，回报将停滞
+# 熵快速塌缩：探索耗尽，KL 后续几乎为零，训练进入平台期
+entropy = info.get("entropy", float("nan"))
+kl = info.get("mean_kl_loss", float("nan"))
+print(f"entropy={entropy:.3f} kl={kl:.4f}")
+
+# 连续动作任务额外监控动作标准差：它直接反映行为侧噪声的实际强度
+if hasattr(algo.get_policy(), "action_dist_class"):
+    import numpy as np
+    acts = np.stack([algo.compute_single_action([0.0, 0.0], explore=True)[0]
+                     for _ in range(64)])
+    print("action_std=", acts.std(axis=0).round(3))
+# 指标键随版本演进（新版在 info.learner 下按 RLModule 组织）</code></pre>
+    <p>解读：这段代码把"探索是否健康"变成可读数字。<strong>（1）</strong>熵曲线的形状比绝对值更重要：健康训练呈缓慢下降的阶梯，突降或长升都指向熵系数失配。<strong>（2）</strong>动作标准差实测用采样估计，它能同时暴露噪声配置错误与动作边界裁剪问题（被裁剪的噪声会让实测标准差明显低于配置值）。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>按本地步数退火</strong>：探索参数在自定义代码里用 worker 内计数器递减，各 worker 处于不同衰减阶段，批次分布被割裂。修复：统一读取算法下发的全局环境步数。</li>
+      <li><strong>噪声先注入后裁剪的比例错误</strong>：经 tanh 压缩的动作先加噪再压缩，实际扰动远小于配置值。修复：明确噪声注入点（压缩前还是压缩后），并用实测标准差验证。</li>
+      <li><strong>评估路径未关闭探索</strong>：评估时仍按探索配置采样，评估曲线方差大、可复现性差。修复：统一走 <code>explore=False</code> 的确定路径，自定义探索类必须显式处理该分支。</li>
+      <li><strong>熵系数按回报量级误设</strong>：回报动辄数百的任务里沿用默认熵系数，熵项相对任务损失过大，策略无法收敛。修复：把熵项量级与回报量级对齐后重新取值。</li>
+      <li><strong>把 OU 噪声用于无记忆任务</strong>：时序相关的噪声让探索轨迹长时间偏向同一方向，覆盖效率反而低于独立高斯噪声。修复：仅在系统具有惯性的任务中使用 OU 噪声。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把片段 1 中 SAC 的高斯噪声标准差从 0.2 改为 0.5 与 0.05，预测采样阶段的回报方差、有效探索覆盖与最终收敛水平的差异。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>0.5 近似全范围抖动，早期覆盖快但价值目标噪声大；0.05 接近无探索，训练易停在高熵平台。用固定种子各跑三次比较学习曲线包络。</div></details>
+      </li>
+      <li>推导：二值动作下策略熵 H(p) = −p·log p − (1−p)·log(1−p)，证明其最大值在 p = 0.5 处取得，并说明熵项梯度在 p→0 时的行为。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>对 p 求导令其为零得 p=0.5；p→0 时 −log p 的导数趋于无穷，这正是熵项阻止动作概率被压至零的机制。</div></details>
+      </li>
+      <li>实现一个"按回合回报自适应"的探索类：连续若干回合回报无提升时把温度回升，提升后继续退火。说明状态需要保存哪些量、如何与检查点兼容。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>需要滚动窗口回报统计与当前温度；全部放进 <code>get_state</code> 返回的字典并在 <code>set_state</code> 恢复，注意各 worker 的统计口径差异与同步代价。</div></details>
+      </li>
+      <li>比较 ε-贪心与温度采样在"动作数 = 20、最优动作概率 0.9"场景下的采样分布，说明两者对策略梯度方差的不同影响。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>ε-贪心产生双峰分布，随机动作全部来自均匀层；温度采样是单峰平滑分布。双峰让离策略校正的方差更大，平滑分布给出更稳定的梯度。</div></details>
+      </li>
+      <li>设计并行一致性测试：在 8 个采样 worker 上同时打印实际温度/ε 值，验证退火是否同步；给出预期输出与常见偏差的原因。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>预期各 worker 打印值在同一全局步下一致；若出现阶梯状偏差，通常源于本地计数或 worker 启动时间差未用全局步归并。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>探索同时承担数据覆盖与优化逃逸两项职责，探索强度应随训练进度衰减，静态强度在两类任务里都会失配。</li>
+      <li>行为侧噪声（ε-贪心、高斯、OU）与目标侧熵正则是两类独立机制；同策略算法偏重熵项，异策略算法偏重行为噪声调度。</li>
+      <li>熵系数的症状学：过大则回报停滞，过小则熵塌缩导致训练平台期。</li>
+      <li>退火必须绑定全局环境步数，多 worker 下本地步计数会把数据分布割裂。</li>
+      <li>自定义探索类需实现动作计算、状态存取与评估分支三件事，评估路径必须关闭探索。</li>
+      <li>下一章处理探索无法解决的问题：奖励尺度差异，即奖励归一化（Reward Normalization）的统计口径与实现。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch042.html">← 第 042 章：RLlib实现AlphaZero风格算法</a>
+    <a class="next" href="ch044.html">第 044 章：RLlib自定义奖励归一化 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第003章 Ray对象存储与共享内存 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · Ray 基础与分布式编程</span>
+    <span class="sep">/</span>
+    <span>第 003 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · Ray 基础与分布式编程</div>
+    <h1>第 003 章：Ray对象存储与共享内存</h1>
+    <p class="lead">结果对象为什么能跨进程"零拷贝"流转、大数组为什么只存一份，以及对象引用与内存回收如何共同决定训练任务的显存与内存水位。</p>
+    <ul class="meta">
+      <li>主题：Ray 核心 / 对象存储与数据流转</li>
+      <li>关键机制：不可变对象、共享内存零拷贝、序列化规则、分布式引用计数</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 002 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解对象存储（Object Store）的分区结构与共享内存（Shared Memory）机制，说清"零拷贝"的真实含义与边界。</li>
+      <li>掌握对象的序列化规则：小对象内联、大对象落存储、数组类对象按缓冲区直接映射。</li>
+      <li>理解对象引用（ObjectRef）与分布式引用计数如何共同决定对象生命周期，能预测内存水位。</li>
+      <li>会用 ray.put 显式物化大对象并广播给多个消费者，避免重复序列化。</li>
+      <li>能诊断对象存储溢写、引用泄漏、返回值只读三类问题。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>分布式系统的性能分水岭在数据移动。一个"简单"的实现会把同一份观测矩阵在每个进程里复制一遍，64 个工作进程意味着 64 倍内存放大与成倍的内存带宽争用，吞吐还没提升，内存先被耗尽。<strong>Ray 的答案是把结果对象放进节点级的对象存储，所有进程通过共享内存访问同一份数据，引用传递代替数据复制</strong>。</p>
+    <p>这条设计贯穿整个训练链路：RLlib 把采样批次交给训练器时传的是对象引用；Tune 试验之间共享的数据集通过 ray.put 物化一次；回放缓冲里的大批观测以共享内存页的形式被反复读取。理解对象存储的行为，等于握住了分布式训练内存模型的总开关。</p>
+    <p>本章从对象存储的物理结构讲起，依次回答三个问题：对象存在哪里、怎么传输、什么时候被回收。第 004 章的依赖调度与第 009 章的容错重建，都建立在对象生命周期语义之上。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 对象存储的物理结构</h3>
+    <p>每个节点启动时划出一块固定预算的内存段，即对象存储。它对该节点上所有工作进程可见，以共享内存方式映射进各进程地址空间。可以把它理解为一块<strong>由调度器统一记账的进程间内存池</strong>：</p>
+    <table>
+      <tr><th>层次</th><th>内容</th><th>访问方式</th></tr>
+      <tr><td>元数据层</td><td>对象编号、大小、引用计数、所在节点</td><td>GCS 与 Raylet 维护</td></tr>
+      <tr><td>数据区</td><td>序列化后的大对象字节与数组缓冲区</td><td>共享内存映射，各进程直接读</td></tr>
+      <tr><td>溢写区</td><td>超出预算被换出的对象落盘文件</td><td>再次访问时换回内存</td></tr>
+    </table>
+    <p><strong>对象一旦写入即不可变</strong>。不可变性是零拷贝可行的前提：既然没有任何进程能原地修改，多个读者共享同一份字节就不存在一致性问题。若需要"更新"数据，做法是产生一个新对象、替换引用，这与函数式编程中数据结构不变、引用更新的模式一致。</p>
+
+    <h3>2. 传输路径：引用流动，数据不动</h3>
+    <p>当驱动进程把一个大数据对象作为参数传给远程函数时，实际发生的是：</p>
+    <ol>
+      <li><strong>物化</strong>：序列化发生在提交端。若对象之前已通过 ray.put 的返回值持有，则跳过序列化，直接复用存储中的字节。</li>
+      <li><strong>选址</strong>：调度器看到任务依赖某个对象，优先把任务派发到存储该对象的节点，让计算寻找数据。</li>
+      <li><strong>映射</strong>：工作进程通过共享内存映射访问对象数据，进程虚拟地址不同，物理页相同，此类访问不产生拷贝。</li>
+      <li><strong>跨节点例外</strong>：对象与任务不在同一节点时，对象需经网络传输到目标节点；此后在该节点内部继续走共享内存。跨节点传输是真正的数据移动，规模规划时要尽量让计算就近。</li>
+    </ol>
+    <div class="formula">
+      进程内与同节点访问：零拷贝映射；跨节点访问：一次网络传输 + 一次落地
+      <span class="note">规划原则：大对象与消费它的任务尽量同节点；多副本消费走广播引用，逐份发送会让流量随副本数线性放大</span>
+    </div>
+    <p>需要注意"零拷贝"的作用范围：它消除的是<strong>同一节点内进程间的重复拷贝</strong>，并不消除序列化本身，也不消除跨节点的网络传输。因此减少大对象传输的根本手段是减少数据移动次数，即引用复用。</p>
+
+    <h3>3. 序列化规则：什么走内存池，什么内联</h3>
+    <p>提交任何参数或返回值时，运行时都要决定其表示形式：</p>
+    <ul>
+      <li><strong>小对象内联</strong>：低于阈值（约 100 KB 量级，随版本略有差异）的对象直接编码进调度消息，省去一次存储写入，代价是消息体变大。频繁传递的小张量属于此类，这也是"小对象走存储反而更慢"的原因。</li>
+      <li><strong>通用 Python 对象</strong>：通过序列化库编码为字节流写入对象存储。自定义类需要可序列化；锁、文件句柄、数据库连接等含运行时资源的对象不可序列化，需在 Actor 内部持有。</li>
+      <li><strong>数组类对象</strong>：NumPy 数组与张量按缓冲区布局直接落存储，取回时以只读视图映射进目标进程，省去逐元素编码。</li>
+    </ul>
+    <p>这条规则解释了训练代码中的两条实践经验：小批量标量统计可直接传值；观测矩阵、模型权重这类大数组必须走引用。把 4 MB 的权重矩阵当普通参数在 16 个任务间各传一次，等于每轮产生 64 MB 的冗余序列化与传输。</p>
+
+    <h3>4. 生命周期：引用计数与回收</h3>
+    <p>对象的生死由分布式引用计数管理。创建者（Owner，通常是驱动进程或某个 Actor）为对象建立账目；任何持有对象引用副本的进程都会让计数加一，引用被回收或进程退出则减一，归零后对象可被释放。<strong>驱动进程持有全部结果引用，是最常见的内存膨胀来源</strong>，训练脚本若把每轮结果无限追加进列表，对象存储会持续增长直至触发溢写。</p>
+    <p>溢写（Spilling）是预算超限时的兜底：对象被换出到磁盘，后续访问再换回，代价是显著的单轮延迟尖峰。溢写说明预算与工作集不匹配，正确做法是控制同时在途的对象数量，例如及时删除不再使用的引用、按需分块处理数据。</p>
+
+    <h3>5. 数值算例：批次体积、广播流量与溢写代价</h3>
+    <p>先核算观测批的体积。设每步观测为 84×84 单通道 float32 图像，单步字节数为 84 × 84 × 4 = 28224 字节，约 27.6 KiB。批大小为 B 步时，单批体积为 B × 27.6 KiB：4k 步约 116 MB，16k 步约 462 MB，64k 步约 1.85 GB。以 2 GiB 对象存储预算、同时在途 4 个批次计算驻留量：</p>
+    <table>
+      <tr><th>批步数 B</th><th>单批体积</th><th>4 批在途驻留</th><th>2 GiB 预算可容纳在途批数</th></tr>
+      <tr><td>4k</td><td>116 MB</td><td>0.46 GB</td><td>约 18</td></tr>
+      <tr><td>16k</td><td>462 MB</td><td>1.85 GB</td><td>约 4</td></tr>
+      <tr><td>64k</td><td>1.85 GB</td><td>7.40 GB</td><td>约 1</td></tr>
+    </table>
+    <p>代入过程以 16k 一档为例：16384 × 28224 = 462422016 字节，即 462 MB；乘以 4 个在途批次得 1.85 GB，已占满 2 GiB 预算的八成以上。64k 一档的驻留量 7.4 GB 远超预算，第 5 个批次进入前必然触发溢写。溢写的代价可以直接估算：1.85 GB 对象在读写 500 MB/s 的磁盘上换回一次耗时约 3.7 秒，而同节点共享内存映射的访问延迟在微秒量级，两者相差几个数量级，这就是训练后期出现规律性耗时尖峰的来源。规划结论：<strong>批大小、在途批数与存储预算三者是一组联动参数，任何两档组合都要先做体积核算再定</strong>，练习 2 的完整算术与此处一致。</p>
+    <p>再核算权重广播的网络流量。设策略权重对象为 256 MiB，16 个采样任务分布在 4 个节点上（每节点 4 个任务）。按值传递时，驱动进程为每次远程调用各序列化一份，其中 12 个远程任务的数据需跨节点传输，合计 12 × 256 MiB = 3.0 GiB，按 10 GbE 链路的有效带宽 1.25 GB/s 折算约 2.6 秒。改用先 <code>ray.put</code> 再传引用的方案：对象写一次，4 个节点中除源节点外有 3 个需要跨网拉取，网络流量降为 3 × 256 MiB = 768 MiB，约 0.64 秒，同时驱动侧的序列化次数从 16 次降为 1 次。<strong>流量降至四分之一，耗时降至约四分之一，节省幅度随消费任务数与节点数增长</strong>，这就是"物化一次、全员引用"在数值上的收益。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>围绕对象存储设计数据流的步骤：</p>
+    <ol>
+      <li><strong>给数据分类</strong>：按"尺寸 × 传递次数"给每类数据打分。大且多次传递的数据最有优化价值，优先物化一次、全员引用。</li>
+      <li><strong>选择物化时机</strong>：需要被多个任务共享的只读数据，在广播前用 ray.put 显式物化；一次性消耗的返回值无需物化。</li>
+      <li><strong>控制引用存活范围</strong>：驱动进程只保留当前窗口需要的引用；历史轮次的结果显式释放，避免引用堆积。</li>
+      <li><strong>估算内存水位</strong>：同时在途数据量 = 单对象尺寸 × 在途对象数；对象存储预算取物理内存 30% 以内，工作集超出预算即调整分块或压缩。</li>
+      <li><strong>监控</strong>：用内存视图观察对象存储占用与溢写量，把"内存是否健康"变成可观测指标。</li>
+    </ol>
+    <table>
+      <tr><th>参数</th><th>典型取值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>object_store_memory</td><td>2–8 GiB</td><td>节点对象存储预算</td><td>物理内存 30% 以内，留足解释器与模型内存</td></tr>
+      <tr><td>物化阈值</td><td>约 100 KB</td><td>内联与落存储的分界</td><td>运行时自动判定，调参时以此解释行为差异</td></tr>
+      <tr><td>在途对象数</td><td>并发任务数的 1–2 倍</td><td>引用窗口</td><td>采样批次 4k–64k 步对应对象数按批组织</td></tr>
+    </table>
+
+    <h3>三条传输路径的对照与选择</h3>
+    <table>
+      <tr><th>路径</th><th>触发条件</th><th>写入成本</th><th>读取成本</th><th>适用场景</th></tr>
+      <tr><td>内联消息路径</td><td>对象小于约 100 KB</td><td>编码进调度消息，无存储写入</td><td>随消息反序列化</td><td>标量、小配置、小统计量</td></tr>
+      <tr><td>对象存储路径（同节点）</td><td>大对象或显式 ray.put</td><td>一次写入共享内存</td><td>共享内存映射，近似零拷贝</td><td>观测批、权重、数据集分片</td></tr>
+      <tr><td>跨节点路径</td><td>消费者与数据不同节点</td><td>源节点写入一次</td><td>网络传输加落地，之后同节点零拷贝</td><td>计算无法移动到数据旁时的兜底</td></tr>
+    </table>
+    <p>选择顺序可以固定为三步：先问"是否会小于内联阈值"，是则直接传值；再问"是否会被多个任务消费"，是则显式物化；最后检查"生产与消费是否同节点"，不能同节点时再评估跨节点流量是否在预算内。三步之外还有一条否决规则：含文件句柄、锁、连接池这类运行时资源的对象不进任何路径，保留在创建它的进程内部。</p>
+    <div class="box tip">
+      <span class="box-title">与上一章的差异点</span>
+      <p>第 002 章关注"调用怎么执行"，本章关注"数据放在哪"。Actor 方法返回大对象与远程函数返回大对象走同一条传输路径；差别仅在于 Actor 内部还可以把状态对象留在存储中跨调用复用，形成长期缓存。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>以下片段采用 Ray 2.x 时期的通用写法；接口随版本演进，以对应版本官方文档为准。</p>
+    <p><strong>片段 1：零拷贝的直观验证</strong></p>
+    <pre class="code"><code>import ray
+import numpy as np
+
+ray.init(num_cpus=4, object_store_memory=2 * 1024**3)
+
+big = np.zeros((2000, 2000), dtype=np.float32)   # 约 16 MB 的观测矩阵
+weight_ref = ray.put(big)                        # 物化一次：16 MB 只写存储一份
+
+@ray.remote(num_cpus=1)
+def read_weight(ref):
+    mat = ray.get(ref)            # 共享内存映射取回，不产生第二份拷贝
+    return float(mat[0, 0]), mat.nbytes
+
+# 16 个任务同时消费同一个对象；若按值传递，将产生 16 份序列化副本
+results = ray.get([read_weight.remote(weight_ref) for _ in range(16)])
+print(results[0])                # (0.0, 16000000.0)
+print("存储中副本数: 1，进程引用数: 16")</code></pre>
+    <p>解读：<code>ray.put</code> 的返回值即对象引用，16 个任务拿到的是同一份存储对象。<strong>若把 <code>big</code> 直接作为参数传入</strong>，运行时同样会先物化再让所有任务共享，差别在于显式 put 可以复用整个训练进程的生命周期，每轮都省下一次判断与编码开销。把 <code>mat.nbytes</code> 一并返回，便于在日志中核对对象尺寸，这是排查"内存比预期大"问题的第一手数据。</p>
+
+    <p><strong>片段 2：小对象与大对象的传输差异</strong></p>
+    <pre class="code"><code>import ray
+import numpy as np
+import time
+
+ray.init(num_cpus=8)
+
+@ray.remote(num_cpus=1)
+def consume(x):
+    return x.shape if hasattr(x, "shape") else x
+
+# 小数组：低于内联阈值，直接编码进调度消息，走"消息路径"
+t0 = time.perf_counter()
+small = np.ones(100, dtype=np.float32)
+ray.get([consume.remote(small) for _ in range(200)])
+print("小对象 200 次: %.4f s" % (time.perf_counter() - t0))
+
+# 大数组：先物化一次，200 个任务共享同一个引用，走"存储路径"
+t0 = time.perf_counter()
+large_ref = ray.put(np.ones((512, 512, 4), dtype=np.float32))
+ray.get([consume.remote(large_ref) for _ in range(200)])
+print("大对象 200 次: %.4f s" % (time.perf_counter() - t0))</code></pre>
+    <p>解读：这段对比实验用来建立选择直觉，具体数字仅作参照。小对象反复传递时，内联路径省去了存储写入与引用记账，单次开销更低；大对象若不走引用，每次提交都会触发序列化与存储写入，成本随尺寸线性增长。<strong>判定标准可以记成一条：会被多于一个任务消费的大数据一律先 put 再传引用，一次性使用的小数据直接传值</strong>。在 RLlib 内部，观测批与权重广播都遵循这条规则。</p>
+
+    <p><strong>片段 3：引用窗口与内存水位控制</strong></p>
+    <pre class="code"><code>import ray
+import numpy as np
+
+ray.init(num_cpus=4, object_store_memory=1024**3)
+
+@ray.remote(num_cpus=1)
+def make_shard(shard_id, rows=256, cols=256):
+    rng = np.random.default_rng(shard_id)
+    return rng.standard_normal((rows, cols), dtype=np.float32)   # 每片约 256 KB
+
+window = []          # 只保留最近的引用窗口，模拟"训练先消费、后释放"的节奏
+for step in range(64):
+    window.append(make_shard.remote(step))
+    if len(window) > 8:              # 窗口超过 8 片即释放最旧引用
+        done, window = ray.wait(window, num_returns=1)
+        shard = ray.get(done[0])     # 消费完成
+        del shard                    # 驱逐本地视图，允许对象存储回收
+print("同时存在的对象引用数:", len(window))   # 恒定为 8，与总轮数无关</code></pre>
+    <p>解读：训练循环的内存膨胀几乎总来自"只提交、不释放"。这段代码用 <code>ray.wait</code> 实现滑动窗口：任意时刻在途对象固定为 8 片，对象存储在稳态下的占用可预测。<code>ray.wait</code> 与"一次性 ray.get 全部"的区别在调度语义上同样重要：它允许程序按完成顺序消费结果（样本到达顺序即训练节奏），无须等待最慢的分片。<strong>这种"窗口化引用管理"是把内存水位变成常数的通用手法</strong>，第 004 章的依赖调度会把它扩展到多级流水线。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>驱动进程无限累积结果引用</strong>：每轮把结果引用追加进列表且从不释放，对象存储持续增长直到溢写。症状是训练后期单轮耗时出现规律性尖峰。修复：只保留窗口内引用，历史对象显式释放。</li>
+      <li><strong>把返回的数组当可写缓冲使用</strong>：从对象存储取回的数组以只读视图映射，原地写入会抛出不支持写操作的异常。修复：需要修改时先复制（如 <code>np.array(arr, copy=True)</code>），或让产生端输出新对象。</li>
+      <li><strong>大对象按值在多任务间传递</strong>：同一权重矩阵在 16 个任务参数里各出现一次，序列化与存储开销乘以任务数。修复：先 ray.put 再传引用；这一条对模型权重广播尤其重要。</li>
+      <li><strong>对象存储预算超过物理内存承受范围</strong>：预算、解释器堆、模型参数三者叠加超过物理内存，触发系统级交换，表现为全集群吞吐同时塌陷。修复：按物理内存 30% 以内设置预算，并监控实际水位。</li>
+      <li><strong>序列化不可序列化的运行时资源</strong>：把连接池、文件句柄、锁作为参数传递，提交阶段直接报序列化错误。修复：这类资源在 Actor 构造时创建、方法内使用，永远不出进程边界。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把片段 2 中的大数组改为按值传递（不调用 ray.put），预测两组耗时的差距方向，运行验证并解释。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>按值传递时每次提交都要序列化并写入存储，200 次的开销随之上升；差距随数组尺寸放大。内联阈值以下的小对象行为相反。</div></details>
+      </li>
+      <li>计算题：观测批尺寸 64k 步，每步观测为 84×84 单通道浮点数组。估算单个批次对象的体积；若同时在途 8 个批次并保留一份参考副本，对象存储需要多大预算？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>84×84×4 字节约 28 KB，乘以 64k 步约 1.8 GB；8 个在途批次再加参考副本远超 8 GiB 预算，必须降批次或改按分片组织。这个算术正是把采样批次定为 4k–64k 步的依据之一。</div></details>
+      </li>
+      <li>设计题：为"策略权重广播"设计数据流：训练完成后权重需要交给 16 个采样 Actor 使用。画出引用流向，说明哪一步会拷贝、哪一步不会，以及跨节点时会发生什么。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>训练端 put 一次生成引用；16 个 Actor 收到的都是同一引用的副本。同节点零拷贝映射，跨节点一次网络传输后落地，再由该节点进程共享。</div></details>
+      </li>
+      <li>分析：某实验把每轮 32 MB 的回放数据以"每轮新建对象、引用全部保留"的方式积累 500 轮。给出对象存储占用曲线形态，并提出两种使水位保持常数的方法。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>占用随轮数线性增长直至溢写。方法：固定容量的环形窗口，或把数据合并进少量大对象并周期替换引用，让旧对象自然归零释放。</div></details>
+      </li>
+      <li>推导：设对象尺寸为 S，消费任务数为 N，同节点共享访问开销可忽略，跨节点比例为 r，网络带宽为 B。写出总传输时间的一阶表达式，并讨论何时"把任务搬到数据旁"优于"把数据搬到任务旁"。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>传输量约为 S×N×r，时间约为 S×N×r/B；当 S×N 较大而任务本身计算量较小时，调度器就近派发的收益显著，这也是调度器偏向数据本地性的动机。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>对象存储是节点级共享内存池，对象不可变是零拷贝成立的前提；同节点访问零拷贝，跨节点仍需一次网络传输。</li>
+      <li>序列化规则：小对象内联走消息路径，大对象落存储，数组按缓冲区直接映射；大对象多次消费必须先物化再传引用。</li>
+      <li>对象生命周期由分布式引用计数管理，<strong>驱动进程持有引用即阻止回收</strong>；窗口化引用管理让内存水位保持常数。</li>
+      <li>溢写是预算与工作集不匹配的兜底信号；调优方向是控制同时在途对象数量，调大预算只能推迟溢写。</li>
+      <li>下一章进入依赖机制：<strong>任务依赖与 DAG 调度</strong>，看对象引用如何把任务连成有向无环图并驱动自动调度。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch002.html">← 第 002 章：Ray远程函数与Actor基础</a>
+    <a class="next" href="ch004.html">第 004 章：Ray任务依赖与DAG调度 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

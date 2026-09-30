@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第074章 多机器人故障检测与恢复 | 多机器人协同学习课程 · ROS2 通信与系统集成</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第四篇 · 系统集成与工程化</span>
+    <span class="sep">/</span>
+    <span>第 074 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第四篇 · 系统集成与工程化</div>
+    <h1>第 074 章：多机器人故障检测与恢复</h1>
+    <p class="lead">机器人会死、会卡、会失联，而且"死"和"断网"长得一模一样。用两级检测（疑似→确诊）与心跳序列号把误判压下去，用纪元（epoch）与幂等重派把任务接管做安全，用重入协议把修好的机器人接回来。</p>
+    <ul class="meta">
+      <li>主题：系统集成 / 容错与恢复</li>
+      <li>关键机制：心跳与序列号、疑似/确诊两级判定、仲裁与法定人数、纪元防脑裂、任务接管与重入</li>
+      <li>预计学时：65 分钟</li>
+      <li>前置章节：第 073 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>建立故障分类心智模型：进程崩溃、应用挂起、链路失效、传感器退化、任务失败，各自的可观测特征与检测手段。</li>
+      <li>掌握两级检测（SUSPECT → FAILED）与心跳序列号机制，会由心跳频率推导检测时延并评估误判概率。</li>
+      <li>理解"网络分区与节点死亡不可区分"这一分布式难题，会用法定人数、纪元号与物理降级（停车）做兜底。</li>
+      <li>会设计任务接管流程：账本对账、幂等重派、双执行防护；会写机器人重入（rejoin）协议。</li>
+      <li>能用生命周期节点与进程监督实现"自愈"，并知道哪些故障恢复必须人工介入。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>多机器人系统里"某台机器人出问题"属于常态：电池耗尽、WiFi 盲区失联、程序被内存压死、导航卡在死角、计算机过热降频……系统质量的分水岭不在"会不会坏"，而在<strong>坏了以后多久被发现、多久被恢复、恢复过程本身会不会造成二次伤害</strong>。</p>
+    <p>本章把"故障处理"拆成三段流水：<strong>检测</strong>（现在是谁不健康？是死了还是断网？）→ <strong>仲裁</strong>（由谁、按什么规则宣布故障与接管）→ <strong>恢复</strong>（任务怎么转移、故障机怎么修、修好怎么回来）。三段各自都有经典陷阱：检测太快误判、仲裁脑裂双主、恢复重派导致任务重复执行。理解这三段，是第 075 章动态重构与第 085 章"带故障恢复的任务系统"阶段项目的直接基础。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 故障分类与可观测特征</h3>
+    <table>
+      <tr><th>故障类型</th><th>典型原因</th><th>可观测特征</th><th>检测手段</th></tr>
+      <tr><td>进程崩溃</td><td>段错误、OOM 被杀</td><td>话题停更、LIVELINESS 丢失</td><td>DDS 活性 + 心跳超时</td></tr>
+      <tr><td>应用挂起</td><td>死锁、回调饿死</td><td>进程在、心跳断、CPU 可能 0 或 100%</td><td>应用层心跳（DDS 活性检测不到）</td></tr>
+      <tr><td>链路失效</td><td>WiFi 盲区、AP 过载</td><td>心跳断、但连接恢复后突然续上</td><td>两阶段超时 + 重连观察</td></tr>
+      <tr><td>传感器退化</td><td>镜头脏污、雷达受扰</td><td>数据在但质量差（重复、偏移）</td><td>数据质量监控（非本章重点）</td></tr>
+      <tr><td>任务失败</td><td>路径受阻、抓取失败</td><td>机器人健康、任务无进展</td><td>进度看门狗（阶段未迁移）</td></tr>
+    </table>
+    <p>两类最容易误诊的故障：<strong>应用挂起</strong>在 DDS 层面看起来完全正常（底层线程还活着、心跳线程可能也在），只有<em>应用层</em>心跳会断，所以心跳必须由业务主循环发出；独立线程代发会让挂起故障漏检；<strong>链路失效</strong>与<strong>进程崩溃</strong>对监控者不可区分，这正是下面两级检测与分区难题的根源。</p>
+
+    <h3>2. 检测：心跳、序列号与两级判定</h3>
+    <p>应用层心跳消息带三个字段：机器人 ID、单调递增序列号、发送时刻。监控端维护每台机器人的"最后心跳"记录，并执行两级判定：</p>
+    <ul>
+      <li><strong>SUSPECT（疑似）</strong>：超过 t<sub>1</sub> 没有新心跳（如 3 × 周期）→ 标记疑似，<strong>只观察、不动作</strong>，同时向该机器人发起主动探测（服务 ping）。</li>
+      <li><strong>FAILED（确诊）</strong>：超过 t<sub>2</sub>（如 10 × 周期）仍无声，且探测连续失败 → 宣布故障，进入恢复流程。</li>
+    </ul>
+    <div class="formula">
+      检测时延 ≈ t<sub>2</sub>（最坏），心跳开销 = 消息大小 × 频率 × 台数
+      <span class="note">1 Hz 心跳、50 字节、20 台 → 1 KB/s 总量，微不足道；t<sub>1</sub> = 3 s、t<sub>2</sub> = 10 s 是常用起点</span>
+    </div>
+    <p>为什么必须有"疑似"这一级？无线链路的丢包是突发型的：一次 2 秒的遮挡足以让三次心跳蒸发，但机器人完好无损。直接把单次超时当故障，系统会陷入<strong>误恢复循环</strong>，宣布故障、重派任务、机器人回来、撤销、再宣布……两级判定把"丢包的短暂沉默"和"真实的死亡"分开，代价是确诊慢了 5–7 秒，这个延迟对绝大多数任务可接受。</p>
+    <p>序列号是心跳里最容易被忽略的字段，它防的是<strong>重放的陈旧心跳</strong>与"节点重启后计数器回绕"两种假活：监控端只接受序列号严格递增的心跳；重启后的节点序列号从 0 重新开始，必须携带"启动实例标识（boot_id）"让监控端识别"这是一次新的生命"，避免把两次生命的心跳混在一起算。</p>
+
+    <h3>3. 仲裁：谁有权宣布故障</h3>
+    <p>检测是每台监控者各自的事实，宣布故障却是一个<strong>全局决策</strong>，因为接管的动作（任务重派、领导权转移）会改变系统状态。三个设计问题：</p>
+    <ul>
+      <li><strong>谁仲裁</strong>：集中式（一个监控节点/地面站）实现简单，是默认选择；无中心场景用法定人数（quorum）：超过半数成员标记某机器人为故障才生效，防止单点误判触发全队接管。</li>
+      <li><strong>网络分区怎么办</strong>：分区两侧都会"看不见对方"，各自都可能宣布对方死亡，这是分布式系统的经典不可判定问题。<strong>物理世界的兜底是保守动作</strong>：与指挥端失联超过 t<sub>2</sub> 的机器人执行"安全停车 + 原地等待"（fail-safe），继续自主执行任务会放大分区两侧的冲突。宁可停，不可猜。</li>
+      <li><strong>双主防护（fencing）</strong>：领导权（调度器、编队领航）转移时给新领导发一个递增的<strong>纪元号（epoch）</strong>；所有执行端只接受纪元号 ≥ 自己已见值的指令，旧领导一旦恢复通信，其低纪元指令自动被拒。<strong>没有纪元的领导切换一定会在恢复阶段出现"两个领导同时指挥"</strong>。</li>
+    </ul>
+
+    <h3>4. 恢复：接管、自愈与重入</h3>
+    <p>恢复动作按故障者的角色分三种：</p>
+    <ul>
+      <li><strong>任务接管</strong>：把故障机的未完成任务重派。安全前提是<strong>幂等</strong>：任务模板必须定义"重复执行是否安全"，"把货箱搬到 A"重复执行一次无妨（第二台发现货箱已在），"给电池充电 20 分钟"重复执行只是多充（可接受），而"增量计数器 +1"式任务必须先对账再续做（从断点看已完成部分）。重派流程：账本标记该机任务为 ORPHANED → 查证最后一次进度上报 → 按断点重派或整任务重派。</li>
+      <li><strong>进程自愈</strong>：把关键节点放进"生命周期 + 监督"结构：监督器（宿主机 systemd 或一个 supervisor 节点）发现进程退出就重启；生命周期节点支持"停止→重新配置→再启动"而不重装系统。重启是恢复的第一手段，但要设重启风暴保护（5 分钟内最多 3 次，仍失败则锁定并告警求人工）。</li>
+      <li><strong>重入（rejoin）</strong>：修好的机器人回来不能"直接插进战场"，必须走重入协议：向监控报到 → 拉取当前纪元与角色表（Transient-local 话题或服务）→ 状态同步（定位初始化、地图版本比对）→ 申请任务 → 通过校验后转为 ACTIVE。错过重入协议的机器人会带着陈旧的纪元号与任务状态乱发指令。</li>
+    </ul>
+    <table>
+      <tr><th>恢复动作</th><th>适用故障</th><th>关键防护</th></tr>
+      <tr><td>进程重启</td><td>崩溃、挂起</td><td>重启风暴上限；重启后走重入</td></tr>
+      <tr><td>任务重派</td><td>机器人长时间离场</td><td>幂等 + 断点对账 + 纪元校验</td></tr>
+      <tr><td>降级续跑</td><td>车队减员但仍需完成任务</td><td>用 075 章重构逻辑重排角色；验收线放宽要显式声明</td></tr>
+      <tr><td>安全停车</td><td>分区、纪元冲突、未知状态</td><td>fail-safe 优先于任务完成度</td></tr>
+    </table>
+
+    <h3>5. 数值算例：两级判定的误判率</h3>
+    <p>两个判据的分工可以概括成一句话：疑似门槛（3 倍周期）控制探测流量，确诊门槛（10 倍周期）控制误接管率，前者放宽到系统能承受的探测频率，后者收紧到年误触发在个位数以内。参数调整的方向由此明确：想更快恢复就压低确诊门槛，代价是突发遮挡下误接管概率上升；想更稳就抬高确诊门槛，代价是接管时延变长。两个方向都应在故障注入环境里各跑至少 5 次，用统计数据拍板，直觉定值经不起误判率的核算。</p>
+    <p>把两级阈值换算成概率，看看它买到了什么。1 Hz 心跳、t<sub>1</sub> = 3 s 意味着"连续丢 3 包"才进入 SUSPECT；设单包独立丢失率 p = 5%，则每次机会的误判概率为 0.05³ = 1.25×10⁻⁴。单台机器人每小时约 3600 次机会，期望触发约 0.45 次疑似；20 台机器人全队约 9 次/小时，而疑似只触发主动探测、不产生任何系统级动作，这个量级的探测流量可以忽略。确诊门槛 t<sub>2</sub> = 10 s 要求连续丢 10 包，独立模型下概率为 0.05¹⁰ ≈ 9.8×10⁻¹⁴，实际上不可能误触发；真实无线链路的丢包是突发相关的（遮挡、AP 过载），有效概率比独立模型高若干数量级，这正是确诊还要叠加"主动探测连续失败"这条证据的原因：探测走的是另一条路径，能把"链路整段坏掉"与"节点真死"区分开。最坏检测时延 = t<sub>2</sub> + 判定轮询周期 = 10 + 0.5 = 10.5 s，对照"故障到接管 ≤ 15 s"的验收线，留给重派与纪元广播的预算约 4.5 s，够用但不宽裕，重派逻辑的复杂度要控制在这条预算内。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>故障管理子系统的四个模块与接口：</p>
+    <ol>
+      <li><strong>心跳生产</strong>：每台机器人主循环 1 Hz 发 <code>/fleet/heartbeat</code>（ID、序列号、boot_id、当前任务、纪元）。Best-effort 即可（丢了下一拍补）。</li>
+      <li><strong>监控与判定</strong>：订阅全部心跳，维护状态机 HEALTHY → SUSPECT → FAILED；确诊后发布 <code>/fleet/fault_event</code>（Reliable + Transient-local，事件不能丢、晚来者也要看到）。</li>
+      <li><strong>恢复协调器</strong>：订阅故障事件，执行"接管/重启/告警"决策；所有恢复动作写 <code>/fleet/recovery_log</code> 供审计。</li>
+      <li><strong>重入管理器</strong>：为新上线或重启完成的机器人做验收（时间同步、地图版本、纪元、自检位姿）并放行。</li>
+    </ol>
+    <h3>关键参数表</h3>
+    <table>
+      <tr><th>参数</th><th>建议值</th><th>依据</th></tr>
+      <tr><td>心跳周期</td><td>1 Hz</td><td>开销可忽略；采样密度足够判定</td></tr>
+      <tr><td>疑似阈值 t<sub>1</sub></td><td>3 s</td><td>容忍连续 2 次丢包</td></tr>
+      <tr><td>确诊阈值 t<sub>2</sub></td><td>10 s</td><td>覆盖 WiFi 漫游与短暂遮挡；给探测留 2 轮时间</td></tr>
+      <tr><td>主动探测</td><td>疑似期 2 Hz</td><td>服务 ping 确认"进程活着但消息不通"</td></tr>
+      <tr><td>重启风暴上限</td><td>3 次 / 5 min</td><td>超过即锁定，防止重启—崩溃循环烧坏系统</td></tr>
+      <tr><td>分区停车阈值</td><td>10 s（与 t<sub>2</sub> 对齐）</td><td>与指挥端失联即安全停车，不赌"它只是忙"</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：为什么故障检测阈值不能"按最优值调"？</span>
+      <p>t<sub>2</sub> 越小，系统"反应越快"，但把正常网络抖动算成故障的概率也越高。误判的代价不对称：少等 5 秒发现真故障，收益是 5 秒接管提前量；但一次误判触发的错误接管会造成任务重复执行、双领导指令，甚至碰撞。<strong>阈值应该按"误判率可接受"来定，"检测越快越好"会让误接管率失控</strong>，用第 076 章的基准测试采集正常链路的间断分布，把 t<sub>2</sub> 设在分布的 99.9 分位之外。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：两级判定的监控状态机</strong></p>
+    <pre class="code"><code>class RobotHealthMonitor(Node):
+    """心跳监控：HEALTHY -&gt; SUSPECT -&gt; FAILED 两级判定，防无线抖动误判。"""
+    T1, T2 = 3.0, 10.0                      # 疑似 / 确诊阈值（秒）
+
+    def __init__(self):
+        super().__init__("health_monitor")
+        self.state = {}                     # rid -&gt; {"level", "last_seen", "seq", "boot"}
+        self.create_subscription(Heartbeat, "/fleet/heartbeat", self.on_hb, 10)
+        self.fault_pub = self.create_publisher(FaultEvent, "/fleet/fault_event", 10)
+        self.create_timer(0.5, self.evaluate)   # 2 Hz 评估：判定精度 0.5 s 足够
+
+    def on_hb(self, msg):
+        rec = self.state.setdefault(msg.robot_id,
+                                    {"level": "HEALTHY", "seq": -1, "boot": None})
+        if msg.boot_id != rec["boot"]:      # 节点重启：序列号重新计数，重置基线
+            rec["boot"] = msg.boot_id
+            rec["seq"] = -1
+        if msg.seq &lt;= rec["seq"]:           # 旧序列号（乱序/重放）：丢弃，保持单调
+            return
+        rec["seq"] = msg.seq
+        rec["last_seen"] = self.now_s()
+        if rec["level"] != "HEALTHY":       # 恢复心跳：回到健康（确诊由仲裁处理）
+            self.get_logger().info(f"{msg.robot_id} 心跳恢复")
+            rec["level"] = "HEALTHY"
+
+    def evaluate(self):
+        now = self.now_s()
+        for rid, rec in self.state.items():
+            gap = now - rec.get("last_seen", 0.0)
+            if rec["level"] == "HEALTHY" and gap &gt; self.T1:
+                rec["level"] = "SUSPECT"    # 只观察 + 主动探测，先不动手
+                self.probe(rid)
+            elif rec["level"] == "SUSPECT" and gap &gt; self.T2:
+                rec["level"] = "FAILED"     # 两级都越线：确诊
+                ev = FaultEvent()
+                ev.robot_id = rid
+                ev.kind = "HEARTBEAT_LOST"
+                ev.detected_at = now
+                self.fault_pub.publish(ev)</code></pre>
+    <p>解读：状态机的两个设计点决定检测质量。<strong>（1）序列号单调性检查</strong>：只接受更大的序列号，天然免疫消息乱序与重放；boot_id 变化时重置基线，解决"重启后序列号归零被当成旧消息丢弃"的问题。<strong>（2）分级动作</strong>：进入 SUSPECT 只触发主动探测（服务 ping），不产生任何系统级动作；只有越过 T2 才发布故障事件。这让"检测"与"处置"解耦，检测器做保守的事实判定，处置决策留给协调器。<code>evaluate</code> 用轮询（2 Hz），不给每台机器人各开定时器：机器人数量动态变化时，单一循环比 N 个定时器好维护，0.5 s 的判定 granularity 相对 3 s/10 s 的阈值完全够用。真实实现中探测结果要回写到 rec 里参与 T2 判定（片段中 probe 是占位调用），"连续两次探测失败"是确诊的补充证据。</p>
+
+    <p><strong>片段 2：任务接管，纪元校验 + 幂等重派</strong></p>
+    <pre class="code"><code>class RecoveryCoordinator(Node):
+    """故障恢复协调器：接管任务、防止双执行、广播新纪元。"""
+    def __init__(self):
+        super().__init__("recovery_coordinator")
+        self.epoch = 1                       # 车队纪元：每次领导/成员变更 +1
+        self.create_subscription(FaultEvent, "/fleet/fault_event",
+                                 self.on_fault, 10)
+        self.assign_pub = self.create_publisher(TaskAssignment,
+            "/fleet/assignment", qos_transient_reliable())
+
+    def on_fault(self, msg):
+        if msg.kind != "HEARTBEAT_LOST":
+            return
+        self.epoch += 1                      # 先升纪元：所有旧指令立即失效
+        self.get_logger().warn(f"{msg.robot_id} 确诊故障，纪元升为 {self.epoch}")
+        orphans = self.ledger.orphaned_tasks_of(msg.robot_id)
+        for task in orphans:
+            if task.idempotent:              # 幂等任务：整任务重派
+                self.reassign(task, exclude=msg.robot_id)
+            else:                            # 非幂等：先对账，按断点续做
+                last = self.ledger.last_progress(task.id)   # 机器人最后上报
+                self.reassign(task, resume_from=last, exclude=msg.robot_id)
+
+    def reassign(self, task, exclude, resume_from=None):
+        cands = [r for r in self.robots if r.id != exclude
+                 and r.capable(task) and r.healthy()]
+        if not cands:
+            self.escalate(task)              # 无人可接：升级人工/降级任务
+            return
+        r = self.pick_by_cost(cands, task)   # 用 066 章口径挑代价最小的
+        a = TaskAssignment()
+        a.task_id = task.id
+        a.robot_id = r.id
+        a.epoch = self.epoch                 # 携带新纪元：接收端校验
+        a.resume_from = resume_from or None
+        self.assign_pub.publish(a)</code></pre>
+    <p>解读：接管逻辑有两层安全设计。<strong>（1）纪元先行</strong>：确诊故障后的第一个动作是 epoch+1 并广播，陈旧机器人的一切后续指令自动失效，即使"死掉的"机器人其实只是断网并带着旧任务恢复通信，它的指令（旧纪元）也不会被任何人执行。这就是 fencing 思想的落地形态。<strong>（2）幂等分派</strong>：任务模板自带的 <code>idempotent</code> 标志决定重派方式，幂等任务整任务重派（最简单、代价最小）；非幂等任务必须携带 <code>resume_from</code> 断点（第 071 章账本里最后进度），接管者从断点续做，避免"货箱搬了两遍"。注意 <code>pick_by_cost</code> 复用 066 章的代价口径：故障接管本质是一次小规模再分配，没有理由另造一套逻辑。若没有候选机器人，<code>escalate</code> 走人工通道，静默丢弃是禁止项，<strong>恢复流程的终点必须是一个明确的终态</strong>（已接管 or 已升级），不能是"无人知晓"。</p>
+
+    <p><strong>片段 3：重入协议，把修好的机器人接回来</strong></p>
+    <pre class="code"><code>class RejoinManager(Node):
+    """重入验收：机器人重启/修复后，通过四步检查才允许转为 ACTIVE。"""
+    CHECKS = ("clock", "map", "epoch", "selfpose")   # 检查项定序执行
+
+    def on_rejoin_request(self, req, resp):
+        r = req.robot_id
+        # 1) 时间同步：证书与日志对账都依赖统一时钟
+        if abs(req.clock_offset) &gt; 0.05:
+            resp.accepted = False
+            resp.reason = "clock_unsynced"
+            return resp
+        # 2) 地图版本：旧地图上的位姿毫无意义（第 026/027 章的版本号）
+        if req.map_version != self.current_map_version:
+            resp.accepted = False
+            resp.reason = "map_outdated"
+            return resp
+        # 3) 纪元：携带旧纪元的机器人先自我降级为“只读观察者”再刷新
+        if req.epoch &lt; self.epoch:
+            resp.accepted = True
+            resp.mode = "OBSERVE_ONLY"       # 允许上来了，但先不许发言/接单
+            resp.epoch = self.epoch
+            return resp
+        # 4) 自检位姿：与融合定位交叉验证，偏差大则要求重新初始化
+        if self.pose_mismatch(r, req.self_pose) &gt; 0.5:
+            resp.accepted = True
+            resp.mode = "RELOCALIZE"
+            resp.epoch = self.epoch
+            return resp
+        resp.accepted = True
+        resp.mode = "ACTIVE"                 # 全部通过：允许参与任务
+        resp.epoch = self.epoch
+        return resp</code></pre>
+    <p>解读：重入协议把"恢复"从"重启成功"提升为"可信地回到系统"，很多团队只做到进程重启就宣布恢复，结果旧地图、旧纪元、错位时钟的机器人进去乱跑。四个检查项的排序有讲究：<strong>时钟 → 地图 → 纪元 → 位姿</strong>，从"最基础且最便宜"到"最贴近业务"。三种验收结果是刻意的分级：不合格直接拒（时钟/地图），合格但受限（观察者/重定位），完全合格（ACTIVE）。OBSERVE_ONLY 模式让恢复中的机器人可以看但不可指挥（例如跟随编队但不领航），这是 075 章"渐进式重构"的最小版本。所有拒绝都要带 <code>reason</code>，自动恢复系统的可调试性全靠理由码，否则运维只能看到"它是没回来"。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>单次超时即宣布故障</strong>：WiFi 漫游丢两包，系统开始"故障—恢复—再故障"的抽搐。修复：两级判定 + 主动探测；阈值按 076 章采样的间断分布来定。</li>
+      <li><strong>领导切换没有纪元号</strong>：恢复后的旧领导继续按自己的计划发指令，与新领导打架。修复：任何角色变更 epoch+1；执行端拒绝低纪元指令；已发布指令带纪元字段。</li>
+      <li><strong>任务重派不考虑幂等</strong>：非幂等任务被两台机器人（故障者只是断网，其实还在干活）各自执行一遍。修复：任务模板声明幂等性；非幂等任务先对账后按断点续做；物理层用资源租约（069 章）兜底。</li>
+      <li><strong>分区期间两侧都"自主续跑"</strong>：网络分区其实是"双方都活着"，各自宣布对方死亡并继续执行互相冲突的任务。修复：与指挥端失联超过阈值即安全停车；恢复后走重入协议对账。</li>
+      <li><strong>恢复流程没有测试</strong>：故障恢复代码上线后从未真实触发过。修复：用 077 章的故障注入（杀进程、断话题、模拟延迟）定期演练；把恢复时长纳入验收指标（例如"从故障到任务接管 ≤ 15 s"）。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>1 Hz 心跳、t<sub>1</sub> = 3 s、t<sub>2</sub> = 10 s。计算最坏检测时延；若实际丢包独立同分布、单包丢失率 5%，单次超时判故障与两级判定的误判概率分别是多少？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>最坏检测时延 ≈ 10 s（加判定轮询 0.5 s）。单次超时误判 ≈ 0.05³（连续 3 包丢）量级；两级还要叠加第二轮 7 秒无心跳（≈ 连续 7 包丢），概率再降数个量级。体验"阈值换误判率"的量化关系。</div></details>
+      </li>
+      <li>构造"分区"实验：两台机器人网络正常，第三台被 iptables 屏蔽（只断通信、进程照跑）。预测监控端、被屏蔽机器人、其他机器人各自看到什么，然后设计"双方都不做危险动作"的处置策略。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>监控端：该机 FAILED；被屏蔽机：自己也看不到指挥端（对称失联）。处置：被屏蔽机 10 s 后安全停车；监控端按故障接管其任务；恢复后重入验收发现任务是"疑似重复执行"→ 对账解决。</div></details>
+      </li>
+      <li>给任务模板标注幂等性：列出你项目里 5 种任务，逐一判断"重复执行是否安全"，对不安全的给出断点字段设计（做到哪一步、如何续做）。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>搬箱（按箱 ID 幂等—查在途状态）、充电（近似幂等—重复只多充）、巡检拍摄（幂等）、货架盘点（非幂等—需批次号去重）、闸机开关（非幂等且危险—需状态查询加锁）。</div></details>
+      </li>
+      <li>设计一个"恢复演练剧本"：包含崩溃、挂起、分区、恢复四种注入与各自的验收指标（检测时延、接管时延、任务重复率、二次故障率），并说明每种注入的观测数据从哪里取。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>数据源：fault_event 时间戳（检测）、task_event（接管与重复）、recovery_log（动作审计）。验收示例：检测 ≤ 12 s、接管 ≤ 15 s、重复执行 = 0、恢复后 10 分钟内无二次故障；每种注入至少重复 5 次取统计量。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>故障五分类各有观测面；应用挂起只能靠业务主循环心跳发现，"进程活着"不等于"业务健康"。</li>
+      <li>两级判定（SUSPECT → FAILED）+ 序列号/boot_id + 主动探测，把无线抖动与真实死亡分开；阈值按误判率定，不按"越快越好"定。</li>
+      <li>仲裁解决"谁说了算"：集中式默认、法定人数防单点误判、纪元号防双主、分区时安全停车，物理系统宁可停不可猜。</li>
+      <li>恢复=接管+自愈+重入：幂等与断点防重复执行，重启风暴保护防自毁，重入四检查（时钟/地图/纪元/位姿）分级放行。</li>
+      <li>下一章把恢复升级为"重塑系统本身"：成员增减时角色、拓扑与编队如何整体演进，<strong>多机器人动态重构</strong>。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch073.html">← 第 073 章：多机器人安全通信</a>
+    <a class="next" href="ch075.html">第 075 章：多机器人动态重构 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

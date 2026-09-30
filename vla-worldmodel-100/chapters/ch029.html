@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第029章 VLA策略的实时推理优化 | 具身智能学习课程 · VLA 与世界模型联合训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 联合训练进阶与策略能力</span>
+    <span class="sep">/</span>
+    <span>第 029 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 联合训练进阶与策略能力</div>
+    <h1>第 029 章：VLA策略的实时推理优化</h1>
+    <p class="lead">控制回路有固定的周期约束，推理延迟必须装进预算；本章讲清端到端延迟的分解口径、动作分块如何解耦推理频率与控制频率，以及量化与异步流水线的取舍。</p>
+    <ul class="meta">
+      <li>主题：推理优化（inference optimization） / 延迟预算（latency budget）</li>
+      <li>关键公式：T<sub>ctrl</sub> ≥ T<sub>pre</sub> + T<sub>enc</sub> + T<sub>dec</sub> + T<sub>comm</sub>；有效控制频率 = min(f<sub>infer</sub> / k, f<sub>loop</sub>)</li>
+      <li>预计学时：50 分钟</li>
+      <li>前置章节：第 028 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解控制周期约束下推理延迟的口径划分：预处理、编码、解码与通信四段，以及分位数的报告方式。</li>
+      <li>掌握动作分块（action chunking）对推理频率的解耦作用，能计算块长、执行步数与有效控制频率的关系。</li>
+      <li>掌握模型侧优化手段（半精度、INT8 量化、KV 缓存、蒸馏）与系统侧手段（异步流水线、双缓冲、算子融合）的适用边界。</li>
+      <li>会设计带时间戳的动作队列：过期丢弃、插值与保持三种策略的取舍。</li>
+      <li>能诊断尾延迟、量化尺度漂移与同步点瓶颈三类问题。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>VLA 策略与视觉语言骨干参数量大，单次前向的计算量远高于传统控制算法；机器人控制回路通常以 20 ms 至 100 ms 的周期运行，推理必须装进这个预算。延迟超标不只是"动作晚一点"：状态陈旧让策略基于过时的观测决策，闭环稳定性随延迟上升而下降。</p>
+    <p>推理优化在两个层面进行。模型层面压缩单次前向成本：半精度、整型量化、缓存复用、蒸馏小模型。系统层面让推理与执行重叠：动作分块一次预测多步，预测期间执行器持续输出；异步流水线让下一块推理与当前块执行并行。两层优化叠加后，推理频率可以远低于控制频率，而控制回路的平滑性保持。</p>
+    <p>本章与第 028 章的衔接：随机化让策略适应环境差异，推理优化让策略在周期约束内实际可用。下一章的世界模型长期预测评估则回答一个问题：想象轨迹能推进多远而不失真。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 延迟分解与控制周期约束</h3>
+    <p>从观测产生到动作生效，端到端延迟由四段组成，预算约束为：</p>
+    <div class="formula">
+      T<sub>ctrl</sub> ≥ T<sub>pre</sub> + T<sub>enc</sub> + T<sub>dec</sub> + T<sub>comm</sub>
+      <span class="note">T<sub>pre</sub> 预处理（缩放、归一化）、T<sub>enc</sub> 视觉语言编码、T<sub>dec</sub> 动作解码、T<sub>comm</sub> 通信与执行器接管</span>
+    </div>
+    <p>举例说明预算算术：控制回路周期 20 ms（50 Hz），预处理与通信合计测得 6 ms，则留给网络前向的预算为 14 ms。自回归解码按 token 逐步生成，动作块 8 步、每步 7 维或 7 个 token 时解码步数最多 56 次，共享 KV 缓存后每步只计算单 token 的注意力，单步成本随序列长度线性增长。若解码占满预算，就应扩大动作块并降低推理频率。</p>
+    <p>报告口径上必须区分：平均延迟决定吞吐，尾延迟决定稳定性。控制回路用固定周期节拍，偶发的长尾延迟会造成一次大的状态陈旧，闭环表现为轨迹抖动。工程上报 p50 与 p99 两个分位数，并按分位数做预算裁剪。</p>
+    <p>数值算例：控制周期 20 ms，预处理与通信合计 6 ms，前向预算 14 ms；实测前向 p50 = 8 ms、p99 = 16 ms，p99 超出预算 2 ms，动作偶发晚一拍，闭环表现为周期性抖动。延迟对稳定性的影响可用相位裕度换算：回路带宽 f<sub>bw</sub> = 5 Hz 时，延迟 d 引入的附加相位滞后为 360° · f<sub>bw</sub> · d，20 ms 对应 36°，60 ms 对应 108°，后者足以让原本 60° 裕度的回路失稳。取附加滞后不超过原裕度的三分之一作为预算约束，60° 裕度、5 Hz 带宽下允许的延迟上限约为 20° / (360° × 5 Hz) ≈ 11 ms。</p>
+    <p>KV 缓存的收益随解码长度放大：块长 8、每步 7 个 token 共 56 个解码步，无缓存时第 i 步重新处理前 i 个 token，累计计算量为 L(L+1)/2 = 1596 个 token 对，启用缓存后降至 L = 56 个，比值 (L+1)/2 = 28.5，前缀注意力开销下降一个数量级。缓存本身占用显存，键值张量按层数与注意力头数展开后随长度线性增长，块长选择需要把这份显存计入预算。</p>
+
+    <h3>2. 动作分块：频率解耦</h3>
+    <p>设动作块长度为 H<sub>c</sub>、每块只执行前 k 步后重新推理，则全回路有效控制频率与推理频率的关系为：</p>
+    <div class="formula">
+      f<sub>loop,eff</sub> = min( f<sub>infer</sub> · k , f<sub>exec</sub> )
+      <span class="note">f<sub>infer</sub> 为推理频率，f<sub>exec</sub> 为执行器插值输出频率；k ≤ H<sub>c</sub> 为每块执行步数</span>
+    </div>
+    <p>k 与推理预算共同决定推理频率：k 越小，重新规划越频繁，动作衔接越新，代价是推理次数增加；k 越大，推理负担轻，但块间漂移由观测反馈覆盖不到。k 取 H<sub>c</sub>/2 是常见起点。重叠执行时，新块与旧块在时间上有交叠区，交叠区内的动作需要融合（例如按时间权重插值），避免衔接点跳变。</p>
+    <p>数值算例：T<sub>ctrl</sub> = 20 ms、H<sub>c</sub> = 8、k = 4 时，推理间隔为 80 ms，f<sub>infer</sub> = 12.5 Hz，有效控制频率 = min(12.5 × 4, 50) = 50 Hz，恰好顶到执行器节拍，块内动作全靠执行器插值填充。推理 p99 为 60 ms 时，推理线程利用率约为 60 / 80 = 0.75；把 k 减到 2，间隔变为 40 ms，利用率升到 1.5，单线程必然积压，队列水位持续上涨。工程上利用率控制在 0.75 以下，p99 波动才有吸收余量，剩余额度用双缓冲与提前触发吸收。</p>
+
+    <h3>3. 延迟下的状态陈旧与补偿</h3>
+    <p>推理耗时期间观测持续变化。决策依据可以写成"上一次观测 + 已执行动作历史"：</p>
+    <div class="formula">
+      a<sub>t</sub> = π( o<sub>t−d</sub>, a<sub>t−1</sub> 至 a<sub>t−m</sub>, τ )
+      <span class="note">d 为观测延迟（以控制周期计），m 为动作历史窗口长度，τ 为时间戳特征；策略输入包含动作历史是处理延迟的通用结构</span>
+    </div>
+    <p>训练时把延迟纳入输入分布（动作历史与时间戳拼接进状态），策略在部署时对陈旧观测自适应；推理侧可用世界模型前滚到当前时刻补偿：以旧观测的潜状态为起点，用已执行动作推进 d 步，得到当前时刻的状态估计。该补偿即第 035 章闭环控制中预测补偿的推理侧版本。</p>
+    <p>数值算例：设世界模型单步预测误差标准差为 0.01（归一化状态单位），随机误差独立时前滚 d 步的误差标准差按 √d 增长：d = 3 时为 0.017，d = 10 时为 0.032。对照不使用补偿的陈旧误差：状态每步漂移约 0.02，d = 3 步的陈旧偏差为 0.06，明显大于前滚误差 0.017，前滚补偿在 3 步延迟下净收益约 0.043。延迟扩大到 d = 10 时，陈旧偏差 0.2 仍大于前滚误差 0.032，但补偿的计算量与模型偏差风险同步上升；若单步误差因动力学失配增长到 0.02（系统误差随 d 线性累积），d = 10 的前滚误差达 0.2，与陈旧偏差持平，此时前滚不再带来收益，判据是前滚误差估计低于陈旧偏差的一半才启用。</p>
+
+    <h3>4. 模型侧与系统侧优化</h3>
+    <table>
+      <tr><th>手段</th><th>作用位置</th><th>收益来源</th><th>代价</th></tr>
+      <tr><td>半精度（FP16/BF16）</td><td>全部算子</td><td>内存带宽减半、张量核加速</td><td>个别算子数值敏感需回退</td></tr>
+      <tr><td>INT8 量化</td><td>卷积与线性层</td><td>吞吐提升、显存下降</td><td>需校准，动作输出可能偏移</td></tr>
+      <tr><td>KV 缓存</td><td>自回归解码</td><td>避免重复计算历史 token</td><td>显存随序列长度增长</td></tr>
+      <tr><td>蒸馏小模型</td><td>整体网络</td><td>参数与计算量成倍下降</td><td>精度损失需评估</td></tr>
+      <tr><td>异步流水线</td><td>推理与执行之间</td><td>延迟被执行时间掩盖</td><td>观测陈旧度增加</td></tr>
+      <tr><td>算子融合与编译</td><td>计算图</td><td>减少内核启动与访存</td><td>编译时间与算子兼容性</td></tr>
+    </table>
+    <p><strong>优化顺序的经验法则：先做零成本的系统优化（融合、缓存、同步点消除），再做精度换速度的模型优化（半精度、量化），最后才考虑蒸馏。</strong>蒸馏改变模型结构，重新训练的成本最高。</p>
+    <p>量化误差可以提前估算：动作范围 ±0.5、对称 INT8 每张量量化时，缩放因子为 0.5 / 127 ≈ 0.00394，单次舍入误差上界为半个步长 ≈ 0.00197，均匀舍入下均方误差为步长平方除以 12，约 1.3 × 10<sup>−6</sup>；夹爪开合类动作若范围扩大到 ±1，误差上界翻倍到约 0.0039。对旋转类动作换算角度，误差上界约 0.23°，低于多数执行器的机械重复精度。误差进入闭环后会被反馈部分修正，验证方法是部署前用验证集对比量化前后的动作输出：平均绝对偏差明显超过半个量化步长时，说明校准集未覆盖动作的实际分布，需要补充校准样本。</p>
+    <p>异步流水线的时间账：执行到剩余 k 步触发下次推理，可用重叠窗口为 k · T<sub>ctrl</sub> = 80 ms（k = 4、周期 20 ms）；推理 p99 = 60 ms 落在窗口内，新块在旧块耗尽前约 20 ms 到达，双缓冲完成交接。若推理滑出窗口，队列出现空档，执行端按保持策略输出上一动作，空档计数是流水线欠载的可观测信号。提前触发步数由此确定：先按利用率约束取 k，再预留 1 至 2 步安全余量。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>实时推理系统由推理服务与执行队列两部分组成。与第 028 章的差异：028 扩展训练分布，本章处理部署时的时序约束。</p>
+    <ol>
+      <li><strong>推理服务</strong>：接收观测（带时间戳），输出动作块（带时间戳与有效期）；模型侧启用半精度与编译，自回归解码启用 KV 缓存。</li>
+      <li><strong>执行队列</strong>：控制回路按固定节拍从队列取动作，处理过期丢弃、插值与低置信保持。</li>
+      <li><strong>异步流水线</strong>：当前块执行到剩余 k 步时触发下一次推理，推理与执行重叠；双缓冲避免推理结果覆盖正在执行的块。</li>
+      <li><strong>监控</strong>：统计端到端延迟的 p50 / p99、队列水位与过期丢弃率，三者联动判断是否需要调整块长或优化模型。</li>
+    </ol>
+    <h3>超参数起点表</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>控制周期</td><td>20 ms（50 Hz）</td><td>回路节拍</td><td>执行器与任务要求</td></tr>
+      <tr><td>动作块长 H<sub>c</sub></td><td>8</td><td>单次推理覆盖的动作步数</td><td>演示数据平滑尺度</td></tr>
+      <tr><td>执行步数 k</td><td>4</td><td>重推理前的执行量</td><td>块长的一半为起点</td></tr>
+      <tr><td>推理提前量</td><td>k 步对应时间</td><td>异步触发时机</td><td>推理耗时实测分位</td></tr>
+      <tr><td>过期阈值</td><td>2 个控制周期</td><td>动作块的有效期</td><td>执行器允许的陈旧度</td></tr>
+      <tr><td>量化位宽</td><td>INT8（线性与卷积）</td><td>吞吐与显存</td><td>校准集上的动作偏差</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：时间戳队列与最新值覆盖的取舍</span>
+      <p>最新值覆盖会让控制回路在推理完成瞬间跳变到新块起点，期间的动作长度参差不齐。带时间戳的队列按统一节拍取出与当前时刻匹配的动作，过期项显式丢弃，杜绝静默覆盖。统一的节拍让执行器侧的行为可预测，也便于统计过期率这一关键指标。</p>
+    </div>
+    <h3>空档执行策略对照</h3>
+    <table>
+      <tr><th>策略</th><th>行为</th><th>适用情形</th><th>代价</th></tr>
+      <tr><td>过期丢弃</td><td>无可用动作时进入安全保持</td><td>p99 长尾明显的早期系统</td><td>响应迟滞，轨迹停顿</td></tr>
+      <tr><td>保持上一动作</td><td>重复输出最近一次成功执行的指令</td><td>空档 1 至 2 个控制周期</td><td>长空档下产生稳态偏差</td></tr>
+      <tr><td>插值到当前时刻</td><td>对相邻动作块按时间权重融合</td><td>新旧块衔接区</td><td>实现复杂，需要两块同时可用</td></tr>
+    </table>
+    <p>选择由空档长度决定：1 个周期内的空档用保持最稳，跨块衔接用插值消除跳变，连续 2 个周期以上无新动作时按过期丢弃进入安全保持，并触发降级（降低控制频率或切换轻量策略）。把空档计数与空档长度分布纳入监控，可以在轨迹劣化出现之前发现推理服务的容量不足。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>以下片段参照公开的实时策略部署实现设计，版本中立；接口随版本演进，时间统一为控制周期的倍数。</p>
+
+    <p><strong>片段 1：带时间戳的动作队列执行器</strong></p>
+    <pre class="code"><code>class ActionQueue:
+    """执行器侧队列：按控制节拍取动作，处理插入、过期丢弃与插值。"""
+    def __init__(self, deadline_ticks=2):
+        self.queue = []                     # 元素为 (tick, action)
+        self.deadline = deadline_ticks      # 允许的最大陈旧度
+        self.tick = 0
+
+    def push(self, tick, actions):
+        # 动作块带起始 tick：队列按时间序拼接，重叠区暂不合并
+        for i, a in enumerate(actions):
+            self.queue.append((tick + i, a))
+
+    def pop(self):
+        # 兜底取当前 tick 的动作：先剔除过期项再精确匹配与插值
+        self.queue = [item for item in self.queue
+                      if item[0] &gt;= self.tick - self.deadline]
+        exact = [a for t, a in self.queue if t == self.tick]
+        if exact:
+            chosen = exact[0]
+        else:
+            # 无精确匹配时取最近项，避免控制回路空转
+            nearest = min(self.queue, key=lambda item: abs(item[0] - self.tick),
+                          default=None)
+            chosen = nearest[1] if nearest is not None else None
+        self.tick += 1
+        return chosen
+</code></pre>
+    <p>解读：<strong>（1）</strong>以 tick 为时间单位，与物理时钟解耦，控制回路与队列共用同一时基，避免时钟漂移；<strong>（2）</strong>过期项按 deadline 显式剔除，沉默覆盖会掩盖推理跟不上节拍的问题；<strong>（3）</strong>精确匹配优先、最近项兜底，保证执行器不空转；<strong>（4）</strong>队列状态可观测（长度、过期数），与延迟监控联动决定是否缩短块长。</p>
+
+    <p><strong>片段 2：异步推理流水线</strong></p>
+    <pre class="code"><code>import threading
+import torch
+
+class AsyncInference:
+    """双缓冲异步推理：执行当前块的同时预测下一块，结果写入备用缓冲。"""
+    def __init__(self, policy, on_ready):
+        self.policy = policy
+        self.on_ready = on_ready            # 推理完成回调：把块交给队列
+        self.obs_shared = None              # 待处理观测
+        self.lock = threading.Lock()
+        self.worker = threading.Thread(target=self._loop, daemon=True)
+
+    def submit(self, obs, tick):
+        with self.lock:
+            # 只保留最新观测：队列积压时旧观测的执行价值极低
+            self.obs_shared = (obs, tick)
+
+    def _loop(self):
+        while True:
+            with self.lock:
+                item = self.obs_shared
+                self.obs_shared = None
+            if item is None:
+                continue
+            obs, tick = item
+            with torch.inference_mode():    # 关闭自动微分，减少显存与开销
+                actions = self.policy.act(obs)
+            self.on_ready(tick, actions.cpu())
+</code></pre>
+    <p>解读：<strong>（1）</strong>提交端只保留最新观测，积压的旧观测直接丢弃，与执行端"过期丢弃"策略呼应；<strong>（2）</strong>推理由独立线程执行，主控制回路不被阻塞，两者通过锁保护的最小共享状态通信；<strong>（3）</strong>推理模式（inference_mode）关闭梯度跟踪，显存与计算开销显著下降；<strong>（4）</strong>结果经 to("cpu") 拷出后再交给执行侧，避免执行线程访问占用中的显存张量；跨设备拷贝的时机与同步点需要实测确认，防止成为新瓶颈。</p>
+
+    <p><strong>片段 3：半精度与编译的推理配置</strong></p>
+    <pre class="code"><code>def build_inference_policy(checkpoint, device="cuda"):
+    """部署配置：半精度 + 编译 + 暖启动，保证首包延迟稳定。"""
+    model = load_policy(checkpoint).to(device).eval()
+    # 半精度降低内存带宽压力，张量核在矩阵运算上吞吐更高
+    model = model.to(torch.float16)
+    try:
+        # 编译融合算子；mode=reduce-overhead 面向小批次低延迟场景
+        compiled = torch.compile(model.forward, mode="reduce-overhead")
+    except Exception:
+        # 环境不支持编译时回退动态图：两条路径的功能行为一致
+        compiled = model.forward
+    model.forward = compiled
+    # 暖启动：让编译与缓存图在正式控制前完成，避免首包长尾
+    dummy = torch.zeros(1, 3, 224, 224, device=device, dtype=torch.float16)
+    with torch.inference_mode():
+        for _ in range(3):
+            model.forward(dummy)
+    return model
+</code></pre>
+    <p>解读：<strong>（1）</strong>eval 与 float16 是部署的两个基本开关，顺序放在加载之后统一执行；<strong>（2）</strong>编译用 try 包裹并允许回退，环境差异不该阻塞部署，回退路径保持全功能；<strong>（3）</strong>暖启动跑满若干次前向，把编译与缓存初始化移出控制回路，消除首包长尾；<strong>（4）</strong>INT8 量化需要校准集生成动作输出的期望偏差报告，属于独立步骤，此处保留半精度作为基线配置。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>只统计平均延迟</strong>：p50 达标而 p99 超出周期数倍，偶发长尾表现为轨迹抖动。修复：按 p99 做预算裁剪，长尾来源逐一排查（首次前向、内存分配、跨设备拷贝）。</li>
+      <li><strong>量化后动作尺度漂移</strong>：INT8 校准不充分时输出分布偏移，闭环出现稳态误差。修复：用覆盖全动作范围的校准集，部署前对比量化前后动作输出在验证集上的平均偏差。</li>
+      <li><strong>过期动作静默覆盖</strong>：新块直接覆盖旧块剩余动作，衔接点动作跳变。修复：使用带时间戳的队列，衔接区插值，并监控过期率指标。</li>
+      <li><strong>同步点阻塞流水线</strong>：推理线程与执行线程共享张量未及时同步，主回路等待推理完成。修复：结果张量拷贝副本后再共享，锁只保护最小状态交换区。</li>
+      <li><strong>延迟口径不一致</strong>：预处理与通信未计入延迟统计，上报数字与真实端到端不符。修复：以观测时间戳到动作下发时间戳的差值为统一口径，分段统计便于定位。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>控制周期 20 ms，推理耗时 p50 为 30 ms、p99 为 60 ms，块长 16、执行步数 k 取多少才能让 95% 的周期有可用动作？给出计算过程与假设。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>每块覆盖 16 步，若执行 k = 8 步（160 ms）后触发下一块，推理 60 ms 远小于 160 ms，尾声有充足余量；k 的上限由"块执行时间 &gt; 推理 p99"给出，即 k 不超过 8。取满足条件的最大 k 以降低推理频率。</div></details>
+      </li>
+      <li>推导：观测延迟 d 个周期时，世界模型前滚补偿的计算量与实际收益。说明 d 增大时补偿误差如何变化，并给出放弃补偿的判据。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>前滚 d 步的计算量与 d 成线性关系；补偿误差随 d 增大而累积（动力学预测误差叠加）。当补偿误差估计超过观测陈旧本身带来的误差时，放弃前滚、直接使用最新观测更稳妥。</div></details>
+      </li>
+      <li>设计实验比较三种执行策略：过期直接丢弃、保持上一动作、插值到当前时刻。预测三者在轨迹平滑度与跟踪误差上的差异，并给出量化指标。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>丢弃最平滑但引入空转与响应迟滞；保持动作在长延迟下产生稳态偏差；插值兼顾连续与跟踪。指标可用动作二阶差分（抖动幅度）与轨迹跟踪误差的 p95。</div></details>
+      </li>
+      <li>把动作块长从 8 增到 32，推理频率下降四倍（保持 k = H<sub>c</sub>/2）。预测端到端延迟压力与块尾动作质量的相反变化，说明块长选择的权衡点。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>推理压力下降，但块尾动作基于较旧观测，与真实状态偏差变大；权衡点是"重推理间隔"与"动作质量衰减时间常数"的交叉位置，通过执行误差随块内位置的增长曲线测定。</div></details>
+      </li>
+      <li>推导：某回路相位裕度 45°、带宽 4 Hz。计算 25 ms 附加延迟引入的相位滞后，判断是否超过裕度三分之一，并反解允许的最大延迟。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>附加滞后为 360° × 4 × 0.025 = 36°，超过 45° / 3 = 15° 的上限，需要压缩延迟或放宽带宽；按 15° 反解，d ≤ 15° / (360° × 4 Hz) ≈ 10.4 ms。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>端到端延迟由预处理、编码、解码与通信四段组成，预算裁剪以 p99 为准。</li>
+      <li>动作分块解耦推理频率与控制频率，有效控制频率由推理频率、执行步数与执行器插值频率共同决定。</li>
+      <li>延迟带来的状态陈旧通过动作历史输入与世界模型前滚补偿两条路径处理。</li>
+      <li>优化顺序为系统优化优先、精度换速度其次、结构与蒸馏最后，逐级评估代价。</li>
+      <li>带时间戳的队列让执行行为可预测，过期率与队列水位是核心监控指标。</li>
+      <li>下一章进入世界模型的长期预测能力评估：定义预测可用时域与误差增长曲线的报告方法。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch028.html">← 第 028 章：联合训练中的随机化</a>
+    <a class="next" href="ch030.html">第 030 章：世界模型的长期预测能力评估 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第045章 RLlib使用LSTM处理部分可观测环境 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第三篇 · RLlib 算法实现</span>
+    <span class="sep">/</span>
+    <span>第 045 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第三篇 · RLlib 算法实现</div>
+    <h1>第 045 章：RLlib使用LSTM处理部分可观测环境</h1>
+    <p class="lead">记忆即状态：部分可观测马尔可夫决策过程（Partially Observable Markov Decision Process, POMDP）为什么需要历史信息、长短期记忆网络（Long Short-Term Memory, LSTM）如何把历史压缩成隐状态、序列打包（Sequence Packing）与状态管理在多 worker 采样中如何保持正确。</p>
+    <ul class="meta">
+      <li>主题：RLlib 训练（循环策略）</li>
+      <li>关键机制：时序截断反向传播、序列长度、隐状态生命周期</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 044 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解部分可观测性对策略类的本质要求：最优动作依赖历史信息，单帧观测不足以支撑决策。</li>
+      <li>掌握循环网络在策略中的三层状态管理：初始状态、逐步传递、回合边界清零。</li>
+      <li>掌握序列打包的约束关系：训练批次、序列长度、采样并行度之间的整除要求及其来源。</li>
+      <li>会配置 RLlib 的 LSTM 策略并校验早停与截断行为，能诊断梯度沿时间传播的偏差。</li>
+      <li>能对比"帧堆叠"与"循环网络"两条记忆路径的成本与适用条件。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>许多任务在单个时刻提供的信息不足以决策：速度信息只存在于位置序列中，遮挡、传感器噪声与有限视野让观测与真实状态之间存在别名（Aliasing）。此类环境在数学上对应部分可观测马尔可夫决策过程，最优策略是历史的函数，而马尔可夫策略类无法表达这层依赖，训练表现为"看得到却能做对的状态、看不到就退化"。</p>
+    <p>循环网络把历史逐时刻压缩进隐状态，用一套可训练的参数替代手工特征工程。代价是训练与系统层面的复杂度：梯度沿时间反向传播，批次必须按序列组织，隐状态的生命周期必须与回合边界严格对齐。本章把这三件事讲清楚。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p>本节的逻辑链是：为什么需要记忆、记忆如何表示、训练如何组织、状态如何管理。</p>
+
+    <h3>1. 部分可观测性的形式化与信息缺口</h3>
+    <p>POMDP 在 MDP 的基础上引入观测函数：智能体看到的是由观测概率 O(o<sub>t</sub> | s<sub>t</sub>, a<sub>t−1</sub>) 生成的观测 o<sub>t</sub>，真实状态 s<sub>t</sub> 被观测过程隐藏。充分统计量是信念状态（Belief State）b<sub>t</sub>，即对当前状态的后验分布。理论最优策略以信念为输入，实践中的近似方法有两类：显式维护信念（粒子滤波等），或用循环网络直接从观测序列回归出"够用的摘要"。<strong>循环策略的隐状态就是这份摘要的承载者。</strong></p>
+    <p>一个可操作的判据：若把环境的完整状态交给策略训练，性能显著高于现有观测，而扩大网络宽度无效，则部分可观测性是主要瓶颈，应引入记忆机制。</p>
+
+    <h3>2. LSTM 的门控结构与梯度特性</h3>
+    <p>LSTM 单元用三个门控制信息流：遗忘门决定旧记忆保留比例，输入门决定新信息写入比例，输出门决定暴露给外部的比例。相对简单循环网络，门控的核心收益是<strong>梯度沿时间步的传播路径被设计成近恒等映射</strong>，反向传播时梯度不容易消失或爆炸，因此可以学习更长时程的依赖。</p>
+    <p>门控可以写成明确的更新式：f<sub>t</sub> = σ(W<sub>f</sub>[x<sub>t</sub>, h<sub>t−1</sub>]) 为遗忘门，i<sub>t</sub> 为输入门，g<sub>t</sub> 为候选记忆，细胞状态按 c<sub>t</sub> = f<sub>t</sub> ⊙ c<sub>t−1</sub> + i<sub>t</sub> ⊙ g<sub>t</sub> 更新，输出 h<sub>t</sub> = o<sub>t</sub> ⊙ tanh(c<sub>t</sub>)。当遗忘门接近 1、输入门接近 0 时，c 的更新近乎恒等，反向传播的连乘因子近似保持稳定，长时程依赖因此可以保留；门控学了什么，可以从遗忘门的开合统计直接观察。</p>
+    <p>隐状态包含两部分：细胞状态（Cell State，长期记忆）与隐输出（Hidden State，短期输出）。在 RLlib 的策略接口里，这两部分合起来构成状态的输入输出对（state in / state out），每个时间步把上一步的 state out 作为下一步的 state in，形成链式传递。</p>
+
+    <h3>3. 时序截断反向传播与序列打包</h3>
+    <p>训练时把连续 T 个时间步的转移组织成一个序列，梯度只沿这 T 步回传，称为时序截断反向传播（Truncated Backpropagation Through Time, TBPTT）。T 即 <code>max_seq_len</code>，它决定三件事的平衡：<strong>T 越大，梯度携带的时程信息越多，但显存占用与计算时间近似线性上升；T 越小，训练越便宜，然而长时程依赖被系统性截断，策略学不到超过 T 步的记忆。</strong></p>
+    <p>序列打包指把多条轨迹切分成定长片段、凑成训练批次。这使得一个约束浮现：批次大小、序列长度与采样并行度之间存在整除关系。</p>
+    <div class="formula">
+      train_batch_size ÷ ( max_seq_len × num_envs_per_env_runner ) 必须为整数
+      <span class="note">每个环境需要能提供整数条定长序列；不整除时部分版本直接报错，部分版本静默丢弃尾部样本，样本预算被浪费</span>
+    </div>
+    <p>比"整除"更重要的机制是<strong>掩码与填充</strong>：回合提前结束时，不足 T 步的序列用零填充，训练损失必须以掩码排除填充位置，否则网络会在假转移上学到错误动态。RLlib 在样本批次中携带边界标志，自定义模型必须正确使用它。</p>
+
+    <h3>4. 隐状态的生命周期管理</h3>
+    <p>隐状态在采样时按环境独立维护，规则有三条：<strong>（1）</strong>回合开始注入零状态，网络从"无记忆"出发，避免上一局的信息泄漏到新局；<strong>（2）</strong>每次前向后把 state out 写回采样器，与动作一起进入样本批次；<strong>（3）</strong>训练时按序列展平，跨序列之间切断梯度。填充位与回合边界的处理依赖批次中的状态有效性标记，这一点在自定义模型里最容易出错。梯度切断也有具体做法：批次按序列展开成（序列数, T）的形状后，反向传播只在 T 维内进行，序列之间的批次维度不参与梯度；若误把整批拼成一条长链，梯度会跨越序列边界继续传播，既放大计算量又制造跨回合的伪依赖，症状是损失出现难以复现的尖峰。</p>
+    <p>新版本 RLlib 还提供预热（Burn-in）机制：从缓冲区取出序列开头的若干步仅用于推进隐状态、不计算损失，让状态估计更接近在线值后再计算梯度。预热步数与序列长度共同决定记忆质量，代价是额外的前向计算。</p>
+
+    <h3>5. 数值算例：整除、梯度衰减与参数量</h3>
+    <p>整除约束先算清楚：unit = max_seq_len × num_envs_per_env_runner = 32 × 4 = 128；批次 8192 除以 128 得 64 个 128 步的单元；每个单元含 4 条 32 步序列，全批合计 256 条；换算到每个环境运行器是 1024 步、每个环境 256 步、合 8 条序列，32 个环境恰好拼满。若序列长度改成 20、环境数 3，unit = 60，8192 ÷ 60 ≈ 136.5，向下取整 136 对应批次 8160，其余 32 步会被补齐或丢弃，样本预算随配置余数静默缩水。</p>
+    <p>TBPTT 的衰减因子直接量化为 γ<sup>T</sup>：γ = 0.99 时，T = 8 的片段保留约 0.923 的折扣权重，T = 20 约 0.818，T = 32 约 0.725，T = 50 约 0.605，T = 128 约 0.276。超过序列长度的依赖，梯度贡献被折扣与截断双重衰减；要让 50 步量级的线索进入信用分配，T 至少要取到该量级。</p>
+    <table>
+      <tr><th>序列长度 T</th><th>γ<sup>T</sup>（γ = 0.99）</th><th>含义</th></tr>
+      <tr><td>8</td><td>0.923</td><td>短时程线索基本保留</td></tr>
+      <tr><td>20</td><td>0.818</td><td>中等时程</td></tr>
+      <tr><td>32</td><td>0.725</td><td>常用配置的衰减水平</td></tr>
+      <tr><td>50</td><td>0.605</td><td>长时程线索仍有可观权重</td></tr>
+      <tr><td>128</td><td>0.276</td><td>远端依赖大幅衰减</td></tr>
+    </table>
+    <p>参数量把记忆成本摆上台面：输入维度 128、隐层 256 时 LSTM 参数约 39.5 万，占整个网络参数的主体；隐层降到 128 约 13.2 万，升到 512 约 131 万。隐状态本身的内存很小：256 宽的双状态约 2 KB 每环境，千环境也只要 2 MB 量级，开销集中在计算与参数而不在状态存储。</p>
+
+    <h3>6. 帧堆叠与循环网络的对照</h3>
+    <table>
+      <tr><th>维度</th><th>帧堆叠</th><th>LSTM 策略</th></tr>
+      <tr><td>记忆范围</td><td>固定 K 帧</td><td>受 T 与门控控制，可覆盖更长时程</td></tr>
+      <tr><td>观测改造成本</td><td>低，环境包装即可</td><td>中，需改模型与批次组织</td></tr>
+      <tr><td>批次组织</td><td>常规批次</td><td>序列打包加整除约束</td></tr>
+      <tr><td>参数开销</td><td>输入层按 K 倍加宽</td><td>循环层参数主导</td></tr>
+      <tr><td>失效形态</td><td>超过 K 帧的线索丢失</td><td>边界或掩码错误导致状态泄漏</td></tr>
+    </table>
+    <p>选择的量化判据：线索时长上限明确且短（数帧内）时帧堆叠更省；线索时长不明或需要跨遮挡恢复时循环网络才有优势，且用同预算对照验证收益，对照指标至少覆盖收敛步数与最终回报两项，把噪声水平一并纳入变量。</p>
+
+    <h3>7. 边界与失效模式</h3>
+    <p>截断自举的边界：片段在回合中途截断时需要价值自举，而自举使用的隐状态必须与片段末端严格对应；训练序列的切分与采样回合边界不重叠时，截断点的状态错位，价值目标偏差沿序列传播。校验方式是核对批次内终止标记与序列边界的重合程度。</p>
+    <p>预热的边界在成本与新鲜度之间：预热步数越长状态越接近在线值，前向成本按步数累加；序列本身短于任务记忆时程时，预热的改善有限，应先加长序列再考虑预热，两者的预算要分开记录。</p>
+    <p>并行采样的边界在状态同步：每个环境独立维护隐状态，worker 故障恢复或环境重置后必须同步清零，否则局部状态错位只污染该 worker 的批次，难以从全局指标察觉。把边界清零次数与环境数乘回合数核对，是发现该类错误的固定手段；补一块按 worker 拆分的回报分布面板，可以让这类局部错位无处藏身。</p>
+    <p>预热的成本占比可以估算：预热 B 步、序列 T 步时，额外前向占比为 B ÷ (T + B)。B = 10、T = 32 时约 24%，B = 20 时约 38%；把预热步数计入单批总步数后，再与整除约束一起核对，能避免"加了预热却忘了批次"的组合错误。</p>
+    <p>信息缺口的量化再补一个：若线索是位置序列隐含的速度，两帧差分把观测噪声放大 √2 倍（σ<sub>v</sub> ≈ √2·σ ÷ Δt）；噪声标准差 0.1、帧间隔 1 时速度估计的噪声约 0.14。这解释了"帧堆叠 K 帧"为什么在噪声任务上收益下降：K 越大，差分链越长，误差传播越重，循环网络的门控则在训练中学习如何抑制噪声。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>启用循环策略按以下五步推进。</p>
+    <ol>
+      <li><strong>确认可观测性缺口</strong>：用完整状态做一次上界实验；若无显著差异，优先考虑帧堆叠等低成本方案。</li>
+      <li><strong>选择记忆结构</strong>：默认 LSTM，单元宽度 128 至 256；需要更强时程建模且算力充足时考虑注意力机制。</li>
+      <li><strong>设定序列长度</strong>：从任务的关键时间尺度出发（如速度估计需要 5 至 20 帧，遮蔽恢复需要更长），取 20 至 50 起步。</li>
+      <li><strong>校验整除关系</strong>：调整批次大小使其满足整除约束，并留出余量；多环境时逐 worker 检查。</li>
+      <li><strong>验证状态正确性</strong>：检查样本批次中的状态字段、回合边界零状态、填充掩码三件事。</li>
+    </ol>
+    <h3>参数表</h3>
+    <table>
+      <tr><th>参数</th><th>典型值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td><code>use_lstm</code></td><td>true</td><td>在模型目录中启用循环层</td><td>部分可观测任务启用</td></tr>
+      <tr><td><code>lstm_cell_size</code></td><td>128–256</td><td>隐状态宽度</td><td>任务记忆容量需求；过大易过拟合</td></tr>
+      <tr><td><code>max_seq_len</code></td><td>20–50</td><td>截断回传长度</td><td>关键时序尺度；显存预算的反向约束</td></tr>
+      <tr><td><code>train_batch_size</code></td><td>4000–32000 步</td><td>训练批次</td><td>须为 <code>max_seq_len</code> 与并行环境数的公倍数</td></tr>
+      <tr><td><code>num_envs_per_env_runner</code></td><td>2–8</td><td>并行环境数</td><td>整除约束的另一因子</td></tr>
+      <tr><td>写回状态字段</td><td>state_out</td><td>跨步传递隐状态</td><td>由框架自动附加</td></tr>
+    </table>
+    <p>与上一章的差异：044 章处理数值尺度，本章处理信息组织；归一化改变数据的量级，序列化改变数据的结构，两者都会影响训练稳定性，但诊断入口完全不同（前者看损失量级，后者看整除与掩码）。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：PPO 循环策略配置与整除校验</strong></p>
+    <pre class="code"><code>from ray.rllib.algorithms.ppo import PPOConfig
+
+MAX_SEQ_LEN = 32
+NUM_ENVS_PER_RUNNER = 4
+
+def pick_batch_size(base=8192):
+    """把批次大小对齐到整除约束：必须同时被序列长度与并行环境数整除。"""
+    unit = MAX_SEQ_LEN * NUM_ENVS_PER_RUNNER
+    return (base // unit) * unit          # 向下取整到公倍数，避免尾部样本被丢弃
+
+config = (
+    PPOConfig()
+    .environment("PartiallyObservableNav")
+    .framework("torch")
+    .env_runners(num_env_runners=8, num_envs_per_env_runner=NUM_ENVS_PER_RUNNER)
+    .training(
+        train_batch_size=pick_batch_size(8192),   # 8192 / (32*4) = 64 条序列
+        lr=3e-4,
+        gamma=0.99,
+        lambda_=0.95,
+        model={
+            "use_lstm": True,
+            "lstm_cell_size": 256,     # 记忆容量与单步计算成本的折中
+            "max_seq_len": MAX_SEQ_LEN,  # 截断回传长度，直接影响显存
+            "fcnet_hiddens": [128],      # LSTM 前的特征提取层保持较窄
+        },
+    )
+)
+algo = config.build()
+assert config.train_batch_size % (MAX_SEQ_LEN * NUM_ENVS_PER_RUNNER) == 0</code></pre>
+    <p>解读：三处设计意图。<strong>（1）</strong><code>pick_batch_size</code> 把整除约束写进代码，任何参数改动都会经过这一个入口，尾部样本被浪费的问题从源头避免；约束只写在注释里则无法拦截非法配置。<strong>（2）</strong><code>lstm_cell_size</code> 与 <code>max_seq_len</code> 是两类成本：前者是单步计算与参数量的线性因子，后者是回传长度与显存的线性因子，调参时分开评估。<strong>（3）</strong>断言放在构建之后做最终校验，配置对象可能在上层被再次改写，断言是最后一道防线。</p>
+
+    <p><strong>片段 2：自定义循环模型的初始状态与前向</strong></p>
+    <pre class="code"><code>import torch
+import torch.nn as nn
+from ray.rllib.models.torch.torch_modelv2 import TorchModelV2
+
+class RecurrentQNet(TorchModelV2, nn.Module):
+    """自定义循环模型：显式定义初始状态与逐步前向。
+    state 结构为 [h, c]，各 (batch, cell_size)。"""
+    def __init__(self, obs_space, action_space, num_outputs, model_config, name):
+        TorchModelV2.__init__(self, obs_space, action_space, num_outputs, model_config, name)
+        nn.Module.__init__(self)
+        self.cell = model_config["custom_model_config"]["cell_size"]
+        self.fc = nn.Linear(obs_space.shape[0], 128)
+        self.lstm = nn.LSTM(128, self.cell, batch_first=True)
+        self.pi = nn.Linear(self.cell, num_outputs)
+        self.vf = nn.Linear(self.cell, 1)
+
+    def get_initial_state(self):
+        # 回合开始注入零状态：旧记忆绝不能泄漏进新回合
+        return [torch.zeros(self.cell), torch.zeros(self.cell)]
+
+    def forward(self, input_dict, state, seq_lens):
+        # 观测先过特征层，再送入 LSTM；seq_lens 供框架标记序列边界
+        x = torch.relu(self.fc(input_dict["obs_flat"].float()))
+        h, c = state[0].unsqueeze(0), state[1].unsqueeze(0)
+        out, (h_new, c_new) = self.lstm(x.unsqueeze(1), (h, c))
+        out = out.squeeze(1)
+        logits = self.pi(out)
+        self._value = self.vf(out).squeeze(-1)
+        # 返回新状态：采样器把它作为下一步的 state in 写回
+        return logits, [h_new.squeeze(0), c_new.squeeze(0)]
+
+    def value_function(self):
+        return self._value</code></pre>
+    <p>解读：逐块说明。<strong>（1）</strong>初始状态必须是零张量且形状与运行时一致，形状不匹配在批量训练阶段才暴露，错误信息常常指向 LSTM 内部，调试时应先核对状态维度。<strong>（2）</strong>前向的输入是展平观测，上一时刻的状态通过参数传入，返回的新状态由采样器传播；训练时框架把序列展开，逐步调用同一前向。<strong>（3）</strong>价值头与策略头共享 LSTM 输出，梯度同时回流到循环层，这也是循环策略价值估计震荡时的排查点之一。接口随版本演进，新版以 RLModule 的形式组织模型与学习器。</p>
+
+    <p><strong>片段 3：样本批次的序列结构巡检</strong></p>
+    <pre class="code"><code>import numpy as np
+
+def inspect_sequence(batch, max_seq_len=32):
+    """检查循环批次的三要素：状态字段、边界标记、填充掩码。"""
+    n = batch["obs"].shape[0]
+    print("样本数=", n, "会不会整除=", n % max_seq_len == 0)
+    # 状态字段：有 state_in/state_out 说明框架按序列组织了数据
+    has_state = "state_in_0" in batch and "state_out_0" in batch
+    print("含状态字段=", has_state)
+    # 边界标记：序列首步的 state_in 应接近零，这是回合起源的特征标识
+    first_states = batch["state_in_0"][::max_seq_len]
+    print("序列首状态范数均值=", first_states.abs().mean().item())
+    # 若该值明显大于零，检查采样器是否把上一回合的终态带进了新序列
+    dones = batch.get("dones")
+    if dones is not None:
+        print("回合终止样本占比=", float(np.mean(dones)))
+    return has_state</code></pre>
+    <p>解读：巡检函数把抽象约束落成四个可读数字。<strong>（1）</strong>整除检查直接暴露批次组织错误。<strong>（2）</strong>序列首状态范数是最有价值的一项：健康训练中它接近零，数值偏大意味着状态跨回合泄漏，此类错误会让评估性能虚高或虚低且难以定位。<strong>（3）</strong>终止占比用于交叉验证序列切分与回合边界是否吻合。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>批次不满足整除约束</strong>：训练启动即报形状错误，或尾部样本被静默丢弃导致实际批次小于配置值。修复：用统一函数对齐批次大小，多环境场景按 <code>max_seq_len × num_envs_per_env_runner</code> 校验。</li>
+      <li><strong>回合边界未清零状态</strong>：上一局的信息泄漏进新局，表现为评估曲线虚高但上线性能不符，或早期回合表现异常。修复：检查初始状态注入与采样器的边界处理，用片段 3 的首状态范数巡检。</li>
+      <li><strong>填充位参与损失</strong>：短回合补零的假转移被计入梯度，价值函数在零观测上产生偏差。修复：确认自定义模型与损失使用边界掩码，序列内遇终止立即切断回传。</li>
+      <li><strong>序列长度与任务时程错配</strong>：记忆时程要求 50 步而配置 20，策略学不到完整依赖；反向配置则显存无谓翻倍。修复：用上界实验估计关键时程，从该量级的 1 至 2 倍起步。</li>
+      <li><strong>默认帧堆叠与 LSTM 重复投入</strong>：环境已做帧堆叠又启用 LSTM，计算成本叠加而收益有限。修复：二选一，用同等采样预算做对照实验决定。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>计算：<code>max_seq_len=20</code>、<code>num_envs_per_env_runner=3</code>，列出 8192 附近满足整除约束的三个批次取值。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>单环境需要 20 的倍数且总量除以 60 为整数，按 60 的公倍数向下取整，如 7980、8040、8100 等待选。</div></details>
+      </li>
+      <li>把 <code>max_seq_len</code> 从 32 改为 8 与 128，预测显存占用、单次更新耗时、可学习时程与最终性能四个量的变化方向。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>显存与耗时近似随序列长度线性上升；时程能力随长度增加；性能先升后饱和，过长还可能因梯度噪声累积而波动。</div></details>
+      </li>
+      <li>设计"帧堆叠对比 LSTM"的对照实验：固定采样总步数与网络参数量级，给出评测指标与结论表述方式。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>参数量对齐可用堆叠帧数乘特征层宽度的组合；指标选收敛步数、最终回报、遮挡条件下的回报保持率；结论按同时满足两条件才判 LSTM 更优。</div></details>
+      </li>
+      <li>推导：TBPTT 把长序列截断为长度 T 的片段，证明被截断的梯度项与完整梯度相差的一个因子与折扣 γ<sup>T</sup> 同阶，并解释它为什么对长时程任务不公平。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>超过 T 步的依赖其梯度贡献被折扣与截断双重衰减，γ<sup>T</sup> 越小损失越多；这解释了长时程信用分配需要更大 T 或层次化结构。</div></details>
+      </li>
+      <li>解释预热（Burn-in）为什么能改善状态估计：从"序列起点状态与真实隐状态存在偏差"这一事实出发分析，并说明预热步数与序列长度的折中。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>训练序列从缓冲区截取，起点希望状态为零但真实历史更长；预热让 LSTM 先用无梯度前向消化若干步，缩小状态估计误差，代价是额外计算。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>部分可观测环境下最优策略依赖历史，循环网络的隐状态承担信念摘要的角色。</li>
+      <li>LSTM 门控结构让梯度沿时间传播更稳定，细胞状态与隐输出共同构成策略的状态对。</li>
+      <li>序列打包引入整除约束：批次大小须为序列长度与并行环境数之积的公倍数。</li>
+      <li>状态生命周期三规则：回合起始零状态、逐步传递 state out、序列间切断梯度；填充位必须掩码。</li>
+      <li>序列长度是时程能力与计算成本的杠杆，须按任务关键时间尺度选取并做对照验证。</li>
+      <li>下一章把单智能体循环策略的经验扩展到多智能体：结构化环境接口、智能体分组与逐策略训练组织。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch044.html">← 第 044 章：RLlib自定义奖励归一化</a>
+    <a class="next" href="ch046.html">第 046 章：RLlib多智能体训练 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

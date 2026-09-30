@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第028章 RLlib使用GPU训练 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · RLlib 核心接口与训练</span>
+    <span class="sep">/</span>
+    <span>第 028 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · RLlib 核心接口与训练</div>
+    <h1>第 028 章：RLlib使用GPU训练</h1>
+    <p class="lead">GPU 在训练循环中有两个参与点：采样前向推理与学习反向更新。本章讲清资源声明的语义、主机与设备之间的数据搬运开销、GPU 收益的判定条件，以及显存与并行度的规划方法。</p>
+    <ul class="meta">
+      <li>主题：RLlib 训练 / 加速器资源</li>
+      <li>关键机制：推理与学习分工、主机设备搬运、分数 GPU 共享、利用率诊断</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 027 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解训练循环中 GPU 的两类参与点及其算力特征差异。</li>
+      <li>掌握资源声明语义：学习器 GPU 配额与采样进程 GPU 配额的区别与相乘关系。</li>
+      <li>会估算主机到设备的搬运开销，判断小批量下 GPU 是否带来净收益。</li>
+      <li>会用利用率与耗时指标定位 GPU 空转或显存瓶颈，指导批次与并行度调整。</li>
+      <li>会规划分数 GPU 共享方式，理解上下文切换与显存竞争带来的代价。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>策略网络的规模增长与图像类观测的普及，让学习阶段的矩阵运算成为训练耗时的主要部分。把学习更新放到 GPU 上执行，可以显著缩短每轮迭代时间。与此同时，采样阶段也在调用策略网络做前向推理，推理发生在采样进程内，默认运行在 CPU 上。</p>
+    <p>资源分配常被忽略的事实：加速器同时改变计算速度、搬运成本与占用粒度。小网络小批次时，搬运与调度开销可能超过计算节省。配置顺序是测量瓶颈、分配资源、用指标验证；任何一步跳过都容易得到相反效果。上一章完成离线训练路径，本章讨论加速器的共性配置。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p>GPU 的收益取决于计算密度与搬运成本之比，两类参与点需要分别评估。</p>
+
+    <h3>1. 两类参与点与算力特征</h3>
+    <p>学习更新处理整批样本的张量运算：批量越大，利用率越好。采样推理相反：单步前向的批量等于并行环境数，规模小，且与步骤调度交错，延迟敏感。<strong>默认把 GPU 留给学习器，采样进程用 CPU 推理；</strong>模型足够大、推理成为采样瓶颈时再给采样分配小份额配额。</p>
+
+    <h3>2. 数据搬运与重叠</h3>
+    <p>每轮更新前，样本批次从主机内存搬到显存；更新完成后参数可能搬回采样侧。搬运时间与字节数成正比；计算时间在大批量区间随批量增长。两者叠加构成设备侧耗时：</p>
+    <div class="formula">
+      T<sub>device</sub> ≈ T<sub>copy</sub> + T<sub>compute</sub>，批量小的时候 T<sub>copy</sub> 占比高
+      <span class="note">搬运与计算可以通过异步拷贝（Asynchronous Copy）部分重叠；持续分配与释放显存会引入额外开销，复用缓冲区可降低单轮成本</span>
+    </div>
+    <p>工程含义直接：<strong>GPU 上的有效批量不能太小。</strong>把训练批次从 2000 提到 8000 到 16000 的区间，搬运占比明显下降；同时学习率需要按批次比例适度上调，否则有效更新步长反而变小。</p>
+
+    <h3>3. 资源声明的语义</h3>
+    <p>学习器侧声明（num_gpus）决定学习进程可见的 GPU 数；采样侧声明（num_gpus_per_env_runner）是每进程配额，可取分数值，例如 0.1 表示十个进程共享一卡。分数共享由运行时累加记账，不超卖。<strong>两类声明相乘构成整机 GPU 占用，规划时要与集群容量核对</strong>（接口名称随版本演进，以对应 Ray 版本的官方文档为准）。</p>
+
+    <h3>4. 收益判定与利用率诊断</h3>
+    <p>判定顺序：先测 CPU 基线的迭代时间与耗时占比；学习阶段是瓶颈且单批规模足够时，分配 GPU 才有意义。分配后看三项信号：学习耗时、设备利用率、显存余量。利用率低说明批次小或供给不足；显存接近上限则缩小批次或减少并行进程。<strong>加卡不加吞吐时，先检查搬运与等待，再怀疑算力。</strong></p>
+
+    <h3>5. 搬运与计算的数值分解</h3>
+    <p>取带宽 10 GB/s、单样本 4 KB、每样本计算 8 微秒、每轮固定搬运 0.5 MB（参数与缓冲回传）代入分解：</p>
+    <table>
+      <tr><th>批量</th><th>拷贝时间（毫秒）</th><th>计算时间（毫秒）</th><th>拷贝占比</th></tr>
+      <tr><td>2000</td><td>0.87</td><td>16.0</td><td>约 5.2%</td></tr>
+      <tr><td>8000</td><td>3.33</td><td>64.0</td><td>约 4.9%</td></tr>
+      <tr><td>16000</td><td>6.60</td><td>128.0</td><td>约 4.9%</td></tr>
+    </table>
+    <p>拷贝中的固定部分被摊薄后占比微降，占比的绝对值说明该参数组合下搬运尚不构成主要矛盾；<strong>这类配置的批量收益主要来自计算单元利用率的提升，</strong>小批量时每样本计算耗时偏长，大批量逐渐逼近峰值吞吐。把单样本字节数换成 48 KB 的图像观测，拷贝时间同比例放大十二倍，占比升到三成以上，此时放大批量与启用异步拷贝的收益才变得明显。</p>
+
+    <h3>6. 收益交叉点的数值示例</h3>
+    <p>把设备选择写成批量规模的函数。设 GPU 每轮固定开销 30 毫秒（内核启动、流同步与固定搬运），大批量下每样本计算 0.5 微秒；CPU 每样本 8 微秒且固定项可忽略。两侧耗时相等处即交叉点：</p>
+    <div class="formula">
+      n* = F<sub>g</sub> / (c<sub>cpu</sub> − c<sub>gpu</sub>) = 30 毫秒 / (8 微秒 − 0.5 微秒) ≈ 4000
+      <span class="note">n* 以下 CPU 更快，n* 以上 GPU 更快；固定开销越大或两设备单样本速度差越小，交叉点越靠右</span>
+    </div>
+    <p>代入验证：批量 1000 时 CPU 约 8 毫秒、GPU 约 30.5 毫秒，GPU 慢约 3.8 倍；批量 4000 时两侧持平在 32 毫秒附近；批量 16000 时 CPU 约 128 毫秒、GPU 约 38 毫秒，GPU 快约 3.4 倍。<strong>交叉点左侧使用 GPU 属于负收益，批次扫描实验的意义就是测出该点的位置。</strong>真实交叉点受模型结构、内核实现与设备代际影响，估算值用于设计搜索区间，最终以实测为准。</p>
+
+    <h3>7. 资源声明组合的对比</h3>
+    <table>
+      <tr><th>配置</th><th>学习侧</th><th>采样侧</th><th>搬运动作</th><th>适用情形</th></tr>
+      <tr><td>全 CPU</td><td>CPU 更新</td><td>CPU 推理</td><td>无设备搬运</td><td>小网络、小批量、无 GPU 资源</td></tr>
+      <tr><td>学习单卡</td><td>GPU 更新</td><td>CPU 推理</td><td>每轮样本上行、参数下行</td><td>默认起点，中等以上网络规模</td></tr>
+      <tr><td>学习加采样小配额</td><td>GPU 更新</td><td>分数 GPU 推理</td><td>增加推理侧输入搬运</td><td>推理成为采样瓶颈的大模型任务</td></tr>
+      <tr><td>学习加采样整卡</td><td>GPU 更新</td><td>专用卡推理</td><td>采样侧计算独立</td><td>图像编码器推理重、显存充足</td></tr>
+    </table>
+    <p>选择依据：先排除搬运与调度收益为负的小批量场景，从学习单卡起步；采样侧配额仅在推理耗时占采样阶段主要部分时启用，启用后复核采样吞吐与显存余量，确认没有挤占学习侧显存。采样侧与学习侧共享同一张卡时，先安排学习侧的整卡预算再评估拆分方案。分数配额的调度粒度等于声明值：声明 0.25 时一张卡最多承载四个进程，声明总和由调度器累加核对，超卖不会发生。</p>
+
+    <h3>8. 显存预算的组成</h3>
+    <p>显存常驻项按参数量估算：参数与梯度各一份，优化器状态通常两份（一阶与二阶矩），合计约为参数字节的四倍；100 万参数按 float32 计约 16 MB 常驻。浮动项是激活与批次数据，随内部小批规模与网络宽度线性增长，图像编码器会显著抬高该项。<strong>规划顺序：先按常驻项确定模型占用，再把内部小批逐档放大并记录显存峰值，在七成到八成占用处停下，</strong>为评测缓冲区与临时张量留出余量。</p>
+
+    <h3>9. 互联通道、参数回传与激活占用的量化</h3>
+    <p>搬运时间的量级由通道带宽决定，三个常见档位的对照如下（按 32 MB 批次的单向拷贝计）：</p>
+    <table>
+      <tr><th>通道</th><th>有效带宽量级</th><th>32 MB 拷贝耗时</th><th>适用判断</th></tr>
+      <tr><td>PCIe 3.0 × 16</td><td>约 10 GB/s</td><td>约 3.2 毫秒</td><td>单机入门的默认通道</td></tr>
+      <tr><td>PCIe 4.0 × 16</td><td>约 22 GB/s</td><td>约 1.5 毫秒</td><td>搬运占比随代际减半</td></tr>
+      <tr><td>高速卡间互联</td><td>约 300 GB/s</td><td>约 0.11 毫秒</td><td>多卡梯度同步的专用通道</td></tr>
+    </table>
+    <p>表中耗时本身不构成压力，32 MB 的整批搬运每轮只发生少数几次。<strong>容易被忽略的是采样侧参数回传：进程持有显卡策略副本时，每轮都要下发最新参数，成本与参数量和进程数都成正比。</strong>5000 万参数按单精度约 200 MB，10 GB/s 通道下发给 2 个采样进程约 40 毫秒，6 个进程约 120 毫秒；学习阶段每轮百余毫秒时，这笔固定开销足以吞掉单卡拆分的收益。这就是"默认 CPU 推理"建议的量化依据：在推理未成为瓶颈前，采样侧留在处理器上，参数回传为零。</p>
+    <div class="formula">
+      参数回传耗时 ≈ 参数字节数 × 采样进程数 / 通道带宽（同通道串行下发时）
+      <span class="note">5000 万参数约 200 MB：2 进程 40 毫秒、6 进程 120 毫秒；进程数或参数量任一翻倍，回传成本同步翻倍</span>
+    </div>
+    <p>显存占用同样可以按张量算。全连接层宽度 256、内部小批 512 时，单层激活为 512 × 256 × 4 字节 = 512 KB；卷积层按 512 × 20 × 20 × 32 的激活形状算，单个张量约 26 MB，是前者的五十倍。<strong>图像任务的显存大头落在卷积激活与批次对象上，缩小内部小批或启用梯度检查点，比缩小模型宽度更直接。</strong>搬运、回传与激活三项账目连同显存预算表放在一起，才能对"哪一项先成为上限"给出有依据的判断。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>资源规划流程：基线测量、瓶颈定位、资源分配、批次匹配、指标验证。</p>
+    <table>
+      <tr><th>参数</th><th>示例值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td><code>num_gpus</code></td><td>1</td><td>学习器可见 GPU 数</td><td>单卡起步，按学习耗时占比扩展</td></tr>
+      <tr><td><code>num_gpus_per_env_runner</code></td><td>0</td><td>采样进程 GPU 配额</td><td>默认留空；推理成为瓶颈时给小数配额</td></tr>
+      <tr><td><code>train_batch_size</code></td><td>8000</td><td>单轮学习样本量</td><td>放大到搬运占比低于计算占比的区间</td></tr>
+      <tr><td><code>sgd_minibatch_size</code></td><td>512</td><td>学习内部小批</td><td>小批过小则核内利用率不足，过大则显存紧张</td></tr>
+      <tr><td><code>num_env_runners</code></td><td>6</td><td>采样进程数</td><td>CPU 核数减一至二，防止与学习抢核</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：为什么小网络小批次加 GPU 会更慢？</span>
+      <p>小批量下批级矩阵运算无法填满 GPU 的并行单元，计算时间没有明显下降；而每次迭代固定付出内核启动、流同步与主机设备拷贝的成本，这些成本与批量大小弱相关。两侧叠加后，设备侧总耗时可能高于 CPU 直接计算。<strong>评估方式是批次扫描实验：同配置分别在 CPU 与 GPU 跑若干轮，比较学习耗时，找到收益由负转正的交叉点。</strong></p>
+    </div>
+    <p>采样侧启用 GPU 的判断标准：单步推理耗时占采样步周期的比例超过三成，且模型属于百万参数以上的图像编码网络；启用后配额从 0.1 至 0.25 的小额起步，观察采样吞吐与学习侧显存余量的变化。重叠执行的实现方式是用多个流把拷贝与计算交错推进，并把大块拷贝拆成若干段流水线化，实际效果受内核调度影响，以实测校准。</p>
+    <p><strong>流水线重叠的收益上界等于拷贝时间本身，先按字节数预估值不值得做：</strong>低维场景批量 2000 时拷贝约 0.87 毫秒、计算约 16 毫秒，重叠最多压掉设备侧百分之五；图像观测在同一批量下单样本 48 KB，拷贝升到约 9.6 毫秒，重叠能压掉设备侧近四成。前者不值得引入多流实现，后者属于显式收益；先算这个比值，再决定是否投入重叠改造。</p>
+    <p>资源校准的扫描顺序：先声明学习单卡与采样零配额跑基线，记录学习耗时；把训练批次从 4000 逐档扫到 16000，记录学习耗时与显存峰值；若 16000 仍未进入计算主导区间，说明模型规模偏小，收益转向模型层面的优化。固定显存缓冲复用是常规手段：每个小批处理前把输入写入预分配缓冲，避免分配器碎片化与反复申请。省显存的常用手段按优先级排列：缩小小批、缩小模型宽度、启用梯度检查点、降低计算精度；前两项影响拟合能力，后两项需要核对数值稳定性后再采用。批次扫描实验建议在两类样本体积上各做一遍（低维状态与图像观测），同时观察搬运占比对字节数的敏感度。</p>
+    <p>与上一章差异：第 027 章的离线监督训练以大批次计算为主，GPU 收益最明显；本章扩展到在线训练，覆盖推理与学习的算力分工。下一章讨论多卡与梯度同步。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：GPU 资源声明与批次匹配</strong></p>
+    <pre class="code"><code>from ray.rllib.algorithms.ppo import PPOConfig
+
+config = (
+    PPOConfig()
+    .resources(num_gpus=1)                   # 学习器使用一张卡执行反向更新
+    .env_runners(
+        num_env_runners=6,
+        num_envs_per_env_runner=2,
+        num_gpus_per_env_runner=0,           # 采样先用 CPU 推理，避免无谓搬运
+    )
+    .training(
+        train_batch_size=8000,               # 大批次摊薄搬运与内核启动开销
+        sgd_minibatch_size=512,              # 学习内部小批：兼顾利用率与显存
+        lr=3e-4,
+    )
+)
+algo = config.build_algo()
+result = algo.train()
+print(result["info"]["timers"]["learn_time_ms"])   # 学习耗时是否下降</code></pre>
+    <p>解读：配置把资源与批次放在一起决定。<strong>采样配额为零是默认起点：</strong>推理批量等于并行环境数，规模小，CPU 推理避免了每步的主机设备往返；学习侧指定一卡，批次留出足够规模填满计算单元。校准顺序是先测学习耗时，再定批次，最后考虑采样配额。键名随版本演进（新 API 栈中使用 learner 相关配置项），迁移时以官方文档为准。</p>
+
+    <p><strong>片段 2：搬运与计算的耗时分解</strong></p>
+    <pre class="code"><code>def device_time_breakdown(batch_bytes, compute_per_sample_s, n_samples,
+                          copy_gbps=10.0):
+    """估算设备侧耗时：拷贝时间与计算时间分开计量。"""
+    copy_s = batch_bytes / (copy_gbps * 1e9)      # 主机到设备单向拷贝
+    compute_s = compute_per_sample_s * n_samples  # 批级张量运算的近似线性项
+    total = copy_s + compute_s
+    return {
+        "copy_ms": 1000 * copy_s,
+        "compute_ms": 1000 * compute_s,
+        "copy_share": copy_s / total,             # 拷贝占比：判断批次是否偏小
+    }
+
+
+# 单样本 4 KB、每样本计算 8 微秒：批量从 2000 提到 16000 时拷贝占比显著下降
+for n in (2000, 8000, 16000):
+    row = device_time_breakdown(4 * 1024 * n, 8e-6, n)
+    print(n, round(row["copy_ms"], 2), round(row["compute_ms"], 2),
+          round(row["copy_share"], 3))</code></pre>
+    <p>解读：分解模型把"批次要不要继续放大"变成可计算的问题。拷贝时间随批量线性增长，计算时间在批量区间内近似线性增长，但拷贝占比随批量增大而下降，因为每轮的固定拷贝（例如参数回传）被摊薄。<strong>拷贝占比高于两成时优先放大批量或启用异步拷贝；计算占绝对主导后应转向模型或算法层面的优化。</strong>实测时分别记录拷贝与计算区间，与估算模型对照校准。</p>
+
+    <p><strong>片段 3：小批次对照实验</strong></p>
+    <pre class="code"><code>def compare_device(env_factory, batch_sizes=(512, 2048, 8192)):
+    """同一配置在 CPU 与 GPU 上分别学习，找出收益转正的批次区间。"""
+    records = []
+    for bs in batch_sizes:
+        for device in ("cpu", "gpu"):
+            # 构建算法时只切换资源声明，其余配置保持完全一致
+            cfg = make_config(env_factory, batch=bs, gpus=1 if device == "gpu" else 0)
+            algo = cfg.build_algo()
+            algo.train()                       # 预热一轮，排除首次编译与分配
+            learn_ms = algo.train()["info"]["timers"]["learn_time_ms"]
+            records.append({"batch": bs, "device": device, "learn_ms": learn_ms})
+            algo.stop()
+    # 返回按批次分组的对照表：同一批次下 GPU 相对 CPU 的加速比
+    return records</code></pre>
+    <p>解读：设计要点是单变量：批次与设备交叉，其余固定；每个组合预热一轮，排除首次分配与编译开销。<strong>输出表格回答一个具体问题：在哪个批次之上 GPU 明显更快。</strong>小批次行 GPU 更慢属正常，说明搬运与启动开销占主导；交叉点以上的区间才是 GPU 配置的适用范围。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>默认加卡就会更快</strong>：小网络小批次下 GPU 学习耗时反而高于 CPU。症状是配置 GPU 后迭代时间不变或变长。修复：做批次扫描找到交叉点，小规模场景留在 CPU。</li>
+      <li><strong>多个采样进程共享半张卡</strong>：推理与上下文切换相互干扰。症状是采样吞吐抖动、设备利用率不高。修复：采样侧要么整卡分配给少量进程，要么保持 CPU 推理。</li>
+      <li><strong>显存接近上限时继续放大批次</strong>：批次与中间激活共同占用显存。症状是运行中途显存溢出。修复：按激活规模反推批次上限，留出两成余量。</li>
+      <li><strong>忽略参数回传成本</strong>：采样进程持有 GPU 策略副本时，每轮参数同步都要搬运。症状是迭代时间出现规律的峰值。修复：评估参数广播字节数与频率，或让采样侧使用 CPU。</li>
+      <li><strong>以利用率低推断算力不足</strong>：利用率低多为数据供给或批次过小。症状是加卡后利用率仍然偏低。修复：先提高样本供给与批次规模，再评估设备数量。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>单样本 4 KB、批量 2000 时估算拷贝占比；说明批量放大四倍后占比的变化方向与原因。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>拷贝时间随批量线性增长，但固定部分（参数、缓冲）被摊薄；占比随批量增大而下降，具体数值代入分解模型即可。</div></details>
+      </li>
+      <li>训练批次从 4000 提到 16000，预测学习耗时与显存占用变化，并给出学习率的调整方向。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>学习耗时上升但边际递减，显存占用随批次与激活增长；有效步长变大，学习率应向大调整或保持等待验证。</div></details>
+      </li>
+      <li>推导：说明拷贝时间占设备侧耗时比例随批量变化的渐近趋势，以及异步拷贝能改善哪一部分。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>占比随批量增大趋近一个由每样本字节数与计算密度决定的常数；异步拷贝把搬运与计算重叠，削减的是串行相加中的拷贝项。</div></details>
+      </li>
+      <li>设计诊断流程：给定学习耗时、设备利用率与显存占用三项指标，分别给出批次偏小、数据供给不足、显存紧张三种场景的判据。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>批次偏小表现为利用率低且拷贝占比高；供给不足表现为利用率随迭代周期波动；显存紧张表现为占用贴近上限且批次放大即溢出。</div></details>
+      </li>
+      <li>设计实验：在图像观测任务上比较采样侧 CPU 推理与小数 GPU 配额的端到端迭代时间，给出结论与适用条件。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>固定学习侧配置，仅切换采样侧配额；比较 sample_throughput 与迭代时间，大模型图像任务在配额充足时推理更快，小模型则相反。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>GPU 参与两类负载：学习更新的大批量张量运算与采样推理的小批量前向。</li>
+      <li>默认把 GPU 留给学习器，采样进程用 CPU 推理；推理成为瓶颈时再考虑小数配额。</li>
+      <li>设备侧耗时由拷贝与计算构成，小批量下拷贝占比高，放大批次是首要调节手段。</li>
+      <li>资源声明按角色区分，分数配额由调度器累加记账，规划时核对整机容量。</li>
+      <li>收益判定基于对照实验：批次扫描找到交叉点，利用率与显存指标验证配置。</li>
+      <li>下一章进入多 GPU 训练：梯度同步的通信结构与多卡扩展效率。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch027.html">← 第 027 章：RLlib离线数据与行为克隆</a>
+    <a class="next" href="ch029.html">第 029 章：RLlib多GPU分布式训练 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

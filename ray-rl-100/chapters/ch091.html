@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第091章 模型部署：从训练到服务 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第五篇 · 训练工程与系统进阶</span>
+    <span class="sep">/</span>
+    <span>第 091 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第五篇 · 训练工程与系统进阶</div>
+    <h1>第 091 章：模型部署：从训练到服务</h1>
+    <p class="lead">一句话：本章讲策略从检查点走向在线服务的完整链路：导出与冻结、动态批处理（Dynamic Batching）、会话状态管理与前后处理一致性。</p>
+    <ul class="meta">
+      <li>主题：训练工程 / 模型部署（Model Deployment）</li>
+      <li>关键机制：推理图导出、动态批处理、时延与吞吐权衡、有状态会话</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 090 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>掌握策略导出的完整产物清单：推理图、前处理统计量、动作解码规则与版本标识。</li>
+      <li>理解训练与服务之间前处理不一致（Train-Serve Skew）的成因与检测方法。</li>
+      <li>掌握动态批处理的参数：最大批大小与等待超时，以及它们对时延与吞吐的相反作用。</li>
+      <li>会为循环策略设计会话状态（Session State）管理：键的选取、状态的生命周期与过期清理。</li>
+      <li>会部署一个最小策略服务并验证其行为与训练时一致。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>训练得到的策略最终要以推理服务的形态提供动作输出：控制回路的每个决策点上，服务接收观测、返回动作，时延进入闭环控制周期。<strong>部署的核心计量是两个相互制约的指标：单次请求的时延（Latency）与每秒可处理的请求数（Throughput）。</strong>强化学习推理有两点特殊：策略网络包含随机采样与状态（循环网络）等训练期概念，服务端需要明确其取舍；观测前处理（归一化、帧堆叠、缩放）在训练流水线中是隐式的，部署时必须显式复现，否则服务输出与训练行为系统性偏离。</p>
+    <p>本课程前二十章重训练、轻推理，源于一个事实：策略的价值最终由闭环行为检验，而行为由部署链路决定。把训练与部署的边界画清楚（哪些状态随模型走、哪些在服务端维护、哪些由调用方提供），是本章的任务。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p><strong>部署的原理可以概括为：把训练时的完整决策函数拆分为"随模型走的部分"与"服务端维护的部分"，再为批处理选择时延与吞吐的工作点。</strong>本节按导出、一致性、批处理与状态依次展开。</p>
+
+    <h3>1. 导出链路与产物清单</h3>
+    <p>导出的起点是检查点，终点是一组自包含的推理产物。因为训练框架与推理环境的依赖往往不同，标准做法是导出为通用推理格式（如 TorchScript 或 ONNX），并在服务端以最小依赖加载。导出物的完整清单包括四类：</p>
+    <ul>
+      <li><strong>推理计算图</strong>：网络参数与结构固化的前向计算，处于推理模式（关闭丢弃与批归一化的训练行为），随机采样按需要固定为分布参数输出或确定性输出。</li>
+      <li><strong>前处理统计量</strong>：观测归一化的均值与方差、帧堆叠规则、缩放与通道顺序，这些量在训练中由包装器持有，导出时容易遗漏。</li>
+      <li><strong>动作解码规则</strong>：连续动作的缩放与裁剪边界、离散动作的概率到采样映射、动作语义的版本。</li>
+      <li><strong>版本标识</strong>：训练配置、代码版本与随机种子的标识，用于服务与实验记录的对应（第 098 章展开）。</li>
+    </ul>
+    <p>产物清单的意义在于自包含：<strong>推理产物配上清单应与训练环境中的策略行为逐位对齐</strong>，任何一项缺失都要在服务端"凭记忆补"，这就是不一致的入口。</p>
+
+    <h3>2. 前处理一致性</h3>
+    <p>训练与服务不一致的典型表现是"评测回报高、上线表现差"，根因多为前处理差异：归一化统计量不同（用训练末态统计量与训练初态统计量、或干脆不归一化）、帧堆叠的拼接顺序不同（新帧在前或在后）、图像缩放算法不同（最近邻与双线性在细粒度输入上差异可观）。检测方法有两种：离线回放一批训练期观测，比较服务端与训练端的输出差异；或把同一观测同时喂给训练中的策略与推理产物，断言动作分布一致。<strong>把前处理实现为导出产物的一部分并从同一个代码路径导出，是消除该类差异的根本方案。</strong></p>
+
+    <h3>3. 动态批处理与工作点</h3>
+    <p>单次推理的固定开销（请求解析、张量组装、核启动）在批处理下被摊薄：一批 b 条观测共享一次前向的固定成本。吞吐与时延的模型为：</p>
+    <div class="formula">
+      Throughput(b) ≈ b / ( c(b) + c<sub>0</sub> )，Latency(b) ≈ w(b) + c(b)
+      <span class="note">c(b) 为批计算时间，c<sub>0</sub> 为每批固定开销，w(b) 为凑批等待时间，随批大小增长</span>
+    </div>
+    <p>批越大吞吐越高，但凑批等待推高时延；工作点由控制回路的周期决定：<strong>时延预算 = 控制周期减去传输与执行余量，等待超时必须显著小于该预算。</strong>动态批处理的实现方式是队列加两个参数：最大批大小限制单批计算量，等待超时限制凑批时长；请求到达即入队，凑满或超时即触发前向。参数标定顺序：先测不同批大小的计算时间，画吞吐与时延曲线，按时延预算反查最大批大小。</p>
+    <p>GPU 推理要注意批的收益与显存的边界：小网络在 GPU 上批处理的边际收益有限，核启动开销与显存搬运可能使小批量下 CPU 推理更快，标定时两种设备都要测。训练与服务共享硬件时，推理进程按第 089 章的分数资源声明，避免显存超卖。</p>
+
+    <h3>4. 有状态策略的会话管理</h3>
+    <p>循环策略（如 LSTM 策略）的决策依赖隐藏状态，服务端必须为每个决策流维护状态序列。设计要点有四个：<strong>键的设计</strong>，用调用方提供的会话标识作键，键的空间与业务实体对应；<strong>状态的所有权</strong>，状态由服务端持有并在每次请求后更新，调用方只传标识；<strong>生命周期</strong>，为状态设置过期时间与容量上限，超限时按最久未用淘汰；<strong>一致性</strong>，同一会话的请求需顺序处理或带序号，乱序到达会污染状态序列。</p>
+    <p>无状态策略应坚持无状态实现：状态是故障恢复的负担（第 090 章）与水平扩容的障碍。选择循环结构前先评估"用观测堆叠替代历史"的可行性，多数部分可观测任务可以用堆叠近若干帧的观测近似，从而把服务保持在无状态形态。</p>
+
+    <h3>5. 版本与切换</h3>
+    <p>策略更新意味着服务切换。切换的最小正确做法是双版本并存与流量切换：新版本加载完成后先以影子流量（Shadow Traffic）回放验证输出合理性，再逐步切换真实流量。<strong>版本标识必须进入请求日志</strong>，使线上行为可回溯到具体训练检查点。回滚以版本为单位执行，回滚目标限定为上一个通过验证的版本，任意历史版本都不在考虑范围。滚动切换期间，同一闭环控制流应尽量保持单一版本，避免控制序列在不同版本间跳变。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>部署流程分六步，每一步有明确的验收动作。</p>
+    <ol>
+      <li><strong>导出推理产物</strong>：从检查点生成推理图与前处理统计，写入清单文件。</li>
+      <li><strong>离线对齐验证</strong>：回放训练期观测，断言服务端与训练端输出一致（容差按动作维度给定）。</li>
+      <li><strong>标定批参数</strong>：测吞吐与时延曲线，按控制周期定最大批大小与等待超时。</li>
+      <li><strong>实现会话管理</strong>（如需）：状态键、过期与容量策略、顺序处理约定。</li>
+      <li><strong>部署与影子验证</strong>：新版本先接入影子流量，通过后再切换。</li>
+      <li><strong>监控与回滚预案</strong>：时延分位数、错误率、版本号入库；回滚路径演练。</li>
+    </ol>
+    <h3>部署参数起点表</h3>
+    <table>
+      <tr><th>参数</th><th>常用起点</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>max_batch_size</td><td>16 至 64</td><td>单批计算上限</td><td>按时延预算与显存标定</td></tr>
+      <tr><td>batch_wait_timeout</td><td>1 至 10 毫秒</td><td>凑批等待</td><td>显著小于控制周期余量</td></tr>
+      <tr><td>num_replicas</td><td>1 起，按请求速率扩</td><td>服务副本数</td><td>副本吞吐叠加后覆盖峰值</td></tr>
+      <tr><td>max_concurrent_queries</td><td>8 至 32</td><td>并发上限</td><td>防止队列无界增长</td></tr>
+      <tr><td>session TTL</td><td>30 至 300 秒</td><td>会话状态过期</td><td>与控制流空闲间隔匹配</td></tr>
+    </table>
+    <div class="box warn">
+      <span class="box-title">与上一章的差异</span>
+      <p>第 090 章的检查点服务于"训练可恢复"，本章的导出卖服务于"推理可复现"。两者共享版本标识与原子写入的纪律，但产物不同：检查点保留全部训练状态，导出物只保留决策函数与它的前处理附件。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>以下片段基于 Ray 2.x 时期的通用写法，接口随版本演进，以对应版本的官方文档为准。</p>
+
+    <p><strong>片段 1：导出推理图与前处理统计清单</strong></p>
+    <pre class="code"><code>import json
+import torch
+
+def export_policy(algo, out_dir):
+    """从训练器导出推理产物：TorchScript 计算图加前处理统计清单。
+    清单自包含是关键：服务端不依赖训练环境的任何隐式状态。"""
+    policy = algo.get_policy()
+    module = policy.model
+    module.eval()                                    # 推理模式：关闭丢弃等训练行为
+    example = torch.zeros(1, *policy.observation_space.shape, dtype=torch.float32)
+    # 冻结计算图：服务端加载时不需要构造训练侧的网络代码
+    traced = torch.jit.trace(module, example)
+    traced.save(f"{out_dir}/policy.pt")
+    # 前处理统计必须随模型导出：训练端由包装器持有，最容易在部署时丢失
+    manifest = {
+        "obs_mean": policy.get_obs_mean().tolist(),       # 归一化均值
+        "obs_std": policy.get_obs_std().tolist(),         # 归一化方差
+        "frame_order": "oldest_first",                    # 帧堆叠顺序约定
+        "action_low": policy.action_space.low.tolist(),
+        "action_high": policy.action_space.high.tolist(),
+    }
+    with open(f"{out_dir}/manifest.json", "w", encoding="utf-8") as fh:
+        json.dump(manifest, fh)                          # 与服务端校验逻辑配套</code></pre>
+    <p>解读：这段导出流程围绕"自包含"组织。<strong>（1）</strong>切换到推理模式再导出：丢弃层与批归一化的训练行为若被固化进图，服务输出会带随机性且与训练统计口径不符。<strong>（2）</strong>追踪只覆盖前向计算，动作采样与解码留给服务端实现，使导出的图在采样策略变化时无需重新导出。<strong>（3）</strong>清单里的帧堆叠顺序与动作边界是与训练端约定的接口契约，服务端启动时校验这些字段的存在性，缺项即拒绝启动，把不一致拦截在部署阶段。</p>
+
+    <p><strong>片段 2：动态批处理部署</strong></p>
+    <pre class="code"><code>import numpy as np
+from ray import serve
+
+@serve.deployment(num_replicas=2, max_ongoing_requests=16)
+class PolicyService:
+    """策略服务：动态批处理把固定开销摊薄到一批请求上。
+    批参数按控制周期的时延预算标定，等待超时须显著小于预算。"""
+    def __init__(self, model_dir):
+        self.model = self._load(model_dir)          # 加载推理图与清单
+
+    def _load(self, path):
+        import torch
+        import json
+        module = torch.jit.load(f"{path}/policy.pt")
+        with open(f"{path}/manifest.json", encoding="utf-8") as fh:
+            self.manifest = json.load(fh)           # 前处理契约随模型加载
+        return module
+
+    @serve.batch(max_batch_size=32, batch_wait_timeout_s=0.005)
+    async def infer(self, observations):
+        """批函数：凑批或超时后统一前向，返回与请求一一对应的动作。"""
+        obs = np.stack(observations).astype(np.float32)
+        # 归一化用导出的统计量：与训练端保持同一变换序列
+        obs = (obs - np.asarray(self.manifest["obs_mean"], dtype=np.float32)) / (
+            np.asarray(self.manifest["obs_std"], dtype=np.float32) + 1e-8)
+        with torch.no_grad():
+            actions = self.model(torch.from_numpy(obs))     # 单次前向服务整批
+        return actions.numpy()
+
+    async def __call__(self, request):
+        obs = np.asarray(await request.json()["obs"], dtype=np.float32)
+        action = await self.infer(obs)
+        return {"action": action.tolist()}</code></pre>
+    <p>解读：这段服务代码展示了批处理与一致性的结合。<strong>（1）</strong><code>serve.batch</code> 装饰器把并发到达的请求聚合成批：32 条上限限制单次计算量，5 毫秒等待超时防止个别请求拖长队列。<strong>（2）</strong>归一化在服务端用导出清单的统计量执行，与训练端同式；统计量缺失时服务无法启动，杜绝静默使用错误参数。<strong>（3）</strong>推理置于 <code>no_grad</code> 下，关闭梯度记录与反向图构建；返回动作按请求顺序展开，顺序对应由装饰器保证。</p>
+
+    <p><strong>片段 3：循环策略的会话状态管理</strong></p>
+    <pre class="code"><code>import time
+
+class SessionStore:
+    """会话状态存储：为循环策略维护隐藏状态序列。
+    容量与过期双限：状态不清理会随会话数无界增长。"""
+    def __init__(self, capacity=10000, ttl_seconds=120):
+        self.capacity = capacity
+        self.ttl = ttl_seconds
+        self.states = {}                              # key -> (state, last_seen)
+        self.order = []                               # 按最久未用淘汰的辅助序列
+
+    def get(self, key, initial_state):
+        now = time.monotonic()
+        self._evict(now)
+        if key not in self.states:
+            # 新会话从初始状态开始：初始状态由模型定义，不由调用方提供
+            self.states[key] = (initial_state, now)
+            self.order.append(key)
+        state, _ = self.states[key]
+        return state
+
+    def put(self, key, state):
+        now = time.monotonic()
+        self.states[key] = (state, now)
+        # 新状态置于序列尾部：头部始终是最久未用键
+        self.order = [k for k in self.order if k != key]
+        self.order.append(key)
+        self._evict(now)
+
+    def _evict(self, now):
+        # 先按过期清理，再按容量淘汰：过期是时间语义，容量是空间语义
+        expired = [k for k, (_, t) in self.states.items() if now - t &gt; self.ttl]
+        for k in expired:
+            self.states.pop(k, None)
+        while len(self.states) &gt; self.capacity:
+            oldest = next((k for k in self.order if k in self.states), None)
+            if oldest is None:
+                break
+            self.states.pop(oldest, None)</code></pre>
+    <p>解读：会话存储把循环策略变成有状态服务，设计围绕"可回收"展开。<strong>（1）</strong>过期与容量是两种独立的回收语义：过期对应业务会话结束，容量对应资源硬上限，两者都要有。<strong>（2）</strong>隐藏状态的初始值由模型定义，调用方只提供标识，避免把模型内部结构泄漏到接口契约。<strong>（3）</strong>同一会话的请求应顺序到达，服务层通过键的路由或序号校验保证；乱序请求会以错误的状态序列前向，表现为动作行为错乱，监控上难以定位，应在接入层拦截。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>归一化统计量未随模型导出</strong>：上线行为与训练评测系统性偏离。修复：统计量进入导出清单，服务启动时强校验。</li>
+      <li><strong>遗忘推理模式切换</strong>：丢弃层生效使输出带随机噪声，批归一化使用运行时统计产生差异。修复：导出前显式切换。<code>eval()</code> 并在对齐测试中校验。</li>
+      <li><strong>等待超时设置过大</strong>：凑批等待超过控制周期余量，闭环抖动。修复：超时按控制周期标定，通常为毫秒量级。</li>
+      <li><strong>有状态策略无清理策略</strong>：会话状态随请求增长，内存持续占用。修复：过期与容量双限，加监控指标。</li>
+      <li><strong>训练与服务共享 GPU 超卖</strong>：推理抢占显存使训练溢出，或训练占满使推理时延飙高。修复：按分数资源声明并放量测峰值，或物理分离。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>计算题：单次前向固定开销 2 毫秒，批计算时间按每样本 0.2 毫秒增长。求批大小 1、8、32 时的单样本平均时延与吞吐，说明工作点选择的依据。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>批 1：2.2 毫秒/条、约 455 条/秒；批 32：8.4 毫秒摊薄后 0.26 毫秒/条、约 3800 条/秒；工作点由时延预算截断。</div></details>
+      </li>
+      <li>预测题：把帧堆叠顺序从"旧帧在前"改为"新帧在前"而不重训模型。预测离线评测、线上行为与诊断指标的走向。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>输入语义改变使动作分布偏移，评测与线上同时变差；用同一观测双端比对的容差测试可立即暴露。</div></details>
+      </li>
+      <li>设计题：为"控制周期 50 毫秒、请求速率峰值 2000 次/秒、部分可观测"的任务设计部署方案：批参数、副本数、循环结构选择与会话策略。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>等待超时不超过 5 毫秒；先按观测堆叠评估无状态可行性；需要循环时再引入会话存储与顺序约束。</div></details>
+      </li>
+      <li>分析题：讨论影子流量验证的对照口径：用什么输入回放、与谁比较、通过判据如何定义，才能同时覆盖数值一致性与行为一致性？<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>输入用训练期观测回放；比较对象为训练端策略输出；数值层面看动作距离分布，行为层面对照回合回报与动作分布。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>导出产物须自包含：推理图、前处理统计、动作解码与版本标识缺一不可。</li>
+      <li>前处理一致性是训练与服务差异的头号来源，离线双端比对是最小检测手段。</li>
+      <li>动态批处理以凑批等待换取吞吐；最大批大小与等待超时按控制周期的时延预算标定。</li>
+      <li>循环策略用会话状态服务化，键、生命周期与顺序是三个设计点；能无状态则无状态。</li>
+      <li>版本切换走影子验证与逐步切换；下一章把这些机制装进第一条端到端流水线。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch090.html">← 第 090 章：训练任务的容错与恢复策略</a>
+    <a class="next" href="ch092.html">第 092 章：端到端实践：Atari风格任务训练流水线 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

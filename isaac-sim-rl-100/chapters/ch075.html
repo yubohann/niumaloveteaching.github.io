@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第075章 实现演示引导的强化学习 | 机器人仿真学习课程 · Isaac Sim 强化学习训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第三篇 · 高级强化学习专题</span>
+    <span class="sep">/</span>
+    <span>第 075 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第三篇 · 高级强化学习专题</div>
+    <p class="lead">先让演示把策略"扶上马"，再让 RL"送一程"：本章讲清模仿学习的复合误差、演示回放与 n 步回报、模仿损失退火，给出样本效率提升的可复现路线。</p>
+    <ul class="meta">
+      <li>主题：示范与 RL 混合训练 / 样本效率</li>
+      <li>相关组件：Isaac Sim / Isaac Lab / PPO / 行为克隆</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 074 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>说清"纯模仿"与"纯 RL"各自的天花板：复合误差 vs 探索瓶颈，理解二者互补的结构。</li>
+      <li>掌握三段式流程：演示采集 → 行为克隆预热 → RL 微调（含演示回放与辅助损失）。</li>
+      <li>会实现带回合边界与 n 步回报的演示回放池，并正确与 RL 经验混合采样。</li>
+      <li>会设计模仿辅助损失的权重退火，兼顾"早期稳定"与"后期超越演示"。</li>
+      <li>会用"达到成功阈值的样本量"作为主指标，量化演示引导相对纯 RL 的加速。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>到这里你已经收集了一类宝贵资产：演示数据（第 073 章为 GAIL 采的，第 074 章为偏好标注采的）。演示的价值不只是"告诉策略怎么做"，更是<strong>把策略快速放到任务相关的状态分布上</strong>，这是纯 RL 最慢的一步。行为克隆（Behavior Cloning, BC）单独用会栽在复合误差上：策略在演示没覆盖到的小偏差状态上没有纠正能力，误差随回合长度累积，最终偏离到演示分布之外。RL 恰好擅长在任意状态上通过试错学会"拉回来"，但它需要先"见过"有价值的状态。</p>
+    <p>演示引导的强化学习（demo-guided RL / demo-augmented RL）把两者的强项拼接：<strong>BC 负责把策略带上任务轨道，RL 负责在其上继续优化与纠错</strong>。经典形态包括 DQfD/DDPGfD 风格（演示进回放池 + 监督损失 + 优先级采样）与预训练-微调风格（BC 预热 + RL 精调）。本章按后者的实现讲透，前者思想顺带覆盖。它是第三篇的收官：把前面 IRL/偏好/演示的所有素材，收束为一条实用、可复现的训练路线。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 复合误差：BC 的数学天花板</h3>
+    <p>设策略单步犯错的概率上界为 ε，回合长度为 T。BC 的朴素分析给出：期望总误差 O(εT²)，原因是<strong>错误会改变分布，新分布上又会产生新错误</strong>，每步误差被后续"越走越偏"的轨迹放大。同为模仿学习，DAgger 通过"在策略自己到达的状态上继续查询专家"把界压到 O(εT)，增长从平方级回到线性级。这个对比揭示了两件事：<strong>其一</strong>，解决复合误差的关键是让学习发生在"策略真实访问的状态分布"上；<strong>其二</strong>，RL 恰恰天然在策略自己的分布上学习，用 RL 微调 BC 预热策略，等价于在关键区域做"在线 DAgger"，且监督信号从"专家动作"升级为"任务回报"。</p>
+
+    <h3>2. 三段式管线</h3>
+    <p>标准工业化流程：</p>
+    <table>
+      <tr><th>阶段</th><th>目标</th><th>关键配置</th></tr>
+      <tr><td>演示采集</td><td>覆盖任务关键场景（起始位姿、目标点、接触点）</td><td>50–200 条成功轨迹；冻结仿真随机种子集，场景多样性优先于数量</td></tr>
+      <tr><td>BC 预热</td><td>把策略推到任务附近（不要求成功）</td><td>监督损失 + 早停验证集；典型 10k–50k 步（比从零 RL 少一个量级）</td></tr>
+      <tr><td>RL 微调</td><td>在策略分布上纠错 + 超越演示</td><td>演示回放占 batch 25–50% + 模仿辅助损失 λ 退火 0.1→0.01</td></tr>
+    </table>
+    <p>BC 预热的停止标准是"任务进入可探索邻域"：验证集动作误差不再下降、或第一次在仿真里出现偶发成功，就该切 RL，<strong>过度 BC 有害</strong>，它把策略固定在演示模式上（演示由脚本控制器生成、动作风格刻板，RL 需要的探索空间被压缩）。</p>
+
+    <h3>3. 演示回放：三个必须做对的技术点</h3>
+    <ul>
+      <li><strong>奖励书写</strong>：演示只有状态-动作对，没有奖励。两种处理：用环境奖励函数回填（推荐，保持与 RL 目标一致），或按演示给固定回报（可能引入偏置）。Isaac Sim 里可直接在重放中对每个演示转移调用同一奖励计算函数。</li>
+      <li><strong>n 步回报</strong>：把演示当作"一条连续的短轨迹"，用 n 步折扣和（n 常取 8–16）估计回报，稀疏奖励场景尤其重要；单步回报会让演示看起来"毫无价值"。</li>
+      <li><strong>回合边界</strong>：跨演示的 n 步回报必须被回合边界截断（否则把 A 演示的结尾与 B 演示的开头连起来算回报）。用 <code>done</code> 标志显式处理，所有混采的 RL 经验与演示共享同一套回报计算路径。</li>
+    </ul>
+
+    <h3>4. 辅助损失与退火：小心"趴在演示上不动"</h3>
+    <p>RL 损失加一项监督模仿项：L = L<sub>RL</sub> + λ(t)·L<sub>BC</sub>。λ 的作用是"保底"：什么情况下都别把演示学到的行为忘光。退火策略的设计依据：<strong>早期 λ 大（防止 RL 的随机探索摧毁预热行为）、后期 λ 小（放开策略去超越演示）</strong>。常见误区有二：λ 固定为 0.5 之类的常值，策略永远以模仿为主，上限被演示锁死；λ 一上来就降到 0，预热行为在几万个 RL 步内被"遗忘"（灾难性遗忘），回落到从零训练的曲线上。经验做法：λ 从 0.1 线性/指数退到 0.01，下限保留一点以维持示范技能（特别是回放蒸馏类方法）。若演示严格最优且风格即目标（如操作规范流程），λ 可以不退甚至保持。</p>
+
+    <h3>5. 评估：样本效率是主指标</h3>
+    <p>演示引导的验收标准是<strong>达到目标性能所需的交互步数</strong>（最终回报水平往往三者相近）。推荐实验设计：同一环境与随机种子集合，跑三条曲线，纯 RL、纯 BC（无 RL）、BC+RL 微调；报告"达到 80% 峰值成功率"的步数。典型结果是 2–5 倍的样本效率提升。要额外报告两个护栏数字：<strong>最终成功率</strong>（确认没有因模仿锁定而低于纯 RL）与<strong>动作平滑度</strong>（确认没有出现"学坏"的抖动）。</p>
+
+    <h3>6. 复合误差的量化示例</h3>
+    <p>把 O(εT²) 的直觉换成可算的数字。设单步"偏离演示分布"的概率 ε = 1%，回合长度 T：</p>
+    <div class="formula">
+      全程不偏离演示分布的概率 ≈ (1 − ε)<sup>T</sup>
+      <span class="note">T = 100 时约 37%；T = 200 时约 13%；一旦偏离，后续状态不再被演示覆盖</span>
+    </div>
+    <p>这说明 BC 的问题不在平均动作误差，而在"长时间停留在演示分布之外"：回合越长，纯监督训练的策略越难待在训练分布内，末端状态的动作质量无从保证。演示引导的 RL 微调把学习搬回"策略真实访问的分布"，把误差增长从平方级压回线性级，与 DAgger 的结论一致。数值上还可以核对数据规模：100 条 × 200 步 = 2 × 10⁴ 样本，按 80% 训练集、batch 256 计，每轮约 63 个梯度步，30 轮合计约 1.9 × 10³ 次更新，属于轻量级预热。</p>
+
+    <h3>7. 三条管线的样本量对照</h3>
+    <table>
+      <tr><th>管线</th><th>典型样本需求（示意）</th><th>最终上限</th><th>主要风险</th></tr>
+      <tr><td>纯 BC</td><td>2 × 10⁴ 演示样本（离线）</td><td>受演示质量与覆盖限制</td><td>复合误差，长回合末端崩坏</td></tr>
+      <tr><td>纯 RL</td><td>10⁶ 级在线步</td><td>可超过演示（发现更优解）</td><td>探索慢，稀疏任务可能学不动</td></tr>
+      <tr><td>演示引导 RL</td><td>演示 2 × 10⁴ + 在线 2–5 × 10⁵ 步</td><td>接近或超过纯 RL</td><td>λ 与演示比例调错会锁死或遗忘</td></tr>
+    </table>
+    <p>对照表的用法是估算实验经济性：演示采集成本高但离线可复用，在线步昂贵但上限高，混合管线取两者的交点。若任务有现成的演示源（遥操作、脚本控制器、较慢的规划器），混合管线几乎总是划算；若拿不到合格演示，则回到纯 RL 与课程学习（032 章）的路线。</p>
+
+    <h3>8. n 步回报视野的量化</h3>
+    <p>稀疏奖励下，n 的选择决定"演示里有多少比例的步骤携带非零回报"。以 200 步演示、只有终点 +1 为例：</p>
+    <div class="formula">
+      非零回报覆盖比例 ≈ n / T
+      <span class="note">n = 12 时约 6%（最后 12 步）；n = 50 时约 25%；n 太小会让演示"看起来没有价值"</span>
+    </div>
+    <p>比例偏低会削弱演示样本对值函数的锚定作用；比例过高（n 接近 T）则回报估计方差变大，对回合边界截断也更敏感。12–16 的常用档位是"覆盖尾部关键段"与"方差可控"的折中；若演示长达千步，把 n 提到 32–64 再评估。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>以 Franka 抓取放置为目标，完整落地：</p>
+    <ol>
+      <li><strong>演示采集</strong>：脚本控制器（IK 到目标位姿 + 抓握时序）在 5 组随机初始位姿下各录 20 条，共 100 条，每条 2–4 s。采集数据：obs、action、仿真时间戳；动作存<strong>统一归一化域</strong>的值（与 RL 训练动作口径一致）。</li>
+      <li><strong>BC 预热</strong>：MSE 监督损失 + Adam(3e-4)，batch 256，验证集 20%。停止条件：验证动作误差连续 3 个 epoch 不降，或仿真中首次出现成功。</li>
+      <li><strong>RL 微调</strong>：PPO，batch 里 40% 来自演示回放、60% 来自策略新数据；演示样本奖励回填 + 12 步回报；辅助损失 λ: 0.1 → 0.01（前 20% 训练步指数退火）。</li>
+      <li><strong>护栏</strong>：演示只保留成功轨迹（失败案例单独用于偏好/IRL 章节）；RL 微调时监控策略动作离演示动作的散布距离，异常变大说明漂移，随时调大 λ。</li>
+      <li><strong>评估</strong>：三曲线对比（纯 BC / 纯 RL / BC+RL），主指标"达到 80% 成功率的步数"，副指标最终成功率和动作平滑度（相邻动作差均方）。</li>
+    </ol>
+    <div class="box key">
+      <span class="box-title">设计思维：为什么演示只做"成功轨迹"，不做失败轨迹？</span>
+      <p>BC 的监督损失是"模仿这个动作"，给失败轨迹会教会策略执行失败动作。失败数据在第 073/074 章有用（判别器负样本、偏好中的"较差"项），那是用它做<strong>对比</strong>；在 BC 与演示回放这种"直接模仿"路径上，只用成功数据是纪律。若确实想利用失败样本，应该走偏好学习或为失败状态设计专门惩罚；混进模仿目标会教坏策略。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：演示回放池，奖励回填与 n 步回报</strong></p>
+    <pre class="code"><code>import numpy as np
+
+class DemoBuffer:
+    """演示存储：按回合存，采样时补齐奖励与 n 步回报，也支持 BC 监督取样。"""
+    def __init__(self, n_step=12, gamma=0.99, reward_fn=None):
+        self.obs_list, self.act_list, self.done_list = [], [], []
+        self.n_step, self.gamma, self.reward_fn = n_step, gamma, reward_fn
+
+    def add_episode(self, obs_seq, act_seq):
+        # done 边界显式存档：n 步回报与混采都靠它，别在采样时猜边界
+        obs_seq = np.asarray(obs_seq, dtype=np.float32)
+        act_seq = np.asarray(act_seq, dtype=np.float32)
+        for t in range(len(obs_seq)):
+            self.obs_list.append(obs_seq[t])
+            self.act_list.append(act_seq[t])
+            self.done_list.append(t == len(obs_seq) - 1)
+        self.obs = np.stack(self.obs_list)        # [N, obs_dim]
+        self.act = np.stack(self.act_list)
+        self.done = np.array(self.done_list, dtype=bool)
+
+    def sample(self, batch, rng):
+        n = len(self.obs)
+        idx = rng.integers(0, n, size=batch)
+        rewards, next_obs, term = [], [], []
+        for i in idx:
+            g, ret = 1.0, 0.0
+            for k in range(self.n_step):          # 向前累计 n 步折扣回报
+                j = i + k
+                if j &gt;= n or self.done[j]:
+                    # 到达演示片段末尾：后续不再纳入回报（回合边界截断）
+                    ret += self.reward_fn(self.obs[j]) * g
+                    break
+                ret += self.reward_fn(self.obs[j]) * g
+                g *= self.gamma
+            rewards.append(ret)
+            next_obs.append(self.obs[min(i + self.n_step, n - 1)])
+            term.append(self.done[i])             # 单步 done 决定 bootstrap 与否
+        return self.obs[idx], self.act[idx], np.array(rewards, np.float32), \
+               np.stack(next_obs), np.array(term, np.float32)</code></pre>
+    <p>解读：这段代码的三处细节对应第 3 节的三个技术点。<strong>done 按"帧是否回合末"存储</strong>：采样的循环里一旦遇到 done 就停止累计，演示 A 的末尾与演示 B 的开头隔着一次 reset，物理上不是连续转移，n 步回报绝不能跨越；漏掉这个截断是"演示引导训练莫名其妙学坏"的头号原因。<strong>奖励回填</strong>：<code>reward_fn(self.obs[j])</code> 用与 RL 完全相同的环境奖励函数逐帧计算，保证演示样本和在线样本在同一个回报尺度上，绝不要给演示写"固定高分"或按步数发常数奖励，那是引入偏置。<strong>bootstrap 语义</strong>：<code>term</code> 返回单步 done，值函数在非终止样本上正常 bootstrap；片段末尾附近样本仍有价值，不能整体当作终止。注意这里用逐帧循环写 n 步回报是为了清楚，4096 并行训练时应改成向量化实现（预计算前缀和），这是热路径。</p>
+
+    <p><strong>片段 2：BC 预热训练</strong></p>
+    <pre class="code"><code>import torch
+import torch.nn as nn
+
+def bc_pretrain(policy, demo, epochs=30, batch=256, lr=3e-4, val_split=0.2):
+    """行为克隆预热：监督学习演示的 (s → a)，含验证集早停。"""
+    n = len(demo.obs)
+    perm = torch.randperm(n)
+    n_val = int(n * val_split)
+    val_idx, train_idx = perm[:n_val], perm[n_val:]
+    opt = torch.optim.Adam(policy.parameters(), lr=lr)
+    best_val, patience = float("inf"), 3
+    for epoch in range(epochs):
+        policy.train()
+        for batch_idx in torch.split(train_idx, batch):
+            obs = torch.as_tensor(demo.obs[batch_idx.numpy()], device=policy.device)
+            act = torch.as_tensor(demo.act[batch_idx.numpy()], device=policy.device)
+            pred = policy.mean_action(obs)          # 取均值动作：预热阶段不做随机采样
+            loss = nn.functional.mse_loss(pred, act)  # 连续动作的标准监督损失
+            opt.zero_grad(); loss.backward(); opt.step()
+        with torch.no_grad():                        # 验证集：只评估不更新
+            policy.eval()
+            vo = torch.as_tensor(demo.obs[val_idx.numpy()], device=policy.device)
+            va = torch.as_tensor(demo.act[val_idx.numpy()], device=policy.device)
+            val_loss = nn.functional.mse_loss(policy.mean_action(vo), va).item()
+        if val_loss &lt; best_val - 1e-5:
+            best_val, patience = val_loss, 3
+        else:
+            patience -= 1
+            if patience == 0:
+                break                                # 早停：防止把演示"背下来"
+    return best_val</code></pre>
+    <p>解读：几个设计点。<strong><code>mean_action</code> 取条件均值</strong>：BC 阶段优化确定性的动作输出，避免随机采样引入方差干扰监督信号；RL 阶段再恢复分布采样。验证集早停是防"记忆演示"的基本保障，尤其演示场景重复度高（同一初始位姿多次采集）时，训练损失会远低于真实误差。<strong>数据量核算</strong>：100 条 × 200 步 ≈ 2 万样本，30 个 epoch × batch 256 覆盖几十遍，是典型规模；演示上万条时改为几个 epoch 并通过 RL 微调继续利用。这个函数只做预热，不包含"演示回放混入 RL"，两者更新目标不同，别写在一个循环里混淆。预热完成后的验收：在仿真里跑 20 回合，观察是否出现偶发成功或接近成功；若完全没有，优先检查演示覆盖的初始状态是否太窄；加 epoch 解决不了覆盖问题。</p>
+
+    <p><strong>片段 3：RL 微调的混合采样与模仿损失退火</strong></p>
+    <pre class="code"><code>import numpy as np
+import torch
+import torch.nn as nn
+
+def mix_batch(demo_buffer, ppo_buffer, batch=512, demo_ratio=0.4, rng=None):
+    """按比例混合演示与在线经验：演示维持'别忘'、在线负责'超越'。"""
+    n_demo = int(batch * demo_ratio)
+    obs_d, act_d, r_d, next_d, term_d = demo_buffer.sample(n_demo, rng)
+    idx = rng.integers(0, len(ppo_buffer.obs), size=batch - n_demo)
+    obs_p, act_p = ppo_buffer.obs[idx], ppo_buffer.act[idx]
+    r_p = ppo_buffer.rewards[idx]          # 在线样本已完成 GAE 前的回报统计
+    next_p, term_p = ppo_buffer.next_obs[idx], ppo_buffer.terminated[idx]
+    obs = np.concatenate([obs_d, obs_p], axis=0)
+    act = np.concatenate([act_d, act_p], axis=0)
+    return obs, act, {"rewards": np.concatenate([r_d, r_p]),
+                      "next_obs": np.concatenate([next_d, next_p]),
+                      "terminated": np.concatenate([term_d, term_p]),
+                      "is_demo": np.concatenate([np.ones(n_demo), np.zeros(batch - n_demo)])}
+
+
+def imitation_aux_loss(policy, obs_demo, act_demo):
+    """辅助模仿损失：只对演示样本生效，防止 RL 把预热行为遗忘。"""
+    pred = policy.mean_action(obs_demo)       # 与 BC 同一目标：条件均值
+    return nn.functional.mse_loss(pred, act_demo)
+
+
+def bc_lambda(step, total_steps, lam0=0.1, lam_min=0.01):
+    """退火：早期保底、后期放开；指数衰减比线性多保留中期稳定性。"""
+    frac = min(1.0, step / (0.2 * total_steps))   # 前 20% 训练步内完成退火
+    return lam_min + (lam0 - lam_min) * np.exp(-3.0 * frac)
+
+
+# 每个 PPO 迭代：
+# obs, act, mixed = mix_batch(demo, ppo_rollout, batch=512, demo_ratio=0.4, rng=rng)
+# L_rl = ppo_clip_loss(policy, obs, act, mixed)              # 混合样本都算 RL 损失
+# L_bc = imitation_aux_loss(policy, obs[mixed["is_demo"] == 1], act[mixed["is_demo"] == 1])
+# L = L_rl + bc_lambda(step, total_steps) * L_bc            # 只有演示样本贡献模仿损失</code></pre>
+    <p>解读：混合采样是"演示引导"名字的由来。<strong>混合的每一部分都参与 RL 损失</strong>（演示样本有回填奖励与 n 步回报，值函数照常学），但<strong>只有演示样本额外贡献模仿损失</strong>，对在线样本做模仿没有"目标动作"，无从监督。演示比例 0.4 是一个务实起点：太高（0.7+）会让策略以模仿为主、样本多样性不足；太低（0.1）则演示的锚定作用消退。λ 退火下限取 0.01：保底项让"演示技能"作为底线永不被完全遗忘，在多技能任务里它还能防止旧任务能力被新数据冲掉（对第 053 章多任务、第 080 章容错训练同样适用）。<code>bc_lambda</code> 用指数衰减：相比线性，它在退火中段保留更大的保底强度、末段更快放开，实践中对稳定性的帮助更明显。监控建议：分别记录"演示样本的 TD 误差"与"在线样本的 TD 误差"，前者持续大幅高于后者，说明演示奖励回填或回报计算有问题（回到片段 1 检查）。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>动作口径不一致</strong>：演示的动作是物理量（rad），RL 的动作是归一化域（±1），预热学会的是错误缩放。症状是 BC 验证损失正常，但仿真里动作被错误缩放（或直接撞限位）。修复：全链路统一在归一化域存储与训练，反归一化只在一个地方做。</li>
+      <li><strong>n 步回报跨回合</strong>：演示回放采样没做回合边界处理，把不同演示首尾相连。症状是值函数对"演示中段"的估值异常，策略在回合末行为混乱。修复：并存 done 标志、累计循环遇 done 即断（片段 1）。</li>
+      <li><strong>λ 不退或退太早</strong>：不退火则永远趴在演示上，最终性能≈BC；退太早则灾难性遗忘，训练曲线先好后退到零基础水平。修复：指数退火到 0.01 的区间先固定跑一遍，再按曲线微调。</li>
+      <li><strong>演示覆盖太窄</strong>：50 条演示只来自两个初始位姿，预热后策略在其余位姿全崩，RL 微调把这些状态当作"新问题"从零学。症状是训练曲线剧烈震荡、成功率上不去。修复：采集时铺开起始状态，覆盖"任务变体维度"（位姿、物体大小、目标点），宁可每格少采几条。</li>
+      <li><strong>用错误数据做演示</strong>：把遥操作时顺手撞桌子的轨迹也存进去，BC 把撞桌学成常规动作。修复：按成功判定 + 平滑度过滤；"演示只做成功轨迹"是纪律不是建议。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>跑三曲线对比实验（纯 BC / 纯 RL / BC+RL），报告达到 80% 成功率所需的步数与最终成功率，解释你观察到的样本效率倍数。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>三个实验使用相同随机种子集合与评测协议；纯 BC 的最终成功率通常低于另外两条（复合误差）。</div></details>
+      </li>
+      <li>把演示比例从 0.4 调到 0.1 与 0.7，观察曲线形状变化，给出你任务上的推荐比例与理由。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>0.7 的早期稳定但后期平台低；0.1 的后期上限高但早期易震荡。看"越过演示水平"的步数。</div></details>
+      </li>
+      <li>取消 n 步回报（用单步奖励），观察演示样本的 TD 误差与训练曲线，解释为什么短视野会贬值演示。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>稀疏奖励下演示的前 90% 步骤单步奖励近零，值函数学不出"这段演示整体有价值"。</div></details>
+      </li>
+      <li>设计演示覆盖度实验：2 种初始位姿 vs 20 种初始位姿各采 50 条，对比 RL 微调的收敛步数与成功率方差。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>覆盖窄时方差大（有些种子直接失败）；用 5 个种子画箱线图，比看均值更有信息量。</div></details>
+      </li>
+      <li>实现"λ 自适应"：当在线样本的价值损失连续升高时自动调大 λ，设计触发规则并验证它能否减少"遗忘回退"。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>价值损失骤升常伴随分布剧变；自适应 λ 本质是"漂移检测 + 保底回拉"，注意加最大 λ 上限防止锁死。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>纯 BC 的复合误差随回合长度二次增长，纯 RL 缺探索；演示引导用"BC 上轨 + RL 纠错超越"补齐两者。</li>
+      <li>三段式：采演示（覆盖优先）→ BC 预热（早停防背题）→ RL 微调（演示回放 25–50% + 模仿损失退火）。</li>
+      <li>演示回放三纪律：奖励用环境函数回填、n 步回报、回合边界截断；所有口径与在线经验完全一致。</li>
+      <li>λ 退火 0.1→0.01：太大会锁死上限、太早归零会灾难性遗忘；自适应 λ 是进阶选项。</li>
+      <li>验收主指标是"达到目标成功率的交互步数"（典型 2–5 倍加速），护栏是最终成功率与动作平滑度。</li>
+      <li>第三篇到此收束。下一章开启第四篇：控制与优化，先讲策略蒸馏，把大策略（或特权教师）压缩成可以带上真机的小策略。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch074.html">← 第 074 章：实现偏好学习</a>
+    <a class="next" href="ch076.html">第 076 章：实现策略蒸馏 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

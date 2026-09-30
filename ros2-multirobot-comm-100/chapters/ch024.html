@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第024章 多机器人坐标变换广播 | 多机器人协同学习课程 · ROS2 通信与系统集成</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 数据分发与协同感知</span>
+    <span class="sep">/</span>
+    <span>第 024 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 数据分发与协同感知</div>
+    <h1>第 024 章：多机器人坐标变换广播</h1>
+    <p class="lead">两台机器人各自都"知道"自己在哪，但系统要回答的是"它相对我在哪"。本章讲 TF 树的广播与查找机制，以及多机器人场景下如何把一张张 TF 树连成一片森林。</p>
+    <ul class="meta">
+      <li>主题：协同感知基础 / 坐标变换系统</li>
+      <li>关键机制：TF2 广播与监听、坐标系命名规范、静态变换、时间戳插值</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 023 章（大消息传输：图像与点云压缩）</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解 TF2 的工作模型：广播者持续喂给缓冲区、监听者按时间戳查询并插值。</li>
+      <li>掌握多机器人 TF 的两种拓扑方案（前缀单树 / 统一 world 根），并能判断该用哪种。</li>
+      <li>会写广播者与监听者代码：知道时间戳为什么必须取自数据时刻（<code>now()</code> 是错误来源），超时与异常怎么处理。</li>
+      <li>掌握静态变换（static_transform_publisher）的使用位置与发布频率概念。</li>
+      <li>能排查"查不到变换"的三类根因：帧名拼错、时间未同步、树存在多父冲突。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>一个机器人只要自己内部的坐标自洽就能工作，但多机器人系统的一切协同动作，编队、共享检测、地图拼接，都建立在同一个问题上：<strong>A 机器人看到的东西，换算到 B 机器人的坐标系里在哪里</strong>？这需要一个跨越整支车队的坐标变换系统。</p>
+    <p>ROS2 的答案是 TF2：一个由"广播者写、监听者读"构成的分布式变换数据库。单机时它管着一棵树（map → odom → base_link → 传感器）；多机时，你要决定每台机器人这棵树怎么与全局参考系连接。这个决定看起来只是命名问题，实则是整个感知系统能否"对齐"的根基：第 025 章的标定、026 章的地图合并、031 章的协同感知，全部要先经过本章的坐标系设计。<strong>坐标没有对齐的协同感知，等于两台机器人在两个平行宇宙里各自描述世界。</strong></p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. TF2 模型：一棵带时间轴的树</h3>
+    <p>TF2 把每个坐标系（frame）当作树的节点，把两帧之间的刚体变换当作有向边（子 → 父），每条边在时间轴上是一条"变换曲线"。工作方式分两半：</p>
+    <ul>
+      <li><strong>广播者（broadcaster）</strong>：持续发布"父帧、子帧、变换、时间戳"，例如 <code>world → robot1/map</code>、<code>robot1/odom → robot1/base_link</code>。监听端把收到的变换存进本地缓冲区（默认缓存约 10 s 的历史）。</li>
+      <li><strong>监听者（listener）</strong>：查询"帧 A 在时刻 t 到帧 B 的变换"。TF2 在缓冲区里找到覆盖 t 的两条变换记录做<strong>插值</strong>（平移线性插值、旋转球面插值），得到任意时刻的连续变换。</li>
+    </ul>
+    <p>变换的数学形式是刚体变换：平移封在向量 t 里，旋转用四元数 q 表示，离线的组合就是矩阵乘法 <code>T_AC = T_AB × T_BC</code>。TF2 帮你自动完成链式组合，查询任意两帧时，它沿树找到最短路径上的边并连乘。你只需要保证一件事：<strong>树里没有环、每个子帧只有一个父</strong>。</p>
+    <div class="formula">
+      T<sub>target,source</sub>(t) = T<sub>target,common</sub>(t) × T<sub>common,source</sub>(t)
+      <span class="note">树的公共祖先让任意两帧可组合；插值让任意时刻可信，这是 TF 的两块基石</span>
+    </div>
+
+    <h3>2. 多机器人拓扑：森林怎么连成一片</h3>
+    <p>单机器人的标准层次是 <code>map → odom → base_link → 各传感器</code>。多机器人扩展有两个主流方案：</p>
+    <table>
+      <tr><th>方案</th><th>结构</th><th>优点</th><th>代价</th></tr>
+      <tr><td>前缀单树</td><td>所有帧加机器人前缀，挂在统一 <code>world</code> 下：<code>world → robot1/map → robot1/odom → robot1/base_link</code></td><td>任意两帧直接查询；语义清晰</td><td>全局树大，可视化工具负担重；改动所有代码的帧名</td></tr>
+      <tr><td>独立树 + 桥接</td><td>各机保持原生帧名（<code>map/odom/base_link</code>），用 <code>world → robotN_map</code> 这类静态/低频边桥接</td><td>对既有单机代码零改动</td><td>需要人工保证桥接边正确；同名帧在不同命名空间下的查询需明确前缀</td></tr>
+    </table>
+    <p>推荐做法：<strong>机器人内部保持原生帧名（复用全部单机生态），跨机器人建立"根桥接"：<code>world → robot1/map</code>、<code>world → robot2/map</code> 等</strong>。桥接边可能来自静态标定（第 025 章，offset 固定）或在线定位（第 029 章，持续修正）。</p>
+
+    <h3>3. 同名帧冲突：TF 树最危险的错误</h3>
+    <p>TF2 里"一个子帧只能有一个父帧"。如果两台机器人都在发布 <code>map → odom</code>，而你没有用命名空间把它们分开，系统会出现两种后果：帧归属随机漂移（谁的数据后到谁生效，表现为姿态跳动），或者树结构在某些查询路径上出现矛盾。<strong>这类错误不产生报错，只产生"偶尔很准、偶尔离谱"的诡异现象</strong>，是协同系统最难排查的 bug 之一。防御手段很直接：广播前把帧名完整拼出（例如 <code>robot1/odom</code>，尽量不要写成裸名 <code>odom</code>），并在集成测试里跑一遍"任意两帧可查询"的检查脚本。</p>
+
+    <h3>4. 时间戳与频率：TF 的动力来源</h3>
+    <p>TF 查询本质上是一次<strong>跨时间轴的对齐操作</strong>，因此对时间质量极其敏感：</p>
+    <ul>
+      <li><strong>时间戳来源</strong>：动态变换（如 odom → base_link）应使用"推导该位姿所用传感器数据的时间戳"；改用发布时刻会引入随机抖动，破坏插值平滑性。</li>
+      <li><strong>频率</strong>：动态 TF 通常与状态输出同频，30–50 Hz 对多数系统足够；过低会让监听端频繁触发"外推超限"，过高徒增广播流量（每条变换几百字节，本质是状态消息）。</li>
+      <li><strong>时间同步</strong>：跨机器人的 TF 链路要求第 009 章的时间同步先行。两台机器人差 100 ms 的时钟，会让"A 在 B 坐标系里的位置"带上 100 ms 的运动滞后，编队控制里这足以引发振荡。</li>
+      <li><strong>外推（extrapolation）</strong>：查询时刻超出缓冲区最新时间，TF2 默认拒绝外推并抛 <code>ExtrapolationException</code>。这是保护机制：宁可不给答案，也不给外推的错答案。</li>
+    </ul>
+    <div class="box key">
+      <span class="box-title">帧命名约定速记</span>
+      <p>沿用 REP-105 的精神：<code>map</code> 是全局一致但不连续（会跳变）；<code>odom</code> 是局部连续但不全局一致（会漂移）；<code>base_link</code> 是机器人本体。多机器人时给每台机器人的这三类帧加统一前缀，跨机共用唯一的 <code>world</code>。命名规范写进项目文档，比在代码里口口相传可靠得多。</p>
+    </div>
+
+    <h3>5. 广播频率与插值误差的定量关系</h3>
+    <p>TF2 把两条相邻的变换记录之间当作"匀速直线与匀速旋转"来插值，因此每一次查询都隐含一个近似：真实运动在采样间隔内被线性化了。平移部分的误差有明确上界：设机器人该时刻的加速度为 a，广播周期为 Δt，线性插值的中点误差约为 a·Δt²/8。代入三个常用频率（加速度取 1 m/s²）：</p>
+    <table>
+      <tr><th>广播频率</th><th>采样周期 Δt</th><th>插值位置误差上界（a = 1 m/s²）</th><th>适用判断</th></tr>
+      <tr><td>10 Hz</td><td>100 ms</td><td>约 1.25 mm</td><td>低速巡检可用；急停急转场景偏粗</td></tr>
+      <tr><td>30 Hz</td><td>33.3 ms</td><td>约 0.14 mm</td><td>差速底盘的标准档位</td></tr>
+      <tr><td>50 Hz</td><td>20 ms</td><td>约 0.05 mm</td><td>高机动平台；带宽代价很小</td></tr>
+    </table>
+    <p>旋转部分用球面线性插值（Spherical Linear Interpolation, SLERP），在角速度恒定的区间内插值本身是精确的；误差只来自角速度的突变（例如受到一次碰撞），量级与平移同阶。因此频率选择的依据来自运动状态本身的变化带宽，插值误差在其中只占极小的份额：底盘受到的一次冲击、一次急停，其频率成分通常不超过 3–5 Hz，按经验采样频率取运动带宽的 6–10 倍即可，30–50 Hz 覆盖绝大多数地面平台。</p>
+    <p>再算一笔广播开销的账，确认"提高到 50 Hz"是否负担得起。每条 TF 消息（含帧名字符串与四元数）序列化后约 200–300 字节。一支 4 机器人队伍，每台内部 10 条边、全部按 50 Hz 广播，跨机汇总流量约为 4 × 10 × 50 × 250 B ≈ 500 KB/s，仅占千兆链路可用容量的 0.5%。<strong>TF 本身从来不构成带宽问题，真正贵的是发现流量与图像流</strong>；这也是第 010 章把调优重点放在发现协议上的原因。</p>
+
+    <h3>6. 数值算例：100 ms 时钟偏差如何变成 0.47 m 的目标错位</h3>
+    <p>第 4 小节的定性描述用一个算例坐实。设 A、B 两机时钟相差 Δt = 100 ms（未做时间同步时的典型量级），机器人以 1 m/s 速度、90°/s 角速度运动。B 机检测到一个目标后，把"目标在 B 坐标系下的位置"连同 B 的 TF 一起发给 A；A 用自己时钟的时刻查询 B 的变换，得到的是 B 在 100 ms 之前的位姿。误差分三项叠加：</p>
+    <ul>
+      <li>位置项：1 m/s × 0.1 s = 0.10 m；</li>
+      <li>朝向项：90°/s × 0.1 s = 9.0°，即 0.157 rad；</li>
+      <li>组合项：目标若在 B 正前方 3 m 处，朝向误差带来的横向错位约为 3 m × 0.157 ≈ 0.47 m。</li>
+    </ul>
+    <p>0.47 m 意味着什么？行人检测框的典型宽度约 0.5 m，这个错位足以让融合端把同一个行人算成两个，或把两个并排的人算成一个。<strong>这也解释了为什么时间同步（第 009 章）必须排在 TF 之前交付</strong>：同步后的残差通常压到 1 ms 以内，同样的公式给出横向错位约 5 mm，与传感器噪声同量级，融合算法不再需要为"时间"单独建模。</p>
+
+    <h3>7. 失效模式与边界条件</h3>
+    <table>
+      <tr><th>失效模式</th><th>症状</th><th>根因</th><th>修复</th></tr>
+      <tr><td>仿真时间与墙上时间混用</td><td>回放或仿真里查询报外推错误，且差值恰好等于仿真时长</td><td>部分节点 use_sim_time 未开或 /clock 未发布</td><td>全系统统一时间源；回放时先起 /clock 再起节点</td></tr>
+      <tr><td>时钟阶跃（NTP 跳变）</td><td>运行中突然成批外推失败，数十秒后自愈</td><td>系统时钟被 step 校正，TF 缓冲时间轴回跳</td><td>用平滑校正（slew）；关键系统禁用大步长跳变</td></tr>
+      <tr><td>缓冲区过期</td><td>停发 TF 超过缓冲窗口后，历史时刻无法查询</td><td>动态边停发，监听端缓存仅覆盖最近约 10 s</td><td>监控各动态边的发布频率；长停顿后只查最新时刻</td></tr>
+      <tr><td>多播被禁用</td><td>同机 TF 正常，跨机查询报不连通</td><td>无线或交换网络丢弃多播，发现失败</td><td>配置单播发现（第 010 章），或改用发现服务器</td></tr>
+      <tr><td>桥接边双发布</td><td>姿态在两组值间间歇跳动，偏差随两机相对运动增大</td><td>标定静态边与在线定位边同时存在且数值不一致</td><td>同一时刻只允许一个责任发布者；切换时先停旧源</td></tr>
+    </table>
+    <p>边界条件有一条要写进接口文档：<strong>TF2 拒绝外推，查询越界一定抛异常，愿意等多少毫秒由调用方决定</strong>。等待时间本身也是设计参数：设感知循环周期 50 ms，查询最多等 50 ms 会吃掉整个节拍，常见折中是在 10–50 ms 之间按周期分配；等待超时后的降级策略（丢帧、用上一帧、临时切到本机坐标）必须显式实现，默认行为只有抛异常一种。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>多机器人 TF 系统的设计按五步：</p>
+    <ol>
+      <li><strong>先画树后写码</strong>：列出全部帧与父子关系，把"静态边"（安装位置）与"动态边"（里程计、定位）分开标注。任何帧只出现为一个父帧下的子节点。</li>
+      <li><strong>定命名规范</strong>：<code>world</code> 为全局根（可选 <code>earth</code>）；机器人前缀 <code>robotN/</code> 只加在跨机可见的帧上；机器人内部尽量沿用原生帧名以复用生态。</li>
+      <li><strong>分派发布者</strong>：静态边由 launch 里的 static_transform_publisher 发布（只发一次，晚加入者也能拿到）；动态边由状态源（里程计/定位/SLAM）发布。指定唯一"责任人"，绝不两个节点发同一条边。</li>
+      <li><strong>定频率</strong>：动态 TF 与源数据同频（30–50 Hz）；跨机桥接边按定位更新率（10–20 Hz）；静态边零重复成本。</li>
+      <li><strong>验收</strong>：写一个检查节点，启动后逐一查询关键帧对（如 <code>world</code> 到每台机器人的 <code>base_link</code>），把不可达帧打印出来。这比出事后再翻日志高效一个量级。</li>
+    </ol>
+    <table>
+      <tr><th>帧（示例）</th><th>父帧</th><th>类型</th><th>发布者</th><th>频率</th></tr>
+      <tr><td><code>robot1/base_link</code></td><td><code>robot1/odom</code></td><td>动态</td><td>里程计节点</td><td>50 Hz</td></tr>
+      <tr><td><code>robot1/lidar</code></td><td><code>robot1/base_link</code></td><td>静态</td><td>launch（static）</td><td>一次</td></tr>
+      <tr><td><code>world</code></td><td>无（根帧）</td><td>无</td><td>无</td><td>无</td></tr>
+      <tr><td><code>robot1/map</code></td><td><code>world</code></td><td>标定/在线</td><td>标定节点或定位融合</td><td>10 Hz 或一次</td></tr>
+    </table>
+    <p>启动顺序也影响验收：静态边随 /tf_static 立即到达，动态边需要"填充期"。监听节点在启动后的前一到两个广播周期内查询失败属于正常现象，验收脚本应等待动态边频率稳定后再开始判定（例如先确认 /tf 频率连续 10 个周期落在预期区间），否则会把冷启动误报成故障。另一个容易忽略的验收项是"坐标系闭环"：在共同祖先之下，从 A 帧到 B 帧再到 C 帧的连乘结果，应与直接查询 A 到 C 的结果一致，差异仅来自插值与浮点误差，量级在 1×10⁻⁶ 以内；这条检查能一次抓出半边树挂错位置的结构性错误。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：广播动态变换 odom → base_link（时间戳是灵魂）</strong></p>
+    <pre class="code"><code>import math
+import rclpy
+from rclpy.node import Node
+from geometry_msgs.msg import TransformStamped
+from tf2_ros import TransformBroadcaster
+
+class OdomBroadcaster(Node):
+    """把里程计位姿广播成 robotN/odom -> robotN/base_link 的动态变换。"""
+    def __init__(self):
+        super().__init__("odom_broadcaster", namespace="robot1")
+        self.br = TransformBroadcaster(self)      # 一个广播者服务所有边
+
+    def send_odom(self, x, y, theta, stamp):
+        t = TransformStamped()
+        # 帧名写全：前缀在这里拼，绝不依赖运行环境"看起来对"
+        t.header.frame_id = "robot1/odom"         # 父帧：局部连续坐标系
+        t.child_frame_id = "robot1/base_link"     # 子帧：机器人本体
+        # 时间戳取"位姿所依据的传感器时刻"；now() 是错误的锚点：
+        # 插值需要稳定的时间轴，回放时 now() 更是完全错误的时间源
+        t.header.stamp = stamp
+        t.transform.translation.x = x
+        t.transform.translation.y = y
+        t.transform.translation.z = 0.0
+        # 平面运动只绕 z 轴：四元数按半角公式生成（θ/2）
+        half = theta / 2.0
+        t.transform.rotation.z = math.sin(half)
+        t.transform.rotation.w = math.cos(half)
+        self.br.send_transform(t)                 # 每秒 50 次左右，构成"变换曲线"
+
+    def tick(self):
+        # 真实实现中这里读取里程计队列的下一帧（时间戳随帧走）
+        now = self.get_clock().now().to_msg()
+        self.send_odom(0.0, 0.0, 0.0, now)</code></pre>
+    <p>解读：这段代码浓缩了动态 TF 的三个工程要点。<strong>（1）帧名前缀显式拼接</strong>：多机器人系统里绝对不要靠"节点命名空间自动加前缀"来生成帧名，TF 的帧名是字符串，不受话题重映射影响，必须自己写全，这样在日志里一眼能看出是哪台机器人的树。<strong>（2）时间戳用数据时刻</strong>：这是被违反最多的一条。用 <code>now()</code> 打戳在实时系统里"看起来能用"，但回放（第 037 章）时会彻底错乱，而且插值平滑性变差。<strong>（3）发布频率隐含在调用频率里</strong>：TF 不是"发一次的事"，监听端缓冲区靠持续发布填充；停发超过缓冲窗口，查询就开始报外推错误。</p>
+
+    <p><strong>片段 2：launch 中的静态变换与根桥接</strong></p>
+    <pre class="code"><code>from launch import LaunchDescription
+from launch_ros.actions import Node
+
+def static_tf(parent, child, xyz, rpy):
+    """静态变换工厂：安装位置与根桥接都从这里生成，统一参数顺序。"""
+    return Node(
+        package="tf2_ros", executable="static_transform_publisher",
+        # 参数顺序：x y z yaw pitch roll parent child（以发行版文档为准）
+        arguments=[str(xyz[0]), str(xyz[1]), str(xyz[2]),
+                   str(rpy[0]), str(rpy[1]), str(rpy[2]),
+                   parent, child],
+        name=f"stf_{child.replace('/', '_')}",   # 唯一节点名，避免同名冲突
+    )
+
+def generate_launch_description():
+    nodes = []
+    for rid in (1, 2):
+        # 传感器安装位姿：一次标定、长期有效，用静态边（latched，晚加入者也能取到）
+        nodes.append(static_tf(f"robot{rid}/base_link", f"robot{rid}/lidar",
+                               (0.15, 0.0, 0.35), (0.0, 0.0, 0.0)))
+        # 跨机器人根桥接：这里示意"标定得到"的固定偏移；
+        # 若改为在线定位输出，则应换成 10 Hz 的动态广播（第 029 章）
+        nodes.append(static_tf("world", f"robot{rid}/map",
+                               (float(rid - 1) * 5.0, 0.0, 0.0), (0.0, 0.0, 0.0)))
+    return LaunchDescription(nodes)</code></pre>
+    <p>解读：静态变换的价值有两个层面。<strong>（1）语义层面</strong>：安装位置这类"不随时间变化"的关系用静态边表达，系统启动后一劳永逸；<code>static_transform_publisher</code> 发布的是 <code>/tf_static</code> 话题，使用 transient-local 语义，<strong>任何时刻加入的监听者都能立刻拿到全部静态边</strong>，不需要"等它发下一帧"。<strong>（2）架构层面</strong>：把桥接边集中在 launch 里，一眼可见"哪些机器人被连进了 world、用什么偏移"。当第 025 章标定出新参数时，只改这一处。注意参数顺序（平移在前、旋转在后、父帧在子帧之前）在历史发行版中有过变动，写代码时以对应发行版的官方文档为准，不要凭记忆。</p>
+
+    <p><strong>片段 3：监听端查询，超时、异常与降级</strong></p>
+    <pre class="code"><code>import rclpy
+from rclpy.node import Node
+from rclpy.duration import Duration
+from tf2_ros import Buffer, TransformListener, LookupException
+from tf2_ros import ConnectivityException, ExtrapolationException
+
+class TargetLocator(Node):
+    """把本机检测的目标位姿换算到 world 系：跨机协同感知的第一步。"""
+    def __init__(self):
+        super().__init__("target_locator")
+        self.buf = Buffer()                        # 每节点一份本地缓冲区
+        self.listener = TransformListener(self.buf, self)   # 自动订阅 /tf /tf_static
+
+    def to_world(self, frame_id, x, y, stamp):
+        try:
+            # 阻塞最多 50 ms：等待变换到齐的常见姿势（也可以传 timeout=0 立即查）
+            tr = self.buf.lookup_transform("world", frame_id, stamp,
+                                           timeout=Duration(seconds=0.05))
+        except (LookupException, ConnectivityException, ExtrapolationException) as e:
+            # 三类失败要分开统计：帧拼错/树不连通/时间超窗，各有各的修法
+            self.get_logger().warn(f"变换查询失败 {frame_id}->world: {e}")
+            return None                            # 降级：本帧不参与融合，好过用错坐标
+        tx = tr.transform.translation.x
+        ty = tr.transform.translation.y
+        return (tx + x, ty + y)                    # 简化示意：仅平移合成</code></pre>
+    <p>解读：监听端的核心是"查询可能失败，失败要可控"。<strong>（1）</strong>三类异常对应三类根因：<code>LookupException</code> 帧名不存在（多半是拼写或前缀漏了）、<code>ConnectivityException</code> 两帧不在同一棵树（桥接边缺了）、<code>ExtrapolationException</code> 时间超窗（时间同步问题或 TF 停发）。分开统计这三类计数，排障时直接定位层次。<strong>（2）</strong>查询阻塞 50 ms 是折中：给广播的传输抖动留一点余量，又不至于拖垮感知循环节拍。<strong>（3）</strong>失败时返回 <code>None</code>，拒绝"拿最近一帧凑合"：跨机融合里一个错坐标的破坏力远大于缺一帧数据，错误的目标位置会在融合端生成"幽灵目标"。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>两台机器人发布同名 map → odom</strong>：TF 树出现竞争，姿态随机跳动。修复：所有跨机可见帧加前缀；用检查脚本扫描"一帧多父"。</li>
+      <li><strong>帧名依赖命名空间自动展开</strong>：话题会带命名空间，帧名是纯字符串不会。症状：<code>LookupException</code>。修复：在代码里显式写全帧名（见片段 1）。</li>
+      <li><strong>用 now() 打时间戳</strong>：实时下表现为插值毛刺，回放时彻底错乱。修复：时间戳永远取自被变换数据的时间。</li>
+      <li><strong>时间未同步就跨机查 TF</strong>：<code>ExtrapolationException</code> 频繁出现，或换算结果带固定延迟。修复：先做时间同步（第 009 章），再查 TF。</li>
+      <li><strong>静态边用动态方式发布</strong>：有人用 1 Hz 定时器发"静态"变换，晚加入的监听者要等一秒才拿到，还平白多了一条动态边。修复：真正不变的边交给 static_transform_publisher。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把静态桥接改成 10 Hz 动态广播，预测什么现象会变化？用 <code>ros2 topic hz /tf</code> 与查询日志验证。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>/tf 频率上升；晚加入的监听者不再"瞬间可得"桥接边，需要等下一帧；插值轴从常量变为曲线。若广播停摆，查询会从"永远可查"变成"超窗报错"。</div></details>
+      </li>
+      <li>故意在两台机器人上各起一个发布 <code>map → odom</code> 的节点（不加前缀），观察 TF 查询结果如何变化，并记录现象用于日后排查。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>你会看到姿态在两个值之间"跳"，且不同查询时刻结果不同，这正是"一帧多父"的典型症状。</div></details>
+      </li>
+      <li>推导：两机时间差 Δt = 100 ms，机器人以 1 m/s、90°/s 运动。当 A 查询 B 的目标位置时，位置与朝向各引入多大误差？这个误差对 3 m 外目标的坐标影响多大？<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>位置误差 ≈ 0.1 m，朝向 ≈ 9°（0.157 rad）；3 m 外目标的横向误差 ≈ 0.47 m，已经接近一个行人检测框的宽度，融合端会当成两个目标。</div></details>
+      </li>
+      <li>设计题：为一支 3 机器人系统画出完整 TF 树（含 world 根、各机内部层次），为每条边标注类型/发布者/频率，并写出一份"不可能发生多父"的命名检查清单。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>关键是把"跨机边"限制为少数几条根桥接；检查清单可形式化为：对每个子帧，全项目 grep 只有一个发布点使用该帧名字符串。</div></details>
+      </li>
+      <li>思考：为什么 TF 查询在外推时不返回"最近可用变换"？如果你确实需要它（例如显示用途），应该在哪里做这个降级决定？<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>外推等于编造运动模型，控制/融合使用会产生系统误差。降级应发生在<strong>使用方</strong>（如可视化工具自己允许"用最近帧"），而底层库必须保持"要么正确要么报错"的契约。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>TF2 = 分布式变换数据库：广播者持续写入带时间戳的边，监听者按时刻查询并插值。</li>
+      <li>多机器人拓扑推荐"机器人内原生帧名 + 跨机 world 根桥接"；桥接边来自标定（静态）或定位（动态）。</li>
+      <li>最危险的错误是一帧多父（同名 map → odom）；防御靠命名规范加自动检查。</li>
+      <li>时间质量决定 TF 质量：数据时刻打戳、跨机先同步、拒绝外推是三条纪律。</li>
+      <li>下一章深入桥接边从哪里来：<strong>统一坐标框架设计与标定</strong>，把"两台机器人在同一个世界里的相对位置"精确求出来。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch023.html">← 第 023 章：大消息传输：图像与点云压缩</a>
+    <a class="next" href="ch025.html">第 025 章：统一坐标框架设计与标定 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第037章 RLlib实现SAC算法 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第三篇 · RLlib 算法实现</span>
+    <span class="sep">/</span>
+    <span>第 037 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第三篇 · RLlib 算法实现</div>
+    <h1>第 037 章：RLlib实现SAC算法</h1>
+    <p class="lead">SAC（Soft Actor-Critic）以最大熵目标把探索写进优化对象，用双 Q 网络与软更新稳定价值估计。本章讲清熵增强回报、软贝尔曼方程、重参数化采样与温度自动调节，以及连续控制场景的配置要点。</p>
+    <ul class="meta">
+      <li>主题：RLlib 算法 / 离策略演员评论家</li>
+      <li>关键机制：最大熵目标、软 Q 更新、双 Q、重参数化、温度自动调节</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 036 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解最大熵目标的结构，说明熵项与温度系数在探索中的角色。</li>
+      <li>掌握软贝尔曼方程与双 Q 目标的构造，理解最小化取值对高估的抑制。</li>
+      <li>理解重参数化采样与有界压缩，会处理对数概率的修正项。</li>
+      <li>掌握温度自动调节的机制与目标熵取值依据。</li>
+      <li>会配置 SAC 的关键参数：软更新系数、回放容量、学习启动步数与批次规模。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>连续控制任务的动作为实数向量，价值型算法对连续动作取最大值的操作不可直接枚举，标准做法是再训练一个策略网络逼近最大动作，流程与稳定性都更复杂。SAC 从另一条路解决同一问题：把策略的随机性纳入优化目标，最大化回报与熵的加权和，策略网络直接输出动作分布，价值网络评估软 Q 值。</p>
+    <p>收益有两层：熵增项让策略在回报相近的动作间保持分散，探索持续存在；离策略结构支持回放复用，样本效率高于同策略方法。<strong>SAC 因此成为连续控制的常见默认选择，前提是奖励尺度与温度机制对齐。</strong>上一章数据用完即弃，本章重新引入回放并改造目标函数。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p>SAC 的四块拼图：最大熵目标、软 Q 更新、重参数化采样与温度调节。</p>
+
+    <h3>1. 最大熵目标</h3>
+    <p>标准目标是最大化期望回报；SAC 在每个时间步的回报上追加熵奖励，得到熵增强回报：</p>
+    <div class="formula">
+      J(π) = Σ<sub>t</sub> E[ r<sub>t</sub> + α · H(π(·|s<sub>t</sub>)) ]
+      <span class="note">H 为策略熵，α 为温度系数，控制"每单位回报换取多少随机性"；α 越大策略越分散，α 越小越接近确定性策略</span>
+    </div>
+    <p>熵项把探索提升为优化对象的一部分：策略在多个高回报动作间保持概率质量，面对噪声与估计误差更稳健。温度系数是熵与回报的兑换率，取值与奖励尺度耦合，这是 SAC 对奖励量纲敏感的根本原因。</p>
+
+    <h3>2. 软 Q 更新与双 Q</h3>
+    <p>软贝尔曼方程在目标中吸收熵项：下一状态的价值由下一个动作的 Q 值减去该动作的对数概率乘温度构成。SAC 同时维护两个 Q 网络，目标取两者最小值：</p>
+    <div class="formula">
+      y = r + γ ( min<sub>i=1,2</sub> Q<sub>i,target</sub>(s′, a′) − α · log π(a′|s′) )
+      <span class="note">取最小值缓解 Q 值高估；a′ 由当前策略采样，不再对动作取最大，两条设计共同替代了离散场景的 max 操作</span>
+    </div>
+    <p>双 Q 与"采样代替最大化"的组合是连续场景爆掉高估问题的主要手段。目标网络的更新采用软更新：每次梯度步把目标参数向在线参数移动一个小比例，取代周期性整体复制。<strong>软更新的等效平滑窗口约为 1/τ 次更新，</strong>τ 取 0.005 时窗口约两百步，与 DQN 的硬同步周期是同类节奏参数。</p>
+
+    <h3>3. 重参数化与有界压缩</h3>
+    <p>策略网络输出高斯分布的均值与标准差，动作经重参数化采样：先采标准正态噪声再线性变换，梯度可穿过采样回传，方差低于得分函数估计。动作再经双曲正切压缩到有界区间，对数概率需加雅可比修正项：<strong>压缩改变概率密度，不做修正时熵估计错误，温度调节随之失准。</strong>修正后的对数概率同时出现在策略损失与软 Q 目标中，两处使用同一份数值。</p>
+
+    <h3>4. 温度自动调节</h3>
+    <p>固定温度需要按任务逐个调参；自动调节把温度当作对偶变量：当策略熵低于目标熵时增大温度（加强探索激励），高于目标熵时减小温度。目标熵通常取动作维度的相反数，例如六维动作对应目标熵负六。<strong>自动调节让温度在训练过程中自适应：</strong>早期策略分散、温度下降，后期策略收敛、温度回升以维持目标熵。温度曲线本身是诊断指标：长期贴近零说明目标熵过小，长期高企说明回报信号不足。</p>
+
+    <h3>5. 软目标与温度项的数值示例</h3>
+    <p>取 r = 1、γ = 0.99、Q₁ = 2.0、Q₂ = 1.8、α = 0.2。下一动作的对数概率为 −0.7 时：软价值 = min(2.0, 1.8) − 0.2×(−0.7) = 1.8 + 0.14 = 1.94，目标 y = 1 + 0.99×1.94 ≈ 2.92。若策略更分散、下一动作对数概率降到 −2.0：软价值升到 1.8 + 0.4 = 2.2，目标升到约 3.18。<strong>同一奖励与 Q 值下，策略越随机软目标越高，训练持续奖励在相似回报下保留随机性的行为。</strong></p>
+    <div class="formula">
+      y = r + γ ( min(Q₁, Q₂) − α · log π(a′|s′) )
+      <span class="note">对数概率为负值，熵惩罚项 −α·logπ 为正；α = 0.2、logπ = −0.7 时惩罚贡献 0.14，策略分散程度直接影响目标水平</span>
+    </div>
+
+    <h3>6. 软更新系数的档位对比</h3>
+    <table>
+      <tr><th>τ</th><th>等效平滑窗口</th><th>目标跟随速度</th><th>稳定性</th><th>适用情形</th></tr>
+      <tr><td>0.001</td><td>约 1000 次更新</td><td>慢</td><td>最高</td><td>奖励噪声大、价值震荡明显时</td></tr>
+      <tr><td>0.005</td><td>约 200 次更新</td><td>中</td><td>高</td><td>默认起点</td></tr>
+      <tr><td>0.01</td><td>约 100 次更新</td><td>较快</td><td>中</td><td>训练预算有限、需要快速收敛</td></tr>
+      <tr><td>0.05</td><td>约 20 次更新</td><td>快</td><td>低</td><td>仅用于短程任务验证</td></tr>
+    </table>
+    <p>等效窗口按 1/τ 计算，含义是经过这些更新步后，目标参数与在线参数之间的差距衰减到约 37%（1/e）。窗口应与回放池周转周期匹配：目标更新明显快于池周转时，目标跟随陈旧数据的噪声；明显慢于周转时，学习信号传递滞后。</p>
+
+    <h3>7. 压缩修正的数值示例</h3>
+    <p>以均值 0、标准差 1 的预压缩分布为例，高斯对数概率按 −0.5(x² + ln 2π) 计算：</p>
+    <table>
+      <tr><th>预压缩值 x</th><th>tanh(x)</th><th>修正项 log(1−tanh²)</th><th>高斯对数概率</th><th>修正后对数概率</th></tr>
+      <tr><td>0</td><td>0</td><td>0</td><td>−0.919</td><td>−0.919</td></tr>
+      <tr><td>1</td><td>0.762</td><td>−0.868</td><td>−1.419</td><td>−0.551</td></tr>
+      <tr><td>2</td><td>0.964</td><td>−2.650</td><td>−2.919</td><td>−0.269</td></tr>
+    </table>
+    <p>计算过程：x = 1 时高斯对数概率为 −0.5×(1 + 1.838) = −1.419，修正项 log(1 − 0.762²) = log(0.420) ≈ −0.868，动作空间对数概率为 −1.419 − (−0.868) = −0.551。x = 2 时修正项为 log(1 − 0.964²) = log(0.0706) ≈ −2.650，修正后为 −0.269。<strong>越靠近动作边界，修正项的绝对值越大；遗漏修正会让边界附近的对数概率被低估，熵估计偏大，温度调节误判为探索充足而削减激励。</strong></p>
+
+    <h3>8. 连续控制算法对照</h3>
+    <table>
+      <tr><th>算法</th><th>探索机制</th><th>高估抑制</th><th>目标网络更新</th><th>样本复用</th><th>稳定性特征</th></tr>
+      <tr><td>DDPG</td><td>外部动作噪声</td><td>无专门机制</td><td>软更新</td><td>支持</td><td>对超参敏感，易发散</td></tr>
+      <tr><td>TD3</td><td>外部动作噪声</td><td>双 Q 取最小，策略延迟更新</td><td>软更新加目标动作噪声</td><td>支持</td><td>较稳定，探索靠噪声设计</td></tr>
+      <tr><td>SAC</td><td>熵写入目标函数</td><td>双 Q 取最小</td><td>软更新</td><td>支持</td><td>稳定，对奖励尺度敏感</td></tr>
+    </table>
+    <p>选择依据：需要内置探索与较少调参时选 SAC；任务对确定性动作有要求、愿意手工设计噪声时评估 TD3；DDPG 作为理解最小结构的历史对照，新任务不优先选用。</p>
+
+    <h3>9. 数值算例：熵水平、双 Q 偏差与回放周转</h3>
+    <p>对角高斯的每维熵为 H = ln σ + 0.5 ln(2πe) ≈ ln σ + 1.419。σ = 1 时每维熵约 1.42，σ = 0.5 时约 0.73，σ = 0.1 时约 −0.88；目标熵按"维度相反数"取每维 −1 时，自动调节会把标准差推向 σ ≈ 0.089 的水平。这组数字说明两件事：目标熵是启发式基线，取值按经验设定，高维动作空间里它偏保守，需要按探索需求上调；温度机制直接控制分布宽度，σ 从 1 收缩到 0.1 意味着动作抖动幅度下降一个数量级。</p>
+    <table>
+      <tr><th>标准差 σ</th><th>每维熵 H</th><th>行为含义</th></tr>
+      <tr><td>1.0</td><td>约 1.42</td><td>宽分布，强探索</td></tr>
+      <tr><td>0.5</td><td>约 0.73</td><td>中等分散</td></tr>
+      <tr><td>0.1</td><td>约 −0.88</td><td>接近确定性</td></tr>
+      <tr><td>0.089</td><td>约 −1.00</td><td>目标熵对应的宽度</td></tr>
+    </table>
+    <p>双 Q 的偏差可以估算：设两条网络的估计误差近似独立、标准差为 σ<sub>q</sub>，取最小值的期望偏差约为 −0.564 σ<sub>q</sub>（两个标准正态取最大值的期望是 1 ÷ √π ≈ 0.564）。单网络取最大时的正向高估同量为 0.564 σ<sub>q</sub>，双 Q 把高估换成轻微低估，σ<sub>q</sub> = 1 时偏差约 0.56 个价值单位。方向选择有讲究：高估沿自举链放大并诱发过度乐观的策略，低估只让策略偏保守，后者安全。</p>
+    <p>回放周转同样可算：容量 10 万、每轮写入 256 条时，池的整体换血需要约 391 轮。目标网络等效平滑窗口（τ = 0.005 时约 200 次更新）短于周转周期，学习信号里始终夹着旧策略数据的痕迹；容量缩到 1 万时周转缩短到 39 轮，数据新鲜度提高而样本效率下滑。容量选择是在新鲜度与复用深度之间取舍，判据是池内数据年龄分布与价值损失的波动。</p>
+
+    <h3>10. 边界与失效模式</h3>
+    <p>压缩函数的饱和边界：预压缩值 |x| 超过 3 后，修正项 log(1 − tanh<sup>2</sup>x) 的绝对值升到 −6 以下并快速走低，梯度接近消失，落在边界附近的动作难以被有效修正。表现是策略把部分动作长期顶在边界上；修复动作是核对动作范围与任务需求的匹配，必要时放宽动作界声明。</p>
+    <p>熵目标的坏情形要会识别：目标熵过高时策略长期保持高随机性，回报停滞而熵曲线贴着目标；过低时早期就收缩到确定性，探索不足导致次优收敛。稀疏奖励任务适合下调目标熵，密集奖励任务可保持默认。温度自动调节是慢回路，奖励尺度突变后要给足调节时间，或直接重设初值。</p>
+    <p>并行度也有边界：离策略算法不依赖大批量新鲜数据，采样器从二到四个继续增加，边际收益迅速衰减；回放池的读写是单点服务时，过多采样器还会在池的写入队列上排队。规模验证的办法是扫描采样器数并观察单位墙钟时间的更新数据比，比值不再上升即为该加别的资源。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>配置顺序：核对奖励尺度与动作范围，设置回放与批次，再校准温度机制与软更新节奏。</p>
+    <table>
+      <tr><th>参数</th><th>示例值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td><code>tau</code></td><td>0.005</td><td>目标网络软更新系数</td><td>等效平滑窗口约两百次更新</td></tr>
+      <tr><td><code>twin_q</code></td><td>True</td><td>双 Q 网络</td><td>连续控制默认启用</td></tr>
+      <tr><td><code>initial_alpha</code></td><td>0.2</td><td>初始温度</td><td>随奖励尺度调整，自动调节从该值出发</td></tr>
+      <tr><td><code>target_entropy</code></td><td>auto</td><td>目标熵</td><td>默认取动作维度相反数，可按探索需求微调</td></tr>
+      <tr><td><code>replay_buffer_capacity</code></td><td>100000</td><td>回放容量</td><td>连续状态体积小，容量按训练步数预算放大</td></tr>
+      <tr><td><code>learning_starts</code></td><td>2000</td><td>学习启动步数</td><td>先填充多样性样本再更新</td></tr>
+      <tr><td><code>train_batch_size</code></td><td>256</td><td>每步更新批次</td><td>离策略小批次高频更新</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：为什么 SAC 对奖励尺度格外敏感？</span>
+      <p>温度系数是熵与回报的兑换率：奖励整体放大十倍时，同样的温度下熵的相对吸引力下降，策略迅速确定化，探索激励形同消失。自动调节能部分吸收尺度差异，目标熵与初始温度仍需与量纲匹配。<strong>奖励函数修改后，温度参数重新校准，两者写入同一份实验记录。</strong></p>
+    </div>
+    <p>温度初值与奖励量纲同比例缩放：奖励整体放大十倍时，初始温度从 0.2 量级抬到 2.0 量级，熵与回报的兑换率才保持不变；自动调节能吸收部分差异，初值偏离过大时调节过程需要更长时间，早期策略可能已经确定化。目标熵的手工设定用于两类场景：高维动作空间按维度取相反数往往偏保守，可适度上调；稀疏奖励任务中回报信号弱，可下调目标熵避免策略长期松散。双 Q 的两条网络应使用不同的初始化，共模初始化会削弱取最小值对高估的抑制作用。梯度裁剪阈值与学习率配套检查，SAC 的更新同时涉及策略、双 Q 与温度多个目标，梯度尺度失衡时优先怀疑学习率。回放池容量与观测体积的关系：状态 8 维、单转移约 70 字节时，10 万容量仅占约 7 MB，容量可取大；图像观测按单帧字节数重算后再定容量。评估阶段关闭动作随机化，取分布均值或低温采样，保持与部署行为一致；评估回报与训练回报的差值进入监控，差值扩大时先排查探索强度与过拟合。双 Q 与自动温度同时开启时，价值估计的收敛速度通常慢于单 Q 配置，学习率的校准要以最终组合为准。回放池采用单写入多读取结构时，索引由写入端更新、读取端只取完整转移，采样进程的数量不改变写入顺序。</p>
+    <p>与上一章差异：第 036 章的策略批次来自并行采样、用完即弃；本章把回放池带回训练循环，且目标函数多了熵项、价值侧多了一个网络与软更新。<strong>数据组织回到离策略模式，稳定性机制则从"批次新鲜度"转移到"目标平滑与双 Q"。</strong>下一章讨论 PPO：用裁剪目标限制更新幅度，是目前使用最广的同策略方法。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：SAC 配置骨架</strong></p>
+    <pre class="code"><code>from ray.rllib.algorithms.sac import SACConfig
+
+config = (
+    SACConfig()
+    .environment(env=ContinuousGoalEnv)
+    .training(
+        lr=3e-4,
+        tau=0.005,                        # 软更新：目标参数每次向在线侧移动千分之五
+        twin_q=True,                      # 双 Q 取最小值，抑制高估
+        initial_alpha=0.2,                # 温度初值：与奖励尺度对齐
+        target_entropy="auto",            # 目标熵取动作维度相反数
+        n_step=1,                         # 默认单步自举；长程稀疏任务可加大
+        replay_buffer_capacity=100000,    # 连续状态体积小，容量可放大
+        learning_starts=2000,             # 先填充样本再更新参数
+        train_batch_size=256,             # 小批次高频更新
+    )
+    .env_runners(num_env_runners=2)       # 离策略采样只需少量并行
+)
+algo = config.build_algo()
+result = algo.train()</code></pre>
+    <p>解读：配置呈现离策略演员评论家的三段结构：目标平滑（tau、twin_q）、探索温度（initial_alpha、target_entropy）、数据管理（回放容量与启动步数）。<strong>并行度只需二到四个采样器：</strong>离策略算法不依赖大批量新鲜数据，回放池承担数据供给，并行度过高会稀释池的更新价值。键名与自动温度的相关选项随版本演进，以对应版本文档为准。</p>
+
+    <p><strong>片段 2：软更新与双 Q 目标</strong></p>
+    <pre class="code"><code>import numpy as np
+
+
+def soft_update(online_params, target_params, tau=0.005):
+    """目标参数向在线参数移动：目标参数 = tau 乘在线参数 + (1 − tau) 乘目标参数。"""
+    for name in online_params:
+        target_params[name] = (
+            tau * online_params[name] + (1.0 - tau) * target_params[name])
+    return target_params
+
+
+def sac_target(rewards, q1_next, q2_next, log_prob_next, dones,
+               alpha=0.2, gamma=0.99):
+    """软贝尔曼目标：双 Q 取最小，减去温度的熵惩罚项。"""
+    entropy_term = alpha * log_prob_next           # 下一动作的熵贡献
+    soft_value = np.minimum(q1_next, q2_next) - entropy_term
+    soft_value = np.where(dones, 0.0, soft_value)  # 终止样本屏蔽自举
+    return rewards + gamma * soft_value</code></pre>
+    <p>解读：软更新把"复制参数"变成"参数插值"，实现是逐参数的加权平均，等效于在线参数的指数移动平均。<strong>目标中的熵项是 SAC 与 DQN 目标的结构性差别：</strong>价值评估的对象变成"回报减熵成本"的软价值；终止掩码在熵项计算之后应用，吸收态不引入任何后续项。双 Q 取最小值的对象是两条独立网络的前向结果，两条网络的初始化与训练数据相同但梯度路径独立，减小估计的共模误差。</p>
+
+    <p><strong>片段 3：有界压缩与对数概率修正</strong></p>
+    <pre class="code"><code>def squashed_log_prob(mean, log_std, noise):
+    """重参数化加 tanh 压缩，返回动作与其修正后的对数概率。"""
+    std = np.exp(np.clip(log_std, -20, 2))          # 标准差截断，防数值发散
+    pre_tanh = mean + std * noise                    # 重参数化：噪声独立采样
+    action = np.tanh(pre_tanh)                       # 压缩到 [-1, 1]
+    # 高斯对数概率按每个维度计算（对角协方差）
+    gaussian_logp = -0.5 * (
+        ((pre_tanh - mean) / std) ** 2 + 2 * log_std + np.log(2 * np.pi))
+    # 雅可比修正：log(1 - tanh(x)^2)，防止熵估计被压缩扭曲
+    correction = np.log(1 - action ** 2 + 1e-6)
+    return action, gaussian_logp - correction.sum(axis=-1)
+
+
+# 策略损失 = (alpha * log_prob - Q(s, a)).mean()：
+# 提高 Q 的同时奖励高熵动作，两项的相对权重由 alpha 给出</code></pre>
+    <p>解读：重参数化的价值在于梯度路径贯穿采样：噪声是外生输入，梯度可以穿过均值与标准差回传。tanh 压缩改变密度，雅可比修正项把概率换算回动作空间的密度；<strong>修正遗漏时 log_prob 的尺度错误，策略损失与温度调节同时失准，</strong>症状是熵曲线与回报曲线同时异常。标准差截断是数值稳定手段，防止早期网络输出过大导致高斯尾部采样溢出。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>奖励尺度与温度不匹配</strong>：奖励放大后熵吸引力下降，策略迅速确定化。症状是熵跌落而回报不涨。修复：随奖励量纲校准初始温度与目标熵。</li>
+      <li><strong>回放容量或批次过小</strong>：离策略复用不足，训练退化为近似同策略。症状是样本效率优势消失。修复：放大容量与批次，或提高采样环境数。</li>
+      <li><strong>对数概率修正遗漏</strong>：压缩后未加雅可比项。症状是熵曲线异常、温度震荡。修复：在策略损失与软 Q 目标两处使用同一修正实现。</li>
+      <li><strong>评估使用随机动作</strong>：评估未取分布均值，评估回报被随机性压低。症状是评估曲线明显低于部署表现。修复：评估模式取动作分布均值，与部署行为对齐。</li>
+      <li><strong>软更新系数过小或过大</strong>：τ 过小目标几乎不动、学习滞后；过大目标跟随过快、稳定性下降。症状是价值损失长期高位或高频震荡。修复：从 0.005 量级起步，按价值曲线的平滑程度微调。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>奖励整体放大五倍后，预测熵曲线与温度曲线的变化方向，给出两种补偿手段。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>熵的吸引力相对下降，熵曲线下移；补偿手段是放大初始温度或提高目标熵，两者都恢复熵与回报的兑换率。</div></details>
+      </li>
+      <li>把 tau 从 0.005 改到 0.05，预测目标网络平滑窗口与训练稳定性的变化。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>等效窗口从约两百次更新缩短到约二十次，目标跟随更快、稳定性下降，价值损失震荡概率上升。</div></details>
+      </li>
+      <li>推导：说明 tanh 压缩的雅可比修正项来源，以及遗漏它时熵估计的偏差方向。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>密度变换需乘以压缩函数的导数绝对值，取对数即 log(1−tanh(x)²)；遗漏时边界附近动作的概率密度被高估，熵与温度调节失准。</div></details>
+      </li>
+      <li>设计消融实验：twin_q 开关与固定温度、自动温度两组对照，说明观察指标与判定标准。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>观察 Q 值的高估幅度（与回报核对）、熵曲线与评估回报；双 Q 关闭且奖励尺度大时高估明显，自动温度在任务切换时更省调参。</div></details>
+      </li>
+      <li>设计诊断流程：价值损失高企时，按目标网络节奏、回放新鲜度、熵项三方向排查并给出判据。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>先核对 tau 与更新频率的匹配、再看池内数据年龄分布、最后检查熵项尺度是否压过回报；三个方向分别对应目标滞后、分布偏移与目标函数失衡。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>最大熵目标把熵奖励并入回报，温度系数 α 是熵与回报的兑换率。</li>
+      <li>软贝尔曼目标用双 Q 最小值与下一动作熵惩罚替代离散场景的 max 操作。</li>
+      <li>重参数化采样让梯度穿过随机采样；tanh 压缩需雅可比修正，修正贯穿两处损失。</li>
+      <li>温度自动调节按目标熵自适应，目标熵默认取动作维度相反数。</li>
+      <li>离策略回放复用样本，并行采样器只需少量；奖励量纲变化时必须重新校准温度。</li>
+      <li>下一章讨论 PPO：用裁剪目标限制更新步幅的稳定同策略方法。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch036.html">← 第 036 章：RLlib实现A3C算法</a>
+    <a class="next" href="ch038.html">第 038 章：RLlib实现PPO算法 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

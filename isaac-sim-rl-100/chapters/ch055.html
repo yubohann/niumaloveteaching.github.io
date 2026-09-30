@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第055章 实现分层强化学习 | 机器人仿真学习课程 · Isaac Sim 强化学习训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第三篇 · 高级强化学习专题</span>
+    <span class="sep">/</span>
+    <span>第 055 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第三篇 · 高级强化学习专题</div>
+    <h1>第 055 章：实现分层强化学习</h1>
+    <p class="lead">把"做什么"和"怎么做"拆成两层：管理器每 0.2 秒选一个子目标，工人以 50 Hz 把它执行到位，用时间抽象解决长程任务的信用分配与探索难题。</p>
+    <ul class="meta">
+      <li>主题：高级专题 / 分层与时间抽象</li>
+      <li>相关组件：Isaac Sim / Isaac Lab / Stable-Baselines3（两个 PPO）</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 054 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解长程任务的两大痛点（信用分配跨度、探索空间爆炸），以及时间抽象如何同时缓解两者。</li>
+      <li>能写出选项（option）三要素 I、π<sub>ω</sub>、β，并说清它与"固定脚本阶段"的区别。</li>
+      <li>掌握 manager-worker 双网络结构：决策频率、子目标表示、终止条件三件事的工程取舍。</li>
+      <li>会设计子目标空间：为什么"相对末端的位移"优于绝对坐标点。</li>
+      <li>会分配两层的奖励：worker 的密集子目标跟踪奖励 + manager 的稀疏任务奖励与可达性信号。</li>
+      <li>能规划两阶段训练（先训 worker 再训 manager）与联合微调，并识别"高层提出不可达子目标"这一典型病态。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 042 章用人工阶段机（接近→对齐→插入）把长任务切成短段，效果很好，但那套阶段是工程师写的。当任务更长、更杂（"把三块积木按颜色码放到架子第二层，再把工具放回抽屉"），手工阶段机会迅速变成难以维护的脚本树，而且无法随环境自动调整顺序。分层强化学习（hierarchical RL, HRL）的目标就是：<strong>让"分几步走、每步做什么"也由学习得到</strong>。</p>
+    <p>它的核心杠杆叫时间抽象（temporal abstraction）：高层不再逐步决策，改为每 k 步选一个"子目标"，低层用 k 步把它完成。这样做一次决策覆盖多个环境步，信用分配的链条缩短了 k 倍；同时高层在"子目标空间"里探索，比在原始动作空间里随机摸索高效得多。代价是两层要协调，本章会把协调的接口与奖励设计讲清楚。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 长程任务为什么难</h3>
+    <p>考虑一个需要 500 步才能完成的抓放任务：稀疏奖励只在最后一步给出。对平坦（flat）策略来说：</p>
+    <ul>
+      <li><strong>信用分配</strong>：最终奖励要"归功"到 500 步之前的选择，梯度信号在时间上被稀释得几乎为零；GAE 的 λ 衰减 0.95 在 100 步后只剩 0.006。</li>
+      <li><strong>探索</strong>：随机动作序列里恰好碰出完整成功轨迹的概率随步长指数下降（每步正确概率 0.9 时，500 步全对的概率约 10<sup>−23</sup>）。</li>
+    </ul>
+    <p>这两个问题本质上是"时间尺度"问题。HRL 的答案：<strong>在不同的时间尺度上分别决策</strong>，高层每 10–20 步做一次选择（500 步只有 25–50 个决策点），信用链条自然缩短；低层只需要解决它看得见的小问题。</p>
+
+    <h3>2. 选项框架：时间抽象的数学形态</h3>
+    <p>经典选项（option）定义为三元组 ω = (I, π<sub>ω</sub>, β)：</p>
+    <div class="formula">
+      I: 启动集合（哪些状态可以启动这个选项）<br>
+      π<sub>ω</sub>: 低层策略（在选项内部怎么动）<br>
+      β: 终止函数 β(s) → [0, 1]（什么时候算完成）
+    </div>
+    <p>本章的 manager-worker 结构是它最常用的工程特例：选项由子目标参数化，"走到某个点半"、"抓稳某个物体"；终止函数即"到达子目标或超时"。理论上分层策略在 SMDP（半马尔可夫决策过程）上优化：决策间隔是变量，回报按跨越的真实时间加权（γ<sup>k</sup>）。工程上为了简单，常把 manager 写成固定频率（每 k 步决策一次），此时 SMDP 退化成"动作重复 k 步"的 MDP，严格性稍弱但实现简洁，效果通常够用。</p>
+
+    <h3>3. 子目标表示：相对量与可达性</h3>
+    <p>子目标怎么表示，决定了整个系统好不好学。三种常见选择：</p>
+    <table>
+      <tr><th>表示</th><th>优点</th><th>问题</th></tr>
+      <tr><td>绝对坐标点（"去 (0.4, 0.1, 0.3)"）</td><td>直观</td><td>随场景位置变化需重新学；点可能落在障碍/不可达区</td></tr>
+      <tr><td>相对位移（"向前 5 cm"）</td><td>平移泛化好，量纲受限</td><td>对旋转/姿态不敏感</td></tr>
+      <tr><td>相对当前末端的位姿偏移（Δ位姿）</td><td>泛化好 + 可表达姿态</td><td>子目标空间仍是连续的，需要范围约束</td></tr>
+    </table>
+    <p>本章推荐第三种，并把偏移量限制在"低层一步区域（约 0.2 s 内能到达）"的尺度：位移 ±8 cm、旋转 ±20°。加上这个限制，高层提出的子目标天然"近在眼前"，低层通过率就高。这个做法对应选项理论里的"可达性约束"。</p>
+
+    <h3>4. 两层奖励：谁为什么负责</h3>
+    <p>低层（worker）的奖励是密集的：<strong>跟踪子目标的负距离 + 到达奖励 + 动作平滑</strong>。它不关心任务成败，那是高层的责任。高层（manager）的奖励是稀疏的任务奖励加上一个关键信号：<strong>它所选子目标期间 worker 累计获得的回报</strong>（worker 的回报本质上度量"这个子目标可达不可达、容易不容易"）。这个小设计治愈了分层学习最常见的病：高层学会提出"遥不可及"的子目标，把任务失败归咎于低层。同理，高层奖励里还应减去"子目标切换频率"的惩罚，防止它在两个目标间反复横跳刷分。</p>
+
+    <h3>5. 训练流程：先工人、后经理、再合练</h3>
+    <p>端到端同时训练两层会让两边同时非平稳（高层的目标在变、低层的技能也在变）。标准三步：<strong>（1）worker 单独预训练</strong>，在随机子目标分布上学习"指哪到哪"，这不依赖任务；<strong>（2）冻结 worker 训 manager</strong>，低层行为固定，高层面对一个稳定的"技能库"；<strong>（3）联合微调</strong>，解冻 worker 用较小的学习率继续训练，做最后的协调。经验上，前三步带来的样本效率优势最明显的是第（2）步：manager 的问题被压缩成"在 25–50 个决策点里选对子目标序列"。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>用"长程抓放"任务搭建分层系统（比 042 更长：需经过障碍、码放、回位）：</p>
+    <ol>
+      <li><strong>任务</strong>：机械臂抓取桌面目标物 → 绕过中间竖板 → 放入 1 m 外的容器 → 回到初始位。全流程约 500 控制步（50 Hz 下 10 秒）。</li>
+      <li><strong>频率设计</strong>：worker 50 Hz（每步出关节动作）；manager 每 k=10 步决策一次（5 Hz，一次决策覆盖 0.2 s）。为什么 k 不更大？0.2 s 是末端完成一个"小位移-抓放"的原语动作时间；k=30（0.6 s）时子目标会跨越多个动作阶段，worker 跟踪与 manager 意图开始脱节。</li>
+      <li><strong>子目标空间</strong>：相对末端位姿偏移（6 维），位移限 ±8 cm、旋转限 ±20°；额外 2 维"夹爪开合期望"（抓取/放开由高层决定）。</li>
+      <li><strong>观测</strong>：manager 看"全局慢信息"，物体位置、容器位置、末端位姿、进度（4 维）、上一子目标；worker 看"本体快信息"，关节状态、末端速度、目标物相对位姿、当前子目标。</li>
+      <li><strong>奖励</strong>：worker：−0.5·‖末端−子目标‖ + 到达 +1（阈值 1 cm）+ 动作平滑；manager：任务完成 +10、阶段完成 +2、子目标可达性 0.2·Σworker 回报、子目标切换罚 −0.05/次。</li>
+      <li><strong>训练</strong>：阶段 1 worker 预训练 200 万步（随机子目标）；阶段 2 冻结 worker 训 manager 500 万步；阶段 3 联合微调 100 万步（worker 学习率 ×0.1）。</li>
+      <li><strong>评估</strong>：任务成功率、平均完成步数、子目标到达率（worker 层面）、子目标切换次数（看高层是否"犹豫"）、以及分层版与平坦 PPO 的对照曲线。</li>
+    </ol>
+    <table>
+      <tr><th>对比项</th><th>平坦 PPO</th><th>manager-worker</th></tr>
+      <tr><td>决策点数（500 步任务）</td><td>500</td><td>50（高层）+ 500（低层跟踪）</td></tr>
+      <tr><td>稀疏奖励下的样本量</td><td>数千万步起</td><td>几百万步（含预训练）</td></tr>
+      <tr><td>实现复杂度</td><td>低</td><td>中（两层接口/奖励/训练流程）</td></tr>
+      <tr><td>可解释性</td><td>低</td><td>子目标序列可视化为"计划"</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计思维：分层与"阶段机"（042 章）是什么关系？</span>
+      <p>阶段机是"人工分层"：阶段由工程师按工艺顺序写死，切换条件也是规则的，优点是可控、可验证，缺点是脆（环境一变顺序就失效）。HRL 是"学出来的分层"：何时切换到哪个子目标由策略决定，能自适应环境，但可解释性与安全性需要额外手段保障。工程上的折中很常见：<strong>用课程/脚本先把低层技能训好（阶段机的思想），再让高层学顺序</strong>，本章的阶段 1 预训练就是这个折中。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：manager-worker 主循环</strong></p>
+    <pre class="code"><code>import numpy as np
+
+class ManagerWorkerLoop:
+    # 时间抽象：manager 每 k 个控制步决策一次；worker 每步决策
+    def __init__(self, manager, worker, k=10, reach_tol=0.01):
+        self.manager, self.worker = manager, worker
+        self.k = k
+        self.reach_tol = reach_tol     # 子目标到达阈值 1 cm
+        self.subgoal = None
+        self.subgoal_age = 0           # 当前子目标存活步数（超时切换）
+        self.switch_count = 0          # 切换次数：高层"犹豫"的诊断指标
+
+    def step(self, obs_high, obs_low, t):
+        # 触发条件：每 k 步，或子目标已到达/超时。到达检测由低层状态完成
+        need_new = (self.subgoal is None) or (t % self.k == 0)
+        if need_new:
+            self.subgoal = self.manager.act(obs_high)   # 6 维相对位姿偏移
+            self.subgoal_age = 0
+            self.switch_count += 1
+        self.subgoal_age += 1
+
+        # worker 的观测里显式包含当前子目标：它不需要"猜"经理想要什么
+        a_low = self.worker.act(np.concatenate([obs_low, self.subgoal]))
+        return a_low, self.subgoal</code></pre>
+    <p>解读：主循环里藏着三处分层接口的关键决定。第一，触发条件用"固定周期 + 到达/超时"的组合：纯固定周期（每 10 步）最简单、时序规整，但子目标早已到达时仍在等待；纯事件触发（到达才换）则可能卡在不可达目标上。工程上常见做法是"固定周期为主，辅以超时保护"，本实现里 <code>t % k == 0</code> 保证节拍，<code>subgoal_age</code> 留给调用方做超时判断。第二，<code>switch_count</code> 这个计数器不是给训练用的，是给调试用的：如果它远大于"每 10 步一次"的基准（比如每回合 100 多次），说明子目标频繁被事件打断，高层处于"犹豫"状态，通常是子目标空间过大或切换罚太小的症状。第三，worker 观测里显式拼入子目标：新手常让 worker"自己体会"经理的意图（比如只看物体的位置变化），这在两层各自学习时几乎必然失败，<strong>层间的接口必须是显式、无歧义的</strong>。</p>
+
+    <p><strong>片段 2：两层奖励的分解</strong></p>
+    <pre class="code"><code>def worker_reward(ee_pos, subgoal_pos, action, prev_action):
+    # 低层的唯一目标：把末端送到子目标。密集、局部、与任务成败无关
+    d = float(np.linalg.norm(ee_pos - subgoal_pos))
+    r = -0.5 * d                                    # 距离越近越好（密集梯度）
+    r -= 0.01 * float(np.linalg.norm(action - prev_action))   # 动作平滑
+    if d &lt; 0.01:
+        r += 1.0                                    # 到达奖励：给"精准"一点甜头
+    return r
+
+def manager_reward(task_done, stage_done, subgoal_switches,
+                   worker_returns_sum, cfg):
+    # 高层的奖励 = 任务/阶段奖励 + 子目标可达性 + 切换惩罚
+    r = 0.0
+    if task_done:
+        r += 10.0
+    if stage_done:
+        r += 2.0
+    # 可达性信号：这段时间里 worker 累计回报越高，说明高层选的子目标越"好办"
+    # 这是治愈"高层甩锅"的关键项：不可达的子目标会让 worker 回报很低
+    r += 0.2 * worker_returns_sum
+    # 切换惩罚：防止在两个子目标之间来回横跳刷可达性分
+    r -= 0.05 * subgoal_switches
+    return r</code></pre>
+    <p>解读：两段奖励的分工对应两层的"职责边界"。worker 的公式只有三个成分，其中 <code>-0.5 * d</code> 是主角，把"如何靠近"变成一个连续优化问题，与任务语义完全解耦，所以同一个 worker 可以在任何任务里复用（阶段 1 预训练就是这个原因）。到达奖励阈值 0.01 m 与主循环的 <code>reach_tol</code> 保持一致：如果两个地方写不同的数（比如奖励用 1 cm、切换判定用 5 mm），worker 会在"已拿到达奖励但系统认为没到达"的区间里逗留，表现为子目标迟迟不切换。manager 侧的重点是可达性项：<code>worker_returns_sum</code> 是该高层决策周期内 worker 获得的回报总和，把它加进高层奖励，等价于告诉经理"你许的愿得是工人干得成的愿"。量级上 0.2 倍是有意的：太高会让经理变得过度保守（只提"一步就够"的子目标，任务永远推不动），太低则治不住甩锅。切换罚 −0.05/次相对任务奖励 10.0 很小，只用于消除"横跳刷分"这类无量纲病，不改变正常行为。</p>
+
+    <p><strong>片段 3：子目标空间的定义与裁剪</strong></p>
+    <pre class="code"><code>class SubgoalSpace:
+    # 子目标 = 相对当前末端的位姿偏移。相对量让策略"平移不变"：
+    # 桌子挪了 20 cm、目标物换位置，子目标的语义完全不变
+    def __init__(self, max_dpos=0.08, max_drot=0.35):
+        self.max_dpos = max_dpos       # 位移偏移上限 8 cm（0.2 s 可达尺度）
+        self.max_drot = max_drot       # 旋转偏移上限 0.35 rad（约 20 度）
+
+    def decode(self, action, ee_pose):
+        # manager 输出 6 维 [-1,1]，按上限缩放成相对偏移
+        a = np.clip(np.asarray(action, dtype=np.float32), -1.0, 1.0)
+        d_pos = a[:3] * self.max_dpos
+        d_rot = a[3:] * self.max_drot
+        pos = ee_pose[:3] + d_pos                         # 当前末端 + 偏移
+        quat = quat_multiply(ee_pose[3:], quat_from_rotvec(d_rot))
+        return np.concatenate([pos, quat])
+
+    def encode(self, subgoal_pose, ee_pose):
+        # 反向：把绝对子目标转回"相对偏移"，供 manager 观测历史使用（归一化到 [-1,1]）
+        d_pos = (subgoal_pose[:3] - ee_pose[:3]) / self.max_dpos
+        d_rot = quat_to_rotvec(quat_multiply(quat_conjugate(ee_pose[3:]),
+                                              subgoal_pose[3:])) / self.max_drot
+        return np.clip(np.concatenate([d_pos, d_rot]), -1.0, 1.0)</code></pre>
+    <p>解读：这个类承担"高层动作空间"的定义，三个设计点值得展开。第一，相对偏移的上限取 8 cm / 0.35 rad：这是"低层在 0.2 s 内、从静止到到达"的可达尺度（末端 1 m/s 的常规速度 × 0.2 s ≈ 20 cm 路程，考虑加减速打七折）。上限太大会出现"高层许愿、低层永远追不上"（回到甩锅病），太小则高层要几十次决策才能走完一个动作阶段，时间抽象的红利消失。第二，encode/decode 成对存在不是多余的：manager 的观测里要包含"上一子目标相对现在的偏移"（经过裁剪、归一化），"decode 再 encode"的往返保证观测里的数值与它自己发出的动作在同一尺度上，如果不做这个标准化，观测里的 0.08 米与动作里的 1.0 语义对不上，网络要浪费容量做换算。第三，这里故意没有做"可达性过滤"（比如把子目标投影到工作空间内）：本章让 manager 从奖励（可达性项）里学，没有用规则硬挡，两种思路都对，规则硬挡更稳但更像手写控制；先学后加规则是常见的迭代方向。最后注意旋转偏移用"当前姿态 ⊗ 小旋转"合成（右乘），与 046 章残差动作的约定保持一致。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>高层甩锅（提出不可达子目标）</strong>：manager 的奖励只有任务成败，它会学会"把活推给低层"。症状是子目标序列在空间上频繁跳动、worker 到达率低。修复：加可达性项（worker 回报）进高层奖励，并限制子目标幅度。</li>
+      <li><strong>两层同时从零开始训练</strong>：双方的非平稳互相叠加，训不动。症状是两边损失都高但谁都不进步。修复：三阶段训练（worker 预训练 → 冻结训 manager → 小学习率联合微调）。</li>
+      <li><strong>子目标切换太频繁</strong>：高层每步都想"改主意"（k 太小或切换不设限），worker 疲于奔命哪个都完不成。症状是 <code>switch_count</code> 飙升、末端在两点间来回。修复：k ≥ 单原语动作时间（本节 10 步）+ 切换惩罚。</li>
+      <li><strong>worker 观测里没有子目标</strong>：让低层"猜"高层意图，训练早期直接崩。修复：显式传入子目标（相对偏移），并在 encode/decode 间保持尺度一致。</li>
+      <li><strong>用绝对坐标当子目标</strong>：桌子挪位/换场景后全面失效，且子目标常落在不可达区。修复：相对末端位姿偏移；如必须用绝对坐标，至少让观测包含"末端到子目标的相对量"。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把 k 从 10 改成 3 与 30，记录任务成功率、子目标切换次数与平均完成步数，解释 k 的三种典型失效模式。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>k=3：高层太频繁，切换多、抽象红利小；k=30：子目标跨越多个动作阶段，worker 跟踪误差累积、失败率高；k=10 附近通常是甜点。</div></details>
+      </li>
+      <li>去掉 manager 奖励里的可达性项（worker 回报），训练后统计子目标到达率与失败模式，验证甩锅现象。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>没有可达性项时，观察子目标位移的均值是否显著变大（经理越来越"敢想"），以及 worker 的到达率（d 小于 1 cm 的比例）是否下降。</div></details>
+      </li>
+      <li>把 worker 的子目标观测删掉，只保留"目标物位置"，训练后对比到达率，解释为什么显式接口不可省略。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>worker 学不到"经理要它去哪"，它只能各自猜一个折中行为（比如总是追物体），到达率接近随机水平。</div></details>
+      </li>
+      <li>设计一个"技能库复用"实验：用同一个预训练 worker，换三种不同的高层任务（抓放/推物/旋钮），验证高层只需重新训练即可适配。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>关键是把 worker 的接口（相对位姿偏移）设计成任务无关的；如果某个新任务需要新原语（比如按压），worker 技能库要扩容，此时需要重训或加一个"专用 worker"分支。</div></details>
+      </li>
+      <li>把阶段 2 的"冻结 worker"改成"worker 也继续训练（学习率相同）"，对比联合微调与完全不冻结的差异。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>完全不冻结时，worker 在新子目标分布上变化快，manager 的"可达性估计"始终过期；结果通常介于两者之间但方差更大。记录成功率的标准差，稳定性是分层训练的核心变量。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>长程任务的两个痛点（信用分配跨度、探索爆炸）都源于时间尺度；时间抽象让高层每 k 步决策一次，直接把决策链缩短 k 倍。</li>
+      <li>选项三要素（I, π<sub>ω</sub>, β）；工程特例是 manager-worker：固定频率选子目标 + 低层跟踪 + 到达/超时终止。</li>
+      <li>子目标用"相对末端位姿偏移"表示并限幅（±8 cm、±20°），兼顾泛化性与可达性；接口必须显式、尺度一致。</li>
+      <li>奖励分工：worker 密集跟踪（负距离 + 到达 + 平滑）；manager 稀疏任务奖励 + 可达性信号（worker 回报）+ 切换罚。</li>
+      <li>训练三阶段：worker 预训练 → 冻结训 manager → 小学习率联合微调；诊断指标：子目标到达率与切换次数。</li>
+      <li>下一章进入模型的世界：<strong>基于模型的强化学习</strong>，不再只靠真实交互，改为先学一个"世界模型"，在想象里训练。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch054.html">← 第 054 章：实现元强化学习</a>
+    <a class="next" href="ch056.html">第 056 章：实现基于模型的强化学习 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

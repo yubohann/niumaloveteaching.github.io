@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第085章 多智能体PPO的分布式训练 | 深度强化学习课程 · PPO、SAC 与多智能体系统</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第四篇 · 多智能体强化学习</span>
+    <span class="sep">/</span>
+    <span>第 085 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第四篇 · 多智能体强化学习</div>
+    <h1>第 085 章：多智能体PPO的分布式训练</h1>
+    <p class="lead">把 IPPO 的采样从"一个环境慢慢走"改成"多路并行"：先实现同步的多环境向量采样，再实现线程化的异步采样-学习架构，用吞吐（步/秒）、KL 与围捕成功率对比两种方案的收益与代价。</p>
+    <ul class="meta">
+      <li>主题：多智能体机制 / 采样架构与吞吐</li>
+      <li>关键公式：T<sub>并行</sub> ≈ (T/K)·c<sub>env</sub> + (T/K)·c<sub>batch</sub>(K×N)</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 084 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解分布式 RL 的基本角色划分：采样端（worker/collector）与学习端（learner），以及两者之间的同步点。</li>
+      <li>掌握<strong>同步向量采样</strong>：K 个环境步调一致，每步对 K×N 个智能体做一次批量前向，采样完成后合并更新。</li>
+      <li>掌握<strong>异步线程采样</strong>：worker 各持策略快照独立产轨迹进队列，learner 异步消费，理解"陈旧数据（staleness）"的代价。</li>
+      <li>会用吞吐（步/秒）、更新次数、围捕成功率对比两种架构，并解释它们分别适合什么硬件条件。</li>
+      <li>说清本章实现是教学简化：没有跨进程通信、没有容错、异步模式结果不保证逐位复现。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 084 章我们看到：PPO 每次更新要等一批完整数据，而多智能体环境的单步开销随智能体数量线性增长，4 个智能体、每步一次前向、60 步一回合，4 万步的采样量已经相当可观；在真实项目里这个瓶颈还会随智能体数量继续放大：<strong>采样成为墙钟时间的绝对大头，GPU 反而在等数据</strong>。</p>
+    <p>解决办法很直接：把采样并行化。工业界最常用的两种做法是"同步多环境"（向量化环境，所有 worker 在同一时间点交付数据）与"异步 actor-learner"（worker 按自己的节奏产数据，learner 持续消费）。本章用 4 个智能体协同围捕 1 个脚本猎物的任务，把两种架构都写出来，重点在于把"哪些环节并行、代价是什么"讲清楚，极致性能是次要目标。围捕场景还提供天然的难度梯度：猎物速度上限 0.6，低于围捕者可达的最大速度，策略需要学会"围"；单纯去"追"成功率有限。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 为什么并行采样能提速</h3>
+    <p>设单环境的步进成本为 c<sub>env</sub>，单次网络前向为 c<sub>fwd</sub>。串行采样 T 步的总成本约为 T·(c<sub>env</sub>+c<sub>fwd</sub>)；K 个环境并行时：</p>
+    <div class="formula">
+      T<sub>串行</sub> ≈ T·(c<sub>env</sub> + c<sub>fwd</sub>)<br>
+      T<sub>并行</sub> ≈ (T/K)·c<sub>env</sub> + (T/K)·c<sub>batch</sub>(K×N)
+    </div>
+    <p>符号含义：T 是总步数、K 是并行环境数、N=4 是每环境智能体数。关键在 c<sub>batch</sub>，把 K×N 个智能体的观测拼成一个大批量做<strong>一次</strong>前向，单样本成本远低于逐智能体前向（小矩阵乘法的框架开销被摊薄）。多智能体任务天生适合这种合并：参数共享意味着所有智能体共用同一个网络，观测只是同一个批量里的不同行。</p>
+
+    <h3>2. 同步架构：确定性与等待</h3>
+    <p>同步向量采样的时间线是"齐步走"：所有环境走一步 → 合并一次前向 → 所有环境再走一步。实现简单、结果可复现，缺点是<strong>最慢的那个环境决定整体节奏</strong>（长尾环境会拖垮吞吐）。本实现用单进程按 env 循环驱动 K 个环境，前向是唯一被批量化的环节，这也是"向量化环境"最本质的加速来源。</p>
+
+    <h3>3. 异步架构：吞吐与陈旧</h3>
+    <p>异步 actor-learner 打破齐步走：每个 worker 拿一份策略快照独立采样，把轨迹塞进队列；learner 从队列取数据做更新，worker 每次开始新 rollout 前重新同步权重。代价是<strong>数据与当前策略不一致</strong>：worker 采样时用的可能是 θ<sub>t−k</sub>，而 learner 已经更新到 θ<sub>t</sub>。策略越旧，重要性比率越偏离 1，日志里 KL 与裁剪比例的上升就是"数据变质"的直接信号。</p>
+    <div class="formula">
+      staleness ≈ worker 一次采样期间 learner 完成的更新次数
+    </div>
+    <p>直觉：rollout 越长、学习越快，staleness 越大。这里的裁剪目标还有一个隐性好处，即使数据略旧，比率超出 [0.8, 1.2] 的样本梯度归零，天然限制了陈旧数据的破坏力。</p>
+
+    <h3>4. 队列设计与背压</h3>
+    <p>异步实现里必须处理队列：学习比采样贵时队列会被填满。本章策略是<strong>满则丢弃</strong>（<code>put_nowait</code> 失败直接跳过），相当于"过期数据不学"，真实系统里也常用丢弃或降采样来防止陈旧数据堆积。所有被丢弃的样本都白采了，所以日志里同时打印"消费吞吐"和"总产出"，两者的差就是浪费。</p>
+
+    <h3>5. 评估口径</h3>
+    <p>两种架构在相同环境步预算（4 万步）下比较，但要区分两个口径：<strong>样本效率</strong>（用多少环境步学会）与<strong>算力效率</strong>（每墙钟秒处理多少步）。分布式主要改善后者，前者由算法本身决定，这段实验里两种架构的算法一行没变。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+
+    <h3>模块划分</h3>
+    <table>
+      <tr><th>组件</th><th>职责</th><th>关键点</th></tr>
+      <tr><td><code>EncirclEnv</code></td><td>4 围捕者 vs 1 脚本猎物（纯 numpy）</td><td>共享奖励；全员进入 0.22 半径即围捕成功</td></tr>
+      <tr><td><code>PPOActorCritic</code></td><td>与第 084 章同构的连续 PPO 网络</td><td>参数共享，4 个智能体共用一个策略</td></tr>
+      <tr><td><code>collect_single_env</code></td><td>单环境轨迹采样 + GAE</td><td>两种架构共用的最小单元</td></tr>
+      <tr><td><code>run_vector</code></td><td>同步多环境采样与更新循环</td><td>每步一次 <code>act_batch</code> 覆盖 K×N 个智能体</td></tr>
+      <tr><td><code>Worker</code> / <code>run_thread</code></td><td>异步线程采样 + 队列消费</td><td><code>threading.Lock</code> 同步权重快照，队列满即丢弃</td></tr>
+      <tr><td><code>evaluate</code></td><td>确定性评估</td><td>回报、围捕成功率、结束时最大距离</td></tr>
+    </table>
+
+    <h3>关键超参数</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用与取值理由</th></tr>
+      <tr><td><code>dist</code></td><td>vector</td><td>默认同步模式，保证可复现；thread 用来观察吞吐</td></tr>
+      <tr><td><code>workers</code></td><td>4</td><td>并行环境/线程数；超过物理核数后吞吐不再增长</td></tr>
+      <tr><td><code>rollout</code></td><td>1000</td><td>每个 worker 每次采样步数，决定一次更新看到多少数据</td></tr>
+      <tr><td><code>queue_size</code></td><td>8</td><td>异步队列容量；越大越能吸收抖动，但允许的陈旧数据也越多</td></tr>
+      <tr><td><code>epochs</code></td><td>4</td><td>PPO 每批数据的更新轮数</td></tr>
+      <tr><td><code>batch_size</code></td><td>256</td><td>更新小批量；4000 步×4 智能体 = 16000 样本/批</td></tr>
+      <tr><td><code>max_steps</code></td><td>40000</td><td>总环境步预算，两种架构一致（公平对比的公共货币）</td></tr>
+    </table>
+
+    <h3>数据流</h3>
+    <p><strong>vector：</strong>每步把 K 个环境观测拼成 (K×N, 12) → 一次批量前向 → 按切片分发动作给各环境步进 → 采满 rollout 后逐环境做 GAE → 把 (T, K, N) 展平成一个大批次做 4 轮裁剪更新。<strong>thread：</strong>每个 Worker 独立循环"加锁同步权重 → 采 rollout → 入队"，主线程从队列取批次做同样的 <code>ppo_update</code>，KL/裁剪比例照常诊断；队列满的批次被丢弃。</p>
+
+    <h3>与前一章的差异</h3>
+    <p>第 084 章关心"哪种算法学得快"；本章固定用 IPPO，关心"<strong>同样的算法怎么跑得更快</strong>"。代码上的区别集中在采样层：<code>collect_single_env</code> 是两章共有的最小单元，<code>run_vector</code> 把它扩展成 K 路同步，<code>Worker</code> 把它包进线程。算法（GAE、裁剪目标、优势标准化）一行没变，这也说明采样架构与学习算法是正交的两个维度。</p>
+
+    <div class="box key">
+      <span class="box-title">两种架构各自的"隐形税"</span>
+      <p>1) <strong>同步税：木桶效应</strong>：任何一个环境出现长回合，K 路都要等它。缓解手段是让回合长度尽量均匀（本环境的回合上限固定 60 步，恰好规避了这个问题）。</p>
+      <p>2) <strong>异步税：数据陈旧 + 供给不稳定</strong>：队列长度直接等于"允许攒多少旧数据"；队列越长吞吐越稳、但学到的策略与数据版本差得越远。这种权衡没有免费午餐，只能用实验找平衡点。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：脚本猎物与围捕终止条件</strong></p>
+    <pre class="code"><code># 猎物脚本策略：远离围捕者质心，速度大小固定，是一条纯几何规则
+centroid = self.pos.mean(axis=0)
+flee = self.prey - centroid
+norm = float(np.linalg.norm(flee)) + 1e-8        # 加 1e-8 防止质心重合除零
+self.prey = np.clip(self.prey + self.prey_speed * flee / norm,
+                    -self.bound, self.bound)
+self.steps += 1
+
+dists = np.linalg.norm(self.pos - self.prey[None, :], axis=1)
+reward = float(-dists.mean())                    # 团队共享势函数：一起逼近猎物
+terminated = bool(dists.max() &lt; self.capture_radius)  # 所有人都在半径内才算围住
+if terminated:
+    reward += 5.0                                # 稀疏大奖励只在真围捕成功时出现
+truncated = (not terminated) and self.steps &gt;= self.max_steps</code></pre>
+    <p>解读：环境的核心设计是"追 vs 围"的差异。<strong>（1）</strong>奖励用距离<strong>均值</strong>（取最小值只奖励最近者，其余可以摸鱼）：所有人都得靠近，避免了"一个猛冲、三个摸鱼"的退化策略，这在信用分配上是团队任务的标准做法。<strong>（2）</strong>终止条件是 <code>dists.max() &lt; 0.22</code>：注意是 max，也就是<strong>最远的那个</strong>也要进圈，这是"围捕"与"追上"的分水岭。<strong>（3）</strong>猎物只逃离质心、不会预判：围捕者学会站位后可以从多个方向合拢，脚本猎物比自学习对手稳定，适合本章聚焦"采样架构"这个变量。<strong>（4）</strong>末段 reward 追加 5.0 用 <code>if</code> 包住，保证只在一瞬间出现；<code>truncated</code> 与 <code>terminated</code> 互斥，60 步上限是纯时间截断。</p>
+
+    <p><strong>片段 2：同步向量采样的批量前向</strong></p>
+    <pre class="code"><code>for _ in range(args.rollout):
+    obs_batch = np.concatenate(obss, axis=0)     # (K*N, 12)：把 K 个环境拼成一个大 batch
+    a, logp, v = net.act_batch(obs_batch, device)  # 一次前向服务全部 K*N 个智能体
+    rews_step, dones_step = [], []
+    for k, env in enumerate(envs):
+        sl = slice(k * EncirclEnv.n_agents,       # 按环境切片，把动作发回各自的环境
+                   (k + 1) * EncirclEnv.n_agents)
+        next_obs, rew, terminated, truncated, info = env.step(a[sl])
+        rews_step.append(rew)
+        dones_step.append(float(terminated))
+        if terminated or truncated:
+            obss[k] = env.reset(rngs[k])          # 回合边界：单独重置这个环境
+        else:
+            obss[k] = next_obs
+    obs_buf.append(obs_batch); act_buf.append(a)
+    logp_buf.append(logp); val_buf.append(v)
+    rew_buf.append(rews_step); done_buf.append(dones_step)
+    total_steps += args.workers * EncirclEnv.n_agents</code></pre>
+    <p>解读：同步架构的全部加速就藏在这段循环里。<strong>（1）</strong><code>np.concatenate(obss)</code> 把 K 个环境、每个 N=4 个智能体拼成 (K×N, 12) 的批量，一次 <code>act_batch</code> 覆盖所有智能体，这是 c<sub>batch</sub> 摊薄的关键。<strong>（2）</strong>切片 <code>a[sl]</code> 把大前向的输出精准切回每个环境；智能体数 N 在环境里是常量，所以切片边界是静态的。<strong>（3）</strong>回合结束时只重置<strong>那个环境</strong>并清空它的观测，其他环境继续，这就是"异步回合边界、同步数据边界"：采样期各自独立，采样结束才统一计算。<strong>（4）</strong>日志台账 <code>total_steps</code> 按 K×N 累加：吞吐口径是"智能体·步"，与单环境实验不同，对比时注意单位。</p>
+
+    <p><strong>片段 3：逐环境 GAE 再合并</strong></p>
+    <pre class="code"><code>values = np.stack(val_buf).reshape(args.rollout, K, N)
+rewards = np.asarray(rew_buf, dtype=np.float32)          # (T, K) 每个环境一个共享奖励
+dones = np.asarray(done_buf, dtype=np.float32)           # (T, K)
+adv = np.zeros((args.rollout, K, N), dtype=np.float32)
+with torch.no_grad():
+    for k in range(K):
+        # 每个环境单独算最后一次观测的 bootstrap 价值，不能混用别的环境的值
+        last_v, _, _ = net.forward(torch.as_tensor(
+            obss[k], dtype=torch.float32, device=device))
+        last_values = last_v.cpu().numpy().astype(np.float32)
+        adv[:, k, :], ret[:, k, :] = compute_gae_single_env(
+            rewards[:, k], values[:, k, :], dones[:, k],
+            last_values, args.gamma, args.lam)</code></pre>
+    <p>解读：<strong>这段是本章最容易写错、也最不该写错的地方</strong>。<strong>（1）</strong>K 个环境各有自己的轨迹与回合边界，GAE 必须逐环境调用：想让优势递推在某个环境的回合末端"正确切断/衔接"，就必须用该环境自己的 <code>dones[:, k]</code> 与 bootstrap 价值 <code>last_values</code>。<strong>（2）</strong>如果图省事把所有环境按时间拼成一条长序列算 GAE，回合事件（done）会在错误的位置切断递推，某个环境的路径末端优势会"串"进另一个环境。<strong>（3）</strong>正确性优先于写法漂亮：这里用了 K 次小循环，换来的是与单环境版完全一致的数学语义，两种架构之间只差调度，不差算法。<strong>（4）</strong><code>reshape(T, K, N)</code> 成立的前提是采样时按"先环境后智能体"的顺序拼接，这个约定必须与 <code>np.concatenate(obss)</code> 的轴序一致。</p>
+
+    <p><strong>片段 4：异步 Worker 的三步循环</strong></p>
+    <pre class="code"><code>def run(self):
+    while not self.stop_event.is_set():
+        # 1) 同步权重（拿一份快照）：锁内复制，防止读到更新了一半的参数
+        with self.lock:
+            self.net.load_state_dict(self.global_net.state_dict())
+        # 2) 采样一段固定长度的轨迹（用本地快照，不阻塞 learner）
+        batch, ep_returns, self.obs = collect_single_env(
+            self.env, self.net, self.rng, self.args.rollout,
+            self.obs, self.device, self.args)
+        self.samples += self.args.rollout * EncirclEnv.n_agents
+        # 3) 入队；队列满则丢弃（教学简化：表示"数据过期"）
+        try:
+            self.out_queue.put_nowait(batch)
+        except queue.Full:
+            pass</code></pre>
+    <p>解读：异步架构的全部复杂度浓缩在这 12 行。<strong>（1）</strong>权重复制在 <code>with self.lock</code> 里进行：learner 正是通过同样的锁在 <code>optimizer.step()</code> 前后保护参数，否则 worker 可能读到"更新到一半"的网络，产生不可解释的坏动作。<strong>（2）</strong>worker 用本地快照 <code>self.net</code> 采样，省锁、省同步；代价是数据带版本延迟，这就是 staleness 在代码里的样子。<strong>（3）</strong><code>put_nowait</code> + <code>except queue.Full: pass</code> 是显式的背压策略：宁可丢数据也不阻塞采样线程；被丢的批次本质上代表"learner 跟不上了"。<strong>（4）</strong><code>stop_event</code> 由主线程在训练预算用完后置位，worker 会在本轮采样结束后退出，教学实现不做强制中断，保持简单。</p>
+
+    <p>完整可运行脚本（附录）：<a href="../code/ch085.py" download>code/ch085.py</a></p>
+    <pre class="sh"><code>python code/ch085.py               # 默认 vector 同步模式：CPU 约 2–4 分钟
+python code/ch085.py --dist thread # 异步线程模式：约 3–6 分钟，不保证逐位复现
+python code/ch085.py --quick       # 快速跑通：约 30–60 秒</code></pre>
+    <p>日志打印吞吐、KL 与裁剪比例。<strong>预期（以实跑为准）：两种架构都能到每秒上千步（强依赖 CPU 核心数）；thread 模式吞吐通常略高，但 KL 与裁剪比例波动更大；4 万步预算下围捕成功率约 0.2～0.5</strong>，策略先学会"朝猎物跑"，完整包围需要更长训练。异步模式请跑多次取中位数。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>同步模式里 GAE 按错误的维度组织</strong>：K 个环境的奖励是 (T, K)，优势是 (T, K, N)。先把所有数据展平再算 GAE，会让某个环境回合末端的优势泄露给另一个环境。必须<strong>逐环境</strong>调用 <code>compute_gae_single_env</code>。</li>
+      <li><strong>异步模式忘记给权重复制加锁</strong>：<code>load_state_dict</code> 与 <code>optimizer.step</code> 并发执行时可能读到一部分新、一部分旧的参数。worker 侧必须把快照复制放进 <code>with self.lock:</code>。</li>
+      <li><strong>把线程数当成免费的加速</strong>：Python 的 GIL 会让纯 Python 部分串行，真正并行的是 torch 的底层运算。workers 超过物理核后，上下文切换反而让吞吐下降。</li>
+      <li><strong>对异步实验追求可复现</strong>：线程调度、队列丢弃都依赖系统时序，同样的种子也不会逐位一致。对比时固定 <code>--dist</code> 并多次运行取中位数。</li>
+      <li><strong>忽略"产出 vs 消费"的差额</strong>：thread 日志里产出持续大于消费，说明队列在丢弃数据（白采了）。此时调小 <code>--queue-size</code> 或 <code>--workers</code>，整体反而可能更快。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把 <code>--workers</code> 从 2 一路调到 8（同步模式），先预测吞吐拐点出现在哪里，再记录日志里稳定段的吞吐验证。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>每次只改一个数。拐点通常出现在 workers 接近物理核心数时，此后环境步进与网络计算开始抢 CPU。</div></details>
+      </li>
+      <li>数一数同步模式每次更新用多少样本（<code>rollout×workers×4</code>），对照一次更新的耗时算"每样本开销"，再比较 workers=2 与 4 的变化。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>用日志里吞吐的倒数即可近似每智能体·步的耗时；注意第一次更新包含初始化，忽略它。</div></details>
+      </li>
+      <li>把异步模式的 <code>--queue-size</code> 改成 1，先预测裁剪比例与吞吐分别会变好还是变坏，再看日志验证。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>队列 1 意味着数据刚产出就被消费，陈旧度低；但生产者一抖动 learner 就饿肚子。对比 KL 与吞吐两个指标，它们会给出相反的信号。</div></details>
+      </li>
+      <li>给异步架构加一个"陈旧度监控"：worker 在批次里附带全局更新计数版本号，learner 统计入队版本与消费版本的差。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>用一个锁保护的整数计数器：worker 采样前读版本放进 batch 字典；learner 更新前算差值并打印均值。观察队列大小与平均陈旧度的相关关系。</div></details>
+      </li>
+      <li>把同步模式改成纯串行（去掉批量前向，逐环境 <code>collect_single_env</code>），保持 rollout 总量不变，量化"批量前向"单独贡献了多少加速。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>把 <code>act_batch(np.concatenate(obss))</code> 换成 for 循环逐环境前向。这是把 c<sub>batch</sub> 变回 N 次 c<sub>fwd</sub> 的对照实验，预期吞吐显著下降，降幅就是批量化的价值。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>分布式 RL 的骨架是"采样端 + 学习端"：同步向量采样齐步走、可复现但受最慢者制约；异步 actor-learner 重叠采样与学习、吞吐更高但数据会陈旧。</li>
+      <li>多智能体任务适合批量前向：K×N 个智能体的一次合并前向，是吞吐提升的主要来源。</li>
+      <li>逐环境 GAE 与逐环境重置是同步架构的正确性底线；权重复制加锁是异步架构的正确性底线。</li>
+      <li>评估要区分样本效率与算力效率：分布式主要改善后者，KL/裁剪比例的上升是异步数据变质的信号。</li>
+      <li>下一章把分布式搬到 SAC：多采集器写入共享回放池、学习器持续采样，比较"同步 collect-then-learn"与"异步共享缓冲"的差别。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch084.html">← 第 084 章：多智能体PPO与SAC对比</a>
+    <a class="next" href="ch086.html">第 086 章：多智能体SAC的分布式训练 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

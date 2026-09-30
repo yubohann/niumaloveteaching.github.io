@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第063章 多目标优化与约束优化 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第四篇 · Ray Tune 超参搜索</span>
+    <span class="sep">/</span>
+    <span>第 063 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第四篇 · Ray Tune 超参搜索</div>
+    <h1>第 063 章：多目标优化与约束优化</h1>
+    <p class="lead">回报、吞吐、时延、显存常被同时要求，单一标量目标无法表达这种取舍。本章讲透多目标优化（Multi-Objective Optimization, MOO）的支配关系与帕累托前沿（Pareto Frontier），给出权重和、ε-约束、惩罚三种表达方式各自的边界，以及训练期约束的可行性处理路径。</p>
+    <ul class="meta">
+      <li>主题：Ray Tune 调优 / 多目标与约束</li>
+      <li>关键机制：帕累托支配、超体积、ε-约束、惩罚项、可行域</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 062 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>掌握帕累托支配与帕累托前沿的定义，会从结果表手工判定支配关系。</li>
+      <li>理解权重和标量化的局限：非凸前沿段不可达，从而理解为什么需要 ε-约束与多目标搜索。</li>
+      <li>会用 Tune 的多目标搜索接口（以 OptunaSearch 为代表）同时优化两个指标，并提取前沿集合。</li>
+      <li>掌握约束的三种处理路径：空间层消除、惩罚项软约束、训练期检测硬终止，知道各自的代价。</li>
+      <li>会判读多目标实验：用前沿点数量与超体积（Hypervolume）评估搜索进展。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>强化学习调优的实际问题常带多个要求：回合回报要尽量高，每迭代耗时不能失控，显存占用要在预算内，策略熵不能塌缩。把多要求压成一个加权求和是常见做法，但它有两个硬伤：<strong>权重难以事先确定，且权重和只能找到前沿的凸起部分。</strong>非凸的取舍关系（例如“略微牺牲回报换取大幅吞吐”）在权重和框架下永远采不到。</p>
+    <p>约束优化处理另一类要求：某些指标不参与竞争，只要求不越界。显存超限、动作越界、可行性违例都属于此类。<strong>约束与目标的区别在于语义，一个要求“尽量好”，一个要求“不许坏”。</strong>混用两种语义会把搜索引向违规边界。本章把多目标表达与约束处理分开讲清，再合流到统一的实验设计。</p>
+    <p>归属判定的口径可以写成一句话：某项指标"多一点少一点都要尽量好"就归目标；"越过某条线才需要处置"就归约束。按这条口径逐项过一遍指标清单，每个量都有归属，后续搜索接口与惩罚项的配置就不再依赖临时判断。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 支配关系与帕累托前沿</h3>
+    <p>多目标问题写作 min f(θ) = (f<sub>1</sub>(θ), …, f<sub>m</sub>(θ))。配置 A 支配（Dominate）配置 B，当且仅当 A 在所有目标上不劣于 B，且至少在一个目标上严格更优。被任何配置都不支配的配置集合构成帕累托前沿。前沿上的点互相不可比较，取舍由下游偏好决定。<strong>多目标优化的输出是一个集合，不存在单一最优点，这一点决定了实验报告的形式：给出的应是前沿表，单行最优配置无法表达取舍。</strong></p>
+    <div class="formula">
+      A ≺ B &nbsp;⟺&nbsp; ∀i: f<sub>i</sub>(A) ≤ f<sub>i</sub>(B) &nbsp;且&nbsp; ∃i: f<sub>i</sub>(A) &lt; f<sub>i</sub>(B)
+      <span class="note">“≺”表示支配；前沿 = 不被任何点支配的子集；两目标问题可在一张散点图上直接圈出</span>
+    </div>
+
+    <h3>2. 权重和标量化的局限</h3>
+    <p>权重和把目标合成 S(θ) = w<sub>1</sub>f<sub>1</sub> + w<sub>2</sub>f<sub>2</sub>，形式上把问题还原为单目标。它的可达集合是前沿与某条等值线的切点，几何上只覆盖前沿的凸包（Convex Hull）部分。前沿若向原点凹陷，凹陷段上任意一点都不是任何正权重组合的最小值，无论怎么调权重都取不到。ε-约束法解决这个缺陷：保留一个主目标，把其余目标改为上限约束 f<sub>2</sub>(θ) ≤ ε<sub>2</sub>，扫描若干 ε 值即可贴着一整段前沿采样，包括非凸段。</p>
+    <p>不可达的凹部可以用一组手算读数确认：取三个可行配置的目标值（两个目标都取最小化），P1=(0,4)、P2=(1.5,2.7)、P3=(4,0)。P1 与 P3 互不支配（一个第一目标更好、一个第二目标更好）；P2 虽在每个单目标上都不占优，却也没有被任何点支配，属于帕累托前沿成员。把权重和 S=w·f<sub>1</sub>+(1−w)·f<sub>2</sub> 在 w 从 0.05 扫到 0.95 上逐一求最小，结果只会落在 P1 或 P3，P2 从不取胜；几何上 P2 位于 P1P3 连线的上方，任何权重的等值线都切不到它。<strong>换成 ε-约束即可达：令第一目标不超过 2，在可行集内最小化第二目标，P2 以 2.7 胜出。</strong></p>
+
+    <h3>3. 前沿质量的度量：超体积</h3>
+    <p>比较两轮搜索得到的前沿需要单标量指标。超体积（Hypervolume, HV）以一个参考点 r 为基准，计算被前沿支配区域的 Lebesgue 测度：</p>
+    <div class="formula">
+      HV(A) = Volume( ∪<sub>p∈A</sub> [r, p] )
+      <span class="note">参考点取各目标的最差值再加余量；前沿越接近理想角、点越密，超体积越大</span>
+    </div>
+    <p>超体积对“前沿向理想方向推进”与“前沿覆盖变宽”都敏感，适合作为多目标搜索的进展曲线：<strong>随试验数绘出 HV 曲线，若长期平坦说明边际收益耗尽，应转入局部加密或更换空间。</strong></p>
+    <p>数值算例：第一轮前沿为 (175,39)、(180,39)、(185,44)（回报越大越好、耗时越小越好），参考点取 (170,50)。按回报升序扫描被支配区域：到 175 贡献 5×11=55；到 180 新增宽度 5、高度 11，贡献 55；到 185 新增宽度 5、高度 6，贡献 30，合计 HV=140。第二轮前沿推进为 (175,39)、(185,38)、(190,42)：按耗时最小值分段计算，三段贡献 5×12=60、10×12=120、5×8=40，HV=220，相比第一轮的 140 提升约 57%。<strong>推进距离与覆盖宽度都被同一根曲线吸收，这正是用 HV 做进展曲线的理由。</strong>参考点的位置影响 HV 的绝对数值，跨轮比较必须固定同一参考点，并在各目标最差值之外留约 5% 余量；参考点移动过的两轮结果不可直接相减。</p>
+
+    <h3>4. 调度器与多目标的适配</h3>
+    <p>早停调度器的比较池基于单指标，与多目标存在口味差：一个在目标一上出色、目标二上平庸的试验，在单指标调度器眼里可能被判弱。<strong>常用方案是给调度器指定一个主指标（例如回报），多目标搜索机制在存活试验之间维护前沿；主指标承担筛选，前沿承担输出。</strong>把两个角色分开后，逻辑清晰且与现有调度器兼容。若希望调度器也感知取舍，可用超体积贡献作为调度指标，但这会增加实现复杂度，适合在基础流程稳定后再引入。</p>
+
+    <h3>5. 约束的三种处理路径</h3>
+    <p>约束按“可判定时机”分三层处理：</p>
+    <ul>
+      <li><strong>空间层消除</strong>：整除、互斥这类采样时即可判定的结构约束，用第 061 章的 <code>sample_from</code> 联动，代价为零。</li>
+      <li><strong>惩罚项软约束</strong>：把违反量加进目标，S(θ) = 归一化目标 − λ·Violation(θ)。λ 是代价旋钮：过小时约束被无视，过大时梯度被惩罚主导、目标优化停滞。<strong>惩罚量必须与目标同量纲，先各自归一化再线性组合。</strong></li>
+      <li><strong>训练期检测硬终止</strong>：当约束只能在训练中判定（显存溢出、数值爆炸），在训练函数内检测并抛出终止信号，试验立即回收资源。它保住剩余预算，但已消耗的部分不可追回，因此检查频率要高、判定要留安全余量。</li>
+    </ul>
+    <p>可行率高时，硬终止近似于采样拒绝，效率可观；可行率很低（多数配置都违规）时，应回到空间层收缩范围，把采样概率质量移回可行区。</p>
+
+    <h3>5.1 惩罚系数的对照实验口径</h3>
+    <p>惩罚系数 λ 的对照实验按倍率展开：以"违反量达到整个经验量程时惩罚等价于一份主目标"为基准口径，分别测试 0.5、2、8 三档。预期读数：0.5 时可行率偏低，约束被部分无视；2 时可行率与主目标的联合曲线进入拐点区间；8 时几乎全部试验挤在可行域内侧，主目标推进停滞。判读口径看两条曲线的交叉区：可行率随 λ 上升趋近 1，主目标随 λ 上升而下降，取两者乘积开始回落的点作为 λ 的起点。实验记录里同时保存未归一化的原始量，后续改量纲时可以直接回算，不必重跑。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>多目标与约束实验的设计从一张清单开始：<strong>把每个指标明确归类为“目标”或“约束”，目标给出方向，约束给出阈值与判定时机。</strong>与上一章的差异在于，第 062 章调度试验的生死，本章重新定义试验被评价的坐标系。</p>
+    <table>
+      <tr><th>方法</th><th>适用情形</th><th>表达方式</th><th>主要风险</th></tr>
+      <tr><td>权重和</td><td>只有两个目标且前沿近凸</td><td>单指标 S = Σw<sub>i</sub>f<sub>i</sub></td><td>非凸段不可达；权重需反复试</td></tr>
+      <tr><td>ε-约束</td><td>可指定可接受阈值</td><td>主目标 + 其余指标上限</td><td>阈值过紧时可行域为空</td></tr>
+      <tr><td>多目标搜索</td><td>要求输出完整前沿</td><td>指标列表 + 方向列表</td><td>调度器需指定单指标适配</td></tr>
+      <tr><td>惩罚项</td><td>约束可量化且时时可测</td><td>目标 − λ·违反量</td><td>λ 选择困难，量纲敏感</td></tr>
+      <tr><td>训练期硬终止</td><td>约束只在运行中暴露</td><td>检测后抛出终止信号</td><td>已消耗预算不可追回</td></tr>
+    </table>
+    <p>执行流程分五步：</p>
+    <ol>
+      <li><strong>归一化口径</strong>：为每个指标确定参考范围（历史结果或首轮粗搜），后续所有组合运算都在归一化后进行。</li>
+      <li><strong>目标与约束分离</strong>：目标进搜索接口的指标列表，约束进惩罚项或检测点。</li>
+      <li><strong>调度主指标选择</strong>：从目标中挑一个与最终诉求最贴近的作为调度器比较轴，写进实验说明。</li>
+      <li><strong>预算分配</strong>：多目标搜索的试验数取 60 至 120，比单目标更宽，因为前沿覆盖率随点数增长。</li>
+      <li><strong>判读输出</strong>：导出前沿表与超体积曲线，前沿点逐个检查是否贴合物理直觉，异常点回查配置。</li>
+    </ol>
+    <p>判读的三条阈值规则写进分析脚本：前沿点数占总试验数的比例反映搜索集中度，比例低于 5% 说明大多数试验被支配、空间可能过宽；前沿中相邻点的目标间距突然变大处是覆盖空洞，下一轮对该区段加密；目标值几乎相同的重复点在提取时按试验标识去重，避免同一配置占用多个前沿名额。实验报告只呈现清洗后的前沿表与 HV 曲线，异常点回查配置后再归档。</p>
+    <div class="box key">
+      <span class="box-title">设计决策：为什么多目标搜索仍要指定调度主指标？</span>
+      <p>调度器在每个上报点上只接受一个标量比较值，这是接口层面的现实约束。指定主指标意味着“筛选标准”与“输出标准”分离：筛选过程保持单轴可解释，输出阶段再展示完整取舍。主指标建议选择与任务目标直接相关的量（回报），把资源类指标（时延、显存）留给前沿展示与约束判定。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：双目标搜索配置</strong></p>
+    <pre class="code"><code>from ray import tune
+from ray.tune.search.optuna import OptunaSearch
+
+# 两个目标联合优化：回报最大化、每迭代耗时最小化
+optuna_moo = OptunaSearch(
+    metric=["episode_return_mean", "iteration_time_s"],
+    mode=["max", "min"],
+    # 多目标模式下建议机制维护一组非支配候选，避免被单标量掩盖
+    points_to_evaluate=[
+        # 以两个已知可行情景为起点，降低前期冷启动成本
+        {"lr": 3e-4, "train_batch_size": 4096, "num_env_runners": 8},
+        {"lr": 1e-4, "train_batch_size": 8192, "num_env_runners": 4},
+    ],
+)
+
+tune.run(
+    train_fn,
+    search_alg=optuna_moo,
+    # 试验数 80：前沿覆盖率随点数增长，比单目标预算更宽
+    num_samples=80,
+    config={
+        "lr": tune.loguniform(1e-5, 1e-2),
+        "train_batch_size": tune.choice([2048, 4096, 8192, 16384]),
+        "num_env_runners": tune.randint(2, 17),
+    },
+    # 调度器仍按主指标（回报）比较：筛选与输出分离
+    metric="episode_return_mean",
+    mode="max",
+    scheduler=asha,
+)</code></pre>
+    <p>解读：这段配置把三种角色拆得很清楚。<strong>（1）</strong>搜索算法层面接收两个指标与两个方向，建议机制在双目标空间中维护候选；<strong>（2）</strong>调度器层面仍指定单一主指标，早停逻辑无需改造；<strong>（3）</strong><code>points_to_evaluate</code> 用少量已知点预热，对多目标尤其有价值，因为冷启动阶段前沿尚未成形，建议质量低。注意：把 <code>metric</code> 在 <code>tune.run</code> 与搜索算法里同时使用是常见写法，两处语义不同（调度比较轴与建议目标），在实验记录里要分别注明。接口细节以对应版本的官方文档为准。</p>
+
+    <p><strong>片段 2：从结果表提取帕累托前沿</strong></p>
+    <pre class="code"><code>import pandas as pd
+
+def pareto_front(df, objs, modes):
+    """非支配筛选：objs 为指标列，modes 为每列方向（max/min）。"""
+    df = df.dropna(subset=objs).reset_index(drop=True)
+    sign = [1.0 if m == "max" else -1.0 for m in modes]
+    # 统一方向后一律按“越大越好”比较，支配判定只写一遍
+    pts = [tuple(df[c].iloc[i] * s for c, s in zip(objs, sign))
+           for i in range(len(df))]
+    keep = []
+    for i, p in enumerate(pts):
+        dominated = False
+        for j, q in enumerate(pts):
+            # 不允许自我支配；其余点需在所有目标上不劣且至少一维严格更优
+            if i != j and all(qk &gt;= pk for qk, pk in zip(q, p)) \
+                    and any(qk &gt; pk for qk, pk in zip(q, p)):
+                dominated = True
+                break
+        if not dominated:
+            keep.append(i)
+    # 返回时保留原始量纲与列结构，便于直接生成报告表
+    return df.iloc[keep].sort_values(objs[0], ascending=(modes[0] == "min"))
+
+front = pareto_front(results_df, ["episode_return_mean", "iteration_time_s"],
+                     ["max", "min"])
+print(f"前沿点数 {len(front)} / 总试验数 {len(results_df)}")</code></pre>
+    <p>解读：提取函数只有两层循环，代价 O(n²)，本课程的试验量级下完全可接受。<strong>（1）</strong>先按方向把各列乘以符号，之后所有比较都按“越大越好”，避免在判据里反复分支，减少方向写反的机会。<strong>（2）</strong>支配判定要求“所有维度不劣”与“至少一维严格更优”同时成立，缺一不可；只有全等时互不支配，两个重复点会同时保留，此时可按试验标识去重。<strong>（3）</strong>输出保留原始量纲并沿主目标排序，直接可作报告表；前沿点数与总试验数的比值反映搜索是否集中，比值过小说明大量试验被支配、空间可能过宽。接口随版本演进，若所用版本自带前沿工具函数，可用它替换本实现并核对结果一致。</p>
+
+    <p><strong>片段 3：惩罚项与训练期硬终止</strong></p>
+    <pre class="code"><code>from ray import tune
+
+# 归一化参考：由首轮粗搜得到的目标量程与违反量量程
+RET_SCALE = 200.0     # 回合回报的经验量程
+VIOL_SCALE = 0.4      # 显存违反比例的经验量程
+
+def train_fn(config):
+    for it in range(max_iters):
+        m = run_one_iteration(config, it)
+        # 违反量：超出显存预算的比例，0 表示完全满足约束
+        viol = max(0.0, m["mem_used_gb"] / m["mem_budget_gb"] - 1.0)
+        # 惩罚项与目标各自归一化后相减：量纲对齐是 λ 有效的前提
+        penalized = m["episode_return_mean"] / RET_SCALE \
+            - 2.0 * (viol / VIOL_SCALE)
+        if viol &gt; VIOL_SCALE:
+            # 严重不可行：尽早终止，回收剩余预算（异常类型以版本文档为准）
+            raise tune.TuneError("显存约束严重违反，终止该试验")
+        tune.report(episode_return_mean=m["episode_return_mean"],
+                    penalized_return=penalized,
+                    mem_violation=viol)</code></pre>
+    <p>解读：这段训练函数展示约束处理的双层结构。<strong>（1）</strong>轻微违反交给惩罚项，搜索机制仍能沿着“可行边缘”寻找平衡点；<strong>（2）</strong>严重违反交给硬终止，避免为一个已注定不可行的配置继续消耗数十分钟的采样预算，两个阈值分开设置给了一个缓冲区。<strong>（3）</strong>惩罚系数 2.0 的含义是“违反量达到整个经验量程时，惩罚相当于两份归一化目标”，即约束权重约为主目标的两倍；系数的最终取值靠对照实验确定，先跑 2 至 3 个系数值观察可行率与回报的曲线。<strong>（4）</strong>上报三个指标：主指标供调度器使用，惩罚目标供分析对比，违反量供可行性审计。具体异常类型与终止语义以对应版本的官方文档为准。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>方向写反</strong>：<code>mode</code> 与指标含义不匹配（耗时按 max 处理），前沿整体取反，挑出的“最优”恰是最差。症状是前沿点明显违背直觉。修复：前沿提取前先做方向断言，检查主指标与人工抽查点一致。</li>
+      <li><strong>量纲未归一化就做支配判定</strong>：回报量程两百、耗时量程个位数时，耗时差异对支配关系几乎无影响，第二目标形同虚设。修复：比较前统一归一化，或先标准化再进前沿提取。</li>
+      <li><strong>用权重和代表全部取舍</strong>：非凸前沿段不可达，搜索跑到“凸角”就停滞。修复：改 ε-约束或直接使用多目标搜索接口。</li>
+      <li><strong>惩罚系数失控</strong>：λ 过小时约束被无视，试验批量违规；λ 过大时全部试验挤向可行边界内侧，目标优化停滞。修复：在归一化基础上做 λ 的小范围对照，观察可行率与目标的联合变化。</li>
+      <li><strong>硬终止判定阈值过紧</strong>：把“接近上限但仍有优化价值”的配置提前杀掉，可行率虚高但前沿缩水。修复：设缓冲带，把终止阈值放在预算上限之外再留余量。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>给定三个配置的（回报, 耗时）测量值：(185, 44)、(180, 39)、(175, 39)，判断支配关系并写出前沿集合。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>回报按 max、耗时按 min 比较：(180, 39) 支配 (175, 39)（回报更高、耗时相同）；(185, 44) 与 (180, 39) 互不支配（一个回报更高，一个耗时更短）。前沿为 {(185, 44), (180, 39)}。</div></details>
+      </li>
+      <li>预测题：双目标搜索中把调度主指标从回报改为耗时，早期被 ASHA 淘汰的试验群体结构会怎样变化？对最终前沿的覆盖有什么影响？<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>以耗时为主指标会保留“快而弱”的试验，回报高但慢的配置在第 0 档就被淘汰，最终前沿在高回报区域出现空洞。主指标应与最终诉求对齐，牺牲的恰好是另一侧的覆盖。</div></details>
+      </li>
+      <li>设计题：用 ε-约束法设计一次两阶段搜索：第一阶段用宽 ε 找出可行域边界，第二阶段收窄 ε 并加密主目标搜索。给出两阶段的试验数、ε 取值与判读标准。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>阶段一 40 个试验扫描 3 个 ε 档位，找出可行与不可行的分界；阶段二在分界内侧 1 至 2 档选 40 个试验密集搜索。判读标准：阶段一的违规率必须随 ε 单调下降；阶段二主目标的分布不应向 ε 边界塌缩。</div></details>
+      </li>
+      <li>推导题：写一个两目标专用的前沿提取算法，利用“按第一目标排序后扫描”把复杂度降到 O(n log n)，并说明为什么它不能直接推广到三维。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>按第一维降序排序，维护当前第二维的最大值，新点第二维若不超过该最大值则被支配。三维需要维护二维前缀结构（如分层树），简单扫描失效。</div></details>
+      </li>
+      <li>实践题：仿照片段 3 为你的任务定义一条训练期约束（如梯度范数上限），选择惩罚系数起点，并写出判定硬终止的阈值与理由。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>先统计无约束训练中该量的分布，取 95 分位作为违反从零起算的基准；硬终止阈值放在 99 分位之外并留 20% 余量，惩罚系数从“违反量满量程等价于一份主目标”开始对照。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>多目标优化的输出是帕累托前沿集合；支配判定要求全维不劣且至少一维严格更优。</li>
+      <li>权重和只能覆盖凸前沿段；ε-约束与非支配搜索是更完整的表达方式。</li>
+      <li>超体积把前沿质量压成单标量，适合作为搜索进展曲线与两轮搜索的对比指标。</li>
+      <li>调度器保持单主指标，多目标搜索维护前沿，“筛选与输出分离”是兼容现有组件的关键设计。</li>
+      <li>约束按判定时机分三层处理：空间层消除、惩罚项软约束、训练期硬终止；惩罚必须建立在归一化之上。</li>
+      <li>下一章处理调优实验的容错：实验状态、检查点与恢复的完整链路。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch062.html">← 第 062 章：调度器机制深入</a>
+    <a class="next" href="ch064.html">第 064 章：调优实验的故障恢复 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

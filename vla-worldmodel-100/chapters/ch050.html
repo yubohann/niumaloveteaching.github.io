@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第050章 VLA策略的模型压缩 | 具身智能学习课程 · VLA 与世界模型联合训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第三篇 · 策略与世界模型深化</span>
+    <span class="sep">/</span>
+    <span>第 050 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第三篇 · 策略与世界模型深化</div>
+    <h1>第 050 章：VLA策略的模型压缩</h1>
+    <p class="lead">压缩的目标是延迟与显存，约束是动作精度：本章讲清量化的误差传播路径、直通估计器的训练机制、结构化剪枝与词元剪枝的取舍，以及闭环评估口径。</p>
+    <ul class="meta">
+      <li>主题：VLA 策略 / 部署优化（Deployment Optimization）</li>
+      <li>关键公式：x̂ = s · (clamp(round(x/s) + z<sub>p</sub>, q<sub>min</sub>, q<sub>max</sub>) − z<sub>p</sub>)</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 049 章 联合训练中的知识蒸馏</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <p>本章把压缩从"参数量缩小"改写为"受精度约束的延迟优化问题"。</p>
+    <ul>
+      <li>理解量化（Quantization）的基本公式与均匀量化的误差上界，能计算指定位宽下的量化步长。</li>
+      <li>掌握逐通道（Per-Channel）对称量化的实现与校准（Calibration）流程，理解激活离群值对 Transformer 量化的影响。</li>
+      <li>掌握量化感知训练（Quantization-Aware Training, QAT）中直通估计器（Straight-Through Estimator, STE）的梯度机制。</li>
+      <li>理解动作头对量化误差的敏感性来源，能设计视觉主干与动作头分级精度的方案。</li>
+      <li>能设计闭环压缩评估协议：延迟、动作误差与任务成功率三项指标的组合口径。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>联合训练产出的模型要在控制频率约束下运行，而推理预算由延迟与显存共同划定。压缩提供四个旋钮：降低权重与激活的数值位宽、删除通道、分解矩阵、丢弃冗余词元。<strong>它们都能降低计算量，但对动作输出的影响路径不同：量化注入逐点噪声，剪枝改变特征子空间，词元剪枝改变空间分辨率。动作块是连续量，任何逐点噪声都会直接进入控制回路，压缩方案必须按误差传播路径分别设计。</strong></p>
+    <p>上一章的蒸馏在行为层面克隆教师，压缩在数值与结构层面改造学生。两者通常串联使用：先蒸馏得到结构紧凑的学生，再对其实施量化与剪枝。<strong>串联顺序影响最终精度：先压缩再蒸馏，教师标签可以补偿压缩误差；先蒸馏再压缩，学生容量已经受限，压缩误差无处消化。</strong>本章按"先原理、后分级、再评估"推进，重点放在与动作精度直接相关的环节。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p>先给出量化的数学形式与误差界，再讨论剪枝与评估口径。</p>
+
+    <h3>1. 均匀量化与误差界</h3>
+    <p>均匀量化把浮点张量映射到整数量化网格。对称量化（零点为零）的公式为：</p>
+    <div class="formula">
+      q = clamp(round(x/s), −2<sup>b−1</sup>+1, 2<sup>b−1</sup>−1)，x̂ = s · q，s = max|x| / (2<sup>b−1</sup>−1)
+      <span class="note">b 为位宽；舍入误差满足 |x − x̂| ≤ s/2，误差随位宽指数下降</span>
+    </div>
+    <p>位宽与误差的关系是压缩预算的起点：8 位相比 32 位浮点，表示范围固定后量化步长约放大 2<sup>24</sup> 倍量级，但神经网络权重与激活的动态范围远小于理论区间，实际误差由每个张量的最大值与分布形状决定。<strong>逐张量（Per-Tensor）量化用一个尺度覆盖整个张量，个别离群值会撑大整体步长，普通数值的精度被浪费；逐通道（Per-Channel）对每个输出通道单独计算尺度，离群值的影响被限制在所在通道内，是权重量化的标准做法。</strong></p>
+    <p>激活的量化更困难：激活分布随输入变化，且 Transformer 中常出现个别通道的极大值（离群通道）。处理方式包括按通道校准、对离群通道保留高精度、以及在 QAT 中用裁剪阈值学习替代最大值统计。误差传播分析显示，视觉主干的量化噪声经注意力层平滑后影响有限，动作头输出的噪声直接进入控制，两者的容忍度差异是下一节分级方案的依据。</p>
+    <p>数值示例：某权重层最大绝对值 0.8、典型取值标准差 0.05 时，8 位量化步长 0.0063，均匀量化噪声的标准差约 0.0018（噪声方差为 s²/12），约为权重标准差的 3.6%；位宽降到 6 位，步长放大约 4 倍，噪声占比升到约 15%；4 位时噪声占比约 66%，输出层已经无法承受。位宽每降 1 位，步长与噪声标准差约翻倍，这一比例关系是分级位宽分配的换算基础。</p>
+
+    <h3>2. 校准与量化感知训练</h3>
+    <p>训练后量化（Post-Training Quantization, PTQ）用一批校准样本统计激活的动态范围，不需要反向传播，成本低但对低位宽与分布敏感的场景精度损失明显。校准集的选择原则是覆盖部署时的主要输入模式：<strong>用训练集随机样本做校准，在部署分布有偏移时尺度估计偏差较大；正确做法是从部署场景采集 200 至 500 条样本，覆盖光照与物体变化的主要模式。</strong></p>
+    <p>量化感知训练在训练图中插入伪量化节点，前向用低精度数值，反向用直通估计器把梯度原样传过量化函数：</p>
+    <div class="formula">
+      前向：x̂ = quantize(x)，反向：∂L/∂x = ∂L/∂x̂ · 1
+      <span class="note">舍入函数的真实导数几乎处处为零，STE 用恒等映射替代，让参数在量化误差的约束下继续优化</span>
+    </div>
+    <p>STE 的偏差来源是把量化视作可微的恒等映射，梯度方向不反映噪声实际变化；实践中通过较长的微调（数千步）与较小的学习率（1e-5 量级）让参数适应量化网格。伪量化节点在部署时被真正的整数算子替换，训练与部署的数值路径需要逐层对齐，这一点在后面的评估部分再次强调。</p>
+
+    <h3>3. 结构化剪枝与词元剪枝</h3>
+    <p>非结构化剪枝把个别权重置零，稀疏矩阵在没有专用硬件的条件下不产生实际加速；结构化剪枝删除整个输入或输出通道，直接减少矩阵乘的维度。通道重要性可依据权重的范数、批激活的方差或对损失的泰勒近似排序。<strong>剪枝后必须微调，删除通道使特征子空间发生变化，损失在剪枝瞬间上升，微调把剩余通道重新组织到新的子空间。</strong></p>
+    <p>词元剪枝作用在视觉编码器入口：按注意力显著性保留前 ρ 比例的词元，其余丢弃。词元数与注意力成本平方相关，剪枝收益显著。对操作任务而言，保留判据应偏向任务相关的空间区域，例如机械臂末端与目标物体附近的词元；全局显著性排序容易保留背景中的高频纹理，需要在损失中加入任务监督的选择器，或直接把策略的交叉注意力权重作为评分来源。</p>
+    <p>低秩分解把权重矩阵 W 近似为两个小矩阵的乘积 U·V（U 为 d×r、V 为 r×k，r 小于两者的较小维），参数与乘加量按 d·k / (r·(d + k)) 的倍数下降：d = k = 512、r = 64 时参数量从 26.2 万降到 6.6 万，降为四分之一。优势是结构规整、现有算子直接支持；秩截断误差集中在少数大奇异值方向上，重要输出可能受损，通常与量化叠加并配合微调恢复。</p>
+
+    <h3>4. 误差传播与分级精度</h3>
+    <p>把动作头输出的误差写成两部分：权重与激活的量化噪声经线性层传播的项，以及解码过程中累积的项。动作块长度为 H 时，块内各步共享同一份压缩误差，闭环执行中误差逐块累积。敏感度分析的做法是逐层注入量化并测量输出误差：<strong>视觉主干层对输出误差的贡献通常低一个量级，动作头与动力学核心层居中，输出投影层的贡献最高。分级方案把位宽预算按敏感度分配：主干 8 位，核心层 8 位逐通道，输出投影保留 16 位。</strong></p>
+    <p>四个旋钮的定位对照：</p>
+    <table>
+      <tr><th>旋钮</th><th>作用对象</th><th>延迟收益来源</th><th>精度风险</th><th>典型档位</th></tr>
+      <tr><td>量化</td><td>权重与激活的数值</td><td>整数算子吞吐与显存带宽</td><td>逐点噪声，动作头最敏感</td><td>主干 8 位，输出投影 16 位</td></tr>
+      <tr><td>结构化剪枝</td><td>通道维度</td><td>矩阵乘维度下降</td><td>特征子空间突变</td><td>每轮 5%，累计不超过 30%</td></tr>
+      <tr><td>低秩分解</td><td>权重矩阵的秩</td><td>参数量与乘加量下降</td><td>秩截断误伤大奇异方向</td><td>r 取较小维的 1/8 至 1/4</td></tr>
+      <tr><td>词元剪枝</td><td>视觉词元的数量</td><td>注意力成本随词元数平方下降</td><td>空间信息损失</td><td>保留比例 0.7 起步</td></tr>
+    </table>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>压缩流程按"敏感度分析、分级量化、剪枝、闭环评估"四步执行，任何一步的精度损失超过预算即回退。</p>
+    <h3>流程</h3>
+    <ol>
+      <li>逐层注入模拟量化，记录动作输出误差，得到敏感度排序。</li>
+      <li>按敏感度分配位宽与逐通道策略，训练后量化失败时切换到 QAT。</li>
+      <li>结构化剪枝按通道重要性执行，逐次小比例（每次 5%）并立即微调。</li>
+      <li>闭环评估：目标硬件上测延迟，真实任务上测成功率，均与未压缩基线对照。</li>
+    </ol>
+    <h3>超参数表</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>视觉主干位宽</td><td>8 位逐通道</td><td>量化主干权重</td><td>主干对输出误差贡献低，8 位足够</td></tr>
+      <tr><td>动作头位宽</td><td>16 位或 8 位逐通道</td><td>保护动作精度</td><td>敏感度最高；先试 8 位，误差超标则升 16 位</td></tr>
+      <tr><td>校准样本数</td><td>512 条</td><td>统计激活范围</td><td>覆盖主要输入模式；少于 128 条尺度不稳</td></tr>
+      <tr><td>QAT 微调步数</td><td>3000 步</td><td>适应量化网格</td><td>学习率 1e-5；过少网格误差未消化</td></tr>
+      <tr><td>词元保留比例</td><td>0.7</td><td>视觉词元剪枝</td><td>低于 0.5 时空间信息损失明显</td></tr>
+      <tr><td>通道剪枝比例</td><td>每轮 5%</td><td>结构化剪枝</td><td>一次大比例删除难以恢复，累计上限 30%</td></tr>
+    </table>
+    <h3>与前一章的差异点</h3>
+    <p>第 049 章改变模型的参数规模与行为来源，网络结构保持不变；本章改变数值精度与特征通道，结构被改写。<strong>蒸馏后的学生仍以浮点运行，压缩后的模型才具备目标硬件上的部署形态；两者共享同一套评估指标，但压缩多出一项硬件延迟验收。</strong></p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>以下片段以公开实现的通用设计为参照，接口命名随版本演进。</p>
+    <p>片段覆盖逐通道伪量化、词元剪枝与闭环评估。位宽与校准设定与上表一致。</p>
+
+    <p><strong>片段 1：逐通道对称伪量化与 STE</strong></p>
+    <pre class="code"><code>import torch
+
+class FakeQuantPerChannel(torch.autograd.Function):
+    """直通估计器（Straight-Through Estimator, STE）实现的伪量化。
+    设计意图：前向模拟整数网格，反向把梯度原样传过舍入，供 QAT 使用。"""
+    @staticmethod
+    def forward(ctx, x, bits=8):
+        # 逐输出通道计算尺度：离群值只污染所在通道，不抬高整体步长
+        scale = x.abs().amax(dim=0, keepdim=True) / (2 ** (bits - 1) - 1)
+        scale = scale.clamp(min=1e-8)            # 防止全零通道产生除零
+        q = torch.round(x / scale).clamp(-(2 ** (bits - 1)) + 1, 2 ** (bits - 1) - 1)
+        ctx.save_for_backward(scale)             # 反向不需要 scale，保存仅为接口完整
+        return q * scale
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        # 直通：舍入的导数为零，用恒等映射近似，梯度方向保持有效
+        return grad_out, None
+
+def fake_quant(x, bits=8):
+    return FakeQuantPerChannel.apply(x, bits)</code></pre>
+    <p>解读：<strong>（1）</strong>尺度在 forward 中按当前张量动态计算，等价于动态量化；若切换为静态量化，尺度应改为校准阶段统计的固定 buffer，并注意区分训练与部署两种口径。<strong>（2）</strong>钳位到整数范围，越界样本在反传中同样通过恒等映射获得梯度，实践中配合权重裁剪可减少饱和带来的偏差。<strong>（3）</strong>STE 的偏差在数值上不可忽略，补偿手段是足够长的微调与较小的学习率；若微调后误差仍大，应缩小逐层位宽差距，继续增加步数解决不了位宽不均的问题。</p>
+
+    <p><strong>片段 2：按任务显著性剪枝视觉词元</strong></p>
+    <pre class="code"><code>import torch
+
+def token_prune(patch_tokens, attn_scores, keep_ratio=0.7):
+    """按交叉注意力显著性保留词元：任务相关区域优先留下。
+    设计意图：词元数与注意力成本平方相关，剪枝收益大于等量通道剪枝。"""
+    # attn_scores: (B, H, N) 策略对视觉词元的平均注意力，H 为查询数
+    saliency = attn_scores.mean(dim=1)           # 对查询取平均，得到每词元的显著性
+    n_keep = max(1, int(patch_tokens.size(1) * keep_ratio))
+    idx = saliency.topk(n_keep, dim=-1).indices  # 逐样本选择保留索引
+    # gather 保持词元顺序：注意力块通常按序列位置索引，乱序会破坏位置编码语义
+    idx_sorted, _ = idx.sort(dim=-1)
+    keep = patch_tokens.gather(1, idx_sorted.unsqueeze(-1).expand(-1, -1, patch_tokens.size(-1)))
+    return keep, idx_sorted</code></pre>
+    <p>解读：<strong>（1）</strong>显著性来自策略自身的交叉注意力，属于任务监督信号；仅凭视觉模型的内部分数选择，容易保留背景纹理而丢弃操作目标。<strong>（2）</strong>gather 前对索引排序，保持原始空间顺序，位置编码与注意力掩码的口径不被破坏。<strong>（3）</strong>保留比例 0.7 是精度与延迟的折中起点；重新测量任务成功率后再决定是否上调，词元恢复比通道恢复容易，可先从保守比例开始。</p>
+
+    <p><strong>片段 3：压缩模型的闭环评估</strong></p>
+    <pre class="code"><code>import time
+import torch
+
+@torch.no_grad()
+def evaluate_compression(model, baseline, loader, rollout_fn, trials=30):
+    """三项指标联合评估：延迟、动作误差、任务成功率。"""
+    # 延迟在目标硬件、批量 1 的条件下测量，重复 50 次取中位数抑制抖动
+    lat = []
+    for _ in range(50):
+        x = torch.randn(1, 3, 224, 224)
+        t0 = time.perf_counter()
+        model(x)
+        lat.append(time.perf_counter() - t0)
+    latency_ms = sorted(lat)[len(lat) // 2] * 1000
+    # 动作误差用同一批观测在浮点基线与压缩模型之间比较
+    err = 0.0
+    for obs, _ in loader:
+        err += (model(obs) - baseline(obs)).pow(2).mean().item()
+    action_mse = err / max(1, len(loader))
+    # 闭环成功率：开放环误差小不代表闭环稳定，必须实机或高保真仿真验证
+    success = sum(rollout_fn(model) for _ in range(trials)) / trials
+    print(f"延迟 {latency_ms:.1f} ms，动作 MSE {action_mse:.4f}，成功率 {success:.1%}")
+    return latency_ms, action_mse, success</code></pre>
+    <p>解读：<strong>（1）</strong>延迟测量固定批量 1 与固定输入尺寸，中位数对系统调度抖动更稳健；批量推理的吞吐数字不能替代单步延迟，控制回路看的是后者。<strong>（2）</strong>动作 MSE 是开放环指标，压缩引入的噪声可能在 MSE 上不显著却改变闭环稳定性，因此必须叠加成功率指标。<strong>（3）</strong>三项指标应打包报告，单独任何一项都可能误导：延迟达标但成功率跌落意味着压缩过度，成功率达标但延迟超标意味着收益未兑现。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>校准集与部署分布不匹配</strong>：PTQ 精度骤降。修复：从部署场景采样校准集，覆盖光照、物体与视角变化的主要模式。</li>
+      <li><strong>动作头量化过粗</strong>：动作块出现高频抖动，闭环任务中表现为末端震荡。修复：动作头升为逐通道 8 位或 16 位，并对输出投影层单独保留高精度。</li>
+      <li><strong>只看参数量不看延迟</strong>：剪枝后参数量下降但延迟未变，因为稀疏结构未获得硬件支持。修复：采用结构化剪枝，在目标硬件上实测延迟。</li>
+      <li><strong>剪枝后不微调</strong>：特征子空间突变，成功率直接跌落。修复：每轮剪枝 5% 并立即微调数千步，逐步逼近目标比例。</li>
+      <li><strong>忽略归一化层统计</strong>：量化与剪枝改变了激活分布，归一化统计沿用旧值导致偏移。修复：微调阶段重新校准归一化统计，并把统计更新纳入验收流程。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>计算：某通道权重最大绝对值为 0.8，位宽 8 时量化步长与最大舍入误差各是多少？位宽降到 4 位后误差放大多少倍？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>s = 0.8/127 ≈ 0.0063，误差上界 s/2 ≈ 0.0031。4 位时 (2³−1)=7，误差放大 127/7 ≈ 18 倍。</div></details>
+      </li>
+      <li>把词元保留比例从 0.7 降到 0.4，预测三件事的变化：延迟、单步动作误差、闭环成功率，并说明验证顺序。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>延迟下降（注意力部分更明显），动作误差上升，成功率在细粒度操作任务上可能大幅下降。先测延迟确认收益，再测闭环，不要用离线 MSE 单独下结论。</div></details>
+      </li>
+      <li>设计逐层敏感度分析：如何用受控实验确定哪些层必须保留 16 位？写出对照设置、指标与判定阈值。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>每轮只量化一层，其余保持浮点，测量动作输出误差增量；增量超过总预算 20% 的层进入高精度名单。轮次间共享同一评估批次。</div></details>
+      </li>
+      <li>讨论：为什么"压缩后再蒸馏"与"蒸馏后再压缩"的最终精度不同？给出一个支持前者占优的场景条件。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>压缩后蒸馏时教师标签可以校正压缩噪声，学生仍以小容量吸收行为；当压缩误差以逐点噪声为主且教师可用时前者占优。若教师本身超出部署预算，顺序选择还要考虑训练算力。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>压缩是受动作精度约束的延迟优化问题，四个旋钮分别为量化、通道剪枝、低秩分解与词元剪枝。</li>
+      <li>均匀量化误差上界为半步长，逐通道尺度限制离群值影响，激活量化比权重更敏感。</li>
+      <li>QAT 用直通估计器把梯度传过舍入函数，微调步数与小学习率是消化 STE 偏差的前提。</li>
+      <li>动作头与输出投影层对量化最敏感，分级精度方案按逐层敏感度分配位宽。</li>
+      <li>验收必须同时报告延迟、动作误差与闭环成功率，三项指标的组合口径不可拆分。</li>
+      <li>下一章进入数据效率：<strong>世界模型的样本效率提升（Sample Efficiency）如何通过想象 rollout、优先级回放与重分析放大单条样本的价值</strong>。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch049.html">← 第 049 章：联合训练中的知识蒸馏</a>
+    <a class="next" href="ch051.html">第 051 章：世界模型的样本效率提升 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第075章 多机器人动态重构 | 多机器人协同学习课程 · ROS2 通信与系统集成</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第四篇 · 系统集成与工程化</span>
+    <span class="sep">/</span>
+    <span>第 075 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第四篇 · 系统集成与工程化</div>
+    <h1>第 075 章：多机器人动态重构</h1>
+    <p class="lead">机器人走了、任务换了、通道窄了，系统不能"推倒重来"，而要换一副骨架继续跑：用四层配置（角色/拓扑/控制/任务）描述当前形态，用两阶段提交与屏障同步完成原子切换，用迟滞与回滚压住重构本身的代价。</p>
+    <ul class="meta">
+      <li>主题：系统集成 / 变结构协同</li>
+      <li>关键机制：配置四层模型、两阶段提交、屏障同步（barrier）、渐进重构与回滚</li>
+      <li>预计学时：65 分钟</li>
+      <li>前置章节：第 074 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>区分"故障恢复"与"动态重构"：前者修复一个元素，后者让整个系统迁移到一个新的正常态。</li>
+      <li>掌握配置四层模型（角色、拓扑、控制、任务）与"过渡态必须安全"的设计原则。</li>
+      <li>会用两阶段提交（提议→收集→提交）与屏障同步实现全体一致的原子切换，理解版本号/纪元的角色。</li>
+      <li>会设计重构抑制：收益阈值、稳定窗、冷却期，避免系统在两种构型间来回跳。</li>
+      <li>能实现一个带渐进执行与回滚的重构管理器，并为它定义验收指标。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>上一章的恢复处理"单点坏了怎么办"；本章处理更宏观的一类变化：<strong>系统的"正常态"本身变了</strong>。四台机器人巡逻，一台电池告罄主动返航，不是故障，但巡逻段的划分、相遇点、盯着关键点的角色都要重新安排；任务从"搬运"切换到"安检"，编队形态、控制增益、通信拓扑全都要换一副面孔。</p>
+    <p>没有重构能力的系统只有两个选项：要么僵死在初始配置上（减员即失效），要么被人工重启（停机即事故）。动态重构的目标是<strong>让系统在运行中平稳地换骨架</strong>：切换过程本身安全、切换结果全队一致、切换失败能退回去。它是多机器人从"演示系统"走向"生产系统"的关键一步，也直接服务第 085 章"带故障恢复的任务系统"阶段项目。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 配置是可序列化的四层数据结构</h3>
+    <p>"当前形态"不能用散落各处的参数表达，而要收敛成一份可版本化、可下发、可比对的<strong>配置对象</strong>，分四层：</p>
+    <table>
+      <tr><th>层</th><th>内容示例</th><th>变更影响面</th></tr>
+      <tr><td>角色层</td><td>leader/follower、searcher/guard、负责区段</td><td>决策与任务权限</td></tr>
+      <tr><td>拓扑层</td><td>谁监听谁的状态、控制链路的邻接图</td><td>通信负载分布、发现关系</td></tr>
+      <tr><td>控制层</td><td>编队几何（间距、相位）、控制增益、速度上限</td><td>运动行为</td></tr>
+      <tr><td>任务层</td><td>任务归属与顺序（第 066–071 章的结果）</td><td>任务完成度</td></tr>
+    </table>
+    <p>把配置建模成数据结构（例如一个 JSON/YAML 对象，每台机器人持有它的副本）带来三个能力：<strong>版本化</strong>（配置号 v17 → v18，出问题能知道"哪一版引入的"）、<strong>差异最小化</strong>（切换时只重启变化的子系统，未变部分不动）、<strong>可预演</strong>（新配置先在影子模式里校验合法性，如"无重复槽位、无资源互斥冲突"再提交）。</p>
+
+    <h3>2. 过渡态安全：重构不是瞬移，是搬家具</h3>
+    <p>从构型 A 到构型 B，物理世界必须经过一个<strong>过渡态</strong>：编队从三角变纵队，机器人要先散开再成列，中间有几十秒"既不是 A 也不是 B"的状态。设计铁律：<strong>过渡态的每一刻都必须是安全的</strong>（满足最小间距、不占同一资源、随时可停）。三条衍生规则：</p>
+    <ul>
+      <li><strong>不允许"无主"或"双主"窗口</strong>：角色交接瞬间必须定义谁说了算，典型做法是保留旧 leader 直到新 leader 的屏障确认，再降级旧 leader。</li>
+      <li><strong>过渡走安全走廊</strong>：编队变换的中间形态选择"有序让位路径"（例如先全部减速到 0.3 m/s，再按序拉开间距）；各自奔新位置是碰撞的温床。</li>
+      <li><strong>过渡可中断</strong>：任何时刻收到急停或新重构指令，系统能停在一个"合法但未完成"的状态，之后要么继续、要么回滚。所以过渡态要设计成<strong>可枚举的中间检查点</strong>，一段黑盒动画无法在中途安全中止。</li>
+    </ul>
+
+    <h3>3. 两阶段提交与屏障：让全队换到同一页</h3>
+    <p>单机切换配置很简单，难的是"全队在同一时刻切换到同一版本"。借鉴分布式事务的两阶段提交（2PC）：</p>
+    <ol>
+      <li><strong>提议（propose）</strong>：重构管理器算出候选配置 v18（含新的角色/编队/任务表）与生效条件，广播 <code>ReconfigProposal</code>（配置全文或差异 + 校验和）。</li>
+      <li><strong>准备（prepare/ack）</strong>：各机器人校验自己能否满足新配置（电量够不够、位姿是否支持新角色、资源是否可用），回 <code>ack(ready / reject+reason)</code>。</li>
+      <li><strong>提交（commit）</strong>：全部 ready（或达到法定人数）后，管理器广播 <code>ReconfigCommit(v18, epoch)</code>；各机器人切换到 v18 并进入过渡态执行器，过渡完成回报 <code>transition_done</code>。</li>
+      <li><strong>稳定（stabilize）</strong>：管理器在稳定窗内（如 30 s）观察指标，通过则宣布 v18 稳定；若期间出现异常或某机长时间未完成过渡 → 触发回滚。</li>
+    </ol>
+    <p>版本号（version）与纪元号（epoch）分工不同：<strong>version 标识配置内容（v17 和 v18 的差异可 diff）</strong>；<strong>epoch 标识"哪一次变更具有权威"（防止旧版指令在回滚/二次重构时复活）</strong>。两者都放进每条控制消息里，接收端校验"版本兼容 + 纪元最新"才执行。</p>
+
+    <h3>4. 重构抑制与渐进执行</h3>
+    <p>重构是有成本的（过渡期效率降低、通信翻倍、风险窗口），所以<strong>"要不要重构"本身要用经济学判断</strong>：</p>
+    <div class="formula">
+      重构收益 = 新构型的预测完成时间收益 + 安全收益 − 过渡成本（≈ 过渡时长 × 全队效率损失 + 风险溢价）
+      <span class="note">例如巡逻减员使 idleness 从 5 min 升到 8 min（收益明确），但过渡只需 20 s，值得；若只是某扇门临时关闭，绕行即可，别重构</span>
+    </div>
+    <p>抑制机制三件套：<strong>收益阈值</strong>（预测改进 &lt; 15% 不动）、<strong>稳定窗</strong>（一次重构完成后 60 s 内不再发起新的）、<strong>冷却与滞环</strong>（触发条件与撤销条件用不同阈值，例如电量 20% 触发返航、充电到 60% 才允许回归）。渐进执行则把大重构拆成有序的小步：先加入新成员、观察一窗、再撤销旧角色，每一步都可独立验收与回滚。<strong>大爆炸式切换（全员同时换）只在低风险配置（如仅改速度参数）时使用。</strong></p>
+
+    <h3>5. 数值算例：一次减员重构的收益账</h3>
+    <p>用 063 章的回路口径算一遍减员重构。回路总负载 25 min（行驶 24 min + 12 点驻留 1 min），等时切分下 idleness = 25/n min：4 台时 6.25 min，减为 3 台时 8.33 min。按 12 小时班次换算总访问次数：720/6.25 ≈ 115 次，对照 720/8.33 ≈ 86 次，减少 25%。同一条曲线继续往下算：3 台减到 2 台，idleness 12.5 min、访问次数降到 57.6 次，再减 33%；2 台减到 1 台直接腰斩到 28.8 次。这组数给出重构决策的量化模板：减员的代价随规模缩小而放大，而过渡成本（约 20–40 s 的一次性切换）相对班次级收益可以忽略。所以当电池告罄、维修离场这类事件发生时，及时重构几乎总是正收益；真正需要抑制的是"为了鸡毛蒜皮的效率改进"频繁重构，那才是收益阈值 15% 与稳定窗 60 s 要拦住的对象。</p>
+    <p>但减员不是免费的：若任务有"每点 10 min 必访"的硬约束，3 台配置的 8.33 min 已经贴着线，任何一次告警抢占都会让某些点短暂超标。重构规划器应该在提交前把这类约束当成 PREPARE 阶段的校验项（类似 074 章重入检查的"能不能满足"投票），算不过就拒绝本轮，并给出"需要替换成 4 台或放宽约束"的具体理由。这就是四层配置模型的价值：约束与配置分离，切换前可以用同一份配置数据做静态校核，把不可行方案拦在过渡态之外。</p>
+
+    <h3>6. 数值算例：法定人数与 2PC 的失败模式账</h3>
+    <p>先把法定人数具体化：3 台机器人时简单多数是 2，4 台时是 3；按"关键成员全体 + 总数 ≥ ⌈2n/3⌉"的加权规则，4 台配置要求关键集合（新领导、唯一覆盖某防区者、持资源者）全部 ready 且总 ready 数 ≥ 3。举例：4 台中 3 台已 ready，但唯一覆盖北门的那台 reject（电量不足），即使人数达标也要取消本轮；否则新构型"形式上成立、功能上残缺"，北门出现无人覆盖的空窗。把 2PC 的四类失败对齐到处置动作，重构管理器就完整了：PREPARE 期间成员掉线 → 超时按 reject 处理，本轮取消；部分成员没收到 COMMIT → 按纪元判断，重发 COMMIT，靠"epoch 更新"补齐；过渡超时或稳定窗指标恶化 30% → 回滚到上一稳定配置并升纪元；回滚本身再失败（成员大面积离线）→ 全员安全停车并锁定重构，转人工。每类失败都要求"有确定终态"，绝不允许系统停在"既不是 A 也不是 B 且没人知道"的中间态。</p>
+    <p>重构的可观测指标要在上线时就定好：过渡时长（P50/P95）、回滚发生率、稳定窗内的指标漂移、以及"预测收益与实测收益"的偏差。校准例子：预测 idleness 从 6.25 升到 8.33 min，实测 60 个通知点的平均空置 9.1 min，比预测高 9%；把这个系统性偏差折进预测器，多轮之后收益评估会越来越准。没有这组指标的团队只能凭感觉判断"这次切换值不值"，而数据本身不贵：全部从已有的状态上报与事件日志里算得出来，观测器模块顺手输出即可。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>重构管理器的结构：一个状态机 + 三个接口。</p>
+    <ol>
+      <li><strong>触发器</strong>：汇总四类输入，成员变化（074 章的上线/离线事件）、任务变化（调度器事件）、环境变化（禁区/通道宽度）、性能退化（idleness/能耗监控）。所有输入先归一成"重构理由"对象再评估。</li>
+      <li><strong>规划器</strong>：生成候选配置。角色/槽位分配复用 066 章的匹配思想，代价里加重"切换平稳项"（保持原角色的机器人代价为 0，换角色加固定切换罚金），<strong>让重构尽量少动人</strong>。</li>
+      <li><strong>执行器</strong>：2PC 协议 + 屏障；维护"当前稳定配置"与"上一稳定配置"两个版本以备回滚。</li>
+      <li><strong>观测器</strong>：过渡时长、失败率、回滚次数、重构收益实测值；这些数字是下一轮阈值调参的依据。</li>
+    </ol>
+    <h3>关键参数表</h3>
+    <table>
+      <tr><th>参数</th><th>建议值</th><th>依据</th></tr>
+      <tr><td>重构收益阈值</td><td>15%</td><td>过渡成本与预测误差的量级；低于此噪声占主导</td></tr>
+      <tr><td>稳定窗</td><td>60 s</td><td>过渡后指标（idleness/编队误差）需要时间回到稳态</td></tr>
+      <tr><td>ack 超时</td><td>3 s</td><td>与 066 章派发确认同量级；超时视为 reject</td></tr>
+      <tr><td>过渡超时</td><td>90 s</td><td>编队变换典型 20–40 s 的两倍余量</td></tr>
+      <tr><td>回滚触发</td><td>过渡超时或稳定窗内指标恶化 30%</td><td>回滚是安全网，宁可回到旧构型也不带病前进</td></tr>
+      <tr><td>冷却期</td><td>120 s</td><td>回滚后的系统需要时间清账，禁止连环重构</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：为什么回滚目标固定为"上一稳定配置"？现场重算新配置的代价在哪里？</span>
+      <p>回滚的目标是<strong>确定性</strong>：回滚发生时系统往往已经在异常态（指标恶化、成员缺失），此时再运行规划器可能算出一个"看起来更好的第三配置"，但它的实际表现未经验证，是把一次故障叠加成两次。<strong>回滚必须回到"已知能跑"的状态</strong>（上一稳定版），然后再重新规划、重新走 2PC。这也解释了为什么"当前稳定配置"在运行时不能删，它是系统的锚。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：角色/槽位重分配，把"少动人"写进代价</strong></p>
+    <pre class="code"><code>SWITCH_PENALTY = 40.0     # 换角色的等效秒数：磨合成本 + 重定位成本
+
+def assign_roles(robots, slots, travel, current_role_of):
+    """给机器人分配角色槽位：代价 = 到位时间 + 换角色罚金，最大化保持原角色。"""
+    C = np.zeros((len(robots), len(slots)))
+    for i, r in enumerate(robots):
+        for j, s in enumerate(slots):
+            eta = travel(r.pose, s.pose) / r.speed
+            # 关键：原本就是此角色的机器人不加罚金，重构倾向于“微调”
+            penalty = 0.0 if current_role_of.get(r.id) == s.id else SWITCH_PENALTY
+            C[i, j] = eta + penalty
+    rows, cols = linear_sum_assignment(C)
+    return [(robots[i].id, slots[j].id) for i, j in zip(rows, cols)]
+
+def should_reconfigure(old_pred, new_pred, transition_cost, threshold=0.15):
+    """重构收益评估：改进必须显著超过过渡成本，且越过收益阈值才动手。"""
+    improvement = (old_pred.makespan - new_pred.makespan) / old_pred.makespan
+    net = improvement * old_pred.makespan - transition_cost
+    return improvement &gt;= threshold and net &gt; 0.0</code></pre>
+    <p>解读：规划器复用 066 章的匹配算法，但代价项多了一维"<strong>切换平稳项</strong>"。没有它，算法会为了 3 秒的到位时间差把整队角色洗牌，每个换角色的人都付出磨合与重定位的隐性成本（40 秒量级）。加了罚金后，只有当新构型在"省下的时间"上明显胜出时，才会推倒现有分工。<code>should_reconfigure</code> 是重构的"财务门槛"：先算替换收益，再减过渡成本，最后还要越过 15% 阈值，三重闸门把"为 1 秒优化折腾全队"的可能性彻底掐掉。参数建议写进配置文件随车队规模调整：机器人越多，切换罚金应越大（一次洗牌的绝对成本更高）。</p>
+
+    <p><strong>片段 2：两阶段提交，提议、收集、提交</strong></p>
+    <pre class="code"><code>class ReconfigManager(Node):
+    """重构管理器：2PC 执行全队一致的配置切换，带屏障与回滚。"""
+    def __init__(self):
+        super().__init__("reconfig_manager")
+        self.stable = load_config()            # 当前稳定配置（回滚锚点）
+        self.epoch = 1
+        self.phase = "IDLE"
+        self.acks = {}                         # robot_id -&gt; True/False/reason
+        self.create_timer(0.5, self.tick)
+        self.cmd_pub = self.create_publisher(ReconfigCommand, "/fleet/reconfig", 10)
+
+    def propose(self, candidate):
+        self.phase = "PREPARE"
+        self.candidate = candidate
+        self.acks.clear()
+        cmd = ReconfigCommand()
+        cmd.action = "PREPARE"                 # 携带全文 + 校验和：接收端先校验再回执
+        cmd.config = candidate.serialize()
+        cmd.epoch = self.epoch
+        self.cmd_pub.publish(cmd)
+
+    def on_ack(self, msg):
+        if self.phase == "PREPARE":
+            self.acks[msg.robot_id] = msg.ready   # False 时 msg.reason 一并记录
+
+    def tick(self):
+        if self.phase == "PREPARE" and self.all_acked_or_timeout():
+            if self.majority_ready():
+                self.epoch += 1                   # 提交前升纪元：新旧指令永不混淆
+                cmd = ReconfigCommand()
+                cmd.action = "COMMIT"
+                cmd.config = self.candidate.serialize()
+                cmd.epoch = self.epoch
+                self.cmd_pub.publish(cmd)
+                self.phase = "TRANSITION"
+            else:
+                self.get_logger().warn(f"准备失败：{self.reasons()}")
+                self.phase = "IDLE"               # 未达条件：本轮重构取消
+        elif self.phase == "TRANSITION" and self.transition_timeout():
+            self.rollback()
+
+    def rollback(self):
+        self.epoch += 1
+        cmd = ReconfigCommand()
+        cmd.action = "COMMIT"
+        cmd.config = self.stable.serialize()     # 回到“已知能跑”的上一稳定版
+        cmd.epoch = self.epoch
+        self.cmd_pub.publish(cmd)
+        self.phase = "IDLE"</code></pre>
+    <p>解读：2PC 的每一步都对应一个失败模式。<strong>PREPARE 阶段收集"能不能做"</strong>，机器人按自己的实况（电量、位姿、资源占用）投票，任何一个 reject 都附带理由，管理器据此决定取消还是换方案；<strong>COMMIT 前升 epoch</strong>，保证从这一刻起旧纪元的任何指令（包括回滚前的残留消息）都不再有效；<strong>TRANSITION 阶段超时即回滚</strong>，回滚目标固定为 <code>self.stable</code>（不是重新规划）。细节：<code>majority_ready()</code> 允许在非关键成员失联时仍推进重构（法定人数思想，074 章同源）；<code>stable</code> 只在稳定窗结束后才被替换为新配置，把"宣布稳定"做成显式动作，"提交了就算成功"是很多实现省略的一步。生产实现里还要给 COMMIT 消息加重发（接收端可能没收到），并用 ack 编号去重。</p>
+
+    <p><strong>片段 3：机器人侧的渐进过渡执行器</strong></p>
+    <pre class="code"><code>class TransitionExecutor(Node):
+    """接收 COMMIT 后在本地执行带检查点的过渡，任何异常都可安全中止。"""
+    CHECKPOINTS = ("slow_down", "clear_zone", "take_slot", "formation_lock")
+
+    def on_commit(self, msg):
+        if msg.epoch &lt;= self.epoch:            # 旧纪元（乱序/重放）：直接忽略
+            return
+        self.epoch = msg.epoch
+        self.target = parse_config(msg.config)
+        self.step = 0
+        self.active = True                     # 进入过渡态：以安全速度执行
+
+    def tick(self):
+        if not self.active:
+            return
+        phase = self.CHECKPOINTS[self.step]
+        done = {
+            "slow_down": self.set_speed(0.3),           # 先降速：所有让位动作的前提
+            "clear_zone": self.leave_shared_resources(),# 释放窄道/工位（069 章租约）
+            "take_slot": self.goto_new_slot(),          # 按“有序让位”路径到位
+            "formation_lock": self.check_formation(),
+        }[phase]()
+        if done:
+            self.step += 1
+            self.report("transition_checkpoint", self.step)
+            if self.step &gt;= len(self.CHECKPOINTS):
+                self.active = False                     # 过渡完成
+                self.report("transition_done", None)
+
+    def abort(self, reason):
+        # 中止时停在当前检查点：位置本就合法（每个检查点后都安全）
+        self.active = False
+        self.hold_position()
+        self.report("transition_aborted", reason)</code></pre>
+    <p>解读：过渡执行器的精髓是<strong>把"换队形"拆成四个有序检查点</strong>，一条从旧位置到新位置的直线路径是中途无法安全中止的黑盒。四个检查点的顺序是安全逻辑的体现：先 <code>slow_down</code>（速度是所有让位动作的前提）、再 <code>clear_zone</code>（释放共享资源，避免带资源换位引发 069 章的死锁）、然后 <code>take_slot</code>（按有序让位路径进场）、最后 <code>formation_lock</code>（全队校验新编队误差达标）。每个检查点完成后立即上报，管理器的过渡超时判据以"最慢检查点"为界，全队统一一个时间点会掩盖卡住的位置。回滚/中止时 <code>hold_position</code> 保证系统停在合法状态：<strong>因为每个检查点后都是安全态，中止永远不需要"倒带"</strong>。这就是"过渡态可枚举"的实际收益。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>构型震荡</strong>：指标在阈值附近时系统在两种构型间反复切换，每次切换期间效率更差。修复：进入/退出用不同阈值（滞环）+ 稳定窗 + 冷却期；重构收益阈值 15%。</li>
+      <li><strong>部分成员切换到新配置、部分滞留旧配置</strong>：没有 2PC 与屏障，消息丢失就让全队裂成两半。修复：PREPARE/COMMIT 两阶段 + ack 重发 + 纪元校验；滞留者按 OBSERVE_ONLY 降级等重入。</li>
+      <li><strong>过渡路径撞上资源冲突</strong>：编队变换经过窄道时两台机器人同时申请通行权，重构卡死。修复：过渡检查点包含"释放共享资源"步骤；变换路径预先做资源冲突检查（与 069 章的预约系统联动）。</li>
+      <li><strong>不留回滚点</strong>：新配置一提交就把旧配置覆盖，出问题只能"向前修"。修复：稳定窗结束前保留上一稳定版；回滚是广播旧版 + 升纪元，不重算。</li>
+      <li><strong>重构期间不冻结任务</strong>：编制变了但调度器还在按旧表派任务，机器人收到两套指令。修复：重构期调度器暂停派发（冻结窗），过渡完成后按新配置一次性重派。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>三台机器人（角色 A/B/C）与三个槽位，rerouting 代价矩阵如下：机器人 1 到槽位 A/B/C 分别 5/20/25 s，机器人 2 为 20/5/20 s，机器人 3 为 25/20/5 s。切换罚金 40 s。求"保持原角色"与"最小到位时间"两种口径下的分配结果，并解释差异。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>保持原角色：对角 5+5+5 = 15；最小到位时间若无罚金同为对角（矩阵构造如此）。把机器人 1 的对角改成 60（它只剩 20% 电量跑不到）再看：无罚金时会洗牌，有罚金时可能仍留守，体会罚金是"稳定优先"的旋钮。</div></details>
+      </li>
+      <li>为"四机巡逻减员为三机"写一份完整重构方案：新配置的角色与区段划分（参考 063 章等时切分）、触发条件与收益计算、过渡检查点的具体动作、验收指标（idleness 上限、过渡时长、任务零丢失）。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>切分：原四段合并重排为三段（等时 + 共享边界点）；收益：idleness 5 → 6.7 min，过渡成本 ≈ 30 s；检查点：减速—让出交叠区—新段就位—队列校验；验收：过渡 ≤ 60 s、idleness ≤ 7 min、task_event 无缺口。</div></details>
+      </li>
+      <li>把片段 2 的 <code>majority_ready()</code> 从"简单多数"改成"关键成员必须全体 ready + 非关键成员多数"的加权法定人数，写出判定逻辑并说明哪些角色应被定义为关键成员。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>关键成员 = 新配置的 leader、唯一覆盖某防区的机器人、持有共享资源的机器人；判定 = 关键集合全 ready 且总 ready 数 ≥ ⌈2n/3⌉。理由：关键成员缺失会让新构型"形式上成立、功能上残缺"。</div></details>
+      </li>
+      <li>设计一次"重构失败注入"演练：在 COMMIT 后让一台机器人卡在 take_slot 检查点（模拟被行人挡住），验证超时回滚路径。写出观测点（哪些事件、什么时间线）与验收线（回滚完成时间、是否有双主窗口、任务重复次数）。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>注入：暂停该机器人过渡执行器 120 s。观测：transition_checkpoint 停在第 3 步、管理器 90 s 超时 → COMMIT(stable, epoch+1)；验收：回滚广播 ≤ 5 s、双主窗口 = 0（用 epoch 拒绝日志证明）、任务重复 = 0、恢复巡逻 ≤ 60 s。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>重构 = 系统迁移到新正常态；配置要作为四层可版本化对象管理，规划代价里包含"少动人"的切换罚金。</li>
+      <li>过渡态每一刻都必须安全：有序让位路径、检查点化、可中断；无主/双主窗口一律禁止。</li>
+      <li>2PC + 屏障保证全队一致切换：PREPARE 收集能力，COMMIT 升纪元执行，稳定窗后才宣布成功；失败回滚到上一稳定配置。</li>
+      <li>重构抑制三件套：15% 收益阈值、60 s 稳定窗、冷却与滞环；渐进执行优于大爆炸。</li>
+      <li>下一章换一个视角：不谈怎么改系统，转谈怎么"量"系统，<strong>多机器人系统性能基准测试</strong>。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch074.html">← 第 074 章：多机器人故障检测与恢复</a>
+    <a class="next" href="ch076.html">第 076 章：多机器人系统性能基准测试 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

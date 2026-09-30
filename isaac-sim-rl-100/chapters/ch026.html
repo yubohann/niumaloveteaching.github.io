@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第026章 实现连续动作空间 | 机器人仿真学习课程 · Isaac Sim 强化学习训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · 仿真环境与训练框架</span>
+    <span class="sep">/</span>
+    <span>第 026 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · 仿真环境与训练框架</div>
+    <h1>第 026 章：实现连续动作空间</h1>
+    <p class="lead">从高斯采样到 tanh 压缩，从 log-prob 修正到动作缩放与平滑滤波：连续控制策略的每个零件和它存在的理由。</p>
+    <ul class="meta">
+      <li>主题：动作空间设计 / 连续控制</li>
+      <li>相关组件：Isaac Sim、Stable-Baselines3（PPO / SAC）、PyTorch</li>
+      <li>预计学时：50 分钟</li>
+      <li>前置章节：第 025 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解连续动作策略的完整结构：均值网络 + 标准差参数 → 高斯采样 → tanh 压缩 → 仿射缩放。</li>
+      <li>掌握 tanh 压缩必须配的 log-prob 修正项，理解缺少它时梯度为什么会偏。</li>
+      <li>会设计动作的缩放、平滑与限幅：把网络输出翻译成关节目标的每一层都有明确职责。</li>
+      <li>会调连续策略的两个关键旋钮：初始 log 标准差与熵系数，知道"探索坍缩"与"探索爆炸"的症状。</li>
+      <li>能比较 PPO 与 SAC 在机器人连续控制任务上的适用差异。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>上一章你看到了离散化的边界：多自由度精细操作必须保留连续量。现实中绝大多数机器人任务，关节伺服、力控、灵巧手、四足步态，都属于连续控制。连续动作空间的优势直白：<strong>分辨率不受限（可以表达任意小的修正）、维度增长是线性的（7 个关节就是 7 维实数）、轨迹平滑（采样自连续分布，天然相邻步相似）。</strong></p>
+    <p>但连续控制也有自己的一套陷阱：策略输出的是分布参数，动作本身要靠采样产生、采样出的动作要经过非线性压缩才能落进量程、压缩会改变概率密度从而污染梯度、缩放到真实关节量纲时错了系数会让策略"永远学不会"……<strong>本章要做的是把这条从"网络输出"到"关节转动"的完整通路拆开，逐段说清每一层为什么存在。</strong>理解这条通路，后面所有操作任务（036 起）的动作设计都是它的实例化。</p>
+  </section>
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 高斯策略：为什么输出的是分布参数</h3>
+    <p>连续策略的标准形式是状态条件高斯分布：</p>
+    <div class="formula">
+      π(a | s) = N( a ; μ<sub>θ</sub>(s), σ<sub>θ</sub><sup>2</sup> )，  u ~ N(μ, σ)，  a = tanh(u)
+      <span class="note">μ 是网络的均值输出；σ 可由网络输出（随状态变化）或作为独立参数（SB3 默认）</span>
+    </div>
+    <p>为什么不直接输出一个确定性动作？<strong>因为策略梯度需要"在动作上积分"来估计期望，探索内生于分布。</strong>采样公式 u = μ + σ·ε 里，ε~N(0,1) 是噪声源。重复参数化（reparameterization）的关键性质：噪声与参数解耦后，梯度可以穿过采样操作直接回传到这个式子，这是 SAC 能端到端训练随机策略、PPO 能估计对数概率的基础。σ 同时承载探索强度：它是可学习参数，任务需要精细时网络会主动压低 σ。</p>
+
+    <h3>2. tanh 压缩与 log-prob 修正：一个必须成对出现的公式</h3>
+    <p>机器人关节有量程（±2.9 rad），而高斯分布支撑集是整个实数轴。<b>标准做法是先采样无界变量 u，再做 a = tanh(u) 压到 (−1,1)，最后仿射缩放到真实量程。</b>但换变量会改变概率密度，密度必须按雅可比行列式校正：</p>
+    <div class="formula">
+      log π(a) = log N(u; μ, σ) − Σ<sub>i</sub> log( 1 − tanh<sup>2</sup>(u<sub>i</sub>) )
+      <span class="note">校正项源于 da/du = 1 − tanh²(u)；每个动作维贡献一项，对多维动作求和</span>
+    </div>
+    <p>为什么这一项非写不可？PPO 的重要性比值是 π<sub>new</sub>(a)/π<sub>old</sub>(a)。若漏掉修正，分子分母都被同一个错误雅可比"污染"，看似会抵消，但对数空间的加减不像乘除那样自动精确抵消，且 SAC 的熵项 ⟨−log π⟩ 完全依赖它。<strong>少了它，策略梯度会系统性偏向 tanh 饱和区（两端），表现为动作长期贴限位。</strong>另一处常见错误是把修正写成 log(1−a²)（用压缩后的 a），正确写法必须用压缩前的 u = atanh(a)，细节错一个变量，训练行为就有肉眼可见的差别。</p>
+
+    <h3>3. 动作缩放：仿射映射的方向与居中</h3>
+    <p>PPO/SAC 生态默认动作在 (−1,1)（由 tanh 保证）。仿真环境要的是真实量纲，映射用仿射变换：</p>
+    <div class="formula">
+      q<sub>cmd</sub> = q<sub>mid</sub> + a × q<sub>scale</sub>，  q<sub>mid</sub> = (q<sub>max</sub>+q<sub>min</sub>)/2，  q<sub>scale</sub> = (q<sub>max</sub>−q<sub>min</sub>)/2
+      <span class="note">a ∈ (−1,1) 映到 (q<sub>min</sub>, q<sub>max</sub>)；若任务只需要小范围运动，用一个更小的自定义 scale</span>
+    </div>
+    <p>关键取舍：<strong>用满量程缩放的策略，学习负担是"能到任何位置"；用受限缩放的策略（如只允许在初始位姿 ±0.3 rad 内活动），探索半径小、易收敛，但需要外部逻辑把机器人先送到工作区。</strong>操作任务常见折中是"绝对关节目标 + 相对偏移"的混合：观测里给当前位姿，动作限定为相对偏移量（delta action，仍连续），由环境积分成目标。这与第 025 章增量分档是同一思想的连续版本，区别只是分辨率无限。</p>
+
+    <h3>4. 平滑滤波与动作率惩罚：让连续动作"像人"</h3>
+    <p>连续策略相邻步的动作是独立采样的噪声叠加，60 Hz 下关节目标会"哆嗦"。两种抑制手段：</p>
+    <ul>
+      <li><b>低通滤波</b>：a<sub>t</sub> ← α·a<sub>new</sub> + (1−α)·a<sub>t−1</sub>，α=0.3 时时间常数约 3 个控制步。实现成本为零，代价是引入执行延迟（等效于控制带宽下降），α 太小会让策略"迟钝"。</li>
+      <li><b>动作率惩罚</b>：奖励里加 −w·‖a<sub>t</sub>−a<sub>t−1</sub>‖²，w 取主奖励的 1%–5%。它让策略自己学会平滑，不做额外滤波，对 sim-to-real 更友好，因为学到的平滑行为与部署时一致。</li>
+    </ul>
+    <p><strong>推荐同时用两者但都调轻</strong>：滤波器（α≈0.4）兜底防止极端抖动，小权重惩罚引导策略主动平滑。注意滤波会改变"策略输出"与"实际执行"的对应关系，若在评估时要复现训练行为，评估端必须启用同一个滤波器。</p>
+
+    <h3>5. PPO 还是 SAC？</h3>
+    <p>两个主流连续控制算法在 Isaac 并行场景下的对照：<b>PPO</b> 是 on-policy，样本利用率低但扩展性极好，4096 并行环境让它"以量取胜"，且实现稳定，是机器人训练的实际默认；<b>SAC</b> 是 off-policy，样本效率高但回放缓冲与并行环境的组合更复杂（第 025 章 DQN 的并行折中同样适用），更适合单环境或小规模、接触丰富、需要高样本效率的任务。经验法则：<strong>能并行的仿真任务优先 PPO；仿真昂贵、环境数上不去时考虑 SAC。</strong></p>
+
+    <h3>6. 完整算例：log-prob 修正的数值走查</h3>
+    <p>取 σ=0.6（对应 log_std=−0.5）、μ=0，逐点计算 u 取不同值时的对数密度，看修正项到底改变了什么：</p>
+    <table>
+      <tr><th>u</th><th>高斯项 log N(u;0,0.6)</th><th>修正项 log(1−tanh²u)</th><th>合计 log π</th></tr>
+      <tr><td>0</td><td>−0.408</td><td>0.000</td><td>−0.408</td></tr>
+      <tr><td>1</td><td>−1.797</td><td>−0.868</td><td>−2.665</td></tr>
+      <tr><td>2</td><td>−5.964</td><td>−2.650</td><td>−8.614</td></tr>
+      <tr><td>3</td><td>−12.908</td><td>−4.619</td><td>−17.527</td></tr>
+      <tr><td>4</td><td>−22.630</td><td>−6.614</td><td>−29.245</td></tr>
+    </table>
+    <p>读完这张表的三个结论。<strong>第一，修正项是"饱和区密度惩罚"</strong>：u=3 时高斯本身已经把概率压到 e<sup>−12.9</sup> 量级，压缩会让 a=tanh(3)≈0.995 这样"贴边"的动作密度抬高 101 倍；修正项 −4.619 把这部分多出来的密度还回去，策略为贴边行为付出的对数概率代价与中心区保持可比。第二，<strong>修正与高斯项数量级相当</strong>，u=2 时分别是 −5.96 与 −2.65，漏掉修正等于丢掉了三分之一到一半的概率信息。第三，<strong>数值上必须用 u 算</strong>：u=4 时 1−tanh²u=0.00134，若用 a=tanh(u) 反推再算 1−a²，float32 的有效位数在 0.999 附近的相减里损耗严重，误差会被 log 放大。把这张表当作单元测试：任何新实现的对数概率都应与它逐点对上。</p>
+
+    <h3>7. 滤波延迟与带宽预算</h3>
+    <p>低通滤波器是"用延迟换平滑"，延迟量可以算。EMA 形式 a<sub>t</sub> = αa<sub>new</sub> + (1−α)a<sub>t−1</sub> 的等效连续截止频率为 f<sub>c</sub> = −ln(1−α)/(2π·dt)，相位滞后为 arctan(f/f<sub>c</sub>)：</p>
+    <table>
+      <tr><th>α</th><th>时间常数（控制步）</th><th>等效截止频率（Hz）</th><th>2 Hz 处相位损失</th></tr>
+      <tr><td>0.3</td><td>2.8</td><td>3.4</td><td>30°</td></tr>
+      <tr><td>0.4</td><td>2.0</td><td>4.9</td><td>22°</td></tr>
+      <tr><td>0.5</td><td>1.4</td><td>6.6</td><td>17°</td></tr>
+    </table>
+    <p>参照 021 章的相位预算：一个控制步（1/60 s）的延迟在 2 Hz 任务上约损失 12° 相位，而 α=0.3 的滤波器等价于再多花掉 30°。这意味着<strong>"滤波器开大 + 动作率惩罚也开大"会双重侵蚀相位余量</strong>，接触类任务会表现为跟踪迟钝、接触力收敛慢。选型建议：α 不低于 0.4（22° 以内），动作率惩罚保持主奖励的 1%–3% 小权重，两者相加的等效延迟控制在 2–3 个控制步以内。</p>
+
+    <h3>8. 熵系数与探索强度的定量关系</h3>
+    <p>熵系数不是玄学，可以换算成"每步白拿多少分"。一维高斯的微分熵是 H = ½(1 + ln(2πσ²))；σ=0.6 时 H≈0.91 nat，7 维动作合计约 6.36 nat。熵奖励 = ent_coef × H<sub>total</sub>：</p>
+    <div class="formula">
+      ent_coef=0.001 → 每步约 +0.006；ent_coef=0.01 → 每步约 +0.064
+      <span class="note">对照：距离项单步典型值 0.3 量级；0.01 的熵奖励等于"乱动也拿 20% 的主分"</span>
+    </div>
+    <p>这就是"0.01 太大、策略满足于乱动"的算术解释：熵奖励 0.064 与稠密主奖励 0.3 同档，策略宁可保持随机也不收敛到精确动作。0.001 的 0.006 只占主奖励的 2%，起到"防止探索坍缩的保底工资"作用。另一个参照是 SAC 的自动熵调节：常见启发式把目标熵的对标值取为动作维度量级（7 nat），σ=0.6 时的 6.36 nat 与之同档，说明 −0.5 的初始 log_std 是合理的起点。</p>
+
+    <h3>9. 边界与失效模式</h3>
+    <ul>
+      <li><strong>log_std 上下限的两端</strong>：σ 触到上限（1.0）时每步增量在整个 ±0.05 rad 区间近乎均匀乱扫，接触力爆炸；触到下限（e<sup>−5</sup>≈0.0067）时动作几乎确定，探索停止，成功率会卡在平台。判据：训练中期检查 log_std 参数的实际取值，若长期贴边，说明熵系数或初始化需要调整。</li>
+      <li><strong>log-prob 的求和维度</strong>：多维动作的对数概率是各维之和，漏掉 <code>.sum(dim=-1)</code> 或用成均值，会改变重要性比值的尺度，clip 范围 0.2 的语义随之漂移。症状：PPO 的近似 KL 数值与行为变化不匹配。修复：与 6 节的表逐点核对。</li>
+      <li><strong>滤波与部署不一致</strong>：训练侧的滤波器是环境行为的一部分；策略学到的是"经过滤波的动作序列"与其后果的对应关系。部署端漏掉滤波器，等于换了动力学。修复：把滤波参数写进部署配置，在仿真里用同一参数做最终验收。</li>
+      <li><strong>限幅处的目标不可达</strong>：tanh 的输出永远到不了 ±1，因此"绝对许可范围的两端"实际不可达；如果任务要求关节到达量程端点（如某些标定动作），需要在缩放层做一次"贴边补偿"或把量程略微放宽。这个细微差异在评估时表现为"总是差最后几十毫弧度"。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p><strong>连续动作通路的实现顺序是"网络输出 → 采样 → 压缩 → 缩放 → 平滑 → 下发"六层。</strong>每层的位置固定、职责单一，任何一层错了都能从行为症状反查。</p>
+    <ol>
+      <li><strong>网络输出</strong>：MLP 共享主干 + 两个头，均值头线性输出、标准差头输出 log_std（保证 σ&gt;0）。</li>
+      <li><strong>采样与压缩</strong>：u = μ + σ·ε，a = tanh(u)；训练时同时计算 log π(a)（含修正项），评估时取 a = tanh(μ)（确定性动作）。</li>
+      <li><strong>缩放</strong>：环境侧仿射映射到关节量程或增量范围；增量模式下再积分成绝对目标。</li>
+      <li><strong>平滑</strong>：低通滤波 + 奖励侧动作率惩罚双保险。</li>
+      <li><strong>下发</strong>：写入位置驱动器目标（第 004 章），由底层控制器完成伺服。</li>
+    </ol>
+    <table>
+      <tr><th>设计点</th><th>推荐值/做法</th><th>理由</th></tr>
+      <tr><td>动作语义</td><td>关节增量 × 0.05 rad</td><td>探索半径与平滑的平衡；绝对模式需额外处理大范围探索风险</td></tr>
+      <tr><td>初始 log_std</td><td>−0.5 ~ −1.0</td><td>σ≈0.6 时单步扰动适中；σ=1 以上等于全量程乱扫</td></tr>
+      <tr><td>log_std 上下限</td><td>[−5, 0]</td><td>下限防探索坍缩，上限防噪声爆炸</td></tr>
+      <tr><td>低通系数 α</td><td>0.3–0.5</td><td>时间常数 1.4–2.8 个控制步；α 太小引入明显延迟</td></tr>
+      <tr><td>动作率惩罚 w</td><td>主奖励的 1%–3%</td><td>足够让策略"学会平滑"，又不喧宾夺主</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计思维：评估时动作要确定性</span>
+      <p>训练时 σ&gt;0 保证探索；评估时若继续采样，同一个策略两次跑出的成功率能差 5–10 个点，还掩盖了真实控制精度（噪声帮你"蒙"过了抖动考核）。<strong>评估统一取 μ 的 tanh 输出，确定性动作才是策略的真实成绩。</strong>这也是很多论文复现实验对不上的原因之一：训练日志的随机策略成绩 vs 论文的确定性评估成绩，本就不可比。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：含 tanh 修正的高斯策略（核心 20 行）</strong></p>
+    <pre class="code"><code>import torch, math
+
+class GaussianPolicy(torch.nn.Module):
+    def __init__(self, obs_dim, act_dim, hidden=256, init_log_std=-0.5):
+        super().__init__()
+        self.trunk = torch.nn.Sequential(
+            torch.nn.Linear(obs_dim, hidden), torch.nn.ELU(),
+            torch.nn.Linear(hidden, hidden), torch.nn.ELU(),
+        )
+        self.mu_head = torch.nn.Linear(hidden, act_dim)          # 均值：无界，交给 tanh 管
+        self.log_std = torch.nn.Parameter(torch.full((act_dim,), init_log_std))
+        # log_std 是独立可学习参数：机器人任务的状态相关 σ 收益有限，独立参数更稳
+
+    def forward(self, obs, deterministic=False):
+        mu = self.mu_head(self.trunk(obs))
+        std = self.log_std.clamp(-5.0, 0.0).exp()                # 夹紧：防探索坍缩/爆炸
+        if deterministic:
+            u = mu                                               # 评估：直接取均值路径
+        else:
+            u = mu + std * torch.randn_like(mu)                  # 重复参数化采样
+        a = torch.tanh(u)                                        # 压到 (-1,1)
+        # 对数概率（训练用）：校正项必须用压缩前的 u，用 a 会损失数值精度
+        log_prob = (-0.5 * ((u - mu) / std) ** 2
+                    - torch.log(std) - 0.5 * math.log(2 * math.pi)
+                    - torch.log(1.0 - torch.tanh(u) ** 2 + 1e-6)).sum(dim=-1)
+        #                                   ↑ 雅可比修正：log(1 - tanh²(u))，逐维求和
+        return a, log_prob</code></pre>
+    <p>解读：这段三十行代码是连续控制的"心脏"。三个细节决定成败：<b>(1) 校正项只认压缩前的 <code>u</code></b>：<code>log(1 − tanh²(u))</code> 在 |u|&gt;3 时数值趋向 −∞，代表"压缩后落在两端的动作密度极高"；如果错用 <code>log(1 − a²)</code>，当 a 接近 ±1 时同样趋向 −∞，看似相近，但 a 的数值精度在饱和区已经丢光了，误差会被放大，工程上统一用 u。<b>(2) +1e-6 的数值保护</b>：tanh 饱和时 1−tanh²(u) 下溢到 0，log 变 −inf，一个 NaN 会污染整批梯度。<b>(3) σ 夹紧在 [e<sup>−5</sup>, 1]</b>：上限防"从第 1 步就在全量程乱扫"，下限防训练后期探索彻底消失、陷入局部最优无法脱身。</p>
+
+    <p><strong>片段 2：环境侧，缩放、积分与平滑三层</strong></p>
+    <pre class="code"><code>class ContinuousActionAdapter:
+    """把策略的 (-1,1)^n 动作变成关节目标：缩放 → 积分 → 平滑 → 限幅"""
+    def __init__(self, num_joints, delta_scale=0.05, alpha=0.4):
+        self.num_joints = num_joints
+        self.delta_scale = delta_scale      # 单步最大关节增量（rad）：探索半径旋钮
+        self.alpha = alpha                  # 低通系数：0.4 ≈ 2 步时间常数
+        self.q_target = None                # 累计目标：连续版"积分器"（对比第 025 章）
+        self.prev_action = None
+
+    def reset(self, current_q):
+        self.q_target = current_q.clone()   # 回合起点对齐当前位姿，避免首步猛跳
+        self.prev_action = torch.zeros_like(current_q)
+
+    def map(self, action):                  # action ∈ (-1,1)^n，已经过 tanh
+        smooth = self.alpha * action + (1 - self.alpha) * self.prev_action
+        self.prev_action = smooth.clone()   # 记录平滑后的动作：奖励惩罚也应对照它
+        self.q_target = self.q_target + smooth * self.delta_scale   # 增量积分
+        low, high = self.joint_limits
+        self.q_target = torch.clamp(self.q_target, low, high)       # 软墙：防漂出量程
+        return self.q_target
+
+    def rate_penalty(self, action):
+        # 动作率惩罚：让策略"自己学会"平滑，而不只依赖滤波器
+        return ((action - self.prev_action) ** 2).sum(dim=-1) * 0.01</code></pre>
+    <p>解读：注意这个适配器与第 025 章离散包装器的结构对照，<strong>缩放系数取代了档位表、累加取代了查表，但"积分 + 限幅"的骨架完全一致</strong>。这说明动作空间设计在本质上只关心两件事：动作的语义（增量还是绝对）与安全边界。<code>rate_penalty</code> 里有个容易踩的细节：它拿 <code>action</code>（原始输出）与 <code>prev_action</code>（平滑后的历史）作差，严格来说应该拿"平滑后"的两个时刻作差才是纯抖动指标；这里保留原式是提醒你：<b>惩罚项对准哪个量，策略就会优化哪个量，写奖励时先想清楚"我到底恨什么"</b>。恨的是关节真正执行的抖动，就该对执行量（平滑后）作差。</p>
+
+    <p><strong>片段 3：SB3 训练入口与两个关键超参</strong></p>
+    <pre class="code"><code>from stable_baselines3 import PPO
+
+model = PPO(
+    "MlpPolicy", vec_env,
+    n_steps=16,                 # 每个并行环境一次采 16 步（对应 RL-Games 的 horizon）
+    batch_size=16384,           # 4096 环境 × 16 步 / 4：整除 batch，GPU 满负荷
+    n_epochs=5,                 # 同一批数据的最大回炉次数
+    learning_rate=3e-4,         # 连续控制常用起点；KL 或回报曲线异常时再调
+    gamma=0.99,                 # 60 Hz 下有效视野约 1.7 s
+    gae_lambda=0.95,            # GAE 平滑系数
+    clip_range=0.2,             # PPO 裁剪：抑制单次策略漂移
+    ent_coef=0.001,             # 熵系数：太小会探索坍缩，太大策略永远随机
+    policy_kwargs=dict(
+        net_arch=dict(pi=[256, 256], vf=[256, 256]),   # actor/critic 各自两层
+        log_std_init=-0.5,      # σ≈0.6：单步扰动约为量程的 1/3，探索强度适中
+        activation_fn=torch.nn.ELU,   # 光滑激活：连续控制的默认选择
+    ),
+    device="cuda",
+)
+model.learn(total_timesteps=100_000_000)   # 1 亿步：4096 并行下约 1-2 小时量级
+model.save("runs/reach_ppo/checkpoint")    # 评估时用 deterministic=True 取均值动作</code></pre>
+    <p>解读：超参里专门说两个。<b>ent_coef=0.001 是连续 PPO 的甜点区</b>：熵项给"保持随机"发工资，设 0.01 太大，策略会满足于乱动不学精；设 0（SB3 默认）在小任务上偶尔探索坍缩，表现为成功率卡在某个平台上不去。机器人任务建议从 0.001 起步，成功率平台期若明显早于预期就升一档到 0.005 试试。<b>log_std_init=−0.5 决定开局探索质量</b>：把它设成 0（σ=1），等价于每步增量在整个 ±0.05 rad 区间均匀乱跳；设成 −2（σ=0.14），动作几乎确定，早期几乎不探索。第 025 章 ε 衰减与这里 σ 的初始化是同一个问题的两种形态：<strong>探索强度要"开局有、后期收"，收的机制可以是被学习的 σ，也可以是衰减调度。</strong></p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>漏写 tanh 的 log-prob 修正</strong>：策略梯度有偏，动作长期贴 ±1 极限位。症状：动作直方图在两端堆峰、关节一直在限位抖动。修复：log π 里加 Σ log(1−tanh²(u))，且用压缩前的 u 计算。</li>
+      <li><strong>缩放系数方向错（scale 取半程）</strong>：把 ±1 直接乘以量程 max（正确做法是乘半量程），动作范围翻倍、目标越界，限幅后策略学到"永远顶格"的坏习惯。修复：仿射公式用 (max−min)/2 与 (max+min)/2。</li>
+      <li><strong>忘记 log_std 夹紧</strong>：训练中 σ 缓慢坍缩到 0，后期完全失去探索；或初始化过大，从第 1 步就全量程乱扫、接触力爆炸。症状：前者是成功率早停，后者是开局就"抽搐"。修复：clamp 到 [−5, 0]。</li>
+      <li><strong>评估动作不是确定性的</strong>：训练后直接跑随机策略看成绩，成功率虚低且不可复现。修复：评估路径取 tanh(μ)；需要采样时固定种子。</li>
+      <li><strong>滤波只加在训练侧</strong>：训练时用滤波器产生了平滑行为，部署时忘了带滤波器，真机动作抖动。修复：滤波参数写进策略的部署配置，训练与部署一致。</li>
+      <li><strong>log-prob 漏掉按维求和</strong>：多维动作的对数概率必须是各维之和；漏掉 <code>.sum(dim=-1)</code> 或误用均值，会让重要性比值的尺度与 clip 语义错位。症状：KL 数值与行为漂移不同步。修复：按 6 节的数值表逐点核对实现。</li>
+      <li><strong>滤波器与动作率惩罚都开大</strong>：两者叠加把相位余量吃穿：2 Hz 任务上 α=0.3 的滤波本身就占 30°，再加一档重惩罚，等效相位损失可越过 45° 的经典余量线，跟踪明显迟钝。修复：α ≥ 0.4、惩罚权重 1%–3%，等效延迟总预算压到 1–2 个控制步。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把 <code>log_std_init</code> 依次设为 −2、−0.5、0，训练同一个 Reach 任务 100 个 update。画出三条回报曲线并解释开局差异来自什么。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>关注"前 20 个 update 的奖励上升速度"与"最终平台高度"两个指标。σ 太大伤早期、太小伤后期。</div></details>
+      </li>
+      <li>故意删掉 log-prob 里的修正项（保留其他不变），训练到收敛。从动作分布的直方图解释你看到的"贴限位"现象。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>把每步动作存下来画直方图（10 个 bin 即可）。修正缺失时，概率密度对 tanh 饱和区的"高密度"没有惩罚，策略会漂向那里。</div></details>
+      </li>
+      <li>实验设计题：只改 <code>delta_scale</code>（0.01 / 0.05 / 0.2），预测并验证它对"收敛步数"和"最终定位误差"的影响。哪个组合可能同时最差？<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>0.2 可能定位误差大（步长大，过冲）；0.01 收敛慢（探索半径小）。想想为什么"0.2 + 无动作率惩罚"通常是最差组合。</div></details>
+      </li>
+      <li>实现一个消融：对比"只有滤波器"、"只有动作率惩罚"、"两者都开"三组策略的抖动指标（相邻步动作差 RMS），给出你的推荐组合并说明理由。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>评价不只抖动，还有成功率。滤波器稳但引入延迟，惩罚不改执行路径却延长训练；两种效应的实证排序才是答案。</div></details>
+      </li>
+      <li>思考题：为什么 SAC 在单环境下的样本效率高，而 PPO 在 4096 并行下总吞吐更强？从"每条 transition 被用了多少次"的角度给出一段定量分析。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>SAC 的 transition 可以进回放缓冲被反复采样（利用率高但受分布漂移限制）；PPO 每条数据只在一轮里用 3–5 次，靠并行环境把"每秒数据量"堆起来。</div></details>
+      </li>
+      <li>用 6 节的方法手算验证：σ=0.3（log_std≈−1.2）、u=2 时高斯项、修正项与合计各是多少？把它与你自己实现输出的 log π 对照，误差应在 1e-3 以内。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>高斯项 = −½(u/σ)² − ln σ − ½ln(2π)；修正项 = ln(1−tanh²u)。重点检查饱和区（|u|≥3）的数值稳定性与误差量级。</div></details>
+      </li>
+      <li>计算题：α 取 0.2 时等效截止频率与 2 Hz 相位损失各是多少？若任务闭环带宽 3 Hz 且已有 1 步执行延迟，总相位预算还剩多少（按 45° 余量线评估）？<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>f<sub>c</sub>=−ln(0.8)/(2π/60)≈2.1 Hz；3 Hz 处相位损失约 55°，加上延迟的 2π·3·(1/60)≈18°，合计已超预算，结论是 α=0.2 对 3 Hz 任务过重。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>连续策略 = 均值网络 + 可学习标准差；采样用重复参数化，评估取确定性均值路径。</li>
+      <li>tanh 压缩必须配 log-prob 雅可比修正（用压缩前的 u），否则梯度有偏、动作贴限位。</li>
+      <li>仿射缩放把 (−1,1) 映射到关节量程；增量语义用"缩放 → 积分 → 限幅"三段式，与第 025 章离散版同构。</li>
+      <li>平滑用低通滤波 + 小权重动作率惩罚双保险；评估端要复现同一套滤波与确定性采样。</li>
+      <li>下一章把动作通路放一放，转向观测的三条模态路线：先是维度最大的那条，基于像素的观察。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch025.html">← 第 025 章：实现动作空间离散化</a>
+    <a class="next" href="ch027.html">第 027 章：实现基于像素的观察 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

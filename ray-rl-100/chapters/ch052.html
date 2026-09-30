@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第052章 RLlib经验回放与优先级采样 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第三篇 · RLlib 算法实现</span>
+    <span class="sep">/</span>
+    <span>第 052 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第三篇 · RLlib 算法实现</div>
+    <h1>第 052 章：RLlib经验回放与优先级采样</h1>
+    <p class="lead">数据复用与偏差校正的平衡术：经验回放（Experience Replay）如何打断样本相关性、优先级采样（Prioritized Sampling）为什么按时序差分误差分配抽取概率、重要性采样权重（Importance Sampling Weight）如何把引入的偏差校正回去。</p>
+    <ul class="meta">
+      <li>主题：RLlib 训练（回放机制）</li>
+      <li>关键机制：优先级、求和树、重要性采样、数据新鲜度</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 051 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解经验回放的两个基础作用：打断样本时间相关性、把单样本的梯度贡献复用多次。</li>
+      <li>掌握优先级采样的概率形式与两种变体（比例式与秩式），能计算个体抽取概率。</li>
+      <li>掌握重要性采样权重的推导直觉与 β 退火策略，理解偏差与方差如何随 β 变化。</li>
+      <li>会配置 RLlib 的优先级回放参数，并诊断"高优先级样本饥饿"与"权重过期"两类故障。</li>
+      <li>能规划回放容量与更新数据比（Update-To-Data Ratio, UTD），在数据新鲜度与复用收益间取舍。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>异策略算法的样本效率来自回放：经验先存储、再抽样、可供多次梯度更新。均匀抽样实现简单，但同样一次抽取，价值估计误差大的转移包含更多学习信息，误差小的转移近乎冗余。优先级采样让"更值得学的样本"被更频繁抽取，把有限的计算预算集中在信息量高的数据上。</p>
+    <p>代价是抽样分布偏离真实分布，梯度估计产生偏差，必须用重要性采样校正。偏差与方差、复用与新鲜度这两对矛盾贯穿本章，也是回放参数配置的全部依据。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p>本节按"为什么回放、抽谁、如何校正、结构如何支撑"四层展开。</p>
+
+    <h3>1. 回放的两个基础作用</h3>
+    <p>在线采样的数据高度相关：连续转移共享同一段轨迹的回报结构，直接顺序训练会让梯度方向被短期模式主导。回放通过随机存取打破这种相关性。同时，同一条转移可被抽取多次，单步采样的计算投入换来多份梯度信号，这就是第 047 章"经验复用次数 k"的来源。<strong>容量、抽样分布与更新频率三者共同决定 k 的取值与数据质量。</strong></p>
+    <p>复用强度可以先做一次换算：每轮写入 2048 条、小批量 256、每轮 4096 次梯度步时，每轮从缓冲区消费约 4096×256≈105 万条样本，消费量与写入量之比约 512。该比值是复用强度的上界参照，单条样本实际被抽中的次数还受容量与淘汰策略影响：容量 50 万、填满周期 244 轮的配置里，一条样本被反复抽取直至被新写入挤出去。复用过低（个位数）时异策略的样本效率优势无从发挥，过高时数据陈旧与过拟合旧分布的风险同步上升，两端的症状分别对应价值学习缓慢与价值目标被旧策略污染。</p>
+
+    <h3>2. 优先级：按时序差分误差分配概率</h3>
+    <p>优先级回放的核心假设是：时序差分误差（Temporal-Difference Error, TD 误差）δ<sub>i</sub> 越大，该转移对价值估计的修正价值越高。比例式优先级把抽取概率写成误差的幂律：</p>
+    <div class="formula">
+      P(i) = p<sub>i</sub><sup>α</sup> / Σ<sub>j</sub> p<sub>j</sub><sup>α</sup> ， p<sub>i</sub> = |δ<sub>i</sub>| + ε
+      <span class="note">α ∈ [0,1] 控制优先级的强度：α=0 退化为均匀抽样，α=1 为完全按误差抽样；ε 防止零误差样本永不被抽</span>
+    </div>
+    <p>秩式变体用排序名次替代误差原值：P(i) ∝ 1 / rank(i)。它对误差的极端值不敏感，即异常大的误差不会垄断采样配额，训练更稳健，代价是丢失了误差之间的相对幅度信息。两类变体的选择经验：<strong>误差分布重尾时用秩式，误差量级稳定时用比例式。</strong></p>
+    <p>新写入缓冲的转移尚无误差记录，标准做法是把它的优先级设为当前最大值，保证新数据至少被抽到一次；否则新数据可能长期沉底，回放退化为陈旧数据集。</p>
+
+    <h3>3. 重要性采样校正与 β 退火</h3>
+    <p>按非均匀分布 P(i) 抽样后，梯度期望不再等于真实期望。重要性采样权重把每条样本的贡献按"被抽到的概率"反向加权：</p>
+    <div class="formula">
+      w<sub>i</sub> = ( 1 / (N · P(i)) )<sup>β</sup> / max<sub>j</sub> w<sub>j</sub> ， 损失使用 w<sub>i</sub> · δ<sub>i</sub><sup>2</sup>
+      <span class="note">β=1 时无偏；β=0 时完全忽略校正。分母的最大值归一化把权重限制在 (0,1]，防止早期梯度被放大</span>
+    </div>
+    <p>β 采用退火（从约 0.4 线性升到 1）：训练早期接受偏差换取低方差，让价值估计快速成型；后期逐步恢复无偏，保证收敛精度。<strong>β 的终点必须到达 1，训练结束时仍在低值意味着算法始终在带偏的梯度上运行。</strong></p>
+
+    <h3>4. 数据结构与系统实现</h3>
+    <p>按优先级抽样需要频繁执行"采样、更新、查询最大优先级"三类操作，用求和树（Sum Tree，一种线段树）把三者都压到 O(log N)：叶子存优先级，内部节点存子树和，采样时按前缀和下降定位。容量 10<sup>6</sup> 时树深约 20，单次操作代价可忽略。RLlib 的优先级回放实现封装了这一结构，用户只需配置参数。</p>
+    <p>最后一个系统参数是容量与新鲜度的平衡：容量过小，缓冲区里几乎全是新数据，复用次数趋于 1，退化为近似同策略；容量过大，早期旧策略产生的数据长期滞留，价值目标被陈旧分布污染。<strong>实用的规划口径是"填满周期"：容量除以每轮迭代写入量，控制在 10 至 50 轮之间。</strong>更新数据比（每轮训练梯度次数与写入样本数之比）与复用次数同向变化，超过 4 以后收益递减且稳定性变差。</p>
+
+    <h3>5. 数值算例：五样本的抽取概率与权重逐项计算</h3>
+    <p>取时序差分误差 [0.1, 0.2, 5.0, 0.05, 0.3]，α=0.5、β=0.4、ε 取 1e-6，逐步计算。第一步开方：五个绝对值开方后为 [0.316, 0.447, 2.236, 0.224, 0.548]，总和 3.771。第二步归一化得抽取概率 [0.084, 0.119, 0.593, 0.059, 0.145]，误差 5.0 的样本抽到概率约 59%，约为均匀抽样 20% 的三倍。第三步按 w=(1/(N·P))<sup>0.4</sup> 计算权重并归一化到批内最大值：</p>
+    <table>
+      <tr><th>样本绝对误差</th><th>抽取概率 P</th><th>重要性权重 w</th><th>校正后有效份额 P×w</th></tr>
+      <tr><td>0.10</td><td>0.084</td><td>0.871</td><td>0.073</td></tr>
+      <tr><td>0.20</td><td>0.119</td><td>0.758</td><td>0.090</td></tr>
+      <tr><td>5.00</td><td>0.593</td><td>0.398</td><td>0.236</td></tr>
+      <tr><td>0.05</td><td>0.059</td><td>1.000</td><td>0.059</td></tr>
+      <tr><td>0.30</td><td>0.145</td><td>0.699</td><td>0.101</td></tr>
+    </table>
+    <p>读表：最高误差样本的抽取概率与权重呈反向关系（0.593 对 0.398），最低误差样本拿到最大权重（1.000），这正是偏差校正的直接展示。把 P×w 作为校正后的有效份额，误差 5.0 的样本仍以约 0.236 的份额领先，但相对 0.593 的原始概率已收缩一半以上；β 越接近 1 收缩越强，该样本的权重会进一步降到 0.100。<strong>校正的力度由 β 控制，权重列与概率列的乘积就是判断力度是否合适的直接读数。</strong></p>
+
+    <h3>6. 有效样本数与 β 的偏差方差交换</h3>
+    <p>用有效样本数 ESS = 1/Σ(ŵ<sub>i</sub>²)（ŵ 为归一化到和为 1 的权重）度量一批权重的集中程度：上面的五样本在 β=0.4 时 ESS≈4.66（满值 5），β=0.7 时约 4.23，β=1.0 时约 3.83。β 升高的过程把偏差校正得更彻底，同时让权重分布更尖锐，等效样本数下降、梯度方差上升。<strong>β 退火的实质是在这条曲线上滑动：早期取 0.4 保方差，后期取 1 保无偏；训练结束仍停在低值，意味着偏差始终没有被校正。</strong></p>
+
+    <h3>7. 容量与填满周期的数值规划</h3>
+    <p>填满周期等于容量除以每轮写入量。三种配置的数值：容量 500000、每轮写 2048 条时约 244 轮；容量 100000、每轮写 4096 条时约 24 轮；容量 200000、每轮写 8192 条时同样约 24 轮。周期由两量之比决定，单独看容量没有意义。规划口径是策略迭代快的任务把周期压到 10 至 50 轮，迭代慢的稀疏奖励任务可放宽到数百轮。容量还要过一遍内存账：观测为 100 维浮点的任务，单条转移约 400 字节，100 万条约 400 MB；观测含 64×64×3 图像帧时单条约 12 KB，100 万条超过 12 GB，图像任务必须压缩观测或按需存储。</p>
+
+    <h3>8. 均匀与优先级的对照实验口径</h3>
+    <p>两种抽样方式的对照实验口径：固定其余参数，只切换优先级开关，比较相同环境步数下的三条曲线（回报、价值损失、低回报样本的抽取频次）。预期差异出现在稀疏奖励任务上：优先级开启后价值损失前期下降更快，回报曲线更早离开平台；密集奖励任务里两者差距落在种子波动以内，此时优先级的额外计算与调参成本不值得引入。判别依据看过误差的分布宽度：样本间 TD 误差相差一个数量级以上时优先级有增益空间，误差普遍接近时 α 的作用被压缩，效果趋近均匀抽样。对照至少跑 3 粒种子，按最差种子的回报做采纳判定。</p>
+
+    <h3>9. 求和树与饥饿的代价核算</h3>
+    <p>求和树的深度：容量 10<sup>6</sup> 时深度为 ⌈log₂10<sup>6</sup>⌉=20，一次抽样与一次优先级回写各经过约 20 个节点；逐条线性扫描需要 10<sup>6</sup> 次比较，单次抽样代价相差约五万倍，这是优先级回放能在线运行的结构前提。饥饿的量化：ε 过小且误差分布集中时，低误差样本的抽取概率可低到 10<sup>−5</sup> 量级，按每轮 2000 次抽样计，期望命中频率为每轮 0.02 次，平均约 50 轮才被抽到一次，训练的有效时间窗口内等于从未被学习。诊断口径用零抽取占比：抽样 1 万次后统计从未被抽到的样本比例，超过总量的一半即判定存在饥饿，处置是增大 ε 或改用秩式优先级。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>回放机制的配置按五步执行。</p>
+    <ol>
+      <li><strong>决定是否启用优先级</strong>：误差分布重尾、低回报样本占比高时收益明显；数据量小或任务简单时均匀抽样足够。</li>
+      <li><strong>设定容量</strong>：按每轮写入量与目标填满周期估算，常见量级 10<sup>5</sup> 至 10<sup>6</sup>。</li>
+      <li><strong>设定优先级参数</strong>：α 取 0.4 至 0.6，ε 取 1e-6 至 1e-3 量级。</li>
+      <li><strong>设定校正参数</strong>：β 从 0.4 退火到 1.0，退火步数与总训练预算对齐。</li>
+      <li><strong>验证</strong>：抽样分布直方图与权重均值两项巡检，确认优先级生效且权重未失真。</li>
+    </ol>
+    <h3>参数表</h3>
+    <table>
+      <tr><th>参数</th><th>典型值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>容量</td><td>1e5–1e6 转移</td><td>数据池规模</td><td>填满周期 10–50 轮</td></tr>
+      <tr><td><code>alpha</code></td><td>0.4–0.6</td><td>优先级强度</td><td>重尾误差取低值或改用秩式</td></tr>
+      <tr><td><code>beta</code> 起点 / 终点</td><td>0.4 → 1.0</td><td>校正强度退火</td><td>终点必须为 1</td></tr>
+      <tr><td><code>epsilon</code></td><td>1e-6–1e-3</td><td>防零优先级饥饿</td><td>误差量级越小取值越接近下界</td></tr>
+      <tr><td>更新数据比 UTD</td><td>1–4</td><td>每样本梯度次数</td><td>超过 4 后收益递减、稳定性下降</td></tr>
+      <tr><td>多步回报 n</td><td>1–3</td><td>价值目标传播速度</td><td>n 越大偏差越大、方差越小</td></tr>
+    </table>
+    <p>参数之间的联动关系要一并核对：α 与 β 同调，α 升高让重尾加剧，β 的退火终点必须保持 1；容量与更新数据比同向，容量很大而更新数据比很低时，数据在池中闲置过期，等于用内存换不来学习；ε 与误差量级匹配，奖励经过归一化后误差被整体缩放，ε 需要按新量级重设，044 章的归一化改动会直接波及该参数。上线前的四项巡检：抽样分布直方图、权重均值漂移、零抽取占比、优先级回写的时间分布，任何一项异常先查对应参数，再动其余配置。</p>
+    <p>与上一章的差异：051 章诊断训练中的数值症状，本章配置产生这些症状的数据侧机制；优先级参数失配的典型表现（价值损失尖峰、低回报样本反复被抽）正是诊断表的输入。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：优先级与重要性权重计算</strong></p>
+    <pre class="code"><code>import numpy as np
+
+def sample_probabilities(td_errors, alpha=0.5, eps=1e-6):
+    """比例式优先级的抽取概率：p_i = (|δ_i| + eps)^alpha 归一化。"""
+    p = (np.abs(td_errors) + eps) ** alpha
+    return p / p.sum()
+
+def importance_weights(probs, beta=0.4, eps=1e-6):
+    """权重 w_i = (1/(N·P_i))^beta，再按最大值归一化到 (0,1]。"""
+    n = len(probs)
+    w = (1.0 / (n * (probs + eps))) ** beta
+    return w / w.max()
+
+td = np.array([0.1, 0.2, 5.0, 0.05, 0.3])
+probs = sample_probabilities(td, alpha=0.5)
+w = importance_weights(probs, beta=0.4)
+for i in range(len(td)):
+    print(f"样本{i} |δ|={td[i]:5.2f} P={probs[i]:.4f} w={w[i]:.4f}")
+# 输出解读：误差 5.0 的样本抽取概率约 59%，但权重被压到 0.40；
+# 这就是"多抽几次、每次少算点"的偏差校正机制</code></pre>
+    <p>解读：逐块说明。<strong>（1）</strong>ε 同时出现在概率与权重两处，作用不同：前者保证零误差样本有非零抽取概率，后者防止权重分母为零。两处的量级要匹配误差的典型幅度。<strong>（2）</strong>权重按批内最大值归一化把缩放限定在 (0,1]，避免早期样本的权重放大梯度；这引入了常数缩放偏差，实践中用学习率调整吸收。<strong>（3）</strong>输出示例可用作教学验证：高误差样本的 P 与 w 呈反向关系，正是偏差校正的直观展示。</p>
+
+    <p><strong>片段 2：RLlib 优先级回放配置</strong></p>
+    <pre class="code"><code>from ray.rllib.algorithms.dqn import DQNConfig
+
+config = (
+    DQNConfig()
+    .environment("SparseRewardArena")
+    .framework("torch")
+    .env_runners(num_env_runners=8, num_envs_per_env_runner=1)
+    .training(
+        train_batch_size=2048,             # 每轮更新的抽样条数
+        lr=5e-4,
+        n_step=3,                          # 多步回报：加速稀疏奖励传播
+        replay_buffer_config={
+            "type": "PrioritizedReplayBuffer",
+            "capacity": 500000,            # 约 10 至 30 轮的写入量
+            "alpha": 0.5,                  # 优先级强度
+            "beta": 0.4,                   # 起始校正强度，随训练退火到 1.0
+            "prioritized_replay_eps": 1e-6,
+        },
+        # 每轮在缓冲区上执行的更新数据比：1 表示每写入一条学一次
+        update_to_data_ratio=1.0,
+    )
+)
+# 注意：不同版本的参数名与默认值不同（如 beta 退火的实现位置），
+# 以对应版本的官方文档为准；启用优先级后必须核对权重是否随训练变化</code></pre>
+    <p>解读：三处设计决策。<strong>（1）</strong>容量 500000 与批次 2048 搭配：按每轮写入 2048 条计，填满周期约 244 轮，偏大，适合策略改进较慢的稀疏奖励任务；若任务策略迭代快，应缩小到几十轮的写入量。<strong>（2）</strong><code>n_step=3</code> 与优先级是互补的：多步回报加快稀疏奖励的价值传播，优先级让高误差样本多学，两者同时使用在稀疏任务中常见。<strong>（3）</strong>注释强调版本差异与核对动作：启用优先级后比较权重均值随训练的漂移，缺少漂移通常意味着退火未生效或优先级未更新。</p>
+
+    <p><strong>片段 3：运行期巡检：分布与饥饿检查</strong></p>
+    <pre class="code"><code>def audit_replay(buffer, n_draw=10000):
+    """两项巡检：抽样分布是否随误差倾斜、是否出现饥饿。"""
+    stats = buffer.get_sampling_statistics() if hasattr(buffer, "get_sampling_statistics") else None
+    if stats is None:
+        # 退化路径：手工抽样并统计频次（仅用于小规模诊断）
+        import numpy as np
+        counts = np.zeros(buffer.size, dtype=np.int64)
+        for _ in range(n_draw):
+            _, idx = buffer.sample_with_index() if hasattr(buffer, "sample_with_index") else (None, None)
+            if idx is None:
+                break
+            counts[idx] += 1
+        unseen = int((counts == 0).sum())
+        print(f"抽样 {n_draw} 次，未被抽到的样本: {unseen}/{buffer.size}")
+        # 大量样本零抽取 + 容量接近上限：检查 eps 是否过小
+        if unseen &gt; 0.5 * buffer.size:
+            print("提示：可能存在优先级饥饿，调大 epsilon 或改用秩式优先级")
+    return stats
+
+# 权重均值监控：beta 退火正常时，训练中期权重均值应缓慢上升
+# w_mean = float(torch.mean(batch["weights"]))  # 从抽样批次读取
+# 记录进指标面板，与 051 章的解释方差联合观察</code></pre>
+    <p>解读：逐块说明。<strong>（1）</strong>饥饿检测的判据是"零抽取样本占比"：超过一半样本从未被抽到，且剔除尚未见过的旧数据占用量后仍偏高，说明 ε 太小或误差分布过于集中。<strong>（2）</strong>权重均值是 β 退火的直接观察量：退火正常时它随训练上升，若长期不变，先查退火实现再查配置。<strong>（3）</strong>手工抽样路径仅用于小规模诊断，演示"用可观测行为验证内部机制"的方法，大规模运行时用框架自带统计接口。</p>
+    <p>回写优先级的纪律要写进训练循环：抽样时记录每条样本的索引，反向传播后立即用新的 TD 误差回写，中间不做批内重排；漏写或改错索引会得到"优先级永远停留在入池时刻"的静默故障。巡检办法是导出缓冲区优先级的直方图，正常训练中它随策略改进缓慢移动，长期纹丝不动就是回写链路断开的信号。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>β 未退火或未到达 1</strong>：训练全程在带偏梯度上运行，收敛精度受损。修复：把退火步数与总预算对齐，训练结束时核对 β 轨迹。</li>
+      <li><strong>ε 过小导致饥饿</strong>：低误差样本永不更新，价值网络在这些状态上停滞。修复：增大 ε 或改用秩式优先级，用片段 3 的零抽取占比验证。</li>
+      <li><strong>训练后未回写优先级</strong>：抽样后新的 TD 误差没有更新回缓冲区，优先级永远停留在写入时刻。修复：确认训练循环回写误差，监控优先级分布随时间的变化。</li>
+      <li><strong>新样本优先级初始化错误</strong>：新数据以零或小优先级入池，长期不被抽到，缓冲区退化为陈旧数据集。修复：新样本以当前最大优先级入池。</li>
+      <li><strong>容量与更新比例失衡</strong>：容量巨大且 UTD 很低，数据复用不足却占用大量内存。修复：按填满周期规划容量，或提高更新比例让数据物尽其用。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>计算：五个样本的 |δ| 为 [0.1, 0.2, 5.0, 0.05, 0.3]，α=0.5、ε=1e-6，写出各样本的抽取概率，并与片段 1 的输出对照。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>先对每个误差开平方，得到 [0.316, 0.447, 2.236, 0.224, 0.548]，总和 3.771；最大误差样本的平方根 2.236 除以总和约 59%，其余四个样本合计约 41%。</div></details>
+      </li>
+      <li>推导：均匀抽样下 w<sub>i</sub> 恒为 1；非均匀抽样下说明 β=1 时梯度期望无偏，β=0 时偏差最大，并解释为什么实践中从 β=0.4 开始。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>无偏性要求 E[w<sub>i</sub>·f(i)] = Σ f(i)/N；代入 w 定义即可验证 β=1。早期高方差样本少，先降方差后逐步恢复无偏是稳定性考虑。</div></details>
+      </li>
+      <li>把 α 从 0.5 改为 0 与 1.0，预测价值损失曲线、低回报样本被抽取的比例与训练稳定性三个量的变化方向，设计对照实验。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>α=0 退化为均匀抽样，低频高价值样本学习慢；α=1 抽取消偏差最大但方差高。对照实验固定其余参数，比较相同步数下的回报。</div></details>
+      </li>
+      <li>推算容量：每轮采样 4096 条、目标填满周期 20 轮，容量应设为多少？若任务改为策略快速迭代型，填满周期该取多少并说明理由。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>4096×20 ≈ 82000，取 1e5 量级；快速迭代型策略的旧数据迅速过时，填满周期缩短到 5 至 10 轮以内。</div></details>
+      </li>
+      <li>解释求和树为什么能把"按优先级抽样"从 O(N) 降到 O(log N)，画出三层求和树的示意结构并标注一次抽样经过的节点数。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>每个内部节点存子树优先级之和，抽样时以 [0, 总和) 的随机数从根下行；三层树定位叶子的路径长度为 3，即 O(log N)。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>回放打断样本相关性并提供数据复用，复用次数由容量、抽样分布与更新频率共同决定。</li>
+      <li>优先级采样按 TD 误差的幂律分配抽取概率，α 控制强度，ε 防止饥饿，新样本以最大优先级入池。</li>
+      <li>重要性采样权重把非均匀抽取的偏差校正回来，β 从 0.4 退火到 1，终点必须到达。</li>
+      <li>求和树是优先级回放的标准数据结构，采样、更新、查询最大优先级均为对数复杂度。</li>
+      <li>容量按填满周期 10 至 50 轮规划，更新数据比超过 4 后收益递减。</li>
+      <li>下一章处理回放数据上的另一个时间尺度问题：目标网络与更新节奏，价值目标的稳定性如何通过延迟更新获得。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch051.html">← 第 051 章：RLlib训练稳定性诊断</a>
+    <a class="next" href="ch053.html">第 053 章：RLlib目标网络与更新节奏 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

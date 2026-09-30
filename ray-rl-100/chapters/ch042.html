@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第042章 RLlib实现AlphaZero风格算法 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第三篇 · RLlib 算法实现</span>
+    <span class="sep">/</span>
+    <span>第 042 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第三篇 · RLlib 算法实现</div>
+    <h1>第 042 章：RLlib实现AlphaZero风格算法</h1>
+    <p class="lead">搜索与学习互相成就：蒙特卡洛树搜索（Monte Carlo Tree Search, MCTS）如何用策略价值网络的先验替代均匀探索、访问计数如何蒸馏回网络参数、自博弈（Self-play）回路为什么需要缓冲区与竞技场两道闸门。</p>
+    <ul class="meta">
+      <li>主题：RLlib 训练（搜索增强型算法）</li>
+      <li>关键机制：PUCT 选择、访问计数蒸馏、自博弈数据回路</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 041 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解 AlphaZero 风格算法的三段结构：网络引导的搜索、访问计数蒸馏、自博弈数据回路。</li>
+      <li>掌握 PUCT 选择公式中先验项与探索项各自的数学作用，以及根节点狄利克雷（Dirichlet）噪声的动机。</li>
+      <li>掌握温度参数（Temperature）对策略目标分布的影响，能设计退火计划。</li>
+      <li>会在 RLlib 中通过多智能体映射与自定义回环组织自博弈训练，理解为什么该算法没有现成内置实现。</li>
+      <li>能规划模拟次数、缓冲区容量、竞技场评估阈值三类参数，并说明其与训练成本的量化关系。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>标准策略梯度方法直接学习"状态到动作分布"的映射，在搜索树分支极多的对弈任务里，每一步都被迫在没有前瞻的情况下选择动作，样本效率低下。AlphaZero 风格的算法把搜索嵌入学习回路：搜索借助网络先验减少无效展开，网络又借助搜索产生的更优动作分布得到改进，两者互相增强。</p>
+    <p>RLlib 内置算法集中于无搜索的策略优化，AlphaZero 风格需要自行组装。本章讲透其数学结构，并给出在 RLlib 框架内落地的最小骨架，重点是"为什么这样组织"，完整系统的复现不在本章范围。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p>本节按数据流顺序拆解算法：一次模拟如何选择、目标如何构造、回路如何闭合。</p>
+
+    <h3>1. 网络的两个输出与搜索的两个用途</h3>
+    <p>策略价值网络的输入是状态，输出两部分：动作先验 P(s,·) 与状态价值 v(s)。搜索过程对两部分的使用方向相反：<strong>先验 P 用于"选择向何处展开"</strong>（把模拟预算花在更可能的好着法上），<strong>价值 v 用于"判断叶节点好坏"</strong>（替代到终局的完整模拟）。搜索结束后，根节点各子动作的访问计数 N(s,a) 就是一份比网络原始先验更可靠的策略，这正是蒸馏信号的来源。</p>
+
+    <h3>2. PUCT 选择：先验与探索的加权和</h3>
+    <p>模拟从根节点下行时，每个节点按 PUCT 分数选择子动作：</p>
+    <div class="formula">
+      U(s, a) = Q(s, a) + c<sub>puct</sub> · P(s, a) · √( Σ<sub>b</sub> N(s, b) ) / ( 1 + N(s, a) )
+      <span class="note">Q(s,a) 为该动作的平均回传价值；先验项随父节点访问总量增长而增大，随自身访问次数衰减，实现"探索一次即降权"</span>
+    </div>
+    <p>公式里藏着两条设计意图。<strong>（1）</strong>当某动作从未被访问（N=0），先验项取最大值、Q 项为零，网络认为有希望的分支优先获得尝试机会。<strong>（2）</strong>随父节点总访问量上升，未充分尝试的动作的探索权重递增，搜索不会过早锁死在单一分支上。系数 c<sub>puct</sub> 控制探索强度，对弈任务常用 1.5 至 2.5。</p>
+    <p>根节点处还会向先验注入狄利克雷噪声：P′(s,·) = (1−ε)·P(s,·) + ε·Dir(α)。训练期的自博弈需要足够的落子多样性，否则搜索反复选择同一条主变，数据分布塌缩到单一路径；评估期关闭噪声，取确定性强着。</p>
+
+    <h3>3. 目标构造：计数蒸馏与结果回传</h3>
+    <p>一局结束后，每个时间步 t 生成一条训练样本：搜索结束的根节点访问计数构成策略目标 π<sub>t</sub>(a) ∝ N(s<sub>t</sub>, a)<sup>1/τ</sup>，价值目标是该局结果 z ∈ {+1, −1}（或引入折扣回传的多步目标）。网络损失为三项之和：</p>
+    <div class="formula">
+      L = − Σ<sub>a</sub> π<sub>t</sub>(a) · log p<sub>θ</sub>(a | s<sub>t</sub>) + ( z − v<sub>θ</sub>(s<sub>t</sub>) )² + c · ‖θ‖²
+      <span class="note">第一项为交叉熵策略蒸馏，第二项为价值回归，第三项仅做示意；温度 τ 控制 π 的尖锐程度</span>
+    </div>
+    <p>温度的行为需要精确理解：τ=1 时目标正比于访问计数，保留搜索的探索分布；τ→0 时目标退化为访问量最大的单点分布，用于强着法。训练早期用高温（如 1.0）保证样本多样，随训练推进或对局步数增长线性降温到接近零，这是标准做法。</p>
+
+    <h3>4. 自博弈回路：三个部件与两道闸门</h3>
+    <p>自博弈指当前网络同时执黑白两方对局，把对局数据写入回放缓冲（Replay Buffer），再用缓冲区数据训练网络，形成闭环。回路中必须设置两道闸门：</p>
+    <ul>
+      <li><strong>数据闸门（缓冲区窗口）</strong>：只保留最近若干局数据。网络迭代若干次后，早期数据对应的策略分布已过时，继续训练会把网络拉向旧分布；窗口大小需要与每轮迭代的数据产出量匹配。</li>
+      <li><strong>版本闸门（竞技场评估）</strong>：新网络与基准网络对弈若干局，胜率超过阈值（如 0.55）才将其设为新的数据生成网络，防止一次糟糕更新污染后续所有数据。评估必须关闭根节点噪声与温度退火，保证结果可复现。</li>
+    </ul>
+    <p>从 RLlib 的视角看，自博弈就是上一章"学习者对固定对手"的演进：数据生成网络固定在样本收集路径上，训练更新其副本，竞技场通过后交换角色。<strong>映射函数在此承担对手生成器的职责，两方映射到同一策略集合的不同成员。</strong></p>
+
+    <h3>5. 数值算例：竞技场判定与搜索成本</h3>
+    <p>竞技场的判定本质是一次二项检验。200 局、胜率阈值 55%（即至少 110 胜）时，观测胜率的标准差约 3.5%。真实胜率 50% 的网络偶然过线的概率约 8.9%；真实胜率 53% 的网络过线概率约 31.0%；真实胜率 57.5% 的网络过线概率约 78.5%。这组数字揭示版本闸门的两类错误：阈值 0.55 对 53% 水平的网络放行概率不低，而 57.5% 的网络仍有约两成概率被拦下。降低误判的标准手段是加局数：局数升到 800 时标准差减半、判别力提高，代价是评估耗时同步上升。</p>
+    <table>
+      <tr><th>真实胜率</th><th>200 局下过线概率（阈值 55%）</th><th>含义</th></tr>
+      <tr><td>50%</td><td>约 8.9%</td><td>虚警率</td></tr>
+      <tr><td>53%</td><td>约 31.0%</td><td>弱优势被判过线的概率不低</td></tr>
+      <tr><td>57.5%</td><td>约 78.5%</td><td>约两成漏判</td></tr>
+    </table>
+    <p>搜索成本同样要算：每步 200 次模拟、对局 60 步时，单局需要 1.2 万次网络前向；单次前向 2 毫秒时单局约 24 秒，评估期用 800 次模拟时升到约 96 秒。自博弈的数据产出速率由此被搜索预算锁定，训练批次的供给节奏与模拟次数直接挂钩；把训练期模拟次数压到评估期的一半以内，是控制采样占比的常用手段。批量并行搜索时还要注意虚拟损失（virtual loss）：同一批并发线程需要临时下调已选中路径的分数，否则多个线程反复撞进同一条主变，模拟预算被重复消耗。</p>
+
+    <h3>6. 边界与失效模式</h3>
+    <p>终局语义的边界有三种要区分：一方获胜（±1）、和棋（0）、达到步数上限判和（0）。胜负符号只对取胜方取正；和棋样本的价值目标取零，若错误地按"最后行动者取正"处理，网络会把和棋学成胜负，评估胜率随之扭曲。</p>
+    <p>循环局面的边界在规则层：对弈状态可能重复出现（双方来回走子），搜索若不做局面去重（置换表）会被无意义分支吞掉模拟预算；规则层若有重复判和条款，环境的终止逻辑必须实现它，否则自博弈数据里会出现大量重复状态的样本。</p>
+    <p>推理吞吐的边界在搜索与网络的耦合方式：搜索是串行的树推进，网络是批量的张量运算，两者节奏不匹配时设备利用率被单线程拖低。缓解手段是把一次模拟内的多次前向合并成批（树并行），或用统一的推理服务进程承接前向请求，代价是同步与延迟管理复杂度上升。</p>
+
+    <h3>7. 数值算例：温度缩放与噪声强度</h3>
+    <p>用访问计数 [8, 4, 2, 1] 演算温度的作用。τ = 1 时目标与计数成正比，权重为 [0.533, 0.267, 0.133, 0.067]；τ = 0.5 时权重取计数的平方，变为 [0.753, 0.188, 0.047, 0.012]，次优动作的采样概率从 0.267 降到 0.188；τ = 0.25 时权重取计数的四次方，首动作占比升到 0.938，其余动作接近被放弃。退火计划（对局前段 τ = 1，后段 τ = 0.1 或直接取最大）的作用，就是把训练数据的多样性限定在前段。</p>
+    <table>
+      <tr><th>温度 τ</th><th>动作一权重</th><th>动作二权重</th><th>动作三权重</th><th>动作四权重</th></tr>
+      <tr><td>1.0</td><td>0.533</td><td>0.267</td><td>0.133</td><td>0.067</td></tr>
+      <tr><td>0.5</td><td>0.753</td><td>0.188</td><td>0.047</td><td>0.012</td></tr>
+      <tr><td>0.25</td><td>0.938</td><td>0.059</td><td>0.004</td><td>0.000</td></tr>
+    </table>
+    <p>狄利克雷噪声的典型强度也可估计：7 个动作、α = 0.3 时，噪声分布的最大分量平均约 0.55，约 81% 的采样会把某个动作的噪声分量推到 0.4 以上；经 ε = 0.25 混合后，一个原本均匀的先验（约 0.143）会被典型抬升到约 0.24 的级别。噪声过小则主变单一、数据塌缩；过大则先验被淹没、搜索退化为随机试探，α 与 ε 的取值就是在这两端之间找落点。</p>
+
+    <h3>8. 探索结构的对照</h3>
+    <table>
+      <tr><th>搜索变体</th><th>选择依据</th><th>数据多样性</th><th>样本效率</th><th>失效形态</th></tr>
+      <tr><td>均匀蒙特卡洛树搜索</td><td>访问次数</td><td>高</td><td>低，预算摊薄在弱分支</td><td>收敛慢</td></tr>
+      <tr><td>先验引导（PUCT）</td><td>Q 值与先验加权</td><td>中</td><td>高</td><td>先验偏差被放大、主变单一</td></tr>
+      <tr><td>PUCT 加根噪声</td><td>先验受噪声扰动</td><td>高</td><td>高</td><td>噪声过大时棋力下降</td></tr>
+    </table>
+    <p>对照的读法：三种变体的差别只在探索项的信息来源与扰动方式，训练目标与蒸馏机制不变；结构升级的顺序是从均匀起步，加入先验，再加入噪声与退火，每一步都用竞技场胜率验证收益，负收益的组件回退，升级过程本身留在完整的对照记录里。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>在 RLlib 中实现该算法的最小路径分四步。</p>
+    <ol>
+      <li><strong>把搜索封装进策略决策路径</strong>：每一步动作由 MCTS 给出，搜索使用网络推理。落地方式是把搜索作为策略类的方法（自定义策略的 <code>compute_actions</code> 内调用搜索），网络参数由 RLlib 管理，训练时复用同一策略对象做批量前向。</li>
+      <li><strong>用多智能体接口组织对局双方</strong>：两个玩家各为一个 agent，映射到"数据生成"与"基准"两份策略；数据生成策略的更新通过参数同步完成，基准策略保持冻结。</li>
+      <li><strong>在样本后处理中构造监督目标</strong>：搜索产生的计数目标写入样本批次，作为策略蒸馏项与价值回归项的标签，替换标准策略梯度的优势估计。</li>
+      <li><strong>组装训练回环</strong>：采集若干局 → 训练若干个 mini-batch → 竞技场评估 → 达标后同步参数并清空旧数据。</li>
+    </ol>
+    <h3>关键参数表</h3>
+    <table>
+      <tr><th>参数</th><th>典型值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>每步模拟次数</td><td>200–800</td><td>搜索强度与延迟的杠杆</td><td>动作预算允许时取大值；训练期与评估期可不同</td></tr>
+      <tr><td><code>c_puct</code></td><td>1.5–2.5</td><td>探索强度</td><td>先验网络越准可取越小</td></tr>
+      <tr><td>根噪声 α</td><td>0.3（ε 0.25）</td><td>自博弈多样性</td><td>分支数越多取越大</td></tr>
+      <tr><td>温度 τ</td><td>1.0 → 0.1</td><td>策略目标尖锐度</td><td>前若干步高温，之后退火</td></tr>
+      <tr><td>缓冲区容量</td><td>50k–500k 局面</td><td>控制数据新鲜度</td><td>约等于最近 10–50 轮迭代的产出</td></tr>
+      <tr><td>竞技场局数</td><td>100–400</td><td>评估置信度</td><td>胜率阈值 0.55 时局数越多误判越少</td></tr>
+    </table>
+    <p>与上一章的差异：041 章的策略映射只做数据分派，本章映射同时承担"对手生成"；训练目标从策略梯度切换为监督式蒸馏加价值回归，算法整体进入"自产数据、自我蒸馏"的闭环。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：PUCT 选择与一次模拟的主循环</strong></p>
+    <pre class="code"><code>import math
+
+def puct_select(node, c_puct=2.0):
+    """在节点内选择一个子动作：Q 均值 + 先验加权的探索项。"""
+    best, best_score = None, -float("inf")
+    for action, child in node.children.items():
+        # Q 在首次访问时定义为 0，先验项占主导，保证未见过的分支被尝试
+        q = child.value_sum / child.n if child.n &gt; 0 else 0.0
+        # 先验项：父访问总量开方后乘以先验，除以自身访问数实现探索衰减
+        u = c_puct * node.prior[action] * math.sqrt(node.n) / (1 + child.n)
+        score = q + u
+        if score &gt; best_score:
+            best, best_score = action, score
+    return best
+
+def simulate(root, model, depth=60):
+    """一次模拟：下行选择、叶节点估值、回传。"""
+    node, path = root, []
+    while node.children:                       # 已展开的内部节点继续下行
+        action = puct_select(node)
+        path.append((node, action))
+        node = node.children[action]
+    value = node.terminal_value if node.terminal else model.predict_value(node.state)
+    for parent, action in reversed(path):      # 自底向上回传，符号随换手翻转
+        parent.children[action].n += 1
+        parent.children[action].value_sum += value
+        value = -value                          # 视角交替：对手的好即自己的坏
+    root.n += 1</code></pre>
+    <p>解读：这段代码包含 PUCT 实现中最容易出错的三个细节。<strong>（1）</strong>Q 的未访问默认值取 0：若取负无穷，先验项永远被压制，搜索退化为广度遍历；取 0 与"价值在零附近的对称对局"直觉一致。<strong>（2）</strong>探索项分母用 <code>1 + n</code>：未访问时退化为常数，避免除零并使首次选择完全由先验决定；改用 <code>n</code> 作分母会在首访时除零。<strong>（3）</strong>回传时价值取负号：节点价值以"轮到谁行动"的视角存储，沿路径逐层翻转符号，这正是双人零和博弈的标准约定，漏掉翻转会让网络学到相反的胜负观。</p>
+
+    <p><strong>片段 2：从访问计数构造训练目标</strong></p>
+    <pre class="code"><code>import numpy as np
+
+def make_training_targets(root, outcome, temperature=1.0):
+    """把一局中某一步的搜索结果转成监督标签。
+    root 为该步搜索树根，outcome 为局终结果（当前玩家视角 +1 / -1）。"""
+    counts = np.array([root.children[a].n for a in range(root.n_actions)], dtype=np.float64)
+    if temperature &lt; 1e-3:
+        pi = np.zeros_like(counts)              # 退火到极限：单点分布
+        pi[int(np.argmax(counts))] = 1.0
+    else:
+        weights = counts ** (1.0 / temperature) # 高温保留搜索的探索分布
+        pi = weights / weights.sum()
+    # 价值目标用局终结果；若用多步回传目标，需按折扣逐步替换 outcome
+    return {"policy_target": pi.astype(np.float32), "value_target": float(outcome)}
+
+def self_play_game(env, net, temperature_steps=15, n_sim=400):
+    """网络对自身下一整局，逐步保存（状态，搜索目标）。"""
+    trajectory, state = [], env.reset()
+    while True:
+        root = build_tree(env, state, net)      # 根节点注入狄利克雷噪声
+        for _ in range(n_sim):
+            simulate(root, net)
+        tau = 1.0 if len(trajectory) &lt; temperature_steps else 0.1
+        target = make_training_targets(root, 0.0, tau)
+        action = np.random.choice(len(target["policy_target"]), p=target["policy_target"])
+        trajectory.append((state, target))
+        state, _, done, info = env.step(action)
+        if done:
+            z = info["winner_sign"]             # 以最后行动者视角的胜负符号
+            for idx in range(len(trajectory)):
+                # 偶数步属于同一方；胜负符号按步数奇偶翻转成"该步玩家视角"
+                trajectory[idx][1]["value_target"] = z * (1 if idx % 2 == 0 else -1)
+            break
+    return trajectory</code></pre>
+    <p>解读：逐块说明设计意图。<strong>（1）</strong>温度分支处理两种模式：退火后取最大访问动作，训练早期按 <code>counts^(1/τ)</code> 采样，让对局覆盖不同分支。<strong>（2）</strong>动作从目标分布中采样以保留训练期数据多样性；评估期应改为确定性取最大。<strong>（3）</strong>胜负符号按步数奇偶翻转，把统一的局终结果改写成每一步行动者的视角，与片段 1 的回传符号约定保持一致。<strong>（4）</strong>轨迹先收集完后统一写标签，因为局终结果只在结束时可知。</p>
+
+    <p><strong>片段 3：RLlib 中的自博弈回环骨架</strong></p>
+    <pre class="code"><code>from ray.rllib.algorithms.ppo import PPOConfig
+
+# 自博弈的两个角色：generator 产出对局数据，baseline 冻结用于评估
+def self_play_mapping(agent_id, episode, worker=None, **kwargs):
+    return "generator" if agent_id == "player_0" else "baseline"
+
+config = (
+    PPOConfig()
+    .environment("ConnectFourLike")
+    .framework("torch")
+    .multi_agent(
+        policies={"generator", "baseline"},
+        policy_mapping_fn=self_play_mapping,
+        policies_to_train=["generator"],     # 基准冻结：角色由训练名单区分
+    )
+)
+
+def train_loop(algo, arena_games=200, win_threshold=0.55, sync_every=5):
+    for it in range(50):
+        for _ in range(20):                      # 每轮产出 20 局自博弈数据
+            gen_one_episode(algo, anneal_temperature=it &gt; 10)
+        algo.train()                             # 用缓冲区数据更新 generator
+        if it % sync_every == 0:
+            win_rate = arena(algo, games=arena_games, noise=False)
+            # 胜率过线才同步：防止一次坏更新污染后续全部自博弈数据
+            if win_rate &gt; win_threshold:
+                algo.get_policy("baseline").set_weights(
+                    algo.get_policy("generator").get_weights())
+    return algo</code></pre>
+    <p>解读：这段骨架演示 RLlib 组织自博弈的三个关键动作。<strong>（1）</strong>用两份策略区分"产数据"与"评估"角色，<code>policies_to_train</code> 只含生成方，基准方参数被冻结。<strong>（2）</strong>温度退火由训练轮次驱动，前 10 轮高温保多样性，之后转为确定性策略。<strong>（3）</strong>竞技场结果决定参数同步时机，这是版本闸门的实现。接口随版本演进，策略权重存取与算法 API 以对应版本的官方文档为准。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>价值符号体系不统一</strong>：搜索回传用"当前行动者视角"，训练标签用"绝对视角"，网络学出相反胜负观，表现为训练损失不降且对弈胜率长期在 50% 附近。修复：全程统一为"行动者视角"，写一个函数集中处理符号翻转。</li>
+      <li><strong>搜索成本失控</strong>：每步模拟 800 次加网络前向，单局数据产出耗时远超训练耗时，采样成为瓶颈。修复：训练期降低模拟次数（如 200），评估期再用高次数；网络推理批量并行。</li>
+      <li><strong>温度未退火</strong>：对局后期仍按访问分布采样，强着法被稀释放大，棋力停滞。修复：按步数或训练轮次双条件退火，末期取确定性动作。</li>
+      <li><strong>缓冲区不设窗口</strong>：全部历史数据永久保留，网络被旧策略分布持续牵制。修复：按最近 10–50 轮的数据量设定容量上限，或按胜率闸门通过时清空。</li>
+      <li><strong>评估时残留探索噪声</strong>：竞技场未关闭根噪声与采样，胜率波动大，误判频发。修复：评估路径使用独立的确定性搜索入口。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把片段 1 的模拟次数从 200 提高到 800，预测三件事：单步延迟、对局棋力、单位样本成本。给出验证方案。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>延迟约线性增长；棋力先升后缓，边际收益递减；单位样本成本随模拟次数线性上升。用固定网络、固定局面做离线对照最干净。</div></details>
+      </li>
+      <li>推导：当某父节点只有一个子动作未访问、其余均被访问过，证明 PUCT 中该子动作的 U 项随父节点总访问量单调递增。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>U = c·P·√N_parent/(1+0)，分母恒为 1，直接对 N_parent 求导即可证明导数恒正，这条性质保证未探索分支不会被永久忽略。</div></details>
+      </li>
+      <li>设计竞技场协议：给出局数、先后手分配方式、胜率阈值、平局处理规则，并估算把"真实胜率 53% 的网络误判为过线"的概率量级。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>双方各执先手一半局数以抵消先手优势；平局计半胜；用二项分布的标准差 σ=√(0.25/G) 估算，G=200 时 σ≈3.5%，阈值 55% 距离约 0.5σ 至 1σ，误判并不罕见，故应增大局数或提高阈值。</div></details>
+      </li>
+      <li>解释为什么自博弈中"数据生成网络"与"被训练网络"必须解耦成两份策略参数，若直接用同一份参数在线更新会发生什么。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>训练中的分布偏移会立即反映到数据生成上，回路失去稳定性；解耦后旧策略为数据提供了短时程的平稳参照，缓冲区与闸门才有意义。</div></details>
+      </li>
+      <li>把片段 3 的同步周期从 5 轮改为 1 轮与 20 轮，分别预测数据新鲜度、训练稳定性与吞吐的变化，设计对照实验。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>同步越频繁数据越新但闸门失去了过滤作用，坏更新立刻进入回路；过疏则数据陈旧。对照实验固定总采样量，比较不同周期下的胜率曲线。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>AlphaZero 风格算法的三段结构：网络引导搜索、访问计数蒸馏、自博弈数据回路。</li>
+      <li>PUCT 用 Q 均值负责利用、先验加权项负责探索，根节点狄利克雷噪声保证自博弈的落子多样性。</li>
+      <li>策略目标来自访问计数的温度缩放，价值目标来自局终结果并统一到行动者视角，两者共同构成监督损失。</li>
+      <li>回路稳定依赖两道闸门：缓冲区窗口控制数据新鲜度，竞技场阈值过滤坏更新。</li>
+      <li>RLlib 没有内置该算法，落地路径是自定义策略封装搜索、多智能体映射组织双方、样本后处理构造标签。</li>
+      <li>下一章回到通用训练议题：自定义探索策略，把本章的噪声与温度思想推广到连续动作与无搜索任务。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch041.html">← 第 041 章：RLlib实现MARL算法</a>
+    <a class="next" href="ch043.html">第 043 章：RLlib自定义探索策略 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第093章 世界模型的动态注意力 | 具身智能学习课程 · VLA 与世界模型联合训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第五篇 · 系统集成与研究实践</span>
+    <span class="sep">/</span>
+    <span>第 093 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第五篇 · 系统集成与研究实践</div>
+    <h1>第 093 章：世界模型的动态注意力</h1>
+    <p class="lead">长历史的二次方注意力成本如何压回线性：top-k 稀疏选择、惊喜门控的关键帧记忆与自适应深度的组合设计。</p>
+    <ul class="meta">
+      <li>主题：世界模型（World Model）/ 动态注意力（dynamic attention）</li>
+      <li>关键公式：稀疏注意力复杂度 O(T·k·d) 与惊喜写入判据</li>
+      <li>预计学时：50 分钟</li>
+      <li>前置章节：第 092 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解世界模型消费长历史时注意力的成本结构，区分空间稀疏与时间稀疏两类动态策略。</li>
+      <li>掌握 top-k 稀疏注意力的实现，理解训练期软化与推理期硬化之间的衔接问题。</li>
+      <li>掌握惊喜门控（surprise gating）的关键帧写入与内容寻址检索，理解记忆槽淘汰与陈旧问题。</li>
+      <li>会设计自适应深度门控，用平均深度预算约束计算量并监控早退带来的误差。</li>
+      <li>能诊断近因偏置、门控误判与记忆陈旧三类动态注意力故障。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p><strong>世界模型要预测下一步，所需历史未必均匀分布：多数帧信息冗余，少数关键帧决定走向。</strong>把数百帧全部送入全注意力，计算量随帧数平方增长，显存与延迟都难以承受；而随机丢弃帧又会破坏时序连续性。动态注意力的思路是让计算跟着信息量走：相关处密集计算，无关处快速跳过。</p>
+    <p>第 066 章的记忆增强给出了"带外部记忆的模型"框架，本章细化动态调度的三类机制：token 级选择（top-k 稀疏注意力）、帧级写入判据（惊喜门控）、层级别跳过（自适应深度）。三者都是同一思想的实例：用轻量信号估计信息价值，把计算预算集中到高价值位置。工程目标是让世界模型的单步推理延迟稳定在控制预算内，同时不损失关键历史的信息。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <p><strong>动态注意力的设计围绕"信息价值估计"展开：讨论算空间选择、按惊喜选择时间、按复杂度选择深度。</strong></p>
+
+    <h3>1. 稀疏注意力的成本与选择</h3>
+    <p>全注意力对 T 个位置计算 T×T 相似度矩阵，复杂度 O(T<sup>2</sup>d)。top-k 稀疏注意力只保留每个查询最相关的 k 个键：</p>
+    <div class="formula">
+      O(T<sup>2</sup>d) → O(T·k·d)，k 远小于 T 时成本近似线性
+      <span class="note">T = 256、k = 32 时，注意力核心计算量约降为原来的 1/8</span>
+    </div>
+    <p>代价有两处：相似度矩阵本身仍需 O(T<sup>2</sup>) 计算以选出 top-k（可先降维再选择缓解）；top-k 选择不可微，训练需要软化技巧。<strong>常用折中</strong>：训练时对全部键计算注意力并施加稀疏正则（例如熵惩罚鼓励分布集中），推理时切换硬 top-k；或用直通估计让梯度穿过选择操作。选择质量依赖查询与键的相似度语义，断点在于"相关性"与"因果重要性"并不总一致，位置信息与时间衰减项常需要显式加入打分。</p>
+
+    <h3>2. 惊喜门控与关键帧记忆</h3>
+    <p>帧级稀疏用惊喜（surprise）度量决定写入：用已训练的一步预测器估计下一潜状态，预测误差即惊喜：</p>
+    <div class="formula">
+      s<sub>t</sub> = ‖ z<sub>t</sub> − ẑ<sub>t</sub> ‖，s<sub>t</sub> 大于阈值时把 z<sub>t</sub> 写入记忆槽
+      <span class="note">ẑ<sub>t</sub> 为转移核基于历史给出的预测；阈值按分位数标定</span>
+    </div>
+    <p>直觉：预测得准的帧信息已被模型内化，可以丢弃；预测误差大的帧包含新信息（意外接触、目标被移动），值得保存。读取时按内容相似度检索：当前查询与记忆键做相似度排序，取 top-k 参与注意力。记忆槽固定（例如 64 个），写入采用环形替换，<strong>陈旧槽需要管理</strong>：长期未被读取的槽与远期任务的关联弱，可加权淘汰；新写入只占一个槽，防止单次异常写满记忆。</p>
+
+    <h3>3. 自适应深度</h3>
+    <p>帧间难度差异同样显著：静止场景用浅层即可预测，高速运动与遮挡恢复需要深层推理。层跳过门控输出进入深层的概率 p，按 p 加权组合浅层与深层输出：</p>
+    <div class="formula">
+      h<sub>out</sub> = ( 1 − p ) · h<sub>浅</sub> + p · h<sub>深</sub>，训练时用预算项约束 mean(p) ≈ budget
+      <span class="note">p 由轻量评分网络从当前特征预测；推理期用阈值硬化 p ∈ {0, 1}</span>
+    </div>
+    <p>预算项把平均深度拉向目标值（例如 0.7 表示七成样本走深层路径），保证延迟可控；缺乏预算约束时门控会退化为"全部走深层"。训练用软加权保持可微，推理用硬阈值省计算，两者数值需校准：软模式下平均 p 与硬模式下实际晋级比例应接近，偏差过大说明门控分布形状不佳，需要调整阈值或增加训练样本覆盖。</p>
+
+    <h3>4. 三类稀疏的协同</h3>
+    <p>三个机制作用在不同轴：top-k 压缩每个查询的键集合，惊喜门控压缩历史帧集合，层跳过压缩网络深度。协同设计要避免相互抵消：帧 R 被记忆检索选中后，其内部 token 仍走 top-k 注意力；深层只对门控判为复杂的样本执行，其注意力同样稀疏。<strong>总计算预算 ≈ 活跃帧数 × 活跃 token 数 × 活跃层数</strong>，三个系数各自可控，按延迟目标分配。监控指标：平均活跃帧数、平均注意力熵、平均深度，三者构成动态计算的可观测面。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p><strong>数据流为：帧特征 → 惊喜判据决定写入 → 记忆与近期窗口拼接 → top-k 稀疏注意力 → 层门控决定深度 → 输出。</strong></p>
+    <ol>
+      <li><strong>近期窗口</strong>：保留最近 16 帧的全分辨率特征，与记忆检索的 8 个关键帧拼接，共约 24 个时间位置。</li>
+      <li><strong>写入门控</strong>：惊喜阈值取训练集预测误差的 90% 分位数；每步最多写入 1 个槽，环形替换。</li>
+      <li><strong>top-k 配置</strong>：k = 32；训练期全注意力加熵正则，推理期硬 top-k。</li>
+      <li><strong>深度门控</strong>：预算 0.7，训练软加权、推理硬阈值；延迟超标时下调预算并记录门控漂移。</li>
+      <li><strong>与第 066 章的差异</strong>：记忆的写入判据从固定周期改为惊喜驱动，注意力与深度加入动态调度。</li>
+    </ol>
+    <h3>超参数与取值依据</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>稀疏度 k</td><td>32</td><td>每查询参与的键数</td><td>16 以下信息截断明显，64 以上收益小成本高</td></tr>
+      <tr><td>近期窗口</td><td>16 帧</td><td>局部时序连续性</td><td>覆盖动作块的时间跨度，与块长匹配</td></tr>
+      <tr><td>记忆槽数</td><td>64</td><td>长期信息容量</td><td>按任务时长与关键事件数量估计</td></tr>
+      <tr><td>检索数</td><td>8</td><td>每步读取的槽数</td><td>过多引入无关历史，干扰近期特征</td></tr>
+      <tr><td>惊喜阈值</td><td>90% 分位</td><td>写入选择性</td><td>过高漏写关键帧，过低记忆被冗余帧挤满</td></tr>
+      <tr><td>深度预算</td><td>0.7</td><td>平均计算量</td><td>按延迟目标标定，通常 0.5–0.8</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：为什么保留固定近期窗口而不用纯检索？</span>
+      <p>纯内容检索对局部时序的保真不足：相邻帧语义高度相似，检索打分区分度低，且连续性（速度、加速度）需要逐帧顺序才能感知。近期窗口保证局部动态完整，记忆负责跨度大的事件关联，两者职责分开。窗口长度与动作块长度对齐，使一次前向覆盖完整的近期控制上下文。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>以下片段为 PyTorch 风格示意，接口命名以各开源实现的公开设计为参照，随版本演进可能变化。</p>
+
+    <p><strong>片段 1：top-k 稀疏注意力</strong></p>
+    <pre class="code"><code>def topk_attention(q, k, v, topk=32):
+    """每个查询只与最相关的 topk 个键交互，计算量近似线性。"""
+    B, H, T, d = q.shape
+    sim = q @ k.transpose(-1, -2) / math.sqrt(d)         # (B, H, T, T)
+    k_sel = min(topk, T)
+    val, idx = sim.topk(k_sel, dim=-1)                   # 每个查询的候选键
+    # 只在选中的键上归一化：softmax 的归一化域缩小到 k 个元素
+    attn = torch.softmax(val, dim=-1)                    # (B, H, T, k)
+    # 取对应 value：展平批次后用 take_along_dim 索引，避免构造 T×T 副本
+    v_flat = v.reshape(B * H, T, d)
+    idx_flat = idx.reshape(B * H, T, k_sel).unsqueeze(-1)
+    v_sel = torch.take_along_dim(v_flat.unsqueeze(1), idx_flat, dim=2)
+    out = (attn.reshape(B * H, T, k_sel).unsqueeze(-1) * v_sel).sum(dim=2)
+    return out.reshape(B, H, T, d)</code></pre>
+    <p>解读：相似度矩阵仍是稠密计算（选出 top-k 需要比较全部键），但后续的归一化与加权只在 k 个元素上进行，显存与算力的主要部分被压缩。<code>take_along_dim</code> 按索引并行取值，避免循环；展平批次处理让索引形状匹配。训练期可不启用该函数而用全注意力加熵正则，推理期切换；两种模式必须用同一批数据校验输出差异，差异过大说明稀疏选择与训练分布不匹配。若 T 固定且较小，可用固定块稀疏模式替代内容选择的 top-k，对硬件更友好。</p>
+
+    <p><strong>片段 2：惊喜门控的关键帧写入</strong></p>
+    <pre class="code"><code>class KeyframeMemory(nn.Module):
+    """惊喜驱动的记忆：预测误差大的帧写入，读取按内容相似度检索。"""
+    def __init__(self, d=256, n_slots=64):
+        super().__init__()
+        self.keys = nn.Parameter(torch.zeros(n_slots, d), requires_grad=False)
+        self.values = nn.Parameter(torch.zeros(n_slots, d), requires_grad=False)
+        self.register_buffer("ptr", torch.zeros(1, dtype=torch.long))
+
+    @torch.no_grad()
+    def maybe_write(self, z, surprise, thresh):
+        # 每步至多写入一个槽：防止异常帧批量挤占记忆
+        if surprise &gt; thresh:
+            slot = int(self.ptr.item()) % self.keys.size(0)   # 环形替换
+            self.keys[slot] = F.normalize(z.detach(), dim=-1).squeeze(0)
+            self.values[slot] = z.detach().squeeze(0)
+            self.ptr += 1
+
+    def read(self, query, topk=8):
+        sim = F.normalize(query, dim=-1) @ self.keys.t()      # 内容寻址打分
+        idx = sim.topk(min(topk, self.keys.size(0)), dim=-1).indices
+        return self.values[idx]                               # (B, topk, d)</code></pre>
+    <p>解读：键与值都设 <code>requires_grad=False</code>，记忆是运行时状态，不进入优化器参数更新，随检查点单独保存。<code>@torch.no_grad</code> 装饰防止写操作意外构建计算图。读取返回检索到的槽内容，与近期窗口特征拼接后进入注意力。潜在问题是不同样本共享同一块记忆，批量推理时需按样本维护独立的 <code>ptr</code> 与槽数组；实现简化为单样本版本以突出机制。阈值标定用验证集预测误差的分位数，写入频率目标约为每 10–20 步一次。</p>
+
+    <p><strong>片段 3：自适应深度门控</strong></p>
+    <pre class="code"><code>class LayerSkipGate(nn.Module):
+    """深度门控：评分网络预测进入深层的概率，预算约束平均深度。"""
+    def __init__(self, d=256, budget=0.7):
+        super().__init__()
+        self.score = nn.Sequential(nn.Linear(d, 64), nn.GELU(), nn.Linear(64, 1))
+        self.budget = budget
+
+    def forward(self, h, hard=False, tau=0.5):
+        p = torch.sigmoid(self.score(h))              # 软概率 (B, T, 1)
+        if hard:
+            # 推理期硬化：省下深层计算，门控值只取 0 或 1
+            p = (p &gt; tau).to(h.dtype)
+        deep = self.deep_layers(h)                    # 深层分支输出
+        return (1.0 - p) * h + p * deep, p
+
+    def budget_loss(self, p):
+        """预算项：把平均深度拉向目标，防止门控退化为全深度。"""
+        return (p.mean() - self.budget).abs()</code></pre>
+    <p>解读：软加权输出是浅层与深层的凸组合，梯度可分流到两个分支；硬化只在推理期执行，两模式的均值差异需要在验证时测量并记录。预算项用绝对差，梯度尺度比平方差温和，且对个别离群样本不敏感；权重取 0.01–0.05 量级，与主损失相当。门控的误判成本不对称：该走深层而早退的样本产生预测错误，该走浅层而走深层的样本只浪费算力，因此阈值可略偏向深层，配合预算约束整体收敛。<code>p</code> 返回供监控平均深度与逐样本分布。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>近因偏置</strong>：相似度打分偏好近邻帧，远距离关键帧永远不入选。症状是记忆检索结果几乎全部来自近期。修复：打分加入时间衰减项或位置编码，监控入选帧的年龄分布。</li>
+      <li><strong>硬截断不可微</strong>：训练直接使用 top-k 硬选择，梯度无法回传到未选中的键。症状是选择模式固化、键表示退化。修复：训练期用软注意力加熵正则，推理期硬化；或引入直通估计。</li>
+      <li><strong>阈值过激漏事件</strong>：惊喜阈值设在高分位且固定，稀有但关键的事件因分数略低被丢弃。症状是长任务的中段事件无法回溯。修复：按事件重要度分层写入（至少保留一个兜底槽）、周期性降低阈值扫描、用回放评测验证遗漏率。</li>
+      <li><strong>记忆陈旧</strong>：旧槽长期占据容量，与新任务无关仍被检索。症状是检索内容与当前场景语义不符。修复：淘汰长期未读槽、为每槽记录最后访问步数、按新鲜度调整打分。</li>
+      <li><strong>门控误判</strong>：深度门控把高难度帧判为简单，误差集中在早退样本上。症状是早退样本的预测误差显著高于全深度基线。修复：检查门控输入特征是否包含足够难度信息，用误差对比校准阈值，必要时提高预算。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>推导全注意力与 top-k 注意力的计算量比值，计算 T = 256、k = 32 时的近似加速比，并说明相似度矩阵计算为何影响实际收益。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>主项比值 k/T = 1/8；相似度矩阵仍为 T²，选择开销占比随 k 减小而上升，实际加速小于理论值。</div></details>
+      </li>
+      <li>把稀疏度 k 从 32 降到 8，预测检索质量与推理延迟的变化，并给出验证方法。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>延迟下降但部分查询的相关键被截断，预测误差上升；用消融应比较预测误差与延迟的帕累托前沿。</div></details>
+      </li>
+      <li>设计惊喜阈值的标定流程：给出用验证集分位数标定的步骤，说明写入频率与遗漏率的权衡。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>统计验证集预测误差分布，选分位数使写入频率落在每 10–20 步一次；再用回放评测检查关键事件遗漏。</div></details>
+      </li>
+      <li>推导软加权与硬阈值两种模式下平均深度的关系，说明校准步骤。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>硬模式晋级比例等于 p 超过阈值的样本占比；在验证集上画 p 的分布，调整阈值使两模式均值接近。</div></details>
+      </li>
+      <li>设计动态计算的延迟预算方案：给定每步延迟上限，推导三个稀疏系数的联合约束，并给出过载时的降级顺序。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>总成本约正比于帧数 × token 数 × 层数；降级顺序从层数到检索数再到 k，因为深度压缩对精度损失最可控。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>动态注意力让计算跟随信息价值：空间上选 token，时间上选关键帧，深度上按难度分配。</li>
+      <li>top-k 稀疏注意力把核心计算从 O(T²d) 压到 O(Tkd)；训练软化、推理硬化的衔接需要校验。</li>
+      <li>惊喜门控以预测误差为写入判据，稀有事件优先保存；记忆槽需要淘汰与新鲜度管理。</li>
+      <li>自适应深度用轻量门控加预算约束，早退样本的误差要单独监控，阈值可偏向深层。</li>
+      <li>下一章转向表示学习：<strong>联合训练中的多模态对比学习</strong>，讨论 InfoNCE、困难负样本与动量编码器。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch092.html">← 第 092 章：VLA策略的跨语言支持</a>
+    <a class="next" href="ch094.html">第 094 章：联合训练中的多模态对比学习 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

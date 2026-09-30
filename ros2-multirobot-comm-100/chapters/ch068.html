@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第068章 多机器人任务优先级 | 多机器人协同学习课程 · ROS2 通信与系统集成</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第四篇 · 系统集成与工程化</span>
+    <span class="sep">/</span>
+    <span>第 068 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第四篇 · 系统集成与工程化</div>
+    <h1>第 068 章：多机器人任务优先级</h1>
+    <p class="lead">任务比机器人多的时候，"谁先做"决定系统价值：用截止时间、关键度与等待时长合成优先级，让高优任务能抢占执行中的低优任务，同时用承诺点、迟滞与老化机制防止抖动与饿死。</p>
+    <ul class="meta">
+      <li>主题：系统集成 / 任务排序与抢占</li>
+      <li>关键机制：EDF 排序、老化防饿死、抢占决策（承诺点 + 迟滞）、优先级治理</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 067 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解优先级的三个来源（截止时间、关键度、等待时长）与复合紧急度的构造方法。</li>
+      <li>掌握最早截止优先（EDF）的排序直觉及其在单处理器可抢占场景下的最优性，知道多机器人场景为什么只能"借鉴"。</li>
+      <li>会设计抢占决策：何时抢占、何时不抢占（承诺点、切换代价、迟滞），并量化抢占收益。</li>
+      <li>会用老化（aging）机制防止低优任务饿死，并配置合理的参数上限。</li>
+      <li>能实现一个带抢占通知与断点恢复的任务队列，写出优先级治理规范。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>066/067 章解决了"任务怎么分"，但现实里任务到达速度高于机器人执行速度，队列一定存在，于是必须回答"<strong>队列怎么排</strong>"。排错了的代价不对称：把低价值的巡检往后挪半小时通常无碍；把火警确认、医疗配送或产线急件往后挪，损失可能是下一级的。</p>
+    <p>优先级问题在多机器人系统里比单机复杂：优先级不只是本机队列的排序，还要<strong>跨机器人比较</strong>，一台机器人手上是 P2 任务，另一台来了 P0 任务，该不该打断前者去支援？打断又要付出空驶与断点恢复的代价。本章给出从排序到抢占到治理的完整链条，为 069 章（资源竞争）与 070 章（调度）提供时间维度的排序基础。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 优先级的三个来源</h3>
+    <table>
+      <tr><th>来源</th><th>含义</th><th>典型取值</th><th>语义</th></tr>
+      <tr><td>静态优先级 P</td><td>业务方标注的关键度</td><td>0–100（P0 急件、P3 常规）</td><td>表达"多重要"</td></tr>
+      <tr><td>截止时间 D</td><td>必须在何时之前完成</td><td>绝对时间戳（同步时钟）</td><td>表达"多紧急"</td></tr>
+      <tr><td>等待时长 age</td><td>任务入队至今的时长</td><td>秒</td><td>补偿"等了多久"，防饿死</td></tr>
+    </table>
+    <p>三者不重叠：一个任务可以"重要但不紧急"（季度盘点，P1 但截止下周），也可以"不重要但紧急"（临时搬运，P3 但五分钟内要）。<strong>只用一个数字表达两种语义，必然在某个场景下排错队</strong>；三源复合就是答案，单乘系数解决不了。</p>
+    <p>复合紧急度的常用形式：</p>
+    <div class="formula">
+      U = w<sub>d</sub> / max(1, D − t) + w<sub>p</sub>·P + w<sub>a</sub>·(t − t<sub>arrive</sub>)
+      <span class="note">第一项是"截止临近度"（还剩 10 s 比还剩 100 s 紧急 10 倍）；w<sub>a</sub> 让等待者缓慢升温，示例 0.8/s 对应每 60 s 约一档</span>
+    </div>
+
+    <h3>2. EDF：最早截止优先的直觉与边界</h3>
+    <p>忽略关键度、只看截止时间时，排序规则叫<strong>最早截止优先</strong>（Earliest Deadline First, EDF）：谁的截止时间早，谁先做。实时系统理论有个漂亮结论：<strong>单处理器上，只要任务可抢占，EDF 是"可行则必然可行"的最优调度</strong>，任何 EDF 排不下的任务集，换任何算法也排不下。直觉解释：把每个任务看作"截止时间前必须占用 CPU 一段时间"，EDF 相当于不断处理最冒烟的炉子，不会先救远处的火。</p>
+    <p>但这个结论在机器人车队上只能借鉴，不能照搬，原因有三：</p>
+    <ul>
+      <li><strong>执行体不止一个</strong>："CPU" 是多台分布在不同位置的机器人，任务还带空间约束（只有附近机器人来得及）；EDF 的全局最优性不复存在。</li>
+      <li><strong>抢占不是免费的</strong>：处理器抢占是上下文切换（微秒级），机器人抢占是空驶折返（十秒到分钟级）。</li>
+      <li><strong>执行时间不确定</strong>：导航时长有方差，理论上的"可行性判定"退化为统计问题。</li>
+    </ul>
+    <p><strong>工程结论：EDF 用作排序的骨架（截止时间第一关键字），把关键度与等待时长作为修正项，再用抢占代价门槛控制"打断"的激进程度。</strong></p>
+
+    <h3>3. 抢占决策：打断一个正在执行的任务值不值</h3>
+    <p>收到高优任务时，默认动作是先算一笔账，再决定是否抢占：</p>
+    <div class="formula">
+      gain = (U<sub>high</sub> − U<sub>low</sub>) × T<sub>remaining</sub> − C<sub>switch</sub>
+      <span class="note">T<sub>remaining</sub> 是被打断任务剩余时长；C<sub>switch</sub> 是切换代价（返程 + 重对齐 + 断点恢复），经验取 15–60 s 等效</span>
+    </div>
+    <p>gain 为正才值得抢占。这个公式解释了两个现象：<strong>快做完的任务不该被打断</strong>（T<sub>remaining</sub> 小，即使紧急度差很大，收益也覆盖不了切换代价）；<strong>低优任务刚出发就被打断是最亏的</strong>（已经付出空驶成本，还要再付一次）。与它配套的机制是：</p>
+    <ul>
+      <li><strong>承诺点（commitment point）</strong>：任务执行到某个不可逆阶段后禁止抢占，例如已经抓取货箱、已经进入门洞、正在对接充电桩。承诺点之后"打断"的代价变成损坏（时间损失退居次要），必须硬禁止。</li>
+      <li><strong>迟滞（hysteresis）</strong>：抢占收益阈值设 20–30%，且同一任务被抢占一次后冷却 60 s，防止任务在队列两端反复横跳。</li>
+      <li><strong>抢占预算</strong>：每台机器人每小时被抢占次数上限（如 10 次），超限只排新任务不打断执行，保护吞吐的兜底。</li>
+    </ul>
+
+    <h3>4. 老化与优先级治理</h3>
+    <p>静态优先级 + EDF 有一个经典病：<strong>低优任务永远排在后面，可能无限期等待（饿死）</strong>。典型场景：物流场景中 P3 的"托盘归位"任务，只要 P0/P1 持续到达就永远排不上。老化机制让等待时间参与排序：每多等 60 s，紧急度上浮一档；上浮上限是原优先级的两档以内，<strong>老化太快会让优先级体系失去意义，太慢则防不住饿死</strong>。</p>
+    <p>另一个隐藏问题是<strong>优先级通胀</strong>：所有业务方都把自己的任务标 P0，优先级区分度归零。治理手段需要制度与技术双管，单靠技术不够：优先级只允许上游系统按白名单规则写入（例如只允许安防系统写 P0），分配器对 P0 任务做速率限制（每秒最多 1 个，超出自动降级到 P1 并告警），每周评审实际分布。<strong>优先级体系是契约，不是标签。</strong></p>
+
+    <h3>5. 数值算例：EDF 的利用率账</h3>
+    <p>EDF 的最优性有一个可直接计算的判据：单处理器可抢占场景下，任务集可调度的充要条件是总利用率 U = Σ C<sub>i</sub>/T<sub>i</sub> ≤ 1。给一组数值：三个周期任务的执行时间与周期分别是 (2 ms, 10 ms)、(3 ms, 20 ms)、(5 ms, 50 ms)，利用率 U = 0.20 + 0.15 + 0.10 = 0.45，容量用了一半不到，EDF 在任意释放时刻都能排下。再追加一个 (6 ms, 10 ms) 的任务，U = 0.45 + 0.60 = 1.05 > 1，此时存在某些释放组合让某个任务必然错过截止，无论换什么算法都救不回来。车队的映射关系是：把"执行时间"换成任务占用机器人的时长、把"周期"换成任务到达间隔，U 就是车队的容量占用率。工程上不会让 U 贴到 1.0，因为导航时长有方差、抢占有代价；经验上把稳态负载控制在 0.7–0.8，留出的余量用于吸收长尾任务与临时告警。超过 0.8 就该扩容或延后低优任务，继续在原配置上加负载会透支全部余量。</p>
+
+    <h3>6. 数值算例：老化与抢占收益的一致性核对</h3>
+    <p>先核对参数表内部自洽性：老化速率 0.8 分/秒意味着等待 60 s 上浮 48 分，恰约一档（50 分），与"每 60 s 上浮一档"的表述一致；上浮封顶两档即 100 分，对应到顶时间 100/0.8 = 125 s，所以一个被打压的低优任务最多等两分多钟就到达加成上限，饿死窗口被限制在分钟级。这个数与 10 次/小时的抢占预算是同一量级的保护：即使电机频繁被抢，任务的紧迫度也会在几分钟内重新爬回来。</p>
+    <p>再用同一组参数核对抢占公式的边界。高优与低优任务的紧急度差 120 分、被抢任务剩余 40 s、切换代价 25 s：收益 = 120×40/100 = 48 s，净收益 = 48 − 25 = 23 s，超过迟滞门限 0.25×25 = 6.25 s，允许抢占。把剩余时间压到 5 s：收益 = 120×5/100 = 6 s，净收益 = 6 − 25 = −19 s，拒绝抢占，"快做完的任务别人抢不走"的行为就是从这个公式里自动长出来的。两者之间的临界点可以解出来：令收益恰好等于切换代价加迟滞，120×t/100 = 25 + 6.25，得 t ≈ 26 s。也就是说在当前参数下，剩余时间不足约 26 s 的任务受到公式保护；把切换代价调大（例如跨楼层任务），保护时间同比例变长，这与运维直觉一致：让它做完比打断更划算的距离，取决于打断要付出多少。</p>
+    <p>抢占预算的代价同样可以量化。预算上限 10 次/小时/机器人，按单次切换代价 25 s 估计，最坏情况每小时有 250 s 花在"打断与重返"上，约占一小时的 7%；如果实测切换代价是 40 s，同样的预算会吃掉 11% 的产能，此时应把预算收紧到 6 次/小时，或者在任务模板层缩短可中断段、把切换代价本身降下来。预算是吞吐保护的兜底，取值应随实测切换代价滚动修订；写死在代码里不更新，保护要么失效、要么过度保守。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>任务消息与队列结构的设计是本章的落地核心：</p>
+    <ol>
+      <li><strong>任务消息扩展</strong>：在 066 章的 TaskRequest 上增加 <code>priority</code>（0–100）、<code>deadline</code>（绝对时间戳，可为 0 表示无截止）、<code>criticality</code>（可中断性：0 = 可任意抢占，1 = 承诺点后不可抢占）、<code>arrive_time</code>（由分配器盖章，不接受来源自填，防伪造）。</li>
+      <li><strong>队列排序</strong>：用复合键 (deadline 有效者优先，deadline 相同或缺失时按 U)，出队永远取键首；老化在每次出队检查时动态重算，不预排序。</li>
+      <li><strong>抢占判定</strong>：调度器（或分布式场景下各机器人本地判定）维护"在执行任务表"，新任务到达时对每台候选机器人计算 gain；gain 超阈值且未过承诺点才发抢占。</li>
+      <li><strong>断点协议</strong>：被抢任务的执行机保存断点上下文（已完成的子步骤、当前位置、抓取状态），向调度器回执"已暂停 + 断点摘要"；恢复时从断点继续。</li>
+      <li><strong>可观测性</strong>：记录每次抢占的 gain、被抢任务、恢复延迟；每周统计"抢占收益分布"作为调参依据。</li>
+    </ol>
+    <h3>关键参数表</h3>
+    <table>
+      <tr><th>参数</th><th>建议值</th><th>理由</th></tr>
+      <tr><td>关键度权重 w<sub>p</sub></td><td>1 档 = 50 分等效</td><td>关键度差一档约等价于离截止 2 s vs 1 s（100/2 = 50、100/1 = 100），量级可解释</td></tr>
+      <tr><td>老化速率 w<sub>a</sub></td><td>每 60 s 上浮一档</td><td>饿死窗口控制在分钟级；上浮上限 2 档</td></tr>
+      <tr><td>抢占收益阈值</td><td>20–30%</td><td>覆盖切换代价不确定性；低于此值抖动大于收益</td></tr>
+      <tr><td>抢占冷却</td><td>60 s / 任务</td><td>队伍稳定期与导航重启时间的折中</td></tr>
+      <tr><td>抢占预算</td><td>10 次/小时/机器人</td><td>保吞吐的硬上限，超限只排序不打断</td></tr>
+    </table>
+    <div class="box warn">
+      <span class="box-title">注意：没有承诺点的抢占系统迟早出事故</span>
+      <p>如果机器人正抓着货箱、正在电梯里、正在对接充电桩时被"更紧急"的任务抢走，轻则任务失败，重则设备损坏。承诺点必须在任务模板里<strong>事先声明</strong>（每个任务类型定义自己的不可中断阶段）；运行时靠任务名称猜测不可靠。设计任务模板时问一句："从哪一步开始，中断的代价从'浪费时间'变成'弄坏东西'？"答案就是承诺点。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：复合紧急度与老化队列</strong></p>
+    <pre class="code"><code>import math
+
+W_DEADLINE = 100.0     # 截止临近度权重：离截止越近，第一项越大
+W_PRIORITY = 50.0      # 每档关键度等效 50 分
+AGING_PER_S = 0.8      # 每秒老化上浮：60 s 约涨 48 分 ≈ 一档
+
+def urgency(task, now, aging_cap=2):
+    """复合紧急度：截止临近度 + 关键度 + 等待时长加成（带上限防通胀）。"""
+    if task.deadline &gt; now:
+        dl = W_DEADLINE / max(1.0, task.deadline - now)   # 剩余不足 1 s 不再涨
+    else:
+        dl = 2 * W_DEADLINE                               # 已过期：最高紧迫锚点
+    age = min(task.waited(now) * AGING_PER_S,
+              aging_cap * W_PRIORITY)                     # 老化封顶：最多补两档
+    return dl + W_PRIORITY * task.priority + age
+
+def pop_next(queue, now):
+    """每次出队动态计算紧急度：老化是时间函数，不需要定时器抬升。"""
+    if not queue:
+        return None
+    return max(queue, key=lambda t: urgency(t, now))</code></pre>
+    <p>解读：这段代码把"动态优先级"压缩成一个纯函数，<strong>紧急度只依赖任务数据与当前时间，任何时候算都一样</strong>，因此不需要后台线程周期性改优先级（那种实现最容易出竞态）。三个刻意设计：<strong>（1）</strong>剩余时间不足 1 秒时除数被钳到 1，避免除零或数值爆炸；<strong>（2）</strong>已过期任务的紧急度给定值锚点 2×W<sub>DEADLINE</sub>，比"还差 0.5 秒"更高，过期任务必须优先处理或明确放弃，不许无限逼近却不超越；<strong>（3）</strong>老化有上限 aging_cap，超过后不再上涨，保证严格高优先级的新任务永远能插到老化任务前面（除非老化任务已经等了非常久，那是治理问题，该告警了）。</p>
+
+    <p><strong>片段 2：抢占收益裁决</strong></p>
+    <pre class="code"><code>def should_preempt(incoming, running, now, switch_cost):
+    """决定是否用 incoming 抢占 running 任务。返回 (是否抢占, 收益)。"""
+    # 承诺点是一票否决：抓取中、门洞中、对接中的任务绝不打断
+    if running.phase in running.commitment_phases:
+        return False, float("-inf")
+    gain = (urgency(incoming, now) - urgency(running.task, now)) \
+           * running.remaining_time(now) / 100.0          # 归一化到"秒低效量"
+    net = gain - switch_cost                               # 切换代价含返程与重对齐
+    # 迟滞：收益必须超过阈值，仅为正还不够
+    return net &gt; 0.25 * switch_cost, net
+
+def on_new_task(node, task):
+    """新任务到达：先尝试给空闲机器人，其次裁决抢占，都失败则排队。"""
+    idle = node.idle_robots_near(task.pose)               # 不只看空闲，还看距离
+    if idle:
+        node.dispatch(idle[0], task)
+        return
+    best = None
+    for r in node.busy_robots:
+        ok, net = should_preempt(task, r.running, node.now(), r.switch_cost)
+        if ok and (best is None or net &gt; best[1]):
+            best = (r, net)                                # 选"净收益最大"的被抢者
+    if best:
+        node.preempt(best[0], keep_context=True)           # 保留断点供恢复
+        node.dispatch(best[0], task)
+    else:
+        node.queue.push(task)                              # 排队等自然出队</code></pre>
+    <p>解读：抢占裁决函数是全章的灵魂，注意四个决策。<strong>（1）承诺点是硬门</strong>：先于任何收益计算返回 False，可中断性不参与权衡，有些事不能"算账"，只能禁止。<strong>（2）收益乘剩余时间再归一化</strong>：紧急度差（分值）乘以"这段差距还能影响多久"，量纲从"分"变成"秒低效量"，才能与切换代价（秒）相减；除 100 的除数是权重标定的产物，换成别的常数也行，但必须固定并写进文档。<strong>（3）迟滞用 25%×switch_cost，收益为正不算过线</strong>：切换代价本身是估计值，误差 ±20% 很常见，正收益可能被估计误差吃掉，所以要求一个安全边际。<strong>（4）在多个候选中选净收益最大者</strong>：逐台比较才能实现"抢最不痛的那台"这一隐含目标。</p>
+
+    <p><strong>片段 3：被抢方的断点保存与恢复</strong></p>
+    <pre class="code"><code>class TaskExecutor(Node):
+    """机器人侧执行器：接收抢占通知、保存断点、恢复续做。"""
+    def __init__(self):
+        super().__init__("executor")
+        self.current = None
+        self.context = {}        # task_id -&gt; 断点上下文（阶段、位置、抓取状态）
+        self.create_subscription(PreemptNotice, "/fleet/preempt",
+                                 self.on_preempt, 10)
+
+    def on_preempt(self, msg):
+        if self.current is None or msg.task_id != self.current.id:
+            return                                   # 不是冲我来的通知
+        if self.current.phase in self.current.commitment_phases:
+            self.report_reject(msg)                  # 承诺点内拒绝，调度器改派他人
+            return
+        # 断点必须记录到"可恢复"的粒度：阶段编号 + 当前位置 + 手爪状态
+        self.context[self.current.id] = {
+            "phase": self.current.phase,
+            "pose": self.last_pose,
+            "gripper": self.last_gripper_state,
+        }
+        self.nav.cancel_current_goal()               # 取消导航（异步，不阻塞）
+        self.current = None
+        self.report_ack(msg)                         # 回执：调度器才知道可派新任务
+
+    def resume(self, task_id):
+        ctx = self.context.pop(task_id, None)        # 取出并清除，避免重复恢复
+        if ctx is None:
+            return False                             # 无断点：只能从头做
+        self.current = load_task(task_id, resume_from=ctx)
+        self.start()                                 # 从 ctx["phase"] 继续
+        return True</code></pre>
+    <p>解读：断点保存的粒度决定系统能力。<strong>阶段编号 + 位置 + 手爪状态</strong>三件套是最小可用组合：回到任务时知道"做到哪一步、要回到哪、手上有没有东西"。若任务模板做不到阶段化（只有"整段搬运"一个阶段），断点恢复就退化成"从头再来"，抢占的价值大打折扣，<strong>抢占机制逼着你把任务模板设计得更细，这是它带来的隐性收益</strong>。代码里的 <code>report_reject</code> 路径很关键：被抢方在承诺点内拒绝抢占，调度器必须能处理"发出抢占但被拒绝"的返回并改派，否则会出现高优任务卡死等待的假象。最后，<code>resume</code> 里 <code>pop</code> 断点保证幂等，即使恢复消息重复到达，第二次会返回 False，不会出现两个执行流。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>没有老化，低优任务饿死</strong>：P3 任务在高峰永远排不上，验收时被发现"昨天的归位任务今天还没做"。修复：等待时长参与排序 + 老化封顶；监控上对"等待超过 SLO 的任务数"设告警。</li>
+      <li><strong>优先级通胀</strong>：三个上游系统都写 P0，紧急度分布全挤在顶部。修复：按来源限速 P0、超出自动降级并告警、定期评审分布，技术手段与治理制度同时上。</li>
+      <li><strong>抢占抖动</strong>：A 抢占 B、B 恢复一半又被 C 抢占，切换时间超过实际执行时间。修复：收益阈值 25%、每任务抢占冷却 60 s、全局抢占预算每小时 10 次。</li>
+      <li><strong>没有承诺点</strong>：抓着货箱被抢走，货箱掉落或导航指令冲突。修复：任务模板声明不可中断阶段，执行器拒绝承诺点内的抢占并回执，调度器改派。</li>
+      <li><strong>用本机时钟判断截止</strong>：各机器人时钟偏差 1–2 s 常见，deadline 判据在不同机器上结论不同。修复：统一时间源（第 009 章），<code>arrive_time</code> 由分配器盖章，比较全部基于同一时钟。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>两个任务：A（P0、截止 120 s 后、执行需 60 s）、B（P2、截止 90 s 后、执行需 30 s）。按 EDF 骨架排序谁先做？再按本章复合紧急度公式（w<sub>d</sub> = 100、w<sub>p</sub> = 50、假设同时到达）计算 U<sub>A</sub> 与 U<sub>B</sub>，解释结果与纯 EDF 的差异。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>EDF：B 先（截止更早）。复合式：U<sub>A</sub> = 100/120 + 50×3 ≈ 150.8，U<sub>B</sub> = 100/90 + 50×1 ≈ 51.1，P0 的权重压过截止差，关键度高的任务先做；检查截止可行性：A 先做（60 s）后 B 还有 30 s，恰好赶上，两不耽误。</div></details>
+      </li>
+      <li>机器人正在执行剩余 40 s 的 P1 任务，切换代价实测 25 s；新来 P0 任务。用片段 2 的公式判断是否抢占（紧急度差设为 120 分），并说明 <code>0.25 * switch_cost</code> 迟滞在此例中的作用。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>gain = 120 × 40/100 = 48 s，net = 48 − 25 = 23 s；阈值 0.25×25 = 6.25 s，23 > 6.25 → 抢占成立。注意若剩余只有 5 s：gain = 6 s，net = −19，不抢占，快做完的任务别人也抢不走。</div></details>
+      </li>
+      <li>把老化上限从 2 档改成无上限，构造"P3 任务持续到达、系统长期满载"的场景，预测两周后的优先级分布，并解释为什么无上限老化会破坏"紧急任务优先"的初衷。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>无限老化下，等了几小时的低优任务紧急度超过任何新任务，系统退化为纯 FCFS，真正的紧急任务被老任务挤住。上限的作用是让老化只服务于"防饿死"，避免反转优先级。</div></details>
+      </li>
+      <li>为你的项目写一份"优先级治理规范"：定义档位（P0–P3）各自的可写入方与校验规则、P0 限速值、老化参数、抢占阈值与预算、每周评审指标（P0 占比、平均等待、抢占次数分布）。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>关键是"可证伪"：P0 只允许安防与调度系统写入、每秒 ≤ 1 且需附带理由码；评审看四项指标的趋势，单次数值说明不了问题；把规范链接写进任务消息 schema 的文档注释里。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>优先级有三个正交来源：关键度、截止时间、等待时长；复合紧急度让"重要不紧急"与"紧急不重要"各得其所。</li>
+      <li>EDF 是单处理器可抢占场景的最优调度，多机器人场景只借其骨架；执行时间方差与抢占代价让"全局最优"退化为工程权衡。</li>
+      <li>抢占三件套：收益公式（紧急度差 × 剩余时间 − 切换代价）、承诺点（不可中断阶段）、迟滞与预算（防抖动、保吞吐）。</li>
+      <li>老化防饿死但有封顶；优先级需要治理，写入白名单、P0 限速、分布评审，缺了制度，技术指标两周内一定失效。</li>
+      <li>下一章处理另一种"争抢"：机器人争的是充电桩、窄道、电梯这类资源（争夺对象从任务换成了资源），<strong>多机器人资源竞争管理</strong>。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch067.html">← 第 067 章：多机器人协同任务分配</a>
+    <a class="next" href="ch069.html">第 069 章：多机器人资源竞争管理 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

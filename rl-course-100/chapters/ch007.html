@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第007章 PPO的奖励归一化实现 | 深度强化学习课程 · PPO、SAC 与多智能体系统</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · 策略梯度与 PPO</span>
+    <span class="sep">/</span>
+    <span>第 007 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · 策略梯度与 PPO</div>
+    <h1>第 007 章：PPO的奖励归一化实现</h1>
+    <p class="lead">自建一个"每回合奖励尺度随机"的 5×5 GridWorld，对比原始奖励、滑动标准差归一化、奖励裁剪三种处理，用价值损失与成功率看清尺度失衡到底伤在哪里。</p>
+    <ul class="meta">
+      <li>主题：奖励尺度 / 训练稳定性</li>
+      <li>关键公式：r̃ = clip(r / max(σ̂<sub>G</sub>, ε), −10, 10)；奖励 ×s ⇒ 价值损失 ×s<sup>2</sup></li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 006 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解奖励尺度如何通过价值目标与价值损失影响 PPO 的训练稳定性，而不仅仅是"数值大小"问题。</li>
+      <li>掌握折扣回报滑动标准差归一化（return scaling）的实现：Welford 在线统计 + 预热 + 裁剪。</li>
+      <li>实现一个带随机奖励尺度的轻量 GridWorld，作为检验归一化的受控环境。</li>
+      <li>对比 none / scale / clip 三种处理在成功率、价值损失、梯度范数上的差异。</li>
+      <li>知道归一化应该只作用于训练目标，评估与日志必须保留原始尺度。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>CartPole 的奖励永远是 +1，Pendulum 的奖励在 −16 到 0 之间，自制环境里可能是 ±1000，同一个 PPO 代码换一个环境就崩，很多时候问题不在算法而在<strong>奖励尺度</strong>。尺度失衡的破坏路径很具体：价值网络要预测的回报目标随尺度线性变化，而价值损失是平方误差，于是大尺度回合产生的梯度可以压过一切；梯度裁剪又会把它们的梯度削平，让学习信号变形。</p>
+    <p>更麻烦的是"尺度还会变"：如果任务里不同回合的奖励量级不同（本章故意设计成每回合随机相差 25 倍），价值函数根本无法用一套参数拟合所有回合，优势估计随之失真。本章先造出这个极端环境，再对比三种最常见的处理：<strong>不处理、按折扣回报的滑动标准差归一化、裁剪到 [−1, 1]</strong>。你会看到归一化是把"可学习性"还给价值网络的便宜手段，而裁剪只是次优的补丁。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 尺度失衡从哪里开始伤训练</h3>
+    <p>设本回合奖励被放大 s 倍，则回报目标 R<sub>t</sub> 与最优价值 V<sup>*</sup> 都放大 s 倍，价值损失（MSE）放大 s<sup>2</sup> 倍：</p>
+    <div class="formula">
+      L<sub>V</sub> = 𝔼[(V<sub>θ</sub>(s) − R<sub>t</sub>)<sup>2</sup>]　⟹　奖励 ×s ⇒ 价值损失 ×s<sup>2</sup>，梯度 ×s
+      <span class="note">优势在更新前会被标准化，所以策略损失受影响较小，主战场是价值网络与梯度尺度</span>
+    </div>
+    <p>尺度混叠时，更糟的是<strong>目标不可调和</strong>：同一个状态在不同回合的回报目标可能相差 25 倍，MSE 的最优解是"平均数"，于是优势估计系统性地偏向平均值，策略更新方向被噪声主导。诊断特征：<strong>价值损失不降、梯度范数持续贴顶、成功率忽高忽低</strong>。</p>
+
+    <h3>2. 折扣回报的滑动标准差归一化</h3>
+    <p>做法是维护"最近若干回合折扣回报"的标准差 σ̂，把每一步奖励都除以它之后再送进 GAE：</p>
+    <div class="formula">
+      r̃<sub>t</sub> = clip( r<sub>t</sub> / max(σ̂<sub>G</sub>, ε), −10, 10 )
+      <span class="note">σ̂<sub>G</sub> 用 Welford 在线算法更新；预热期（前 5 个回合）先用原始奖励</span>
+    </div>
+    <p>统计对象取"折扣回报"的理由：折扣回报 G = Σγ<sup>t</sup>r<sub>t</sub> 包含了回合长度与折扣结构的信息，正是价值目标的量级；用它归一化等价于让价值目标落到 O(1)。<strong>统计对象必须是回合级的量</strong>，若改成"每步奖励的滑动方差"，遇到"稀疏大奖励 + 密集小惩罚"的任务会把奖励比例压坏。</p>
+
+    <div class="box key">
+      <span class="box-title">数值算例：同一状态、25 倍尺度差下的价值目标</span>
+      <p>取 γ=0.99，最短路径 8 步（7 次步惩罚加 1 次目标奖励），先算两种尺度下"成功回合"的折扣回报：G(s) = s × (γ<sup>7</sup> − 0.05×Σ<sub>t=0</sub><sup>6</sup>γ<sup>t</sup>) = s × (0.9321 − 0.05×6.7935) = 0.5924 s。于是 s=0.2 的回合 G≈0.118，s=5 的回合 G≈2.962，比值就是尺度比 25 倍。</p>
+      <p>尺度按 U[0.2, 5] 抽取时，尺度均值 2.6、标准差 1.386，回报目标的均值约 1.540、标准差约 0.821。若价值网络在这个状态上只能给出一个与尺度无关的预测（小网络的表达力在尺度混叠下接近这种情况），MSE 最优解是条件均值 1.540。它对 s=0.2 的回合高估 +1.42，对 s=5 的回合低估 −1.42，<strong>两个方向的偏差都超过了小尺度回合的目标本身（0.118）</strong>。优势估计虽然会做批内标准化，但这部分系统性偏差会先进入 Â，再转为策略方向的噪声。</p>
+      <p>归一化后的账完全不同：σ̂≈0.821 把两个目标变成 0.144 与 3.61，尺度差被换算成可控的 O(1) 范围。再把失败回合放进来（40 步全吃惩罚）：s=5 时原回报约 −8.28，归一化后约 −10.1，恰好触及 ±10 的裁剪上限；s=0.2 时原回报只有 −0.33，归一化后约 −0.40。这正是三道保险缺一不可的原因：归一化本身放大了小 σ̂ 的风险，下限保护与 ±10 裁剪把最坏情况锁住。裁剪上限还留了一定量化余量：成功目标的 3.61 要放大到 10 需要 σ̂ 被低估约 2.8 倍，正常训练到不了这个程度。</p>
+    </div>
+
+    <p>统计口径还有一个随时间漂移的问题，用数字看：固定尺度 s=2.6，成功回合的 G 约 +1.54，失败回合（40 步）的 G 约 −4.30。策略从早期到后期，成功率 p 从 0.1 升到 0.9，回报混合的均值从约 −3.72 升到 +0.96、标准差先升后降（p=0.1 与 0.9 时约 1.75，p=0.5 时约 2.92）。本实现的 RunningStats 统计全历史、不设窗口，于是训练前期的失败样本会长期把 σ̂ 与均值拉在高位，后期策略已收敛时归一化强度与实际回报结构不再匹配。要做更细的控制，可把 <code>finish_episode</code> 的累计改成最近 N 个回合的滑窗统计，观察价值目标是否更稳定（练习方向之一）。</p>
+
+    <h3>3. 奖励裁剪为什么只是补丁</h3>
+    <p>DQN 在 Atari 上把奖励裁剪到 [−1, 1]，因为它只关心"符号 + 相对大小"，且 Atari 的奖励结构简单。裁剪的问题是<strong>它改写了奖励的比例关系</strong>：本章中目标奖励 +1·s 与步惩罚 −0.05·s 的比值是 20:1，裁剪后当 s&gt;1 时目标被压到 +1、惩罚最多 −0.25，比值随 s 漂移。它能把极端值关进笼子（稳定性提升），但也牺牲了精确定位最优策略所需的比例信息（上限降低）。scale 保留了同一个回合内奖励的相对比例，只把回合间的量级拉齐，这就是它通常更优的原因。</p>
+    <p>用本章的尺度端点把"比例漂移"算实：s=0.2 时，目标 +0.2 与步惩罚 −0.01 都在裁剪区间内，比值保持 20:1；s=5 时，+5 被压成 +1，而 −0.25 原样保留，有效比值变成 1:0.25 = 4:1。同一个任务、同一条最优路径，大尺度回合把"每多走一步"的相对代价放大了 5 倍，策略看到的世界在两档尺度下并不一致，这就是裁剪给出的策略在两个尺度档位上表现分化的数学原因。</p>
+    <p>退一步说，一个介于 raw 与 scale 之间的做法是"只减均值、不除标准差"（中心化）。回到上一小节的数字：中心化后两个目标变为 −1.42 与 +1.42，尺度差原封不动，MSE 最优常数是 0，但预测任何常数都会在两个方向上错 1.42；<strong>中心化抹掉的是系统性偏移，抹不掉尺度混叠</strong>，本任务下它单独使用的效果接近 none。什么时候可以不做归一化：奖励天然是 O(1) 量级且跨回合结构一致的任务（CartPole 的恒定 +1 属于这一类），此时 σ̂ 只反映回合长度分布，除或不除都不会引入混叠，加上它只是多一个统计量要维护；当奖励量级进入几十、上百，或跨回合结构会漂移时，先上归一化再谈其他调参。</p>
+
+    <h3>4. 归一化只服务训练</h3>
+    <p>评估、日志、成功率必须使用<strong>原始奖励</strong>。训练时归一化是"为了让梯度好走"，一旦把归一化后的奖励写进评估，不同处理方式的成绩就不可比了。本章的评估环境固定 <code>fixed_scale=1.0</code>，三种处理在同一把尺子下比较。</p>
+    <p>用一个数字演示口径混用的后果：同一条成功路径在评估环境（s=1.0）的原始折扣回报是 0.5924。如果评估回报也过各自的 processor，none 模式的 σ̂ 约等于 1 时读数仍约 0.59；scale 模式的 σ̂ 约 0.821，读数被放大到约 0.72；clip 模式在成功路径上没有奖励被裁剪、读数仍是 0.59。同一条轨迹、同一个策略，只因为"评估阶段是否套用训练时的变换"，三种模式会给出两个不同的分数，排序与结论全部失真。把"训练目标口径"与"评估口径"分开写在报告里，是这类实验的最低要求。本章结果文件 <code>runs/ch007/reward_norm.txt</code> 里的成功率与评估回报均按固定评估环境（s=1.0）统计，三种模式可以直接横向对照；训练日志里的价值损失来自各自的训练目标口径，只适合纵向看趋势，不适合跨模式比大小。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+
+    <h3>模块划分</h3>
+    <table>
+      <tr><th>组件</th><th>职责</th><th>与第 006 章的关系</th></tr>
+      <tr><td><code>NoisyGridWorld</code></td><td>5×5 网格，重置时抽取 reward_scale ∈ [0.2, 5.0]</td><td><strong>新增</strong>：脚本内联轻量环境</td></tr>
+      <tr><td><code>RunningStats</code></td><td>Welford 在线均值/方差</td><td><strong>新增</strong>：无依赖的滑动统计</td></tr>
+      <tr><td><code>RewardProcessor</code></td><td>none / scale / clip 三种奖励变换</td><td><strong>新增</strong>：归一化逻辑集中一处</td></tr>
+      <tr><td><code>collect_rollout</code></td><td>奖励先过 processor 再进 GAE，单独统计原始回报与成功率</td><td>采样管线插入一个变换层</td></tr>
+      <tr><td><code>evaluate</code></td><td>在固定尺度 1.0 的环境上统计贪婪策略成功率</td><td>评估口径改为成功率</td></tr>
+      <tr><td>诊断</td><td>价值损失 + 梯度范数 + 成功率</td><td>由结构对比改为尺度诊断</td></tr>
+    </table>
+
+    <h3>关键超参数</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用与取值理由</th></tr>
+      <tr><td>奖励尺度 s</td><td>U[0.2, 5.0]</td><td>回合间量级差 25 倍，快速放大尺度问题</td></tr>
+      <tr><td>步惩罚 / 目标奖励</td><td>−0.05 / +1.0</td><td>比值 20:1，用于展示裁剪对比例关系的破坏</td></tr>
+      <tr><td>回合上限</td><td>40 步</td><td>最短路径 8 步，留出绕路空间</td></tr>
+      <tr><td><code>--max-steps</code></td><td>80000</td><td>每种处理 8 万步；三种合计 24 万步</td></tr>
+      <tr><td>预热回合</td><td>5</td><td>σ̂ 至少来自 5 个回合，避免早期方差估计过小</td></tr>
+      <tr><td>归一化裁剪</td><td>±10</td><td>防止 σ̂ 偶发过小时产生巨大奖励</td></tr>
+    </table>
+
+    <h3>数据流</h3>
+    <p>每个模式一条完整训练：重设种子 → 环境 <code>reset</code> 抽本回合尺度 → 采样 2048 步，<strong>每步奖励先经 <code>processor.process()</code> 再进 GAE</strong>，同时按原始奖励累计回合回报与折扣回报 → 回合结束时 <code>finish_episode()</code> 更新统计量 → 10 epochs 更新（记录价值损失与梯度范数）→ 跑满 8 万步 → 在 <code>fixed_scale=1.0</code> 的评估环境上跑贪婪策略 → 汇总成功率对比表。</p>
+
+    <div class="box key">
+      <span class="box-title">三道保险缺一不可</span>
+      <p><strong>预热</strong>（前 5 回合用原始奖励）：σ̂ 没有足够样本前不可信；<strong>下限保护</strong>（<code>max(σ̂, 1e-3)</code>）：防止早期方差过小导致奖励被放大百倍；<strong>裁剪 ±10</strong>：防止统计量的偶发异常。只做其中一两个，都可能在大尺度回合刚出现时把价值网络一次带飞。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：制造尺度混叠的环境</strong></p>
+    <pre class="code"><code>class NoisyGridWorld(gym.Env):
+    """5x5 网格；到达 (4,4) 得 +1，其余步 −0.05，全部乘以本回合的 reward_scale。"""
+
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        if seed is not None:
+            self._rng = np.random.default_rng(seed)   # 环境自带随机流，可独立复现
+        self.pos = np.array([0, 0], dtype=np.int64)
+        self.steps = 0
+        if self.fixed_scale is None:          # 训练：每回合从 U[0.2, 5.0] 重抽
+            self.reward_scale = float(self._rng.uniform(self.scale_low, self.scale_high))
+        else:
+            self.reward_scale = float(self.fixed_scale)   # 评估：固定 1.0
+        return self._obs(), {}
+
+    def step(self, action):
+        deltas = {0: (-1, 0), 1: (0, 1), 2: (1, 0), 3: (0, -1)}   # 上右下左
+        dy, dx = deltas[int(action)]
+        self.pos[0] = int(np.clip(self.pos[0] + dy, 0, self.size - 1))
+        self.pos[1] = int(np.clip(self.pos[1] + dx, 0, self.size - 1))
+        self.steps += 1
+        success = bool(self.pos[0] == self.size - 1 and self.pos[1] == self.size - 1)
+        raw_r = 1.0 if success else -0.05
+        r = raw_r * self.reward_scale         # 尺度混叠的来源：同一事件、不同量级
+        terminated = success
+        truncated = self.steps >= self.max_steps
+        info = {"success": success, "raw_reward": raw_r, "reward_scale": self.reward_scale}
+        return self._obs(), float(r), terminated, truncated, info</code></pre>
+    <p>解读：<strong>（1）</strong>环境用一个内联随机流 <code>self._rng</code>：训练时每回合抽样一次尺度，配合 <code>reset(seed=...)</code> 保证三种处理面对同一串尺度序列（受控对比）。<strong>（2）</strong><code>fixed_scale=1.0</code> 的评估实例是本章的"公平尺"：评估时不再抽尺度，章节里所有成绩都在同一量级下比较。<strong>（3）</strong><code>info</code> 字典透出 <code>raw_reward</code> 与 <code>reward_scale</code>：日志统计原始回报、以及练习里的分桶分析都靠它，这是自建环境时值得养成的习惯。<strong>（4）</strong>观测是归一化坐标 <code>(x/4, y/4)</code>：环境内部已经处理了观测尺度，本章的实验变量只有奖励。</p>
+
+    <p><strong>片段 2：Welford 在线统计</strong></p>
+    <pre class="code"><code>class RunningStats:
+    """Welford 在线均值/方差：单遍扫描、数值稳定，不需要保存历史。"""
+    def __init__(self):
+        self.n = 0
+        self.mean = 0.0
+        self.m2 = 0.0
+
+    def update(self, x: float) -> None:
+        self.n += 1
+        delta = x - self.mean
+        self.mean += delta / self.n           # 均值的递推更新
+        self.m2 += delta * (x - self.mean)    # 二阶中心矩的递推更新
+
+    @property
+    def std(self) -> float:
+        if self.n &lt; 2:
+            return 1.0                        # 样本不足时先返回 1，不做归一化
+        return float(np.sqrt(self.m2 / (self.n - 1)))</code></pre>
+    <p>解读：<strong>（1）</strong>为什么用 Welford：它替代"存一个列表再 <code>np.std</code>"的做法，在线算法只维护三个标量，内存 O(1)，且避免了大数相减的精度损失；对"训练多久就统计多久"的场景更自然。注意这里没有窗口，统计的是从训练开始到现在的所有回合；要做滑动窗口版本可以让 <code>finish_episode</code> 按到最近 N 回合（练习方向）。<strong>（2）</strong><code>n &lt; 2</code> 时返回 1.0：除数为 1 意味着"不缩放"，这与预热期的行为配合。<strong>（3）</strong><code>m2 / (n-1)</code> 是样本方差（无偏）；若用 <code>n</code> 会在大尺度短序列上偏小，n=2 时两者的标准差相差 √2 ≈ 1.41 倍，早期判断会偏乐观。<strong>（4）</strong>统计量的尺度问题：<code>x</code> 本身是折扣回报（可能到几十），<code>std</code> 直接使用，量级几十，这正是归一化要消掉的量级。</p>
+    <p>把 Welford 的更新手算一遍，便于以后排查实现错误。设最近三个回合的折扣回报是 1.5、0.3、2.0：第一回合后 n=1、mean=1.5、m2=0；第二回合 delta=0.3−1.5=−1.2，mean 更新为 1.5+(−1.2)/2=0.9，m2 增加 −1.2×(0.3−0.9)=0.72；第三回合 delta=2.0−0.9=1.1，mean 更新为 0.9+1.1/3≈1.2667，m2 增加 1.1×(2.0−1.2667)=0.8067，累计 1.5267。用"先求均值再算平方和"核对：Σ(x−1.2667)<sup>2</sup>=0.0544+0.9345+0.5378=1.5267，两条路径一致，最终 std=√(1.5267/2)≈0.8738。若实现对不上，先检查 <code>m2 += delta * (x - self.mean)</code> 这一行：delta 用的是旧均值，括号里的 <code>self.mean</code> 必须已经是更新后的新均值，一个新一个旧，写反是最常见的流式统计抄写错误。</p>
+
+    <p><strong>片段 3：RewardProcessor，三种处理的统一封装</strong></p>
+    <pre class="code"><code>class RewardProcessor:
+    """三种奖励处理方式的统一封装：none / scale / clip。"""
+    def __init__(self, mode: str, warmup_episodes: int = 5):
+        self.mode = mode
+        self.warmup = warmup_episodes
+        self.stats = RunningStats()
+
+    def process(self, r: float, gamma: float = 0.99) -> float:
+        if self.mode == "none":
+            return r
+        if self.mode == "clip":
+            return float(np.clip(r, -1.0, 1.0))     # DQN-Atari 风格：只保符号与相对大小
+        if self.mode == "scale":
+            if self.stats.n &lt; self.warmup:
+                return r                            # 预热期：统计量不可靠，用原始奖励
+            std = max(self.stats.std, 1e-3)         # 下限保护：防 σ̂ 过小时奖励爆炸
+            return float(np.clip(r / std, -10.0, 10.0))   # 第二道保险：±10 裁剪
+        raise ValueError(f"未知的奖励处理模式: {self.mode}")
+
+    def finish_episode(self, discounted_return: float) -> None:
+        if self.mode == "scale":
+            self.stats.update(discounted_return)    # 统计对象是“回合级折扣回报”</code></pre>
+    <p>解读：<strong>（1）</strong>三种处理封装在同一个类里，采样代码只调用 <code>process</code>/<code>finish_episode</code> 两个接口，切换模式不改采样管线，这是做对比实验的基本结构。<strong>（2）</strong>scale 分支的顺序不能换：<strong>先判断预热 → 再取下限保护 → 最后裁剪</strong>。若先裁剪再除以 std，大尺度回合的惩罚会被先削掉再缩放，比例关系改变（那是 clip 的行为，不是 scale 的）。<strong>（3）</strong><code>finish_episode</code> 接收的是<strong>折扣回报</strong>这个回合级量，逐 step 奖励由调用方（collect_rollout）在回合内累计 <code>ep_disc += ep_gamma * r</code>，这里只负责更新统计。职责分离让"统计口径"只有一个地方可改（练习 3 会改坏它看效果）。<strong>（4）</strong>异常分支 <code>raise ValueError</code>：配置错误要尽早暴露；若静默返回 r，写错模式名会得到"看起来正常但没处理"的实验结果。</p>
+
+    <p><strong>片段 4：处理层插入采样管线</strong></p>
+    <pre class="code"><code>    for _ in range(steps):
+        a, logp, v = net.act(obs_t)
+        next_obs, r, terminated, truncated, info = env.step(a)
+
+        r_used = processor.process(r, gamma)   # 唯一被替换的点：奖励 → GAE 之间插一层
+
+        obs_buf.append(obs_t.squeeze(0).cpu().numpy())
+        act_buf.append(a)
+        logp_buf.append(logp)
+        rew_buf.append(r_used)                 # GAE 用处理后的奖励
+        val_buf.append(v)
+        term_buf.append(float(terminated))
+
+        ep_ret += r                            # 日志口径：原始奖励
+        ep_disc += ep_gamma * r                # 折扣回报：送给滑动统计
+        ep_gamma *= gamma
+        success_flag = success_flag or bool(info.get("success", False))
+
+        obs_t = to_tensor(next_obs, device)
+        obs_after = obs_t
+        if terminated or truncated:
+            ep_returns.append(ep_ret)
+            ep_success.append(1.0 if success_flag else 0.0)
+            processor.finish_episode(ep_disc)  # 回合结束：更新统计量
+            ep_ret, ep_disc, ep_gamma, success_flag = 0.0, 0.0, 1.0, False
+            reset_obs, _ = env.reset()
+            obs_t = to_tensor(reset_obs, device)</code></pre>
+    <p>解读：<strong>（1）</strong>一行之差是本章的全部改动：<code>rew_buf</code> 里放 <code>r_used</code>（进 GAE），<code>ep_ret</code> 里放原始 <code>r</code>（进日志）。这两条口径如果混用，实验结果就失去了意义。<strong>（2）</strong><code>ep_disc += ep_gamma * r</code> 在回合内按 γ 的幂累计，注意这里用的是<strong>原始奖励</strong>：归一化前的折扣回报反映环境真实的量级结构，是滑动统计的输入。<strong>（3）</strong>回合结束才调用 <code>finish_episode</code>：统计对象是完整的回合级折扣回报；逐 step 奖励只是它的组成片段，不能单独送进统计。这个时序在写代码时容易顺手塞进主循环，务必对照（练习 3 的错误示范）。<strong>（4）</strong>成功率 <code>success_flag</code> 用 <code>or</code> 累积：一旦本回合某一步 <code>info["success"]=True</code>，该回合即算成功，之后 reset。<strong>（5）</strong>注意 <code>term_buf</code> 里仍然只放 <code>terminated</code>，奖励处理不影响 terminated/truncated 的语义，这两条线要保持正交。</p>
+
+    <p>完整可运行脚本（附录）：<a href="../code/ch007.py" download>code/ch007.py</a></p>
+    <pre class="sh"><code>python code/ch007.py                 # none / scale / clip 各 8 万步，CPU 约 2–5 分钟
+python code/ch007.py --quick         # 三种方式各 1.2 万步，约 20–40 秒
+python code/ch007.py --modes none scale   # 只比较主角与对照组</code></pre>
+    <p>预期结论（<strong>以实跑为准</strong>）：none 的价值损失比 scale 高一个数量级（约 17 vs 1.3）、梯度范数经常贴顶 0.5、成功率卡在 60% 上下；scale 最快越过 80% 成功率、评估成功率通常在 0.9 以上；clip 有改善但介于两者之间（约 0.8），因为 20:1 的奖励比例被裁剪破坏，策略容易在"多走几步"和"尽快到达"之间摇摆。单次运行有波动，建议结合 <code>runs/ch007/reward_norm.txt</code> 的数值多跑两个种子复核。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>用每步奖励方差代替折扣回报方差</strong>：统计对象错了，归一化会把"稀疏目标奖励 + 密集步惩罚"的结构压坏，价值目标反而更难拟合。记住统计的是回合级折扣回报。</li>
+      <li><strong>忘记预热期或没有下限保护</strong>：刚开始 σ̂ 未定义或极小，归一化后奖励会被放大成数千，一轮更新就能把价值网络带飞。预热 5 个回合 + <code>max(σ̂, 1e-3)</code> + 裁剪 ±10 是三道保险，缺一不可。</li>
+      <li><strong>把归一化后的奖励用于评估或日志</strong>：不同处理方式的成绩会失去可比性，也会掩盖环境真实的回报结构。训练目标与评估口径必须分开。</li>
+      <li><strong>以为归一化能修复奖励设计错误</strong>：如果奖励函数本身不指向目标（币值/势能写错），归一化只会让错误学得更快。先检查奖励语义，再谈尺度。</li>
+      <li><strong>把 <code>term_buf</code> 的语义和奖励处理混在一起改</strong>：处理奖励时顺手把 truncated 也记进终止标志，会在不知不觉中破坏 bootstrap，两条线要分开动。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把奖励尺度范围从 [0.2, 5.0] 改成 [0.05, 20.0]（改 <code>NoisyGridWorld</code> 的默认参数），观察 none 与 scale 的差距是否扩大。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>改 <code>scale_low</code> / <code>scale_high</code> 默认值，或从命令行透传。量级差从 25 倍变成 400 倍，none 的价值损失会进一步失控。</div></details>
+      </li>
+      <li>实现第四种模式 <code>fixed</code>：直接用固定常数 1/回报量级 归一化（提前告知尺度），与 scale 对比，验证"已知尺度时不需要自适应"。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>注意固定常数无法适应回合间 25 倍的差异，这正是自适应统计存在的意义。对比价值损失与成功率曲线。</div></details>
+      </li>
+      <li>把 Welford 统计对象从"折扣回报"改成"每步奖励的滑动标准差"，重跑 scale 模式，解释为什么结果可能变差。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>每步奖励的方差被稀疏的目标奖励主导，与回合长度相关；而折扣回报才是价值目标的量级。观察价值损失与成功率。</div></details>
+      </li>
+      <li>按奖励尺度把回合分成两组（s &lt; 1 与 s &gt; 2.5），分别统计成功率，做一张"尺度—成绩"表，看 none 在哪一档失败最严重。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>在 <code>collect_rollout</code> 的回合结束分支里读取 <code>info["reward_scale"]</code> 并分桶记录成功数。预期 none 在大尺度回合上明显更差，因为它们的回报目标被小尺度回合"平均"掉了。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>奖励尺度通过价值损失（平方）与梯度尺度影响训练；回合间尺度混叠会让价值目标不可调和，优势估计失真。</li>
+      <li>折扣回报滑动标准差归一化（Welford + 预热 + 裁剪）把价值目标压回 O(1)，是本任务上效果最好的处理。</li>
+      <li>奖励裁剪能压住极端值，但会破坏同回合内奖励的比例关系，效果介于 raw 与 scale 之间。</li>
+      <li>归一化只改变训练目标，评估必须回到原始奖励；本章用固定尺度 1.0 的评估环境统一口径。</li>
+      <li>下一章把同样的"尺度"主题从奖励移到观测：一边做观测归一化，一边把单环境升级成"单进程多环境轮转"的向量化采样。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch006.html">← 第 006 章：PPO的神经网络架构设计</a>
+    <a class="next" href="ch008.html">第 008 章：PPO的观测归一化与向量化环境 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

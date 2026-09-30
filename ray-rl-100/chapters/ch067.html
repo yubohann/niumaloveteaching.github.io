@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第067章 分布式超参调优 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第四篇 · Ray Tune 超参搜索</span>
+    <span class="sep">/</span>
+    <span>第 067 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第四篇 · Ray Tune 超参搜索</div>
+    <h1>第 067 章：分布式超参调优</h1>
+    <p class="lead">把搜索任务铺到多节点集群上，收益来自并行度，代价来自协调与数据搬运。本章讲透集群初始化与前置检查、driver 单点负载、共享存储约束、弹性伸缩的适用边界，以及用两点式测试判读扩展效率的方法。</p>
+    <ul class="meta">
+      <li>主题：Ray Tune 调优 / 多节点分布式运行</li>
+      <li>关键机制：集群初始化、driver 负载、共享存储、弹性伸缩、扩展效率</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 066 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>掌握分布式调优的启动流程：连接集群、盘点资源、校验共享存储、提交实验四步的顺序与要点。</li>
+      <li>理解 driver 进程的单点属性：它聚合全部试验结果，负载随试验数与上报频率增长，会先于计算资源成为瓶颈。</li>
+      <li>会判断弹性伸缩的适用边界：扩容时间与试验时长的量级关系决定弹性是否划算。</li>
+      <li>掌握自定义资源标签与节点亲和，把大显存试验定向到匹配节点。</li>
+      <li>会用两点式扩展测试（50% 节点、100% 节点各跑一批）判读并行效率并定位瓶颈环节。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>当试验总数与单试验资源需求的乘积超过单机容量时，多节点成为必选项。分布式带来两种新的代价：<strong>协调代价</strong>与<strong>搬运代价</strong>。协调代价集中在 driver 进程：全部试验的调度循环、结果聚合、检查点索引都由它维护；搬运代价集中在网络与共享存储：采样数据、检查点、日志都要跨节点流动。算力增加时，这两类代价不会同比例增长，收益因此存在上限。</p>
+    <p>上一章处理单机内的装箱，本章处理多机之间的调度。核心问题是找到“扩展的有效区间”：在什么规模以内加节点接近线性收益，超过之后边际收益被哪个环节吃掉。回答这个问题需要可判读的测试方法，凭感觉扩容无法定位收益消失的环节。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 集群角色与 driver 单点</h3>
+    <p>Ray 集群由头节点（Head Node）与工作节点（Worker Node）组成。调优实验的 driver（运行 <code>tune.run</code> 的进程）默认运行在头节点，试验被调度到任意节点执行。<strong>driver 维护全部试验的状态与结果流，它的负载与“试验数 × 上报频率”成正比。</strong>上报频率由训练循环的节奏决定：每迭代上报一次、迭代仅需数秒时，120 个并发试验每秒给 driver 送去数十条结果记录，驱动的调度循环与状态写入会占用可观 CPU。缓解手段有三类：降低上报频率（合并细粒度指标）、控制并发试验数、把 driver 日志级别调低。</p>
+    <div class="formula">
+      driver 输入负载 ≈ 活跃试验数 × 每试验每秒上报条数
+      <span class="note">120 个试验每 5 秒各上报一次约 24 条/秒，尚可；每试验每秒多条时，调度循环延迟开始可见</span>
+    </div>
+
+    <h3>2. 共享存储是分布式恢复的前提</h3>
+    <p>各节点的本地路径互相隔离，头节点上的目录不会自动出现在工作节点。实验目录、检查点与状态文件必须放在共享文件系统或对象存储上：<strong>存储路径在所有节点上可解析，是“试验迁移后能继续”的前提。</strong>第 064 章的远端同步在这一层的角色是把本地写入周期性地复制到共享位置，减少对共享文件系统实时写性能的依赖。选择实时共享挂载还是“本地写 + 周期同步”，取决于共享存储的时延：网络文件系统时延高时，周期同步更稳；对象存储只能走同步路径。</p>
+
+    <h3>3. 弹性伸缩的适用边界</h3>
+    <p>弹性伸缩（Autoscaling）按未满足的资源请求增加或释放节点。它有两个时间尺度：扩容是分钟级动作（节点启动、加入、资源注册），试验是迭代级动作（数分钟到数小时）。<strong>当单试验时长与扩容时间同量级时，弹性会引入抖动：节点刚就绪，试验已接近完成，缩容信号紧接着触发。试验时长显著大于扩容时间（例如数倍）时，弹性才稳定发挥。</strong>短试验批次的场景适合固定池：预先申请足量节点，跑完释放。</p>
+
+    <h3>4. 异构节点与定向调度</h3>
+    <p>集群里的节点常不一致：显存规格不同、CPU 与 GPU 配比不同。默认调度按“有卡即用”分配，可能把大模型试验放到小显存节点上直接失败。<strong>定向调度用自定义资源标签实现：启动节点时声明标签与数量，试验声明同时请求该标签，调度器便只会在匹配节点上放置它。</strong>标签的另一个用途是隔离：把交互式实验与批量搜索分到不同标签的子池，互不干扰。标签规划应在集群启动时完成，运行中改标需要重启节点。</p>
+
+    <h3>5. 扩展效率与端到端吞吐</h3>
+    <p>端到端吞吐由最慢的环节决定：采样吞吐、学习吞吐、检查点与结果写盘、driver 调度循环。加节点只提升并行部分，<strong>当某个共享环节成为瓶颈后（存储带宽、driver、对象存储的连接数），继续加节点不会提高整体完成速率，甚至因为争抢而下降。</strong>判读用两点式扩展测试：同样的一批试验分别用 50% 节点与 100% 节点各运行一次，比较完成时间。线性扩展时时间减半，实际效率 = 加速比 / 节点数比例。</p>
+    <div class="formula">
+      并行效率 E = (T<sub>50%</sub> / T<sub>100%</sub>) / 2
+      <span class="note">E 接近 1 说明瓶颈未出现；E 明显低于 0.6 时优先排查 driver 负载、共享存储带宽与网络</span>
+    </div>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>分布式调优的落地按“盘点、校验、提交、判读”四步执行。与上一章的差异在于，第 066 章把资源摆进单个节点，本章把节点组成的池子接通并保证数据可达。</p>
+    <ol>
+      <li><strong>盘点</strong>：读取集群资源总量与标签，用第 066 章的并发预算公式计算可达并发，核对目标试验数是否被容量支持。</li>
+      <li><strong>校验</strong>：确认实验目录位于共享存储、各节点时钟与依赖版本一致、同步目标可达。</li>
+      <li><strong>提交</strong>：低并发预热 2 至 3 个试验验证全链路，再按目标并发启动正式搜索。</li>
+      <li><strong>判读</strong>：运行中监控队列长度与 driver 负载；收尾时做两点式扩展测试，为下一次搜索定规模。</li>
+    </ol>
+    <table>
+      <tr><th>环节</th><th>瓶颈信号</th><th>缓解手段</th></tr>
+      <tr><td>driver</td><td>调度循环延迟、结果写入排队</td><td>降低上报频率、控制并发、关闭高频调试日志</td></tr>
+      <tr><td>共享存储</td><td>检查点写入等待、同步落后</td><td>调大同步周期、减少检查点体积、分级保留</td></tr>
+      <tr><td>网络</td><td>采样传输延迟、跨节点试验变慢</td><td>严格打包、就近放置、压缩观测传输</td></tr>
+      <tr><td>弹性伸缩</td><td>扩缩抖动、节点刚就绪任务已结束</td><td>固定池、拉长试验批次、合并小任务</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：为什么预热试验要放在低并发？</span>
+      <p>分布式链路的故障面比单机大：路径解析、权限、版本、同步配置任一环节出错，都会在并发启动时以“成批试验同时失败”的形式呈现，排查成本高。低并发预热用 2 至 3 个试验逐项验证链路，确认检查点写入共享存储、恢复路径可读、日志聚合正常后再放大并发，把故障暴露在最小代价的时刻。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：连接集群与前置检查</strong></p>
+    <pre class="code"><code>import os
+import ray
+from ray import tune
+
+# 集群模式：连接既有集群；driver 运行在头节点
+ray.init(address="auto")
+
+# 资源盘点：把总量打印出来，与并发预算对照，避免声明超过容量
+res = ray.cluster_resources()
+total_cpu = res.get("CPU", 0)
+total_gpu = res.get("GPU", 0)
+print(f"集群资源：{total_cpu:.0f} 核 / {total_gpu:.0f} 卡")
+if total_cpu &lt; 32 or total_gpu &lt; 4:
+    raise RuntimeError("资源少于预期，检查节点是否全部加入")
+
+# 存储校验：实验目录必须位于所有节点可解析的共享路径
+shared_dir = "/shared/tune_results"
+if not os.path.isdir(shared_dir):
+    raise RuntimeError("共享目录不可用，先修复挂载再提交实验")
+
+tune.run(
+    train_fn,
+    storage_path=shared_dir,   # 状态与检查点写入共享存储
+    name="dist_ppo_sweep",
+    num_samples=120,
+    max_concurrent_trials=24,
+    config=search_space,
+)</code></pre>
+    <p>解读：前置检查把三类事故挡在实验启动之前。<strong>（1）</strong><code>ray.cluster_resources</code> 给出的是已加入集群的节点汇总；节点掉线或未启动时数值低于预期，此时提交实验只会得到大面积排队。<strong>（2）</strong>两个断言分别对应“资源不足”与“存储不可达”，它们是最常见的分布式起点失败。<strong>（3）</strong><code>storage_path</code> 指向共享挂载点后，试验迁移与驱动重启都能续上进度；路径写法保持一致（有些环境里挂载点名称在不同节点上不同，统一用符号链接固化）。接口名与集群命令随版本演进，以对应版本的官方文档为准。</p>
+
+    <p><strong>片段 2：自定义资源标签与定向调度</strong></p>
+    <pre class="code"><code>from ray import tune
+
+# 集群启动阶段为节点打标（在节点启动脚本中执行一次）：
+# 大显存节点：ray start --address=head:6379 --resources='{"big_gpu": 2}'
+# 普通节点保持默认资源，不加标签
+
+# 大模型试验：同时请求 GPU 与 big_gpu 标签
+big_trial = tune.with_resources(
+    train_fn,
+    resources={"cpu": 8, "gpu": 1, "big_gpu": 1},
+)
+
+# 小模型试验：只请求基础资源，可落到任意节点
+small_trial = tune.with_resources(
+    train_fn_small,
+    resources={"cpu": 4, "gpu": 0.5},
+)
+
+# 两类试验分开提交：各自的声明决定调度范围
+tune.run(big_trial, name="big_model_sweep", num_samples=20,
+         config=search_space_big, storage_path="/shared/tune_results")
+tune.run(small_trial, name="small_model_sweep", num_samples=60,
+         config=search_space_small, storage_path="/shared/tune_results")
+</code></pre>
+    <p>解读：定向调度的两个要点在这段配置里可见。<strong>（1）</strong>标签在节点启动时声明，试验在资源字典里请求；调度器只把试验放到“声明了该标签且余量足够”的节点上。<b>（2）</b>标签请求是排他条件：节点必须同时满足全部键，标签打错或忘记给节点打标会让试验永久排队，表现为“资源看似充足却跑不起来”。<strong>（3）</strong>两类试验分成两个实验提交，各自的空间与并发独立配置，避免混合排队；若共用一份空间，建议改用 065 章的并发预算为两类分别设限。</p>
+
+    <p><strong>片段 3：两点式扩展效率测试</strong></p>
+    <pre class="code"><code>def scalability_report(t_half, t_full):
+    """两点式判读：一半节点与全部节点各跑同一批试验的完成时间。"""
+    speedup = t_half / t_full
+    efficiency = speedup / 2.0
+    print(f"加速比 {speedup:.2f}，并行效率 {efficiency:.0%}")
+    # 效率阈值给两条观察线：低于 0.6 先查共享环节，高于 0.8 可继续扩容
+    if efficiency &lt; 0.6:
+        print("低效区间：依次排查 driver 负载、共享存储带宽、网络")
+    elif efficiency &gt;= 0.8:
+        print("高效区间：扩容边际收益仍高")
+    return efficiency
+
+# 同一批 40 个试验的两次实测（单位：分钟）
+scalability_report(t_half=90.0, t_full=52.0)   # 效率约 87%，扩展良好
+scalability_report(t_half=90.0, t_full=80.0)   # 效率约 56%，存在共享瓶颈
+</code></pre>
+    <p>解读：函数把扩展性讨论变成两次运行的对照实验。<strong>（1）</strong>两次运行必须使用同一批试验（相同试验数、相同预算、相同种子策略），否则比较失去意义；建议用固定的试验清单与随机顺序执行。<strong>（2）</strong>两条输出线给出行动建议：高效区可继续扩容；低效区按“driver、存储、网络”的顺序排查，因为这三者的修复成本依次上升。<strong>（3）</strong>效率介于 0.6 与 0.8 之间的灰色区不自动给建议：先看瓶颈信号（队列长度、写入等待），再做单环节优化后复测。实测数值取自具体环境，换任务后需重测。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>实验目录落在节点本地盘</strong>：试验迁移后找不到状态与检查点，恢复能力归零。症状是节点故障后出现成批“从零开始”的试验。修复：统一共享存储路径并做前置校验。</li>
+      <li><strong>头节点同时运行大量试验</strong>：driver 与试验争抢头节点资源，调度循环变慢，形成“越忙越慢”的正反馈。修复：头节点保持轻载，大试验定向到工作节点。</li>
+      <li><strong>盲目开启弹性伸缩</strong>：试验时长与扩容时间同量级，扩缩信号反复触发，试验在节点迁移中反复暂停恢复。修复：短试验批次用固定池，长试验再考虑弹性。</li>
+      <li><strong>标签请求写错导致永久排队</strong>：拼写错误或节点未打标时，试验永远等不到匹配节点。症状是队列长时间不动、资源充足。修复：提交前用资源盘点接口验证标签存在。</li>
+      <li><strong>结果上报频率过高压垮 driver</strong>：训练迭代很短的试验每秒上报多条记录，群起写入使调度循环延迟可见。修复：合并细粒度指标、降低上报频率、必要时减少并发试验数。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>算一算：集群 8 节点、每节点 32 核 2 卡，单试验声明 CPU 8 核、GPU 0.5 块，算法上限设为 20。可达并发与最终并发各是多少？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>CPU 方向 256/8=32；GPU 方向 16/0.5=32；资源上限 32，减一档缓冲 31，与算法上限 20 取小，最终并发 20。</div></details>
+      </li>
+      <li>预测题：试验数从 60 提到 120、节点从 4 加到 8，在 driver 上报负载接近饱和的情况下，完成时间如何变化？哪个环节先出问题？<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>计算侧接近线性，但 driver 的调度循环与结果写入延迟上升，完成时间改善低于预期；先出问题的是 driver，其次可能是共享存储写入。判据是队列长度与上报间隔的偏差。</div></details>
+      </li>
+      <li>设计题：把一次 80 个试验的贝叶斯搜索改造成两组独立小组（各 40 个、独立建议机制）在集群上并行，最后合并结果。说明这种分片在何种算法或并发约束下值得使用，以及合并时需要注意什么。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>当建议机制的并行上限低于集群容量时值得分片；合并需统一指标口径与试验标识命名空间，并注意两组的前沿或 top-K 不能直接对比绝对排名，应先按同预算聚合。</div></details>
+      </li>
+      <li>推导题：建立端到端吞吐模型：采样吞吐 R<sub>s</sub>、学习吞吐 R<sub>l</sub>、存储写入带宽 R<sub>io</sub>，推导系统吞吐上限，并解释为什么扩容到某一点后吞吐不再提升。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>上限 min(R_s, R_l, R_io, R_driver)。采样与学习可随节点数提升，存储与 driver 是共享环节，固定不变；当共享环节成为最小值后，继续加节点不会改变上限，只会增加竞争开销。</div></details>
+      </li>
+      <li>实践题：设计一次两点式扩展测试：定义固定试验清单、两次运行的节点配置、要记录的三个指标（完成时间、队列长度曲线、driver 负载），并给出判读标准。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>指标记录应覆盖“结果与过程”：完成时间给结论，队列长度与 driver 负载给归因。判读标准先看效率分档，再看两类曲线的形态是否与瓶颈假设一致。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>分布式调优按“盘点、校验、提交、判读”四步执行；预热试验在低并发下验证全链路。</li>
+      <li>driver 是单点：负载随试验数与上报频率增长，往往先于计算资源成为瓶颈。</li>
+      <li>共享存储是恢复与迁移的前提；实时挂载与周期同步的选择取决于存储时延。</li>
+      <li>弹性伸缩的适用边界由扩容时间与试验时长的量级关系决定；短试验批次优先固定池。</li>
+      <li>自定义资源标签实现定向调度与子池隔离，标签验证应放进提交前检查。</li>
+      <li>扩展效率用两点式测试判读，效率低于 0.6 时按 driver、存储、网络的顺序排查。</li>
+      <li>下一章转入结果侧：实验可视化与列表、曲线、散点的判读方法。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch066.html">← 第 066 章：资源分配与GPU使用调优</a>
+    <a class="next" href="ch068.html">第 068 章：实验可视化与结果分析 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第065章 实现仿真到现实迁移 | 机器人仿真学习课程 · Isaac Sim 强化学习训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第三篇 · 高级强化学习专题</span>
+    <span class="sep">/</span>
+    <span>第 065 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第三篇 · 高级强化学习专题</div>
+    <h1>第 065 章：实现仿真到现实迁移</h1>
+    <p class="lead">把仿真里练成的策略"搬"到真机上：本章聚焦迁移的总管线与部署机制，延迟、执行器动力学、接口对齐与安全包络，四连章的第一站。</p>
+    <ul class="meta">
+      <li>主题：Sim2Real / 迁移策略与部署</li>
+      <li>相关组件：Isaac Sim / Isaac Lab / PyTorch / ROS 2（部署侧）</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 064 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>会用 MDP 的语言形式化仿真到现实（Sim2Real）迁移，区分观测偏移、动力学偏移、执行器偏移、时延偏移四类差距。</li>
+      <li>理解延迟为什么破坏闭环稳定性（相位裕度视角），并在仿真中注入延迟训练抗延迟策略。</li>
+      <li>掌握执行器一阶滞后模型：为什么理想力矩源会让策略在真机上震荡。</li>
+      <li>会写一份"接口对齐检查清单"，把观测顺序、单位、坐标系、动作反归一化逐项核对。</li>
+      <li>会设计分阶段部署流程与安全包络（速率限制、限幅、看门狗），并定义迁移验收指标。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>Isaac Sim 里训练出一个抓取成功率 95% 的策略，接到真机上成功率腰斩甚至直接震荡，这是每个具身智能团队都要过的坎。九十年代到现在的工程经验表明：<strong>大多数初次迁移失败的原因在于部署管线里的"最后一公里"没对齐</strong>：关节顺序错了一个、延迟没建模、电机跟不上指令、安全滤波器与策略互相冲突。</p>
+    <p>本章是 Sim2Real 四连的总纲与落地篇：先建立差距分类的框架（后续三章各自深入，第 066 章讲域随机化训练、第 067 章讲系统辨识、第 068 章讲差距测量），然后集中解决<strong>延迟、执行器、接口、安全</strong>四件部署工程问题。学完你会得到一条可执行的迁移检查表。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. Sim2Real 的形式化：两个不同的 MDP</h3>
+    <p>策略 π 在仿真 MDP M<sub>sim</sub> = (S, A, P<sub>sim</sub>, R) 上优化，部署环境是 M<sub>real</sub> = (S, A, P<sub>real</sub>, R)。迁移性能差写为：</p>
+    <div class="formula">
+      ΔJ = J(π; M<sub>real</sub>) − J(π; M<sub>sim</sub>) = 期望回报在真实世界中的落差
+      <span class="note">M<sub>sim</sub> 与 M<sub>real</sub> 的差异越集中在策略敏感的方向，ΔJ 越大</span>
+    </div>
+    <p>差距分解为四类，后续章节将逐类处理：</p>
+    <table>
+      <tr><th>差距类型</th><th>典型来源</th><th>本章处理方式</th></tr>
+      <tr><td>观测偏移</td><td>传感器噪声、标定误差、时钟不同步</td><td>接口对齐清单 + 噪声注入（第 068 章量化）</td></tr>
+      <tr><td>动力学偏移</td><td>质量/摩擦/惯量参数不准</td><td>系统辨识（第 067 章）+ 域随机化（第 066 章）</td></tr>
+      <tr><td>执行器偏移</td><td>电机带宽有限、摩擦、饱和</td><td>本文：一阶滞后模型注入仿真</td></tr>
+      <tr><td>时延偏移</td><td>传感/通信/推理/执行链路延迟</td><td>本文：延迟队列 + 抗延迟训练</td></tr>
+    </table>
+    <p>关键判断：<strong>闭环反馈能吸收小幅、零均值的扰动，但会放大系统性偏差和延迟</strong>。例如摩擦被仿真低估了 20%，控制器会持续输出偏大的指令去"凑"目标位置，表现为跟踪误差与能量超支；而纯延迟 e<sup>−τs</sup> 的相位损失在穿越频率处与一阶惯性环节等价，τ 越大稳定裕度越小。</p>
+
+    <h3>2. 延迟预算：每个毫秒都要记账</h3>
+    <p>从"关节运动"到"策略看到"的路径上，延迟逐项累加：传感器采样与滤波（3–8 ms）、总线/ROS 通信（1–5 ms）、观测拼接（0.5 ms）、神经网络推理（1–5 ms）、动作解包与安全滤波（0.5 ms）、驱动器电流环（1–2 ms）。60 Hz 控制下总延迟常常达到 <strong>20–40 ms，相当于 1–2 个控制周期</strong>。为什么这很危险？二阶系统的闭环带宽若约 5 Hz（云台类 0.2 s 时间常数），20 ms 延迟带来的相位滞后约 36°，已经吃掉一般设计 45° 裕度的八成。工程准则：<strong>延迟 τ 应小于闭环时间常数的 1/4，否则要么降增益、要么在训练时就把延迟喂给策略</strong>。</p>
+    <div class="formula">
+      相位滞后 ≈ 2π f · τ（rad）；f=5 Hz、τ=20 ms 时约 0.63 rad ≈ 36°
+      <span class="note">纯延迟不改变幅值，只损失相位，这正是它难以从数据上"看出来"的原因</span>
+    </div>
+
+    <h3>3. 执行器：真实电机不是理想的力矩源</h3>
+    <p>仿真里你若直接把力矩指令交给关节，电机瞬间响应；真实电机有电流环带宽（典型 100–500 Hz）、减速器摩擦与背隙，等效成一个带饱和的一阶滞后：</p>
+    <div class="formula">
+      τ<sub>act</sub>(t) = clip( τ<sub>act</sub>(t−Δt) + (Δt/T)(τ<sub>cmd</sub> − τ<sub>act</sub>(t−Δt)), −τ<sub>max</sub>, τ<sub>max</sub> )
+      <span class="note">T 为等效时间常数（常见 5–20 ms）；Δt 为仿真步长</span>
+    </div>
+    <p>把这个模型加进仿真再训练，策略会自动学会"提前量"与"别猛冲"：因为超过 T 的快速指令根本传不到关节。经验数据：<strong>不建模执行器直接迁移，四足高频步态的扭矩振荡是主要失败模式；加入 T=10 ms 滞后模型重训后，真机足端轨迹跟踪误差通常能降 30–50%</strong>（具体取决于硬件与频率）。</p>
+
+    <h3>4. 接口纪律：迁移的 80% 是工程对齐</h3>
+    <p>仿真里"观测 45 维"没有歧义；真机上这 45 维的构造方式必须逐项定义：关节顺序（同 URDF 的关节索引表）、角度单位（弧度）、坐标系（世界/基座/工具）、四元数顺序（wxyz vs xyzw）、速度滤波与单位、上一动作的存放位置。任何一项错位，策略收到的输入就是"乱码"。动作侧同理：策略输出归一化到 [−1, 1]，需按每个关节的物理量程反归一化（例如 ±2.9 rad、力矩 ±87 N·m），量程表必须在仿真与真机之间共享同一份配置。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>迁移管线分"仿真侧改造 → 部署侧实现 → 分阶段验证"三段：</p>
+    <ol>
+      <li><strong>仿真侧改造</strong>（训练前完成，三条都做）：注入延迟，把动作延迟 1–2 个控制步、观测延迟 1 步；注入执行器模型，一阶滞后 + 饱和；对齐量程，动作空间严格使用真机量程反归一化。完成后重新训练，观察策略是否学会"动作收敛、不过冲"。</li>
+      <li><strong>部署侧实现</strong>：单一控制进程 + 环形延迟缓冲；策略用 TorchScript 导出并在目标设备上做一次"数值一致性测试"（同一批输入，仿真侧与部署侧输出差值应小于 1e-5）；观测构造沿用仿真同一份索引表与归一化参数（导出为 JSON 供两端读取）。</li>
+      <li><strong>安全包络</strong>：动作速率限制（相邻步变化不超过 ±0.025 rad/步，约 ±1.5 rad/s）、关节位置软限位（距硬限位 5° 开始衰减指令）、力矩限幅（电机额定值的 80%）、看门狗（200 ms 无新动作则回零位保持）。</li>
+      <li><strong>分阶段验证</strong>：悬挂测试（机器人吊起、末端自由）→ 低速空载（指令频率降为 1/3）→ 全速空载 → 接触任务（软物体开始）。每阶段定义进入下一阶段的通过条件，例如低速阶段要求跟踪误差 RMS 小于 1 cm。</li>
+      <li><strong>验收指标</strong>：20 次重复试验的成功率、末端跟踪误差 RMS、峰值接触力（应低于安全阈值）、单次决策延迟 P95（应在预算内）。</li>
+    </ol>
+    <div class="box key">
+      <span class="box-title">设计思维：为什么延迟要"注入到训练里"？</span>
+      <p>部署侧能补偿的只有已知的固定延迟（如动作队列补偿一步），而真实延迟随总线负载抖动。把延迟分布（1–2 步随机）放进训练，策略学到的"提前量"是对整个延迟分布稳健的；这属于第 066 章域随机化思想在时序维度上的特例，也是 Sim2Real 里性价比最高的一项改造。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：仿真侧延迟注入 + 执行器一阶滞后的物理步进包装</strong></p>
+    <pre class="code"><code>import numpy as np
+
+class DelayActuatorWrapper:
+    """在 Isaac Sim 环境外层再包一层：动作先过延迟队列，再过执行器模型。"""
+    def __init__(self, env, dt=1.0 / 60.0, tau_act=0.010, max_delay_steps=2):
+        self.env = env
+        self.dt = dt
+        self.T = tau_act                       # 电机等效时间常数 10 ms
+        self.joint_tau = np.zeros(env.action_dim)   # 当前实际输出的力矩状态
+        self.delay_queue = [np.zeros(env.action_dim) for _ in range(max_delay_steps)]
+
+    def step(self, action):
+        # 1) 延迟：策略刚发出的动作要过 1~2 步才生效，模拟通信+执行链路滞后
+        self.delay_queue.append(np.asarray(action, dtype=np.float32))
+        delayed = self.delay_queue.pop(0)      # 固定队列长度 = 固定延迟，训练后策略有提前量
+        # 2) 执行器动力学：一阶滞后逼近指令 + 力矩饱和，真实电机做不到瞬时响应
+        alpha = self.dt / (self.T + self.dt)   # 离散化系数：T=10ms、dt=16.7ms 时 alpha≈0.625
+        target = np.clip(delayed, -1.0, 1.0)   # 指令先归一化域限幅
+        self.joint_tau = (1 - alpha) * self.joint_tau + alpha * target
+        return self.env.step(self.joint_tau)</code></pre>
+    <p>解读：包装器放在环境外层，是为了在 Isaac Sim 的批量步进上叠加。<strong><code>alpha = dt/(T+dt)</code> 是后向欧拉离散的结果</strong>，T 越大（电机越慢）alpha 越小、响应越迟钝，这正是真机上的行为。用"归一化域限幅"，是因为下游环境自己会把动作映射到物理单位；保持一致的动作域是防止双重缩放错误的关键。延迟队列取固定长度作为训练的基线配置：先让策略适应"确定性延迟"，再在练习里改成随机 1–2 步。注意 <code>pop(0)</code> 对 list 是 O(n)，n=2 时无所谓；若延迟步数设到 8 以上，应改用定长的 <code>collections.deque</code>。</p>
+
+    <p><strong>片段 2：部署侧控制循环，观测延迟对齐、速率限制与看门狗</strong></p>
+    <pre class="code"><code>import time
+from collections import deque
+
+class DeployLoop:
+    """真机侧主循环。核心纪律：观测构造与动作下发与仿真完全同构。"""
+    def __init__(self, policy, robot, cfg, dt=1.0 / 60.0):
+        self.policy, self.robot, self.cfg = policy, robot, cfg
+        self.dt = dt
+        self.obs_queue = deque(maxlen=2)       # 观测延迟缓冲：真机常延迟 1 步才拿到完整观测
+        self.last_action = None
+        self.last_alive = time.time()          # 看门狗时间戳
+
+    def step_once(self):
+        t0 = time.perf_counter()
+        if time.time() - self.last_alive &gt; 0.2:  # 看门狗：上一周期严重超时（策略/通信卡顿）则安全保持
+            self.robot.hold_position()
+            self.last_alive = time.time()
+            return
+        obs = self.robot.read_observation()    # 顺序、单位、坐标系由共享 JSON 保障
+        self.obs_queue.append(obs)
+        obs_used = self.obs_queue[0] if len(self.obs_queue) &gt; 1 else obs
+        a_norm = self.policy.act(obs_used)     # 归一化动作，与训练动作域一致
+        a = self.robot.denormalize(a_norm)     # 反归一化到物理单位（rad / N·m）
+        if self.last_action is not None:       # 速率限制：真机安全的第一道闸
+            delta = self.cfg.max_dq * self.dt
+            a = self.last_action + (a - self.last_action).clip(-delta, delta)
+        self.robot.send_action(a)
+        self.last_action = a
+        self.last_alive = time.time()          # 心跳：每个完整周期刷新，供看门狗监测
+        time.sleep(max(0.0, self.dt - (time.perf_counter() - t0)))  # 锁定控制周期</code></pre>
+    <p>解读：<code>obs_queue</code> 刻意保留"旧观测"喂给策略，是为了<strong>与训练时的观测延迟保持一致</strong>，如果训练时尚无观测延迟、部署侧凭空加了延迟，分布就对不上了。速率限制的物理意义：60 Hz 下 <code>max_dq=1.5 rad/s</code> 限制的是"每秒动作变化"，防止策略抖动直接变成关节抖动，代价是跟踪高频指令的能力下降，所以要从宽到紧逐步收紧。看门狗是最后防线：策略进程卡死或通信中断时机器人必须停止，不能保持最后一帧继续输出。循环末尾的 <code>sleep</code> 保证周期稳定，控制周期抖动本身也是一种"隐式延迟"，会破坏策略的时间假设。</p>
+
+    <p><strong>片段 3：模型导出与一致性校验</strong></p>
+    <pre class="code"><code>import torch
+
+def export_and_check(policy, example_obs, path="policy_ts.pt", tol=1e-5):
+    """导出 TorchScript 并在导出前后做数值一致性测试：迁移前必做。"""
+    policy.eval()
+    with torch.no_grad():
+        ref = policy.act_mean(example_obs)          # 导出前参考输出（确定性均值）
+    traced = torch.jit.trace(policy.act_mean, example_obs)
+    traced.save(path)                               # 部署端只加载该文件，避免依赖训练代码
+    with torch.no_grad():
+        out = traced(example_obs)
+    err = (out - ref).abs().max().item()
+    assert err &lt; tol, f"导出前后输出不一致: {err}"     # 不一致通常源于动态控制流
+    # 补充检查：约定输入契约（维度、dtype、归一化）并写入共享配置
+    contract = {"obs_dim": int(example_obs.shape[-1]), "dtype": "float32",
+                "obs_normalized": True, "action_normalized": True}
+    return contract</code></pre>
+    <p>解读：<code>torch.jit.trace</code> 把网络固化为静态图，部署端不需要 Python 训练环境；但<strong>trace 只记录被示例输入走过的分支</strong>，如果你的策略里有 <code>if</code> 动态控制流，务必显式验证。一致性断言是这个片段的核心价值：把"接口错觉"消灭在训练机旁边，避免留到真机复现。输入契约写进共享 JSON，和观测索引表、归一化统计一起构成"两端唯一真相源"，这是防止第 4 节说的 45 维乱码的工程手段。若部署目标是 TensorRT/ONNX，同理要做导出前后一致性检查与延迟测量（取 P95）。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>关节顺序不一致</strong>：仿真里关节按 URDF 索引排列，真机 SDK 按电机 ID 排列，装备时没换映射。症状是机器人"癫痫式"乱动。修复：共享一份关节索引表 JSON，并在启动时做"单关节小幅摆动、其余锁死"的逐关节验证。</li>
+      <li><strong>动作域双重缩放</strong>：策略输出已是物理力矩，安全层又乘了一次量程。症状是力矩量级错成应有值的 87 倍或 1/87。修复：约定"策略输出永远是归一化值"，反归一化只在一个函数里做。</li>
+      <li><strong>训练未注入延迟，部署延迟靠补偿硬扛</strong>：固定补偿在延迟抖动时会过冲。症状是周期性的"追-超-回"振荡。修复：训练时随机 1–2 步延迟，部署侧只做一步固定延迟对齐。</li>
+      <li><strong>安全滤波与新指令冲突</strong>：速率限制太紧时，策略的输出被持续截断，等价于换了动力学，跟踪失败还查不出原因。症状是低速正常、一提速就崩。修复：记录被截断的比例（&gt;10% 说明限制过紧或策略需重训），并让训练环境包含同样的限制。</li>
+      <li><strong>用均值延迟评估、上线后被 P95 延迟放倒</strong>：平均 20 ms 不代表最坏 60 ms。症状是偶发失控且难以复现。修复：测量延迟分布，用 P95/P99 做预算设计，并让训练覆盖延迟上界。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把执行器时间常数 T 从 0 调到 10 ms、20 ms 各训练一次，画出"真机跟踪误差 vs T"的曲线，并解释 T 增大时策略学会了什么。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>观察动作频谱：T 大时策略倾向输出更平滑、更提前的指令，高频分量被自然抑制。</div></details>
+      </li>
+      <li>在部署循环里去掉速率限制跑一次悬挂测试（末端自由、低速指令），记录停止距离与振荡幅度，再恢复限制对比。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>务必从低速开始；对比两次的关节速度峰值，理解"安全包络保护的是硬件不是指标"。</div></details>
+      </li>
+      <li>设计延迟预算表：列出你手上系统从传感器到执行器的每一项延迟与测量方法，标出 P95 值，判断是否满足"τ 小于闭环时间常数 1/4"。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>用"同一事件双端打点"法测端到端延迟：让关节做一个阶跃，真机记录动作时间戳、策略端记录收到该观测的时间戳。</div></details>
+      </li>
+      <li>写一个"接口对齐检查脚本"：自动对比仿真与部署两侧的观测长度、关节顺序、单位与归一化统计，输出差异清单。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>让两端各自导出 JSON（索引、量程、均值方差），脚本逐字段 diff；把"通过检查"作为数据采集的前置条件。</div></details>
+      </li>
+      <li>把延迟从固定 1 步改成随机 0–2 步重训，预测并验证策略在延迟抖动下的性能方差变化。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>评测时扫延迟 0/1/2/3 步画性能曲线；随机化训练的策略曲线应更平，但最优点的绝对值可能略降。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>Sim2Real 落差 ΔJ 分为观测/动力学/执行器/时延四类；闭环能消化小扰动，放大系统偏差与延迟。</li>
+      <li>延迟按相位算账：20 ms 在 5 Hz 带宽上就是 36° 相位损失，必须进训练；只在部署侧做补偿不解决问题。</li>
+      <li>执行器用一阶滞后 + 饱和建模（T 常取 5–20 ms），把它加进仿真重训，策略自动学会提前量与平滑。</li>
+      <li>迁移 80% 是接口工程：观测索引、单位、坐标系、动作反归一化、共享配置，全部要有"唯一真相源"。</li>
+      <li>安全包络四件套：速率限制、软限位、力矩限幅、看门狗；用分阶段验证与量化指标定义"迁移完成"。</li>
+      <li>下一章把迁移的"训练侧武器"展开：域随机化，不追求把仿真调到最准，目标转向让策略见过足够宽的动力学分布。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch064.html">← 第 064 章：实现多模态融合</a>
+    <a class="next" href="ch066.html">第 066 章：实现域随机化迁移 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

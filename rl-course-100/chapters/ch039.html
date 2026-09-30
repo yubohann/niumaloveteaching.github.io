@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第039章 SAC的观测归一化 | 深度强化学习课程 · PPO、SAC 与多智能体系统</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 离策略方法与 SAC</span>
+    <span class="sep">/</span>
+    <span>第 039 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 离策略方法与 SAC</div>
+    <h1>第 039 章：SAC的观测归一化</h1>
+    <p class="lead">Pendulum 的角速度跨度是 ±8，角度却在 ±1，同一个网络第一层要同时吃下两种量纲。用 Welford 在线统计把观测逐维标准化，看看早期学习能快多少。</p>
+    <ul class="meta">
+      <li>主题：输入预处理 / 在线统计</li>
+      <li>关键公式：z<sub>i</sub> = clip( (x<sub>i</sub> − μ<sub>i</sub>) / σ<sub>i</sub>, −c, c )；Welford：μ ← μ + δ/n，M₂ ← M₂ + δ(x−μ)</li>
+      <li>预计学时：50 分钟</li>
+      <li>前置章节：第 038 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解输入特征尺度不一致为什么拖慢神经网络训练：第一层权重的梯度尺度与输入量级成正比。</li>
+      <li>实现基于 Welford 递推的在线均值/方差统计，把观测逐维标准化并裁剪。</li>
+      <li>掌握"回放池存原始观测、采样时用当前统计量归一化"的干净数据流，避免旧数据的尺度污染。</li>
+      <li>在 <code>Pendulum-v1</code> 上对比原始观测与归一化观测的评估回报、|Q| 与 theta_dot 维度估计标准差。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>神经网络的输入尺度会直接影响训练动力学。考虑第一层 h = Wx + b：如果某个输入维度 |x| 常常在 8 左右，而另一个在 1 左右，那么 W 对应大尺度的那部分列梯度天然大 8 倍，同一个学习率下，<strong>大尺度维度先学、小尺度维度迟迟学不动</strong>。Pendulum 的 [cosθ, sinθ, θ̇] 正好落在 [−1,1]、[−1,1]、[−8,8]。</p>
+    <p>理论上的解法很朴素：让每一维减均值、除标准差，把分布压到均值为 0、方差为 1。但强化学习里统计量不能提前算，你没有一批预先给定的数据，状态的分布还会随着策略改变。于是做法变成"边训练边统计"：用一条条观测在线更新均值与方差（Welford 递推），再用最新统计量归一化。</p>
+    <p>第 038 章改策略结构对付信息缺失；本章回到全观测 Pendulum，动的是<strong>数据进入网络之前的尺度</strong>，喂给网络的数值应该长什么样。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 标准化公式与裁剪</h3>
+    <p>对第 i 维观测 x<sub>i</sub>，用当前运行统计量 μ<sub>i</sub>、σ<sub>i</sub> 做标准化：</p>
+    <div class="formula">
+      ẑ<sub>i</sub> = (x<sub>i</sub> − μ<sub>i</sub>) / σ<sub>i</sub>，&nbsp; z<sub>i</sub> = clip(ẑ<sub>i</sub>, −c, c)
+      <span class="note">c 取 10：标准化后超过 10 倍标准差的值属于分布尾部，裁剪防止单点异常值冲击网络</span>
+    </div>
+    <p>μ 与 σ 由训练中见到的所有观测递推估计，因此它们反映的是"策略当前访问到的状态分布"。这也是一个提醒：<strong>归一化的统计量带着策略的偏置</strong>，早期访问得少的状态，估计自然粗糙。裁剪系数 c 取 10 是一个宽松阈值：标准化后的真实数据几乎都落在 ±5 以内，c=10 只拦截真正的异常值，同时又比"不裁剪"多一层保护。</p>
+
+    <h3>2. Welford 递推：为什么不用"累加再除"</h3>
+    <p>直接维护 Σx 与 Σx² 再算方差，在长训练里会遇到灾难性抵消（大数相减）。Welford 递推逐条更新，数值稳定且只需均值/方差两个数组：</p>
+    <div class="formula">
+      n ← n + 1<br>
+      δ = x − μ<br>
+      μ ← μ + δ / n<br>
+      M₂ ← M₂ + δ·(x − μ) &nbsp;&nbsp;（σ² = M₂ / n）
+    </div>
+    <p>实现里把 var 存成"平方和 M₂"，读取时再除 n，这样每条观测只做几次向量运算，开销可以忽略。初始 n 取一个很小的常数（1e-4），避免第一步除以 0。</p>
+
+    <div class="box key">
+      <span class="box-title">数值例子：手推三步 Welford</span>
+      <p>取一维序列 x = [0.4, 0.6, 0.8]，从 μ=0、M₂=0、n=0 起步：</p>
+      <p><strong>第 1 条</strong>：n=1，δ=0.4，μ=0+0.4/1=0.4，M₂=0+0.4×(0.4−0.4)=0。此时 σ=0，实现里的 1e-8 兜底项在此刻起作用。</p>
+      <p><strong>第 2 条</strong>：n=2，δ=0.6−0.4=0.2，μ=0.4+0.2/2=0.5，M₂=0+0.2×(0.6−0.5)=0.02，σ²=0.01，σ=0.1。</p>
+      <p><strong>第 3 条</strong>：n=3，δ=0.8−0.5=0.3，μ=0.5+0.3/3=0.6，M₂=0.02+0.3×(0.8−0.6)=0.08，σ²=0.08/3≈0.0267，σ≈0.163。</p>
+      <p>核对：三条数据的均值确实为 0.6，总体标准差 (0.04+0+0.04)/3 开根号 ≈ 0.163，递推结果与"整批计算"完全一致。解读：<strong>每一步的计算量与一条观测成正比，不需要保存历史数据</strong>，这是在线统计能在几十万步训练里使用的根本原因。实际代码把 M₂ 初始化为 1、n 初始化为 1e-4，让最早期的 σ 落在 1 附近，起"保守估计"的作用，后续数据会迅速覆盖它。</p>
+    </div>
+
+    <div class="box key">
+      <span class="box-title">数值例子：梯度尺度失衡有多大</span>
+      <p>第一层对权重 W<sub>ij</sub> 的梯度是 ∂L/∂W<sub>ij</sub> = δ<sub>j</sub>·x<sub>i</sub>，与输入值成正比。Pendulum 的观测里：cosθ、sinθ 取值在 [−1, 1]，典型绝对值约 0.7；θ̇ 取值在 [−8, 8]，训练中期典型绝对值为 3～4。两类的梯度尺度比约为 4 : 0.7 ≈ 5.7 倍，极端时刻可以到 8 : 0.1 的量级。</p>
+      <p>标准化后，cosθ、sinθ 分布本就在 ±1 附近（μ≈0、σ≈0.7，标准化后典型值约 1），θ̇ 的估计标准差从 1 收敛到 2～3，标准化后同样落在约 ±1。解读：所有输入维度的典型尺度被拉平到同一量级，同一个学习率对每一维都"够用但不过猛"。这也解释了收益为什么集中在训练早期：后期网络能从数据里把尺度差异吸收进权重，归一化的相对优势随之缩小。</p>
+    </div>
+
+    <h3>3. 归一化放在数据流的哪个位置</h3>
+    <p>两种常见方案：<strong>(a) 入池前归一化</strong>，存进回放池的就是已标准化的观测，但池里混着不同时期统计量处理过的数据，口径不一致；<strong>(b) 采样后归一化</strong>（本章采用），池里始终是原始观测，训练时用"最新统计量"统一处理整批数据，口径一致。方案 (b) 的另一个好处是评估时可以复用同一份统计量，训练与评估的输入分布严格一致。</p>
+
+    <p>两种方案的取舍可以列成表：</p>
+    <table>
+      <tr><th>维度</th><th>(a) 入池前归一化</th><th>(b) 采样后归一化（本章）</th></tr>
+      <tr><td>池内数据的口径</td><td>不同时期统计量混合，含义不一致</td><td>始终为原始值，含义唯一</td></tr>
+      <tr><td>统计量更新时的语义</td><td>旧数据无法用新统计量重新解释</td><td>旧数据按当前统计量重新解释</td></tr>
+      <tr><td>评估复用</td><td>需要额外保存"入池时"的统计量</td><td>直接复用训练统计量，口径天然一致</td></tr>
+      <tr><td>实现成本</td><td>低，但口径问题隐蔽</td><td>略高，职责边界清晰</td></tr>
+    </table>
+
+    <h3>4. 预期收益的边界</h3>
+    <p>归一化优化的是优化景观的条件数，不是信息量。它让早期梯度不再被大尺度维度垄断，所以<strong>学习曲线前半段明显变陡</strong>；后期网络能把尺度自己学进权重，两种设置最终水平靠近。它是"加速器"，最终上限仍由算法本身决定。</p>
+
+    <h3>5. 条件数视角：归一化把优化椭圆的轴比压回 1</h3>
+    <p>把第一层看成一个线性回归问题，梯度下降的收敛速度由输入协方差矩阵的特征值分布决定：最大特征值限制可用学习率的上界，最陡方向与最平方向的收敛速度之比等于特征值之比的平方根。Pendulum 的三个观测维度里，cosθ 与 sinθ 的方差都在 0.5 上下，θ̇ 的标准差训练中期约 3～4，对应方差 9～16；协方差矩阵的条件数因此约为 18～32，等高线椭圆的长短轴之比约 4.2～5.7。学习率被大尺度方向卡住上限时，最平方向每步的收敛因子明显更慢，需要数倍的步数才能达到同等精度，这就是"小尺度维度学不动"的几何解释。逐维标准化把各方差都归到 1 附近，条件数降向 1，椭圆接近圆形，同一个学习率对每个方向都合适。这条推理也预告了收益的时间分布：早期条件数差异最突出，所以曲线前半段受益最明显。</p>
+
+    <h3>6. 数值边界：裁剪阈值与朴素算法的对照</h3>
+    <p>裁剪阈值 c=10 的宽松程度可以直接算：标准化后的数据近似服从标准正态，|z|&gt;1 的概率约 31.7%，也就是说 c=1 会截掉三成以上的数据，输入被大面积压扁；c=3 截掉约 0.27%；c=5 约 5.7×10<sup>−7</sup>；c=10 的截断概率约 1.5×10<sup>−23</sup>，工程上等于不截断，只拦真正的异常值。练习第 1 题里 clip=1 造成的明显劣化，就来自那三成数据的失真，而 clip=100 与 c=10 的实际表现基本相同。</p>
+    <p>Welford 的必要性也能用一组极端数字演示：取 x=[1000000.1, 1000000.2, 1000000.3]，真实方差约 0.00667。用 float32 按"平方的均值减均值的平方"计算，两个 10<sup>12</sup> 量级的数相减，结果得到 65536，是真实值的近一千万倍；换 float64 朴素算法，误差回到千分之几；而用 float64 保存 μ 与 M₂ 的 Welford 递推，得到 0.0066667，与真值逐位一致。实现里把统计量容器定为 float64，正是为了守住这条数值底线。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+
+    <h3>模块划分</h3>
+    <table>
+      <tr><th>组件</th><th>职责</th><th>关键点</th></tr>
+      <tr><td><code>RunningObsNormalizer</code></td><td>Welford 统计 + numpy/tensor 两种归一化入口</td><td>训练用 numpy 逐条 <code>observe</code>，批训练用 <code>normalize_tensor</code></td></tr>
+      <tr><td><code>ReplayBuffer.sample_raw()</code></td><td>返回原始观测张量</td><td>方法名强调"这里不做归一化"，防止读者误解数据流</td></tr>
+      <tr><td><code>SACAgent.update(batch, normalizer)</code></td><td>更新前把 obs / next_obs 归一化</td><td>obs 与 next_obs 必须用同一份统计量处理</td></tr>
+      <tr><td><code>evaluate(env, agent, episodes, normalizer)</code></td><td>用训练中统计量归一化评估观测</td><td>评估不更新统计量，避免评估数据回流训练</td></tr>
+      <tr><td><code>std_tail</code> 日志</td><td>记录 theta_dot 维度的估计标准差</td><td>直观展示统计量从 1 收敛到约 2～3 的过程</td></tr>
+    </table>
+
+    <h3>关键超参数</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用与取值理由</th></tr>
+      <tr><td><code>--obs-norms</code></td><td>none,run</td><td>本章唯一自变量：原始 vs 在线归一化</td></tr>
+      <tr><td><code>--clip</code></td><td>10.0</td><td>裁剪范围；太小会截掉真实极值，太大失去防异常意义</td></tr>
+      <tr><td><code>--max-steps</code></td><td>15000</td><td>两组共享；前期差距在这段预算里最容易观察</td></tr>
+      <tr><td><code>--batch-size</code> / <code>--lr</code></td><td>256 / 3e-4</td><td>沿用第二篇的默认配置</td></tr>
+      <tr><td><code>--eval-every</code></td><td>3000</td><td>同时输出统计量状态，便于解释曲线拐点</td></tr>
+    </table>
+
+    <h3>数据流</h3>
+    <p>每步：从环境拿到新观测 → <strong><code>normalizer.observe(next_obs)</code> 更新统计量</strong> → <strong>原始观测入回放池</strong> → 决策时用 <code>normalize()</code> 处理单条观测 → 训练时 <code>sample_raw()</code> 取原始批、<code>update</code> 内用 <code>normalize_tensor</code> 统一标准化 → 评估时复用同一份统计量、且<strong>不</strong>更新它。两组（none / run）只有 <code>enabled</code> 一个开关不同。</p>
+
+    <h3>与前一章的差异点</h3>
+    <ul>
+      <li>第 038 章动策略结构（MLP → GRU）；本章策略结构不变，只改<strong>观测进入网络前的数值处理</strong>。</li>
+      <li>新增 <code>RunningObsNormalizer</code> 类与"原始入池、采样归一化"的数据流。</li>
+      <li>回放池接口从 <code>sample()</code> 改为 <code>sample_raw()</code>，强调职责边界。</li>
+      <li>评估函数新增归一化参数；模型保存时连统计量一起存，否则加载模型后无法复现输入口径。</li>
+    </ul>
+
+    <h3>与批归一化（第 047 章）的分工</h3>
+    <p>本章处理的是网络<strong>输入层之前</strong>的尺度，统计量来自环境观测的运行均值与方差；第 047 章的批归一化处理的是网络<strong>内部激活</strong>的尺度，统计量来自每个批次内的样本。共同点是让数据尺度更整齐，差别在统计口径与作用位置：观测归一化跨时间累计、口径稳定，适合消除"不同维度量纲差"；批归一化按批统计、随训练波动，适合稳定深层网络的激活分布。两者可以叠加使用，但在本课程这种小网络上叠加收益有限，因为输入已经整齐，隐藏层激活的漂移本来就小。还有一处实践差别：观测归一化的统计量必须随模型一起保存，批归一化的统计由每批数据现算、不携带跨会话状态。</p>
+
+    <div class="box key">
+      <span class="box-title">统计量的"所有权"要唯一</span>
+      <p>训练循环里的那一份 <code>normalizer</code> 是所有消费方的唯一真相：决策、训练、评估都从它读。评估函数<strong>只读不写</strong>（不调用 <code>observe</code>），防止评估回合的观测污染统计量；<code>enabled=False</code> 时所有入口原样透传，于是 none 组根本不需要第二套代码路径。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：Welford 归一化器，整个实验的心脏</strong></p>
+    <pre class="code"><code>class RunningObsNormalizer:
+    """在线统计观测的均值与方差，逐维标准化后裁剪。"""
+
+    def __init__(self, dim, clip=10.0, enabled=True):
+        self.clip = clip
+        self.enabled = enabled
+        self.mean = np.zeros(dim, dtype=np.float64)
+        self.var = np.ones(dim, dtype=np.float64)   # 存的是 M2（平方和）
+        self.count = 1e-4          # 从极小值起步：防止第一步除以 0
+
+    def observe(self, obs):
+        """用一条新观测更新统计量（Welford 递推，数值稳定）。"""
+        if not self.enabled:
+            return
+        x = np.asarray(obs, dtype=np.float64)
+        self.count += 1.0
+        delta = x - self.mean
+        self.mean += delta / self.count             # 均值增量更新
+        self.var += delta * (x - self.mean)         # M2 增量更新（注意用的是新均值）
+
+    def std(self):
+        return np.sqrt(self.var / self.count + 1e-8)   # 1e-8 兜底：方差为 0 时不炸
+
+    def normalize(self, obs):
+        """标准化并裁剪；enabled=False 时原样返回。"""
+        if not self.enabled:
+            return np.asarray(obs, dtype=np.float32)
+        z = (np.asarray(obs, dtype=np.float64) - self.mean) / self.std()
+        return np.clip(z, -self.clip, self.clip).astype(np.float32)
+
+    def normalize_tensor(self, obs):
+        if not self.enabled:
+            return obs
+        mean = torch.as_tensor(self.mean, dtype=torch.float32)
+        std = torch.as_tensor(self.std(), dtype=torch.float32)
+        return torch.clamp((obs - mean) / std, -self.clip, self.clip)</code></pre>
+    <p>解读：把三十行拆成四个关注点看。<strong>（1）<code>observe</code> 的 Welford 递推：</strong><code>delta</code> 用的是更新<strong>前</strong>的均值算，<code>var</code> 的更新用的是更新<strong>后</strong>的均值，这个顺序是 Welford 公式的精确写法，写反了数值会漂。<code>float64</code> 累加也是刻意的：统计量要走几万步，精度值这点开销。<strong>（2）<code>std()</code> 每次现算</strong>：<code>var/count + 1e-8</code> 开根号，兜底项保证观测接近常数时不会除零。<strong>（3）两个归一化入口</strong>：<code>normalize()</code> 服务单条 numpy（决策与评估），<code>normalize_tensor()</code> 服务批次张量（训练），同一组 μ、σ，两种容器，为性能分工。<strong>（4）<code>enabled</code> 的透传</strong>：none 组整个类退化为"原样返回"，实验对比因此只差一个开关，两套代码分支被一并消掉。</p>
+
+    <p><strong>片段 2：原始入池，回放池的职责边界</strong></p>
+    <pre class="code"><code>    def sample_raw(self, batch_size):
+        """返回未经归一化的张量；归一化交给智能体按当前统计量处理。"""
+        idx = np.random.randint(0, self.size, size=batch_size)
+        return {
+            "obs": torch.as_tensor(self.obs[idx]),          # 原始观测，不是标准化后的
+            "act": torch.as_tensor(self.act[idx]),
+            "rew": torch.as_tensor(self.rew[idx]),
+            "next_obs": torch.as_tensor(self.next_obs[idx]),
+            "done": torch.as_tensor(self.done[idx]),
+        }</code></pre>
+    <p>解读：十行代码里没有任何算法，但方法名本身就是设计文档。<strong>（1）</strong>为什么返回原始观测？如果入池前就归一化，10 万条容量里会同时存在"用 3000 步统计量处理过"和"用 15000 步统计量处理过"的数据，同一维在不同条目里含义不同，网络学到的输入分布自相矛盾。<strong>（2）</strong>方法名特意选择 <code>sample_raw</code>：任何后续读代码的人都会停下来问"谁负责归一化"，答案是调用方（agent 用当前统计量）。<strong>（3）</strong>归一化的唯一时机是"消费时刻"，于是同一批原始数据在不同训练阶段会被赋予与当时统计量匹配的标准化值，这正是在线归一化想要的语义。</p>
+
+    <p><strong>片段 3：update 入口，obs 与 next_obs 必须同口径</strong></p>
+    <pre class="code"><code>    def update(self, batch, normalizer):
+        # 用当前统计量归一化观测（回放池里的原始观测不受影响）
+        obs = normalizer.normalize_tensor(batch["obs"])
+        next_obs = normalizer.normalize_tensor(batch["next_obs"])
+        act, rew, done = batch["act"], batch["rew"], batch["done"]
+
+        with torch.no_grad():
+            next_act, next_logp = self.policy.sample(next_obs)
+            q_next = torch.min(self.q1_target(next_obs, next_act),
+                               self.q2_target(next_obs, next_act))
+            target = rew + self.gamma * (1.0 - done) * (
+                q_next - self.current_alpha * next_logp)</code></pre>
+    <p>解读：归一化在 batch 进入计算图之前一次性完成，两个细节决定正确性。<strong>（1）</strong><code>obs</code> 与 <code>next_obs</code> 用<strong>同一个</strong> normalizer 处理：TD 目标里 Q(s′)、策略在 s′ 上采样、Q(s,a) 回归必须处在同一坐标系；若 s′ 用旧统计量、s 用新统计量，等价于把两个不同尺度的状态混在一张 Bellman 方程里。<strong>（2）</strong>归一化放在 <code>no_grad</code> 之外、图的起点：它是纯前处理，不引入任何可学习参数。（3）临时变量命名刻意区分 <code>obs</code>（归一化）与 <code>batch["obs"]</code>（原始），回放池里的数据始终没被改动。<strong>（4）</strong>注意动作、奖励、done 不需要归一化：动作空间的尺度由 tanh/act_scale 管理，奖励尺度在第 035 章的框架里讨论过，本章只动观测。</p>
+
+    <p><strong>片段 4：主循环，更新统计量先于入池</strong></p>
+    <pre class="code"><code>    for step in range(1, args.max_steps + 1):
+        if step &lt;= args.start_steps:
+            action = env.action_space.sample()
+        else:
+            obs_norm = normalizer.normalize(obs)          # 决策用最新统计量
+            action = agent.act(obs_norm, deterministic=False)
+
+        next_obs, rew, terminated, truncated, _ = env.step(action)
+        # 先更新统计量再存原始观测；采样时再按最新统计量归一化
+        normalizer.observe(next_obs)
+        buf.add(obs, action, rew, next_obs, float(terminated))
+        obs = next_obs
+        ep_ret += rew
+
+        if buf.size &gt;= args.batch_size:
+            last_stats = agent.update(buf.sample_raw(args.batch_size), normalizer)
+
+        if step % args.eval_every == 0 or step == args.max_steps:
+            eval_ret = evaluate(eval_env, agent, args.eval_episodes, normalizer)
+            history["eval_return"].append(eval_ret)
+            history["std_tail"].append(float(normalizer.std()[-1]))   # theta_dot 的 σ 估计</code></pre>
+    <p>解读：采样侧的三行顺序就是本章数据的"通关文牒"。<strong>（1）</strong><code>normalizer.observe(next_obs)</code> 在 <code>buf.add</code> 之前：统计量先看到新数据，再存原始值。这个顺序对结果影响极小，但保证"任何时刻用到的统计量都包含最近观测"。<strong>（2）</strong>注意 <code>observe</code> 只统计<strong>训练</strong>环境的观测；评估函数里的归一化只读不写，评估是"观察者"，数据不回流入训练。<strong>（3）</strong><code>std_tail</code> 记录 theta_dot 维度的估计标准差：它是 run 组独有的"体检指标"，从初值 1.0 上升到 2～3 之间并稳定，说明统计量在正常收敛；若长期停在 1.0，说明 <code>observe</code> 根本没执行。<strong>（4）</strong>none 组的 <code>normalizer</code> 处于 disabled 状态，上述所有调用都是透传，两组的控制变量保持唯一。</p>
+
+    <p>完整可运行脚本（附录）：<a href="../code/ch039.py" download>code/ch039.py</a></p>
+    <pre class="sh"><code>python code/ch039.py           # none vs run：CPU 约 5–8 分钟
+python code/ch039.py --quick   # 快速跑通：约 1 分钟
+python code/ch039.py --obs-norms run --max-steps 30000   # 只跑归一化组</code></pre>
+    <p>以实跑为准：<strong>run 组在 3000～6000 步的早期评估明显领先（差距常在 200～400 分）</strong>；15000 步后两组逐步靠近，最终差距缩小到几十以内。<code>theta_dot 估计std</code> 从 1.0 升到 2～3 并趋稳。<strong>归一化买的是早期速度，最终上限由算法本身决定。</strong></p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>训练归一化、评估不归一化（或反过来）</strong>：输入口径不一致，评估回报会突然崩掉。<strong>修复</strong>：把 normalizer 显式传入评估函数。</li>
+      <li><strong>用整批观测算统计量再归一化同一批</strong>：批统计引入批内相关性，正确做法是逐条递推（本章）。</li>
+      <li><strong>忘了保存统计量</strong>：重新加载模型推理时没有 μ/σ，输入尺度对不上，动作全错。<strong>修复</strong>：保存 state_dict 时一并存 <code>obs_mean / obs_std</code>。</li>
+      <li><strong>把归一化用在本来就有界的观测上并期待大收益</strong>：CartPole 这类小尺度环境收益有限，别把实验结论无脑外推。</li>
+      <li><strong>Welford 的更新顺序写反</strong>：<code>var</code> 更新用的必须是更新后的均值；用旧均值会缓慢漂移，长训练里偏差累积。<strong>修复</strong>：对照递推公式逐行核对，并用小序列的解析结果做断言。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>只跑 <code>run</code>，并试 <code>--clip 1.0</code> 与 <code>--clip 100.0</code>，观察裁剪范围对训练的影响。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>clip=1 会把标准化后的观测大面积截断，等于往网络里灌失真信息；clip=100 等于不裁剪。对比 3000 步处的评估回报。</div></details>
+      </li>
+      <li>把归一化改成"入池前归一化"：在 <code>buf.add</code> 之前调用 <code>normalizer.normalize</code>，训练时不再处理。跑一次并解释为什么两种方案在训练早期表现不同。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>回放池容量 10 万条，早期统计量与后期差异大，池子里会混着两种口径。观察 |Q| 曲线是否更抖。</div></details>
+      </li>
+      <li>给归一化器加一个"冻结开关"：训练到 <code>--max-steps</code> 的一半时停止 <code>observe</code>（统计量固定）。评估回报会变好还是变差？<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>后期状态分布变化不大时，冻结统计量往往没有明显损失；可以据此判断"统计量是否已经收敛"。</div></details>
+      </li>
+      <li>把归一化迁移到第 038 章的部分可观测环境：被遮挡维度恒为 0，归一化后是常数 (0−μ)/σ。做一个"只归一化前两维"的变体并与全维对比。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>常数维度对 GRU 相当于无信息输入，但门控仍会给它分配权重；观察屏蔽维度归一化与否是否影响收敛速度。</div></details>
+      </li>
+      <li>把 Welford 的三步手推结果写成断言测试：构造 0.4/0.6/0.8 三条观测，断言 μ=0.6、σ≈0.163（容差 1e-6）。这个小测试能防止后续重构改坏递推顺序。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>注意实现里的初始 M₂=1、n=1e-4 会轻微影响前几步结果，测试时可以先把初始值调成 0 与真实 n，或者把容差放宽到 1e-3 并在注释里说明原因。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>输入维度尺度不一让第一层梯度尺度失衡，归一化把各维压到同量纲，改善优化条件数。</li>
+      <li>在线统计用 Welford 递推：逐条更新、数值稳定、开销可忽略，三条观测的手算结果与整批公式完全一致。</li>
+      <li>做法：原始观测入池、采样时用最新统计量归一化；训练与评估共用统计量并随模型保存。</li>
+      <li>Pendulum 上归一化主要买早期速度：前几千步评估回报常领先 200～400 分，最终差距缩小。</li>
+      <li>统计量要到"消费时刻"才参与计算：原始观测入池、采样归一化，同一批数据在不同训练阶段被赋予与当时统计量匹配的解释。</li>
+      <li>裁判归一化是否生效只需两个信号：theta_dot 维度的估计标准差从 1 升到 2～3；前 5000 步的评估回报明显高于对照组。</li>
+      <li>下一章把同一套思路从观测搬到奖励：用回报运行统计标准化奖励，并与第 035 章的固定缩放做对照，说明两者的分工。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch038.html">← 第 038 章：SAC的循环策略网络</a>
+    <a class="next" href="ch040.html">第 040 章：SAC的奖励归一化 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

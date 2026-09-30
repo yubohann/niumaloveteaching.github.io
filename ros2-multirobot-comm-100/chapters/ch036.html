@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第036章 网络分区下的数据一致性 | 多机器人协同学习课程 · ROS2 通信与系统集成</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 数据分发与协同感知</span>
+    <span class="sep">/</span>
+    <span>第 036 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 数据分发与协同感知</div>
+    <h1>第 036 章：网络分区下的数据一致性</h1>
+    <p class="lead">当无线网络裂成两半，每半边都在继续工作，本章讲如何让它们"各自可用"又在重连后"殊途同归"，避免两个版本的世界永久分叉。</p>
+    <ul class="meta">
+      <li>主题：分布式系统 / 一致性与容错</li>
+      <li>关键机制：分区检测（心跳 + 迟滞）、Lamport 逻辑时钟、可合并状态（CRDT 直觉）、愈合后的差分对账</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 035 章（通信丢包与重传策略）</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解分区（partition）与丢包的区别，以及 CAP 直觉下多机器人系统的典型取舍。</li>
+      <li>掌握分区检测的工程实现：心跳、超时迟滞、误报与漏报的权衡。</li>
+      <li>理解 Lamport 逻辑时钟与版本向量：为什么物理时钟不能作为冲突裁决的唯一依据。</li>
+      <li>掌握"可合并状态"的设计思想（CRDT 直觉）：栅格最大值、log-odds、计数器等合并函数为何天然收敛。</li>
+      <li>能为任务层设计分区期间的隔离策略与愈合后的对账流程，写出系统的不变量清单。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 035 章处理的是"单个消息丢了怎么办"；本章的场景更极端：<strong>两台（或两组）机器人之间完全联系不上，而它们都还在继续工作</strong>。厂区分区、AP 宕机、跨楼层信号盲区都会造成这种局面，持续几秒到几分钟。此时系统面临一个无法回避的三选一（CAP 直觉的工程版本）：停下手里的活等网络（牺牲可用性）、强行假设自己是唯一权威（可能造成两边状态冲突）、还是"先各自工作，事后对账"（接受暂时不一致）。</p>
+    <p>机器人系统很少能承受"停机等网络"，所以主流答案是第三种：<strong>可用性优先 + 最终一致</strong>。但这句口号背后有一整套具体机制，怎么发现分区、用什么样的数据结构和合并规则确保"怎么分叉都能合回来"、任务层面如何防止两台机器人同时扮演同一个角色。本章把这些机制逐一讲透，它们同样适用于第 033 章的地图分块与第 040 章的阶段项目。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 分区与丢包：程度不同，性质不同</h3>
+    <p>丢包是"部分消息没到"；分区是<strong>一组机器人之间在一段时间内所有消息都到不了</strong>。性质差异带来设计差异：丢包靠重传（第 035 章）解决；分区必须靠"允许两侧各自演化 + 收敛协议"解决，因为在分区期间无论怎么重传都不会通。检测也难得多：你无法区分"网络断了"与"对方挂了一小会儿"，检测本质是"基于超时的猜测"，所以检测机制必须在<strong>误报</strong>（好好的网络被当成分区，白白降级）与<strong>漏报</strong>（真分区了系统没察觉，冲突继续累积）之间权衡。</p>
+    <p>两者的量化区分可以用两个模式描述：连续 10 秒内每一条心跳都收不到，是分区；每秒丢 20% 但从未整段中断，是高丢包。系统需要对这两种模式给出不同反应，重传与降频对付后者，隔离与对账对付前者，把两者混为一谈的监测逻辑会在高丢包时误触发隔离、在真分区时还在傻等重传。</p>
+
+    <h3>2. 分区检测：心跳 + 迟滞 + 分级</h3>
+    <p>标准配方是心跳超时，但直接"超时就判分区"会抖动。工程实现三个要点：</p>
+    <ul>
+      <li><strong>迟滞（hysteresis）</strong>：连续 N 个心跳周期未收到才算"疑似分区"（如 3 个周期），恢复时同样要求连续收到 M 个心跳才算"愈合"。单向判据会在边界网络上反复横跳。</li>
+      <li><strong>分级</strong>：健康状态按三档划分：HEALTHY → DEGRADED（丢包高/延迟大）→ PARTITIONED，简单的"通/断"二值描述不了它。降级可以先行（降频、缩小订阅半径），分区判定再切到完全独立模式。</li>
+      <li><strong>检测成本与频度</strong>：心跳 1–2 Hz 足够（带宽可忽略），但定时器精度与调度抖动会影响判定，超时阈值要大于心跳周期 × N + 网络延迟上界。</li>
+    </ul>
+    <div class="formula">
+      分区判定：连续 miss ≥ N 个心跳；愈合判定：连续收到 ≥ M 个心跳
+      <span class="note">N = 3–5、M = 2–3 起步；N 越小越敏感但误报多，反之迟钝但稳定</span>
+    </div>
+
+    <h3>3. 一致性工具箱：从时间戳到可合并状态</h3>
+    <p>分区愈合后要把两侧的状态合回来。合并规则的正确性决定系统是否"殊途同归"。常用工具按复杂度递增：</p>
+    <ul>
+      <li><strong>Lamport 逻辑时钟</strong>：每个事件带一个整数计数，规则是"本地事件 +1；收到消息取 max(local, remote) + 1"。它给出一个在所有节点上一致的<strong>偏序</strong>：同一物理时刻的两边写入可能拿到相同计数，需要 tie-break（如比较机器人 id，规则全局统一）。<strong>关键点：物理时钟在分区期间无法比较（不同步），逻辑时钟可以。</strong></li>
+      <li><strong>版本向量</strong>：每个节点维护"我对每个节点的最新版本"向量，能检测出"两边分别改过"的并发写（向量不可比）。适合需要发现冲突、把裁决留给上层的场景。</li>
+      <li><strong>可合并状态（CRDT 直觉）</strong>：如果状态的合并函数满足<strong>交换律、结合律、幂等</strong>，那么合并顺序、重复应用都不影响最终结果，分区愈合只是"补一次合并"而已。例：计数器的求和、栅格的"取最大占用"、log-odds 的加法、集合的并集。</li>
+    </ul>
+    <p><strong>设计启示：把状态设计成"怎么合都对"，比设计复杂的冲突裁决更划算。</strong>这也是第 027/033 章选择块级版本 + 值合并的深层原因，地图天然适合 CRDT 式设计。</p>
+
+    <h3>4. 任务层：双主问题与隔离策略</h3>
+    <p>数据能合并，动作却不能"合并"。分区期间最危险的场景是<strong>两台机器人同时认为自己负责同一个任务</strong>（双主），比如都去同一区域搜索、都执行同一个搬运任务。对策有三层：</p>
+    <ul>
+      <li><strong>区域隔离</strong>：分区期间各机只执行"自己区域内"的任务，跨区任务挂起。简单可靠，代价是跨区工作暂停。</li>
+      <li><strong>租约（lease）</strong>：任务所有权带期限，到期未续租则释放。租约的时长要长于最坏分区时长，否则分区内一侧自然过期、另一侧接手，产生双主。</li>
+      <li><strong>多数派确认</strong>：对安全关键动作要求"多数机器人确认"后才执行；分区使任何一侧都可能不足多数，动作自然被阻止，<strong>用"宁可不动"换安全，这也是安全关键系统的标准哲学。</strong></li>
+    </ul>
+
+    <h3>5. 愈合流程：对账、合并、广播</h3>
+    <p>分区恢复后的对账流程应是确定性的三步：</p>
+    <ol>
+      <li><strong>交换摘要</strong>：双方交换各自状态的版本摘要（第 027 章 checkpoint 的复用）；</li>
+      <li><strong>差分补齐</strong>：按版本比对找出差异项，定向传输（谁旧谁请求）；</li>
+      <li><strong>应用合并 + 广播</strong>：按合并规则应用差异，产生新版本并广播，确保第三台机器人（如果存在）也能收敛。</li>
+    </ol>
+    <p>对账的代价应与"分叉量"成正比，与"状态总量"无关，这就是为什么版本摘要必须小、差异必须能定向拉取。<strong>愈合瞬间的流量尖峰是对账系统最主要的压力测试：错过的更新越多，补齐流量越大；因此长分区场景还要配合"提前主动同步"策略（例如分区前先广播关键状态）。</strong></p>
+
+    <h3>6. 数值算例：检测延迟、误报与愈合对账流量</h3>
+    <p>先算检测的账。心跳 1 Hz、超时判据 1.5 s、连续 3 次 miss 判分区：从最后一次心跳到宣布分区约需 4–5 s；若把 N 改为 1，判定延迟降到约 1.5 s，但每一次丢心跳都会触发分区判定，2% 的独立丢包率下误报概率约 2%（平均每 50 秒一次误判），WiFi 突发抖动下更频繁。<strong>N 的选择就是在"晚几秒知道"与"频繁误判"之间买保险</strong>，工程起点 3–5 是合理的。</p>
+    <p>再算愈合对账的流量。设系统有 1 万个状态键（地图块、任务条目、日志指针），分区期间分叉 500 个键。摘要交换：1 万键 × 每键 8 B（键标识 + 版本）≈ 80 KB，双向合计 160 KB；差分拉取：500 键 × 平均 1 KB ≈ 500 KB；合并后广播给第三台机器人再 500 KB。<strong>总计约 1.2 MB 的愈合尖峰</strong>，按 1 Mbps 有效带宽约需 10 s 完成；作为对照，若愈合时做"全量覆盖"，1 万键 × 1 KB = 10 MB，需要约 80 s，还会丢掉分区期间的本地更新。摘要加差分的方案把代价从"状态总量"改绑到"分叉量"，分叉少时省一个数量级，这正是它的设计目标。</p>
+
+    <h3>7. 失效模式与边界条件</h3>
+    <ul>
+      <li><strong>租约短于分区时长</strong>：分区内一侧租约自然过期，另一侧接手任务，愈合后两侧都认为自己执行过同一任务。边界动作：租约时长按"最坏分区时长 + 时钟不确定度"设计；分区期间任务一律挂起，不做转让。</li>
+      <li><strong>计数器类状态的重复计数</strong>：把"增量"直接累加合并，消息重传一次就多加一次。修复：用按节点分槽的计数器（每机维护自己的计数值，合并取每槽最大值，总量为各槽之和），幂等性内建。</li>
+      <li><strong>摘要规模失控</strong>：状态键数量持续增长，愈合摘要从 80 KB 涨到几 MB。边界动作：控制键的粒度、管理状态生命周期（第 033 章的归档思想），并按区域分桶交换摘要，让对账可以分片进行。</li>
+      <li><strong>多机愈合风暴</strong>：N 台机器人两两对账，摘要交换次数按 N² 增长，10 台就是 45 对。边界动作：指定协调者或按区域配对，把对账拓扑从全连接改为树形或星形。</li>
+      <li><strong>合并函数两处实现</strong>：在线路径与对账路径各写一份合并逻辑，细微差异让两侧收敛到不同结果。边界动作：合并函数单一实现，用随机操作序列做性质测试，验证交换律、结合律与幂等性。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <ol>
+      <li><strong>给数据分级</strong>：按"能否分区容忍"把系统数据分三类，必须强一致（安全关键）、可最终一致（地图、状态）、仅本地（调试信息）。</li>
+      <li><strong>实施检测</strong>：心跳 + 迟滞 + 三态；把"疑似分区"作为降级的触发信号（第 039 章健康监测联动）。</li>
+      <li><strong>选合并工具</strong>：可合并状态优先（设计成 CRDT 式）；无法做到的设计 Lamport 版本 + 确定性 tie-break；需要发现冲突的用版本向量。</li>
+      <li><strong>任务层策略</strong>：区域隔离起步；跨区协调任务加租约或多数派确认。</li>
+      <li><strong>愈合对账</strong>：摘要交换 → 差分拉取 → 合并 → 广播；对账过程中持续运行本地任务（不阻塞）。</li>
+      <li><strong>验收</strong>：注入分区（第 077 章故障注入），验证"两侧继续工作、愈合后 60 s 内收敛、无重复执行"。 </li>
+    </ol>
+    <table>
+      <tr><th>数据类别</th><th>一致性要求</th><th>机制</th><th>分区期间行为</th></tr>
+      <tr><td>地图块（第 033 章）</td><td>最终一致</td><td>块级版本 + 值合并（CRDT 式）</td><td>各写各的，愈合对账</td></tr>
+      <tr><td>任务分配状态</td><td>分区期间分区隔离</td><td>区域所有权 + 租约</td><td>只执行本区任务</td></tr>
+      <tr><td>关键指令确认</td><td>强一致</td><td>多数派确认 / 单边禁止</td><td>不足多数则不执行</td></tr>
+      <tr><td>日志与指标</td><td>最终一致（可丢）</td><td>本地缓存 + 愈合上传</td><td>本地累积</td></tr>
+    </table>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：Lamport 版本的状态合并（确定性 LWW）</strong></p>
+    <pre class="code"><code>class LwwRegister:
+    """Last-Writer-Wins 寄存器：Lamport 时钟定序，机器人 id 做 tie-break。
+    (clock, robot_id) 二元组是全序：任何两台机器人对同一对写入给出同样的胜负。"""
+    def __init__(self, robot_id):
+        self.rid = robot_id
+        self.clock = 0                       # 本地逻辑时钟
+        self.stamp = (0, "")                 # 当前值的时间戳 (clock, writer)
+        self.value = None
+
+    def local_write(self, value):
+        self.clock += 1                      # 本地事件：时钟前进
+        self.stamp = (self.clock, self.rid)  # 戳随值走：合并时比较的就是它
+        self.value = value
+        return {"stamp": self.stamp, "value": value}
+
+    def receive(self, remote):
+        # Lamport 规则：收到事件的时钟 = max(本地, 对端) + 1，
+        # 保证"接收"在因果上晚于"发送"，后续写不会输给已看到的旧值
+        self.clock = max(self.clock, remote["stamp"][0]) + 1
+        if remote["stamp"] &gt; self.stamp:     # 二元组比较：时钟平局时按 id 裁决
+            self.stamp, self.value = remote["stamp"], remote["value"]</code></pre>
+    <p>解读：LWW 是"简单但不完美"的合并策略，关键在于<strong>确定性</strong>。<strong>（1）</strong>胜负判据 (clock, robot_id) 是二元组全序：任何两方对同一对值算出同一个赢家，这正是"最终一致"的技术含义，不要求"总相等"，只要求"各自算完会相等"。<strong>（2）</strong>Lamport 时钟"接收方追平发送方再 +1"保证因果不被颠倒：先发的写入不会赢过"后来者看到它之后"的写入。<strong>（3）</strong>细看 <code>_wins</code> 的比较逻辑在时钟相等（并发写）时按 id 裁决，这是必要的 tie-break；真实实现应把比较写得比这个示例更严谨（把本地值也存成 (clock, writer) 对再整体比较），示例为了展示规则简化了结构。<strong>（4）</strong>LWW 会静默丢弃"输掉"的写入：如果两个值都重要（比如两个任务清单），应改用集合合并（并集）：<strong>先问语义，再选结构</strong>。</p>
+
+    <p><strong>片段 2：心跳分区检测器（迟滞 + 三态）</strong></p>
+    <pre class="code"><code>import time
+
+class PartitionDetector:
+    """心跳分区检测：连续 miss 判分区、连续 hit 判愈合（双边迟滞）。"""
+    def __init__(self, peers, hb_period=1.0, miss_n=3, heal_m=2):
+        self.peers = {p: {"last": time.monotonic(), "miss": 0, "hit": 0,
+                          "state": "HEALTHY"} for p in peers}
+        self.hb_period = hb_period           # 心跳周期：1 Hz 足够
+        self.miss_n = miss_n                 # 连续 3 个周期无心跳 -> PARTITIONED
+        self.heal_m = heal_m                 # 连续 2 个心跳 -> 恢复 HEALTHY
+
+    def on_heartbeat(self, peer):
+        s = self.peers[peer]
+        s["last"] = time.monotonic()
+        s["miss"] = 0                        # 迟滞：收到即清除未命中计数
+        if s["state"] != "HEALTHY":
+            s["hit"] += 1
+            if s["hit"] &gt;= self.heal_m:      # 连续命中足够 -> 判定愈合
+                s["state"], s["hit"] = "HEALTHY", 0
+                self.on_heal(peer)           # 触发对账流程（片段 3）
+
+    def tick(self):
+        now = time.monotonic()
+        for peer, s in self.peers.items():
+            if now - s["last"] &gt; self.hb_period * 1.5:
+                s["miss"] += 1               # 超时 1.5 个周期记一次 miss
+                s["hit"] = 0                 # 未命中清零愈合计数：防抖
+                if s["miss"] &gt;= self.miss_n and s["state"] != "PARTITIONED":
+                    s["state"] = "PARTITIONED"
+                    self.on_partition(peer)  # 切到隔离策略
+
+    def on_partition(self, peer):
+        print(f"与 {peer} 疑似分区：进入区域隔离模式")
+</code></pre>
+    <p>解读：检测器的精髓在"双边迟滞"。<strong>（1）</strong>判定超时用 <code>hb_period × 1.5</code>，比心跳周期本身放宽 50%：心跳的到达时间有网络抖动与调度延迟，按周期判超时会把正常抖动误判为 miss。<strong>（2）</strong>判分区要连续 <code>miss_n = 3</code> 次、判愈合要连续 <code>heal_m = 2</code> 次，前者防误报（网络瞬断一下不降级），后者防"闪连"（刚回来又断，状态反复横跳）。<strong>（3）</strong>非对称的 N 和 M（3 vs 2）反映了风险不对称：误判分区的代价（白白隔离）小于漏判（冲突累积），但愈合确认也要足够强，否则系统在边界信道上"开会发疯"。<strong>（4）</strong><code>on_partition</code> / <code>on_heal</code> 是策略注入点：检测器只回答"状态是什么"，"该做什么"（隔离、降级、对账）交给上层，这是第 039 章健康监测同样的分层原则。</p>
+
+    <p><strong>片段 3：愈合对账，摘要、差分与确定性合并</strong></p>
+    <pre class="code"><code>class HealReconciler:
+    """愈合后的对账：交换版本摘要，按差异拉取，逐项合并。"""
+    def __init__(self, state):
+        self.state = state                   # state[key] = {"stamp": (c, rid), "v": ...}
+
+    def summary(self):
+        # 摘要只有 key + stamp：几十字节一条，和分叉量成正比
+        return {k: s["stamp"] for k, s in self.state.items()}
+
+    def diff_request(self, peer_summary):
+        # 本地缺失或更旧的 key，统统向对端请求最新值（幂等查询）
+        need = [k for k, stamp in peer_summary.items()
+                if k not in self.state or peer_summary[k] &gt; self.state[k]["stamp"]]
+        return need
+
+    def apply_remote(self, key, stamp, value):
+        # 合并规则与在线路径共用：无论消息来自"对账"还是"实时"，
+        # 同一个 key 的合并逻辑只有一份，否则两侧收敛结果可能不一致
+        cur = self.state.get(key)
+        if cur is None or stamp &gt; cur["stamp"]:
+            self.state[key] = {"stamp": stamp, "v": value}
+            return True
+        return False
+
+    def run(self, transport, peer):
+        req = self.diff_request(transport.exchange(self.summary(), peer))
+        for key in req:
+            stamp, value = transport.fetch(key, peer)   # 定向拉取
+            self.apply_remote(key, stamp, value)
+        # 广播合并后的新版本，确保第三台等更多成员也收敛
+        transport.broadcast_updates(self.state)</code></pre>
+    <p>解读：对账器的三条纪律值得单独强调。<strong>（1）</strong><code>summary()</code> 的大小与"状态条目数"成正比，与"状态体积"无关：摘要里只放 key 与时间戳，哪怕状态值是几 MB 的地图块，摘要也只是一对整数，这是第 027 章 checkpoint 思想在通用状态上的复用。<strong>（2）</strong><code>diff_request</code> 采用"拉"模式：谁落后谁请求，避免双方互发全量；请求本身幂等（对方重发无害），天然兼容第 035 章的丢包重传。<strong>（3）</strong><code>apply_remote</code> 与在线接收路径<strong>共用同一合并函数</strong>：如果对账用一个逻辑、实时更新用另一个逻辑，两侧的"最终状态"可能不同，最终一致性的全部价值就是"任何人算出来一样"。<strong>（4）</strong>最后一步广播不是礼节性的：三方场景里 A 与 B 对账合并出的新版本如果不广播，C 永远停留在被合并前的认知，系统的"最终"就不存在了。<strong>对账结束的标志是"所有人重新追上了同一条时间线"；"我和对方一样了"只完成两方对齐。</strong></p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>用物理时钟做 LWW 判据</strong>：分区期间两侧校时各自漂移，物理时间戳不可比，合并结果不确定。修复：Lamport 逻辑时钟 + 确定性 tie-break。</li>
+      <li><strong>心跳超时一刀切</strong>：太短误报分区（系统反复降级），太长漏报（冲突累积）。修复：心跳周期 × 1.5 判超时、连续 3 次判分区、恢复需连续 2 次心跳。</li>
+      <li><strong>任务所有权没有分区语义</strong>：两侧都"负责"同一任务，双主执行。修复：区域隔离或租约 + 多数派确认，安全关键动作宁可不动。</li>
+      <li><strong>愈合后全量覆盖</strong>：一侧把自己状态整发另一侧覆盖，分区期间的本地更新直接丢失。修复：摘要 + 差分 + 合并（片段 3），覆盖只在合并函数里发生。</li>
+      <li><strong>"最终一致"没有验证</strong>：从不测试分区场景，真断网时才发现没收敛。修复：故障注入（第 077 章）定期演练分区与愈合，验证收敛时间与不变量。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>两个机器人用 LWW 合并同一 key：A 的写入戳 (5, "A")、B 的写入戳 (5, "B")。谁赢？如果规则改成"数值大者赢"会有什么问题？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>二元组比较：("B" &gt; "A") 所以 B 的写赢。改成数值比较时不同机器人对"谁更大"可能各算各的，或与时间无关，确定性来自"全序规则 + 相同数据"，与语义好坏无关，语义正确性要另外设计。</div></details>
+      </li>
+      <li>把心跳分区判定的 miss_n 从 3 改到 1，预测正常网络下的误报率与分区期间的检测延迟变化。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>miss_n=1 时任何一次丢心跳都判分区，WiFi 抖动下误报频繁；检测延迟从 3 个周期降到 1 个周期。真实系统需要在误报代价与检测延迟间按场景选值。</div></details>
+      </li>
+      <li>设计一个"分区中任务不双主"的方案：给定 3 台机器人、任务清单与区域图，写出租约时长推导（要考虑最坏分区持续时间）与超时回退规则。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>租约时长 &gt; 最坏分区时长 + 时钟不确定性；一方无法续租时任务挂起、不做转让，待愈合后由中心/多数派重新分配，可杜绝双主。</div></details>
+      </li>
+      <li>验证题：给地图块设计一个 CRDT 式合并函数（提示：值域 {−1, 0, 100}），证明它满足交换律、结合律与幂等性，并说明它与第 027 章版本守卫的关系。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>取最大（或 log-odds 相加）满足三性质；版本守卫解决的是"同一 key 的新旧顺序"，合并函数解决的是"不同来源的取舍"，两者互补，分别处理不同层面的问题。</div></details>
+      </li>
+      <li>思考：安全关键动作"多数派确认"在双机器人系统里意味着什么？为什么很多双机安全系统宁愿改用"单机即禁止 + 人工确认"？<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>2 机的多数池只有 2，分区时任何一边都不足多数（需 2/2），动作全停，等价于不可用；人工确认把不可用问题交给流程解决，是工程妥协的常见形态。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>分区是"一段时间全断"：靠重传解决不了，必须允许两侧各自演化并设计收敛协议。</li>
+      <li>检测用心跳 + 双边迟滞 + 三态分级；检测只是信号，降级与对账策略由上层注入。</li>
+      <li>合并工具箱：Lamport 逻辑时钟（偏序 + 确定性 tie-break）、版本向量（发现并发）、可合并状态（交换/结合/幂等）。</li>
+      <li>任务层防双主：区域隔离、租约、多数派确认；安全关键动作宁可不动。</li>
+      <li>愈合对账 = 摘要 + 差分拉取 + 统一合并函数 + 广播；下一章把这些机制用于"看得见的工程闭环"：<strong>多机器人数据记录与回放</strong>。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch035.html">← 第 035 章：通信丢包与重传策略</a>
+    <a class="next" href="ch037.html">第 037 章：多机器人数据记录与回放 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

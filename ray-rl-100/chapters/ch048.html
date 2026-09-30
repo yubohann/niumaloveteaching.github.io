@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第048章 RLlib策略模型选择：MLP、CNN与RNN | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第三篇 · RLlib 算法实现</span>
+    <span class="sep">/</span>
+    <span>第 048 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第三篇 · RLlib 算法实现</div>
+    <h1>第 048 章：RLlib策略模型选择：MLP、CNN与RNN</h1>
+    <p class="lead">网络结构跟随观测形态：多层感知机（Multilayer Perceptron, MLP）处理低维向量、卷积网络（Convolutional Neural Network, CNN）利用空间局部性、循环网络（Recurrent Neural Network, RNN）承载时间记忆，以及主干与输出头共享（Shared Trunk）与否对训练的影响。</p>
+    <ul class="meta">
+      <li>主题：RLlib 训练（策略网络结构）</li>
+      <li>关键机制：感受野、参数预算、多模态拼接</li>
+      <li>预计学时：50 分钟</li>
+      <li>前置章节：第 047 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>掌握观测形态到网络结构的映射规则：向量用 MLP、图像用 CNN、序列用 RNN，以及混合形态的拼接方案。</li>
+      <li>理解卷积网络的感受野（Receptive Field）与下采样结构，能手工核算输出尺寸与参数数量。</li>
+      <li>掌握主干共享与分离两种结构对策略价值双头的梯度影响，能按任务选择。</li>
+      <li>会配置 RLlib 的内置模型字典（fcnet、conv、lstm 三类键）并校验形状。</li>
+      <li>能设计消融实验验证结构选择的必要性，例如打乱空间结构后性能变化。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>算法决定优化目标，网络结构决定这套目标能否被高效表达。RLlib 为常见观测形态提供了默认网络，默认值在小规模任务上工作良好，一旦观测结构特殊（多通道图像、向量与图像并存、空间动作图）就会失配：结构不匹配时，网络要么浪费大量参数，要么根本学不到观测中的关键模式。</p>
+    <p>结构选择还有成本维度：全连接层参数量随输入维度线性增长，图像输入动辄上万个维度，直接展平会让参数量失控；卷积结构用局部连接与权重共享把参数量压到可训练范围。本章把三类结构与配置参数对应起来，并给出参数量与感受野的核算方法。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p>本节按"结构先验、尺寸核算、双头组织、混合形态"四步展开。</p>
+
+    <h3>1. 结构先验：三种观测形态各自的内置假设</h3>
+    <table>
+      <tr><th>结构</th><th>内置先验</th><th>适配观测</th><th>失配后果</th></tr>
+      <tr><td>MLP</td><td>维度间无序、全连接</td><td>低维状态向量</td><td>图像输入时参数量爆炸、丢失平移不变性</td></tr>
+      <tr><td>CNN</td><td>局部性、平移等变、权重共享</td><td>图像、网格、空间张量</td><td>向量输入时无收益，白白增加计算</td></tr>
+      <tr><td>RNN</td><td>时序递归、隐状态记忆</td><td>序列、部分可观测</td><td>马尔可夫任务中增加状态管理成本</td></tr>
+    </table>
+    <p>选择规则可以压缩成一句话：<strong>观测里存在什么结构，网络里就内置什么先验。</strong>观测是图像且目标会平移出现时，卷积的平移等变先验直接降低样本需求；观测是无序特征向量时，任何空间先验都没有意义。</p>
+    <p>三类结构的参数走向同样要先算一遍：全连接层参数量随输入维度线性增长，卷积层参数量只与核大小、通道数有关而与输入分辨率无关，循环层参数量与序列长度无关、与隐状态宽度的平方相关。这组关系决定了核算顺序：输入维度大时先检查卷积或池化能把维度压到哪里，时序依赖强时先算循环部分的参数量级，再决定用帧堆叠还是循环网络承载历史。把这三笔账在选型前算完，网络规模的讨论就不会停留在"大一点更保险"的层次，每个参数都有对应的职责与成本。</p>
+
+    <h3>2. 卷积的尺寸与感受野核算</h3>
+    <p>卷积层的输出尺寸由卷积核、步幅与填充共同决定：</p>
+    <div class="formula">
+      W<sub>out</sub> = ⌊ ( W<sub>in</sub> + 2·P − K) / S ⌋ + 1
+      <span class="note">W 为空间边长，K 卷积核，S 步幅，P 填充；逐层递推即得最终空间尺寸，供后续全连接层对接</span>
+    </div>
+    <p>感受野是输出单元能"看到"的输入区域边长，逐层递推公式为 RF<sub>l+1</sub> = RF<sub>l</sub> + (K−1)·∏S<sub>前缀</sub>。<strong>感受野必须覆盖任务的关键目标尺度</strong>：目标占据 10×10 像素而感受野只有 5，网络只能看到局部纹理，无法判断目标的身份与运动。参数量的核算同样直接：单个卷积层参数量为 K²·C<sub>in</sub>·C<sub>out</sub> 加偏置，全连接层为输入维乘输出维，两者相加即可估计模型的规模预算。</p>
+
+    <h3>3. 双头结构：主干共享与分离</h3>
+    <p>策略网络同时输出动作分布与价值估计，两个头可以共享特征提取主干（Shared Trunk），也可以各自独立。共享主干的参数量更小、特征复用效率更高，但两个损失的梯度在同一组参数上叠加，存在相互干扰的可能；分离主干则各自优化，参数量接近翻倍。实践中带图像输入的任务常用共享卷积主干加两套全连接头，低维任务多数直接用默认的 <code>vf_share_layers=False</code> 结构。<strong>当价值损失与策略损失的量级差异大（例如 044 章奖励归一化失配）时，共享主干的不稳定性会被放大，此时优先检查归一化，再考虑结构调整。</strong></p>
+
+    <h3>4. 混合形态与拼接设计</h3>
+    <p>观测同时包含图像与向量（如相机帧加关节角度）时，标准做法是分支编码后拼接：图像分支用卷积压缩到低维特征，向量分支过若干全连接层，两者拼接后进入共享头。拼接的维度配比决定梯度在不同模态上的分配：某分支输出维度过大时，该模态的梯度主导训练。<strong>常用起点是让两个分支的输出维度处于同一量级，再用消融实验调整配比。</strong></p>
+
+    <h3>5. 数值算例：参数量与感受野的逐步核算</h3>
+    <p>以 84×84 单通道帧的经典配置 <code>conv_filters</code>=[[32,[8,8],4],[64,[4,4],2],[64,[3,3],1]] 为例逐步核算。第一层输出边长 (84−8)÷4+1=20，参数量 8×8×1×32+32=2080；第二层 20 经核 4、步幅 2 得 9，参数量 4×4×32×64+64=32832；第三层 9 经核 3、步幅 1 得 7，参数量 3×3×64×64+64=36928。卷积输出 7×7×64=3136 维，经 256 维全连接层需要 3136×256+256=803072 个参数，四部分合计 874912 个参数。</p>
+    <p>感受野按 RF<sub>l+1</sub> = RF<sub>l</sub> + (K−1)·∏S<sub>前缀</sub> 递推：初始 1；第一层加 (8−1)×1 得 8，累计步幅 4；第二层加 (4−1)×4 得 20，累计步幅 8；第三层加 (3−1)×8 得 36。输出单元覆盖 36 像素，约为帧宽的 42.9%，对 20×20 量级的目标有富余。若把配置缩成 [[16,[3,3],2],[32,[3,3],2]]，感受野只有 1+2+4=7 像素，目标尺度 20 时顶层特征看不到完整目标，学到的只能是局部纹理，这就是感受野失效模式的定量依据。</p>
+    <p>与直接展平的对照：84×84 展平为 7056 维，接两层 256 全连接的参数量为 7056×256+256+256×256+256=1872384，约为卷积配置 874912 的 2.14 倍，同时丢失平移等变先验。两组数字并排后，"图像输入用卷积"从经验判断变为参数预算与结构先验两条可核算的理由。</p>
+
+    <h3>6. 多模态拼接的梯度配比与边界</h3>
+    <p>多模态观测里，各分支输出维度之比近似决定融合层输入上各模态的梯度份额。图像分支卷积输出 3136 维、状态分支 64 维时不加压缩直接拼接，图像占融合输入约 98.0%，状态分支的梯度在总梯度里几乎可以忽略；把图像分支先投影到 128 维再与 64 维状态拼接，图像份额降到约 66.7%，两个模态都能获得有效训练。<strong>配比争议不要靠感觉，先算份额再决定投影层的位置与宽度。</strong></p>
+    <p>三条边界同样要记牢：其一，卷积配置对输入分辨率敏感，84×84 上的配置套到 42×42 输入时输出边长从 7 降到 2，全连接层的输入维度必须重算，形状核对以目标分辨率为准；其二，循环网络的序列训练要求批次能被序列长度整除，不匹配时错误常出现在构建期，先把整除关系写进配置校验；其三，帧堆叠与循环记忆提供不同形式的历史，前者是固定窗口，后者是可调长度的记忆，任务依赖更早信息时优先加长窗口或增大隐状态，两者的成本与效果要用消融实验分别确认。</p>
+
+    <h3>7. 双头共享的参数量对照</h3>
+    <p>以 24 维观测、两层 256 隐层、5 个离散动作为例：分离结构的参数量约为 2×(24×256+256×256)+256×5+256=144896；共享主干约为 24×256+256×256+256×5+256=73216。共享节省约 49.5%，节省量恰好等于少建的一份主干（71680 个参数）。共享的成本是两个损失在同一组主干参数上叠加，是否采纳的判定与 051 章的稳定性面板联动：共享后解释方差与裁剪占比同时恶化，就回到分离结构，问题不解决再谈结构调整。</p>
+
+    <h3>8. 消融验证的判定口径</h3>
+    <p>结构先验是否真被利用，用破坏结构的消融实验判定：把图像观测的像素做固定置换（保留数值分布、破坏空间局部性）后重训，若性能在统计噪声之外显著下降，说明卷积的空间先验确实被依赖。判定口径：设正常训练与置换训练的评估回报差为 d、种子间标准差为 σ，各跑 3 粒种子时差值的标准误约为 σ·√(2/3)≈0.82σ；d 小于 0.82σ 时结论不确定，需要增加重复或改用更彻底的置换（如逐行重排）。若置换几乎不影响性能，说明任务依赖的是颜色统计一类的全局特征，卷积先验没有发挥作用，应检查观测预处理与任务定义。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>网络结构的确定按五步执行。</p>
+    <ol>
+      <li><strong>检查观测结构</strong>：打印观测空间的形状与取值范围，判断属于向量、图像还是序列，是否存在多模态。</li>
+      <li><strong>选择主干</strong>：按映射规则选 MLP、CNN 或 RNN；图像输入必须先做归一化与必要的降采样。</li>
+      <li><strong>核算规模</strong>：用两条公式估算参数量与感受野，把参数量控制在任务样本量支撑的范围内。</li>
+      <li><strong>决定双头组织</strong>：默认共享主干；损失量级差异大或结构异质时改用分离头。</li>
+      <li><strong>消融验证</strong>：打乱观测中认定的结构（如空间置换）后重跑，性能显著下降则说明结构先验确实被利用。</li>
+    </ol>
+    <h3>配置键对照表</h3>
+    <table>
+      <tr><th>配置键</th><th>典型值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td><code>fcnet_hiddens</code></td><td>[256, 256]</td><td>全连接层宽度</td><td>观测维度与样本量的折中</td></tr>
+      <tr><td><code>fcnet_activation</code></td><td>tanh / relu</td><td>全连接激活</td><td>RL 任务中 tanh 常见，值域友好</td></tr>
+      <tr><td><code>vf_share_layers</code></td><td>false</td><td>策略价值共享主干</td><td>损失量级差异大时保持分离</td></tr>
+      <tr><td><code>conv_filters</code></td><td>[[32,[8,8],4], [64,[4,4],2], [64,[3,3],1]]</td><td>卷积层序列</td><td>由感受野与输出尺寸核算决定</td></tr>
+      <tr><td><code>conv_activation</code></td><td>relu</td><td>卷积激活</td><td>图像任务惯例</td></tr>
+      <tr><td><code>use_lstm</code> / <code>lstm_cell_size</code></td><td>true / 256</td><td>循环记忆</td><td>部分可观测任务（见 045 章）</td></tr>
+      <tr><td><code>post_fcnet_hiddens</code></td><td>[256]</td><td>卷积主干后的全连接</td><td>对卷积特征做非线性组合</td></tr>
+    </table>
+    <h3>结构定稿前的三项核算清单</h3>
+    <p>核算清单一：尺寸链。从输入分辨率逐层推到最终空间尺寸，与 <code>post_fcnet_hiddens</code> 的输入对接；42×42 输入走同一套三层卷积配置时输出为 1×1×64，全连接入口从 3136 维缩到 64 维，参数量随之大幅减小，但高层特征的容量可能不足，分辨率变化必须重算这条链。清单二：感受野与任务目标尺度之比，覆盖率低于 1 时必须扩大核或加深下采样。清单三：多模态分支的输出维度比，超出一比三的分支先做投影压缩。三项都建议在模型入口用一次空张量前向实测核对，让形状与规模问题在构建期暴露。</p>
+    <p>清单核对完成后留一组对照：结构与观测不匹配时，训练曲线通常长期停在随机水平附近，且解释方差持续为负；排查顺序是先核对归一化与通道顺序，再怀疑结构容量。顺序颠倒会在一堆无关的参数上反复试验，而真正的故障点始终没有被检查。</p>
+    <p>与上一章的差异：047 章在算法层面拍板方法家族，本章在同一家族内部决定网络结构；前者影响数据如何被使用，后者影响观测如何被表示，两者叠加构成完整的模型方案。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：MLP 配置与参数量核算</strong></p>
+    <pre class="code"><code>def mlp_params(obs_dim, hiddens, n_actions, share=False):
+    """核算策略价值双头的参数量（不计偏置的简化估计）。"""
+    dims = [obs_dim] + list(hiddens)
+    trunk = sum(dims[i] * dims[i + 1] for i in range(len(dims) - 1))
+    if share:
+        # 共享主干：两个头都接在最后一层隐层之上
+        head = hiddens[-1] * n_actions + hiddens[-1] * 1
+        return trunk + head
+    # 分离结构：策略头与价值头各自拥有一份主干
+    per_head = sum(dims[i] * dims[i + 1] for i in range(len(dims) - 1))
+    return per_head * 2 + hiddens[-1] * n_actions + hiddens[-1] * 1
+
+config_model = {
+    "fcnet_hiddens": [256, 256],       # 观测几十维：两层 256 足够起步
+    "fcnet_activation": "tanh",        # tanh 输出有界，与优势函数的尺度更协调
+    "vf_share_layers": False,          # 默认分离：先隔离两个损失再谈共享
+}
+print("参数量估计：", mlp_params(24, [256, 256], 5), "个（共享主干更省，但有干扰风险）")</code></pre>
+    <p>解读：这段代码把"网络多大"变成可核算的数字。<strong>（1）</strong>简化公式忽略偏置与激活层，量级判断足够；若内存吃紧，真实参数量再加 5% 左右。<strong>（2）</strong>任务观测 24 维时两层 256 的参数量在十万量级，与通常 10<sup>5</sup> 至 10<sup>6</sup> 步的样本预算匹配。<strong>（3）</strong><code>vf_share_layers</code> 默认取假：先建立基线，再通过消融实验决定是否共享，避免一开始就引入梯度干扰这一变量。</p>
+
+    <p><strong>片段 2：CNN 配置与尺寸核算</strong></p>
+    <pre class="code"><code>def conv_out(size, k, s, p=0):
+    """逐层递推卷积输出边长，供拼接全连接层时核对。"""
+    return (size + 2 * p - k) // s + 1
+
+def receptive_field(layers):
+    """layers: [[out_ch, [k, k], stride], ...]，返回累计感受野。"""
+    rf, stride_prod = 1, 1
+    for _, (k, _), s in layers:
+        rf += (k - 1) * stride_prod     # 当前层贡献叠加在已有跨度上
+        stride_prod *= s                # 后续层的贡献按累计步幅放大
+    return rf
+
+conv_layers = [[32, [8, 8], 4], [64, [4, 4], 2], [64, [3, 3], 1]]
+size = 84
+for _, (k, _), s in conv_layers:
+    size = conv_out(size, k, s)
+print("卷积输出边长：", size, " 感受野：", receptive_field(conv_layers))
+
+model_cfg = {
+    "conv_filters": conv_layers,       # 84x84 灰度帧的经典配置
+    "conv_activation": "relu",
+    "post_fcnet_hiddens": [256],       # 卷积特征压到 256 维再进双头
+    "vf_share_layers": True,           # 图像任务：卷积主干共享，节省显存
+}
+# 84 输入经三层卷积后输出 7x7x64 = 3136 维，接 256 维全连接后进双头
+# 感受野核算结果为 36 像素：约覆盖帧宽的 43%，目标尺度更大时需调整核或层数</code></pre>
+    <p>解读：逐块说明。<strong>（1）</strong>两条递推函数是卷积配置的"计算尺"，改任何一层核大小或步幅后先跑一遍再填配置，避免形状不匹配在构建时报错。<strong>（2）</strong>感受野核算显示该配置约 36 像素：覆盖帧宽的 43% 左右，对视野中央的目标足够，目标更大或更靠边时通过增大首层核、增加下采样层来扩大。<strong>（3）</strong>图像任务共享卷积主干是常见起点：卷积参数占比高，共享收益明显；若训练震荡再切换分离结构对比。</p>
+
+    <p><strong>片段 3：图像与向量混合模型</strong></p>
+    <pre class="code"><code>class MultiModalModel(TorchModelV2, nn.Module):
+    """观测为 {"image": (C,H,W), "state": (d,)}：分支编码后拼接。
+    两个分支输出维度保持同一量级，避免单模态梯度主导。"""
+    def __init__(self, obs_space, action_space, num_outputs, model_config, name):
+        TorchModelV2.__init__(self, obs_space, action_space, num_outputs,
+                              model_config, name)
+        nn.Module.__init__(self)
+        c, h, w = obs_space["image"].shape
+        self.conv = nn.Sequential(
+            nn.Conv2d(c, 32, 5, stride=2), nn.ReLU(),
+            nn.Conv2d(32, 64, 3, stride=2), nn.ReLU(),
+            nn.Flatten(),
+        )
+        with torch.no_grad():
+            conv_dim = self.conv(torch.zeros(1, c, h, w)).shape[1]
+        self.state_fc = nn.Sequential(nn.Linear(obs_space["state"].shape[0], 64),
+                                      nn.ReLU())
+        self.fuse = nn.Sequential(nn.Linear(conv_dim + 64, 128), nn.Tanh())
+        self.pi = nn.Linear(128, num_outputs)
+        self.vf = nn.Linear(128, 1)
+        self._value = None
+
+    def forward(self, input_dict, state, seq_lens):
+        obs = input_dict["obs"]
+        img = obs["image"].permute(0, 3, 1, 2).float() / 255.0   # 通道前置 + 归一化
+        x = torch.cat([self.conv(img), self.state_fc(obs["state"].float())], dim=-1)
+        x = self.fuse(x)
+        self._value = self.vf(x).squeeze(-1)
+        return self.pi(x), state
+
+    def value_function(self):
+        return self._value</code></pre>
+    <p>解读：三个设计点。<strong>（1）</strong>用一次空张量前向自动推算卷积输出维度，改卷积结构时无需手工改全连接层，这是多模态模型最常见的形状错误来源。<strong>（2）</strong>图像张量需要从观测字典中的 HWC 布局转为 CHW 并归一化到 [0,1]，未归一化的像素值会让第一层权重的梯度尺度失控。<strong>（3）</strong>拼接后的融合层把两模态压到 128 维，量级对等；若某分支实际信息量差异大，通过调整 64 与 conv_dim 的配比再平衡。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>图像未归一化</strong>：像素值 0 至 255 直接进入网络，首层梯度量级过大，训练发散或学习率被迫调到极小。修复：进入网络前除以 255，必要时再按通道减均值。</li>
+      <li><strong>通道顺序错误</strong>：观测为 HWC 而卷积按 CHW 解释，形状报错或张量被错误重排后训练出诡异行为。修复：在模型入口显式转换并写注释，片段 3 的 <code>permute</code> 即该转换。</li>
+      <li><strong>卷积输出与全连接层维度不匹配</strong>：改一层核大小后忘记同步更新 <code>post_fcnet_hiddens</code> 的输入维度。修复：用片段 2 的递推函数先核算再改配置，或让框架自动推断。</li>
+      <li><strong>感受野小于目标尺度</strong>：顶层特征看不到完整目标，学习退化为局部纹理匹配，样本需求异常高。修复：核算感受野，用更大核或更多下采样层扩大覆盖。</li>
+      <li><strong>参数量与样本预算失衡</strong>：几十万参数的网络配 10<sup>4</sup> 量级样本，过拟合表现为训练评估差距大。修复：缩小隐层、加正则，或先增大采样预算。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>用两条递推公式核算：输入 64×64，卷积序列 [[16,[5,5],2], [32,[3,3],2]]，输出空间边长与累计感受野各是多少？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>64 经第一层到 30，第二层到 14；感受野第一层贡献 4，累计步幅 2，第二层再贡献 4，合计 9 像素，约为输入边长的 14%；若目标尺度在 20 像素量级，需要增大首层核或再加深一层下采样。</div></details>
+      </li>
+      <li>把片段 1 的 <code>vf_share_layers</code> 从假改为真，预测参数量、训练稳定性与收敛速度的变化，给出验证方案。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>参数量约减半；共享后两个损失在同一主干上叠加，稳定性取决于两者量级是否匹配。固定种子对比两条价值损失曲线。</div></details>
+      </li>
+      <li>设计消融实验验证"空间结构先验被利用"：对图像观测做像素置换（破坏空间局部性）后重训，给出预期与解释。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>像素置换后卷积先验不再匹配数据，性能应显著下降；若变化不大，说明任务依赖的其实是颜色统计等全局特征。</div></details>
+      </li>
+      <li>设计一个三模态观测（前后两帧图像 + 速度向量）的网络结构：给出分支划分、拼接维度与参数量估算，并说明为什么速度分支不应与图像帧一起丢进卷积。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>两帧可堆叠成通道或各自卷积后拼接；速度语义与像素无关，卷积核在其上无物理意义，应走全连接分支。</div></details>
+      </li>
+      <li>解释 <code>post_fcnet_hiddens</code> 的作用：为什么需要卷积主干之后再接全连接层，直接对卷积输出做线性动作投影会损失什么。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>卷积输出的是局部特征图，全连接层负责跨位置的非线性组合；缺少这一层时动作只能由局部特征线性叠加，表达能力受限。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>网络结构跟随观测形态：向量用 MLP、图像用 CNN、序列用 RNN，观测里有什么结构，网络就内置什么先验。</li>
+      <li>卷积配置可核算：输出尺寸与感受野有递推公式，改层前先算再改，形状错误在构建前拦截。</li>
+      <li>策略价值双头默认分离，图像任务因卷积参数占比高常改为共享主干，切换后用消融确认收益。</li>
+      <li>多模态观测用分支编码加拼接，分支输出维度保持同量级，卷积输出维度用空张量前向自动推算。</li>
+      <li>高频错误集中在归一化、通道顺序、维度同步与参数预算四处，配好核算工具即可规避。</li>
+      <li>下一章从单次配置转向系统调优：训练吞吐与并行度，把模型与采样两侧的吞吐账本算清楚。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch047.html">← 第 047 章：RLlib算法选择方法：从任务特性出发</a>
+    <a class="next" href="ch049.html">第 049 章：RLlib训练吞吐与并行度调优 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第028章 PPO的稳定性指标监控 | 深度强化学习课程 · PPO、SAC 与多智能体系统</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · 策略梯度与 PPO</span>
+    <span class="sep">/</span>
+    <span>第 028 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · 策略梯度与 PPO</div>
+    <h1>第 028 章：PPO的稳定性指标监控</h1>
+    <p class="lead">给训练装一套健康检查：每次更新算 6 个诊断量、给出健康/警告/危险三档状态，并用稳健、激进、鲁莽三个配置验证，诊断指标能否在回报崩掉之前先亮红灯。</p>
+    <ul class="meta">
+      <li>主题：训练监控 / 先行指标</li>
+      <li>关键公式：EV = 1 − Var(R<sub>t</sub>−V(s<sub>t</sub>)) / Var(R<sub>t</sub>)；预警提前量 = 性能首跌步 − 首次危险步</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 027 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解"回报是滞后指标"：为什么要在性能崩坏之前监控过程诊断量。</li>
+      <li>实现梯度范数与价值解释方差两个新指标的采集，并掌握它们的健康区间。</li>
+      <li>实现两档阈值 + 冷启动豁免的健康检查逻辑，输出每次更新的三档状态。</li>
+      <li>用"首次警告 / 首次危险 / 性能首跌 / 预警提前量"量化监控系统的有效性。</li>
+      <li>对比稳健 / 激进 / 鲁莽三组超参数，形成"什么组合会触发哪些警报"的直觉。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>前几章你学会了很多诊断量，但它们是零散的：KL 高了、裁剪比例大了、熵掉了，看日志时总要人工综合判断。现实中更常见的情形是：训练跑了几万步，你瞥一眼回报曲线发现早就崩了，而中间那几个关键更新（KL 突然飙高、价值解释方差转负）你根本没注意。</p>
+    <p>本章做一件很工程的事：<strong>把诊断量组织成健康检查</strong>，每个指标给两档阈值，每次更新输出"健康 / 警告 / 危险"和一个触发原因列表。然后用三个配置跑一次对照实验：稳健配置应当几乎全绿；而把学习率与裁剪半径同时放大（鲁莽配置）应当先在 KL、梯度、解释方差上亮灯，<strong>回报下跌是最后一个坏消息</strong>。我们会把"亮灯比下跌早多少步"量化成<strong>预警提前量</strong>，这是监控系统存在的全部意义。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 六个诊断量与它们的含义</h3>
+    <ul>
+      <li><strong>平均 KL</strong>：本次更新把策略推离采样策略多远。0.005～0.02 健康，&gt;0.05 危险；</li>
+      <li><strong>裁剪比例</strong>：多少样本的比率跑出 [1−ε, 1+ε]。5%～20% 正常，&gt;50% 说明更新几乎全被裁剪封住；</li>
+      <li><strong>熵</strong>：策略随机性，骤降说明过早确定化；</li>
+      <li><strong>梯度总范数</strong>：<code>clip_grad_norm_</code> 的返回值，更新方向的"力度"。小网络里 0.5～2 常见，&gt;5 往往对应损失面陡峭；</li>
+      <li><strong>价值解释方差（explained variance, EV）</strong>：价值函数对回报的解释程度：</li>
+    </ul>
+    <div class="formula">
+      EV = 1 − Var(R<sub>t</sub> − V(s<sub>t</sub>)) / Var(R<sub>t</sub>)
+      <span class="note">EV=1 完美预测；EV=0 相当于只会输出均值；EV&lt;0 说明价值网络比常数还差，优势估计此时完全不可信</span>
+    </div>
+    <p>注意 EV 必须在<strong>更新前</strong>、用当前网络对这批新数据计算；拿更新后的网络回算同一批数据会天然偏高，是典型的自证清白。</p>
+
+    <h3>2. 阈值、状态与冷启动</h3>
+    <p>每个指标给出（警告, 危险）两档阈值，本次更新的状态取所有指标里最严重的一档，并记录触发原因：</p>
+    <div class="formula">
+      status(t) = max<sub>metric</sub> severity(metric, threshold)
+    </div>
+    <p>EV 在训练最初几次更新里天然很低（新网络还没学到价值结构），必须加 <strong>warmup 豁免</strong>：前 5 次更新不检查 EV。其余指标随时生效，KL 与梯度的飙高不会因为"还在早期"就无害。</p>
+
+    <h3>3. 回报回撤：性能侧的标尺</h3>
+    <p>性能侧只用一条曲线：近 100 回合滑窗均值相对历史最高的<strong>回撤</strong>：</p>
+    <div class="formula">
+      drawdown(t) = max<sub>τ≤t</sub> window(τ) − window(t)
+    </div>
+    <p>回撤超过 50 分是警告、150 分是危险；而"性能首跌步"定义为回撤首次超过 100 分的时刻。<strong>预警提前量 = 性能首跌步 − 首次危险（无危险则取首次警告）步数</strong>：它为正且足够大，说明监控确实跑在了崩坏前面。</p>
+
+    <h3>4. 三个配置为什么这样设计</h3>
+    <p>学习率与裁剪半径共同决定"每次更新允许走多远"：学习率放大步长，裁剪半径放宽每个样本的比率上限。三个预设中：<code>good</code>（lr=3e-4, clip=0.2）是全书默认；<code>aggressive</code>（lr=1e-3, clip=0.5）步子放大 3 倍多；<code>reckless</code>（lr=5e-3, clip=0.5）则是典型的"能跑但容易失稳"配置，它的样本效率早期可能更快，赌注是后期策略崩坏后能否自己爬回来。监控系统的任务就是在它失稳之前把诊断量里的前兆抓出来。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+
+    <h3>模块划分</h3>
+    <table>
+      <tr><th>组件</th><th>职责</th><th>与第 027 章的关系</th></tr>
+      <tr><td><code>THRESHOLDS</code></td><td>集中定义两档阈值，改一处即可调整整套监控</td><td><strong>新增</strong>：监控配置中心</td></tr>
+      <tr><td><code>explained_variance</code></td><td>EV 计算函数（更新前调用）</td><td><strong>新增</strong>指标</td></tr>
+      <tr><td><code>classify</code></td><td>把 5 个诊断量 + warmup 映射成 (状态, 原因)</td><td><strong>新增</strong>：健康检查核心</td></tr>
+      <tr><td><code>ppo_update</code></td><td>额外采集 <code>clip_grad_norm_</code> 的返回值（梯度总范数）</td><td><strong>扩展</strong>：多一个诊断量</td></tr>
+      <tr><td><code>run_arm</code></td><td>逐更新状态统计 + 首次警告/危险/下跌步 + 预警提前量</td><td><strong>扩展</strong>：从账本到病历</td></tr>
+    </table>
+
+    <h3>关键阈值（节选）</h3>
+    <table>
+      <tr><th>指标</th><th>警告</th><th>危险</th><th>取值理由</th></tr>
+      <tr><td>平均 KL</td><td>&gt; 0.02</td><td>&gt; 0.05</td><td>常用目标 KL 为 0.01～0.02；0.05 以上是明确的过火信号</td></tr>
+      <tr><td>裁剪比例</td><td>&gt; 0.25</td><td>&gt; 0.50</td><td>正常 5%～20%；一半样本被裁剪说明信任域完全失守</td></tr>
+      <tr><td>梯度范数</td><td>&gt; 2.0</td><td>&gt; 5.0</td><td>本网络规模下的经验区间</td></tr>
+      <tr><td>解释方差 EV</td><td>&lt; 0.30</td><td>&lt; 0.00</td><td>EV 转负意味着价值预测不如输出均值</td></tr>
+      <tr><td>滑窗回撤</td><td>&gt; 50</td><td>&gt; 150</td><td>满分 500 的任务里，回撤 10% / 30% 两档</td></tr>
+      <tr><td>warmup</td><td colspan="2">前 5 次更新不检查 EV</td><td>避免冷启动误报</td></tr>
+    </table>
+
+    <h3>数据流</h3>
+    <p>每次更新：<strong>采样 2048 步</strong> → <strong>更新前</strong>用当前网络对整批数据估值、算 EV → <strong>PPO 更新</strong>（顺带接住 <code>clip_grad_norm_</code> 的返回值）→ 用滑窗更新历史最高与回撤 → 组装 metrics 调 <code>classify</code> 得状态与原因 → 记录首次警告/危险/下跌步 → 打印带状态标签的日志。训练结束算预警提前量并进汇总表。</p>
+
+    <h3>与第 027 章的差异点</h3>
+    <ul>
+      <li><strong>关注点</strong>：027 算"数据值不值"；028 算"训练安不安全"。</li>
+      <li><strong>新增两个指标</strong>：梯度总范数（更新力度）与价值解释方差（优势质量）。</li>
+      <li><strong>实验方式</strong>：从扫描数据配置改为对比三组超参数（lr × clip）下的报警特征。</li>
+      <li><strong>新概念</strong>：预警提前量，把"监控有用"变成可以算的数。</li>
+    </ul>
+
+    <div class="box key">
+      <span class="box-title">指标要采集在正确的位置</span>
+      <p>两个位置最容易搞错：<strong>梯度范数</strong>要在 <code>optimizer.step()</code> 之前接住 <code>clip_grad_norm_</code> 的返回值（那是裁剪前的"欲走步长"）；<strong>EV</strong> 要在 <code>ppo_update</code> 之前采集（否则网络刚拟合过这批数据，指标虚高、自证清白）。监控系统的可信度，一半取决于指标采集位置。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：explained_variance，价值网络的"成绩单"</strong></p>
+    <pre class="code"><code>def explained_variance(values, returns):
+    """1 - Var(ret - V) / Var(ret)，衡量价值函数对回报的解释程度。"""
+    v = np.asarray(values, dtype=np.float64)
+    r = np.asarray(returns, dtype=np.float64)
+    var_r = float(np.var(r))
+    if var_r &lt; 1e-8:                 # 回报几乎没有波动：EV 无意义，直接判满分
+        return 1.0
+    return 1.0 - float(np.var(r - v)) / var_r</code></pre>
+    <p>解读：EV 是"价值网络对回报的解释程度"。<strong>（1）</strong>分子是<strong>预测残差</strong>的方差，分母是回报本身的方差：如果 V 完全预测了 R，残差方差为 0，EV=1；如果 V 只会输出常数（等于均值），残差方差≈回报方差，EV≈0。<strong>（2）</strong><code>var_r &lt; 1e-8</code> 的守卫条件处理"回报几乎不变"的病态情形，此时除法无意义，约定返回 1.0。<strong>（3）</strong>用 float64 计算是为了让方差估计更稳，也避免大批量下的精度损失。EV 是优势估计质量的前置条件：它是负的，说明 Â 建立在不可信的价值函数上，后面所有更新都值得怀疑。</p>
+
+    <p><strong>片段 2：classify，健康检查的核心</strong></p>
+    <pre class="code"><code>def classify(metrics, update_idx, warmup=5):
+    """根据诊断量给出（状态等级, 触发原因列表）。warmup 内不检查 EV。"""
+    sev = 0
+    reasons = []
+
+    def flag(level, msg):
+        nonlocal sev
+        if level &gt; sev:
+            sev = level                 # 状态取所有指标里最严重的一档
+        reasons.append(msg)
+
+    if metrics["approx_kl"] &gt; THRESHOLDS["kl_danger"]:
+        flag(2, "KL")
+    elif metrics["approx_kl"] &gt; THRESHOLDS["kl_warn"]:
+        flag(1, "KL")
+
+    if metrics["clip_frac"] &gt; THRESHOLDS["clip_danger"]:
+        flag(2, "裁剪")
+    elif metrics["clip_frac"] &gt; THRESHOLDS["clip_warn"]:
+        flag(1, "裁剪")
+
+    if metrics["grad_norm"] &gt; THRESHOLDS["grad_danger"]:
+        flag(2, "梯度")
+    elif metrics["grad_norm"] &gt; THRESHOLDS["grad_warn"]:
+        flag(1, "梯度")
+
+    if update_idx &gt; warmup:             # 早期价值网络本来就不准，豁免 EV
+        if metrics["explained_var"] &lt; THRESHOLDS["ev_danger"]:
+            flag(2, "解释方差")
+        elif metrics["explained_var"] &lt; THRESHOLDS["ev_warn"]:
+            flag(1, "解释方差")
+
+    if metrics["drawdown"] &gt; THRESHOLDS["dd_danger"]:
+        flag(2, "回撤")
+    elif metrics["drawdown"] &gt; THRESHOLDS["dd_warn"]:
+        flag(1, "回撤")
+
+    return sev, reasons</code></pre>
+    <p>解读：这是本章的"体检报告生成器"。<strong>（1）</strong><code>flag</code> 闭包把"升级状态"和"记录原因"两件事绑在一起：每个指标的判断结构都是"先查危险档、再查警告档"，两个档都触发时只记一次原因，这正是 <code>if/elif</code> 的用意。<strong>（2）</strong>最终状态取所有指标里最严重的一档（0 健康 / 1 警告 / 2 危险），不用简单或运算：即使多个指标同时警告，状态仍是警告，只有任一指标进危险档才升到危险。原因列表则保留全部触发项，<strong>"危险(KL,梯度)"比"危险(KL)"信号强得多</strong>。<strong>（3）</strong>EV 被一层 <code>update_idx &gt; warmup</code> 包住：前 5 次更新里价值网络必然不准，如果不豁免，开局的健康检查会整片飘红，之后就没有区分度了。<strong>（4）</strong>阈值全部来自顶部 <code>THRESHOLDS</code> 字典，调参时改一处即可，不散落在代码各处。</p>
+
+    <p><strong>片段 3：接住梯度范数这个"免费"指标</strong></p>
+    <pre class="code"><code>        for start in range(0, N, args.batch_size):
+            mb = idx[start:start + args.batch_size]
+            logits, value = net(obs[mb])
+            dist = Categorical(logits=logits)
+            logp = dist.log_prob(act[mb])
+
+            ratio = torch.exp(logp - logp_old[mb])
+            surr1 = ratio * adv[mb]
+            surr2 = torch.clamp(ratio, 1.0 - args.clip, 1.0 + args.clip) * adv[mb]
+            policy_loss = -torch.min(surr1, surr2).mean()
+            value_loss = F.mse_loss(value, ret[mb])
+            entropy = dist.entropy().mean()
+            loss = policy_loss + args.vf_coef * value_loss - args.ent_coef * entropy
+
+            optimizer.zero_grad()
+            loss.backward()
+            # clip_grad_norm_ 返回裁剪前的梯度总范数，正好当健康指标
+            gnorm = nn.utils.clip_grad_norm_(net.parameters(), 0.5).item()
+            optimizer.step()</code></pre>
+    <p>解读：与标准 PPO 相比，唯一的变化是<code>gnorm = nn.utils.clip_grad_norm_(...).item()</code>，但这行值回票价。<strong>（1）</strong><code>clip_grad_norm_</code> 的返回值是<strong>裁剪前</strong>的参数梯度总范数，正好记录"这次更新本来想走多大一步"；放在 <code>step()</code> 之前才能拿到干净的读数。<strong>（2）</strong>把它逐 minibatch 累加进 <code>sum_gnorm</code>、最后求均值，就得到一个免费的"更新力度"曲线：正常小网络 0.5～2，飙到 5 以上通常意味着损失面陡峭或优势尺度异常，这正是崩坏的前兆信号之一。<strong>（3）</strong>如果没有这个指标，梯度裁剪 0.5 就像一个静默的保险丝：你永远不知道它是不是每一批都在熔断。</p>
+
+    <p><strong>片段 4：单臂监控循环，从指标到状态再到提前量</strong></p>
+    <pre class="code"><code>        # 更新前的价值解释方差（用当前网络对这批新数据估值）
+        with torch.no_grad():
+            _, v_pred = net(batch["obs"])
+        ev = explained_variance(v_pred.cpu().numpy(), batch["ret"].cpu().numpy())
+
+        stats = ppo_update(net, optimizer, batch, local)
+        update_idx += 1
+
+        window = float(np.mean(all_returns[-100:])) if all_returns else 0.0
+        best_window = max(best_window, window)        # 历史最高：回撤的基准线
+        drawdown = max(0.0, best_window - window)
+        max_drawdown = max(max_drawdown, drawdown)
+
+        metrics = {
+            "approx_kl": stats["approx_kl"], "clip_frac": stats["clip_frac"],
+            "explained_var": ev, "grad_norm": stats["grad_norm"],
+            "drawdown": drawdown,
+        }
+        sev, reasons = classify(metrics, update_idx, warmup=args.warmup)
+        status_count[sev] += 1
+
+        if sev &gt;= 1 and first_warn_step is None:
+            first_warn_step = total_steps          # 首次警告
+        if sev &gt;= 2 and first_danger_step is None:
+            first_danger_step = total_steps        # 首次危险
+        if first_drop_step is None and drawdown &gt; 100.0 and len(all_returns) &gt;= 100:
+            first_drop_step = total_steps          # 性能首跌：回撤破 100 分</code></pre>
+    <p>解读：这段循环是"病历系统"的记账口。<strong>（1）</strong>EV 的采集在 <code>ppo_update</code> <strong>之前</strong>：<code>batch["obs"]</code> 是刚采的数据、网络还没拟合过它，读数才真实；更新后再算会偏高。<strong>（2）</strong><code>best_window</code> 只升不降，<code>drawdown = max(0, best_window - window)</code> 捕捉"从最好水平跌了多远"，这是性能侧唯一需要的量。<strong>（3）</strong>三个"首次"时间戳都用 <code>is None</code> 守卫，只记第一次：首次警告、首次危险、性能首跌（回撤破 100 分）。训练结束后 <code>lead = first_drop_step − alert_step</code> 就是预警提前量。<strong>（4）</strong>注意顺序：状态判定在性能首跌判定之前用同一批数据完成，白天看监控、晚上看成绩单，时间线完全一致。</p>
+
+    <p>完整可运行脚本（附录）：<a href="../code/ch028.py" download>code/ch028.py</a></p>
+    <pre class="sh"><code>python code/ch028.py            # good/aggressive/reckless：各 4 万步，CPU 约 2–4 分钟
+python code/ch028.py --quick    # 快速跑通：30–60 秒
+python code/ch028.py --arms reckless --max-steps 80000   # 鲁莽配置能否爬回来</code></pre>
+    <p>以实跑为准：<strong>good 臂几乎全程健康</strong>（最多一两次 KL 警告，评估 480+）；<strong>aggressive 先亮 KL/裁剪/梯度警告，随后 EV 转弱，最后才出现明显回撤</strong>，预警提前量通常 0.5 万～1.5 万步；<strong>reckless 在 1 万步前后进入危险状态</strong>，最大回撤可达 300 分以上，但预算足够时常能部分恢复。最重要的一列是提前量，<strong>诊断指标确实跑在回报恶化前面</strong>。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>用更新后的网络回算 EV</strong>：同一批数据刚被拟合过，EV 会虚高，掩盖真实的价值学习问题。<strong>修复</strong>：EV 必须在更新前采集。</li>
+      <li><strong>不加 warmup 检查 EV</strong>：训练最初几次更新 EV 天然低甚至为负，会让健康检查开局就整片飘红，失去区分度。</li>
+      <li><strong>单点 KL 尖峰立刻报警</strong>：单次更新的 KL 抖动很大，建议连续两次超限或对最近若干次取均值再触发，降低误报。</li>
+      <li><strong>多臂实验共享优化器/学习率</strong>：每个臂要用独立的 <code>local</code> 命名空间覆盖 lr 与 clip；若误用全局 args，三臂实际上在用同一套参数，报警特征就全错了。</li>
+      <li><strong>梯度范数接错了位置</strong>：在 <code>step()</code> 之后再调用 <code>clip_grad_norm_</code> 拿到的是已裁剪或已被清空的梯度，读数无意义。<strong>修复</strong>：在 <code>backward()</code> 与 <code>step()</code> 之间接住返回值。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>调整 <code>THRESHOLDS</code> 里 KL 的警告/危险阈值（如 0.01/0.03），重跑三配置，观察各臂报警次数与提前量的变化，说明"阈值松紧"对监控的漏报与误报影响。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>阈值收紧会让 good 臂也出现警告（误报），放宽会让 reckless 的危险提前量变小甚至消失（漏报）。理想的阈值是让 good 臂基本全绿。</div></details>
+      </li>
+      <li>把 aggressive 配置改成 lr=1e-3 且 clip 分别取 0.1 与 0.5，对比哪个组合的报警更少，解释学习率与裁剪半径如何"共同决定步子大小"。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>改 <code>ARM_PRESETS</code> 加一个新预设，或在命令行里临时修改。clip 收紧后即使 lr 大，KL 也会被更早压住。</div></details>
+      </li>
+      <li>实现"自动驾驶"：当某次更新状态达到危险时，下一次更新把学习率乘以 0.7（下限 1e-5），观察 reckless 臂的最大回撤与恢复速度变化。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>在 <code>run_arm</code> 里维护一个 <code>lr_now</code>，传进 <code>local.lr</code>；危险降速、连续 5 次健康后再缓慢恢复。这就是工业界的 learning-rate governor 雏形。</div></details>
+      </li>
+      <li>增加"损失尖峰检测器"：用最近 10 次更新的策略损失中位数与 MAD 做鲁棒 z 分数，尖峰超过 5 就单独报警，统计它在三配置中的提前量，与现有指标比较。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>MAD = median(|x − median|)，z = 0.6745·(x − median)/MAD。把尖峰事件记进 <code>metrics</code> 再用 classify 统一处理，或单独维护一个日志列表。</div></details>
+      </li>
+      <li>把 reckless 配置跑 3 个种子（0/1/2），统计"预警提前量"的分布，找出是否出现过"无预警的直接崩溃"或"亮灯后自己恢复"的案例，讨论监控系统的两类错误。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>循环调用 <code>run_arm</code> 并换 <code>--seed</code> 重跑三次（或写个小脚本循环），收集 lead 列表。零提前量/负提前量意味着漏报，需要结合更灵敏的指标。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>回报是滞后指标；KL、裁剪比例、梯度范数、价值解释方差是先行指标，健康检查把它们组织成可行动的三档状态。</li>
+      <li>EV = 1 − Var(R−V)/Var(R) 衡量优势估计的成色，转负意味着价值网络失效，但必须配合 warmup 使用。</li>
+      <li>学习率与裁剪半径共同决定步子大小；两者同时放大会让 KL、梯度、裁剪比例几乎同时亮红灯，随后才是回报回撤。</li>
+      <li>预警提前量把"监控有用"变成数字：典型几千到上万步，是这个系统存在意义的直接证据。</li>
+      <li>下一章把这套指标变成搜索目标：在超参数空间里自动找配置，用失败配置的报警特征提前终止试跑。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch027.html">← 第 027 章：PPO的样本效率分析</a>
+    <a class="next" href="ch029.html">第 029 章：PPO的自动超参数搜索 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

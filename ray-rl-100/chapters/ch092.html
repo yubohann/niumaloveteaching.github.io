@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第092章 端到端实践：Atari风格任务训练流水线 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第五篇 · 训练工程与系统进阶</span>
+    <span class="sep">/</span>
+    <span>第 092 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第五篇 · 训练工程与系统进阶</div>
+    <h1>第 092 章：端到端实践：Atari风格任务训练流水线</h1>
+    <p class="lead">一句话：本章把图像观测、离散动作的游戏风格任务组装成完整流水线：预处理的包装器顺序、卷积网络配置、采样与评估协议、以及围绕它的超参搜索。</p>
+    <ul class="meta">
+      <li>主题：端到端实践 / 图像离散控制</li>
+      <li>关键机制：观测预处理链、卷积特征提取、评估协议、搜索接入</li>
+      <li>预计学时：65 分钟</li>
+      <li>前置章节：第 091 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>掌握图像观测预处理链的标准顺序：跳帧、灰度化、缩放、帧堆叠，并解释每一步的动机与颠倒顺序的后果。</li>
+      <li>会为 84×84×4 输入配置卷积特征提取网络，并估算参数量与推理成本。</li>
+      <li>能组装 PPO 的完整配置：采样批、片段长度、并行环境与复用轮数的整除一致性。</li>
+      <li>掌握该任务形态的评估协议：独立评估环境、评估回合数、评估频率与回报口径。</li>
+      <li>会把关键超参接入 Tune 搜索，并定义抗噪声的排序指标。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>图像输入加离散动作是强化学习最经典的任务形态：观测是高维像素，动作是有限按键，环境步廉价而观测处理昂贵。<strong>这类任务把前面章节的全部配置项同时拉到台面上：批结构、并行度、显存、复用、容错与评估协议，任何一项配置错误都会表现为"训练不收敛"，难以从回报曲线定位根因。</strong>本章按数据从像素到动作的实际路径组织配置，把每一步的选择依据写清楚，使流水线成为可检查、可搜索、可复现的整体。</p>
+    <p>与前面的连续控制、多智能体实践相比，本章流水线的特殊性集中在两处：其一，预处理链在采样与评估两条路径上都要一致地复现，且它对吞吐的影响很大；其二，评估噪声显著（游戏回报方差大），需要固定的评估协议才能比较配置优劣。这两点构成了本章的设计重心。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p><strong>Atari 风格流水线的核心是把"像素到决策"的每一级变换固定成确定性的、两路一致的管道，再围绕它做参数配置。</strong>本节依次讨论预处理、网络、采样配置、评估协议与搜索接入。</p>
+
+    <h3>1. 预处理链的顺序与动机</h3>
+    <p>标准预处理链的次序为：跳帧（Frame Skip）→ 灰度化（Grayscale）→ 缩放（Resize）→ 帧堆叠（Frame Stack）。每一步的依据：</p>
+    <table>
+      <tr><th>步骤</th><th>作用</th><th>颠倒或遗漏的后果</th></tr>
+      <tr><td>跳帧</td><td>每 k 帧决策一次，动作在帧间重复</td><td>决策频率与动作语义错位，学习量成倍增加</td></tr>
+      <tr><td>灰度化</td><td>通道从 3 降到 1，带宽与内存降为三分之一</td><td>在堆叠后灰度化会破坏时间结构</td></tr>
+      <tr><td>缩放</td><td>分辨率归一到 84×84 量级</td><td>先堆叠再缩放使插值跨帧混合，产生鬼影</td></tr>
+      <tr><td>帧堆叠</td><td>近 4 帧拼接，提供速度与方向信息</td><td>缺失堆叠使部分可观测性无法缓解</td></tr>
+    </table>
+    <p>顺序不变量只有一条：<strong>逐帧的几何与颜色变换在堆叠之前完成，堆叠之后不再做任何跨帧混合的变换。</strong>训练与评估必须使用同一份包装器代码构造环境，评估端另起一套等价实现是历史 bug 的高发地带。</p>
+
+    <h3>2. 卷积特征提取与成本</h3>
+    <p>84×84×4 输入的标准卷积栈为三段：32 通道 8×8 步长 4、64 通道 4×4 步长 2、64 通道 3×3 步长 1，输出展平后接 256 维全连接。参数量约 1.7 百万量级，前向计算量集中在第一层。<strong>参数量小意味着显存的主要占用在激活与工作区（第 084 章），模型宽度不需要为显存收缩，需要克制的是采样端推理成本。</strong>采样端每个环境步都要一次前向：卷积前向在 CPU 上与在 GPU 上的单样本时延差异明显，采样规模大时把采样端推理放到 GPU（分数资源共享）或批量前向可以降低每步成本；是否值得取决于实测的采样侧耗时结构（第 085 章的分解）。</p>
+
+    <h3>3. 采样与更新配置的整除一致性</h3>
+    <p>沿用第 083 章的约束：批大小 = 采样进程数 × 每进程环境数 × 片段长度。一组典型配置：批 4096 步、8 个进程、每进程 2 个环境、片段长度 256；更新轮数 4 至 6、小批 256（4096 除 256 得 16 个小批），整除关系需要逐项验证。图像任务的成本结构使并行度偏保守：每个进程持有独立的帧堆叠缓存（约 28 KiB × 环境数），进程过多时内存与调度开销上升，收益递减点通常早于低维任务。</p>
+
+    <h3>4. 评估协议</h3>
+    <p>评估回答"策略当前水平如何"，协议包含五个要素：<strong>独立环境</strong>（与训练环境隔离的实例，避免评估污染训练状态）；<strong>回合数</strong>（每个评估点至少 3 至 5 回合，取平均或中位数）；<strong>策略模式</strong>（评估使用同一动作规则，确定性或固定温度的随机，全程一致）；<strong>频率</strong>（按训练步数计量，训练与评估的样本量对应关系稳定；墙钟时间因机器负载波动不可比）；<strong>记录字段</strong>（每回合回报、回合长度、评估时的步数与版本号）。游戏任务的回报方差大，单回合评估的排序噪声可以覆盖配置差异，这是评估协议必须写死的直接原因。</p>
+
+    <h3>5. 搜索接入与排序指标</h3>
+    <p>该任务形态的敏感超参通常是：学习率、熵系数、裁剪参数、更新轮数。搜索空间按第 081 与 082 章的原则组织：学习率用对数分布（10<sup>-4</sup> 至 10<sup>-3</sup>），熵系数对数分布（10<sup>-3</sup> 至 10<sup>-1</sup>），裁剪参数取 {0.05, 0.1, 0.2} 的离散集合，更新轮数取 {2, 4, 6, 10}。排序指标用评估点的平滑曲线面积（若干评估点的均值），配合 ASHA 提前终止；<strong>搜索预算按试验 20 至 40 次规划，每试验的样本预算取基线收敛步数的 60% 至 80%，使弱配置尽早暴露。</strong></p>
+
+    <h3>6. 网络参数与前向成本的数量分解</h3>
+    <p>按卷积栈 [32·8·4]、[64·4·2]、[64·3·1] 与 256 维全连接头逐模块核算：</p>
+    <table>
+      <tr><th>模块</th><th>输出规格</th><th>参数量</th></tr>
+      <tr><td>卷积 1</td><td>20×20×32</td><td>约 0.8 万</td></tr>
+      <tr><td>卷积 2</td><td>9×9×64</td><td>约 3.3 万</td></tr>
+      <tr><td>卷积 3</td><td>7×7×64</td><td>约 3.7 万</td></tr>
+      <tr><td>拉平到 256 维（策略侧）</td><td>3136 → 256</td><td>约 80.3 万</td></tr>
+      <tr><td>拉平到 256 维（价值侧独立一路）</td><td>3136 → 256</td><td>约 80.3 万</td></tr>
+      <tr><td>输出头（动作与价值）</td><td>256 → 6 与 1</td><td>约 0.2 万</td></tr>
+      <tr><td>合计</td><td></td><td>约 169 万</td></tr>
+    </table>
+    <p>单次策略前向的乘加运算约 930 万次，其中卷积三段合计约 770 万次、两路全连接合计约 160 万次，第一层卷积占卷积计算量约四成。<strong>参数量占比最大的是两路全连接，计算量占比最大的是第一层卷积：前者决定显存常驻，后者决定采样端单步推理成本，两个瓶颈位置不同。</strong>采样规模大时用批量前向摊薄固定开销，收益由实测的采样侧耗时结构判定。</p>
+
+    <h3>7. 评估回合数与噪声量级</h3>
+    <p>设单回合回报标准差约为 20，回合数为 n 时均值的标准误按 σ/√n 缩放：</p>
+    <table>
+      <tr><th>评估回合数</th><th>标准误</th><th>最小可分辨差异（约 2.8 倍标准误）</th></tr>
+      <tr><td>3</td><td>11.5</td><td>32</td></tr>
+      <tr><td>5</td><td>8.9</td><td>25</td></tr>
+      <tr><td>10</td><td>6.3</td><td>18</td></tr>
+    </table>
+    <p>游戏任务的配置差异常落在数十点量级，3 至 5 个回合的单点评估只能支撑粗粒度比较；细粒度排序依赖滑动窗口跨多个评估点累积信息。固定场景集之后，跨配置的方差主要来自策略本身，协议可比性由此成立。</p>
+
+    <h3>8. 跳帧与样本预算的关系</h3>
+    <p>跳帧 k 表示每个决策在环境中重复 k 个仿真帧：k 取 4 时，同样仿真帧数对应的决策样本缩小到四分之一，学习所需样本量下降，单决策的时间分辨率变粗。跳帧与栈深共同决定观测覆盖的时间跨度：k = 4、栈深 4 时观测覆盖约 16 个仿真帧的历史。跳帧参数在环境构造处只出现一次并由工厂统一分发，任何离线评估脚本都不得自行实现跳帧逻辑。训练与评估的帧堆叠缓存各自独立，评估实例在两次评估之间保持空闲但不释放，内存预算按常驻计算。批量前向下用整批观测做一次前向，推理吞吐高于逐个智能体逐步调用，采样规模越大收益越明显。灰度与缩放的具体参数写入配置快照，复现实验时按快照还原预处理链。评估实例的场景种子集固定后，跨配置的评估序列一致；新增配置按同一套种子评估，历史对比不需要重跑旧配置。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>流水线组装分六步，产物是一份"配置 + 包装器 + 评估 + 搜索"四件套。</p>
+    <ol>
+      <li><strong>环境工厂</strong>：把预处理链封装为单一函数，训练与评估共用。</li>
+      <li><strong>网络配置</strong>：卷积栈与全连接头，冻结随机初始化种子。</li>
+      <li><strong>采样配置</strong>：批、进程、环境数、片段长度按整除约束联合确定。</li>
+      <li><strong>算法参数</strong>：PPO 的学习率、折扣、GAE、熵系数、裁剪与更新轮数。</li>
+      <li><strong>评估与检查点</strong>：评估协议五要素与检查点间隔（沿用第 090 章模型）。</li>
+      <li><strong>搜索接入</strong>：开放 2 至 3 个敏感超参，指标与调度器按第 5 点组织。</li>
+    </ol>
+    <h3>基线配置表</h3>
+    <table>
+      <tr><th>参数</th><th>基线值</th><th>依据</th></tr>
+      <tr><td>观测</td><td>84×84 灰度，4 帧堆叠，1 字节存储</td><td>带宽与信息量的标准折中</td></tr>
+      <tr><td>跳帧</td><td>4</td><td>决策频率与动作语义匹配</td></tr>
+      <tr><td>学习率</td><td>2.5×10<sup>-4</sup></td><td>对数区间 1e-4 至 1e-3 的中低位</td></tr>
+      <tr><td>折扣 / GAE</td><td>0.99 / 0.95</td><td>长回合任务的标准起点</td></tr>
+      <tr><td>批 / 小批 / 轮数</td><td>4096 / 256 / 4</td><td>整除校验后确定，批内 16 个小批</td></tr>
+      <tr><td>并行</td><td>8 进程 × 2 环境，片段 256</td><td>整除链闭合，图像任务的收益递减点</td></tr>
+      <tr><td>评估</td><td>5 回合 / 每 50k 步</td><td>覆盖评估噪声，频率与样本量对应</td></tr>
+    </table>
+    <div class="box warn">
+      <span class="box-title">与上一章的差异</span>
+      <p>第 091 章处理部署阶段的推理一致性，本章在训练阶段就为部署铺路：环境工厂从第一天起就承担"训练与评估共用"的职责，导出时的前处理统计与它同源，避免第 091 章所述的 Train-Serve Skew 从训练期埋下。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>以下片段基于 Ray 2.x 时期的通用写法，接口随版本演进，以对应版本的官方文档为准。</p>
+
+    <p><strong>片段 1：预处理链的环境工厂</strong></p>
+    <pre class="code"><code>import gymnasium as gym
+
+def make_env(env_id, frame_skip=4, size=84, stack=4, seed=0):
+    """环境工厂：训练与评估共用同一构造路径。
+    顺序不变量：几何与颜色变换全部在帧堆叠之前完成。"""
+    env = gym.make(env_id, frameskip=frame_skip)
+    # 灰度化与缩放先行：先降维再堆叠，堆叠后不再做跨帧混合变换
+    env = gym.wrappers.GrayscaleObservation(env)
+    env = gym.wrappers.ResizeObservation(env, (size, size))
+    # 帧堆叠提供速度与方向信息，缓解像素观测的部分可观测性
+    env = gym.wrappers.FrameStackObservation(env, stack)
+    # 种子在包装之后设置：保证重置序列与评估端可复现
+    env.reset(seed=seed)
+    env.action_space.seed(seed)
+    return env
+
+# 评估用独立的工厂调用（独立环境实例），不用训练环境做评估
+train_env = make_env("ALE/Pong-v5", seed=101)
+eval_env = make_env("ALE/Pong-v5", seed=909)</code></pre>
+    <p>解读：工厂函数把整条链固定成单一入口。<strong>（1）</strong>包装顺序在函数内部固化，调用方无法在不修改代码的情况下颠倒步骤，顺序不变量由结构保证。<strong>（2）</strong>种子在包装完成后设置，包装可能改变观察空间但不改变重置语义，此顺序保证同一场景序列可复现。<strong>（3）</strong>训练与评估用不同种子构造独立实例：共用实例会让评估步进污染训练状态，也让评估结果依赖训练进度，失去可比性。</p>
+
+    <p><strong>片段 2：图像任务的 PPO 配置与整除校验</strong></p>
+    <pre class="code"><code>from ray.rllib.algorithms.ppo import PPOConfig
+
+def atari_config(batch=4096, n_runners=8, n_envs=2, epochs=4):
+    """组装图像输入任务的 PPO 配置：整除链在入口处一次校验。"""
+    total = n_runners * n_envs
+    assert batch % total == 0, "批大小须被进程数与环境数整除"
+    assert batch % 256 == 0, "批大小须被小批整除"   # 4096 / 256 = 16
+    fragment = batch // total                    # 片段长度由整除链反推
+    return (
+        PPOConfig()
+        .environment("ALE/Pong-v5", env_config={"frameskip": 4})
+        .env_runners(
+            num_env_runners=n_runners,           # 图像任务并行收益递减较早
+            num_envs_per_worker=n_envs,
+            rollout_fragment_length=fragment,
+        )
+        .training(
+            train_batch_size=batch,
+            sgd_minibatch_size=256,              # 每批 16 次小批更新，梯度噪声可控
+            num_sgd_iter=epochs,                 # 复用轮数：4 是图像任务的常用值
+            lr=2.5e-4,                           # 对数空间中低位，配合裁剪稳定更新
+            gamma=0.99,
+            lambda_=0.95,                        # GAE 参数：长回合任务的标准起点
+            entropy_coeff=0.01,                  # 离散动作保持少量探索
+            clip_param=0.1,                      # 裁剪宽度：0.1 是通用起点
+        )
+        .env_runners(record_env_steps=True)      # 评估与排序统一按环境步口径
+    )</code></pre>
+    <p>解读：这份配置把前几章的结论按图像任务语境落地。<strong>（1）</strong>整除断言前置，片段长度由除法推导，避免运行期静默截断。<strong>（2）</strong>更新轮数 4 对应"每样本复用 4 次"，图像任务的裁剪比例对复用敏感，基线不取高档位。<strong>（3）</strong>按环境步记录进度：图像任务墙钟波动大（预处理与推理竞争），步数口径是实验之间唯一稳定的公共标尺。</p>
+
+    <p><strong>片段 3：评估协议与搜索指标</strong></p>
+    <pre class="code"><code>def evaluate(algo, eval_env, episodes=5):
+    """评估协议：独立环境、固定回合数、统一动作规则。
+    返回每回合回报与长度的均值，供 Tune 排序使用。"""
+    returns, lengths = [], []
+    for i in range(episodes):
+        obs, _ = eval_env.reset(seed=9000 + i)    # 固定评估场景集，跨配置可比
+        done, total_r, steps = False, 0.0, 0
+        while not done:
+            action = algo.compute_single_action(obs, explore=False)
+            obs, reward, terminated, truncated, _ = eval_env.step(action)
+            done = terminated or truncated
+            total_r += float(reward)
+            steps += 1
+        returns.append(total_r)
+        lengths.append(steps)
+    mean_r = sum(returns) / len(returns)
+    # 回报与长度一起上报：偶然的短回合高分不应被当成能力提升
+    return {"eval_return": mean_r, "eval_length": sum(lengths) / len(lengths)}
+
+def smooth_score(history, window=5):
+    """排序指标：最近若干评估点的均值，抵抗单点噪声。
+    评估点不足窗口时用全部历史，保持冷启动阶段的可用性。"""
+    recent = history[-window:]
+    return sum(recent) / len(recent)</code></pre>
+    <p>解读：评估代码把协议五要素具体化。<strong>（1）</strong>固定评估场景种子集：所有候选配置在相同初始状态上评估，配置间差异不混入场景抽样的随机性。<strong>（2）</strong>动作规则固定为不探索，排序口径一致；如需随机策略评估，应整套流程切换并在记录中标注。<strong>（3）</strong>平滑窗口作为排序指标：单点回报的方差可以覆盖真实差异，滑动均值把比较基准稳定到趋势上，这一点在噪声大的游戏任务中尤其重要。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>包装器顺序颠倒</strong>：先堆叠再缩放使插值跨帧混合，观测出现重影，回报上限被压低。修复：工厂函数固化顺序，并用单步观测可视化抽查。</li>
+      <li><strong>训练与评估的预处理不一致</strong>：评估端手工实现简化版处理，离线指标与训练行为不符。修复：评估复用同一工厂；导出清单与工厂同源（与第 091 章衔接）。</li>
+      <li><strong>单回合评估下结论</strong>：游戏回报方差大，单回合差异多数来自场景抽样。修复：固定场景集，至少 3 至 5 回合，排序用滑动均值。</li>
+      <li><strong>跳帧参数与动作重复语义错配</strong>：动作在框内的重复次数与决策间隔不一致，策略学到错误的控制频率。修复：跳帧参数只出现一处（环境构造处），训练与评估一致。</li>
+      <li><strong>帧堆叠观测的内存低估</strong>：缓冲与对象存储按单帧估算，实际按堆叠倍数增长。修复：按第 084 章公式重新估算，存储用 1 字节每像素。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>计算题：批 6000、8 进程、3 环境、更新轮数 4、小批 250。检查整除链；若小批改为 256，调整哪个参数能恢复一致性？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>总数 24，6000/24=250 片段恰好；小批 256 不整除 6000，可改小批为 240 或批为 6144 并重算片段。</div></details>
+      </li>
+      <li>预测题：把更新轮数从 4 提到 12、其余不变。预测裁剪比例、评估回报与训练耗时结构的变化。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>裁剪比例上升、学习时间占比上升；回报可能短期提升随后出现平台或回落；样本效率指标不一定改善。</div></details>
+      </li>
+      <li>设计题：为该任务设计一次 24 试验的搜索：两个超参维度、空间范围与理由、每试验预算、调度器参数、排序指标与复核方案。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>学习率与熵系数两维对数空间；预算取基线收敛步数的 70%；ASHA 保留前 25%；排序用评估滑动均值；前三名多种子复核。</div></details>
+      </li>
+      <li>分析题：解释为什么"先灰度化后缩放"通常比"先缩放后灰度化"更省计算，而两者的数值结果几乎一致；什么情况下这个顺序会造成可见差异？<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>灰度化按全分辨率计算但通道合并线性；顺序对线性变换可交换；若缩放采用带邻域混合的插值且颜色空间非线性（如含 gamma），差异才会可见。</div></details>
+      </li>
+      <li>计算题：按卷积栈 [32·8·4]、[64·4·2]、[64·3·1] 与 256 维全连接（策略与价值各一路）估算总参数量，指出占比最大的模块，并说明它对应的资源瓶颈类型。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>卷积合计约 7.8 万，两路全连接合计约 160.6 万，总参数约 169 万；占比最大的是全连接层，对应显存常驻瓶颈，卷积层对应推理计算瓶颈。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>预处理链顺序不变量：跳帧、灰度、缩放先于堆叠；训练与评估共用同一工厂。</li>
+      <li>卷积栈参数量适中，显存瓶颈在激活与工作区；采样端推理成本决定是否启用批量前向。</li>
+      <li>采样配置按整除链一次校验：批 = 进程 × 环境 × 片段，复用轮数取中低档位配裁剪约束。</li>
+      <li>评估协议五要素固定后，比较才有效；排序用滑动均值抵抗场景抽样噪声。</li>
+      <li>下一章切换到连续控制任务：观测归一化、动作边界与离策略复用成为主角。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch091.html">← 第 091 章：模型部署：从训练到服务</a>
+    <a class="next" href="ch093.html">第 093 章：端到端实践：连续控制任务训练流水线 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

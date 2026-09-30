@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第052章 实现部分可观测环境 | 机器人仿真学习课程 · Isaac Sim 强化学习训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第三篇 · 高级强化学习专题</span>
+    <span class="sep">/</span>
+    <span>第 052 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第三篇 · 高级强化学习专题</div>
+    <h1>第 052 章：实现部分可观测环境</h1>
+    <p class="lead">当观测看不清状态：本章把"遮蔽 + 延迟"建成标准的 POMDP 环境，讲清为什么无记忆策略注定失败，以及从帧堆叠到循环网络这条"补记忆"的技术阶梯。</p>
+    <ul class="meta">
+      <li>主题：高级专题 / 部分可观测与记忆</li>
+      <li>相关组件：Isaac Sim / Isaac Lab / Stable-Baselines3 / PyTorch</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 051 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>能写出 POMDP 的七元组 (S, A, P, R, Ω, O, γ)，并说清它与 MDP 的唯一实质差别。</li>
+      <li>理解"状态别名"（aliasing）：两个不同状态映射到同一观测，为什么会让无记忆策略必然次优。</li>
+      <li>会设计可观测量为"遮蔽 + 延迟"的任务，并用"记忆地平线"测试验证策略确实在记忆。</li>
+      <li>掌握帧堆叠的实现细节：开场填充、顺序、归一化，以及它作为"充分统计量"的适用条件。</li>
+      <li>会给策略设计记忆特征（最后可见位置 + 时间戳），并解释它比原始帧堆叠高明在哪。</li>
+      <li>会区分"真 POMDP"与"伪 POMDP"：检查你的环境有没有偷偷把真值泄露进观测。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 051 章的隐藏参数只是"看不见环境的一角"，本章把问题推到极致：<strong>观测本身不完整</strong>。机械臂要装的零件被遮挡、自动驾驶传感器有 100 ms 延迟、对手的动作还没发生但意图已定，这些场景里，同一帧画面可能对应两种完全不同的世界状态，而正确的动作完全相反。</p>
+    <p>为什么这个问题重要？因为大多数仿真任务都太"诚实"了：观测里给了完整的真值状态，策略不需要记忆就能最优。一旦迁移到真机（有遮挡、有延迟、有噪声）就崩掉。本章的目标有两个：一是会<strong>故意制造</strong>部分可观测性，把任务变成策略必须动脑子的记忆问题；二是掌握"补记忆"的标准技术栈，帧堆叠、记忆特征，并为第 061 章的循环网络策略做铺垫。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. POMDP：多出来的只是一个观测函数</h3>
+    <p>部分可观测马尔可夫决策过程（POMDP）在 MDP 之上加了一层"观测函数"：</p>
+    <div class="formula">
+      POMDP = (S, A, P, R, Ω, O, γ)
+      <span class="note">Ω 为观测集合，O(o | s′) 为"到达状态 s′ 后看到 o"的概率；策略只能访问 o<sub>1:t</sub></span>
+    </div>
+    <p>与 MDP 的唯一本质差别：策略只能访问观测 o，不能直接访问状态 s。<strong>状态本身不受影响</strong>，世界仍然是马尔可夫的，只是"看不全"。这个视角带来了接下来全部技术的出发点：既然状态看不见，智能体必须自己维护一个"相信的世界"，信念（belief）b<sub>t</sub>(s) = P(s<sub>t</sub> = s | o<sub>1:t</sub>, a<sub>1:t</sub>)。理论上的最优策略是信念的函数 π(a | b<sub>t</sub>)。</p>
+    <p>对工程实现来说，"维护信念"不需要真的做贝叶斯递推，任何能压缩历史的结构（帧堆叠、RNN 隐状态、注意力池化）都在近似信念。衡量近似好坏的标准只有一个：<strong>它是否保留了"决定动作所需的信息"</strong>。</p>
+
+    <h3>2. 状态别名：无记忆策略的死刑判决</h3>
+    <p>举个最小例子（"藏球游戏"）：两个杯子 A、B，开局球在 A 下面（策略看到了）；之后杯子被盖住并快速交换几次，交换过程被完全遮挡；最后要求策略指出球在哪。观测序列是"看到球在 A"→"全黑（若干帧）"→"请选择"。无记忆策略看到"全黑 + 请选择"这一观测时，它在所有回合里看到的输入完全相同，因此只能输出一个固定选择，<strong>正确率上限 50%</strong>。而任何记住了交换次数与初始位置的策略，正确率可以到 100%。</p>
+    <p>这个例子揭示了 POMDP 的核心困境：观测把不同的真实状态映射到了同一个面上。写成概率：O(o | s<sub>1</sub>) = O(o | s<sub>2</sub>) 但 π<sup>*</sup>(a | s<sub>1</sub>) ≠ π<sup>*</sup>(a | s<sub>2</sub>)。这类任务里，观测和状态之间的"信息缺口"必须由历史填补，这就是为什么 POMDP 的策略网络需要"记忆"。</p>
+
+    <h3>2.1 数值算例：别名程度与记忆需求的信息量</h3>
+    <p>把"藏球"例子的信息量换算成比特。3 个候选位置时，初始观测把不确定性从 log₂3 ≈ 1.58 bit 降到 0；之后每次被遮挡的交换若不可见，信念保持均匀，无记忆策略的正确答案上限是 1/3 ≈ 33%，<b>而任何记住了初始位置与交换次数的策略上限是 100%，两者之间的差距就是记忆的全部价值</b>。候选位置扩到 8 个时，猜测上限降到 12.5%，而"看过一眼"提供的信息量升到 3 bit。候选越多，单次观测的信息价值越高、记忆的回报越大，这就是设计里把位置数从 2 增到 3–5 作为难度轴的信息论依据：随机基线下降的同时，记忆策略的天花板保持在满分附近，两条线越拉越开。</p>
+    <p>时间尺度同样要核算。帧堆叠 k = 8、控制 10 Hz 时覆盖 0.8 s 的历史；设计里"可见 15 步"在 10 Hz 下是 1.5 s，已经超过帧堆叠的容量，单靠堆叠无法覆盖整段空隙，必须依赖记忆特征（最后可见位置 + 年龄）或循环网络。<b>三类方案的适用边界由此量化：延迟 2–3 步用堆叠、遮挡 10–30 步用记忆特征、整回合不可见用循环网络。</b>延迟队列的长度也可以核对：delay_steps = 3 时队列保存 4 个观测（当前 + 3 个历史），10 Hz 下"看到的世界"比真实晚 300 ms，以 0.3 m/s 行走的机器人在这 300 ms 里前进 9 cm，比目标容差大一个量级，说明延迟本身就是必须在结构上显式建模的扰动，不能当作可以忽略的小噪声。</p>
+    <p>记忆地平线曲线的读法可以用一组示例数字演练：可见时长档取 0、2、5、10、20 步，若成功率序列为 [1.00, 0.98, 0.95, 0.70, 0.20]，<b>拐点落在第 3 与第 4 档之间，对应有效记忆约 10 步，10 Hz 下折算 1 秒</b>。判断拐点成因时要先排除分布外因素：如果训练时的可见时长上限是 15 步，评估到 20 步的下跌有一部分来自"从未见过这么长的空窗"，应把训练分布内的拐点当作记忆边界、把分布外的下跌单列为泛化缺口，两部分分开报告。观测维度顺手核对：关节（14）+ 末端位姿（6）+ 目标位置（3）+ 可见性标志（1）+ 时间戳（1）+ 进度（1）= 26，与设计规格一致；目标不可见时置零，由可见性标志与时间戳接管"该信多深"的表达，三个字段合计只占 5 维，<b>换来的却是无记忆网络完全拿不到的信息，这类"小而关键"的字段是 POMDP 观测设计里性价比最高的一部分</b>。</p>
+    <p>评估协议的最后一条数字纪律：延迟档与可见性档不能同时变化。测"记忆地平线"时把 delay_steps 固定在 0，测"延迟鲁棒性"时把可见时长固定，两个缺口分开测，<b>否则折线图的下跌无法归因到是哪一个缺口造成的</b>；这与第 051 章"单变量突变便于评估恢复时间"是同一条实验设计纪律。报告形式建议用两条曲线：可见性-成功率曲线与延迟-成功率曲线，各自标注训练时见过的范围，读者一眼能看出"能力边界"与"泛化缺口"的位置；若两条曲线在同一档位同时断崖，优先怀疑训练分布的覆盖问题，先扩训练范围再谈改进记忆结构。</p>
+
+    <h3>3. 补记忆的技术阶梯</h3>
+    <table>
+      <tr><th>方案</th><th>记忆形式</th><th>适用条件</th><th>成本</th></tr>
+      <tr><td>帧堆叠（frame stacking）</td><td>最近 k 帧观测拼接</td><td>信息缺口 ≤ k−1 步（延迟、短时遮挡）</td><td>输入维度 ×k</td></tr>
+      <tr><td>记忆特征工程</td><td>最后可见位置 + 时间戳等</td><td>能人工说清"缺什么"</td><td>低，但需任务知识</td></tr>
+      <tr><td>循环网络策略</td><td>RNN/GRU 隐状态压缩全部历史</td><td>一般情形（061 章展开）</td><td>训练变复杂（序列化）</td></tr>
+      <tr><td>注意力/Transformer</td><td>对历史 token 的选择性读取</td><td>长历史、稀疏关键帧（062 章）</td><td>计算量 O(n²)</td></tr>
+    </table>
+    <p>阶梯的"适用条件"很关键：<strong>帧堆叠不是万能的</strong>。如果关键信息发生在 50 步之前（藏球游戏交换在很早期），k = 4 的帧堆叠完全无效，它只能记住最近几步。反过来说，如果环境里 90% 的不确定来自传感器延迟（2–3 步），帧堆叠就足够便宜好用。工程决策流程：先确定"信息缺口的时间尺度"，再选方案。</p>
+
+    <h3>4. 真 POMDP 与伪 POMDP：一个必做的体检</h3>
+    <p>很多团队以为自己在训 POMDP，实际训的是"漏气的 MDP"：观测里不知不觉混进了真值，物体的真实质量写进了某个传感器通道、遮蔽函数漏了某个字段、对手的位置在 UI 上不可见但数据里还在。体检方法很朴素：<strong>用"随机策略"与"无记忆最优策略"跑任务，看分数差</strong>。如果无记忆策略能轻松拿满分，你的环境对记忆的需求就是零。另一个体检：把观测屏蔽掉一部分再训练，如果性能毫无变化，说明那部分信息根本没被用上（可能被别的通道泄露了）。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>设计一个标准的 POMDP 抓取任务（"记忆抓取"）：</p>
+    <ol>
+      <li><strong>任务</strong>：桌面上有 3 个位置中的一个随机放着目标方块，机械臂开局扫一眼（0.5 s 可见），然后视野被"限制"（模拟遮挡），机器人必须凭记忆走过去抓。抓错位置判失败。</li>
+      <li><strong>部分可观测的实现</strong>：目标物体的位置只在开局前 15 步可见；之后观测里 target 字段置为 <code>None</code>（用全零 + 可见性标志位表达）。其余状态（关节、末端）始终可见。</li>
+      <li><strong>传感器延迟</strong>：额外加 2–3 步延迟（第 051 章片段同款队列），把"时间尺度"补全：策略必须同时处理"遮挡（无期限）"与"延迟（短期）"。</li>
+      <li><strong>观测</strong>（约 26 维）：关节（14）、末端位姿（6）、目标位置（3，不可见时全零）、可见性标志（1）、时间戳（目标上次可见距今步数，1）、进度（1）。</li>
+      <li><strong>基线对比</strong>：无记忆 MLP（输入当前帧）作为下界；帧堆叠 k=8 作为中档；GRU 策略（061 章）作为上界参考。三个基线的差距就是"记忆的价值"。</li>
+      <li><strong>训练课程</strong>：先 0.5 s 可见（容易）→ 0.2 s（较难）→ 单帧可见（最难）；位置数从 2 个增到 3–5 个。</li>
+      <li><strong>评估</strong>：记忆地平线测试，目标可见时长从 0.5 s 扫到 0 s，画成功率曲线；曲线下降的拐点就是策略记忆能力的"边界"。</li>
+    </ol>
+    <table>
+      <tr><th>信息缺口</th><th>持续时间</th><th>推荐方案</th></tr>
+      <tr><td>传感器延迟</td><td>2–5 步</td><td>帧堆叠 k=4–8</td></tr>
+      <tr><td>短时遮挡（走过柱子）</td><td>10–30 步</td><td>帧堆叠 + 记忆特征（最后位置）</td></tr>
+      <tr><td>无限期遮挡（目标不可见）</td><td>整回合</td><td>RNN 策略（061）/ 外部记忆</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计思维：为什么"时间戳"特征比多堆几帧更值？</span>
+      <p>"目标上次可见距今 12 步"这一个标量，比堆 12 帧老画面更有效地告诉策略"该信多深"。帧堆叠给的是原始历史，网络还得自己学会"哪帧更老、哪帧更可信"；时间戳直接把"信息新鲜度"编码好了。这是 POMDP 环境设计里最通用的技巧：<strong>能人工算出的历史摘要（新鲜度、次数、变化率），就不要留给网络从原始帧里猜</strong>。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：观测函数，遮蔽与延迟</strong></p>
+    <pre class="code"><code>def masked_observation(true_state, rng, buffer, visible_steps, step_id,
+                       occlude_prob=0.5, delay_steps=3):
+    # 遮蔽：目标位置只在前 visible_steps 步可见；之后置零并给可见性标志
+    obs = dict(true_state)                     # 浅拷贝：不改动真实状态
+    if step_id &lt; visible_steps:
+        obs["target_visible"] = 1.0
+    else:
+        obs["target"] = (0.0, 0.0, 0.0)        # 置零并保留字段：保持观测维度恒定
+        obs["target_visible"] = 0.0
+        # 时间戳：目标上次可见距今多少步。它把"记忆有多旧"直接告诉策略
+        obs["target_age"] = float(step_id - visible_steps)
+
+    # 随机遮挡：以 50% 概率额外遮蔽一步（模拟偶发的视觉失败，增强鲁棒性）
+    if rng.random() &lt; occlude_prob:
+        obs["target"] = (0.0, 0.0, 0.0)        # 真值同步置零，否则构成观测泄漏
+        obs["target_visible"] = 0.0
+
+    # 延迟：观测进入队列，取 delay_steps 步之前的旧观测
+    buffer.append(obs)
+    if len(buffer) &gt; delay_steps + 1:
+        buffer.pop(0)
+    return buffer[0]</code></pre>
+    <p>解读：这段代码是"如何老老实实做一个 POMDP"的范例。第一，置零而不删字段：删字段会让观测维度随可见性变化，网络结构与归一化统计全部失效；恒定的维度 + 显式的可见性标志是标准做法。第二，时间戳 <code>target_age</code> 的妙处不在"记得"，而在"知道该不该相信记忆"，这与下文的评估指标直接相关。第三，随机遮挡增加了"视觉偶发失败"的工况，让策略不会在"恰好在最后一步看到目标"的完美设定上过拟合。第四，延迟队列与遮蔽是两种独立的缺口：遮蔽是"信息丢失"，延迟是"信息迟到"，叠加在一起才接近真实感知系统（相机 30 Hz + 处理延迟 + 遮挡）。注意最后一行返回 <code>buffer[0]</code>（最老的观测）：延迟意味着"我现在看到的其实是 3 步前的世界"，这个方向不能搞反。</p>
+
+    <p><strong>片段 2：帧堆叠的工程细节</strong></p>
+    <pre class="code"><code>import numpy as np
+from collections import deque
+
+class FrameStack:
+    # 把最近 k 帧观测拼接成一条。适用条件：信息缺口不超过 k-1 步
+    def __init__(self, k=8):
+        self.k = k
+        self.frames = deque(maxlen=k)
+
+    def reset(self, obs):
+        # 开场用同一帧填满：全零帧在物理上不存在，
+        # 网络会把"补零"当成一种特殊状态，产生额外的分布偏移
+        for _ in range(self.k):
+            self.frames.append(np.asarray(obs, dtype=np.float32))
+        return np.concatenate(self.frames)
+
+    def push(self, obs):
+        # 帧按时间顺序排列：concat 后旧帧在前、新帧在后，顺序必须固定
+        self.frames.append(np.asarray(obs, dtype=np.float32))
+        return np.concatenate(self.frames).astype(np.float32)</code></pre>
+    <p>解读：FrameStack 本身 15 行，但每个细节都是踩过坑的。第一，<code>deque(maxlen=k)</code> 的自动淘汰保证内存恒定，也保证拼接顺序天然按时间排列。第二，开场"同帧填满"：如果用零初始化，8 帧拼接里前几帧全是零向量，策略在回合最开始要面对一个训练数据里罕见的输入分布；同帧填满让开始时的输入与"静止世界"一致，数值上干净。第三，<code>dtype=np.float32</code> 显式转换：观测通常由若干 numpy 片段拼成，dtype 不一（int 状态、float 传感器）会在拼接时悄悄向上转型，统一转 float32 能省内存也避免精度混用。第四，如果观测各通道量纲差异大，堆叠前要做逐通道归一化，否则网络的第一层权重会被某些大数值通道垄断。最后提醒使用边界：k=8、控制 10 Hz 时记忆最长只有 0.8 s；设计任务时"信息缺口的时间尺度"必须与 k 匹配，不能凭感觉。</p>
+
+    <p><strong>片段 3：记忆地平线评估</strong></p>
+    <pre class="code"><code>def memory_horizon_eval(policy, make_env, ages):
+    # 记忆地平线：目标只在前 age 步可见，之后必须靠记忆完成任务
+    # 成功率随 age 的衰减曲线刻画"策略能把信息保留多久"
+    curve = []
+    for age in ages:
+        successes = 0
+        for trial in range(100):
+            env = make_env(visible_steps=age)      # 注意：评估环境每档重建
+            obs = env.reset()
+            state = policy.initial_state() if hasattr(policy, "initial_state") else None
+            done = False
+            while not done:
+                # 带记忆的策略需要传递内部状态（061 章）：无记忆策略忽略 state
+                action, state = policy.act(obs, state)
+                obs, _, done, info = env.step(action)
+            successes += int(info["success"])
+        curve.append(successes / 100.0)
+    return curve     # 例如 [1.0, 0.98, 0.95, 0.7, 0.2] 的拐点在第 3-4 档之间</code></pre>
+    <p>解读：这个评估函数回答的是"你的策略记忆多长"这个本质问题。几个实现细节值得说清。第一，每个 age 档重建环境（<code>make_env(visible_steps=age)</code>）：visible_steps 影响的是任务配置，复用热修改容易残留状态；重建 100 次的开销（每个回合不到 5 s）完全可以接受。第二，<code>hasattr(policy, "initial_state")</code> 让同一个评估器兼容无记忆策略（MLP）和有记忆策略（GRU 需要每回合重置隐状态）；如果你的评估器忘记重置隐状态，GRU 会把上一个回合的记忆带进新回合，评估结果虚高，这是 POMDP 评估里最常见的假阳性。第三，结果的解读方式：曲线在某一档"断崖"的位置就是策略的记忆边界。10 Hz 控制下，能稳定到 age=10 意味着约 1 秒的有效记忆。想提升？先看训练时的可见时长上限，训练里从没见过 age 大于 15 的情况，评估到 20 必然崩，这是分布外问题，与记忆能力无关。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>伪 POMDP（观测泄露真值）</strong>：遮蔽函数漏掉一个字段（比如目标的真实位置还在"特权通道"里），无记忆策略轻松满分，你以为在训记忆任务其实什么都没训。修复：用"无记忆基线"体检，它能拿高分就说明环境在放水。</li>
+      <li><strong>帧堆叠顺序颠倒</strong>：把最新帧放在拼接结果的头部。症状是训练能收敛但记忆任务表现差、对顺序特征不敏感。修复：统一约定"旧在前、新在后"，并在环境初始化时打印一次形状与两帧数据核对。</li>
+      <li><strong>评估忘记重置 RNN 隐状态</strong>：跨回合记忆污染，评估成功率虚高 10–30 个百分点。修复：评估器显式重置（片段 3 的 <code>initial_state</code>），并在每次 <code>reset()</code> 后断言隐状态为初始值。</li>
+      <li><strong>可见时长训练分布与评估不匹配</strong>：训练永远 15 步可见，评估从 1 步开始，成功率暴跌被误读为"策略不会记忆"。修复：训练时随机化 visible_steps（如 1–20），让策略在各种新鲜度下都工作。</li>
+      <li><strong>时间戳写成绝对时间</strong>：把仿真时刻 t 直接进观测。网络要自己减去当前时刻才能得到"多久之前"，还得处理 t 无限增长，几乎必然失败。修复：所有时间类特征都写成"距今多少步/秒"的相对量。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把藏球任务的观测从"完全遮蔽"改成"每 5 步泄露一次位置"，观察帧堆叠 k=2 与 k=8 的成功率差异，并解释与信息缺口时间尺度的关系。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>每 5 步一瞥时，缺口最长 4 步，k=8 足够覆盖；k=2 会漏掉关键的一瞥。成功率差距应当明显。</div></details>
+      </li>
+      <li>用"无记忆 MLP"在你的任务上训练，记录成功率，如果超过 90%，找出观测里泄露真值的字段。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>逐字段做消融：把该字段置零重训，如果无记忆性能掉到随机水平附近，说明记忆缺口是真实的；如果几乎不掉，说明它其实没有被依赖。</div></details>
+      </li>
+      <li>给任务加"观测延迟 0 / 3 / 8 步"三档，测同一策略的成功率，画延迟-性能曲线。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>延迟 3 步以内帧堆叠能覆盖（如果训练时见过延迟）；延迟 8 步超过 k-1 时性能断崖。曲线断崖位置应与训练记忆长度对应。</div></details>
+      </li>
+      <li>设计一个实验，验证"时间戳特征是否真的被策略使用"：写出消融方法、对照组与判定标准。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>时间戳消融后，在"目标长时不可见"的评估档上性能应下降最多；再用注意力可视化或特征扰动看策略对 target_age 通道的敏感度。</div></details>
+      </li>
+      <li>把记忆任务的信息缺口从"3 个位置"扩到"8 个位置"，预测帧堆叠与位置推断的成功率变化，并解释为什么"候选数越多，记忆任务越像分类问题"。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>候选增多时，随机猜测的正确率从 33% 降到 12.5%，记忆的价值被放大；无记忆策略的表现会趋近 1/8。观察两基线的差距随候选数如何扩大。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>POMDP 只比 MDP 多一个观测函数 O(o | s′)：世界仍是马尔可夫的，但策略只能访问不完整的历史。</li>
+      <li>状态别名（同观测、异状态、异最优动作）是无记忆策略的死刑；补记忆的强度必须匹配"信息缺口的时间尺度"。</li>
+      <li>技术阶梯：帧堆叠（短缺口）→ 记忆特征/时间戳（能人工说清的缺口）→ RNN（一般情形，061 章）→ 注意力（长历史，062 章）。</li>
+      <li>实现 POMDP 的纪律：置零不删字段、维度恒定、时间用相对年龄；评估必须重置隐状态、随机化可见时长。</li>
+      <li>体检两件事：无记忆基线是否太强（泄露）、记忆地平线曲线的拐点是否与设计目标一致。</li>
+      <li>下一章换一个维度加复杂度：<strong>多任务学习</strong>，一个策略要同时擅长多种任务。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch051.html">← 第 051 章：实现动态环境适应</a>
+    <a class="next" href="ch053.html">第 053 章：实现多任务学习 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

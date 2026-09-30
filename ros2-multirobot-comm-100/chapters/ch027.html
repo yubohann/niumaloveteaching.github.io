@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第027章 动态地图更新共享 | 多机器人协同学习课程 · ROS2 通信与系统集成</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 数据分发与协同感知</span>
+    <span class="sep">/</span>
+    <span>第 027 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 数据分发与协同感知</div>
+    <h1>第 027 章：动态地图更新共享</h1>
+    <p class="lead">地图是持续变化的共享文档，交付之后仍在生长。本章讲增量更新的完整协议：脏块检测、版本控制、冲突策略、宽松的节流与定期快照。</p>
+    <ul class="meta">
+      <li>主题：地图协同 / 增量同步协议</li>
+      <li>关键机制：脏块检测、tile 打包、版本号防乱序、checkpoint 快照、带宽整形</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 026 章（静态地图合并）</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解"全量重发"为什么在大栅格上不可行，增量更新能省下哪几个数量级。</li>
+      <li>掌握一套完整的增量协议要素：脏块检测、tile 划分、版本号、快照引导与定期 checkpoint。</li>
+      <li>会处理乱序与重传：为什么必须用版本号（"最新收到的就是最新"会出错）。</li>
+      <li>掌握多来源写入同一地图时的三种融合策略与其适用场景。</li>
+      <li>会用"合并 + 整流"控制更新带宽，把不定时的小更新变成可预测的流量。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 026 章合并的是"跑完一圈之后"的静态地图。但真实系统里，地图是<strong>活的</strong>：机器人一边跑，一边把新看到的区域写进地图；环境变化（新放的货架、临时围挡）也随时可能被机器人捕捉。如果每台机器人每次更新都把整张地图重发一遍，一张 2000×2000、0.05 m 分辨率的楼层地图就是 400 万格、约 4 MB，那么三台机器人每秒重发一次，就是 12 MB/s 的持续流量，而且<strong>99% 的内容与前一刻完全相同</strong>。这种"重复劳动"既浪费带宽，又因为大消息阻塞链路，拖慢真正要紧的数据。</p>
+    <p>增量更新（incremental update）是标准答案：只发"变了的部分"。但一旦从"整发"切到"增量"，一批分布式系统问题就浮出水面：消息乱序了怎么办？重传的旧块覆盖了新块怎么办？新上电的机器人错过了开头的增量怎么补齐？本章把这些问题的答案组织成一套可复用的<strong>更新协议</strong>，它也是第 033 章"分布式环境表示"与第 036 章"分区一致性"的前置知识。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 增量经济学：从"重复整发"到"只发脏块"</h3>
+    <p>先量化收益。对比两种策略在"机器人持续建图"场景下的流量：</p>
+    <table>
+      <tr><th>策略</th><th>单次负载</th><th>10 台 × 1 Hz 流量</th><th>问题</th></tr>
+      <tr><td>全量重发</td><td>约 4 MB</td><td>约 40 MB/s</td><td>打满链路，迟到的全量覆盖增量</td></tr>
+      <tr><td>增量（脏块）</td><td>典型 5–50 KB/次</td><td>约 0.05–0.5 MB/s</td><td>需要协议保证不丢不乱</td></tr>
+    </table>
+    <p>省下的是<strong>两个数量级</strong>。原理很简单：SLAM 每次更新的实际变化区域通常只有几个平方米（几百到几千个格子），占全图的千分之几。推断一下极端情形：机器人原地转圈，每次刷新一圈激光数据，脏块可能只占全图的 0.1%。<strong>增量协议的全部复杂度，都在为这个两个数量级买单</strong>，如果你能把这份复杂度换来，就换；换不来（地图小、更新少）时，老老实实全量重发更省心。</p>
+
+    <h3>2. 脏块检测与 tile 打包</h3>
+    <p>增量更新的最小单位是固定尺寸的<strong>块（tile）</strong>（单个格子会被消息头开销淹没）：把地图切成 16×16 或 32×32 格的方块，变化量以块为单位打包。流程：</p>
+    <ol>
+      <li>本地地图每轮更新后，与该块上一版比对，标出不一致的块；</li>
+      <li>为每个脏块生成一个负载：块坐标 (tx, ty) + 版本号 + 整块数据 + 时间戳；</li>
+      <li>按"整流窗口"批量发送（见第 5 小节），避免变一格发一条；</li>
+      <li>发送后把本地记录更新为已发版本，供下一轮比对。</li>
+    </ol>
+    <p>块大小是权衡：块太大 → 一个格子变化也要发一整块（浪费）；块太小 → 消息数量与头开销上升（一条消息至少几十字节头）。16×16 在 0.05 m 分辨率下对应 0.8 m×0.8 m 的物理区域，多数室内场景下"局部变化"刚好落在一两块里，是常用的起点。</p>
+    <p>把权衡算成数字（消息头按 100 B 计）。单格稀疏变化（如一扇门开合）：8×8 块发 164 B、16×16 块发 356 B、32×32 块发 1124 B，小块明显占优；连续 5 m² 的新增区域（约 2000 格）：8×8 需约 32 条消息共 5.2 KB，16×16 约 8 条共 2.8 KB，32×32 约 2 条共 2.2 KB，大块反而省。SLAM 的更新以连续区域为主，稀疏单点变化则来自环境事件，两类流量都会出现，因此 16×16 是两者都不算差的折中；若你的场景以稀疏变化为主（例如只更新门状态），可以把块降到 8×8 并接受消息数上升。</p>
+
+    <h3>3. 版本号：增量协议的心脏</h3>
+    <p>失去版本号，增量协议必然出错，而且错得隐蔽：DDS 不保证"不同发布者之间"的到达顺序，重传会让旧消息晚于新消息到达。现象是地图"偶尔闪回旧状态"，某块区域的墙消失了 200 ms 又回来。</p>
+    <p>正确做法是给每个块维护<strong>单调递增版本号</strong>：发送方每更新一次块、版本加一；接收方只接受"版本号 &gt; 本地该块版本"的更新，否则丢弃。<strong>版本号判断必须在应用层做，不能依赖中间件</strong>，这是增量协议与 QoS 的分工边界：QoS 管"消息别丢"，版本号管"状态别回退"。</p>
+    <div class="formula">
+      接收条件：version<sub>remote</sub>(tile) &gt; version<sub>local</sub>(tile) 时应用，否则丢弃
+      <span class="note">版本号是"每块一个"，不是"整图一个"，块级版本才能容忍部分丢失后独立补齐</span>
+    </div>
+
+    <h3>4. 冲突策略：当两个来源写同一块</h3>
+    <p>多机系统里，两台机器人可能同时更新同一块（都在附近走动）。接收端需要一条确定性的融合规则：</p>
+    <ul>
+      <li><strong>log-odds 求和</strong>（第 026 章）：最符合概率语义，但需要保留 log-odds 状态，且同一证据被多次发送会重复计数，配合版本号可以规避。</li>
+      <li><strong>取最大占用（max）</strong>：保守策略，"有人看到障碍就信障碍"。适合避障安全场景，代价是噪声占用难以消除。</li>
+      <li><strong>时间优先（latest wins）</strong>：以块时间戳为准。简单，但时间戳来自不同机器人时钟，必须先做时间同步（第 009 章），且"新"不等于"对"。</li>
+    </ul>
+    <p>工程建议：<strong>默认用"版本号 + 块来源"做确定性仲裁（同源比版本、异源做融合），并在协议里明确定义</strong>。不要留"看情况"的模糊地带，不一致的融合策略会让两台机器人对同一块地图的理解永久分叉。</p>
+    <table>
+      <tr><th>策略</th><th>决定性</th><th>抗噪</th><th>状态需求</th><th>适用</th></tr>
+      <tr><td>版本 + 来源仲裁</td><td>强（同源线性、异源融合）</td><td>中</td><td>版本表 + 来源表</td><td>默认推荐</td></tr>
+      <tr><td>取最大占用</td><td>强</td><td>弱，噪声占用难消除</td><td>无额外状态</td><td>安全优先的避障层</td></tr>
+      <tr><td>时间优先</td><td>弱，依赖时钟</td><td>中</td><td>时间戳</td><td>时钟已同步的简单系统</td></tr>
+    </table>
+
+    <h3>5. 快照、检查点与整流</h3>
+    <ul>
+      <li><strong>快照引导</strong>：新订阅者需要完整地图起步。做法：全量地图走一个 transient-local 的"快照话题"，增量走另一个 volatile 的"更新话题"；新节点先取快照，再叠加之后的更新（基于版本号去重）。</li>
+      <li><strong>定期 checkpoint</strong>：增量丢失（节点重启、消息错过）会导致状态永久偏离。每 N 秒或每 M 个更新做一次全量/分块校验（checkpoint），接收端比对版本并补齐，这是"最终一致"的保险丝。</li>
+      <li><strong>整流（coalescing）</strong>：把不定时到达的小更新攒起来，按固定频率（如 2 Hz）成批发送。收益：流量的突发性下降，峰值带宽可预测；代价：单块更新最多滞后一个整流周期。地图更新的时效性要求通常以秒计，这个代价完全可以接受。</li>
+    </ul>
+    <p>快照与更新的衔接有一个必答的时序问题：新节点先订阅快照话题、再订阅更新话题，两条订阅各自建立时，中间的更新可能落在两次订阅之间。版本号就是缝合这个缝隙的针脚：快照携带每块的当前版本，节点之后收到的更新若版本不高于快照版本就丢弃，更高才应用。协议必须规定"先快照、后更新"的订阅顺序，并约定快照与更新由同一发布者发出，否则两者的版本表来自不同状态，缝合的前提不成立。</p>
+    <div class="box key">
+      <span class="box-title">设计决策：为什么快照与更新要分两个话题？</span>
+      <p>两者的投递语义不同：快照是状态型（晚加入者必须拿到），更新是事件流型（只对"从此刻起"的订阅者有意义）。混在一个话题里，要么快照被当增量反复应用（重复计数），要么新节点永远错过开头。分开之后，每个话题的 QoS、频率、订阅逻辑都变得干净，<strong>用语义决定话题划分，划分依据与数据内容无关</strong>。</p>
+    </div>
+
+    <h3>6. 数值算例：整套协议的流量与开销账</h3>
+    <p>把第 1 小节的定性收益算成完整账。设定：车队 10 台，共享地图 2000×2000 格（0.05 m 分辨率，覆盖 100 m × 100 m，共 400 万格 = 4 MB）；每台机器人每秒产生 20 个脏块（相当于 20×0.8×0.8 ≈ 12.8 m² 的新区域）；tile 为 16×16 格 = 256 B 数据 + 约 100 B 元信息 = 356 B。</p>
+    <ul>
+      <li>增量方案：每机 20 × 356 B = 7.1 KB/s；10 台合计 71 KB/s；按 2 Hz 整流后每次刷新每机不超过 10 条消息，峰值带宽可预测。</li>
+      <li>全量方案：4 MB × 1 Hz × 10 台 = 40 MB/s。<strong>两者相差 562 倍</strong>，这就是增量协议复杂度的全部回报。</li>
+      <li>checkpoint 摘要：全图 125×125 = 15625 块，若每块按 8 B 打包（块坐标 4 B + 版本 4 B），一次全量摘要约 125 KB，10 秒周期下每机 12.5 KB/s，10 台 125 KB/s，反而超过更新流量本身。</li>
+      <li>优化版 checkpoint：把 8×8 个 tile 归成一个 64 块的"组"，每组只发一份 64 位摘要（组号 4 B + 摘要 8 B = 12 B），一次快照 245 组 × 12 B ≈ 2.9 KB，开销降到原来的 1/42，再配合"摘要变化才请求明细"的两级校验。</li>
+    </ul>
+    <p>这张账给出三条参数依据：<strong>整流周期不需要更慢</strong>（2 Hz 下流量已经平稳，主要空间开销来自 checkpoint 一侧，更新流本身很小）；<strong>checkpoint 必须做成分层摘要</strong>，否则保险丝比被保险的电路还贵；<strong>tile 尺寸取 16</strong>，让单条消息（约 356 B）中的元信息占比（约 28%）保持合理，再小则元信息占比上升、再大则局部变化被放大成整块重发。</p>
+
+    <h3>7. 失效模式与边界条件</h3>
+    <ul>
+      <li><strong>版本号回绕</strong>：版本字段选 int16 时，某块以 50 次/秒被更新，32767 次后回绕，耗时约 11 分钟。症状：该块从此拒绝一切更新（或错误接受旧块）。修复：版本用 64 位整数，在系统寿命内不会回绕。</li>
+      <li><strong>发送端重启后版本归零</strong>：接收端本地版本已到 5000，重启后的发送端从 1 重新计数，所有更新都被判"过旧"而丢弃，地图从此静止，症状与"网络断开"完全一样。修复：版本号带会话标识（epoch），epoch 变化时接收端重置对该源的版本基线。</li>
+      <li><strong>整流掩盖中间态</strong>：一个格子 0.5 s 内经历"占用、空闲、占用"，接收端只看到最终值，中间的短暂状态丢失。边界：避障等安全逻辑不允许骑在整流链路上，应走独立的即时话题。</li>
+      <li><strong>分区愈合风暴</strong>：断连数分钟后恢复，两端各攒下大量差分，若直接全量对发会瞬间打满链路。边界动作：愈合后先交换 checkpoint 摘要，只补真正落后的块（第 036 章展开）。</li>
+      <li><strong>时相错乱</strong>："时间优先"策略在时钟未同步时把迟到的旧观测当新证据。修复：优先用版本号仲裁；时间戳只做第二判据。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>动态地图更新模块的设计清单：</p>
+    <ol>
+      <li><strong>定义消息</strong>：<code>MapTile</code>：块坐标、版本号、来源机器人 id、时间戳、块数据（int8 数组）。同步定义<strong>传送语义</strong>：同源比版本、异源按策略融合。</li>
+      <li><strong>发送侧</strong>：脏块检测 → 整流窗口（2 Hz）→ 发布更新话题；同时周期性（10 s）发布 checkpoint 摘要（各块版本清单）。</li>
+      <li><strong>接收侧</strong>：按块维护本地版本表；更新到达先过版本关，再按策略融合；checkpoint 到达时比对版本表，请求/等待缺失块。</li>
+      <li><strong>QoS</strong>：更新用 Reliable + KEEP_LAST（深度适中，如 50，容纳整流一批的消息数）；快照用 Reliable + transient-local。</li>
+      <li><strong>监控</strong>：发送/接收/丢弃（版本回退）计数、更新带宽、块版本差（本地落后程度），第三个指标是"地图一致性"的直接度量。</li>
+    </ol>
+    <table>
+      <tr><th>参数</th><th>起点值</th><th>依据</th></tr>
+      <tr><td>tile 尺寸</td><td>16×16 格（0.8 m）</td><td>消息头开销 vs 变化局部性的平衡</td></tr>
+      <tr><td>整流周期</td><td>2 Hz</td><td>地图时效以秒计；流量可预测</td></tr>
+      <tr><td>更新 QoS 深度</td><td>50</td><td>容纳一次整流批量的消息数</td></tr>
+      <tr><td>checkpoint 周期</td><td>10 s</td><td>保险丝频率：丢失后恢复时间的上界</td></tr>
+      <tr><td>版本回退告警</td><td>&gt; 0 即关注</td><td>说明存在乱序/重传，协议或网络异常</td></tr>
+    </table>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：脏块检测与整流发送</strong></p>
+    <pre class="code"><code>TILE = 16   # 块边长（格）；0.05 m 分辨率下约 0.8 m
+
+class TilePublisher(Node):
+    """本地地图每轮更新后对比上一版，把差异块整流后发布。"""
+    def __init__(self):
+        super().__init__("tile_pub")
+        self.pub = self.create_publisher(MapTile, "map/updates", 50)
+        self.sent = dict()          # (tx, ty) -> 已发送版本（用于脏块对比）
+        self.pending = dict()       # (tx, ty) -> 待发负载（整流缓冲）
+        self.create_timer(0.5, self.flush)   # 整流周期 2 Hz
+
+    def on_local_map(self, grid, version_of):
+        """grid: 本地全量栅格；version_of(tx,ty) 返回该块最新版本号。"""
+        H, W = grid.shape
+        for ty in range(0, H, TILE):
+            for tx in range(0, W, TILE):
+                v_now = version_of(tx, ty)
+                key = (tx // TILE, ty // TILE)
+                if self.sent.get(key) == v_now:
+                    continue                    # 版本没变：不是脏块，零成本跳过
+                block = grid[ty:ty + TILE, tx:tx + TILE]
+                self.pending[key] = (v_now, block)  # 覆盖式入队：攒最新的
+                self.sent[key] = v_now
+
+    def flush(self):
+        """整流：把窗口内攒下的所有脏块成批发出，流量按固定节奏走。"""
+        if not self.pending:
+            return
+        stamp = self.get_clock().now().to_msg()
+        for (bx, by), (v, block) in self.pending.items():
+            msg = MapTile()
+            msg.tile_x, msg.tile_y, msg.version = bx, by, v
+            msg.header.stamp = stamp             # 同批共享时间戳，便于接收端聚合
+            msg.data = block.astype(np.int8).ravel().tolist()
+            self.pub.publish(msg)
+        self.pending.clear()                     # 一次整流后清空缓冲</code></pre>
+    <p>解读：发送侧有三处关键设计。<strong>（1）</strong><code>sent</code> 表记录"已发送版本"，<code>on_local_map</code> 里只对比版本号就知道块是否变化，用版本比较代替全块 memcmp，既快又简单（SLAM 实现里版本号本来就随更新维护）。<strong>（2）</strong><code>pending</code> 用<strong>覆盖式字典</strong>：同一个块在整流窗口内变了三次，只发最后一次，地图是状态型数据，中间态没有价值。这正是"整流"相对"排队发送"的本质优势。<strong>（3）</strong>整流周期 0.5 s 意味着最坏情况一块更新滞后 0.5 s，对地图语义完全可接受，而流量从"随 SLAM 频率波动"变成"2 Hz 固定节奏"，网络规划立刻清爽。</p>
+
+    <p><strong>片段 2：接收侧，版本关与融合策略</strong></p>
+    <pre class="code"><code>class TileReceiver(Node):
+    """接收远端脏块：先过版本关，再按确定性策略融合进本地地图。"""
+    def __init__(self, local_grid, owner):
+        super().__init__("tile_recv")
+        self.grid = local_grid                   # 本地全量栅格（numpy）
+        self.owner = owner                       # 本机 id，用于仲裁
+        self.ver = dict()                        # (bx,by) -> 版本
+        self.src = dict()                        # (bx,by) -> 最后写入者
+        self.stats = {"applied": 0, "dropped": 0, "fused": 0}   # 运维三计数
+        self.create_subscription(MapTile, "map/updates", self.on_tile, 50)
+
+    def on_tile(self, msg):
+        key = (msg.tile_x, msg.tile_y)
+        v_remote = msg.version
+        if v_remote &lt;= self.ver.get(key, -1):
+            self.stats["dropped"] += 1           # 版本回退：重传/乱序，必须丢
+            return
+        same_source = self.src.get(key) in (None, msg.source_id)
+        remote = np.array(msg.data, dtype=np.int8).reshape(TILE, TILE)
+        y0, x0 = key[1] * TILE, key[0] * TILE
+        local = self.grid[y0:y0 + TILE, x0:x0 + TILE]
+        if same_source:
+            self.grid[y0:y0 + TILE, x0:x0 + TILE] = remote   # 同源：直接替换
+            self.stats["applied"] += 1
+        else:
+            # 异源：本块曾有他人写入，用 log-odds 融合，不做互相覆盖
+            self.grid[y0:y0 + TILE, x0:x0 + TILE] = fuse_logodds(local, remote)
+            self.stats["fused"] += 1
+        self.ver[key] = v_remote                 # 只有真正应用了才更新版本
+        self.src[key] = msg.source_id            # 记录来源，供后续仲裁判断</code></pre>
+    <p>解读：接收侧是整套协议里最容易写错的地方。<strong>（1）</strong>版本关的判据取 <code>&lt;=</code>：版本相等的重复消息也要丢，否则同一份证据会被应用两次，log-odds 场景下直接导致过度置信。<strong>（2）</strong><code>ver</code> 只在"真正应用"后更新，如果一条消息过了版本关但因数据损坏被丢弃，版本号不应前移，否则之后的重传会被误判为过时而永久丢失。<strong>（3）</strong>同源替换、异源融合的分支设计，就是"冲突策略"的代码化：同一条来源的更新线性有序，直接替换最安全；不同来源的证据用融合函数处理，保证仲裁是确定性的（同一组输入在任何机器人上得到同一结论）。<strong>（4）</strong>三个计数器（applied / dropped / fused）是运维的眼睛：丢弃计数持续增长说明网络在乱序或重传风暴；融合计数高说明多机活动区域重叠严重。</p>
+
+    <p><strong>片段 3：checkpoint 摘要与落后检测</strong></p>
+    <pre class="code"><code>def make_checkpoint(ver_table):
+    """生成 checkpoint：只包含各块的版本清单，不含数据本身（几十字节/块）。"""
+    summary = MapCheckpoint()
+    summary.header.stamp = node.get_clock().now().to_msg()
+    # 版本清单是地图状态的特征标识：标识对齐即状态对齐
+    summary.tiles = [TileVersion(tx=k[0], ty=k[1], version=v)
+                     for k, v in sorted(ver_table.items())]
+    return summary
+
+def on_checkpoint(msg):
+    """收到对端 checkpoint：本地落后或有块版本更旧，就登记补块请求。"""
+    nonlocal ver
+    missing = []
+    for tv in msg.tiles:
+        key = (tv.tile_x, tv.tile_y)
+        if key not in ver or ver[key] &lt; tv.version:
+            missing.append(key)                  # 落后：向对端请求该块最新版
+    if missing:
+        node.get_logger().warn(f"落后 {len(missing)} 块，发起补齐")
+        request_tiles(missing)                   # 走 service/action 拉取（见第 003 章）</code></pre>
+    <p>解读：checkpoint 是增量协议的"保险丝"设计，它传输的是<strong>版本摘要</strong>（不含地图数据本身），几十字节一块，足以让接收方自我诊断"我是不是漏了更新"。<strong>（1）</strong>校验只搬运摘要，不回传全量数据：10 秒一次的校验流量可能只有全量的千分之一，却能把"永久不一致"压缩成"最多 10 秒的暂态"。<strong>（2）</strong>补齐动作走独立通道（service 或专用拉取话题）：更新流无状态，让对方重发无法定向；拉取是点对点的、幂等的查询，正合适。<strong>（3）</strong>这个模式在第 036 章网络分区愈合时会再次出现，<strong>版本摘要 + 定向补齐是分布式状态收敛的通用配方</strong>，值得记住。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>没有版本号</strong>：重传/乱序的旧块覆盖新块，地图"偶尔闪回"。症状：重叠区域短暂出现不该有的墙。修复：块级单调版本号，接收端严格校验。</li>
+      <li><strong>整流缓冲写成队列</strong>：同一块积攒多条更新，网络差时越积越多，恢复后一次全发反而制造流量尖峰。修复：覆盖式字典，只保留最新。</li>
+      <li><strong>快照与更新混在一个话题</strong>：晚加入者错过快照，或快照被当增量重复应用。修复：两个话题、两种 QoS 语义分开。</li>
+      <li><strong>版本号"整图一个"</strong>：一次更新让全局版本前进，导致部分块丢失后无法定位，只能整图重发，增量收益归零。修复：块级版本。</li>
+      <li><strong>不设 checkpoint</strong>：偶发丢块没有任何机制发现，地图慢慢"缺角"，几小时后才被导航暴露。修复：周期摘要比对 + 定向补齐。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>估算：2000×2000 地图、tile 16×16、一次更新 20 个脏块。每块负载（16×16 字节 + 头）约多少？相对全量重发省了多少倍？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>每块约 256 B + 头约 100 B ≈ 360 B；20 块 ≈ 7 KB；全量 4 MB，节省约 570 倍。</div></details>
+      </li>
+      <li>把整流周期从 2 Hz 改到 0.5 Hz，预测流量形态与地图新鲜度的变化，并给出你的选择。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>流量峰值进一步平滑，单块更新最坏滞后 2 s。若协同导航要求"秒级新鲜"，0.5 Hz 偏慢；纯建筑建图场景可以接受。</div></details>
+      </li>
+      <li>构造乱序场景：故意先发高版本再发低版本消息，验证接收端丢弃低版本且计数正确，解释为什么必须用 <code>&lt;=</code> 判断。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>等版本重复消息若被应用两次，log-odds 融合会重复累计同一证据（过度置信）；替换策略下虽结果相同，但计数与语义仍应拒绝。</div></details>
+      </li>
+      <li>设计题：为"3 台机器人共享动态地图"写一页协议规格，消息定义、版本规则、冲突仲裁、checkpoint 周期、异常处理（对端离线/落后过多）。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>重点是"确定性"：任何机器人按规格执行，对同一消息序列都得到同一地图状态。写出 3–5 条必须满足的不变量（如版本单调、未知不覆盖已知等）。</div></details>
+      </li>
+      <li>思考：为什么说"地图更新最终一致就够了"，而任务分配、编队这类数据却需要更强的即时一致性？按数据的语义给系统里的话题分个类。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>地图是"世界的事实描述"，容许秒级收敛；编队/任务涉及多机动作耦合，时间窗内不一致会直接造成物理冲突。分类维度：状态型 vs 指令型、时间敏感度。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>增量更新的收益在两个数量级，代价是一套协议：脏块检测、tile 打包、版本控制、快照/checkpoint、整流。</li>
+      <li>块级单调版本号是心脏：接收端"版本不前进不应用"，杜绝乱序与重复应用。</li>
+      <li>多源写入必须定义确定性冲突策略（同源替换、异源融合、规则全局统一）。</li>
+      <li>快照（transient-local）与更新（volatile 事件流）分话题；checkpoint 用版本摘要做保险丝，配合定向补齐。</li>
+      <li>下一章走向地图的上游：<strong>多机器人 SLAM 协同</strong>，地图与轨迹如何互相纠正，而不仅是把成品拼起来。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch026.html">← 第 026 章：静态地图合并</a>
+    <a class="next" href="ch028.html">第 028 章：多机器人SLAM协同 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

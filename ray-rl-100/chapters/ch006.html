@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第006章 Ray异步任务与Future | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · Ray 基础与分布式编程</span>
+    <span class="sep">/</span>
+    <span>第 006 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · Ray 基础与分布式编程</div>
+    <h1>第 006 章：Ray异步任务与Future</h1>
+    <p class="lead">对象引用天然是一张未来值凭据（Future），把它接进异步事件循环，等待就不再浪费执行流：一次写对驱动端的并发等待与 Actor 端的异步服务。</p>
+    <ul class="meta">
+      <li>主题：Ray 核心 / 异步编程模型</li>
+      <li>关键机制：对象引用即 Future、await 语义、异步 Actor 事件循环、背压与流式消费</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 005 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解对象引用与未来值（Future）的同构关系：提交即返回、结果就绪可等待。</li>
+      <li>掌握驱动端异步模式：在事件循环中并发等待多个引用，替代阻塞式循环取回。</li>
+      <li>会编写异步 Actor：异步方法在事件循环中调度，与 max_concurrency 共同决定并发能力。</li>
+      <li>能辨析并发（Concurrency）与并行（Parallelism）在异步场景中的边界，避免对计算型负载误用异步。</li>
+      <li>能诊断三类问题：异步函数内阻塞调用、漏写 await、事件循环被 CPU 任务拖死。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>并行程序里大量时间花在等待：等待样本就绪、等待检查点写入、等待推理服务返回。阻塞式等待把执行流闲置，异步模型让同一执行流在等待期间推进其他工作。<strong>Ray 从设计之初就把对象引用当作未来值：提交得到的凭据既可以同步阻塞取回，也可以接入事件循环异步等待</strong>，两条路都通。</p>
+    <p>为什么训练系统需要它：一个训练循环里同时挂着几十个待完成的采样任务与若干异步评估任务，用线程去一一阻塞，线程数、内存与上下文切换成本都会失控；用事件循环，单个进程即可管理成百上千个等待点。RLlib 的异步采样模式、Serve 的请求处理都建立在事件循环之上。</p>
+    <p>本章先给出 Future 的一致心智模型，再分别讲驱动端与 Actor 端的异步写法，最后落到异步场景最容易踩的坑：把阻塞调用混进事件循环。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 对象引用即 Future</h3>
+    <p>未来值（Future）是并发编程的通用抽象：代表"尚未就绪但最终可用的结果"，提供注册回调或等待两种消费方式。Ray 的对象引用与之逐条对应：</p>
+    <table>
+      <tr><th>Future 语义</th><th>对象引用对应行为</th></tr>
+      <tr><td>创建：立即返回凭据</td><td>f.remote() 立即返回 ObjectRef</td></tr>
+      <tr><td>等待：阻塞取结果</td><td>ray.get(ref)</td></tr>
+      <tr><td>等待：多个中取先就绪</td><td>ray.wait(refs)</td></tr>
+      <tr><td>异步等待：不阻塞执行流</td><td>await ref（事件循环中）</td></tr>
+    </table>
+    <p><strong>把引用接进事件循环后，"等待"变成挂起点</strong>：执行流转去推进其他任务，被等待的对象就绪后再唤醒。前三行在前几章已经用过，本章补上第四行，整个并发工具箱就齐了。</p>
+
+    <h3>2. 驱动端异步：一个进程管理大量等待</h3>
+    <p>驱动端异步的典型结构是"先批量提交、再并发等待"。与线程方案的对比：</p>
+    <ul>
+      <li><strong>线程方案</strong>：每个等待点占一个线程，线程栈与切换开销随等待点线性增长，等待点数量上千时管理成本显著。</li>
+      <li><strong>异步方案</strong>：所有等待点注册在同一事件循环，挂起与唤醒成本与等待点数量近似无关，单进程可平滑管理大量在途任务。</li>
+    </ul>
+    <p>需要明确异步的能力边界：它重叠的是<strong>等待</strong>，无法把一个 CPU 密集的函数拆到多个核上。计算型负载的并行仍依赖任务拆分与资源调度；异步只负责让等待期间执行流不被浪费。</p>
+    <p>三种等待组织方式构成了从简单到高并发的光谱，选择依据是同时在途的等待点数量：</p>
+    <table>
+      <tr><th>组织方式</th><th>阻塞范围</th><th>单进程可管理等待点</th><th>取用顺序</th><th>适用场景</th></tr>
+      <tr><td>逐次 ray.get</td><td>整个调用线程</td><td>数十</td><td>提交顺序</td><td>结果少且顺序敏感</td></tr>
+      <tr><td>ray.wait 窗口循环</td><td>调用线程（可放入后台线程）</td><td>数百</td><td>完成顺序</td><td>驱动端批量消费</td></tr>
+      <tr><td>await 事件循环</td><td>不阻塞，协程挂起</td><td>上千</td><td>完成顺序或聚合</td><td>异步服务、流式管道</td></tr>
+    </table>
+    <p>这张表也解释了迁移路径：脚本阶段用逐次取回最直观；批量实验用窗口循环控制内存；服务化阶段再引入事件循环。三种方式可以共存于同一程序，例如驱动端用窗口循环管理采样，服务端用异步 Actor 承接推理请求。</p>
+
+    <h3>3. 异步 Actor：事件循环加并发方法</h3>
+    <p>把 Actor 的方法声明为异步函数，整个 Actor 由事件循环驱动。语义要点：</p>
+    <ol>
+      <li><strong>方法在等待点挂起时，事件循环转去处理队列中的其他调用</strong>，因此单个 Actor 进程可以同时服务多个在途请求。</li>
+      <li><strong>并发上限由 max_concurrency 与事件循环共同限定</strong>：前者限制同时挂起的调用数（背压），后者负责调度。</li>
+      <li><strong>挂起点只能由异步原语产生</strong>：等待引用、等待异步睡眠、等待异步网络接口。任何同步阻塞调用都会卡住整个事件循环，让所有在途调用一起停摆。</li>
+    </ol>
+    <div class="formula">
+      异步 Actor 有效吞吐 ≈ 并发挂起数 ÷ 单请求等待时长
+      <span class="note">若等待被同步调用替换，并发挂起数为 1，吞吐回落到串行水平</span>
+    </div>
+    <p>这条公式解释了异步服务的甜点区：等待占比高、单请求等待时长稳定、CPU 计算占比低的负载收益最大。推理代理、参数分发、模型服务都属于此类。</p>
+
+    <h3>4. 数值算例：等待占比决定异步收益的上限</h3>
+    <p>设某推理代理单请求等待上游 W = 200 ms、本地计算 C = 20 ms（计算包括序列化、后处理与批拼装）。单个执行流一次只承载一个请求时，吞吐为 1 ÷ (W + C) = 1 ÷ 0.22 ≈ 4.55 请求/秒。事件循环让 M 个请求同时在飞：等待期间 CPU 处理其他请求的计算段，稳态吞吐取两个约束的较小值，等待侧约束为 M ÷ (W + C)，计算侧约束为 1 ÷ C = 50 请求/秒。</p>
+    <div class="formula">
+      吞吐 = min( M ÷ (W + C), 1 ÷ C )；饱和并发度 M* = (W + C) ÷ C = 11
+      <span class="note">等待占 91% 的负载里，11 个并发即可用尽计算侧余量；继续加大并发只增加排队</span>
+    </div>
+    <table>
+      <tr><th>并发度 M</th><th>等待侧上限 M÷(W+C)</th><th>实际吞吐（请求/秒）</th><th>相对串行加速</th></tr>
+      <tr><td>1</td><td>4.5</td><td>4.55</td><td>1.0 倍</td></tr>
+      <tr><td>4</td><td>18.2</td><td>18.2</td><td>4.0 倍</td></tr>
+      <tr><td>8</td><td>36.4</td><td>36.4</td><td>8.0 倍</td></tr>
+      <tr><td>11</td><td>50.0</td><td>50.0</td><td>11.0 倍</td></tr>
+      <tr><td>16</td><td>72.7</td><td>50.0（计算侧封顶）</td><td>11.0 倍</td></tr>
+    </table>
+    <p>代入核对：M = 8 时等待侧允许 36.4 请求/秒，低于计算侧上限 50，吞吐取 36.4；M = 11 时两侧恰好相等，即饱和点；M = 16 时等待侧允许 72.7，计算侧仍只有 50，多出的并发只在队列里排队。<strong>异步收益上限为 (W + C) ÷ C ≈ 11 倍，达到上限所需并发度同样为 11</strong>，这正是练习 5 要求推导的表达式。若把同一服务改成 11 个同步副本以达到 50 请求/秒，每个副本常驻一份 2 GiB 模型，内存约 22 GiB；单异步实例只存一份模型加少量请求状态，约 2.2 GiB。内存账是异步服务在内存与显存紧张时的决定性优势。</p>
+    <p>背压缺位时的膨胀速度同样可以量化：提交速率 200 请求/秒、消费侧只能消化 50 请求/秒时，队列每秒净增 150 项；60 秒后积压 9000 项，按每项结果 2 MB 计算约 18 GB 驻留。这个数量级解释了异步接口必须配在途窗口，窗口大小按"消费速率乘以可接受的积压秒数"反推。</p>
+    <p>公式还给出敏感性判断：若上游优化把等待压到 W = 50 ms、本地计算不变，则饱和并发度降为 (50 + 20) ÷ 20 = 3.5，收益上限同步缩到 3.5 倍。等待占比越低，异步越不值得投入复杂度，这条曲线可以直接用来给服务改造排序。</p>
+
+    <h3>5. 超时、异常与取消的语义边界</h3>
+    <p>异步等待的三种退出路径各有明确语义。<strong>异常</strong>：远程任务抛出的异常在取回点（ray.get 或 await 处）重新抛出；asyncio.gather 默认把第一个异常传给调用者，其余协程仍在后台完成，聚合结果整体失败，若希望收集全部结果与异常，改用 return_exceptions 形式逐个检查。<strong>超时</strong>：用 wait_for 一类原语给等待设上界时，超时只放弃本地等待，远程任务照常执行并把结果写入对象存储，重试提交会叠加执行实例与存储占用。<strong>取消</strong>：放弃对引用的等待不等于取消任务，对象仍会被计算；真正终止需要显式调用取消接口，且对 Actor 方法的取消语义与普通任务不同（以对应版本官方文档为准）。三条规则归到一句工程守则：<strong>等待可以随时放弃，任务的生命周期必须显式管理</strong>。</p>
+
+    <h3>6. 背压：异步不等于无限吞吐</h3>
+    <p>异步接口很容易写出"无脑提交"的循环：提交不阻塞，程序认为自己可以无限快。实际上每个在途任务都有成本（对象存储占用、排队元数据、远端资源占用），<strong>没有背压的异步系统只是把拥塞从调用端移到了队列里</strong>。控制手段与第 005 章的窗口一致：用已完成计数限制在途上限，队列满时让提交循环挂起，把压力回传给生产者。</p>
+    <p>在事件循环内实现背压的标准构件是信号量（Semaphore）：提交前先申请一个名额，取回结果后释放名额；名额耗尽时申请操作挂起提交协程，节流点自然前移到生产者。信号量与窗口列表是同一约束的两种表达，信号量适合纯异步代码路径，窗口列表适合同步与异步混合的循环。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>决定"哪里用异步"的判断流程：</p>
+    <ol>
+      <li><strong>统计等待占比</strong>：测量单任务中等待与计算的时间比例。等待占比高（推理调用、远程读取）优先考虑异步；计算占比高则用并行任务。</li>
+      <li><strong>确定异步边界</strong>：驱动端等待多而散，用事件循环并发等待；服务端请求密集且多为等待，用异步 Actor 加合适并发度。</li>
+      <li><strong>设置并发上限</strong>：按远端容量与内存预算给 max_concurrency 与在途窗口定值，绝不缺省放开。</li>
+      <li><strong>隔离阻塞调用</strong>：必须使用的同步接口放进线程执行器或独立任务，杜绝在事件循环里直接调用。</li>
+      <li><strong>建立观测</strong>：记录事件循环延迟与队列深度，延迟上升即是同步阻塞混入的信号。</li>
+    </ol>
+    <table>
+      <tr><th>参数</th><th>典型取值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>max_concurrency（异步 Actor）</td><td>8–64</td><td>同时挂起的调用上限</td><td>按远端服务容量与内存预算定</td></tr>
+      <tr><td>在途窗口（驱动）</td><td>并发核数的 2–4 倍</td><td>生成与消费速率匹配</td><td>避免等待点无界增长</td></tr>
+      <tr><td>单请求等待量级</td><td>10–500 ms</td><td>异步收益的判据</td><td>等待显著长于本地调度开销才划算</td></tr>
+    </table>
+    <p>一个反例有助于固化边界：把优势估计一类的批量矩阵运算改成异步方法不会获得任何加速，方法内部没有可挂起的等待点，事件循环只是给同一段计算加了调度外壳。判断方法很直接：把方法内所有可能的等待原语列出来，若列表为空，异步化只增加复杂度；只要列表中存在稳定且较长的外部等待（远端推理、对象存储读写、其他 Actor 的方法调用），异步化就能把该等待折叠进并发窗口。</p>
+    <div class="box tip">
+      <span class="box-title">与上一章的差异点</span>
+      <p>第 005 章用线程池让单个 Actor 的同步方法并发，适用于方法内部以等待为主的场景；本章的异步 Actor 用事件循环达到同样的重叠效果，且挂起点数量可以高出一个数量级。前者改动小、与既有代码兼容；后者效率高、但要求整条调用链保持异步。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>以下片段采用 Ray 2.x 时期的通用写法；接口随版本演进，以对应版本官方文档为准。</p>
+    <p><strong>片段 1：驱动端并发等待，阻塞循环与异步循环对照</strong></p>
+    <pre class="code"><code>import asyncio
+import time
+import ray
+
+ray.init(num_cpus=8)
+
+@ray.remote(num_cpus=1)
+def remote_query(qid):
+    time.sleep(0.3)                  # 模拟远端推理服务的等待时间
+    return qid * 2
+
+async def async_main():
+    t0 = time.perf_counter()
+    # 批量提交：所有调用立即返回引用，等待点在事件循环中并发挂起
+    refs = [remote_query.remote(i) for i in range(32)]
+    results = await asyncio.gather(*refs)    # 32 个引用同时在事件循环中等待；受 8 核约束分四轮执行，总计约 1.2 秒
+    print("异步并发 32 次: %.2f s" % (time.perf_counter() - t0), len(results))
+
+asyncio.run(async_main())
+
+# 对照：逐次阻塞取回，32 次累计等待约 9.6 秒
+t0 = time.perf_counter()
+for i in range(32):
+    ray.get(remote_query.remote(i))
+print("阻塞串行 32 次: %.2f s" % (time.perf_counter() - t0))</code></pre>
+    <p>解读：两段代码的任务提交方式完全相同，差异只在<strong>等待的组织方式</strong>。串行版本每轮"提交一个、等待一个"，任务之间毫无重叠；异步版本先把 32 个引用全部纳入事件循环，任一对象就绪就唤醒对应协程。<code>asyncio.gather</code> 负责聚合，引用本身可直接参与等待,无需任何胶水代码。注意并行度上限仍由 8 个核决定：如果每个任务的计算时间远大于等待时间，这个加速会迅速衰减，异步只是把"等待"的墙打掉。</p>
+
+    <p><strong>片段 2：异步 Actor 服务多个在途请求</strong></p>
+    <pre class="code"><code>import asyncio
+import ray
+
+ray.init(num_cpus=4)
+
+@ray.remote(max_concurrency=16)          # 最多 16 个调用同时在事件循环中挂起
+class ModelProxy:
+    def __init__(self):
+        self.served = 0                  # 请求计数：事件循环内单线程访问，无竞态
+
+    async def infer(self, batch_id):
+        await asyncio.sleep(0.25)        # 异步等待上游模型：挂起时不占用执行流
+        self.served += 1                 # 挂起恢复后继续执行，天然串行于其他协程
+        return batch_id, self.served
+
+async def main():
+    proxy = ModelProxy.remote()
+    refs = [proxy.infer.remote(i) for i in range(16)]
+    out = await asyncio.gather(*refs)    # 16 个请求重叠等待，总耗时约 0.25 秒
+    print("完成请求数:", len(out), "最后服务计数:", out[-1][1])
+
+asyncio.run(main())</code></pre>
+    <p>解读：16 个请求在同一个 Actor 进程内重叠等待，总耗时接近单次等待时长。关键机制有两点。<strong>其一，asyncio.sleep 是挂起点</strong>：等待期间事件循环把执行权让给其他挂起协程；把这一行换成同步的 time.sleep，16 个请求会串行排队，退化到约 4 秒。<strong>其二，协程恢复点的交错不产生数据竞态</strong>：单线程事件循环中，<code>self.served</code> 的自增与读取之间没有挂起点，天然原子。异步 Actor 的状态安全来自"挂起点之间不被打断"，书写时要注意把"读、算、写"放在同一段无挂起代码里。</p>
+
+    <p><strong>片段 3：带背压的流式消费</strong></p>
+    <pre class="code"><code>import asyncio
+import random
+import ray
+
+ray.init(num_cpus=8)
+
+@ray.remote(num_cpus=1)
+def produce_chunk(cid):
+    import time
+    time.sleep(0.05 + 0.2 * random.random())   # 分片耗时带随机方差
+    return cid, 4000                            # 每片 4k 步样本的统计量
+
+async def stream_consume(total_chunks=64, window=8):
+    in_flight = []                       # 引用窗口：显式背压，防止无界提交
+    consumed = 0
+    for cid in range(total_chunks):
+        if len(in_flight) >= window:     # 窗口满：先等最先就绪的一个
+            ready, not_ready = await asyncio.wait(
+                in_flight, return_when=asyncio.FIRST_COMPLETED)
+            done = ready.pop()
+            in_flight = list(not_ready)
+            stat = done.result()         # 消费该分片统计量
+            consumed += stat[1]
+        in_flight.append(asyncio.ensure_future(produce_chunk.remote(cid)))
+    for fut in asyncio.as_completed(in_flight):   # 收尾：排空剩余引用
+        consumed += fut.result()[1]
+    print("总消费步数:", consumed)
+
+asyncio.run(stream_consume())</code></pre>
+    <p>解读：这段代码演示了两条工程约束的合流：并发等待解决吞吐，窗口机制解决内存与下游压力。<code>asyncio.wait</code> 的 FIRST_COMPLETED 模式对应引用语义中的 <code>ray.wait</code>，消费顺序取"最早就绪"，提交顺序只作参考。<strong>窗口判定放在提交之前，保证在途引用数恒定</strong>，与第 005 章 Actor 池的窗口逻辑同构，区别仅是等待原语从阻塞 API 换成了协程。<code>as_completed</code> 负责收尾，与主循环共用同一消费逻辑的写法可以再抽成辅助函数，减少重复。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>异步函数内调用同步阻塞接口</strong>：在协程里调用 <code>time.sleep</code> 或阻塞式网络库，整个事件循环停摆，所有在途调用一起变慢。症状是并发数越多延迟越均匀变长。修复：换用异步版本接口，或用线程执行器包装同步调用。</li>
+      <li><strong>漏写 await</strong>：协程对象没有等待直接丢弃，任务从未真正开始，调试时只见"从未完成"或警告信息。修复：审阅所有异步调用点；静态检查工具能捕获大部分漏网。</li>
+      <li><strong>对计算密集负载寄望异步</strong>：把纯计算函数改成异步形态，单核执行流并未变多，吞吐不变甚至因调度开销略降。修复：计算负载继续用任务并行，异步只用于等待重叠。</li>
+      <li><strong>异步接口忘记背压</strong>：提交循环跑满 CPU 而任务完成寥寥，队列与内存同步膨胀。修复：为在途引用设窗口，窗口满时挂起提交。</li>
+      <li><strong>异步 Actor 内使用锁或阻塞同步原语</strong>：单线程事件循环场景下无必要且有死锁风险，等待锁的挂起会牵住整个循环。修复：把状态读写收进无挂起的代码段，依赖事件循环的单线程特性保证互斥。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把片段 1 的任务数从 32 提升到 256，分片等待仍为 0.3 秒。预测异步版本的耗时变化，并说明在核数不变的前提下瓶颈何时从等待转向计算。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>等待时长不变时异步版本耗时基本持平，直到 8 核用满后任务进入排队，耗时开始随任务数线性上升。转折点即饱和点。</div></details>
+      </li>
+      <li>把片段 2 的 <code>asyncio.sleep</code> 换成 <code>time.sleep</code> 并调大请求数，预测吞吐变化并解释，给出两种修复方案。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>同步睡眠阻塞事件循环，并发优势消失。修复：换回异步等待，或把同步等待放进线程执行器后异步等待其结果。</div></details>
+      </li>
+      <li>设计实验：在异步 Actor 服务中加入事件循环延迟测量（记录协程恢复时刻与预期时刻的差值），分别注入同步阻塞与异步等待，观察延迟指标形态。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>异步等待下延迟平稳；注入同步阻塞后延迟出现与阻塞时长同量级的尖峰，且所有在途请求同时受影响。该指标可做成服务健康度告警。</div></details>
+      </li>
+      <li>对比题：同样的"每个请求等待 200 毫秒、计算 20 毫秒"负载，分别给出多副本同步 Actor 与单异步 Actor 的吞吐估算，并讨论显存与内存占用差异。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>8 并发异步约 40 请求/秒；多副本达到同等吞吐需要 8 个进程，内存占用显著更高，但隔离性与容错更强。</div></details>
+      </li>
+      <li>推导：设单请求等待 W、计算 C，异步并发度 M。写出稳态吞吐表达式，并求使异步方案吞吐达到串行方案 K 倍所需的最小并发度。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>单执行流吞吐约 M/(W+C)（M 个请求共享计算段）；串行吞吐为 1/(W+C)，故倍数上限受计算段约束：当 C 不可忽略时，K 受 (W+C)/C 封顶。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>对象引用是完整的未来值：同步等待用 ray.get，按就绪顺序用 ray.wait，不阻塞执行流用 await。</li>
+      <li>驱动端异步用一个进程管理大量等待点；异步重叠的是等待，计算并行仍靠任务拆分与资源调度。</li>
+      <li>异步 Actor 由事件循环驱动，<strong>挂起点只能来自异步原语，任何同步阻塞都会让全 Actor 停摆</strong>。</li>
+      <li>max_concurrency 与在途窗口共同构成背压体系；异步接口若无窗口，拥塞只会转移到队列与内存。</li>
+      <li>下一章从单机走向集群：<strong>集群配置与启动</strong>，讲清头节点、工作节点与连接方式。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch005.html">← 第 005 章：Ray Actor池与并发控制</a>
+    <a class="next" href="ch007.html">第 007 章：Ray集群配置与启动 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

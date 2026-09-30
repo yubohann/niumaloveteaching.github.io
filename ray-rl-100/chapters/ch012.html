@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第012章 Ray Serve部署入门 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · Ray 基础与分布式编程</span>
+    <span class="sep">/</span>
+    <span>第 012 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · Ray 基础与分布式编程</div>
+    <h1>第 012 章：Ray Serve部署入门</h1>
+    <p class="lead">把训练产物变成在线服务：副本即 Actor、路由即负载均衡、动态批处理即吞吐杠杆。本章用三个片段走完"单模型服务、多组件组合、批量优化"的标准路径。</p>
+    <ul class="meta">
+      <li>主题：Ray 生态 / 模型服务化</li>
+      <li>关键机制：部署（Deployment）副本、请求路由、自动缩放配置、动态批处理</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 011 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解部署的运行时结构：副本是常驻 Actor，句柄调用与 HTTP 请求两条入口的差异。</li>
+      <li>掌握单模型服务的完整写法：构造时加载权重、请求方法处理推理、副本与资源声明。</li>
+      <li>会用组合图组织多组件服务：入口组件持有下游句柄，链路组装在绑定时完成。</li>
+      <li>掌握动态批处理的机制与参数：最大批、等待窗口与吞吐延迟的取舍。</li>
+      <li>能诊断三类问题：副本内阻塞事件循环、入口层持有状态、自动缩放配置不当。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>训练完成的策略模型需要被消费：评估脚本要批量调用、仿真系统要循环推演、上层应用要在线查询动作与价值。<strong>把模型直接塞进调用方进程的做法在并发、伸缩与故障隔离上都没有余地</strong>：一个慢请求拖垮整个进程，加并发只能靠复制进程，模型副本的内存还被重复占用。</p>
+    <p>服务层把"模型"包装成部署（Deployment）：每个副本是一个常驻 Actor，请求经统一入口路由到副本队列，副本数量、资源声明与自动缩放都是声明式配置。对强化学习场景，这套设施覆盖三类需求：策略在线推理、评估服务与多模型对比（把不同训练轮次的检查点发布为不同路由，观察行为差异）。</p>
+    <p>本章先把单模型服务写对，再讲组件组合与批处理优化，最后给出上线前的检查清单。与训练侧的衔接点是检查点：副本在构造时加载权重，这正是第 018 章保存流程的下游消费者。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 部署的运行时结构</h3>
+    <p>一次部署声明展开后，运行时由三部分构成：</p>
+    <table>
+      <tr><th>组成部分</th><th>身份</th><th>职责</th></tr>
+      <tr><td>入口（Ingress）</td><td>HTTP 接入层与路由代理</td><td>接收请求、按策略选择副本、维护队列</td></tr>
+      <tr><td>副本（Replica）</td><td>常驻 Actor 进程</td><td>加载模型、执行请求方法、返回结果</td></tr>
+      <tr><td>句柄（Handle）</td><td>部署引用</td><td>组件之间以代码方式互相调用，绕过 HTTP</td></tr>
+    </table>
+    <p><strong>副本即 Actor 意味着第 002 至 006 章的全部语义在这里继续生效</strong>：构造在副本启动时执行一次，实例变量跨请求保持（适合缓存模型与预处理参数），方法默认按队列串行，异步方法可用事件循环重叠等待。副本内阻塞事件循环的后果与第 006 章一致：整个副本的所有在途请求一起变慢。</p>
+    <div class="formula">
+      服务吞吐 ≈ 副本数 × 单副本吞吐；单副本吞吐 ≈ 批大小 ÷ 单批处理时长
+      <span class="note">2–8 个副本覆盖多数推理场景；批处理把单副本吞吐再抬高数倍，两者是相乘关系</span>
+    </div>
+
+    <h3>2. 请求路径与排队</h3>
+    <p>请求从入口到结果依次经过：路由选择、副本队列、方法执行、结果回传。路由策略在副本之间做负载均衡，倾向选择排队最少的副本；<strong>单副本内部的串行队列仍是吞吐上限，副本数负责把这条上限乘以倍数</strong>。两类调用入口共享同一套副本：外部用 HTTP 请求，内部组件用句柄调用，句柄调用省去网络序列化开销，适合服务内部阶段串联。</p>
+    <p>排队语义决定了延迟特征：请求延迟等于排队时间加处理时间。副本数不足时排队时间随负载陡增；自动缩放通过调整副本数把排队维持在目标水位。两条入口的固定开销也不同：句柄调用走集群内 RPC，省去 HTTP 解析与文本序列化；HTTP 入口多一层协议处理，换来外部直接可用。内部链路优先句柄，边界流量才走 HTTP，这一分工可省下每阶段的毫秒级开销。</p>
+
+    <h3>3. 自动缩放与资源声明</h3>
+    <ul>
+      <li><strong>副本数边界</strong>：最小与最大副本数限定伸缩范围；最小值保证低谷可用性，最大值防止故障时的资源失控。</li>
+      <li><strong>目标水位</strong>：以"每副本在途请求数"为目标指标，实际指标高于目标则扩容。目标是缩放灵敏度与稳定性的总开关，过小会频繁扩缩，过大则排队加长。</li>
+      <li><strong>单副本资源</strong>：核数与显存在副本级声明，调度器据此放置副本。模型占显存较大的场景，单卡只能容纳一个副本时，副本所在的节点数就是最大并行度。</li>
+    </ul>
+    <p>自动缩放面对大模型时的固有延迟是冷启动：新副本需要拉起进程并加载权重，加载期间不可服务。<strong>把启动时间纳入容量规划：高峰前的预热、最小副本数的保底，都是对冷启动的缓解手段</strong>。这也是训练侧检查点要控制体积的原因之一：检查点越小，副本冷启动越快。</p>
+    <p>容量估算可以写成一条式子进行：副本数 = 目标吞吐 ÷ 单副本吞吐，再乘安全系数并向上取整。目标 3000 请求/秒、单副本 1032 请求/秒时，3000 ÷ 1032 ≈ 2.91，取 3 个副本；按 1.3 倍突发系数，3.90 向上取整为 4 个副本。若单卡只容一个副本，4 个副本意味着 4 张卡，安全性由副本冗余给出，成本由卡数决定，两个量在上线前都要摆到秤上核对。</p>
+
+    <h3>4. 动态批处理：把并发请求合成批</h3>
+    <p>推理硬件的效率与批大小强相关：一次前向处理 32 条输入远快于 32 次单条前向。动态批处理（Dynamic Batching）让副本把时间窗口内到达的请求合并成一个批：</p>
+    <ol>
+      <li>请求到达副本后不立即执行，先进入批收集窗口；</li>
+      <li>窗口内凑满最大批或等待超时，触发一次批处理调用；</li>
+      <li>批处理结果按请求编号拆分，分别回送。</li>
+    </ol>
+    <p>两个参数构成核心取舍：<strong>最大批大小决定吞吐上限，等待窗口决定引入的额外延迟</strong>。窗口设为数十毫秒量级时，并发充分的场景几乎总是凑满批，延迟增加可忽略；低并发场景则每批偏小，等待成本相对明显。<strong>批处理是提升单副本吞吐的首选杠杆，其次才是加副本</strong>，因为它摊薄的是每次前向的固定开销。</p>
+
+    <h3>5. 数值算例：批处理收益与排队延迟的非线性</h3>
+    <p>设单副本每次前向的固定开销 γ = 15 毫秒（框架调度、显存拷贝、内核启动），单条输入的边际成本 a = 0.5 毫秒。逐条处理时每条耗时 15.5 毫秒，单副本吞吐约 64.5 请求/秒；凑满 32 条批时单批耗时 15 + 32 × 0.5 = 31 毫秒，单副本吞吐升到 32 ÷ 0.031 ≈ 1032 请求/秒，提升约 16 倍。作为对照，把无批处理的副本堆到 4 份也只有 258 请求/秒，且需要 4 份权重驻留；<strong>先让批处理把单副本榨到接近硬件上限，再用副本数解决冗余与峰值，资源效率相差数倍</strong>。</p>
+    <p>延迟的另一半来自排队。把副本当作服务速率 μ = 1032 的单服务台，按到达率 λ 用排队公式 Wq = ρ ÷ (μ − λ)，ρ = λ ÷ μ：λ = 900 时 ρ ≈ 0.87，排队约 6.6 毫秒；λ = 1000 时 ρ ≈ 0.97，排队约 30 毫秒；λ = 1020 时 ρ ≈ 0.99，排队升到约 80.6 毫秒。利用率越过 0.9 后排队时间对到达率极端敏感，这正是自动缩放需要把目标水位控制在拐点之前的原因。</p>
+    <table>
+      <tr><th>到达率 λ（请求/秒）</th><th>利用率 ρ</th><th>排队时间 Wq</th><th>特征</th></tr>
+      <tr><td>900</td><td>0.87</td><td>约 6.6 ms</td><td>余量充足</td></tr>
+      <tr><td>1000</td><td>0.97</td><td>约 30 ms</td><td>接近饱和</td></tr>
+      <tr><td>1020</td><td>0.99</td><td>约 80.6 ms</td><td>延迟随负载陡增</td></tr>
+    </table>
+    <table>
+      <tr><th>方案</th><th>单副本吞吐</th><th>资源代价</th><th>延迟影响</th></tr>
+      <tr><td>动态批处理（批 32）</td><td>约 1032 请求/秒</td><td>显存按批峰值预留</td><td>闲时每条至多增加一个窗口</td></tr>
+      <tr><td>副本扩到 4 份（无批）</td><td>约 258 请求/秒</td><td>4 份权重的内存与显存</td><td>排队更短</td></tr>
+    </table>
+
+    <h3>6. 边界与失效模式</h3>
+    <p>低负载时动态批处理反向收费：请求稀疏，窗口每次都等到超时才发车，批内只有一两条，等待窗口全额加到延迟上。延迟敏感的接口应把窗口压到毫秒量级，或对单条请求走旁路直通。</p>
+    <p>输入异质时批的有效利用率下降：批处理耗时由最慢样本决定，一条高分辨率输入混进小批里，整个批一起等。按输入尺寸分桶（bucket）再各配批参数是常见修复；代价是路由逻辑变复杂。</p>
+    <p>自动缩放天然滞后于突发流量：扩容决策需要观测窗口，新副本还要经历进程拉起与权重加载。数秒级突发放大下，依靠缩放保延迟来不及，工程解法是保底副本覆盖突发头部，或让入口层对超出容量的请求快速拒绝并附重试建议，避免长队列拖高所有请求的延迟。</p>
+    <p>有状态的副本在缩容时状态随副本一起消失：计数器、缓存、召回库都受影响。状态应收敛到独立部署或有外部存储支撑的组件，保证副本集合的任意伸缩都不破坏语义。发布新版本时保留旧版本路由并按比例分流，观察一段时间的行为与延迟后全量切换，这条灰度流程与检查点版本管理直接衔接。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>发布一个策略推理服务的步骤：</p>
+    <ol>
+      <li><strong>定接口</strong>：明确请求与响应的字段（观测向量、返回动作与价值等），把预处理的输入校验放在入口层。</li>
+      <li><strong>写副本类</strong>：权重加载放构造方法，推理逻辑放请求方法；异步接口与批处理按负载形态选择。</li>
+      <li><strong>配副本与资源</strong>：按单副本吞吐与目标并发估算副本数；显存按模型体积加批处理峰值预留。</li>
+      <li><strong>配自动缩放</strong>：设定副本边界与目标水位，用观测数据校准目标值。</li>
+      <li><strong>组链路</strong>：多组件服务用句柄串联，入口只做协议转换与调度。</li>
+      <li><strong>验证与上线</strong>：离线压测确认吞吐与延迟曲线，再接入真实流量；保留回退版本的路由。</li>
+    </ol>
+    <table>
+      <tr><th>参数</th><th>典型取值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>副本数</td><td>2–8</td><td>吞吐与冗余</td><td>目标请求速率除以单副本吞吐</td></tr>
+      <tr><td>单副本核数</td><td>1–4</td><td>推理计算与预处理</td><td>预处理占比高时多分核</td></tr>
+      <tr><td>单副本显存</td><td>1 卡</td><td>模型常驻</td><td>权重加批处理峰值留一档余量</td></tr>
+      <tr><td>最大批 / 等待窗口</td><td>8–64 / 10–50 毫秒</td><td>动态批处理</td><td>吞吐与延迟的显式取舍</td></tr>
+      <tr><td>目标在途请求数</td><td>2–10</td><td>缩放灵敏度</td><td>负载波动幅度与冷启动时长</td></tr>
+    </table>
+    <div class="box tip">
+      <span class="box-title">与上一章的差异点</span>
+      <p>数据层是"拉"的模式：训练按需从数据集中取批。服务层是"推"的模式：请求到达并排队等待处理。一个管离线吞吐，一个管在线延迟，两类指标口径完全不同，容量规划的方法也不同。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>以下片段采用 Ray 2.x 时期的通用写法；接口随版本演进，以对应版本官方文档为准。</p>
+    <p><strong>片段 1：单模型服务的最小完整形态</strong></p>
+    <pre class="code"><code>import ray
+from ray import serve
+
+ray.init(num_cpus=16, num_gpus=2)
+
+@serve.deployment(
+    num_replicas=2,                       # 两个副本：吞吐翻倍，互为冗余
+    ray_actor_options={"num_cpus": 2, "num_gpus": 1},
+    autoscaling_config={
+        "min_replicas": 1, "max_replicas": 4,
+        "target_num_ongoing_requests_per_replica": 4,   # 每副本 4 个在途
+    },
+)
+class PolicyService:
+    def __init__(self, checkpoint_path):
+        # 构造在副本启动时执行一次：加载权重这类重活放在这里
+        self.weights = load_checkpoint(checkpoint_path)   # 示意：从检查点恢复
+        self.preproc = build_preprocessor()               # 预处理参数随权重固化
+
+    async def __call__(self, request):
+        obs = await request.json()          # 异步解析请求体
+        action, value = self.forward(obs)   # 纯计算段：不包含阻塞调用
+        return {"action": action, "value": value}
+
+    def forward(self, obs):
+        import numpy as np
+        x = self.preproc(np.asarray(obs, dtype=np.float32))
+        return int(np.argmax(x[:4])), float(np.sum(x))     # 占位推理
+
+def load_checkpoint(path):
+    return {"path": path}                  # 示意：真实实现读取权重文件
+
+def build_preprocessor():
+    return lambda x: x / 255.0
+
+serve.run(PolicyService.bind("/data/ckpt/policy_v3"))   # 绑定参数并启动服务</code></pre>
+    <p>解读：这份骨架包含四个关键决策。<strong>其一，权重加载在构造方法</strong>，副本启动后常驻内存，请求路径上零加载开销。<strong>其二，请求方法为异步</strong>，解析请求体这类等待不占用执行流；<code>forward</code> 是纯计算段，不包含任何阻塞原语。<strong>其三，自动缩放以每副本在途请求数为指标</strong>，目标值 4 适合中等波动的推理负载；最小副本 1、最大 4 的区间限制了冷启动与资源峰值的两侧风险。<strong>其四，检查点路径通过绑定传入</strong>，同一份代码用不同路径发布不同训练轮次的模型，这正是多版本对比的入口。</p>
+
+    <p><strong>片段 2：多组件组合，句柄串联链路</strong></p>
+    <pre class="code"><code>import ray
+from ray import serve
+
+ray.init(num_cpus=16, num_gpus=2)
+
+@serve.deployment(ray_actor_options={"num_cpus": 1})
+class Preprocessor:
+    async def __call__(self, raw_obs):
+        import numpy as np
+        obs = np.asarray(raw_obs, dtype=np.float32) / 255.0
+        return obs.tolist()               # 归一化后交给下游模型
+
+@serve.deployment(ray_actor_options={"num_cpus": 2, "num_gpus": 1})
+class PolicyModel:
+    def __init__(self):
+        self.loaded = True                # 示意：真实实现加载策略网络
+
+    async def predict(self, obs):
+        return {"action": 1, "value": 0.5}    # 占位：返回动作与价值
+
+@serve.deployment(num_replicas=2)
+class Ingress:
+    def __init__(self, preprocessor, model):
+        # 入口持有下游句柄：链接在绑定时完成，编译期即可发现拼装错误
+        self.preprocessor = preprocessor
+        self.model = model
+
+    async def __call__(self, request):
+        raw = await request.json()
+        obs = await self.preprocessor.remote(raw["obs"])   # 阶段一：预处理
+        return await self.model.predict.remote(obs)        # 阶段二：推理
+
+serve.run(Ingress.bind(Preprocessor.bind(), PolicyModel.bind()))</code></pre>
+    <p>解读：组合模式把服务拆成职责单一的部署，每个阶段独立配置副本与资源：预处理是轻量计算，1 核足够且副本可以多于模型；模型副本绑定显存，数量受卡的容量约束。<strong>句柄调用走内部通道，省去序列化到网络再解包的往返</strong>，阶段间传递的中间量（归一化后的观测）直接以对象形式流动。入口层保持无状态，因此入口自身也能安全地开多个副本；任何缓存或计数都应收敛到有明确生命周期的下游组件里。</p>
+
+    <p><strong>片段 3：动态批处理提升单副本吞吐</strong></p>
+    <pre class="code"><code>import ray
+from ray import serve
+
+ray.init(num_cpus=16)
+
+@serve.deployment(num_replicas=2, ray_actor_options={"num_cpus": 4})
+class BatchedModel:
+    @serve.batch(max_batch_size=32, batch_wait_timeout_s=0.02)
+    async def predict_batch(self, obs_list):
+        """批处理入口：obs_list 是窗口内合并的请求列表。"""
+        import numpy as np
+        batch = np.stack([np.asarray(o, dtype=np.float32) for o in obs_list])
+        # 一次前向处理整批：这正是批处理摊薄的固定开销
+        out = batch.sum(axis=1)
+        return [float(v) for v in out]    # 返回值按请求顺序拆分回送
+
+    async def __call__(self, request):
+        obs = await request.json()
+        score = await self.predict_batch(obs["obs"])
+        return {"score": score}
+
+serve.run(BatchedModel.bind())</code></pre>
+    <p>解读：<code>serve.batch</code> 装饰器把窗内到达的调用合并成一次批处理调用。参数取值体现取舍：批上限 32 决定忙时单次前向的规模，等待窗口 20 毫秒决定闲时引入的额外延迟。<strong>批处理方法接收列表、返回等长列表，路由层负责按请求顺序拆分</strong>，调用方对此无感知。副本核数设为 4 是给批处理预留的向量化计算资源；若换成 GPU 推理，把显存声明加进副本配置，批上限还可按显存余量继续上调。压测时以"吞吐随批大小变化、延迟随等待窗口变化"两条曲线为依据调整参数。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>在请求方法里加载模型</strong>：每次请求都读检查点或初始化网络，延迟与内存双双失控。修复：加载逻辑移入构造方法，请求路径只做推理。</li>
+      <li><strong>异步方法内混入阻塞调用</strong>：事件循环被同步接口卡住，同副本所有请求排队。症状是高并发下延迟整体抬升。修复：换异步接口或用执行器包装，与第 006 章的处理原则一致。</li>
+      <li><strong>入口组件持有可变状态</strong>：入口多副本时状态各持一份，统计值互不一致；入口重启即丢失。修复：状态收敛到有明确生命周期的组件或外部存储，入口保持无状态。</li>
+      <li><strong>自动缩放目标水位配置不当</strong>：目标过小造成副本数频繁抖动，过大则高峰期排队严重。修复：用压测得到"在途请求数与延迟"曲线，把目标定在延迟拐点之前。</li>
+      <li><strong>大模型冷启动被忽略</strong>：扩容决策基于瞬时负载，新副本加载权重耗时数十秒，扩容期间延迟仍然超标。修复：保持最小副本数覆盖基线负载，放大目标水位提前扩容，或优化检查点体积。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把片段 1 的 <code>num_replicas</code> 从 2 改为 4、<code>target_num_ongoing_requests_per_replica</code> 从 4 改为 2，预测稳定吞吐与延迟的变化方向，并解释两个参数各自的杠杆作用。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>副本数抬高吞吐上限；目标水位调低让缩放更早介入、稳态排队更短，代价是副本数可能偏高。两参数一管容量、一管灵敏度。</div></details>
+      </li>
+      <li>预测题：片段 3 把等待窗口从 20 毫秒调到 200 毫秒，忙时与闲时的吞吐、延迟各自如何变化？给出适合"延迟敏感"与"吞吐优先"两类场景的取值方向。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>窗口拉长让闲时也能凑大些的批，吞吐抬头但延迟同幅增加。延迟敏感取小窗口，吞吐优先取大窗口并提高批上限。</div></details>
+      </li>
+      <li>设计题：把"预处理加策略网络加后处理"三级链路设计成服务图：逐组件配置副本数与资源，说明哪一级最可能成为瓶颈，以及瓶颈迁移的观测手段。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>瓶颈通常落在显存约束的模型级：副本数受卡数限制。观测手段是分别记录三级组件的排队时长，排队最长的即当前瓶颈。</div></details>
+      </li>
+      <li>分析：某服务在压测中吞吐随并发上升到一点后停滞，延迟开始陡增。给出两种解释（副本饱和、批处理饱和），以及区分二者的观测指标。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>副本饱和表现为各副本队列同步变长；批处理饱和表现为批已满、单批时长不变但到达速率超出服务速率。观测批量直方图与队列长度即可区分。</div></details>
+      </li>
+      <li>设计：为强化学习策略发布设计多版本对比方案：不同训练轮次的检查点如何映射到路由，流量如何切分，对比指标有哪些（动作分布差异、价值偏差、延迟）。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>每个版本一个部署、入口按比例分发或按路由前缀区分；对比指标建议含动作分布散度与价值均值偏差，两者能快速暴露版本间的行为漂移。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>部署的运行时是入口加副本：副本即 Actor，连接与状态语义沿用核心原语。</li>
+      <li>权重加载进构造方法、请求路径保持纯计算，是副本设计的第一纪律。</li>
+      <li>多组件服务用句柄串联，各组件的副本与资源独立配置；入口层保持无状态。</li>
+      <li>动态批处理用批上限与等待窗口换取吞吐；<strong>先批处理、后加副本是提升单服务吞吐的优先顺序</strong>。</li>
+      <li>下一章回到开发效率：<strong>分布式编程调试与性能诊断</strong>，把前十二章的排障手段系统化。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch011.html">← 第 011 章：Ray Data集成：数据加载与批处理</a>
+    <a class="next" href="ch013.html">第 013 章：分布式编程调试与性能诊断 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

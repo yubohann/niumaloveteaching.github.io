@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第026章 多智能体环境下的归一化技术 | 多智能体强化学习课程 · CTDE 框架与协同算法</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 训练工程与稳定性</span>
+    <span class="sep">/</span>
+    <span>第 026 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 训练工程与稳定性</div>
+    <h1>第 026 章：多智能体环境下的归一化技术</h1>
+    <p class="lead">本章讲多智能体训练中的三种归一化：观测归一化、奖励缩放与价值归一化（PopArt），重点分析运行统计的跨回合累积、训练与评估的统计隔离，以及归一化在分布式执行接口下的约束。</p>
+    <ul class="meta">
+      <li>主题：数值尺度治理 / 统计量管理</li>
+      <li>关键公式：ô = clip((o − μ) / √(σ² + ε))</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 025 章 探索策略在CTDE中的设计</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解多智能体环境中数值尺度失控的三个来源：异构观测分量、奖励量级漂移、价值累积尺度。</li>
+      <li>掌握运行均值方差的增量更新形式（Welford 递推），以及统计量跨回合累积与训练评估隔离的原则。</li>
+      <li>理解观测归一化在分布式执行中的约束：统计量必须可由局部信息估计并随策略一并冻结、保存。</li>
+      <li>掌握奖励缩放与价值归一化（PopArt）的原理，包括输出层的重缩放变换。</li>
+      <li>能实现带冻结开关的统计模块，并诊断统计泄漏、除零放大两类典型故障。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>多智能体环境的观测向量通常由不同来源的物理量拼接而成：位置以米计、速度以米每秒计、能量以比例计，各分量自然量级相差若干数量级。全局状态还叠加了更多维度的任务信息。直接把这样的向量送入网络，梯度方向被大量级分量主导，小量级分量对应的特征长期得不到有效学习。</p>
+    <p>奖励侧存在同类问题：稀疏任务的一次性大额奖励与常规步级惩罚并存，回报在不同任务阶段漂移数个数量级，价值函数需要适配持续变化的回归目标。这些尺度问题在单智能体训练中已经存在，多智能体环境把严重程度放大：智能体数量越多，拼接观测的维度越高；课程与对抗训练让奖励分布随训练阶段系统性地漂移。第 025 章的探索调度了动作分布的广度，本章的归一化处理输入与目标的数值尺度，两者共同构成训练工程的基础设施。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 观测归一化与运行统计</h3>
+    <p><strong>观测归一化把每个分量变换到近似零均值、单位方差的尺度，等价于给网络前端加一层在线估计的白化模块。</strong>标准形式为减去均值、除以标准差，并对结果做幅度截断：</p>
+    <div class="formula">
+      ô = clip( (o − μ) / √(σ² + ε), −c, c )
+      <span class="note">μ、σ² 为运行统计量，ε 防止除零，c 为截断幅值（常用 5 到 10）</span>
+    </div>
+    <p>运行统计不能由单批次或单回合计算。批次统计把同批样本的信息泄漏给彼此，回合统计让归一化依赖回合内未来数据，二者都破坏因果性并引入训练与部署的不一致。正确做法是跨回合增量更新全局统计，用 Welford 递推同时维护计数、均值与二阶矩：</p>
+    <div class="formula">
+      n ← n + 1；μ ← μ + (x − μ) / n；σ² ← (n−1)/n · σ² + (x − μ)<sub>旧</sub>² / n
+      <span class="note">递推形式无需保存历史样本，内存恒定；等价写法用并行合并公式支持批量喂入</span>
+    </div>
+    <p>统计量的作用域有两条常用策略：<strong>全体智能体共享一套统计</strong>，保持同构输入在参数共享结构下的一致性；<strong>每个智能体独立统计</strong>，适配观测分布差异明显的智能体。选择依据是参数是否共享与观测是否同构：共享参数且观测同构时用共享统计，异构智能体（第 030 章）用独立统计或按角色分组统计。混合策略（共享统计加每个智能体的仿射校准）在工程上也很常见。</p>
+
+    <h3>2. 训练与评估的统计隔离</h3>
+    <p>统计模块的行为规则可以概括为三条：<strong>训练期更新统计并应用归一化；评估期只应用训练时冻结的统计快照，不更新统计；部署时把快照随策略参数一起保存与加载。</strong>评估期更新统计量会让评测数据污染归一化参数，评估结果依赖于评估顺序与批次划分，实验不可复现；部署时不保存快照则同一策略在不同环境上产生不同的输入变换，行为漂移。</p>
+    <p>异步采样与多环境并行（第 038 章）还会引入统计竞争：多个采集进程同时写统计量，更新次序失去确定性。解决办法是统计只在学习器侧更新，采集侧使用学习器周期性广播的快照；快照间隔对应统计量的滞后时间，与目标网络的滞后管理同类处理。</p>
+
+    <h3>3. 奖励缩放</h3>
+    <p>奖励缩放的目标是稳定价值回归的数值条件。常用形式是除以回报的运行标准差：</p>
+    <div class="formula">
+      r̃<sub>t</sub> = r<sub>t</sub> / (σ<sub>R</sub> + ε)
+      <span class="note">σ<sub>R</sub> 为近期回合回报的标准差估计；尺度随任务进展自动调整</span>
+    </div>
+    <p>其原理是把价值目标的量级锁定在单位尺度附近，使学习率与梯度裁剪阈值（第 027 章）跨任务迁移。注意两点：其一，缩放系数一旦进入回报，最优策略不变（正数缩放保持策略排序），但塑形项（第 021 章）与原始奖励必须使用同一个缩放系数，否则势能抵消结构在数值上失真；其二，缩放系数本身是运行统计，同样适用训练评估隔离原则，评估回报应换算回原始尺度后再报告。</p>
+
+    <h3>4. 价值归一化与 PopArt</h3>
+    <p>价值归一化在输出层处理尺度问题：网络输出被解释为归一化价值 V̂ = (V − μ<sub>V</sub>) / σ<sub>V</sub>，回归目标也被同尺度变换。PopArt 的关键在于每次统计更新后重新缩放输出层，使网络直接输出未归一化的价值不受影响：</p>
+    <div class="formula">
+      统计更新后：W ← W · σ<sub>旧</sub> / σ<sub>新</sub>，b ← (b · σ<sub>旧</sub> + μ<sub>旧</sub> − μ<sub>新</sub>) / σ<sub>新</sub>
+      <span class="note">W、b 为价值输出层的权重与偏置；变换保持网络输出的物理含义连续</span>
+    </div>
+    <p>这一变换的意义在于兼顾两方面：<strong>内部回归目标保持在单位尺度，稳定优化；对外输出的价值估计始终是原始尺度，策略改进与优势计算无需换算。</strong>多智能体场景中，值分解算法对团队价值头维护一组 PopArt 统计，个体价值通常量级相近，可以共享同一组统计；策略梯度类算法对优势做标准化（减均值除标准差）即可获得类似效果，需要分发全局统计以保持各进程口径一致。</p>
+
+    <h3>5. 数值算例：异构分量的尺度失衡与修复</h3>
+    <p>取两个分量：位置 p ~ 均匀分布 U(0, 10)（单位米），能量 e ~ U(0, 1)（比例）。两者标准差分别为 10 / √12 = 2.887 与 1 / √12 = 0.289，比值恰好 10，数值经程序核对。<strong>对线性层而言，输入分量的尺度决定对应权重收到的梯度量级：在相同的误差信号下，小尺度分量对应的权重每次更新幅度只有大尺度分量的十分之一，能量特征需要约十倍的数据量才能达到同等学习程度。归一化把两者同时压到单位方差，权重更新的竞争回到特征结构本身而不再由量纲决定；拼接观测的异构来源越多，这一矫正的累计收益越大。</strong></p>
+
+    <h3>6. 数值算例：Welford 递推逐步核对</h3>
+    <p>取样本序列 [4, 8, 6]，从零初始化逐步执行递推（数值经程序核对）：</p>
+    <table>
+      <tr><th>步</th><th>x</th><th>μ（更新后）</th><th>m2（更新后）</th></tr>
+      <tr><td>1</td><td>4</td><td>4.000</td><td>0.000</td></tr>
+      <tr><td>2</td><td>8</td><td>4 + (8 − 4) / 2 = 6.000</td><td>0 + 4 × (8 − 6) = 8.000</td></tr>
+      <tr><td>3</td><td>6</td><td>6 + (6 − 6) / 3 = 6.000</td><td>8 + 0 × (6 − 6) = 8.000</td></tr>
+    </table>
+    <p>最终均值 6.000，方差 m2 / n = 8 / 3 = 2.6667，与直接两遍计算逐位一致。<strong>核对要点：<code>m2</code> 的增量使用"更新后的均值"，第 2 步中 4 × (8 − 6) 的减数是新均值 6；用错旧均值会得到 m2 = 16，方差恰好翻倍。该样本刻意让第三个值等于当前均值，使第 3 步增量为零，便于看清递推的停止条件与数值路径。</strong></p>
+
+    <h3>7. 数值算例：PopArt 重缩放的恒等核验</h3>
+    <p>取输出层 w = 3、b = 0.5，统计从 (μ, σ) = (2, 1) 更新到 (4, 2)。重缩放公式给出 w′ = 3 × 1 / 2 = 1.5，b′ = (0.5 × 1 + 2 − 4) / 2 = −0.75。核验原始尺度输出的连续性：更新前 raw(x) = 2 + (3x + 0.5)，更新后 raw(x) = 4 + 2 × (1.5x − 0.75)，在 x = 0、1、2.5 处两式分别给出 2.5、5.5、10.0，逐点一致，数值经程序核对。<strong>读数：重缩放不改变任何 x 处的原始尺度估计；改变的是内部归一化输出，x = 1 处从 3.5 变为 0.75，因为新统计把同一原始值解释为"低于新均值"的位置。价值损失回归的是归一化输出，重缩放后网络沿新尺度目标继续优化；策略改进读取的原始尺度价值保持连续，这就是"内部稳定、对外连续"的完整含义。</strong></p>
+
+    <h3>8. 三类归一化的对照与边界</h3>
+    <table>
+      <tr><th>维度</th><th>观测归一化</th><th>奖励缩放</th><th>价值归一化（PopArt）</th></tr>
+      <tr><td>处理对象</td><td>网络输入</td><td>回报与 TD 目标</td><td>价值输出层与回归目标</td></tr>
+      <tr><td>主要风险</td><td>统计泄漏、部署快照缺失</td><td>与塑形项尺度脱钩</td><td>统计更新过频引发目标抖动</td></tr>
+      <tr><td>不变性</td><td>仿射变换不改策略函数类</td><td>正数缩放不改最优策略排序</td><td>输出连续、内部尺度归位</td></tr>
+      <tr><td>分布式约束</td><td>快照随策略广播</td><td>全局回报统计须一致</td><td>价值头统计与参数同版本</td></tr>
+    </table>
+    <p>边界条件要写清楚：奖励缩放保持最优策略的前提是目标为无熵（或熵权重同步缩放）的折扣回报；同时使用最大熵目标（第 014 章）时，回报整体缩放 c 倍等价于温度除以 c，α 需要联动标定。价值统计若每个优化步都更新，回归目标随统计漂移，价值的移动靶效应会让损失曲线长期高位震荡；按固定间隔（例如每若干千步）更新可以兼顾适应速度与稳定。该纪律与观测统计的快照节奏同源，运行统计的时间常数与管理规则需要写入配置对象并跨实验沿用。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>归一化模块按包装器链组织：环境出口处依次经过观测归一化与奖励缩放，价值归一化放在学习器的输出头。统计模块对外暴露 <code>update</code>、<code>normalize</code>、<code>freeze</code>、<code>state_dict</code> 四个接口，评估与部署路径只允许调用后两个。</p>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>统计更新方式</td><td>Welford 精确递推</td><td>估计均值方差</td><td>数据量中等时精确；超大批量可用指数滑动平均近似</td></tr>
+      <tr><td>ε</td><td>1e-5 至 1e-3</td><td>防止除零</td><td>过小放大低方差分量的噪声，过大削弱归一化效果</td></tr>
+      <tr><td>截断幅值 c</td><td>5 至 10</td><td>限制异常值影响</td><td>截断过紧丢失信息，过松保留离群抖动</td></tr>
+      <tr><td>统计作用域</td><td>按智能体分组</td><td>决定共享范围</td><td>同构观测共享一套；异构智能体独立或按角色分组</td></tr>
+      <tr><td>奖励缩放</td><td>回报标准差</td><td>锁定价值目标尺度</td><td>与塑形项共用同一系数</td></tr>
+      <tr><td>价值头归一化</td><td>PopArt</td><td>稳定价值回归</td><td>离策略自举类优先；优势标准化可替代</td></tr>
+      <tr><td>快照广播间隔</td><td>每 1 万环境步</td><td>同步并行采集统计</td><td>与策略版本同步节奏对齐，见第 038 章</td></tr>
+    </table>
+    <p>与第 025 章的衔接点：探索温度与价值尺度耦合，奖励缩放改变价值量级后，温度调度需要基于归一化后的尺度重新标定；两处配置在实验配置对象中相邻摆放并互相注释。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：带冻结开关的运行统计模块</strong></p>
+    <pre class="code"><code>import numpy as np
+
+class RunningStats:
+    """Welford 递推统计：训练期更新，评估与部署期冻结。"""
+    def __init__(self, shape, eps=1e-5, clip=10.0):
+        self.mean = np.zeros(shape, dtype=np.float64)   # 用 float64 累积统计
+        self.m2 = np.ones(shape, dtype=np.float64)      # 二阶矩累计量
+        self.count = 1e-4                                # 平滑初值，避免首步除零
+        self.eps, self.clip = eps, clip
+        self.frozen = False
+
+    def update(self, x):
+        # 评估路径不更新统计：冻结后 update 直接跳过，防止评测数据污染
+        if self.frozen:
+            return
+        x = np.asarray(x, dtype=np.float64)
+        self.count += 1.0
+        delta = x - self.mean
+        self.mean += delta / self.count            # 均值递推
+        self.m2 += delta * (x - self.mean)         # 与更新后均值配对，数值更稳
+
+    def normalize(self, x, update=True):
+        if update and not self.frozen:
+            self.update(x)
+        # 方差下限 1e-6：低方差分量除以接近零的标准差会放大噪声
+        std = np.sqrt(np.maximum(self.m2 / self.count, 1e-6))
+        return np.clip((x - self.mean) / std, -self.clip, self.clip)
+
+    def freeze(self):
+        # 训练结束或进入评估前调用：此后统计量固定，行为可复现
+        self.frozen = True</code></pre>
+    <p>解读：<strong>四个设计点对应前文三条规则加一条数值纪律。</strong>统计量以 float64 累积，与网络的 float32 分离，长训练下避免均值漂移；<code>m2</code> 增量使用更新后的均值，这是 Welford 稳定性的来源；<code>freeze</code> 提供不可逆的状态切换，评估代码只需检查一个布尔量；方差下限独立于 <code>eps</code>，防止常量分量的乘性噪声。若需要批量喂入，用并行合并公式把 <code>count/mean/m2</code> 三元组合并，代价 O(1)。</p>
+
+    <p><strong>片段 2：多智能体观测归一化包装器</strong></p>
+    <pre class="code"><code>class MultiAgentNorm:
+    """按智能体维护统计：支持共享、独立两种作用域。"""
+    def __init__(self, n_agents, obs_dim, scope="per_agent", clip=10.0):
+        self.scope = scope
+        if scope == "shared":
+            stats = RunningStats((obs_dim,), clip=clip)
+            self.stats = [stats] * n_agents        # 同一对象引用，天然同步
+        else:
+            self.stats = [RunningStats((obs_dim,), clip=clip) for _ in range(n_agents)]
+
+    def transform(self, obs, update=True):
+        # obs 形状 (n_agents, obs_dim)；逐个智能体应用自己的统计
+        return np.stack([self.stats[i].normalize(obs[i], update=update)
+                         for i in range(len(self.stats))], axis=0)
+
+    def state_dict(self):
+        # 快照随策略一起保存：部署端没有训练数据，必须复用训练统计
+        return {"scope": self.scope,
+                "stats": [{"mean": s.mean.tolist(), "m2": s.m2.tolist(),
+                           "count": s.count} for s in self.stats]}</code></pre>
+    <p>解读：<strong>共享作用域通过对象引用复用同一统计，从数据结构层面杜绝了两套共享统计不同步的实现缺陷。</strong>独立作用域下每个智能体的统计量在长训练中可能漂移到不同的尺度，这对异构智能体是期望行为，对同构智能体则需要检查漂移幅度作为诊断指标。<code>state_dict</code> 快照是部署契约的一部分：推理端加载快照后调用 <code>freeze</code> 并只做变换，保证仿真训练与真实推理的输入变换完全一致。</p>
+
+    <p><strong>片段 3：奖励缩放与 PopArt 价值头</strong></p>
+    <pre class="code"><code>import torch
+
+class RewardScaler:
+    """按回报标准差缩放奖励；评估回报需换算回原始尺度再报告。"""
+    def __init__(self, eps=1e-8):
+        self.return_mean, self.return_std, self.count = 0.0, 1.0, 0
+        self.eps = eps
+
+    def scale(self, reward, episode_return=None):
+        if episode_return is not None:
+            # 每个回合结束用回报更新统计，奖励序列未结束时沿用旧系数
+            self.count += 1
+            delta = episode_return - self.return_mean
+            self.return_mean += delta / self.count
+            self.return_std = max(0.1, 0.99 * self.return_std + 0.01 * abs(delta))
+        return reward / (self.return_std + self.eps)
+
+class PopArt(torch.nn.Module):
+    """价值归一化输出层：内部回归用归一化尺度，对外提供原始尺度估计。"""
+    def __init__(self, in_dim):
+        super().__init__()
+        self.linear = torch.nn.Linear(in_dim, 1)
+        self.mu, self.sigma = 0.0, 1.0
+
+    def forward(self, x):
+        return self.linear(x)                  # 归一化尺度输出，用于价值回归损失
+
+    @torch.no_grad()
+    def value(self, x):
+        # 原始尺度估计 = mu + sigma * f(x)，供策略改进与优势计算使用
+        return self.mu + self.sigma * self.linear(x)
+
+    @torch.no_grad()
+    def update_stats(self, targets):
+        mu_new = targets.mean().item()
+        sigma_new = targets.std().item() + 1e-5
+        # 重缩放后 mu_new + sigma_new * f_new(x) 与旧输出的原始尺度估值一致
+        self.linear.weight.data *= self.sigma / sigma_new
+        self.linear.bias.data = (self.linear.bias.data * self.sigma + self.mu - mu_new) / sigma_new
+        self.mu, self.sigma = mu_new, sigma_new</code></pre>
+    <p>解读：<code>RewardScaler</code> 的标准差用指数滑动平均估计，回报分布随任务阶段漂移时窗口自动跟随；下限 0.1 防止缩放系数趋近于零时把奖励放大到失真。<code>PopArt</code> 用同一线性层提供两种读出：<code>forward</code> 的归一化输出供价值损失使用，<code>value</code> 的原始尺度估计供策略改进使用。<code>update_stats</code> 先算新统计、再变换输出层参数，变换保证同一输入在统计更新前后的原始尺度估值连续，这是该方法的全部数学内容。两处统计更新都在 <code>no_grad</code> 或纯 Python 侧完成，不进入计算图；调用频率通常为每若干个优化步一次，避免统计量高频抖动。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>评估期继续更新统计。</strong>评测数据进入运行统计，归一化参数随评估批次漂移，结果依赖评估顺序。症状是同一策略两次评测结果不一致。修复：评测入口调用 <code>freeze</code>，评测结束按需恢复。</li>
+      <li><strong>用当前回合或当前批次统计做归一化。</strong>归一化依赖同批未来数据，因果性破坏，训练与部署行为不一致。症状是策略在训练时表现良好、部署后骤降。修复：统计只在跨回合运行量上更新，批次内使用已有运行统计。</li>
+      <li><strong>统计快照管理缺失。</strong>部署端未随策略加载统计快照，观测尺度与训练错位；并行采集进程各自更新统计造成分叉。修复：快照纳入模型产物清单并在加载时断言；统计只在学习器侧更新，采集侧使用广播快照（第 038、039 章展开）。</li>
+      <li><strong>ε 过小放大多方差分量噪声。</strong>接近常量或极低方差的分量在除以近零标准差后获得夸张的增益。症状是输入出现大幅尖峰、梯度范数异常。修复：设置方差下限，配合截断幅值双重约束。</li>
+      <li><strong>奖励缩放与塑形项尺度脱钩。</strong>塑形项在缩放前叠加而缩放系数按原始奖励统计，塑形项占比随训练漂移。修复：塑形与原始奖励合并后再统一缩放，或分别监控两者的比值。</li>
+          </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>推导：从均值与二阶矩的定义出发，推导 Welford 均值递推 μ<sub>n</sub> = μ<sub>n−1</sub> + (x<sub>n</sub> − μ<sub>n−1</sub>)/n，并说明它与&quot;求和后相减&quot;的朴素算法在数值精度上的差别来源。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>把 μ<sub>n</sub> 写成 (n−1)/n·μ<sub>n−1</sub> + x<sub>n</sub>/n 后再合并同类项；朴素算法在大量级相近样本上做减法相消，递推形式避免了这种相消。</div></details>
+      </li>
+      <li>改参数预测：把观测归一化的截断幅值 c 从 10 降到 2，预测含少量大幅异常观测的训练在熵曲线与回报曲线上的变化，并说明对低方差目标定位的影响。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>强截断压缩目标相关分量的动态范围，位置信息分辨率下降；回报上升更慢，熵曲线更早确定化（信息不足下策略更快退化到粗粒度行为）。</div></details>
+      </li>
+      <li>设计：构造一个异构智能体任务（一个快速小智能体、一个慢速大智能体），给出归一化作用域方案（共享、独立、分组、共享加仿射校准四选一），并用观测分布假设计算各组件的归一化后尺度，说明选择理由。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>两类智能体速度量级不同时独立统计更合理；若两者观测同构且数量少，共享统计加每个体的仿射校准可以兼顾样本利用率与差异适配。</div></details>
+      </li>
+      <li>实验设计：在同一任务上比较无归一化、观测归一化、观测归一化加 PopArt 三种设置，指标使用价值损失的绝对值曲线与达到固定回报的环境步数，并说明为何价值损失曲线必须与回报曲线联读。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>归一化后价值损失口径变化，绝对值之间不直接可比；联读回报曲线判断&quot;损失下降是否对应真实性能&quot;，避免把尺度变化误读为学习进展。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>多智能体训练的尺度问题来自异构观测分量、奖励量级漂移与价值累积三个层面，分别对应观测归一化、奖励缩放与价值归一化。</li>
+      <li>运行统计用 Welford 递推跨回合累积；训练更新、评估冻结、部署保存快照是统计模块的三条行为规则。</li>
+      <li>归一化作用域按参数共享与观测同构性选择：共享保持一致性，独立适配异构，分组与仿射校准是折中方案。</li>
+      <li>PopArt 通过输出层重缩放兼顾内部单位尺度回归与外部原始尺度输出；奖励缩放必须与塑形项共用系数。</li>
+      <li>下一页进入优化器与梯度处理：<strong>梯度裁剪阈值、优化器选择与共享参数下的梯度干扰</strong>。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch025.html">← 第 025 章：探索策略在CTDE中的设计</a>
+    <a class="next" href="ch027.html">第 027 章：梯度裁剪与优化器选择 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

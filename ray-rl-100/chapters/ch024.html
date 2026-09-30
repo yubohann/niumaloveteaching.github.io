@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第024章 RLlib多环境并行训练 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · RLlib 核心接口与训练</span>
+    <span class="sep">/</span>
+    <span>第 024 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · RLlib 核心接口与训练</div>
+    <h1>第 024 章：RLlib多环境并行训练</h1>
+    <p class="lead">多环境并行把采样分散到多个工作进程，样本汇集后组装为训练批次。本章讲清工作进程组的编排结构、同步采样的时间模型、并行加速的上限来源与资源规划方法。</p>
+    <ul class="meta">
+      <li>主题：RLlib 训练 / 采样编排</li>
+      <li>关键机制：工作进程组、同步采样、批次组装、加速上限、资源声明</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 023 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解工作进程组（WorkerSet）的构成与同步采样的执行顺序。</li>
+      <li>掌握采样碎片、训练批次与批量模式三个参数的数量关系与组装过程。</li>
+      <li>会用时间分解与加速比上限分析并行扩展的收益，识别最慢进程造成的长尾等待。</li>
+      <li>会为采样进程声明 CPU 资源，规划进程数与核心数的匹配关系。</li>
+      <li>能根据指标判断扩展方向：继续加进程、加大批次还是调整学习侧。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>单进程采样受限于一个核心的执行能力，把采样分散到多个工作进程可以利用多核资源，显著缩短每轮训练中采样阶段的耗时。RLlib 的默认编排方式是同步采样：每个工作进程在一轮内独立采集若干碎片，全部完成后由主进程拼装批次并交给学习器更新参数。</p>
+    <p>并行不是免费的。进程启动、样本传输、批次拼装都会引入新的开销；最慢的工作进程决定整轮采样的完成时刻。<strong>理解同步采样的时间模型，才能在进程数、批次大小与学习阶段之间找到平衡点。</strong>上一章替换了采样逻辑，本章把采样与学习的编排关系放到进程层面。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p>同步并行的迭代时间由四个部分构成：采样等待、样本传输、批次组装与参数学习。</p>
+
+    <h3>1. 工作进程组的构成</h3>
+    <p>RLlib 以工作进程组（WorkerSet）管理采样资源：一个本地工作进程（通常位于主进程，也称 driver worker）加若干远程工作进程（rollout workers），新 API 栈中对应环境执行器组（EnvRunnerGroup）。每个远程进程持有策略副本与环境副本，采样数据以对象引用（ObjectRef）形式返回，主进程按引用拼装批次。<strong>策略参数从主进程广播到各采样进程，采样完成的样本经对象存储汇聚，两条数据流的走向相反。</strong></p>
+
+    <h3>2. 同步采样的时间模型</h3>
+    <p>同步模式下，一轮迭代等待全部工作进程提交碎片，因此采样耗时等于最慢进程的耗时，平均值在此失去参考意义。环境实例耗时不均、进程被系统调度抢占、节点间网络抖动，都会放大这种长尾效应。设单进程采样耗时为 T，进程数为 N 且负载完全均衡，采样阶段理想耗时为 T/N；再设单核执行时采样与学习的时间占比为 p 与 1−p，则整体加速比的上界为 1/(1−p)。</p>
+    <div class="formula">
+      S(N) = 1 / ((p / N) + (1 − p))
+      <span class="note">阿姆达尔定律（Amdahl's Law）形式：采样占比 p 为 0.8 时，进程数趋于无穷的加速上界为 5；学习占比越重，加进程的收益越早饱和</span>
+    </div>
+
+    <h3>3. 批次组装与数量关系</h3>
+    <p>每个工作进程按碎片长度提交采样片段，主进程把片段拼接为训练批次；当碎片总量不足时继续追加采集，超过时进入缓冲区供后续使用。三个参数的整除关系决定组装效率：总并行环境数乘以碎片长度应整除或以确定余数逼近训练批次。<strong>碎片过小使提交与组装开销占比上升，碎片过大使单轮参数更新延迟上升。</strong>批量模式 truncate_episodes 让碎片对齐固定长度，批次组装时间可预测；complete_episodes 以回合为碎片，长度浮动。</p>
+
+    <h3>4. 资源声明与扩展边界</h3>
+    <p>每个工作进程按声明的 CPU 数量占用资源，采样进程数超过物理核心数会引发上下文切换，吞吐不增反降。经验边界：进程数取物理核心数减一到二，为学习进程、对象存储与系统服务留出余量。扩展方向由指标决定：采样吞吐远高于学习需求时，瓶颈在学习侧，应增大学习批次或模型规模；反之继续增加进程或副本。</p>
+
+    <h3>5. 加速比上界的数值演算</h3>
+    <p>取采样时间占比 p = 0.8，代入 S(N) = 1/(0.8/N + 0.2) 逐档计算：</p>
+    <table>
+      <tr><th>进程数 N</th><th>加速比上界</th><th>相对上一档增量</th><th>说明</th></tr>
+      <tr><td>1</td><td>1.00</td><td>基准</td><td>串行基线</td></tr>
+      <tr><td>2</td><td>1.67</td><td>+0.67</td><td>收益最快的区间</td></tr>
+      <tr><td>4</td><td>2.50</td><td>+0.83</td><td>近乎线性</td></tr>
+      <tr><td>8</td><td>3.33</td><td>+0.83</td><td>仍在线性区间</td></tr>
+      <tr><td>16</td><td>4.00</td><td>+0.67</td><td>增速放缓</td></tr>
+      <tr><td>32</td><td>4.44</td><td>+0.44</td><td>接近上界 5</td></tr>
+    </table>
+    <p>读表可得扩展节奏：进程从 8 增到 16 只增加 0.67 倍加速，从 16 增到 32 只增加 0.44 倍，而核心与内存预算同步翻倍。<strong>p = 0.8 时，超过 16 个采样进程的投入产出比已经很低；</strong>若希望把上界推高，应压缩学习侧的单批耗时或提高采样占比，例如减小模型宽度或减小学批频率带来的学习总耗时，使 p 向 0.9 移动，上界随即抬高到 10。</p>
+
+    <h3>6. 长尾等待的量化影响</h3>
+    <p>同步采样的墙钟时间由最慢进程决定。数值观察：16 个进程各自需要 100 个时间单位完成等量工作，负载均衡时理想墙钟时间为 100；若环境实例异构使最慢进程平均需要 145 个单位，实际墙钟时间即为 145，折合有效并行度 16 × 100 / 145 ≈ 11，超过三成的并行能力消耗在等待上。均值相同的两组环境，耗时方差更大的一组扩展收益更低。<strong>缓解手段包括环境负载均衡、把慢实例移出采样组、缩短碎片长度让快进程尽早进入下一轮组装。</strong>监控上除均值外还应记录每轮采样耗时的最大值与分位数，长尾恶化的信号会先出现在最大值序列上。</p>
+
+    <h3>7. 同步与异步采样的对比</h3>
+    <table>
+      <tr><th>维度</th><th>同步采样</th><th>异步采样</th></tr>
+      <tr><td>样本新鲜度</td><td>高，全部样本来自同一参数版本</td><td>低，各进程参数版本不一致</td></tr>
+      <tr><td>长尾敏感性</td><td>高，等待最慢进程</td><td>低，各进程独立推进</td></tr>
+      <tr><td>算法兼容性</td><td>好，离策略修正负担小</td><td>需要重要性采样或容忍陈旧梯度</td></tr>
+      <tr><td>实现复杂度</td><td>默认路径，复杂度低</td><td>需要额外的版本标记与缓冲管理</td></tr>
+      <tr><td>适用情形</td><td>环境耗时接近、主流算法训练</td><td>环境异构明显、进程数很大的规模</td></tr>
+    </table>
+    <p>选择依据：默认从同步采样起步，环境耗时分布稳定时它给出最干净的数据口径；环境耗时方差大且进程规模到数十以上时，再评估异步采样的收益是否可以覆盖实现与调试代价。</p>
+    <p><strong>陈旧度的量化估算：</strong>异步方案中，进程提交梯度时用的参数未必是最新版本，版本差按"片段时长与参数往返时延之比"估算。片段 0.2 秒采完、梯度提交到新参数回到本地约 0.3 秒时，一个片段的结果落地时全局参数已推进约 1.5 次更新，等效陈旧度略超一次更新；把片段缩到 0.1 秒，同一往返时延下比值升到约 3，陈旧度按比例放大，同时每批样本量减小、梯度噪声上升。保守起点是让片段时长与参数往返时延同量级；比值超过三倍后先做小规模对照，确认回报曲线不抖动再切换全量训练。</p>
+
+    <p>资源核对可以在启动前用脚本完成：把采样进程数与每进程核数相乘，加上学习器、评估与系统占用，与整机容量逐项比较，超出预算时按优先级削减采样进程数。该核对与配置项同一份数据源，避免配置文件与容量表各说各话。同步采样的批次拼接顺序影响优势分段的连续性，跨配置比较时确认拼接策略一致后再对照回报曲线。</p>
+    <p>扩展实验的最小对照设计：固定训练批次与学习配置，只改采样进程数，记录每轮采样耗时、学习耗时与样本吞吐三项指标，画出进程数与迭代耗时的对应曲线；曲线进入平台后继续加进程只用于确认平台位置，不再作为配置调整依据。对照实验同时固定环境耗时分布，否则长尾变化会与扩展效果相互混淆，结论无法归因。</p>
+
+    <h3>8. 资源规划的算式</h3>
+    <p>整机核心预算按四项相加核算：采样进程数乘每进程核数、主进程与学习侧占用、对象存储与系统服务余量、评估并行度。示例：16 核机器取 8 个采样进程各 1 核，学习与主进程留 2 核，系统与对象存储余量 4 核，评估并行 2 核，合计 16。跨机部署时每台机器单独核算，样本接收方额外承担反序列化开销，该项计入余量。<strong>资源声明总和必须与实际分配一致：声明高于实际会让部分核心闲置，声明低于实际会让进程相互争抢，两种偏差都让吞吐曲线偏离预期。</strong></p>
+
+    <h3>9. 步耗分布与跨机流量的量化</h3>
+    <p>长尾的严重程度由步耗分布的离散度决定，均值只作参照。用对数正态分布刻画进程耗时（对数标准差 0.2 表示温和波动，0.5 表示明显异构），模拟 16 个进程的同步轮时间：离散度 0.2 时最慢进程耗时约为均值的 1.40 倍，有效并行度约 11.4；离散度升到 0.5 后倍数涨到 2.22，有效并行度跌到约 7.2，接近腰斩。<strong>进程数翻倍到 32 而离散度保持 0.5 时，有效并行度只回到约 12.5，明显不足 32：</strong>削减方差对吞吐的贡献大于增加进程。</p>
+    <div class="formula">
+      有效并行度 ≈ N × 均值 / E[最慢进程耗时]
+      <span class="note">N = 16、对数标准差 0.2 时约 11.4；0.5 时约 7.2；N = 32、0.5 时约 12.5。倍增进程救不回离散度恶化带来的损失</span>
+    </div>
+    <p>第二笔账是样本跨机流量。低维观测每样本约 70 字节，一轮 8000 样本合计约 560 KB，按每秒 1 GB 的链路折算约 0.6 毫秒，跨机不构成压力；图像观测每样本约 28 KB，同一轮合计约 224 MB，同样链路上单轮传输就要 224 毫秒，与采样阶段同量级。<strong>跨机部署前先按单样本字节数乘训练批次估算链路占用：低维任务可以直接跨机，图像任务通常需要节点本地采样，再加样本压缩或降低批次。</strong>进程方差与链路字节数应作为配置评审的固定核算项。长尾治理的顺序是先查环境异构（同构化、剔除慢实例），后查调度（缩短片段、调整核心分配），加进程排在最后。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>规划顺序：估算单进程吞吐，反推进程数，再校准批次数量关系，最后用指标验证。</p>
+    <table>
+      <tr><th>参数</th><th>示例值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td><code>num_env_runners</code></td><td>8</td><td>远程采样进程数</td><td>物理核心数减一至二</td></tr>
+      <tr><td><code>num_cpus_per_env_runner</code></td><td>1</td><td>每个采样进程占用的核心数</td><td>与进程内副本计算量匹配，避免争抢</td></tr>
+      <tr><td><code>rollout_fragment_length</code></td><td>"auto"</td><td>单进程单次提交的步数</td><td>由训练批次与总环境数反推</td></tr>
+      <tr><td><code>train_batch_size</code></td><td>8000</td><td>每轮更新消耗的样本数</td><td>取总环境数乘碎片长度的整数倍</td></tr>
+      <tr><td><code>batch_mode</code></td><td>truncate_episodes</td><td>碎片切分语义</td><td>批次节奏优先时选截断，统计优先时选回合</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：为什么工作进程数不能一味增加？</span>
+      <p>三条约束同时起作用。<strong>其一，</strong>核心数有限，超过物理核心后操作系统通过时间片轮转模拟并行，上下文切换消耗算力。<strong>其二，</strong>同步采样等待最慢进程，进程越多出现长尾样本的概率越大。<strong>其三，</strong>学习阶段的耗时不变，采样再快也无法压缩，阿姆达尔定律给出明确上界。进程扩展的正确姿势是先测曲线，再取拐点。</p>
+    </div>
+    <p>与上一章差异：第 023 章关注单个采样器的批次契约，并行度保持简单；本章把采样拆到多个进程并处理组装与等待问题，采样逻辑回到默认实现。下一章引入回调函数，在采样与训练的生命周期上插桩。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：并行度与资源声明</strong></p>
+    <pre class="code"><code>from ray.rllib.algorithms.ppo import PPOConfig
+
+config = (
+    PPOConfig()
+    .env_runners(
+        num_env_runners=8,                    # 物理 16 核留一半给学习与系统
+        num_envs_per_env_runner=2,            # 总并行环境 16，单核负载适中
+        num_cpus_per_env_runner=1,            # 每个采样进程占 1 核
+        rollout_fragment_length="auto",       # 按批次与总环境数反推碎片长度
+        batch_mode="truncate_episodes",
+    )
+    .training(train_batch_size=8000)          # 16 环境 × 500 步正好拼满一批
+)
+algo = config.build_algo()
+result = algo.train()
+# 迭代时间分解：采样与学习各自耗时决定下一步的扩展方向
+print(result["info"]["timers"]["sample_time_ms"],
+      result["info"]["timers"]["learn_time_ms"])</code></pre>
+    <p>解读：进程数取核心数的一半，是留给学习侧显存搬运与主进程组装的空间。单进程副本数取 2，让每个采样进程既有批量步进的效率，又不至于让单核长时间饱和。<strong>碎片长度交由 "auto" 反推，保证总环境数乘碎片长度与训练批次成整数关系，</strong>避免组装阶段的零头等待。计时器输出是后续决策的输入：采样时间长期低于学习时间，说明扩展资源应投向学习侧。</p>
+
+    <p><strong>片段 2：加速比上界估算</strong></p>
+    <pre class="code"><code>def amdahl_speedup(n_processes, sample_fraction):
+    """估算同步采样在 n 个进程下的整体加速比上界。"""
+    parallel = sample_fraction / n_processes      # 采样部分被均分
+    serial = 1.0 - sample_fraction                # 学习部分不随进程数变化
+    return 1.0 / (parallel + serial)
+
+
+for n in (1, 2, 4, 8, 16, 32):
+    # 采样占单轮时间的 80%：进程再多，加速比也不会突破 5 倍
+    print(f"进程 {n:2d}: 上界加速 {amdahl_speedup(n, 0.8):.2f} 倍")</code></pre>
+    <p>解读：估算模型把一个经验问题变成可计算的取舍：采样占比 0.8 时，从 1 个进程扩展到 8 个进程可拿到约 3.3 倍加速，继续扩到 16 与 32 增益明显放缓。<strong>提高采样占比是放大扩展收益的前提，</strong>手段包括增大训练批次与降低学习侧单批耗时，两者都直接影响可获得的加速空间。</p>
+
+    <p><strong>片段 3：同步采样的组装时序</strong></p>
+    <pre class="code"><code>def sync_round(runners, train_batch_size, fragment_len):
+    """示意一轮同步采样的时序：等待全部碎片，再拼装训练批次。"""
+    fragments = []
+    for runner in runners:                    # 远程调用并行发出
+        fragments.append(runner.sample(fragment_len))
+    # 与逐条取回不同，这里按对象引用统一等待；
+    # 最慢的进程决定等待时长，长尾效应由此产生
+    ready = [frag.get() for frag in fragments]
+    batch = concatenate_fragments(ready)      # 按时间顺序拼接，保持回合边界
+    remaining = train_batch_size - len(batch["obs"])
+    while remaining &gt; 0:                      # 批次不足时追加采集
+        extra = runners[0].sample(min(fragment_len, remaining)).get()
+        batch = concatenate_fragments([batch, extra])
+        remaining -= len(extra["obs"])
+    return batch</code></pre>
+    <p>解读：时序揭示两处工程要点。第一，远程采样调用并行发出、统一等待，等待时长由最慢进程决定，这正是长尾效应的来源；缩短短尾需要环境侧耗时均衡，必要时把慢实例迁移出采样组。第二，批次不足时的追加采集由单个进程完成，<strong>追加次数越多，组装路径越长，越说明碎片长度与批次的大小关系需要重新校准。</strong></p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>进程数超过物理核心数</strong>：采样进程相互争抢 CPU，吞吐不升反降。症状是 sample_throughput 在增加进程后下降。修复：进程数收敛到核心数减一到二，用曲线实验确定拐点。</li>
+      <li><strong>最慢进程拖尾</strong>：个别环境实例耗时明显偏长，整轮迭代等待它完成。症状是迭代时间分布长尾，采样时间长期高于估算。修复：排查异构环境，必要时缩短单实例负载或迁移。</li>
+      <li><strong>碎片与批次不整除</strong>：追加采集频繁触发。症状是采样时间波动大且出现批次补齐日志。修复：让总环境数、碎片长度与训练批次保持整数关系。</li>
+      <li><strong>资源声明与整机不匹配</strong>：声明核数总和超过机器容量，调度器等待资源，训练迟迟不启动。症状是任务处于等待状态。修复：按整机容量核算全部进程的声明总和再启动。</li>
+      <li><strong>只盯采样侧扩展</strong>：学习阶段长期是瓶颈，继续加进程收益为零。症状是采样吞吐很高但迭代耗时不变。修复：比较采样与学习耗时，把资源投向瓶颈侧。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>单轮训练中采样占 70%、学习占 30%，计算进程数取 1、4、16 时的加速比上界，说明收益何时饱和。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>代入 S(N)=1/(0.7/N+0.3)：N=16 时约 2.9 倍，上界 3.33 倍；N 超过 8 后增量已很小。</div></details>
+      </li>
+      <li>把 num_env_runners 从 8 改到 24（物理核心 16），预测 sample_throughput 与迭代耗时走向，并解释原因。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>进程数超过核心数后上下文切换开销上升，吞吐可能下降或持平；同步等待长尾概率增大，迭代耗时未必改善。</div></details>
+      </li>
+      <li>推导：同步采样下迭代时间等于 max(各进程耗时) 加组装与学习时间，说明为什么环境耗时分布的二阶矩比均值更能预测扩展效果。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>等待值由最大值驱动，分布方差与长尾直接抬高最大值的期望，均值相同而方差不等的两组环境扩展表现差异明显。</div></details>
+      </li>
+      <li>设计诊断流程：给定训练日志中的采样时间与学习时间序列，判断瓶颈侧，并给出两条互斥的调整建议及其验证方式。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>采样时间占比高则增加进程或副本；学习时间占比高则增大批次或缩小模型。调整后跟踪同一指标是否改善。</div></details>
+      </li>
+      <li>为跨机并行设计资源规划：两台 16 核机器、每方可承载的采样进程数与对象存储流量峰值估算，说明网络带宽与批次大小的关系。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>每机进程数留系统余量；样本流量近似为吞吐乘单样本字节数，与训练批次同步放大，跨机链路是新的上限来源。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>工作进程组由一个本地进程与若干远程采样进程构成，策略参数下发、样本经对象存储汇聚。</li>
+      <li>同步采样一轮迭代等待全部碎片，最慢进程决定采样耗时，负载均衡比进程数量更重要。</li>
+      <li>加速比受采样时间占比约束，阿姆达尔定律给出明确上界，学习侧不变时进程扩展很快饱和。</li>
+      <li>碎片长度、总环境数与训练批次保持整数关系，组装路径才稳定可预测。</li>
+      <li>进程数取物理核心数减一到二，资源声明总和不能超过整机容量。</li>
+      <li>下一章进入回调函数机制：在采样与训练的生命周期上插桩，注入指标与自定义逻辑。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch023.html">← 第 023 章：RLlib自定义环境采样器</a>
+    <a class="next" href="ch025.html">第 025 章：RLlib回调函数机制 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

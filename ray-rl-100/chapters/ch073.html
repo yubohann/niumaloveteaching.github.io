@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第073章 检查点频率与日志级别控制 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第四篇 · Ray Tune 超参搜索</span>
+    <span class="sep">/</span>
+    <span>第 073 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第四篇 · Ray Tune 超参搜索</div>
+    <h1>第 073 章：检查点频率与日志级别控制</h1>
+    <p class="lead">检查点频率与日志级别是两个“影响全实验”的开关：前者决定容错粒度、存储占用与训练打扰，后者决定可观测性与磁盘负担。本章给出频率的成本模型、分数保留策略，以及按通道分层的日志配置方法。</p>
+    <ul class="meta">
+      <li>主题：Ray Tune 调优 / 训练工程控制</li>
+      <li>关键机制：检查点成本模型、分数保留、日志通道分层、保存打扰</li>
+      <li>预计学时：50 分钟</li>
+      <li>前置章节：第 072 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>掌握检查点频率的成本模型：保存代价、重算代价与最优间隔的关系，会按模型体积估算频率。</li>
+      <li>会配置保留策略：数量保留与分数保留的差异，以及“最优被覆盖”的防护方法。</li>
+      <li>理解保存动作对训练的打扰：同步阻塞造成的吞吐锯齿与它的量级控制。</li>
+      <li>会按通道分层配置日志：结构化结果、事件文件、文本日志、控制台输出各自的开关与用途。</li>
+      <li>会从检查点目录与日志文件做故障复盘：定位最近可用点与错误现场。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>检查点与日志都被“频率”支配，且方向相反：检查点越密，容错粒度越细，代价是存储与打扰越多；日志越全，可观测性越高，代价是磁盘与同步带宽负担。<strong>两个参数的默认值往往不适合具体任务：默认频率可能对一个 220 MB 的模型过于频繁，默认日志级别可能对 40 个并发试验过于嘈杂。</strong></p>
+    <p>第 064 章从恢复流程的角度提到过检查点，本章从成本与策略的角度把它讲透；日志部分则回答“故障排查需要哪些信息、这些信息平时要不要常开”。两件事放在一章，因为它们共享同一条原则：<strong>把记录行为当作有成本的资源来管理，默认全开的做法会推高存储与带宽负担。</strong></p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 检查点频率的成本结构</h3>
+    <p>单次保存的代价有两部分：<strong>写入时间</strong>（模型与优化器状态体积除以存储带宽）与<strong>打扰时间</strong>（保存期间训练进程停顿，采样管线的填充被浪费）。两次保存之间，发生故障时损失的是“距上一个检查点的进度”，期望值为间隔的一半。把三项合成即得第 064 章的成本模型：</p>
+    <div class="formula">
+      T* = (2c/λ)<sup>1/2</sup>, &nbsp; c = 单次保存折合迭代数, &nbsp; λ = 每迭代故障概率
+      <span class="note">故障率翻倍时最优间隔缩小到原来的 1/√2 倍；保存代价降低四倍时间隔减半</span>
+    </div>
+    <p>模型的体积决定 c 的量级：一个 220 MB 的模型加 440 MB 优化器状态，在 180 MB/s 的存储带宽下写入需要约 3.7 秒；若单迭代耗时 12 秒，则单次保存折合约 0.3 个迭代的代价。故障率按每 6 小时一次估计时，最优间隔约 33 个迭代。<strong>该数字的用途是量级校准：它推翻“每个迭代都保存”与“整场只存一次”两种极端，把频率锚定在十几到几十个迭代的区间。</strong></p>
+
+    <h3>2. 保留策略：数量与分数</h3>
+    <p>检查点目录随训练增长，需要保留策略控制体积。两种策略的语义不同：<strong>数量保留</strong>保留最近的 N 个，天然贴近“恢复最近进度”的需求；<strong>分数保留</strong>按上报指标保留最优的 N 个，贴近“取回最优模型”的需求。<strong>只开数量保留且 N=1 时，最新检查点会覆盖历史最优，训练后期指标回落后最优模型消失，这是检查点管理最常见的事故。</strong>稳妥配置是分数保留为主（N 取 3 至 5），数量维度由存储配额兜底；被抛弃的检查点在归档阶段按第 069 章的 top-K 规则再做一次筛选。</p>
+
+    <h3>3. 保存打扰与吞吐形态</h3>
+    <p>同步保存会让训练线程等待写入完成，表现为吞吐曲线的周期性锯齿：<strong>频率越高锯齿越密，单次节省的时间不足以抵消损失时（保存时间超过锯齿周期里省下的采样时间），净吞吐下降。</strong>缓解路径有三条：减小检查点体积（只存训练必需的参数）、把写入导向测速最快的存储、在调度层面把保存与评估错峰（评估本就有停顿，两个动作合并执行）。</p>
+
+    <h3>4. 日志通道分层</h3>
+    <p>日志按消费者分为四个通道：<strong>结果通道</strong>（结构化指标，全部试验必有，供分析）；<strong>事件通道</strong>（TensorBoard 事件文件，运行期监控）；<strong>文本通道</strong>（按试验落盘的运行日志，故障复盘）；<strong>控制台通道</strong>（面向操作者的即时输出）。四个通道独立配置密度：并发试验多时控制台只保留阶段汇总，文本通道保留警告与错误级别，结果与事件通道维持全量。<strong>“调低日志级别”的准确做法是逐通道降密；全局关闭会同时关掉故障现场。</strong></p>
+
+    <h3>5. 故障复盘的现场要素</h3>
+    <p>故障发生后快速定位需要三样东西：<strong>最近可用检查点</strong>（目录内按分数与时间排序的清单）、<strong>错误现场</strong>（文本日志中的异常栈与最后若干条正常输出）、<strong>外部线索</strong>（调度的暂停与重试记录、节点事件）。三样东西的采集配置应在实验设计时确定，事后开启只能等下一次故障。<strong>检查点目录清单与文本日志的保留时长应当覆盖整个实验周期，事件文件体积大，可以采用“运行期全量、归档期抽样”的策略。</strong></p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>两个开关的设定按“先估成本、再定策略、后验演练”的顺序进行。与上一章的差异在于，第 072 章面向结论，本章面向训练过程的资源与可观测性。</p>
+    <ol>
+      <li><strong>估成本</strong>：测一次保存耗时，按模型与优化器体积换算折合迭代数。</li>
+      <li><strong>定频率</strong>：套用最优间隔公式取量级，向上取整到训练循环的整数边界，并与其他周期动作（评估、同步）错峰。</li>
+      <li><strong>定保留</strong>：分数保留 N=3 至 5 为主，配合存储配额；命名带上分数与迭代号便于检索。</li>
+      <li><strong>定日志</strong>：四个通道逐项设定密度；控制台与文本通道在正式搜索时降密，故障复现时临时提升。</li>
+      <li><strong>演练</strong>：中断一个试验并从检查点恢复，核对恢复后的预算轴与日志记录完整。</li>
+    </ol>
+    <table>
+      <tr><th>场景</th><th>检查点配置</th><th>日志配置</th><th>理由</th></tr>
+      <tr><td>调试期单试验</td><td>间隔 1，保留最近 2 个</td><td>控制台详细，文本全量</td><td>迭代快、体积小，容错优先</td></tr>
+      <tr><td>长训练大模型</td><td>间隔按公式，分数保留 5 个</td><td>控制台汇总，文本警告级</td><td>保存贵、关注最优模型</td></tr>
+      <tr><td>大规模并发搜索</td><td>中等间隔，分数保留 3 个</td><td>控制台静默，结构化全量</td><td>控制干扰与存储增长</td></tr>
+      <tr><td>故障复现专项</td><td>维持原配置</td><td>临时提升到调试级</td><td>只放大文本通道，不动结果通道</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：为什么保存与评估要错峰？</span>
+      <p>评估本身会暂停训练线程（策略切换与批量推理），保存也会暂停写盘。两个停顿合并到同一迭代时，单次打扰时间相加，锯齿更深；错开后每个周期的打扰总量不变，但单次停顿减小，采样管线的填充利用率更高。错峰的实现只需让两个周期互质或半周期偏移，代价为零。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：检查点频率与分数保留</strong></p>
+    <pre class="code"><code>from ray import tune
+
+ckpt_cfg = tune.CheckpointConfig(
+    # 频率按迭代计：先由成本模型取量级，再对齐训练循环边界
+    checkpoint_frequency=20,
+    # 分数保留：只留主指标最高的 3 个点，防止最优被后续回落覆盖
+    num_to_keep=3,
+    checkpoint_score_attribute="episode_return_mean",
+    checkpoint_score_order="max",
+    # 结束与中断时各留一次：被停止的试验也有可续训的落点
+    checkpoint_at_end=True,
+)
+
+tune.run(
+    train_fn,
+    config=search_space,
+    num_samples=40,
+    name="ckpt_managed_sweep",
+    storage_path="/shared/tune_results",
+    checkpoint_config=ckpt_cfg,
+    metric="episode_return_mean",
+    mode="max",
+)</code></pre>
+    <p>解读：配置项对应上一节的三条原则。<strong>（1）</strong>频率 20 来自成本模型的量级校准，有推导依据；改动模型体积后应重新校准。<strong>（2）</strong>分数保留的三个参数必须成套出现：属性名、方向、保留数；只写保留数会退回数量语义，最优保护失效。<strong>（3）</strong><code>checkpoint_at_end</code> 覆盖“正常结束”与“被停止”两种终局，保证每个试验都有落点。<strong>（4）</strong>调度器（如 ASHA）需要暂停试验时同样依赖这些落点，频率过稀会让暂停请求等待到下一个保存点。配置字段名在各版本间有差异（旧版本用独立参数，新版本用配置对象），以对应版本的官方文档为准。</p>
+
+    <p><strong>片段 2：保存代价估算与频率建议</strong></p>
+    <pre class="code"><code>def ckpt_interval_estimate(model_mb=220.0, optimizer_mb=440.0,
+                           store_mbps=180.0, iter_s=12.0,
+                           fault_every_h=6.0):
+    """按成本模型给出检查点间隔建议；结果用于量级校准。"""
+    size_mb = model_mb + optimizer_mb        # 训练必需的最小集合
+    save_s = size_mb / store_mbps            # 单次写入耗时（秒）
+    c = save_s / iter_s                      # 折合为多少个迭代的代价
+    lam = iter_s / (fault_every_h * 3600.0)  # 每迭代的故障概率
+    t_star = (2.0 * c / lam) ** 0.5          # 最优间隔公式
+    # 向上取整并至少为 1；同时给出建议对应的写入开销占比
+    interval = max(1, round(t_star))
+    overhead = c / interval
+    print(f"单次保存折合 {c:.2f} 迭代；建议间隔 {interval} 迭代；"
+          f"写入开销占比约 {overhead:.1%}")
+    return interval
+
+# 基准场景与“存储更慢”的场景对照
+ckpt_interval_estimate()                     # 约 33 个迭代
+ckpt_interval_estimate(store_mbps=60.0)      # 写入变慢，建议间隔拉大</code></pre>
+    <p>解读：估算函数的三个输出各有用途。<strong>（1）</strong>折合迭代数 c 把不同量纲的代价（秒）换算到预算轴，使频率设置与任务节奏对齐。<strong>（2）</strong>建议间隔是量级起点：向上取整到训练循环的整数边界，并与评估周期错峰后再定稿。<strong>（3）</strong>写入开销占比给出另一视角：间隔 33 时开销约 0.9%，间隔 5 时升至约 6%；占比超过一成说明频率过密，应回到体积削减或存储提速。<strong>（4）</strong>存储带宽减到 60 MB/s 时 c 增大三倍，间隔按 √c 扩张约 1.7 倍，这就是“慢存储上不要照搬快存储频率”的量化依据。</p>
+
+    <p><strong>片段 3：日志通道分层配置</strong></p>
+    <pre class="code"><code>import logging
+import ray
+from ray import tune
+from ray.tune.logger import TBXLoggerCallback
+
+# 框架层日志级别：压制过程噪声；结构化结果不受此开关影响
+ray.init(logging_level=logging.WARNING)
+
+tune.run(
+    train_fn,
+    config=search_space,
+    num_samples=40,
+    name="log_layered_sweep",
+    storage_path="/shared/tune_results",
+    # 通道二：事件文件，供运行期监控与离线重绘
+    callbacks=[TBXLoggerCallback()],
+    # 通道三：文本日志按试验落盘，故障复盘时按目录检索
+    log_to_file=True,
+    # 通道四：控制台粒度，并发多时只保留阶段汇总（0 静默 / 1 默认 / 2 详细）
+    verbose=1,
+    checkpoint_config=ckpt_cfg,
+)
+
+# 故障复盘的最小检索路径：
+# 1) 结果目录：按分数排序找最近可用检查点
+# 2) 文本日志：定位异常栈与最后若干条正常输出
+# 3) 调度记录：暂停/重启次数与触发时机</code></pre>
+    <p>解读：配置把四个通道分别落位。<strong>（1）</strong><code>ray.init</code> 的日志级别只影响框架自身的事件输出，不会关闭结果通道；把它调到 WARNING 是并发场景的起点。<strong>（2）</strong>事件与文本通道保持开启：前者服务曲线复盘，后者服务异常追踪，两者的存储成本远低于检查点。<strong>（3）</strong>控制台通道按并发规模调档：40 个试验的逐条输出没有阅读价值，阶段汇总才是操作者需要的信号。<strong>（4）</strong>复盘路径依赖“文本日志 + 检查点清单”同时在位，实验设计阶段就要确认这两处的保留策略；日志接口与级别枚举随版本演进，以对应版本的官方文档为准。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>只开数量保留且保留数极小</strong>：最优检查点被后续覆盖，训练后期指标回落时无法取回最佳模型。修复：启用分数保留（属性、方向、数量三件套），并保留若干数量点作兜底。</li>
+      <li><strong>检查点频率与同步周期错配</strong>：本地保存密而远端同步疏，节点故障时“最近进度”缩水。修复：让两者同量级，见第 064 章的配套关系。</li>
+      <li><strong>忽略保存打扰</strong>：频率设置只算存储不算停顿，吞吐周期性锯齿被误判为环境抖动。修复：用吞吐曲线定位锯齿周期，与保存频率对照，错峰或降频。</li>
+      <li><strong>全局关闭日志代替逐通道降密</strong>：故障发生后没有任何现场，只能重复故障等待复现。修复：文本通道保留警告级以上，仅压制控制台与调试信息。</li>
+      <li><strong>分数保留属性名写错</strong>：配置静默无效，按数量保留运行，直到需要最优模型时才发现。修复：提交前用一个短试验验证保留行为，检查目录内保留的分数分布。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>算一算：模型 100 MB、优化器 200 MB、存储 150 MB/s、单迭代 8 秒、故障每 3 小时一次。折合迭代数与建议间隔各是多少？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>写入 2 秒折合 0.25 个迭代；每迭代故障概率为 8/10800≈7.4e-4；T*≈√(2×0.25/7.4e-4)≈26 个迭代。建议向上取整并对齐循环边界。</div></details>
+      </li>
+      <li>预测题：把检查点频率从每 10 个迭代一次改为每 2 个迭代一次，恢复时的平均重算量、存储增长速度与吞吐曲线形态各自如何变化？<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>重算量从约 5 个迭代降到约 1 个迭代；存储增长五倍；吞吐锯齿变密，若保存时间占比超过一成，净吞吐下降。三者的取舍由成本模型统一度量。</div></details>
+      </li>
+      <li>设计题：为三个场景（调试单试验、长训练大模型、大规模并发搜索）各写一份检查点与日志配置表，给出每个字段的取值与依据。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>参考设计节的场景表；每个取值都要落到“体积、故障率、并发放大”三个变量的某一项上，不接受“经验值”作为依据。</div></details>
+      </li>
+      <li>推导题：从 T*=(2c/λ)<sup>1/2</sup> 出发，推导“故障率翻倍间隔缩小 1/√2”与“保存代价增大四倍间隔减半”，并讨论两项同时变化时的合成效应。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>T* 对 c 的弹性为 1/2，对 λ 的弹性为 −1/2；两项同时变化时按乘积开方组合，例如 c×4、λ×2 时 T* 变为原来的 √(4/2)=√2 倍。</div></details>
+      </li>
+      <li>实践题：对一次已完成实验的检查点目录做审计：统计数量、总体积、保留点的分数分布与时间跨度，判断保留策略是否按预期工作。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>分数分布应呈“越靠后整体越高、被剔除的低于保留线”的形态；若保留点集中在早期或分数杂乱，说明实际执行的是数量保留，需要修正配置。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>检查点频率由成本模型锚定：单次保存折合迭代数 c 与故障率 λ 决定最优间隔 T*=(2c/λ)<sup>1/2</sup>。</li>
+      <li>保留策略以分数保留为主（属性、方向、数量三件套），数量保留兜底；防止最优被覆盖。</li>
+      <li>保存打扰表现为吞吐锯齿；错峰与降频是两条低成本路径。</li>
+      <li>日志按四通道分层：结果、事件、文本、控制台；降密是逐通道动作，不是全局关闭。</li>
+      <li>故障复盘依赖三要素同时在场：检查点清单、错误现场日志、调度记录。</li>
+      <li>下一章处理贯穿全流程的基础变量：随机种子管理。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch072.html">← 第 072 章：实验对比方法</a>
+    <a class="next" href="ch074.html">第 074 章：随机种子管理 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

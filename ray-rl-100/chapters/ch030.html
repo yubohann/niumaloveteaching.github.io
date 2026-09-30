@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第030章 RLlib与Ray Tune集成 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · RLlib 核心接口与训练</span>
+    <span class="sep">/</span>
+    <span>第 030 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · RLlib 核心接口与训练</div>
+    <h1>第 030 章：RLlib与Ray Tune集成</h1>
+    <p class="lead">Ray Tune 是训练之上的实验调度层。本章讲清试验（Trial）的执行模型、RLlib 算法作为可训练对象的接入方式、参数注入的层级结构、资源声明与并发度的关系，以及结果读取与检查点恢复的要点。</p>
+    <ul class="meta">
+      <li>主题：RLlib 训练 / 实验调度</li>
+      <li>关键机制：试验执行模型、参数注入层级、资源声明、结果上报、检查点</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 029 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解 Tune 的试验执行模型：试验、调度器与运行配置三者的职责划分。</li>
+      <li>掌握 RLlib 算法作为可训练对象的接入方式与参数注入的层级结构。</li>
+      <li>会声明每个试验的资源并推算并发试验数，避免资源超配导致排队。</li>
+      <li>会设置停止条件、读取结果表并从检查点恢复训练。</li>
+      <li>能设计第一轮实验规模：先少量试验建立基线，再放大搜索范围。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>单次训练只能回答这套配置表现如何，无法回答哪套配置更好。超参搜索把训练封装为可重复的试验，由调度层批量运行、收集结果。RLlib 与 Ray Tune 的集成让算法配置直接成为搜索空间载体：学习率、批次、并行度作为参数注入，Tune 负责排队与结果汇总。</p>
+    <p>集成难点集中在两处：参数注入的层级必须与算法配置结构对应，写错层级时参数被静默忽略；资源声明必须与容量匹配，超配的试验停留在排队状态。<strong>先做对这两处，再谈搜索策略与调度算法。</strong>上一章完成多卡扩展，本章把训练整体接入调度层。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p>Tune 把"跑很多次训练"组织为试验生命周期管理问题，核心对象是试验、训练函数与调度器。</p>
+
+    <h3>1. 试验执行模型</h3>
+    <p>一个试验是一次完整训练运行，承载一组具体参数；调度器决定试验何时启动与停止；运行配置（RunConfig）描述停止条件、检查点策略与并发控制。RLlib 算法以可训练对象（Trainable）注册，Tune 按名称加配置实例化，训练循环对外表现为迭代步进与结果上报。<strong>每个试验独立持有自己的算法实例、工作进程与检查点目录，试验之间默认不共享状态。</strong></p>
+
+    <h3>2. 参数注入的层级结构</h3>
+    <p>搜索空间通过 param_space 注入，结构与算法配置层级一一对应：顶层键对应算法级配置，嵌套键对应分组配置（采样、训练、资源）。注入发生在试验启动前，Tune 为每个试验采样一组值再构造算法。<strong>层级写错是最高频的错误：</strong>参数落在未识别键上会被部分版本安静忽略，症状是不同试验曲线完全一致。</p>
+
+    <h3>3. 资源声明与并发度</h3>
+    <p>每个试验声明资源包（CPU 核组与 GPU 配额），基本约束是同时在运行的试验资源之和不超过容量。并发试验数由容量除以单试验资源得到；试验内部并行度调高会直接减少并发数，两者共享同一批核心。总吞吐近似为并发数乘单试验吞吐。</p>
+    <div class="formula">
+      并发试验数 ≈ floor(可用资源 / 单试验资源包)
+      <span class="note">8 试验并行、每个占用 2 核加 0.5 张卡时，总需求为 16 核与 4 张卡；任一维度不足都会使部分试验排队</span>
+    </div>
+
+    <h3>4. 检查点与恢复</h3>
+    <p>检查点（Checkpoint）保存算法状态：策略权重、优化器状态与训练计数器。检查点策略决定保存频率与保留数量，恢复时按检查点重建算法继续迭代。恢复要求配置结构与原始实验一致，结构变化会使旧检查点无法映射。结果表记录指标序列与检查点位置，模型选择基于评估指标。</p>
+
+    <h3>5. 搜索成本与并发墙钟的估算</h3>
+    <p>给定总试验数 K、最大并发 C、单试验迭代数 T，搜索墙钟按波次估算：</p>
+    <div class="formula">
+      W ≈ ceil(K / C) × T，C = min( ⌊CPU<sub>总量</sub> / CPU<sub>试验</sub>⌋, ⌊GPU<sub>总量</sub> / GPU<sub>试验</sub>⌋ )
+      <span class="note">K = 24、C = 6、T = 50 时 W ≈ 4 × 50 = 200 个迭代单位；并发数取两个资源维度的较小值，先触顶的维度决定排队</span>
+    </div>
+    <p>数值示例：32 核与 4 卡的容量下，单试验声明 5 核与 0.5 卡，CPU 维度容纳 6 个试验，GPU 维度容纳 8 个，并发取 6。20 个试验排成 4 波，末波只有 2 个试验，其余资源空转；试验数接近并发数的整数倍时排程最紧凑。<strong>把 K 调整为并发数的整数倍，或用 num_samples 补齐末波，是低成本提升资源利用率的做法。</strong></p>
+
+    <h3>6. 试验内部并行度与并发数的权衡</h3>
+    <p>容量固定时，单试验核数 c 与并发数 C = ⌊32/c⌋ 互为反比。数值对照：c = 5 时 C = 6，单个试验推进最快；c = 3 时 C = 10，单试验变慢但并行试验数多；c = 2 时 C = 16，单试验进入效率偏低的核数区间。<strong>在核心线性区间内，两种组合的总试验吞吐接近，差异在于周转速度与资源碎片；当 c 小到并行收益很弱的区间，总吞吐反而下降。</strong>选择依据：需要尽快得到单个结果时用大 c 小 C；需要广泛筛参数时用小 c 大 C，并保持所有试验使用相同的 c 与 T，结果才可比。</p>
+
+    <h3>7. 资源声明策略的对比</h3>
+    <table>
+      <tr><th>声明策略</th><th>声明值示例</th><th>试验实际占用</th><th>后果</th><th>适用情形</th></tr>
+      <tr><td>保守</td><td>5 核 + 0.5 卡</td><td>4 个采样进程加学习线程</td><td>并发略低，调度行为稳定</td><td>默认建议，首轮实验</td></tr>
+      <tr><td>精确</td><td>按实测峰值声明</td><td>与声明一致</td><td>并发最高，资源利用率最好</td><td>已有监控数据、进入正式搜索</td></tr>
+      <tr><td>偏低</td><td>3 核 + 0.25 卡</td><td>实际需要 5 核</td><td>试验间争抢核心，指标抖动</td><td>不推荐，仅用于短期验证</td></tr>
+    </table>
+    <p>核算方法：把试验内部声明的采样进程核数与学习线程核数相加，再加上容器与系统开销，得到单试验资源包；声明值与实际占用偏离越大，调度器的排队与争抢行为越难预测。</p>
+
+    <h3>8. 停止条件的组合与风险</h3>
+    <p>迭代上限与评估阈值可以同时写入 stop 字典，先满足者生效。示例：<code>{"training_iteration": 200, "evaluation/episode_return_mean": 180}</code>。阈值口径决定风险：训练回报带探索噪声，数值偏高，用训练字段做停止条件会让试验过早停止；评估字段的更新频率低于训练轮次（例如每 5 轮评估一次），阈值检测会滞后若干轮，迭代上限在这里起兜底作用。<strong>双条件并用是标准写法：指标负责效率，迭代上限负责预算可控。</strong></p>
+
+    <h3>9. 波次排程与检查点写入的量化</h3>
+    <p>试验按波次推进，每波占满并发后开始下一波，末波不满时资源空转。取并发数 6（32 核容量、单试验 5 核的推算值），三档试验数的排程效率如下：24 个试验恰好排 4 波，利用率百分之百；20 个试验同样要 4 波，末波只有 2 个在跑，利用率约 83%，相对理想时长多耗约两成；8 个试验排 2 波，利用率约 67%，多耗约五成。<strong>把试验数定成并发数的整数倍，或用重复采样补齐末波，是不花额外成本的调度优化。</strong></p>
+    <table>
+      <tr><th>试验数</th><th>并发数</th><th>波数</th><th>资源利用率</th></tr>
+      <tr><td>24</td><td>6</td><td>4</td><td>100%</td></tr>
+      <tr><td>20</td><td>6</td><td>4</td><td>约 83%（多耗约 20%）</td></tr>
+      <tr><td>8</td><td>6</td><td>2</td><td>约 67%（多耗约 50%）</td></tr>
+    </table>
+    <div class="formula">
+      利用率 = 试验数 /（波数 × 并发数），波数 = 向上取整（试验数 / 并发数）
+      <span class="note">末波不满的损失只发生在最后一波；试验数远大于并发数时该损失占比被摊薄，整数倍排程仍然最紧凑</span>
+    </div>
+    <p>另一笔固定账是检查点的写入量。5000 万参数模型的完整状态（参数、优化器矩与计数器）按参数体积的三到四倍估算，约 600 至 800 MB；20 个试验各保留 5 份中期检查点即约 60 GB 写入，按持续 200 MB/s 的写盘速度折算约 300 秒的额外输入输出时间。<strong>短试验只保留末次检查点、长试验限制保留份数，两项纪律把写入量压回与恢复需求匹配的水平。</strong>写入与训练共用存储时，检查点时刻的输入输出抢占会叠加到迭代时间上，保存频率的取值要把这条隐性成本计入。</p>
+    <p>搜索空间也有一笔格子账：4 个参数各取 5 档时全网格为 625 组，预算只有 25 个试验时，网格只能覆盖其中二维的 5 × 5 子格，其余参数被迫固定；同等预算下随机采样能在全部维度上撒点，代价是每维覆盖稀疏。<strong>首轮筛选用随机采样铺开维度，锁定少数关键参数后再用网格细化，两阶段组合兼顾广度与可比性。</strong></p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>第一轮集成的设计顺序：单试验验证、资源核算、小规模搜索、结果读取、扩展边界。</p>
+    <table>
+      <tr><th>配置项</th><th>示例值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td><code>num_samples</code></td><td>8</td><td>采样的参数组合数</td><td>首轮验证用少量组合，确认链路后再放大</td></tr>
+      <tr><td>试验资源包</td><td>2 核 + 0.5 卡</td><td>单试验占用的资源</td><td>与试验内部并行度合计核算，总量不超过容量</td></tr>
+      <tr><td><code>stop</code></td><td>迭代数或评估回报</td><td>试验终止条件</td><td>指标用评估口径，避免训练噪声误停</td></tr>
+      <tr><td>检查点频率</td><td>每 10 轮</td><td>状态保存间隔</td><td>长试验取小值，短试验只留末次</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：为什么第一轮只跑少量试验？</span>
+      <p>失败模式大多与训练质量无关：参数层级写错、资源超配、停止条件不触发、目录冲突。少量试验把链路验证与搜索质量分开：先用个位数试验确认启动、上报与落检查点，再放大数量。<strong>链路未验证前扩大试验数，只会把同一处错误重复很多遍。</strong></p>
+    </div>
+    <p>搜索空间大小的组合计算：学习率取 3 档、训练批次取 2 档、采样进程数取 2 档，网格组合为 3 × 2 × 2 = 12 组，num_samples 取 2 时总试验 24 个，按并发 6 排成 4 波调度。层级写错时，24 个试验只跑出同一种实际配置，结果表的参数列完全相同，识别成本很高；首轮打印生效配置可以在试验数量放大之前拦截这类问题。</p>
+    <p>检查点频率的权衡：保存动作的写入量等于模型与优化器状态的大小，频率越高累计写入越多。以 5000 万参数的模型为例，一次完整状态按数百 MB 至 1 GB 量级估算，保留十份即占用数 GB 磁盘空间。短试验只保留末次检查点，长试验按 10 至 20 轮间隔保留并限制份数，写入量与恢复粒度之间取平衡。恢复前核对四项：检查点目录完整、参数结构一致、依赖版本一致、迭代计数从检查点续接；核对完成后先做一次短运行，确认恢复后的评估指标与保存前衔接。</p>
+    <p>结果表分析的起步视图取三列：参数列确定配置，评估指标列衡量质量，迭代数列衡量速度。先看参数与指标的趋势关系，再决定放大搜索的方向；趋势不明显的维度保持固定，把预算集中到有区分度的参数上；训练与评估两套口径并存时，排序一律使用评估列。<strong>停止条件每次调整后，先在单试验上验证触发时机，再投入批量搜索。</strong></p>
+    <p>停止条件的阈值需要按评估间隔折算：每 5 轮评估一次时，指标从达标到触发终止最多滞后 5 轮，迭代上限按这一滞后量留出余量。试验内部并行度一旦改变，历史试验与新试验的结果可比性下降；对照实验应保持内部结构一致，只变动待研究的参数。多个实验并行运行时，检查点与结果文件的写入目标目录必须隔离，同名文件互相覆盖会让恢复流程读到混杂状态；目录命名带上时间戳与参数摘要，事后检索无需打开文件即可定位到目标实验。</p>
+    <p>与上一章差异：第 029 章在单次训练内部扩展算力；本章把训练放进调度框架，引入试验间资源竞争与结果汇总。搜索空间设计与调度策略属于第四篇主题，本章只建立集成骨架。下一章接入训练曲线可视化。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：PPO 试验的最小集成</strong></p>
+    <pre class="code"><code>from ray import tune
+from ray.tune import RunConfig
+
+# 单试验验证用最小结构：算法名、参数注入、停止条件三件套
+tuner = tune.Tuner(
+    "PPO",                                    # RLlib 算法名字符串即 Trainable
+    param_space={
+        "env": LineGoalEnv,                   # 环境类经配置序列化分发
+        "env_config": {"horizon": 120},
+        "lr": 3e-4,                           # 顶层键对应算法训练配置
+        "train_batch_size": 8000,
+        "num_env_runners": 2,                 # 试验内部并行度：直接影响资源包
+        "num_envs_per_env_runner": 2,
+    },
+    run_config=RunConfig(
+        stop={"training_iteration": 30},      # 首轮用迭代数停止，便于预估预算
+        checkpoint_config={"checkpoint_frequency": 10},
+    ),
+)
+results = tuner.fit()
+best = results.get_best_result(metric="episode_return_mean", mode="max")
+print(best.metrics["episode_return_mean"])</code></pre>
+    <p>解读：最小集成验证三个环节：参数注入（顶层字典展开为算法配置）、结果上报（每轮结果进入试验指标）、停止与检查点。首轮用迭代数停止便于估算单试验成本；正式搜索再切换评估指标停止条件。get_best_result 按评估口径取最优试验，返回值可直接用于后续分析。</p>
+
+    <p><strong>片段 2：小规模搜索空间与资源声明</strong></p>
+    <pre class="code"><code>from ray import tune
+
+# 首轮搜索只放两个参数：学习率与批次，其余保持常量
+param_space = {
+    "env": LineGoalEnv,
+    "lr": tune.grid_search([1e-4, 3e-4, 6e-4]),      # 三个候选：共三组试验
+    "train_batch_size": 8000,
+    "num_env_runners": 4,
+    "num_envs_per_env_runner": 2,
+    # 资源声明与试验内部并行度合计核算：
+    # 每试验 4 个采样进程加学习线程，资源包按 5 核声明较稳妥
+}
+tuner = tune.Tuner(
+    "PPO",
+    param_space=param_space,
+    tune_config=tune.TuneConfig(
+        num_samples=1,                        # 与 grid_search 组合：每组各跑一次
+    ),
+    run_config=RunConfig(
+        stop={"evaluation/episode_return_mean": 180},
+        checkpoint_config={"checkpoint_frequency": 10},
+    ),
+)
+results = tuner.fit()</code></pre>
+    <p>解读：网格搜索的候选组合数等于各参数候选数乘积，与 num_samples 相乘得到总试验数；首轮用单维网格便于核对成本。资源声明依据试验内部进程与学习线程的实际占用：偏小造成争抢，偏大降低并发数。停止条件使用评估字段路径，写法随版本演进，以对应版本文档为准。</p>
+
+    <p><strong>片段 3：结果表读取与检查点恢复</strong></p>
+    <pre class="code"><code>import pandas as pd
+
+# 结果表每行一个试验：参数、指标、检查点与状态
+df = results.get_dataframe()
+cols = ["trial_id", "lr", "episode_return_mean",
+        "evaluation/episode_return_mean", "training_iteration"]
+print(df[cols].sort_values("evaluation/episode_return_mean",
+                           ascending=False).head())
+
+# 恢复：从最优试验的检查点继续，参数结构必须与原始实验一致
+best = results.get_best_result(metric="evaluation/episode_return_mean",
+                               mode="max")
+restored = tune.Tuner.restore(
+    best.path,                                # 试验目录或实验目录
+    trainable="PPO",
+    resume_errored=True,                      # 出错试验一并恢复
+)
+results_2 = restored.fit()</code></pre>
+    <p>解读：结果表把搜索过程变成可分析数据：参数列用于归因，指标列用于排序，检查点路径用于恢复。<strong>排序使用评估指标，</strong>与评估章节的约定一致；若结果表中评估字段缺失，先检查评估配置是否随试验生效。恢复入口接受实验目录或单个试验目录，参数结构一致的约定必须在实验管理层面维护：配置一旦调整，旧检查点的可恢复性随之改变。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>参数注入层级写错</strong>：键名与配置结构不匹配，试验静默使用默认值。症状是不同试验曲线完全一致。修复：对照配置结构逐键核对，首轮打印实际生效配置。</li>
+      <li><strong>资源声明超过集群容量</strong>：任何时刻都无法凑齐单试验资源。症状是试验长期处于排队状态。修复：按容量与单试验需求重新核算，或缩小试验内部并行度。</li>
+      <li><strong>停止条件永不触发</strong>：指标名错误或阈值不可达。症状是试验耗尽时间预算，指标并未达标。修复：首轮打印指标键名，用单试验确认停止逻辑。</li>
+      <li><strong>检查点目录冲突</strong>：多次实验写入同一目录，恢复读取到混杂状态。症状是恢复后行为异常。修复：实验目录按时间或标识隔离，恢复时显式指定目录。</li>
+      <li><strong>搜索空间一次开得过大</strong>：数十组试验同时启动，失败模式被复制放大。症状是大量试验同时报错或排队。修复：先少量试验验证链路，再按预算分批扩展。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>集群有 32 核与 4 张卡，单试验声明 5 核与 0.5 卡，计算最大并发试验数并说明哪一维先成为约束。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>核心维度可容纳 6 个试验（32/5），GPU 维度可容纳 8 个；核心先成为约束，并发数取 6。</div></details>
+      </li>
+      <li>停止条件从迭代数切换为评估回报后，预测试验平均时长的变化与风险，说明双条件并用的写法。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>达标早停的试验变短，平均时长受表现差异影响波动加大；双条件写法是 stop 中同时给出上限迭代数与指标阈值，取先满足者。</div></details>
+      </li>
+      <li>推导：总搜索墙钟时间与并发试验数、单试验时长、试验总数三个量的关系，说明为什么单试验内部并行度存在最优区间。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>时间约为试验总数除以并发数再乘单试验时长；内部并行度提高单试验吞吐但占用更多资源，降低并发数，两者乘积存在极值点。</div></details>
+      </li>
+      <li>设计首轮验证清单：从参数注入、结果上报、检查点、恢复到资源核算，列出每项的验证方式与通过标准。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>每项都可用单试验最小运行验证：打印生效配置、检查指标键、确认检查点文件生成、执行一次恢复运行、核对并发数达到预期。</div></details>
+      </li>
+      <li>设计实验：固定总预算，比较"少量长试验"与"大量短试验"两种策略对最终评估指标的取舍，说明适用条件。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>长试验减少早停噪声、适合接近收敛的对比；短试验覆盖更多组合、适合早期筛选。用同一预算跑两种策略，比较最优试验的评估回报与方差。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>Tune 把训练封装为试验，调度器控制排队与终止，每个试验独立持有算法实例与检查点目录。</li>
+      <li>参数注入的层级与算法配置一一对应，层级写错会静默失效，首轮必须打印实际生效配置。</li>
+      <li>并发试验数由总资源除以单试验资源包得出，内部并行度与并发数共享同一批核心。</li>
+      <li>停止条件用评估口径并设置迭代上限，检查点用于恢复，恢复要求参数结构一致。</li>
+      <li>集成的第一步是少量试验验证链路，再按预算放大搜索范围与试验数量。</li>
+      <li>下一章接入训练曲线可视化：TensorBoard 的日志结构与指标阅读方法。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch029.html">← 第 029 章：RLlib多GPU分布式训练</a>
+    <a class="next" href="ch031.html">第 031 章：RLlib与TensorBoard集成 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

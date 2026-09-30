@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第089章 大规模并行训练的资源规划 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第五篇 · 训练工程与系统进阶</span>
+    <span class="sep">/</span>
+    <span>第 089 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第五篇 · 训练工程与系统进阶</div>
+    <h1>第 089 章：大规模并行训练的资源规划</h1>
+    <p class="lead">一句话：本章给出从吞吐目标反推资源配比的方法：平衡方程、放置组（Placement Group）调度、异构节点处理与留量原则。</p>
+    <ul class="meta">
+      <li>主题：训练工程 / 资源规划（Resource Planning）</li>
+      <li>关键机制：采样学习平衡方程、放置组、分数资源（Fractional Resource）、能力标签</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 088 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>掌握采样学习平衡方程，能按吞吐目标计算 CPU 核数和 GPU 数量的配比。</li>
+      <li>理解 GPU 空转与 CPU 空转的成因，会用利用率指标反推资源缺口方向。</li>
+      <li>掌握 Ray 放置组（Placement Group）的三种策略与创建流程，理解整组调度（Gang Scheduling）的意义。</li>
+      <li>会使用分数资源与自定义资源（Custom Resource）表达共享显存与节点能力标签。</li>
+      <li>掌握"小规模标定、模型外推、规模验证"的三步规划流程，并会预留 20% 至 30% 的余量。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>前八章分别处理了算法侧的损失、采样侧的并行度、内存约束与数据一致性，这些决策最终要在集群上落地为一份资源清单：多少个采样进程、每进程几个环境实例、哪几个进程配 GPU、进程如何分布到节点、留多少余量。<strong>资源清单错向的代价不对称：采样欠配让昂贵的 GPU 长期空转，采样过配则挤占学习与系统内存，两者都会把训练拖入低效区。</strong></p>
+    <p>大规模训练的资源规划与单机调参的差别在于约束来源：单机时核与显存是自然边界，人工试错成本低；集群上资源以配额形式发放，节点之间存在能力差异，进程放置影响通信开销，资源申请与释放有调度延迟。<strong>规划的任务是在"申请之前"用可计算的模型确定配比，把试错收敛到模型误差的修正上。</strong>本章的平衡方程、放置组与三步流程，分别对应配比计算、落地调度与误差修正。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p><strong>资源规划的核心是一道平衡题：采样的数据供给速率必须追平学习的消化速率，两侧同时接近满载时配置最优。</strong>本节先建立方程，再讨论放置与异构，最后给出规划流程与算例。</p>
+
+    <h3>1. 采样学习平衡方程</h3>
+    <p>学习的"吞吐"用每次梯度更新消耗的样本量度量：设小批大小为 m，每次更新消费 m 个样本；学习器每秒能完成 u 次更新，则学习侧每秒消化样本 u·m。采样侧每秒供给 SPS 个样本。稳态匹配要求：</p>
+    <div class="formula">
+      SPS<sub>target</sub> ≈ u · m ，且 SPS<sub>target</sub> = N<sub>env</sub> · r<sub>env</sub> · η
+      <span class="note">N<sub>env</sub> 为环境实例总数，r<sub>env</sub> 为单实例步率，η 为并行效率（第 083 章）；u 为学习器的每秒更新次数</span>
+    </div>
+    <p>两个方程联立即可反推配比：给定目标 SPS 与单核步率，算出环境实例总数；给定小批与单次更新耗时，算出学习侧消化能力；<strong>两侧的较小者决定实际吞吐，较大者是待削减的浪费。</strong>算例：目标 SPS = 5000，单实例步率 300 步/秒，并行效率 0.7，则需实例数约 24 个；学习侧小批 256、单次更新 8 毫秒，每秒可完成 125 次更新、消化 32000 样本，远大于 5000 的供给，说明学习侧过剩，应增加采样或调大每步更新密度；继续堆 GPU 属于无效扩容。反向失衡同理：小批缩小到 32 且更新变慢时，学习侧成为瓶颈，采样供给在此情况下应下调复用比与并行度。</p>
+
+    <h3>2. 空转的读数与含义</h3>
+    <p>利用率是平衡方程的实时读数。<strong>GPU 利用率长期低于 60% 指向采样供给不足</strong>：学习器每轮完成更新后退回等待，等待时间被算进迭代时间；<strong>CPU 利用率长期接近满载且采样片段耗时波动大，指向采样过配或环境间资源竞争</strong>：进程争抢内存带宽与调度时间片，单实例步率低于标定值，平衡被打破。读利用率时注意两个陷阱：一是采样侧利用率高不等于有效，环境步空转（例如等待外部仿真器返回）也计入 CPU 时间；二是 GPU 利用率按瞬时采样统计，短促的更新负载可能被平均窗口抹平，应与更新频率交叉核对。</p>
+    <p>平衡的工程含义是"配比决定效率，总量决定墙钟"。配比失衡时单纯加机器只是把浪费放大；配比正确后，扩容近似按线性缩短训练时长（直到触及通信或存储瓶颈）。<strong>规划的第一步永远是修比，第二步才是加量。</strong></p>
+
+    <h3>3. 放置组与整组调度</h3>
+    <p>Ray 的放置组（Placement Group）把一次训练的全部资源申请表述为一组资源包（Bundle），由调度器整组分配。三种策略的适用场景：<strong>STRICT_PACK</strong> 要求全部资源包落在同一节点，适合单节点内的高通信量任务；<strong>STRICT_SPREAD</strong> 要求资源包分散到可用节点，适合节点级故障隔离要求高的场景；<strong>PACK</strong> 在可行域内尽量集中，是吞吐与容错的折中，作为多节点训练的默认选择。整组调度的意义是原子性：要么全部资源就绪，要么等待，避免"一半采样进程已启动、GPU 还在排队"的半启动状态浪费资源。</p>
+    <p>创建放置组时有两条纪律：<strong>其一，先取资源包再启动组件</strong>，组件启动时把放置组作为调度约束传入，保证落在预留位；<strong>其二，组随训练生命周期释放</strong>，训练结束或失败时显式删除，防止资源泄漏导致后续任务排队。资源包的大小应按角色区分：采样包只含 CPU，学习包含 CPU 与 GPU，夸大任何一侧都会降低整组调度成功率。</p>
+
+    <h3>4. 分数资源与能力标签</h3>
+    <p>两类语义需要额外表达。第一类是共享：多个采样进程可共享同一张 GPU 做小批量前向推理，此时用分数 GPU（Fractional GPU）声明，例如每进程 0.25 张卡，调度器按小数累加记账，保证不超卖。第二类是能力差异：集群里可能存在性能不同的节点，或带有特殊硬件（更大内存、加速器）的节点，用自定义资源（Custom Resource）作为能力标签，例如给高性能节点标 8 个单位、普通节点标 2 个单位，训练配置按标签申请。<strong>标签是逻辑配额，按运维侧标定的口径计量</strong>，申请方必须与其保持一致，否则资源规划落空。</p>
+    <p>异构环境还要处理同步屏障下的快慢混合：同一轮迭代中，慢节点的片段完成时间决定屏障时刻（第 086 章的长尾）。处理策略有三种：把快慢节点分开成组、给慢节点分配更小的片段长度、或把慢节点从关键路径上移出（只做重放数据的补充采样）。<strong>混合异构节点不加处理，等于主动构造长尾。</strong></p>
+
+    <h3>5. 规划流程与留量</h3>
+    <p>三步流程：<strong>小规模标定</strong>，在单节点上测出单实例步率、单次更新耗时、并行效率三个基准量；<strong>模型外推</strong>，把基准量代入平衡方程，算出目标规模下的资源配比与预计 SPS；<strong>规模验证</strong>，按配比申请一次正式资源，实测 SPS 与利用率，与预测对照，偏差超过 20% 时回到标定环节修正假设（最常见的偏差源是并行效率随规模下降与内存带宽竞争）。</p>
+    <p>留量原则：采样本与学习本各留 20% 至 30% 的余量，原因有三：环境步时的批次间波动需要冗余吸收；检查点写入、日志与指标聚合需要额外的 CPU 与磁盘带宽；故障替换时（第 090 章）需要空闲资源立即接管。<strong>零余量的规划在稳态下可行，在扰动下必崩。</strong></p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>资源规划的落地流程分五步，产出物是一份资源清单与一份验证记录。</p>
+    <ol>
+      <li><strong>标定基准量</strong>：单实例步率、每次更新耗时、并行效率，各测三遍取中位数。</li>
+      <li><strong>计算配比</strong>：按平衡方程解出环境实例数与资源包划分，写出配比推导过程。</li>
+      <li><strong>划定留量与角色</strong>：采样包、学习包、驱动包分离，各自加余量。</li>
+      <li><strong>创建放置组并启动</strong>：整组申请，组件按角色绑定资源包。</li>
+      <li><strong>验证与修正</strong>：实测 SPS 与利用率对照预测，修正标定假设后再固化清单。</li>
+    </ol>
+    <h3>资源清单示例（4 节点、每节点 16 核 1 卡）</h3>
+    <table>
+      <tr><th>角色</th><th>数量</th><th>CPU</th><th>GPU</th><th>说明</th></tr>
+      <tr><td>采样进程</td><td>24</td><td>0.75 核/进程</td><td>0</td><td>24 个实例按并行效率 0.7 支撑 5000 SPS</td></tr>
+      <tr><td>学习器</td><td>1</td><td>4 核</td><td>1</td><td>小批 256、6 毫秒级更新</td></tr>
+      <tr><td>回放与协调</td><td>2</td><td>1 核/进程</td><td>0</td><td>缓冲分片与指标聚合</td></tr>
+      <tr><td>余量</td><td>保留</td><td>约 8 核</td><td>共享推理 0.5 卡</td><td>检查点、替换、推理共享</td></tr>
+    </table>
+    <div class="box warn">
+      <span class="box-title">与上一章的差异</span>
+      <p>第 088 章定义数据链路的正确性契约，本章把契约换算成物理资源：版本过滤与反压需要 CPU 余量，原子检查点需要磁盘带宽与内存瞬时占用。一致性成本最终体现在资源清单的余量一栏。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>以下片段基于 Ray 2.x 时期的通用写法，接口随版本演进，以对应版本的官方文档为准。</p>
+
+    <p><strong>片段 1：平衡方程求解器</strong></p>
+    <pre class="code"><code>import math
+
+def plan_resources(target_sps, env_per_second, parallel_eff=0.7,
+                   minibatch=256, update_ms=8.0, headroom=0.25, cores_free=16):
+    """按吞吐目标解配比：先算实例数，再核学习侧消化能力。
+    返回带余量的资源清单草案，供放置组申请使用。"""
+    # 采样侧：单位实例的有效步率 = 单实例步率 x 并行效率
+    eff_per_env = env_per_second * parallel_eff
+    env_instances = math.ceil(target_sps / eff_per_env * (1 + headroom))
+    # 学习侧：每秒可完成的更新次数与可消化的样本量
+    updates_per_sec = 1000.0 / update_ms
+    learn_capacity = updates_per_sec * minibatch
+    balance = learn_capacity / target_sps
+    # 平衡比接近 1 为佳：远大于 1 说明学习侧过剩，应调高复用密度或减少 GPU
+    print(f"环境实例 {env_instances}，学习消化 {learn_capacity:.0f} 样本/秒，"
+          f"平衡比 {balance:.2f}")
+    return env_instances, balance
+
+# 目标 5000 SPS、单实例 300 步/秒、效率 0.7：不含余量约 24 个实例，加 25% 余量取整为 30 个
+env_n, ratio = plan_resources(target_sps=5000, env_per_second=300.0)</code></pre>
+    <p>解读：求解器把平衡方程变成一次调用。<strong>（1）</strong>采样侧先乘并行效率再除目标，余量加在实例数上，得到的数字可直接用于放置组资源包。<strong>（2）</strong>学习侧的消化能力用"更新频率 × 小批"计算，与小批和更新耗时的配置强相关，改网络或批结构后必须重算。<strong>（3）</strong>平衡比是决策读数：大于 1.5 建议提高每步更新密度（第 082 章的旋钮），小于 0.8 建议下调复用比或扩容 GPU，两个方向都有明确的参数出口。</p>
+
+    <p><strong>片段 2：放置组申请与角色绑定</strong></p>
+    <pre class="code"><code>import ray
+from ray.util.placement_group import placement_group
+
+def acquire_group(sampler_bundles, learner_bundle):
+    """整组申请资源：采样包与学习包一次分配，避免半启动状态。
+    STRICT_PACK 适合单节点训练；多节点默认用 PACK。"""
+    bundles = sampler_bundles + [learner_bundle]
+    pg = placement_group(bundles, strategy="PACK")
+    # 等待就绪设显式超时：超时抛出异常，由调用方捕获后决定重试或缩小规模
+    ray.get(pg.ready(), timeout=300)
+    return pg
+
+# 采样包只含 CPU，学习包含 CPU 与 GPU：夸大任一侧会降低调度成功率
+sampler = [{"CPU": 1} for _ in range(24)]
+learner = {"CPU": 4, "GPU": 1}
+group = acquire_group(sampler, learner)
+# 组件启动时传入 placement_group 与 bundle_index，保证落在预留位</code></pre>
+    <p>解读：这段代码落实了两条纪律。<strong>（1）</strong>资源包按角色区分：采样包只申请 CPU，避免抢占显存配额导致整组调度失败。<strong>（2）</strong><code>ready()</code> 设显式超时，把"资源不足"暴露为可处理的异常；无限等待会占用调度队列。<strong>（3）</strong>注释强调组件启动时的绑定参数：放置组只完成预留，组件必须声明落位约束才真正占用，遗漏这一步的常见后果是组件被调度到组外节点，资源核算与计划脱节。</p>
+
+    <p><strong>片段 3：能力标签与异构节点分配</strong></p>
+    <pre class="code"><code>from ray.rllib.algorithms.ppo import PPOConfig
+
+def build_config(normal_nodes, fast_nodes):
+    """利用自定义资源标签区分节点能力：快节点承担学习与高价值采样。
+    标签由集群侧标定（ray start --resources），申请方只负责引用。"""
+    config = (
+        PPOConfig()
+        .environment("CartPole-v1")
+        .env_runners(
+            num_env_runners=normal_nodes + fast_nodes,
+            # 每个采样进程只声明自己需要的核数：声明过剩会拖慢整组调度
+            num_cpus_per_env_runner=1,
+            # 采样侧不使用 GPU：推理在小网络下 CPU 足够，把显存留给学习
+            num_gpus_per_env_runner=0,
+        )
+        .resources(
+            # 学习器显式申请 1 张卡，并声明在快节点上运行的偏好标签
+            num_gpus=1,
+            custom_resources={"fast_node": 1},
+        )
+    )
+    return config
+
+# 异构混跑的替身方案：慢节点分配更短的片段长度，缓解同步屏障的长尾
+cfg = build_config(normal_nodes=16, fast_nodes=8)</code></pre>
+    <p>解读：这份配置展示了能力标签的两种用法。<strong>（1）</strong>自定义资源作为"节点分级"的载体：集群把快节点标为 <code>fast_node</code>，学习器按标签申请，避免被调度到慢节点拖累整轮迭代。<strong>（2）</strong>采样侧显式声明不使用 GPU：小网络推理在 CPU 上完成，显存集中供给学习，这一与直觉相悖的配置在多数任务上反而提高利用率。<strong>（3）</strong>注释保留异构对照的替身方案：无法分级时，用片段长度差异抵消节点速度差异，把长尾从屏障时刻中移除。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>资源声明与实际使用不符</strong>：进程申请 0.2 核却使用一整个核，同节点进程相互争抢导致步率低于标定。修复：声明值与实测占用核对，采样进程按标定核数申请。</li>
+      <li><strong>零余量规划</strong>：稳态正好够用，检查点写入或个别节点抖动即触发连锁延迟。修复：采样与学习两侧各留 20% 至 30% 余量。</li>
+      <li><strong>放置组泄漏</strong>：训练异常退出未释放放置组，资源被长期占用。修复：用上下文管理或在异常处理路径中显式删除，并把组 ID 写入任务日志。</li>
+      <li><strong>混合快慢节点不做处理</strong>：同步屏障按最慢节点对齐，整体吞吐被拖低。修复：分级标签分离，或按节点能力调整片段长度。</li>
+      <li><strong>扩容前未修配比</strong>：采样侧过剩时继续加采样节点，浪费成倍放大。修复：先用平衡方程修比，再按比例扩容。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>计算题：目标 SPS = 8000，单实例步率 250 步/秒，并行效率 0.65，留量 25%。求环境实例数与目标规模下的核数需求。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>有效步率 162.5，实例数取整并加余量约 62 个；按每进程 1 核计需约 62 核供采样。</div></details>
+      </li>
+      <li>预测题：学习侧小批 256、单次更新 20 毫秒，采样侧供给 5000 步/秒。预测 GPU 利用率与迭代时间的结构，并给出两个修正方向。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>学习消化 12800 样本/秒，供不应求的一半，GPU 空转；可提高每步更新密度（减少等待造成的空闲）或增加采样实例。</div></details>
+      </li>
+      <li>设计题：为"4 节点、节点性能两档、单机 16 核 1 卡"的任务设计资源清单与放置策略：资源包划分、标签方案、片段长度差异，以及验证计划。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>采样包按核数划分并加 25% 余量；fast_node 标签给学习器；慢节点片段减半；按三步流程验证。</div></details>
+      </li>
+      <li>分析题：说明"分数 GPU 共享推理"的适用条件与风险：什么规模的小批量前向适合共享，什么情况下共享会引入新的瓶颈？<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>小网络、低频率前向适合共享；显存带宽或 CUDA 上下文切换可能成为新瓶颈，需实测推理吞吐；按份额推断会失真。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>平衡方程把吞吐目标换算为采样与学习的配比；两侧较小者决定实际吞吐，较大者是需要削减的浪费。</li>
+      <li>利用率是平衡的实时读数：GPU 空转指向采样不足，CPU 满载伴随步率下降指向采样过配。</li>
+      <li>放置组以整组申请保证原子性；资源包按角色划分，组件必须显式绑定落位。</li>
+      <li>分数资源表达共享，能力标签表达节点分级；异构混跑必须处理同步屏障的长尾。</li>
+      <li>三步流程：小规模标定、模型外推、规模验证；余量按 20% 至 30% 预留。下一章处理资源失效时的恢复。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch088.html">← 第 088 章：分布式训练数据流与一致性</a>
+    <a class="next" href="ch090.html">第 090 章：训练任务的容错与恢复策略 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

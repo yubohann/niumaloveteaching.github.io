@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第060章 早停与ASHA调度器 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第四篇 · Ray Tune 超参搜索</span>
+    <span class="sep">/</span>
+    <span>第 060 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第四篇 · Ray Tune 超参搜索</div>
+    <h1>第 060 章：早停与ASHA调度器</h1>
+    <p class="lead">把预算花在幸存者身上：逐次减半（Successive Halving）用"小预算广撒网、大预算重点养"的层级结构压缩评估成本，异步版本 ASHA 去掉同步屏障后让试验随到随比，理论性质与实践参数（宽限期、降级因子、档位）逐一讲透。</p>
+    <ul class="meta">
+      <li>主题：Ray Tune 调优（早停调度器）</li>
+      <li>关键机制：逐次减半、档位晋升、异步剪枝</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 059 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解逐次减半的资源分配逻辑：几何级数档位、每档保留固定比例、总预算的指数级节省。</li>
+      <li>掌握 ASHA 的异步化改造：去掉档位屏障后，试验随到随比、达到标准立即晋升或终止。</li>
+      <li>会计算档位表与总预算：由宽限期、降级因子与训练上限推导各级预算与初始试验数。</li>
+      <li>会配置 ASHA 调度器并说明检查点频率与档位对齐的必要性，避免恢复回退浪费。</li>
+      <li>能对比 ASHA 与中位数停止（Median Stopping）的适用差异，并为噪声任务设计宽限期。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>大量试验里，多数配置在训练早期就能被判定为劣质：学习率量级错误的配置往往在十分之一的预算内就露出差距。平均分配预算会把这些注定失败的试验"养到终点"，浪费的算力本可以分给更有希望的候选。早停调度器的任务是把预算从劣质试验手中收回，重新分配给幸存者。</p>
+    <p>逐次减半给出了层级化的分配结构，但同步版本要求所有试验在同一档位等齐才能淘汰，慢试验会拖住整档。ASHA（Asynchronous Successive Halving Algorithm）去掉等待：试验完成一档即可与同档对手比较，胜者立即加预算进入下一档。<strong>强化学习训练时长长、单试验代价高，ASHA 的异步剪枝是 Tune 搜索的默认推荐调度器。</strong></p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p>本节按"逐次减半、ASHA 异步化、档位计算、噪声适配"四步展开。</p>
+
+    <h3>1. 逐次减半：几何档位与固定保留比例</h3>
+    <p>设最小评估预算为 r（宽限期），降级因子为 η，则档位预算构成几何级数：r, r·η, r·η², …, 直到训练上限。每档结束后按指标排序，保留前 1/η 进入下一档，其余终止。初始试验数 n 与档位数 k 的关系由几何结构决定：<strong>从 n 个试验起步，每档规模除以 η，最后一档恰剩 1 个（或少数几个），所需的档位数 k 满足 n ≈ η<sup>k</sup>。</strong></p>
+    <div class="formula">
+      档位预算：r<sub>j</sub> = r · η<sup>j</sup> ，j = 0, 1, …, k ； 每档保留比例 1/η
+      <span class="note">r=10 轮、η=3、上限 810 轮时档位为 10、30、90、270、810 共 5 档；起步试验数约 3<sup>4</sup>=81 个</span>
+    </div>
+    <p>预算节省来自结构：大多数试验只在最小档位消耗 r，少数进入高档。设总档位数 k，全部试验跑满的总成本是 n·r·η<sup>k</sup>，逐次减半的实际成本约为其 1/η 至数分之一的量级（随档数与比例变化）。<strong>节省的本质是把"广撒网"的探索与"重投入"的利用放进同一预算曲线：早期样本多而浅，后期样本少而深。</strong></p>
+    <p>节省倍数可以写成闭式：实际总成本等于 档位数 × 起步数 × 宽限期，全量成本等于 起步数 × 最末档预算，两者相除得 比值 = η<sup>k−1</sup>/k（k 为档位数）。前文例子的 3<sup>4</sup>/5=16.2 与 2<sup>4</sup>/5=3.2 都与此式吻合。因子越大、档位越多，节省越显著，但每档保留比例 1/η 也越小，误杀概率同步上升；这条曲线把"省预算"与"保质量"的取舍写成一个式子，调参时两者一起看。</p>
+
+    <h3>2. ASHA：去掉屏障的异步剪枝</h3>
+    <p>同步逐次减半在每一档设置屏障：等齐、排序、淘汰、放行。ASHA 把排序改为"随到随比"：试验完成当前档位后，与同一档位已完成的试验比较，若排进前 1/η 立即晋升下一档，否则终止。<strong>异步化消除了等待，代价是晋升判定只基于"部分对手"：决策带有局部性，理论保证从精确排序退化为高概率保留优质配置。</strong>在评估噪声可控、试验数量充足时，这个代价可以接受。</p>
+    <p>ASHA 还支持多括号（Brackets）：用不同的宽限期同时运行多个独立的减半结构，例如一组从 10 轮起步、一组从 30 轮起步。<strong>括号是对"最小可信预算"不确定性的对冲：宽限期过小的括号负责快速筛除劣质配置，宽限期较大的括号保护"起步慢、后程强"的配置不被误杀。</strong></p>
+
+    <h3>3. 档位与预算的计算流程</h3>
+    <p>配置 ASHA 的三个输入是宽限期、降级因子与训练上限，其余量可推导：</p>
+    <ol>
+      <li>由上限除以宽限期得到档位跨度比值 R/r；</li>
+      <li>档位数 k = ⌊ log<sub>η</sub>(R/r) ⌋，档位预算为几何级数；</li>
+      <li>每档保留比例 1/η，初始试验数按"最终每档幸存数乘以 η<sup>档位数</sup>"估算；</li>
+      <li>总评估成本按"各档试验数乘档位预算"逐档累加。</li>
+    </ol>
+    <p>检查点频率必须与档位对齐：试验被终止或晋升时，调度器读取最近检查点决定状态；<strong>若检查点频率低于档位间隔，恢复或晋升会回退到旧状态，重复消耗的预算抵消剪枝节省。</strong>对强化学习任务，检查点频率取档位间隔的 1/2 至 1 倍。</p>
+    <p>指标口径的实施同样在配置阶段定死：上报字段必须与调度器声明的 metric 逐字一致，评估前缀写错时调度器把试验视为没有指标、从不淘汰，表现为全部试验跑满上限、算力被明显劣质的配置白白消耗。核对方法沿用 056 章的口径：先跑单试验打印报表键，再写调度器配置；评估间隔不大于宽限期，保证第一档结束时每个试验至少有一次评估读数可用。</p>
+    <p>成本核算的落点：把"档位数 × 起步数 × 宽限期"记入实验记录的预算栏，与资源池换算出的并发数配对，估算搜索墙钟 = 总轮数 ÷（并发数 × 单轮平均耗时）。三个量中任何一个调整后重算一次，整批搜索的资源申请单直接引用该栏数字；评审时无需回翻配置，预算变化时也只改这一处。</p>
+
+    <h3>3.1 数值算例：档位表与总预算的逐步计算</h3>
+    <p>例一：宽限期 10 轮、降级因子 3、上限 810 轮。档位按几何级数生成：10、30、90、270、810，共 5 档；由"最后一级剩 1 个试验"反推起步规模约 3<sup>4</sup>=81 个。逐档成本：第 0 档 81×10=810 轮，第 1 档 27×30=810 轮，第 2 档 9×90=810 轮，第 3 档 3×270=810 轮，第 4 档 1×810=810 轮，总成本 4050 轮。全量评估需要 81×810=65610 轮，剪枝压到约 1/16.2。观察到的不变量：每档成本恰好等于 起步数 × 宽限期，原因是幸存数每档除以 η、档位预算每档乘以 η，两者乘积恒定，于是总成本等于 档位数 × 起步数 × 宽限期。</p>
+    <p>例二：宽限期 15、因子 2、上限 240。档位 15、30、60、120、240 共 5 档，起步 16 个，每档成本 240 轮，总成本 1200 轮；全量 16×240=3840 轮，比值 3.2。两例对比说明两个参数的角色差异：因子决定每档保留比例与档位步进，宽限期决定最小可信预算；总成本由三者乘积控制。调参数前先把这个乘式算一遍，"剪枝后预算反而超支"的配置就不会出现。</p>
+
+    <h3>3.2 宽限期的估计与误杀防护</h3>
+    <p>宽限期估计实验：用一组固定配置跑 10 粒种子，记录回报首次超过随机水平 1.5 倍的轮数，取该分布的中位数再乘 1.5 至 2 作为宽限期。样本中位数为 12 轮时宽限期取 18 至 24 轮；起步慢的配置占比高时取上界。误杀的定量直觉：两个配置真实水平相差 δ、单次评估噪声标准差 σ 时，正确排序的概率约为 Φ(δ/(σ√2))，δ=σ 时约 0.76，δ=2σ 时约 0.92。<strong>宽限期的作用是让 δ 从早期的小值长大到 σ 的量级以上再开始排名，否则"谁先被淘汰"接近抛硬币。</strong></p>
+
+    <h3>3.3 多括号的资源口径</h3>
+    <p>括号数 b 的运行口径：括号共享同一试验预算池，每个括号获得 num_samples/b 个试验；宽限期不同的括号各自独立推进档位，彼此的淘汰互不影响。括号数的代价不在资源，而在每个括号的规模被摊薄：120 个试验分两括号时各 60 个，链长缩短、竞争变弱。启用多括号时建议把总试验数按括号数同比例上调；资源紧张时回到单括号加保守宽限期，比拆分一个小池子更稳。</p>
+
+    <h3>4. 噪声适配：宽限期与指标口径</h3>
+    <p>强化学习评估噪声是早停的最大威胁：宽限期太小时，排名由起步波动决定，优质配置可能被提前淘汰。适配手段有三：<strong>（1）宽限期覆盖"回报脱离随机水平"的典型时长</strong>，用单变量实验估计；<strong>（2）指标用评估回报或滚动均值</strong>，压低单点噪声；<strong>（3）降级因子取温和值（2 至 3）</strong>，保留比例 1/2 或 1/3，给幸存者更多证明机会。中位数停止是另一类早停：把试验与"同进度全部试验的中位数"比较，低于中位数若干轮即终止；它无需分档结构，实现更简单，但缺少几何预算的层级放大效应。<strong>试验数量多、预算紧张时选 ASHA；试验数量少、想温和过滤时选中位数停止。</strong></p>
+    <p>噪声大时还有一条降误杀手段：把降级因子降到 2（每档保留一半），同时把试验总数放大到原来的两倍以上，用规模换统计余量。等价地，把同样预算从"少试验、激进淘汰"改成"多试验、温和淘汰"，在噪声主导的任务里结论更可靠。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>ASHA 接入按五步执行。</p>
+    <ol>
+      <li><strong>估计宽限期</strong>：用单变量扫描估计回报脱离随机水平的轮数，取其 1.5 至 2 倍。</li>
+      <li><strong>定降级因子</strong>：2 至 3；噪声大时取小值（保留比例大）。</li>
+      <li><strong>定训练上限与试验数</strong>：上限按正式训练预算；试验数按档位公式反推，量级 50 至 200。</li>
+      <li><strong>配置检查点</strong>：频率与档位间隔对齐，保证晋升与恢复状态完整。</li>
+      <li><strong>指标与括号</strong>：评估指标进调度器；对宽限期不确定时启用多括号。</li>
+    </ol>
+    <h3>参数表</h3>
+    <table>
+      <tr><th>参数</th><th>典型值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td><code>grace_period</code></td><td>10–50 轮</td><td>最小评估预算</td><td>回报脱离随机水平的 1.5–2 倍</td></tr>
+      <tr><td><code>reduction_factor</code></td><td>2–4</td><td>降级因子 η</td><td>噪声大取小值</td></tr>
+      <tr><td><code>max_t</code></td><td>200–500 轮</td><td>单试验上限</td><td>正式训练预算</td></tr>
+      <tr><td>试验数</td><td>50–200</td><td>探索宽度</td><td>由档位公式与资源池反推</td></tr>
+      <tr><td>检查点频率</td><td>档位间隔的 1/2–1 倍</td><td>状态粒度</td><td>防止恢复回退</td></tr>
+      <tr><td>括号数</td><td>1–3</td><td>宽限期对冲</td><td>对最小预算不确定时启用</td></tr>
+    </table>
+    <p>宽限期、因子与上限的选择顺序固定下来：先由脱离随机水平的实验定宽限期，再由噪声水平定因子（噪声大取 2），最后由正式训练预算定上限；三个量固定后，用核算函数重算档位表与总预算，与资源池换算的并发数一并写入实验记录再启动。顺序颠倒时最常见的返工是把因子调大以求多省预算，结果宽限期不足、误杀率飙升，搜索结论比省下的算力更贵。</p>
+    <p>与上一章的差异：059 章淘汰的是"落后个体"且资源留在种群内继续进化，本章淘汰的试验直接终止、资源回收给新试验或幸存者；PBT 依赖状态复制，ASHA 依赖状态检查点，两者对检查点的依赖形式不同。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：档位表计算</strong></p>
+    <pre class="code"><code>import math
+
+def rung_schedule(grace=10, factor=3, max_t=810):
+    """由宽限期、降级因子与上限推导档位预算表。"""
+    rungs = []
+    r = grace
+    while r &lt;= max_t:
+        rungs.append(r)
+        r *= factor
+    # 每档保留 1/factor：最后一级剩 1 个试验时，初始试验数约为
+    # factor 的(档位数-1)次方；此处按最后档位反推起步规模
+    n_start = factor ** (len(rungs) - 1)
+    total_budget = sum(n_start // (factor ** j) * rungs[j]
+                       for j in range(len(rungs)))
+    print("档位：", rungs, " 起步试验数：", n_start,
+          " 近似总预算：", total_budget, "轮")
+    return rungs, n_start, total_budget
+
+# 输出：档位 [10, 30, 90, 270, 810]，起步 81 个，总预算约 4050 轮
+# 每档成本恒为 810 轮（幸存数减半、预算翻三倍，乘积不变）；
+# 对照：81 个试验全部跑满 810 轮需要 65610 轮，节省约 16 倍</code></pre>
+    <p>解读：逐块说明。<strong>（1）</strong>档位按几何级数生成，循环条件用上限截断；档位数由宽限期与因子共同决定。<strong>（2）</strong>总预算按"每档幸存数乘档位预算"逐档累加：第 j 档的幸存数为 n/η<sup>j</sup>，两者相乘后求和，得到剪枝后的实际消耗。<strong>（3）</strong>对照数字是理解剪枝收益的最短路径：同一探索宽度下，逐次减半的预算约为全量评估的十六分之一；节省倍数随档数与因子变化，可用该函数直接核算后再拍板参数。</p>
+
+    <p><strong>片段 2：ASHA 调度器配置</strong></p>
+    <pre class="code"><code>from ray import tune
+from ray.tune.schedulers import ASHAScheduler
+
+asha = ASHAScheduler(
+    time_attr="training_iteration",           # 档位按训练迭代计
+    max_t=300,                                # 单试验上限：正式训练预算
+    grace_period=20,                          # 宽限期：回报脱离随机水平的估计值
+    reduction_factor=3,                       # 每档保留 1/3
+    brackets=2,                               # 两个括号对冲宽限期不确定性
+    metric="evaluation/episode_reward_mean",  # 评估指标：抗训练噪声
+    mode="max",
+)
+
+analysis = tune.run(
+    "PPO",
+    scheduler=asha,
+    config={
+        "env": "LunarLander-v2",
+        "lr": tune.loguniform(1e-5, 1e-2),
+        "gamma": tune.uniform(0.95, 0.999),
+        "train_batch_size": tune.choice([4096, 8192, 16384]),
+        "evaluation_interval": 5,
+        "num_env_runners": 4,
+    },
+    num_samples=120,                          # 宽探索：多配置配浅预算
+    resources_per_trial={"cpu": 6, "gpu": 0.25},
+    max_concurrent_trials=8,
+    stop={"training_iteration": 300},
+    checkpoint_config=tune.CheckpointConfig(
+        checkpoint_frequency=10,              # 不大于档位间隔：恢复不回退
+        checkpoint_at_end=True,
+    ),
+)</code></pre>
+    <p>解读：这段配置把档位计算的结论逐项落地。<strong>（1）</strong>宽限期 20、因子 3、上限 300 对应的档位为 20、60、180（下一档 540 超过上限），起步规模约 9 个幸存链再乘 120 个试验的探索宽度，剪枝在早期即开始工作。<strong>（2）</strong>括号数 2：两个减半结构并行，一个从宽限期起步、一个从更大预算起步，降低"起步慢但后程强"的配置被误杀的风险。<strong>（3）</strong>检查点频率 10 与档位间隔（20 轮）对齐：晋升与终止决策都能取到较新状态；评估间隔 5 保证调度器看到的指标取自评估回报，与训练噪声隔离。</p>
+
+    <p><strong>片段 3：剪枝效果核算</strong></p>
+    <pre class="code"><code>import pandas as pd
+
+def pruning_report(analysis):
+    """统计被剪枝与跑满的试验，核算实际节省。"""
+    rows = []
+    for trial in analysis.trials:
+        df = trial.metrics_dataframe
+        if df is None or df.empty:
+            continue
+        last_iter = int(df["training_iteration"].max())
+        # 未到上限即结束的试验，即被 ASHA 剪枝的个体
+        rows.append({"trial": trial.trial_id, "iters": last_iter,
+                     "pruned": last_iter &lt; 300,
+                     "best": df["evaluation/episode_reward_mean"].max()})
+    table = pd.DataFrame(rows)
+    pruned = table[table["pruned"]]
+    saved = int((300 - pruned["iters"]).sum())
+    print(f"剪枝试验 {len(pruned)}/{len(table)} 个，节省约 {saved} 轮训练")
+    # 验收口径：剪枝试验的最高指标不应超过幸存者头名太多，
+    # 否则说明宽限期或因子过激进，优质配置被误杀
+    head_pruned = pruned["best"].max() if len(pruned) else 0.0
+    print(f"被剪枝个体的最高指标：{head_pruned:.1f}")
+    return table
+
+# 若被剪枝个体最高指标显著高于幸存者，优先调大宽限期或因子，
+# 继续加试验数收益有限：误杀的成本高于多评估的成本</code></pre>
+    <p>解读：逐块说明。<strong>（1）</strong>以"是否跑满上限"区分剪枝与完整试验，节省量按未消耗的轮数累加，是剪枝收益的直接度量。<strong>（2）</strong>误杀检查给出调度参数的调优方向：被剪枝个体的最高指标接近甚至超过幸存者时，剪枝标准过激，先调宽限期与降级因子再考虑扩容。<strong>（3）</strong>该函数与 056 章的选优流程衔接：剪枝报告用于体检调度器，最优检查点仍按评估指标从幸存者中提取。</p>
+    <p>读取口径再补两点：被剪枝个体在低预算处的高指标不构成误杀证据，只有它们在更高预算上仍具竞争力的旁证（例如同配置在其他括号中的表现）才说明宽限期偏小。报告中同时记录每个试验的结束预算分布：分布集中在低档说明剪枝激进而有效；长尾延伸到高档说明多数试验跑完了大半预算，剪枝收益有限，应检查因子是否过小或指标噪声是否过大。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>宽限期过小</strong>：起步噪声决定排名，优质但起步慢的配置被提前剪枝，搜索结论偏差大。修复：宽限期覆盖回报脱离随机水平的时长，并启用多括号对冲。</li>
+      <li><strong>检查点与档位不对齐</strong>：晋升时只能恢复到很旧的状态，重复训练抵消节省。修复：检查点频率取档位间隔的 1/2 至 1 倍。</li>
+      <li><strong>降级因子过激进</strong>：η 取 4 以上时每档只留 1/4，噪声下幸存者选择几乎随机。修复：η 取 2 至 3，保留比例 1/2 或 1/3。</li>
+      <li><strong>用训练指标驱动剪枝</strong>：训练回报噪声大，剪枝频繁误判。修复：评估指标进调度器，评估间隔不大于档位间隔。</li>
+      <li><strong>试验数不足</strong>：20 个试验配 3 档剪枝，幸存者链条太短，搜索宽度与深度都受限。修复：按档位公式反推起步规模，量级 50 至 200。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>计算：宽限期 15、因子 2、上限 240 的档位表、起步试验数与近似总预算；与全部试验跑满的成本比较节省倍数。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>档位为 15、30、60、120、240 共 5 档；起步 16 个，按每档保留 1/2 逐档累加总预算，再与 16×240 对比。</div></details>
+      </li>
+      <li>推导：设每档保留比例 1/η、档位数 k，写出剪枝后总预算与全量预算的比值表达式，并说明 η 增大时比值如何变化。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>总预算为 Σ n·r<sub>j</sub>/η<sup>j</sup>，全量为 n·r·η<sup>k</sup>；η 越大保留越少、比值越小，但噪声下误杀概率上升，收益与风险同向。</div></details>
+      </li>
+      <li>设计宽限期估计实验：用固定配置跑 10 个种子，记录回报首次超过随机水平 1.5 倍的轮数分布，给出宽限期取值与验证方式。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>取分布的中位数乘 1.5 至 2 作为宽限期；验证方式是观察剪枝报告中误杀个体与幸存者的指标差距。</div></details>
+      </li>
+      <li>比较 ASHA 与中位数停止在"20 个试验、评估噪声大"场景下的表现差异，给出选择与参数建议。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>20 个试验规模小，ASHA 的档位链条短、晋升竞争不足；中位数停止按同进度比较更平滑。建议该场景用中位数停止加宽松阈值，或扩试验数后再启用 ASHA。</div></details>
+      </li>
+      <li>解释多括号为什么能对冲宽限期的不确定性：从"起步慢、后程强"配置的命运角度分析，并说明括号数与资源开销的关系。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>大宽限期的括号让慢热配置获得证明机会；每个括号独立消耗预算，括号数增加意味着同等试验数下每括号的规模变小，需要整体扩容配合。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>逐次减半用几何档位与固定保留比例分配预算：早期样本多而浅，后期样本少而深，总成本降至全量评估的若干分之一。</li>
+      <li>ASHA 去掉档位屏障，试验随到随比、即时晋升或终止；理论保证退化为高概率保留，换取无等待的吞吐。</li>
+      <li>档位、初始试验数与总预算由宽限期、降级因子与训练上限推导，可用核算函数在配置前拍板。</li>
+      <li>检查点频率与档位对齐，评估指标进调度器，宽限期覆盖回报脱离随机水平的时长。</li>
+      <li>多括号对冲宽限期不确定性，误杀检查（被剪枝个体的最高指标）是调度参数调优的第一依据。</li>
+      <li>下一章进入搜索空间的进阶主题：自定义搜索空间与采样分布，把领域约束与先验知识写进参数空间的构造过程。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch059.html">← 第 059 章：种群训练PBT</a>
+    <a class="next" href="ch061.html">第 061 章：自定义搜索空间 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

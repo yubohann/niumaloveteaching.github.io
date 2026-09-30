@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第056章 实现基于模型的强化学习 | 机器人仿真学习课程 · Isaac Sim 强化学习训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第三篇 · 高级强化学习专题</span>
+    <span class="sep">/</span>
+    <span>第 056 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第三篇 · 高级强化学习专题</div>
+    <h1>第 056 章：实现基于模型的强化学习</h1>
+    <p class="lead">先学一个"世界模型"再在想象里训练或规划：本章讲清动力学模型的学习、集成不确定性与复合误差，并给出 CEM 规划与 MBPO 式想象 rollout 两套落地骨架。</p>
+    <ul class="meta">
+      <li>主题：高级专题 / MBRL 与世界模型</li>
+      <li>相关组件：Isaac Sim / Isaac Lab / PyTorch / Stable-Baselines3</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 055 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>能写出动力学模型的学习目标（对下一状态的预测损失），说清"预测增量"与"集成"各自解决什么问题。</li>
+      <li>理解复合误差：单步误差 ε 在 H 步 rollout 里如何被系统动力学放大，以及短 rollout 为什么更稳。</li>
+      <li>掌握模型的两大用途：用模型做规划（CEM/MPC）与用模型生成想象数据（Dreamer/MBPO）的差别。</li>
+      <li>会实现一个动力学集成模型与一小段 CEM 规划循环，并解释采样-选优-重采样的收敛直觉。</li>
+      <li>理解"模型被利用"（model exploitation）现象：策略会在模型不准的区域钻空子，需要悲观/不确定性惩罚。</li>
+      <li>说清在 Isaac Sim 这类高速仿真器旁边 MBRL 的价值定位：服务真机数据效率。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>无模型方法（第 057 章将系统总结）把每一次更新都建立在真实交互数据上：仿真里数据管够时很有效，但真机上"每一步都很贵"，一条真实轨迹的成本是仿真轨迹的几百倍。基于模型的强化学习（model-based RL, MBRL）换了个思路：<strong>先花数据学一个"世界模型"（动力学预测器），之后的训练或规划大量发生在模型内部</strong>。模型学会之后，一秒钟能生成几万条"想象轨迹"，数据的边际成本趋近于零。</p>
+    <p>它也有自己的软肋：模型是错的，而在错误模型里训练出的策略会精准地利用这些错误，这就是模型利用问题。本章的任务就是把这套"学模型—用模型—防利用"的流程讲清楚，并在 Isaac Sim 里搭出可复现的实验：同一任务下对比纯无模型 PPO 与"混合模型数据"的版本，量一量数据效率到底差多少。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 动力学模型：学什么、怎么学</h3>
+    <p>模型要近似的是环境的转移函数 s′ ≈ f<sub>θ</sub>(s, a)。监督信号来自交互数据 D = {(s, a, s′)}，最直接的目标是最小化预测误差：</p>
+    <div class="formula">
+      L(θ) = E<sub>(s,a,s′)~D</sub> [ ‖s′ − f<sub>θ</sub>(s, a)‖<sup>2</sup> ]
+      <span class="note">等价于假设 s′ 在给定 (s,a) 下服从以 f<sub>θ</sub> 为均值的高斯分布时做极大似然</span>
+    </div>
+    <p>三个工程决定贯穿所有实现。第一，<strong>预测增量</strong>：网络输出 Δ = s′ − s，把"保持原样"变成"输出零"，这个默认行为让学习容易得多（尤其在"大多数维度大多数时候不动"的机器人任务里）。第二，<strong>归一化</strong>：状态向量里混着角度（±3.14）、位置（±1）、速度（±10），不归一化的话 MSE 会被最大的量纲主导；标准做法是用数据集统计量把 s、a、Δ 都归一化后再训练。第三，<strong>集成（ensemble）</strong>：训练 N = 5 个成员，每个用不同的初始化与数据子采样（bootstrap）；集成成员的预测分歧就是"模型有多不确定"的近似度量，后面防利用要用。</p>
+
+    <h3>2. 复合误差：为什么 rollout 不能太长</h3>
+    <p>单步预测有误差没关系；问题在于误差会在 rollout 里自我放大。设单步误差为 ε，动力学的局部放大率（李普希茨常数）为 L，H 步后的误差上界大约是按几何级数累积：</p>
+    <div class="formula">
+      ε<sub>H</sub> ≈ ε · (L<sup>H</sup> − 1) / (L − 1)
+      <span class="note">L &gt; 1 时随 H 指数增长；L ≈ 1 时线性增长（ε·H）</span>
+    </div>
+    <p>数字感觉：单步误差 1%（归一化后），H = 50 步、L ≈ 1.02 时，末端误差约 1% × (1.02<sup>50</sup> − 1)/0.02 ≈ 85%，模型自己都不知道自己在说什么了。这就是为什么主流方法都偏爱短 rollout：MBPO 用 1–5 步，Dreamer 在潜伏空间里做 15 步左右的想象。用一句工程口诀概括：<strong>把模型当"局部模拟器"用，"完整仿真器"的角色它承担不了</strong>。注意这与 Isaac Sim 的关系：仿真器之所以能跑几千步不出轨，是因为它积分的是精确的物理方程、误差不会系统性放大；学出来的模型没有这个保障。</p>
+
+    <h3>3. 两大用途：规划与想象</h3>
+    <table>
+      <tr><th>路线</th><th>代表</th><th>怎么用模型</th><th>适合</th></tr>
+      <tr><td>规划（planning）</td><td>MPC / PETS / CEM</td><td>在线优化动作序列，走一步、再规划</td><td>模型好但策略难训、任务短程；可解释</td></tr>
+      <tr><td>想象训练（imagination）</td><td>Dreamer / MBPO</td><td>用模型生成轨迹，训练策略/价值</td><td>需要可复用策略；长任务</td></tr>
+      <tr><td>Dyna 混合</td><td>Dyna-Q 家族</td><td>真实与想象数据混着更新</td><td>工程折中，数据效率与稳健兼顾</td></tr>
+    </table>
+    <p>规划路线的核心算法是"采样-评估-择优"：随机生成一批动作序列，用模型滚动出各自的回报，保留最好的那批，围绕它们重新采样（CEM，交叉熵法）；只执行第一步（MPC 滚动时域），下一步重头再来。想象路线的核心是把"真实起点 + 模型展开若干步"的轨迹放进训练批次：起点真实让前几步误差小，短展开保证误差不爆。</p>
+
+    <h3>4. 模型利用：策略会"作弊"</h3>
+    <p>在模型里做优化时，优化器会同时找两种方向：真实提升与"模型漏洞"。经典现象：策略发现某个动作序列在模型里能到达远处（模型低估了摩擦），于是在真机上原地打滑；或者在接触边界附近找到"模型认为能穿墙"的路径。防御手段有三层：</p>
+    <ul>
+      <li><strong>限制利用面</strong>：只用短 rollout（模型误差小）从真实状态出发（起点准）。</li>
+      <li><strong>不确定性惩罚</strong>：集成分歧大（模型自己也不确定）的状态/动作，奖励打折或直接截断，"悲观主义"。</li>
+      <li><strong>数据配比</strong>：每个训练批次里真实数据永远占一定比例（比如 20–50%），保证策略不会脱离真机分布太远。</li>
+    </ul>
+
+    <h3>5. 在 Isaac Sim 生态里的定位</h3>
+    <p>有人会问：既然仿真几步就能采一条轨迹，为什么还要学模型？答案要从使用场景上找：<strong>（1）真机微调</strong>，先在仿真里训基础策略，到真机后用少量真实数据学一个"残差动力学模型"，在模型里做安全试错，避免真机上摔打；<strong>（2）慢系统</strong>，热力、流体类被控对象单次实验要几分钟到几小时，用模型生成数据是唯一现实选择；<strong>（3）模型可分析</strong>，学到的模型可用于安全监控（预测未来状态是否越界）与奖励塑形。理解这一点，你的实验设计才不会跑偏：在纯仿真任务上，MBRL 相对无模型的优势主要体现在"达到同性能所需的环境交互步数"上，比较时也应以环境步数为口径，墙钟时间会掩盖这一点。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>用"Franka 推块到目标"任务搭建 MBRL 实验台：</p>
+    <ol>
+      <li><strong>状态与动作</strong>：状态 = 末端位姿 + 速度 + 物块位姿（12 维）；动作 = 末端速度指令（3 维）。选这个任务是因为它纯动力学、接触简单，模型容易学出可用的精度。</li>
+      <li><strong>数据收集</strong>：先用随机策略 + 少量 PPO 探索收集 20 万条转移；每 5000 步环境交互重训一次模型（在线迭代，数据和模型交替进步）。</li>
+      <li><strong>模型结构</strong>：5 成员集成，每个 3 层 MLP（256），预测 Δ；bootstrap 采样 + 不同初始化；训练 100 个 epoch/轮，学习率 1e-3，batch 256。</li>
+      <li><strong>想象 rollout</strong>：从真实状态出发展开 H = 3 步（约 0.15 s），每条真实序列生成 3 条想象轨迹；训练批次配比：真实 30% + 想象 70%。</li>
+      <li><strong>不确定性惩罚</strong>：当 5 个成员预测的方差超过阈值（按数据集统计标定）时，把该样本的奖励置 0 并截断该想象轨迹。</li>
+      <li><strong>模型体检</strong>：定期报告 1 步 MSE 与 H 步 rollout 误差；如果 H 步误差超过 1 步误差的 20 倍，说明 H 太大或模型欠拟合，先修模型再谈策略。</li>
+      <li><strong>对照实验</strong>：同任务跑纯 PPO（无模型）直到 300 万交互步；MBRL 版在 100 万交互步处评测。报告"达到 80% 成功率所需的环境步数"，这是 MBRL 的唯一正确 KPI。</li>
+    </ol>
+    <table>
+      <tr><th>超参数</th><th>典型值</th><th>影响</th></tr>
+      <tr><td>集成成员数 N</td><td>5</td><td>分歧估计质量 vs 训练成本线性增长</td></tr>
+      <tr><td>rollout 长度 H</td><td>1–5 步</td><td>太长误差爆炸并被策略利用</td></tr>
+      <tr><td>真实/想象配比</td><td>30/70 到 50/50</td><td>防利用的关键阀门</td></tr>
+      <tr><td>模型重训频率</td><td>每 5000 环境步</td><td>太频浪费算力，太疏数据分布漂移</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计思维：为什么"预测增量"和"集成"是 MBRL 的两块基石？</span>
+      <p>增量预测解决"学得动"：机器人任务里绝大多数转移是"小变化"，网络输出的尺度小、分布集中，回归容易，且天然表达了"世界默认不变"的先验。集成解决"知道何时不该信"：没有不确定性估计，策略只会在模型盲区过度冒进；有了分歧信号，系统就能在"模型自己也没底"的地方踩刹车。一个管精度、一个管自知之明，这正是"模型学习"与"死记硬背预测器"的分界线。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：动力学集成模型与归一化训练</strong></p>
+    <pre class="code"><code>import torch
+import torch.nn as nn
+
+class EnsembleModel(nn.Module):
+    # 预测增量 delta = s' - s：网络只需学"变化量"，默认输出零即"世界不变"
+    # 集成 N 个成员：分歧（方差）近似模型不确定性，用于防"模型利用"
+    def __init__(self, state_dim, act_dim, n_heads=5, hidden=256):
+        super().__init__()
+        self.n_heads = n_heads
+        self.heads = nn.ModuleList([
+            nn.Sequential(nn.Linear(state_dim + act_dim, hidden), nn.SiLU(),
+                          nn.Linear(hidden, hidden), nn.SiLU(),
+                          nn.Linear(hidden, state_dim))
+            for _ in range(n_heads)
+        ])
+
+    def forward(self, s, a):
+        x = torch.cat([s, a], dim=-1)
+        # 输出形状 (N, B, state_dim)：第一维是集成成员
+        return torch.stack([head(x) for head in self.heads], dim=0)
+
+def train_model_step(model, optimizer, batch, norm):
+    # 归一化三件套：状态、动作、目标增量各自用训练集统计量标准化
+    # 不归一化时，量纲最大的维度（比如速度 ±10）会主导 MSE
+    s = (batch["s"] - norm["s_mean"]) / norm["s_std"]
+    a = (batch["a"] - norm["a_mean"]) / norm["a_std"]
+    delta = (batch["s_next"] - batch["s"]) / norm["s_std"]     # 增量也用状态尺度归一
+    pred = model(s, a)                                         # (N, B, D)
+    # 每个成员对同一批次负责：成员间的差异来自 bootstrap 采样与初始化
+    loss = ((pred - delta.unsqueeze(0)) ** 2).mean()
+    optimizer.zero_grad()
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)    # 早期 batch 噪声大，防炸
+    optimizer.step()
+    return float(loss.item())</code></pre>
+    <p>解读：模型部分有两个"不这样做就学不好"的细节。第一，增量归一化的尺度用<strong>状态</strong>的 s_std，这让"预测误差的度量"与"状态误差的度量"一致：如果增量本身再用自己的 std 归一，评估时还得绕回来，容易把"rollout 误差"算错量纲。第二，训练时每个成员虽然见到的是同一批数据，但 bootstrap 采样（由数据加载器负责）与随机初始化让它们产生差异；如果所有成员在同一批数据上收敛到同一个函数，分歧就恒为零，不确定性信号失效，可以用"成员预测相关系数应低于 0.95"作为健全性检查。梯度裁剪阈值 5.0 是经验值：模型训练早期遇到 rollout 拼接的极端 batch（比如碰撞瞬间）时，不裁剪会污染权重。最后注意损失是"对所有成员一起求均值"：这里成员们被同等训练，集成性完全来自数据子采样；另一种做法是每个成员独立优化器，效果相近但显存翻倍。</p>
+
+    <p><strong>片段 2：CEM 规划（采样-选优-重采样）</strong></p>
+    <pre class="code"><code>import numpy as np
+
+def cem_plan(model, state, reward_fn, horizon=10, n_samples=256,
+             n_elite=32, n_iter=3, act_dim=3):
+    # 交叉熵法：在动作序列空间里迭代"采样 -> 评估 -> 收敛到精英样本附近"
+    # 初始分布是零均值、单位方差的高斯
+    mu = np.zeros((horizon, act_dim), dtype=np.float32)
+    sigma = np.ones((horizon, act_dim), dtype=np.float32)
+    for it in range(n_iter):
+        # 从当前分布采样一批候选动作序列
+        candidates = mu + sigma * np.random.randn(n_samples, horizon, act_dim)
+        candidates = np.clip(candidates, -1.0, 1.0)            # 动作限幅同控制接口
+        returns = np.zeros(n_samples, dtype=np.float32)
+        for i in range(n_samples):
+            s = state.copy()
+            ret = 0.0
+            for t in range(horizon):
+                # 用模型的"平均预测"滚动（也可用单成员以保留随机性）
+                delta = model.predict_mean(s, candidates[i, t])
+                s = s + delta                                   # 增量预测：s' = s + delta
+                ret += reward_fn(s, candidates[i, t])
+            returns[i] = ret
+        # 精英集合：取回报最高的 n_elite 条，用它们的经验分布更新 mu/sigma
+        elite = candidates[np.argsort(returns)[-n_elite:]]
+        mu = elite.mean(axis=0)
+        sigma = elite.std(axis=0) + 1e-3                        # eps 防分布塌缩
+    return mu[0]                                                # MPC：只执行第一步</code></pre>
+    <p>解读：CEM 的每一部分都对应一个直觉。候选采样：在 10×3 = 30 维动作序列空间里随机撒 256 个点，足够覆盖局部邻域，又不需要梯度（模型可以是黑箱、不连续）。精英更新：只保留最好的 32 条，用它们的均值与标准差定义新分布，每轮迭代把搜索分布"收缩"到高回报区域，3 轮就足以收敛到一条不错的序列。分布塌缩的保护：<code>+1e-3</code> 的 eps 防止某一步所有精英样本在该维度上取值相同导致 sigma 归零（之后再也探索不动）。只执行第一步：这是模型预测控制（MPC）的精髓，规划了 10 步，但世界会变（真实环境 ≠ 模型），走一步后拿到新观测重头规划，用"闭环反馈"补偿模型误差；如果执行全部 10 步，CEM 的误差就暴露无遗。代价是 256×10 次模型前向/次控制步，这就是规划路线的算力账单，也是它只适合"模型便宜、决策频率低"场景的原因。</p>
+
+    <p><strong>片段 3：想象 rollout 与数据配比（MBPO 风格）</strong></p>
+    <pre class="code"><code>import numpy as np
+
+def imagined_rollout(model, policy, start_state, reward_fn, H=3):
+    # 从"真实状态"出发做短想象：起点准，前几步误差小；
+    # H 保持 1~5 步，避免复合误差爆炸与策略钻模型空子
+    traj = []
+    s = start_state.copy()
+    for t in range(H):
+        a = policy.act(s, deterministic=False)      # 想象里也保留探索噪声
+        members = model.predict_all(s, a)           # (N, state_dim) 集成各成员的预测
+        # 不确定性惩罚：成员分歧超过阈值 -> 截断这条想象轨迹（防模型利用）
+        if members.std(axis=0).max() &gt; UNCERTAIN_TH:
+            break
+        s_next = s + members.mean(axis=0)           # 用集成均值作为下一状态
+        r = reward_fn(s, a, s_next)
+        traj.append((s, a, r, s_next))
+        s = s_next
+    return traj
+
+def mixed_batch(real_buffer, model, policy, batch_size=256, real_ratio=0.3):
+    # 真实数据永远占固定比例：保证训练分布不脱离真机太远（防利用的第三道阀门）
+    n_real = int(batch_size * real_ratio)
+    batch = list(real_buffer.sample(n_real))
+    starts = real_buffer.sample(batch_size - n_real)          # 想象从真实状态起步
+    for s, _, _, _ in starts:
+        batch.extend(imagined_rollout(model, policy, s, reward_fn))
+    return batch</code></pre>
+    <p>解读：这段代码是"怎么安全地用模型"的完整示范。起点选择：<code>starts</code> 从真实回放里采样；如果用模型自己生成的旧状态起步，会形成"模型在自产数据上自我强化"的闭环漂移（用生成数据继续生成数据，误差会指数累积）。截断逻辑：集成成员的标准差超过阈值就止损，这条轨迹不要了，阈值 <code>UNCERTAIN_TH</code> 应该用"数据集内 95 分位的一步预测误差"来标定，不能凭感觉。均值 vs 单成员：用集成均值平滑掉单成员的随机偏差，代价是低估极端情况；如果任务对尾部风险敏感（比如安全约束），应改用成员中的"最悲观预测"。配比参数：<code>real_ratio=0.3</code> 是起点，当任务成功率停滞或真机迁移差时先把它调到 0.5，真实数据比例是防利用最直接的旋钮。最后记住 H=3 与"每段想象的步数"的关系：一次从真实起点出发生成 3 步，并不是说每批只加 3 条数据；每个真实样本都能派生子轨迹，实际数据增量可达真实采样的 5–20 倍，这就是 MBRL 数据效率的来源。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>rollout 太长</strong>：H = 30、50，看着"更多数据"，实际模型误差爆炸，策略学到的是模型的错误。症状是想象回报虚高、真实评估远低。修复：回到 H = 1–5，用"H 步误差 / 1 步误差"体检（超过 20 倍即警报）。</li>
+      <li><strong>模型自产数据自我循环</strong>：想象从"上一次想象生成的状态"继续展开，误差自我强化。修复：每次想象的起点必须来自真实回放（片段 3 的写法）。</li>
+      <li><strong>不归一化直接回归</strong>：MSE 被大尺度维度垄断，小尺度维度（角度）预测成常数。修复：状态/动作/增量统一归一化；评测时统一用归一化误差比较，原始误差会因量纲差异失真。</li>
+      <li><strong>没有不确定性截断</strong>：策略学会在模型盲区（极端接触、超速运动）钻空子。症状是真机表现与仿真评估的巨大落差。修复：集成分歧截断 + 真实数据保底比例。</li>
+      <li><strong>KPI 选错</strong>：用墙钟时间比"MBRL vs PPO"，结论几乎总是无模型赢（模型训练本身要时间）。修复：比"环境交互步数"（MBRL 才公平），并单独报告模型训练算力开销。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把 H 从 3 调到 1、5、15，分别为每条真实序列生成想象数据，画"H 步 rollout 误差/1 步误差"的比值曲线与策略真实成功率曲线。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>误差比随 H 指数上升；成功率通常在 H=3–5 附近最好，H=15 时被模型利用的迹象（真实失败、想象成功）会明显。</div></details>
+      </li>
+      <li>把集成成员数从 5 降到 1（同时去掉分歧截断），训练后对比真机（或高保真评测）性能，验证不确定性估计的价值。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>单成员版在标准评测上可能也不错，但在"极端初始位姿/高速"的困难集上崩得更快；这两组数据的差值就是不确定性的价值。</div></details>
+      </li>
+      <li>把 CEM 的迭代次数从 3 降到 1、升到 8，测规划后的单步回报与计算耗时，画出收益-成本曲线。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>CEM 的收敛通常很快（2–3 轮接近饱和）；8 轮时收益主要来自更锋利的 mu，对回报提升有限。计算耗时几乎随迭代线性增长。</div></details>
+      </li>
+      <li>设计一个"模型利用"的陷阱实验：故意把模型对某类接触的预测偏差注入（比如低摩擦区高估滑动），观察策略是否学会绕开或利用。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>在评测环境里保持真实物理，训练用有偏模型；如果策略在偏差区域出现"奇怪但模型里最优"的行为，就是利用。不确定性截断应能压制它。</div></details>
+      </li>
+      <li>写一段实验方案：如何用 Isaac Sim 完成"仿真预训练 + 少量真机数据模型微调"的阈值判断，列出您需要的真机数据量与成功标准。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>标准例：仿真策略在真机上 50% 成功率；用 200 条真机轨迹训练残差模型后，在模型内微调策略再迁移，成功率提升到 80% 即可认为模型有价值。真机数据量从 200 扫到 5000 看边际收益。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>MBRL 的三步循环：学模型（增量预测 + 归一化 + 集成）→ 用模型（规划或想象）→ 防利用（短 rollout、不确定性截断、真实数据保底）。</li>
+      <li>复合误差随 rollout 长度指数放大（ε·(L<sup>H</sup>−1)/(L−1)），这是 H 取 1–5 的根本原因；衡量指标是"H 步误差/1 步误差"。</li>
+      <li>规划路线（CEM/MPC）在动作序列空间采样-择优-重采样，走一步重规划；想象路线（MBPO 式）从真实状态出发做短展开并混入训练批次。</li>
+      <li>模型利用是永恒的敌人：策略会在模型盲区作弊；三层防御（短展开、分歧截断、真实比例 ≥ 30%）缺一不可。</li>
+      <li>在 Isaac Sim 里评估 MBRL，比的是"达到目标性能的环境交互步数"，不是墙钟时间；MBRL 的真正战场是真机数据效率。</li>
+      <li>下一章回到无模型阵营做一次系统梳理：<strong>无模型强化学习</strong>的目标函数、GAE 与 PPO 核心代码，把这条主线一次夯实。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch055.html">← 第 055 章：实现分层强化学习</a>
+    <a class="next" href="ch057.html">第 057 章：实现无模型强化学习 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

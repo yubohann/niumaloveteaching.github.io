@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第040章 实现开门任务 | 机器人仿真学习课程 · Isaac Sim 强化学习训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 任务与技能实现</span>
+    <span class="sep">/</span>
+    <span>第 040 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 任务与技能实现</div>
+    <h1>第 040 章：实现开门任务</h1>
+    <p class="lead">面对铰接机构：抓住把手、绕着门轴画弧，动态目标的跟踪奖励、门轴状态观测与"中途撒手"的失败判定。</p>
+    <ul class="meta">
+      <li>主题：任务实现 / 铰接物体操作</li>
+      <li>相关组件：Isaac Sim（关节约束）、Stable-Baselines3</li>
+      <li>预计学时：50 分钟</li>
+      <li>前置章节：第 039 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解铰接物体（articulated object）与自由刚体的区别：门只有一个自由度，位置由门轴角度完全决定。</li>
+      <li>掌握门轴状态（角度、角速度）的读取与它在观测/奖励中的双重角色。</li>
+      <li>会设计"抓住把手 → 角度进度 → 保持张开"的三段奖励，并处理把手随门移动这一动态目标。</li>
+      <li>会设置铰接机构的物理参数（门轴阻尼、最大力矩、限位）并把它纳入随机化。</li>
+      <li>能设计开门任务的评估：成功率、最终角度分布、开门耗时、把手脱手率与作用力峰值。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>从本章开始，操作对象升级为<b>铰接物体</b>：门、抽屉、柜子、微波炉，它们在机器人世界里比自由方块更常见。铰接物体的本质是"被约束的刚体"：门不能任意移动，只能绕门轴转动；它的位姿是门轴角度 θ 的一元函数。这带来两个新问题：</p>
+    <p>其一，<b>目标会动</b>：把手随着门转动沿圆弧移动，抓住把手之后"目标位置"就不再固定，策略要在施加开度力矩的同时跟踪移动的把手，这是"被动力学"的入门课。其二，<b>任务有阶段依赖</b>：抓住把手前的奖励是够取，抓住之后是绕轴旋转，中途撒手则前功尽弃。<strong>本章的奖励与控制比堆叠"多一维动态、多一阶段"，但复用工具与前面章节完全相同：抓握链来自第 037 章，进度差分来自第 036 章，阶段标志来自第 038 章。</strong>你会看到它们组合成新的任务形态，这正是本篇"每章一个任务"设计的意义。</p>
+  </section>
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 铰接运动学：把手位置的弧线方程</h3>
+    <p>设门轴在位置 p<sub>hinge</sub>，把手相对门轴的半径向量为 r（门宽方向）。门（绕竖直轴）转过角度 θ 后，把手位置：</p>
+    <div class="formula">
+      p<sub>handle</sub>(θ) = p<sub>hinge</sub> + R<sub>z</sub>(θ) · r，  θ 从"门关闭位"起算
+      <span class="note">R_z 为绕竖直轴的旋转矩阵；把手的轨迹是以门轴为圆心、半径 r 的圆弧，门宽 0.4 m 时，开门 90° 要"走"约 0.63 m 的弧长</span>
+    </div>
+    <p>方程告诉策略两件事：<b>(1) 把手在弧线上运动，方向是切向</b>，施加"切向力"的开门效率最高（力矩臂最大），沿法向推门（指向门轴）做功为零；<b>(2) 门转得越多，把手离初始位置越远</b>，若策略用"追当前把手位置"的贪心方式，它会在弧线上不停追赶。最优行为的图像是：抓住把手后施加一个大致恒定的切向力，让门匀加速转开，把手"自己送上来"。这个几何直觉通过观测中的门轴角度量（θ、门的角速度）间接给到策略。</p>
+
+    <h3>2. 三段奖励：够取 → 开度 → 保持</h3>
+    <table>
+      <tr><th>阶段</th><th>信号</th><th>判据/来源</th><th>量级</th></tr>
+      <tr><td>够取把手</td><td>差分进度</td><td>指尖到把手距离减少</td><td>每步 ~0.01–0.03</td></tr>
+      <tr><td>抓握</td><td>一次性事件</td><td>037 章三条件判据（简化：单侧接触 + 力阈值）</td><td>+0.5</td></tr>
+      <tr><td>开门</td><td>角度差分</td><td>门轴角增量 Δθ（仅当抓握中）</td><td>每弧度 ~1.0，每步 ~0.02</td></tr>
+      <tr><td>保持张开</td><td>状态奖励</td><td>θ &gt; 60° 且仍在抓握</td><td>+0.1/步，封顶 1.0</td></tr>
+      <tr><td>成功</td><td>终局</td><td>θ ≥ 60° 且抓握保持 10 步</td><td>+10</td></tr>
+      <tr><td>中途撒手</td><td>终局失败</td><td>抓握丢失且 θ ∈ (5°, 60°)</td><td>−1 且终止</td></tr>
+    </table>
+    <p>两个量级推理：<b>角度差分以"弧度"为单位给权重 1.0</b>，开门 60°≈1.05 rad，全程累计约 1.05，与抓握事件 +0.5 同量级、低于成功 +10，层级清晰。<b>中途撒手判据带"角度区间"条件</b>：开门不足 5° 时脱手视为"还没开始"，允许重试（不终止，只中断抓握链）；超过 5° 才认为"进行中"，此时脱手是真实失败。这个区间设计给早期探索留了容错，又不放过"半途而废"，与第 036 章"超时不算失败"的管理哲学同源：<b>区分"没学会"与"学坏了"。</b></p>
+
+    <h3>3. 门轴物理参数：三个必须进随机化的量</h3>
+    <p>铰接约束在仿真里由关节驱动模型刻画，三个参数直接决定开门的难度：</p>
+    <ul>
+      <li><b>门轴阻尼（damping）</b>：摩擦扭矩 −c·θ̇。阻尼大 = "沉的门"，松手后迅速停住；阻尼小 = "轻的门"，一推就飞。随机化范围建议覆盖 2–5 倍变化，这是开门任务里影响最大的泛化轴。</li>
+      <li><b>关节最大力矩（effort limit）</b>：仿真里常设为人类开门力矩的上界（如 20 N·m）。它决定"门推不动"的底线：力矩上限太小会捏造出真机上不存在的物理限制。</li>
+      <li><b>门轴限位（limits）</b>：物理门一般开不满 180°（有墙/门挡）。仿真里限位设 90°–120°，同时<b>成功阈值 60° 要在限位之内留出余量</b>，否则策略到达限位后"顶死"，速度归零、角度不再增长，深度值函数学不到"再推一点"的梯度。</li>
+    </ul>
+    <h3>4. 动态把手的跟踪：观测用"门的状态"表达把手位置</h3>
+    <p>把手在动，最直接的观测是"指尖到把手的相对向量"（每步更新）。但对策略学习更高效的做法是<b>同时给出"门轴角度 θ、门角速度 θ̇、指尖相对门轴的极坐标（半径 + 相对门板的切向/法向分解）"</b>。理由：极坐标下的状态把"沿弧线追"这个动态问题变成"角度差多少"的静态问题，策略学 θ<sub>error</sub> 的反馈律（往 θ 增大的方向施力）比学"追一个移动的点"简单得多。<strong>这是"坐标系选择改变学习难度"的又一实例：难度主要取决于你选的观测基。</strong>当门轴几何已知时（仿真里总已知），用任务自然坐标（角度、切向）表达状态，样本效率会显著高于笛卡尔坐标。</p>
+
+    <h3>5. 数值算例：开门力矩、阻尼与时间预算</h3>
+    <p>把"门有没有被推得动"算成一笔账。把门近似为绕轴均质的板：质量 m = 4 kg、从门轴到把手的距离 L = 0.4 m，转动惯量 I = mL²/3 ≈ 0.213 kg·m²；门轴阻尼按设计取 c = 1.5 N·m·s，运动方程 I·θ̈ = τ − c·θ̇。以 0.1 ms 步长数值积分"从全关转到 60°（1.047 rad）"所需的时间：τ = 0.5 N·m 时需要 3.28 s；τ = 1.0 时 1.71 s；τ = 1.5 时 1.19 s；τ = 2.0 时 0.93 s。<b>结论一：在 1.5 s 内把门推开 60° 只需要 1.2 N·m 量级的持续力矩，远低于单臂 10–20 N·m 的能力上限，"推不动"在物理上不会发生；训练里门推不动，几乎总是阻尼参数设错或约束求解异常。</b>反过来这也是一条审计线：若真机数据里开门需要 5 N·m 以上，先怀疑门轴摩擦与模型标定；加大策略的推力输出解决不了标定问题。</p>
+    <p>结论二与把手速度有关：弧长 r·θ = 0.4×1.047 ≈ 0.42 m，按 1.5 s 完成折算，把手平均线速度约 0.28 m/s，瞬态峰值约 0.4 m/s。策略输出是关节增量（0.05 rad/步、60 Hz 折算关节速度上限 3 rad/s），对应末端可达速度 0.4–0.6 m/s 量级，<b>把手跟踪的需求速度处在可达能力的中下段，说明任务的训练难点集中在"施力方向正确（切向）与握持稳定"，速度能力本身不是瓶颈</b>。若把成功阈值从 60° 提到 120°，弧长与行程翻倍，单局时间预算要从 150 步显著放宽，否则时间税会在学习中期压缩有效信号。</p>
+    <p>三段奖励的总量预算核一遍：够取段累计约 0.5（单步 0.01–0.03 乘 20–30 步），抓握事件 +0.5，开门段按 1.0/rad 乘 1.047 rad 累计约 1.05，保持流上限 1.0，成功 +10。<b>成功约为前面全部信号之和的 3 倍，与"事件梯逐级抬升"的结构主张一致</b>；若把角度差分系数调小到 0.3/rad，开门段总量掉到 0.31，低于抓握事件，策略会出现"抓住了但懒得推"的梯度缺口，这类跨项联动是调参时最容易忽略的账。</p>
+    <p>阻尼随机化的效果也可以分离出来：同样的 60° 在阻尼 0.6 时需要约 0.6 N·m、在阻尼 1.5 时约 1.2 N·m，都远在能力之内，<b>阻尼真正改变的是"松手后门会不会自己停"</b>。解 θ̇(t) = θ̇₀·e<sup>−ct/I</sup>：阻尼 0.6 时角速度从约 1 rad/s 衰减到 0.1 rad/s 需要 ln(10)·I/c ≈ 0.8 s，阻尼 1.5 时只需约 0.3 s。轻门（低阻尼）场景下策略必须学会在松手前把门停稳，否则"甩开后撒手"的捷径会被成功判据里的"抓握保持 10 步"直接拦掉。</p>
+    <p>"中途撒手"的角度区间 5°（0.087 rad）同样有数值依据：门转过 5° 后，把手沿弧线前移 r·θ = 0.4×0.087 ≈ 3.5 cm，相对位置已偏移到需要重新规划接近轨迹的程度，此时脱手要重走一遍接近段；而 5° 以下脱手，把手位移不到 3.5 cm，重试代价与初始接近相当，视为"还没开始"更合理。<b>策略在阈值附近的行为会自然分化：先确认握持再推门，或在稳定握持下推进，两种都算健康；不健康的是"推到 4.9° 就松手"来规避失败判定。</b>日志里若看到撒手事件密集堆在阈值下方一点，说明判据被策略研究透了，应把释放判定与"门是否已明显开启"的物理现象（如门缝宽度）解耦，或对反复蹭阈值的回合加长冷却。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p><strong>任务规格：</strong>工作区里一扇带把手的门（40 cm 宽、铰接于竖直门轴，门轴阻尼随机化）；Franka 抓住把手并把门打开到 60° 以上并保持。</p>
+    <table>
+      <tr><th>规格</th><th>设计</th><th>理由</th></tr>
+      <tr><td>观测（28 维）</td><td>本体(15) + 门状态(2：θ、θ̇) + 指尖—把手相对门轴坐标(4：半径/切向差/法向差/高度差) + 接触标志与力(2) + 阶段标志(1) 等</td><td>任务自然坐标表达动态目标；阶段标志区分"够取/开门"两种行为模式</td></tr>
+      <tr><td>动作（8 维）</td><td>7 关节增量 ×0.05 rad + 夹爪宽度增量（同 037 章）</td><td>复用抓握技能与预训练网络</td></tr>
+      <tr><td>奖励</td><td>够取进度 1.0 + 抓握 +0.5 + 角度差分 1.0/rad + 保持 0.1/步（封顶 1.0） + 成功 +10 − 中途撒手 −1</td><td>三段结构；撒手判定带 5° 容错区间</td></tr>
+      <tr><td>成功判据</td><td>θ ≥ 60° 且抓握保持 10 步</td><td>防止"甩开门后撒手"的碰运气行为：成功要求可控地拿着</td></tr>
+      <tr><td>终止</td><td>成功｜中途撒手（5°–60° 脱手）｜超时 150 步</td><td>三类分开打点</td></tr>
+      <tr><td>随机化</td><td>门轴阻尼 ×2–5、把手位置高度 ±5 cm、门质量 ±20%、初始角度 0°–15°</td><td>阻尼是最关键泛化轴；初始微开降低早期难度</td></tr>
+      <tr><td>课程</td><td>初始角度 15° → 5° → 0°（全关）；目标角度 45° → 60°</td><td>微开的门重心已偏移，门轴力矩小；全关起步最难</td></tr>
+    </table>
+    <p>三条设计推理：<b>(1) 为什么成功要求"θ 达标 + 抓握保持 10 步"，只看角度有什么问题？</b>看角度会奖励"猛推一把让门自己转开"的策略，那不是开门技能，是撞门。保持条件强制策略"持续可控地拿着门把"，这也让评估指标（成功率）反映的是真正的操作能力。<b>(2) 角度差分给到"每弧度 1.0"的量级</b>，使开门阶段的连续收益（约 1.05）介于抓握事件 0.5 与成功 10 之间，三段阶梯清晰。<b>(3) 超时 150 步</b>：够取（30–50 步）+ 开门（60–90 步）的自然耗时；比堆叠的 150 步相当但更长更合理。</p>
+    <div class="box key">
+      <span class="box-title">设计思维：门轴参数的"物理真实性"审计</span>
+      <p>铰接机构的仿真参数最容易"拍脑袋失真"：阻尼设成 0（永不停的门）、设成极大（推不动的门）、限位设成无穷大。审计清单只有三行：<b>开门所需的力矩是否在单臂能力范围（10–20 N·m）？松手后门是否会在 0.5–2 s 内停下？限位是否在物理门挡的范围内（90°–120°）？</b>三条都能答"是"，参数才算过关。第 065 章做 sim-to-real 时，这三条就是最基础的参数标定项，门轴阻尼甚至是真机标定里最容易测的量（放手观察衰减即可）。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：门轴状态读取与把手弧线目标</strong></p>
+    <pre class="code"><code>class DoorState:
+    """门的状态：关节角度/角速度 + 把手在门轴坐标下的位置"""
+    def __init__(self, door_joint_view, handle_view, hinge_xy, radius):
+        self.joint = door_joint_view      # 门的铰接关节视图（1 自由度）
+        self.handle = handle_view         # 把手刚体视图
+        self.hinge_xy = hinge_xy          # 门轴的水平位置 (2,)
+        self.radius = radius              # 门轴到把手的水平距离（门宽）
+
+    def read(self):
+        theta = self.joint.get_joint_positions()[:, 0]        # (N,) 门开度（rad）
+        theta_dot = self.joint.get_joint_velocities()[:, 0]   # (N,) 角速度
+        h_pos = self.handle.get_world_poses()[0]              # (N,3) 把手世界位置
+        rel = h_pos[:, :2] - self.hinge_xy                    # 相对门轴的水平向量
+        r_now = rel.norm(dim=-1)                              # 当前半径：与圆心距
+        tangent = torch.stack([-rel[:, 1], rel[:, 0]], dim=-1) / r_now.clamp(min=1e-6)
+        # 切向单位向量：圆的切线方向，开门的最优施力方向（力矩臂最大）
+        radial_err = r_now - self.radius                      # 径向误差：应恒为 0（把手在弧上）
+        return theta, theta_dot, tangent, radial_err</code></pre>
+    <p>解读：这个状态读取器的每个输出都对应观测或奖励里的一个分量。<b>(1) 切向单位向量是关键几何量</b>：它告诉策略"往哪个方向施力最有效"，理想情况下开门力沿切向、大小恒定。把它算好放进观测（或者让网络的输入特征直接用"切向—径向"分解的误差），策略就不用从坐标里"发现"这个几何关系。<b>(2) radial_err 的用途</b>：理论上把手永远在半径 r 的弧上，径向误差应为零；实际数值读取会有毫米级抖动。把它放进观测的意义是"传感器自我的诚实性检查"，若径向误差突然变大（如门被卡住变形），策略能看到异常信号。<b>(3) 读取频率</b>：门角度这类标量状态的读取成本极低，每控制步读；而把手的世界位姿读取较贵（需要物理查询），优化时可以和相机一样降频（每 2 步读一次），中间帧用 θ 的解析式外推，<code>p_handle(θ)</code> 的弧线方程在原理 1 里已经给出。</p>
+
+    <p><strong>片段 2：三段奖励与中途撒手判定</strong></p>
+    <pre class="code"><code>def door_reward(prev_handle_dist, handle_dist, grasped, newly,
+                theta_prev, theta, gripped, theta_success=1.047):
+    """够取 → 开门 → 保持：角度差分只在抓握时发；撒手按角度区间判"""
+    r_reach = 1.0 * (prev_handle_dist - handle_dist) * (1.0 - grasped.float())
+    # 够取项在抓握后自动退场（与 037 章同款掩码）：抓住后"追把手"不再是任务
+    r_grasp = 0.5 * newly.float()
+    d_theta = (theta - theta_prev).clamp(min=0.0)     # 只奖励开的方向：方向反了不给负分
+    r_open = 1.0 * d_theta * grasped.float()          # 每弧度 1.0：门开 60° 累计约 1.05
+    r_hold = 0.1 * ((theta &gt; theta_success) &amp; grasped).float()   # 保持：封顶由调用方累计
+    return r_reach + r_grasp + r_open + r_hold
+
+def door_termination(grasped, ever_grasped, theta, theta_success=1.047,
+                     release_floor=0.087):
+    """撒手失败：进行中（θ &gt; 5°）脱手；失败终止返回 True，成功单独判定"""
+    dropped_midway = ever_grasped &amp; (~grasped) &amp; (theta &gt; release_floor)
+    # 注意：θ &lt; 5° 的脱手不算失败（允许重试）；成功保持计数在外部维护
+    return dropped_midway</code></pre>
+    <p>解读：两个判据的"方向性"设计值得细品。<b>(1) 角差分的 clamp(min=0)</b>：只奖励"门开大"、不惩罚"门关小"。为什么？关门动作可能是策略在"调整握姿"（回一点角度换更有利的施力方向），惩罚它会让策略不敢做必要的反向微调；同时"门被弹簧/配重带回去"这类被动变化，罚策略也不公平。真正的失败由"撒手判定"兜底，不需要在连续奖励里加负项。<b>(2) 中途撒手的角度区间设计</b>：<code>release_floor = 0.087 rad（5°）</code>，低于它脱手=还没真的开始（允许回合继续），高于它脱手=任务失败。这个阈值的物理含义：开门 5° 后门有微小开度，把手位置已经偏离初始位置，"重新开始"不再是无成本的重试。<b>(3) 与成功保持计数的分工</b>：本函数只判"失败终止"，成功（θ 达标保持 10 步）由与第 038 章相同的 hold 计数器在外层实现，把两类终局的判定分开写，日志与调试都清晰。</p>
+
+    <p><strong>片段 3：训练管线，抓握预训练 + 门轴随机化</strong></p>
+    <pre class="code"><code># 1) 从 037 章抓取策略初始化（观测补齐方式同 038 章）
+policy = load_grasp_pretrain(DoorPolicy(...), "runs/grasp/best_policy.pt")
+
+# 2) 门轴随机化：按环境独立采样，写进 reset 后的关节参数
+class DoorRandomizer:
+    def __init__(self, num_envs, damping_base=1.5, effort=20.0):
+        self.damping = torch.empty(num_envs).uniform_(damping_base * 0.4,
+                                                      damping_base * 1.0)
+        # 阻尼 ×0.4–1.0：软到硬的门；每环境独立，4096 环境同时上"不同重量的门"
+        self.effort = effort            # 力矩上限 20 N·m：单臂开门能力量级
+
+    def apply(self, joint_view, env_ids):
+        joint_view.set_joint_damping(self.damping[env_ids], indices=env_ids)
+        joint_view.set_joint_efforts(self.effort, indices=env_ids)
+        # 注意：阻尼/力矩参数在物理引擎侧生效，属于"域随机化"层面（第 021 章）
+        # 每回合重置时应用新的采样值，同一回合内参数不变（避免物理前后不一致）
+
+# 3) 课程：初始角度 15° → 5° → 0°，成功率达标才推进（第 032 章状态机）
+# 评估：固定 20 个门参数（软/中/硬）× 3 个初始角度的网格，报告成功率热力图</code></pre>
+    <p>解读：这份管线展示了"任务特定随机化"的落点。<b>(1) 阻尼为什么按环境独立采样（固定单一值有什么问题）？</b>与第 032 章"逐环境等级"同一个思想：4096 个环境同时在"软门/硬门"上训练，梯度里天然包含参数分布，策略学到的是"对门阻尼鲁棒的开法"（典型行为：轻推试探 + 根据角速度反馈调整施力），对单一阻尼值的过拟合被分布训练压掉。<b>(2) 为什么参数每回合重置时才更新？</b>物理参数在回合中间变化会让动力学不连续（同一策略在不同物理下表现突变），值函数的输入没有包含阻尼值，这种"隐性非平稳"是训练震源的常见来源，<strong>随机化参数的切换时机永远是回合边界。</strong><b>(3) 评估网格的设计</b>：软/中/硬 × 初始角度，热力图能暴露"策略只在某个参数区间能开"的真相；平均成功率会把这种结构性缺陷摊平，网格视图不会。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>成功只看角度</strong>：策略学会"猛推一把让门自己转开"，撒手瞬间也算达标。症状：成功率虚高、真机复现差。修复：成功要求"角度达标 + 抓握保持 10 步"。</li>
+      <li><strong>门轴阻尼不随机化</strong>：策略学到"针对某阻尼的最优推力"，换一扇门就失手（推太猛/推不动）。症状：训练内高成功、参数扰动测试崩盘。修复：阻尼 ×2–5 范围随机化，逐环境独立采样。</li>
+      <li><strong>限位设太近</strong>：门限位 60° 与成功阈值相同，策略到达限位后速度归零，"再推"没有任何反馈，梯度消失，训练卡死。修复：限位 ≥ 成功阈值 + 30°。</li>
+      <li><strong>把手观测用绝对坐标</strong>：给绝对世界坐标，网络要自己学"随门旋转的坐标系"，样本效率低。症状：开门阶段学习缓慢。修复：极坐标/切向-径向分解表达（原理 4）。</li>
+      <li><strong>物理参数回合中途变化</strong>：阻尼在回合内漂移导致动力学跳变。症状：训练不稳定、值函数震荡。修复：随机化参数只在 reset 更新。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>计算题：门宽 0.4 m、开门 60°，把手沿弧线走了多少距离？如果策略用"直线追逐"替代切向施力，每步需要多跟踪多少路径？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>弧长 = r·θ = 0.4×(π/3) ≈ 0.42 m；切向施力让把手"送上门"，直线追逐则要持续补偿弧线的偏离，量级差决定学习难度。</div></details>
+      </li>
+      <li>消融实验：把角度差分的方向性去化（允许负值惩罚关小），观察策略在握姿调整阶段的行为变化。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>策略会变得更"犹豫"：一旦门角度回落就紧张，不敢做微调；成功率可能下降或需要更多步数。</div></details>
+      </li>
+      <li>设计实验：用"固定阻尼 1.5"与"阻尼 ×0.6–1.5 随机化"两组训练，然后在一组折中参数（阻尼 1.0）上评估。预测并验证泛化差距的幅度。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>随机化版的评估优势通常 10–20 个百分点；固定版会显示出"要么推力过大、要么不足"的偏差。</div></details>
+      </li>
+      <li>观测消融：把手观测从"切向-径向分解"换成"世界坐标差值"，比较收敛速度；解释任务自然坐标为什么更快。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>与 028 章"腕部系点云"的结论相互印证：任务自然坐标把已知几何从"学习问题"降级为"算术问题"。</div></details>
+      </li>
+      <li>思考题：如果门的把手换成"旋转把手"（需要先转把手再推门），奖励与观测需要增加什么？画出你的三段变四段结构草图。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>把手旋转本身是一个子目标：加一段"把手角度差分"奖励与把手关节状态观测；阶段标志从两段变成三段（够取/转把手/推门）。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>铰接物体位姿是门轴角度的一元函数；把手沿圆弧运动，切向施力效率最高（力矩臂最大）。</li>
+      <li>三段奖励：够取差分（抓握后掩码退场）→ 角度差分 1.0/rad（仅抓握时，且只奖正向）→ 保持 0.1/步；成功 = 60° + 抓握保持 10 步；中途撒手（&gt;5° 脱手）判失败。</li>
+      <li>任务自然坐标观测（θ、θ̇、切向-径向分解）比绝对坐标样本效率高；门轴阻尼 ×2–5 是最关键随机化轴。</li>
+      <li>物理真实性审计三行：开门力矩在能力范围、松手后 0.5–2 s 停住、限位在 90°–120°。</li>
+      <li>最后一章任务实战：插拔，毫米级精度的"接触之舞"，把力观测（029）、接触奖励（030）、课程（032）与柔顺策略全部拧在一起。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch039.html">← 第 039 章：实现推动任务</a>
+    <a class="next" href="ch041.html">第 041 章：实现插拔任务 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

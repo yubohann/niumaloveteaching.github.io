@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第014章 网络带宽管理与流量整形 | 多机器人协同学习课程 · ROS2 通信与系统集成</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · 通信基础与系统搭建</span>
+    <span class="sep">/</span>
+    <span>第 014 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · 通信基础与系统搭建</div>
+    <h1>第 014 章：网络带宽管理与流量整形</h1>
+    <p class="lead">预算告诉你网络够不够用，策略决定谁先用：关键流优先、大流限速、后台流让路，从应用层到网卡的三级工具箱。</p>
+    <ul class="meta">
+      <li>主题：通信基础 / 流量管理</li>
+      <li>关键机制：流量分类、令牌桶限流、优先级调度、闭环降载</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 013 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解流量管理的目标是"保护关键流、约束贪婪流"，不追求"平均分配"：会做三级分类（关键/尽力/后台）。</li>
+      <li>掌握令牌桶的原理与参数含义（速率与突发额度），会为一条数据流设定合理的限速参数。</li>
+      <li>认识三级工具箱：应用层节流、网络层整形（tc/DSCP）、无线层优先级（WMM），知道每级该做什么、边界在哪。</li>
+      <li>会给系统设计"闭环降载"：拥塞时向上游反馈，让数据源主动降频，网络被挤爆的局面由上游化解。</li>
+      <li>能识别整形的常见反模式：只限速不分类、把 Reliable 流限到低于重传需求、出口方向搞错。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 013 章的预算算出了瓶颈与余量，但系统上线后流量并不会"自觉守规矩"：日志上传想多大就多大，图像节点想发多快就发多快，地图上传想起来就发。结果是一个经典的公地悲剧，<strong>关键的控制指令和贪婪的后台流量在同一个队列里排队</strong>，前者被后者拖垮。</p>
+    <p>流量整形（traffic shaping）要解决的就是这个结构性问题：给流量分类、给贪婪流设上限、给关键流留通道。它是"网络公民教育"：<strong>让每条流拿到"配得上它重要性"的服务，这比单纯放大总带宽有效得多</strong>。本章给的三级工具箱（应用层、网络层、无线层）各有车道，组合使用才能既保护控制流、又不让后台任务彻底饿死。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 先分类，再行动：关键 / 尽力 / 后台</h3>
+    <p>整形的第一步永远是分类。多机器人系统里三条车道：</p>
+    <table>
+      <tr><th>类别</th><th>典型流量</th><th>特征</th><th>策略</th></tr>
+      <tr><td>关键流</td><td>控制指令、状态、心跳、安全事件</td><td>小、持续、延迟敏感</td><td>优先通行；限速余量充足（含重传）</td></tr>
+      <tr><td>尽力流</td><td>感知数据、可视化、协同感知</td><td>中大、可降级</td><td>按配额通行；拥塞时降频降质</td></tr>
+      <tr><td>后台流</td><td>日志上传、录像回传、地图同步、软件更新</td><td>大、可延迟、可断点</td><td>严格限速；低优先级；预约错峰窗口</td></tr>
+    </table>
+    <p>分类依据是<strong>"延迟敏感度 × 可降级性"</strong>这个二维判据，"谁重要"这类模糊感觉不作数：控制指令既敏感又不能降级，进关键车道；日志不敏感可降级，进后台车道；图像介于之间。<strong>没有分类的限速是破坏性的</strong>，如果把所有流量"平等"限到配额，关键流会被后台流挤成受害者。分类 → 配额 → 手段，这个顺序不能乱。</p>
+
+    <h3>2. 令牌桶：限速的基本零件</h3>
+    <p>限速的实现几乎都用令牌桶（token bucket）：桶以恒定速率 r 注入令牌，桶容量为 b（突发额度）；发一个字节消耗一个令牌；桶空时必须等，<strong>长期平均速率被压到 r，短期可以透支到 b 的突发</strong>。</p>
+    <div class="formula">
+      长期平均速率 ≤ r；最大突发量 ≈ b
+      <span class="note">r 决定"稳态多快"，b 决定"憋多久能一次性冲多少"：地图上传需要大 b，控制流要小 b</span>
+    </div>
+    <p>参数选择很讲究：<strong>r 按业务预算设</strong>（如日志每台 2 Mbps）；<strong>b 按"合理的瞬时爆发"设</strong>，太小会把正常突发切成碎片（一个 3 MB 地图上传被 2 Mbps + 小 b 限成几十秒，失去意义）；太大则失去平滑作用（突发照旧冲击网络）。经验起点：<strong>b ≈ r × 0.5–2 秒</strong>，再按实际场景调整。注意桶是在<strong>发送端</strong>就地执行的：先在源头限，再谈网络层。</p>
+    <p><strong>算例：一个 3 MB 文件穿过 r = 2 Mbps、b = 1 MB 的桶要多久？</strong>桶满时先放 1 MB（瞬时），剩余 2 MB 按 2 Mbps = 0.25 MB/s 注入，耗时 2 ÷ 0.25 = 8 s；若桶恰好空着，还要先等 1 MB 的令牌积攒（4 s），最坏 12 s。公式化：<strong>单次传输耗时 ≈ (S − b) ÷ r，桶空时再加 b ÷ r</strong>（S 为消息大小）。再反推一遍 b 的取值哲学：如果这个 3 MB 是必须整体送达的归档，b 至少给到 1 MB 量级才能让传输"不被打断两次以上"；而一条 100 Hz 的控制流，b 应该小到只覆盖几个周期的抖动，防止积压转化为延迟。</p>
+    <table>
+      <tr><th>机制</th><th>超额报文的处理</th><th>是否引入延迟</th><th>适用场景</th></tr>
+      <tr><td>监管（policing）</td><td>直接丢弃或降级标记</td><td>不缓冲，延迟不变</td><td>防滥用、保护池；丢不影响语义的流</td></tr>
+      <tr><td>整形（shaping）</td><td>放入缓冲排队，平滑后发出</td><td>引入排队延迟</td><td>后台大流；需要"完整送达"的传输</td></tr>
+    </table>
+    <p>区分这两个词很重要：<strong>监管是"超了就丢"，整形是"超了就等"</strong>。对控制与感知流用监管（丢一帧无所谓，等一帧反而有害），对日志与归档用整形（宁可慢，不可残）。把需要整形的流做成监管，会得到"文件传一半断掉"的故障；把该监管的流做成整形，则给控制流加上了排队延迟，两头都错。</p>
+
+    <h3>3. 三级工具箱各管什么</h3>
+    <table>
+      <tr><th>层</th><th>手段</th><th>管什么</th><th>边界</th></tr>
+      <tr><td>应用层（ROS 内）</td><td>发布降频、消息降采样、令牌桶节流、数据差分/压缩</td><td>该发多少、什么时候发</td><td>需要改代码；对第三方节点力不能及</td></tr>
+      <tr><td>网络层（主机）</td><td><code>tc</code> 整形/调度、DSCP 标记、HTB 分层配额</td><td>怎么排队、谁先走</td><td>只对出口方向有效；需部署与持久化</td></tr>
+      <tr><td>无线层（AP）</td><td>WMM 四类优先级、SSID/频段分离、每客户端限速</td><td>空口资源的分配</td><td>依赖 AP 能力与配置，端到端可见性差</td></tr>
+    </table>
+    <p>选择标准：<strong>能应用层做就应用层做</strong>（最可控、语义最清楚，你知道这是"图像"而网络只看到字节）；网络层做兜底（防止"漏网流量"破坏全局）；无线层做结构（分离与优先级）。一个实操细节：Linux 的 <code>tc</code> 只管<strong>出口（egress）</strong>，所以要限制"机器人上传"，限制规则要加在<strong>机器人自己身上</strong>；加在服务器侧就装反了方向，是新手常见错误。</p>
+    <p>无线层的优先级值得再拆一层：WMM 把流量分入四个接入类别，靠不同的信道竞争参数（AIFSN 越小越早抢到信道、CWmin 越小退避窗口越短）形成优先次序。典型默认档位如下（具体以实现配置为准）：</p>
+    <table>
+      <tr><th>接入类别</th><th>典型流量</th><th>AIFSN</th><th>CWmin</th><th>相对优先级</th></tr>
+      <tr><td>语音类（VO）</td><td>急停、安全事件</td><td>2</td><td>3</td><td>最高</td></tr>
+      <tr><td>视频类（VI）</td><td>控制指令、状态流</td><td>2</td><td>7</td><td>高</td></tr>
+      <tr><td>尽力类（BE）</td><td>图像、感知数据</td><td>3</td><td>15</td><td>中</td></tr>
+      <tr><td>背景类（BK）</td><td>日志、软件更新</td><td>7</td><td>15</td><td>最低</td></tr>
+    </table>
+    <p>WMM 有一个常被误解的边界：<strong>它管不住多播与广播</strong>。多播帧没有 ACK、没有接入类别队列，通常还按最低基础速率发送，因此发现信标与任何走多播的数据流量都得不到优先级保护，往往最慢、最不可靠。这也从无线层侧面解释了三条老结论：关键流量尽量单播；多播发现要谨慎；大流量不要靠多播省事。</p>
+
+    <h3>4. 闭环降载：让拥塞变成反馈</h3>
+    <p>静态配额有个软肋：网络状况是动态的（有人走近 AP、信道干扰突增、20 台同时开工）。闭环降载把"网络拥塞"变成上游可感知的信号：</p>
+    <ul>
+      <li><strong>信号来源</strong>：AP/交换机计数器（队列丢弃）、QoS deadline 事件（第 012 章）、应用层观测（发送队列积压、重传率上升）。</li>
+      <li><strong>反馈通道</strong>：一条低带宽的"预算指令"话题（如 <code>/fleet/bw_budget</code>，Reliable + Transient-local，1 Hz），或简单粗暴的"降载等级"枚举。</li>
+      <li><strong>执行方</strong>：图像节点收到"降到 5 fps"就降，<strong>有语义的执行（降分辨率/降帧率）远好于网络层一刀切（丢帧不挑内容）</strong>。</li>
+    </ul>
+    <p>这是"自适应"的最小可用形态，不需要花哨算法：监测 → 广播等级 → 节点按等级调整。设计要点是<strong>滞后与稳定</strong>：反馈周期不能太短（会震荡），降载要分级（如 100%/70%/40% 三档），恢复要慢于降级（经典的非对称策略，坏了立刻降，好了慢慢升）。</p>
+
+    <h3>5. 反模式清单</h3>
+    <p>最后固化几条"别这么干"：<strong>（1）只限速不分类</strong>，关键流被平等地伤害；<strong>（2）把 Reliable 流限到低于它的重传需求</strong>，丢包→重传→更堵的死循环（限速值要包含重传余量，无线环境加倍）；<strong>（3）出口方向搞反</strong>，在服务器限"下行"却想治机器人的"上行"；<strong>（4）突发额度抠到零</strong>，正常业务被切碎，团队转头怪"网络不稳定"；<strong>（5）限了带宽不限队列</strong>，整形器自己的缓冲过大，延迟照样膨胀（多机器人场景 buffer bloat 同样致命）。</p>
+    <p><strong>整形也有三条边界，写进设计文档以免过度承诺</strong>：<strong>（1）物理层太差时它无能为力</strong>：弱信号导致的低速率与重传发生在整形器之下，应用层降载只能少发，修好介质仍然是第一优先级；<strong>（2）它不创造带宽</strong>：总需求超过容量时，整形只决定谁挨饿，必须配合"减量"；<strong>（3）端到端可见性有限</strong>：主机整形管不到别人的设备与骨干段，AP 侧排队对主机不可见，所以要保留应用层闭环降载作为跨层兜底。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>回到 20 台 AGV 车间（第 013 章的账）：每 AP 稳态 ρ≈0.56、最坏秒 1.36。给出一份完整的流量管理方案：</p>
+    <ol>
+      <li><strong>分类落表</strong>：控制/状态 → 关键；图像/激光 → 尽力；日志/地图/录像 → 后台。</li>
+      <li><strong>配额分配</strong>（按每台机器人、每 AP 预算倒推）：关键流不限（天然小）；图像按 AP 均分（例：每台 12 Mbps 上限）；后台合计 ≤ 15% 的 AP 容量，且只能走"错峰窗口"。</li>
+      <li><strong>手段组合</strong>：应用层给日志与图像加令牌桶；机器人主机加 DSCP 标记；AP 启用 WMM 并把后台映射到低优先级类。</li>
+      <li><strong>闭环兜底</strong>：监测节点每 5 s 评估每 AP 利用率，>0.75 发"降载 L1"（图像 10→6 fps）、>0.9 发 L2（→3 fps + 日志暂停）。</li>
+      <li><strong>验证</strong>：基线测试（限流前）、限流后主题 bw 对比、拥塞注入测试（人为打满 + 控制延迟不劣化）。</li>
+    </ol>
+
+    <h3>流量管理配置表</h3>
+    <table>
+      <tr><th>流量</th><th>分类</th><th>应用层</th><th>网络层</th><th>无线层</th></tr>
+      <tr><td>cmd_vel / 状态</td><td>关键</td><td>不限；depth 收紧</td><td>DSCP AF41 高优先</td><td>WMM 视频/语音类</td></tr>
+      <tr><td>压缩图</td><td>尽力</td><td>令牌桶 12 Mbps/台 + 自适应降帧</td><td>DSCP AF21</td><td>WMM 视频类</td></tr>
+      <tr><td>日志上传</td><td>后台</td><td>令牌桶 2 Mbps/台；错峰窗口</td><td>DSCP CS1</td><td>WMM 背景类</td></tr>
+      <tr><td>地图同步</td><td>后台</td><td>事件驱动 + 人工确认窗口</td><td>与日志同池</td><td>背景类</td></tr>
+    </table>
+
+    <div class="box key">
+      <span class="box-title">设计决策：为什么"在发送端应用层限流"优先于"在网络设备限流"？</span>
+      <p>四个理由叠加。<strong>（1）语义可见</strong>：应用层知道这是"图像"，可以优雅降级（降分辨率），而网络层只会按字节丢弃（丢掉半张图反而更糟）。<strong>（2）省的是全程</strong>：源头不发，从机器人到 AP、到骨干、到服务器的每一段都省下；网络层限速只省限速点之后的链路。<strong>（3）避免无效重传</strong>：网络层丢 Reliable 流会触发重传，等于"限速又倒贴带宽"；源头降频没有重传。<strong>（4）可观测</strong>：发送端能把"我发了多少、被限了多少"写进日志与监控；交换机的匿名丢弃只会表现为"别人莫名其妙的抖动"。<strong>结论：应用层配额是第一道闸，网络层整形是兜底的第二道闸，两道都有，但顺序别反。</strong></p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：应用层令牌桶，图像上传的限速闸门</strong></p>
+    <pre class="code"><code>class RateLimitedImageSender(Node):
+    """压缩图上传：用令牌桶把长稳速率压到预算内，同时容忍短突发。"""
+    def __init__(self, rate_mbps=12.0, burst_mb=3.0):
+        super().__init__("image_up")
+        self.rate_bps = rate_mbps * 1e6 / 8.0        # MB/s 口径的填充速率
+        self.burst = burst_mb * 1e6                  # 突发额度：约 2 秒的量
+        self.tokens = self.burst                     # 初始满桶：允许开局爆发
+        self.last = self.get_clock().now()
+        self.pub = self.create_publisher(CompressedImage, "camera/compressed",
+                                         qos_profile_sensor_data)
+
+    def try_publish(self, msg):
+        now = self.get_clock().now()
+        dt = (now - self.last).nanoseconds / 1e9
+        self.last = now
+        self.tokens = min(self.burst, self.tokens + dt * self.rate_bps)
+        cost = len(msg.data)                         # 令牌消耗按字节算
+        if self.tokens &lt; cost:
+            return False                             # 桶空：这一帧放弃（可降级为跳帧）
+        self.tokens -= cost
+        self.pub.publish(msg)
+        return True</code></pre>
+    <p>解读：<strong>（1）</strong>令牌桶放在发布路径的函数里（<code>try_publish</code>），不另起线程：调用方对"发不出去"有知情权，可以选择跳帧、降质量、或累计告警；<strong>限流器返回布尔值，把决定权留给业务，默默阻塞是反模式</strong>。<strong>（2）</strong><code>burst = 3 MB</code> 的取法：约等于 2 秒的稳态量，让"刚上线时补发几帧"这类正常突发得以通过，同时把持续超速稳稳压住。<strong>（3）</strong>桶空时选"丢帧"：图像是新闻类数据（第 011 章），排队只会制造延迟；丢弃最新帧、等桶回暖才是正确语义。若换成日志上传（后台、可延后），同样的桶只需把"返回 False"改成"入队稍后重试"。</p>
+
+    <p><strong>片段 2：网络层整形，tc 给后台流设专用通道</strong></p>
+    <pre class="code"><code># 在机器人主机上为"日志出口"建立限速类（HTB），对上行流量生效
+# 前提：DSCP 标记已由应用或 iptables 打在日志流上（示意）
+tc qdisc add dev wlan0 root handle 1: htb default 30
+# 1:10 关键流：大额保底 + 高优先级，保证控制与状态永不受限
+tc class add dev wlan0 parent 1: classid 1:10 htb rate 50mbit ceil 80mbit prio 0
+# 1:20 尽力流（图像）：稳态 12mbit，空闲时可借用（ceil 给到 40）
+tc class add dev wlan0 parent 1: classid 1:20 htb rate 12mbit ceil 40mbit prio 1
+# 1:30 后台流（日志）：稳态 2mbit，上限锁死，不许借别人的额度
+tc class add dev wlan0 parent 1: classid 1:30 htb rate 2mbit ceil 2mbit prio 2
+# 用 fq_codel 作为叶子队列：主动管理缓冲，压制 bufferbloat 式延迟
+tc qdisc add dev wlan0 parent 1:10 fq_codel
+tc qdisc add dev wlan0 parent 1:30 fq_codel
+# 过滤规则：按 DSCP 把流量分到类（语法以你的 tc 版本为准）</code></pre>
+    <p>解读：<strong>（1）</strong>这段配置的结构是"保底 + 可借 + 锁死"三种策略并存：关键流保底 50、上限 80（借空闲）；图像保底 12、可借到 40；日志锁死 2/2（不许借）。<strong>保底保证"再挤也有你的份"，ceil 保证"再空也不许你独占"</strong>，HTB 的价值就在于这套双层语义。<strong>（2）</strong><code>prio</code> 决定同一时刻的出队次序：关键流永远排在图像与日志前面。<strong>（3）</strong>最后挂 <code>fq_codel</code> 是针对多机器人场景的深水细节：整形器不管理缓冲的后果是"限了带宽、没限延迟"，fq_codel 主动丢弃并公平排队，把排队延迟压住，<strong>限速的目标从来是延迟可控，不是数字好看</strong>。</p>
+
+    <p><strong>片段 3：闭环降载，把拥塞变成一条指令</strong></p>
+    <pre class="code"><code>class BandwidthGovernor(Node):
+    """预算治理器：评估每 AP 利用率，向图像节点广播降载等级。"""
+    def __init__(self):
+        super().__init__("bw_governor")
+        qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
+                         durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        # 1 Hz 广播当前等级：新加入的节点立刻拿到（TL 语义，第 011 章）
+        self.pub = self.create_publisher(LoadLevel, "/fleet/bw_level", qos)
+        self.level = 0
+        self.create_timer(5.0, self.evaluate)     # 评估周期：防震荡的第一道闸
+
+    def evaluate(self):
+        util = self.measure_ap_utilization()      # 来自 AP 计数器或本地统计
+        if util &gt; 0.9:
+            want = 2                              # L2：图像 →3 fps，日志暂停
+        elif util &gt; 0.75:
+            want = 1                              # L1：图像 →6 fps
+        else:
+            want = 0
+        if want &gt; self.level:                     # 坏消息立刻执行：降载不迟疑
+            self.level = want
+        elif want &lt; self.level and self.stable_for(30.0):
+            self.level = want                     # 好消息慢慢来：稳定 30 s 才回升
+        msg = LoadLevel()
+        msg.level = self.level
+        self.pub.publish(msg)</code></pre>
+    <p>解读：<strong>（1）</strong>这段代码实现的是第 4 节说的"非对称策略"：<code>if want &gt; self.level</code> 立刻升级降载，恢复则要求 <code>stable_for(30.0)</code>，<strong>坏消息快、好消息慢，是控制回路的通用防震荡手法</strong>（与第 006 章看门狗的连续判定同源）。<strong>（2）</strong>用 Transient-local 发等级：图像节点万一中途重启，也立刻知道"现在还在 L1"，不会满速复活把网络再点着。<strong>（3）</strong>评估周期 5 s、恢复观察 30 s，这两个数字常被质疑"太慢"，但降载不是安全联锁（那个由本地看门狗秒级兜底），它是资源治理，稳定性比速度重要；参数应写进设计表并预留现场调整位。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>限速方向装反</strong>：想在服务器侧限制机器人上行，结果 tc 只管出口（服务器下行），毫无效果。修复：上行流量在机器人主机上整形；把"谁的出口"写进配置注释。</li>
+      <li><strong>把 Reliable 流卡到重传红线以下</strong>：给图像限 10 Mbps，但丢包重传让实际需求 12 Mbps，限速→丢→重传→更拥塞的死亡螺旋。修复：限速值含 20–50% 重传余量；或干脆让该流 Best-effort（第 011 章）。</li>
+      <li><strong>突发额度抠成 0</strong>：令牌桶 burst 设得极小，正常的一次脉冲突发（上传一帧地图）被切成几十段，业务超时连环失败。修复：burst ≈ 0.5–2 秒的稳态量；"平滑"不等于"禁突发"。</li>
+      <li><strong>只限带宽不限缓冲</strong>：整形器缓冲偏大，利用率是低了，但排队延迟高企（bufferbloat），控制流照样迟到。修复：叶子队列用 fq_codel 类主动队列管理；给关键流单独挂小缓冲队列。</li>
+      <li><strong>配置不持久化</strong>：tc 规则手工执行，设备重启即失效。部署脚本/网络管理器统一下发并加"配置自检"（第 006 章图层巡检的思路）。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>参数题：日志上传令牌桶 r=2 Mbps、b=1 MB。一次 3 MB 的归档上传最快需要多久（含突发额度）？如果把 b 改到 0.2 MB 会变成多久？说明两个配置各自适合什么场景。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>桶满起步时 b=1MB 约 8 s（先冲 1 MB，余 2 MB 按 2 Mbps=0.25 MB/s 再 8 s）、b=0.2MB 约 11.2 s；桶空起步再各加满桶等待（4 s / 0.8 s）。小 b 全程平滑但更慢，适合持续小流量；大 b 适合偶发归档。</div></details>
+      </li>
+      <li>预测题：给图像流把 HTB 的 ceil 从 40mbit 改成 12mbit（与 rate 相同），在"网络空闲"与"网络拥挤"两种状态下分别预测图像节点的实际体验变化。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>空闲时失去借用能力（本来能冲到 40 的机会没了），图像可能卡在 12；拥挤时行为不变（本来就接近 12）。结论：ceil 是"空闲红利"的阀门，关掉它等于放弃机会性吞吐。</div></details>
+      </li>
+      <li>设计题：为"软件更新分发"（每台 200 MB，一个月一次）设计流量方案：分类、限速参数、执行窗口、对 ρ 的影响，以及"更新中断续传"的考虑。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>后台类 + 深夜错峰窗口 + 令牌桶 r=5 Mbps/b=10 MB；200 MB 约 6 分钟/台；更新服务器与主业务分流（频段/SSID）；务必支持断点续传（别让 90% 的下载因窗口结束而作废）。</div></details>
+      </li>
+      <li>推导题：给一条 100 Hz 的 cmd_vel 流（每帧 80 B）设计 DSCP/WMM 映射与队列参数：说明它需要的最小带宽（含 30% 余量）、为什么必须走小缓冲队列、以及 bufferbloat 对它的危害量化（0.1 s 缓冲 = 多少米的控制滞后，按 1 m/s）。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>80 B×100 Hz≈64 kbps×1.3≈85 kbps；小缓冲队列（如 20 ms）使最坏排队延迟 20 ms=2 cm 位移误差；若共用 0.1 s 大缓冲，1 m/s 下 10 cm，控制类流量必须"专属小队列"是量化结论，不是偏执。</div></details>
+      </li>
+      <li>方案评审：某方案给"图像、激光、日志"统一限到每台 8 Mbps，理由是"公平"。列出至少三条反对理由，并给出替代设计（含关键流的处理）。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>反对：激光本来就远小于 8（被限制没意义）、日志在窗口外应可让路、公平限速在拥塞时同时伤害关键流（无优先级）。替代：三级分类 + 关键流优先队列 + 尽力/后台各自配额 + 闭环降载兜底。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>整形目标是保护关键流、约束贪婪流：先分类（关键/尽力/后台），再配额，再选手段。</li>
+      <li>令牌桶 = 速率 r + 突发额度 b：r 定稳态、b 定瞬时爆发；"丢帧、排队、稍后重试"按数据语义选。</li>
+      <li>三级工具箱：应用层（语义化降级，第一道闸）→ 网络层（tc/HTB/fq_codel 兜底与优先级）→ 无线层（WMM/分频/分 SSID）。</li>
+      <li>闭环降载：监测利用率 → 广播等级（TL 语义）→ 节点按级降帧；坏消息快、好消息慢，防震荡。</li>
+      <li>反模式：限速不分类、把 Reliable 流卡到重传红线以下、方向反了、禁绝突发、只管带宽不管缓冲；物理层不达标时先修介质，再谈策略。</li>
+      <li>下一章进入度量深水区：<strong>延迟测量与实时性预算</strong>，把"快不快"从感觉变成分解到毫秒的账。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch013.html">← 第 013 章：多机器人网络拓扑与带宽估算</a>
+    <a class="next" href="ch015.html">第 015 章：通信延迟测量与实时性预算 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

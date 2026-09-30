@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第011章 Ray Data集成：数据加载与批处理 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · Ray 基础与分布式编程</span>
+    <span class="sep">/</span>
+    <span>第 011 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · Ray 基础与分布式编程</div>
+    <h1>第 011 章：Ray Data集成：数据加载与批处理</h1>
+    <p class="lead">数据层把"读取、变换、批处理"变成一条声明式流水线：块（Block）为并行单位，流式执行为内存纪律，批处理算子为吞吐引擎。学完能把离线轨迹高效喂给训练循环。</p>
+    <ul class="meta">
+      <li>主题：Ray 生态 / 分布式数据加载与变换</li>
+      <li>关键机制：块结构、惰性执行、流式流水线、批处理算子（map_batches）</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 010 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解数据集（Dataset）的块结构：块是并行与调度的最小单位，块大小决定并行度与内存形态。</li>
+      <li>掌握惰性执行与流式流水线：变换只构图、触发才算，算子之间可以重叠执行。</li>
+      <li>会用批处理算子 map_batches 做向量化变换与批量推理，并正确选择并发度与批大小。</li>
+      <li>掌握与训练循环的对接方式：迭代批次（iter_batches）、数据集分片与跨进程共享。</li>
+      <li>能诊断三类问题：驱动进程内存爆炸、块粒度过细、流水线重复执行。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>强化学习的离线数据规模往往被低估：一条 64k 步的轨迹批次动辄数百兆，百万级轨迹的回放数据集以百 GiB 计。用单进程逐行读取与变换，CPU 在等待存储与序列化的缝隙里闲置。<strong>数据层把数据集切成块，块级并行地读取与变换，再以流式方式供训练消费</strong>，让数据吞吐与训练吞吐解耦。</p>
+    <p>与常见数据处理工具的区别在于执行模型：数据层默认不要求把整个数据集装进内存，也不要求在构图时立即计算。这条特性直接服务于训练循环：训练进程每轮取一个小批次，数据层在后台持续供给，内存占用与数据集总规模无关。</p>
+    <p>本章覆盖三层内容：块与执行模型、变换算子、与训练的对接。采样端的环境数据管道（RLlib 的采样器）另有专门章节，本章聚焦离线数据与批处理。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 块结构：数据集的物理形态</h3>
+    <p>数据集（Dataset）在逻辑上是若干行的序列，在物理上被切分为块（Block）。每个块是一段可独立处理的列式或行式数据，是并行调度的基本单位：</p>
+    <table>
+      <tr><th>概念</th><th>含义</th><th>对性能的影响</th></tr>
+      <tr><td>块（Block）</td><td>一段可分片的行集合</td><td>块数决定并行度上限；块越小调度开销越大</td></tr>
+      <tr><td>块大小</td><td>单块的字节或行数</td><td>影响任务粒度与单任务内存峰值</td></tr>
+      <tr><td>分区（Partition）</td><td>块的逻辑分组</td><td>重分区改变下游算子的并行结构</td></tr>
+    </table>
+    <p><strong>块的切分方式应与存储布局对齐</strong>：读取 Parquet 文件时按文件与行组切块可以只读需要的数据；若块过细，每个块一次任务调度，开销反而超过计算本身。经验区间是让块大小保持在数十兆字节量级，具体随存储带宽与单块处理成本调整。</p>
+
+    <h3>2. 惰性执行与流式流水线</h3>
+    <p>数据层的执行模型有两条规则：</p>
+    <ol>
+      <li><strong>变换惰性</strong>：map、filter、repartition 等调用只登记算子，不触发计算；只有在触发操作（统计、写出、迭代消费）出现时才真正执行。</li>
+      <li><strong>流水线重叠</strong>：执行时，上游块完成一块即可被下游算子处理，各算子阶段并行推进，而不需要整批数据就绪。</li>
+    </ol>
+    <div class="formula">
+      流水线吞吐 ≈ min(读取速度, 变换速度, 消费速度)；稳态内存 ≈ 在途块数 × 块大小
+      <span class="note">阶段速度不齐时，最慢阶段决定整体吞吐；内存由在途块数封顶，与总数据量无关</span>
+    </div>
+    <p>惰性带来的一个常见误解是"重复消费免费"：对同一个数据集对象迭代两次，流水线会重新执行两次（除非显式物化）。<strong>数据集是配方；需要复用中间结果的场景应显式缓存或落盘</strong>。这条语义与第 004 章的 DAG 依赖一脉相承：每次触发都按定义的依赖图重新调度。</p>
+
+    <h3>3. 变换算子：行式与批式</h3>
+    <ul>
+      <li><strong>行式算子</strong>：map 与 filter 逐行处理，语义简单，实现开销按行计。适合轻量标量逻辑；Python 函数逐行调用时解释器开销显著，大数据量下应让位给批式算子。</li>
+      <li><strong>批式算子</strong>：map_batches 一次处理一个批，批格式可选 NumPy 字典或表格结构，配合向量化库把循环展开成张量运算。批量推理（Batch Inference）也走这条路：批内一次前向，吞吐远高于逐行调用。</li>
+      <li><strong>结构算子</strong>：repartition 调整并行结构，随机重排（shuffle）打散数据顺序，join 与 groupby 做聚合。结构算子会引入数据移动，属于重操作，应放在流水线的合适位置。</li>
+    </ul>
+    <p>批式算子的两个关键参数是批大小与并发度。<strong>批大小决定单次计算的向量化效率，并发度决定同时运行的批处理任务数</strong>；两者相乘构成在途数据量，直接约束内存峰值。默认并发度偏保守，重计算变换（图像解码、神经网络推理）应显式调高，并给每个任务声明所需的计算资源。</p>
+    <table>
+      <tr><th>维度</th><th>行式算子（map、filter）</th><th>批式算子（map_batches）</th></tr>
+      <tr><td>调用开销</td><td>每行一次 Python 调用</td><td>每批一次调用</td></tr>
+      <tr><td>适合逻辑</td><td>轻量条件判断与标量运算</td><td>向量化数值计算、模型推理、特征工程</td></tr>
+      <tr><td>内存峰值</td><td>与单行体积相关</td><td>批大小 × 行宽，需要预算</td></tr>
+      <tr><td>主要瓶颈</td><td>解释器逐行开销</td><td>向量化库效率与批大小是否饱和</td></tr>
+    </table>
+
+    <h3>4. 与训练循环对接</h3>
+    <p>训练侧的消费方式有三种：</p>
+    <ol>
+      <li><strong>迭代批次</strong>：<code>iter_batches(batch_size=…)</code> 逐批拉取，训练循环每步处理一批，内存占用与批大小绑定。随机打散可在迭代器层面声明。</li>
+      <li><strong>按分片切分</strong>：把数据集切给多个训练进程，各进程消费自己的分片，避免重复读取。</li>
+      <li><strong>库层共享</strong>：训练库与搜索层提供数据集注册与分片分发接口，进程内通过统一入口获取本地分片。</li>
+    </ol>
+    <p><strong>迭代批次是离线强化学习最常用的形态</strong>：训练步从迭代器取一批 4k 至 64k 行的轨迹数据，做优势估计与梯度更新。数据集若需多轮使用（多个训练轮数），在声明处设置轮数或循环消费；注意每轮重新打散由迭代器参数控制，影响训练随机性质量。</p>
+    <p>打散的粒度值得单独说明：局部打散缓冲区只在流式窗口内重排，内存可控但跨块顺序仍残留相关性；全局随机重排会触发全量数据移动，成本高，通常在准备阶段做一次。多数离线训练用局部打散已经足够，缓冲取迭代批大小的 4 至 8 倍是常见起点；随机性要求高的场景（对顺序敏感的自举法）改为准备阶段全量重排一次再落盘。</p>
+
+    <h3>5. 数值算例：流水线瓶颈、块粒度与向量化收益</h3>
+    <p>用一组读数走完整计算：读取 200 MB/s、变换 80 MB/s、消费 150 MB/s 的三阶段流水线，稳态吞吐取三者的最小值 80 MB/s，瓶颈在变换阶段。以 500 GiB 数据集为例，一轮完整处理耗时 512000 MB ÷ 80 MB/s = 6400 秒，约 1.78 小时。把变换并发从 8 提到 16（假设近似线性扩展），变换阶段升到 160 MB/s，稳态变为 min(200, 160, 150) = 150 MB/s，耗时降到约 3413 秒即 0.95 小时，加速约 1.88 倍。</p>
+    <table>
+      <tr><th>配置</th><th>读取（MB/s）</th><th>变换（MB/s）</th><th>消费（MB/s）</th><th>稳态吞吐</th><th>500 GiB 耗时</th></tr>
+      <tr><td>初始</td><td>200</td><td>80</td><td>150</td><td>80 MB/s</td><td>1.78 h</td></tr>
+      <tr><td>变换并发翻倍</td><td>200</td><td>160</td><td>150</td><td>150 MB/s</td><td>0.95 h</td></tr>
+      <tr><td>再提消费到 200</td><td>200</td><td>160</td><td>200</td><td>160 MB/s</td><td>0.89 h</td></tr>
+    </table>
+    <p>第三行给出边际收益的量化：瓶颈转移到变换阶段后，继续优化消费只把稳态从 150 提到 160 MB/s，耗时改善约 6%。<strong>优化顺序是先定位最慢阶段再提升它，每次只动一个变量并复测</strong>，练习 4 的答案与这张表一致。</p>
+    <p>块粒度的影响同样可算。设调度与启动开销约 50 毫秒/块，块处理速率沿用 80 MB/s：4 MB 的块纯处理 0.05 秒，叠加开销后有效效率 50%；16 MB 为 80%；64 MB 为 94%；256 MB 为 98%。这组数字解释了"数十 MB 量级"经验值的来源：<strong>单块处理时长要比调度开销大一个数量级以上，效率才接近饱和</strong>；块又不能无限增大，单块内存峰值随块大小线性上升，取值的上界由单任务内存预算决定。批式算子的收益来自同一逻辑：行式算子每行一次调用，批式算子每批一次调用，解释器开销被摊薄到批内全部行上。</p>
+
+    <h3>6. 批大小的量化模型与内存预算</h3>
+    <p>把批式算子的单批耗时拆成固定开销与随批增长的变动部分：t(B) = γ + a·B，其中 γ 为任务启动与函数调用开销，a 为单行处理成本。吞吐为 B / (γ + a·B)，随 B 增大单调上升并收敛到上限 1/a。取 γ = 20 毫秒、a = 1.2 微秒/行代入：批大小 512 时单批 20.6 毫秒、吞吐约 2.5 万行/秒；8192 时单批 29.8 毫秒、吞吐约 27.5 万行/秒；65536 时单批 98.6 毫秒、吞吐约 66.4 万行/秒。主要量化收益在数千行量级已经兑现，继续放大批规模，边际吞吐增益递减而内存代价线性上升，上限为 1/a = 83.3 万行/秒。</p>
+    <table>
+      <tr><th>批大小 B</th><th>单批耗时（γ=20 ms，a=1.2 μs/行）</th><th>吞吐（行/秒）</th><th>在途内存（C=8，行宽 2 KB）</th></tr>
+      <tr><td>512</td><td>20.6 ms</td><td>约 2.5 万</td><td>约 8 MB</td></tr>
+      <tr><td>8192</td><td>29.8 ms</td><td>约 27.5 万</td><td>约 128 MB</td></tr>
+      <tr><td>65536</td><td>98.6 ms</td><td>约 66.4 万</td><td>约 1 GB</td></tr>
+    </table>
+    <p>内存要按在途批数核算：单批内存 = B × 行宽，在途内存 = B × 行宽 × 并发 C。行宽按 512 维 float32 观测（2 KB）计，B = 8192 与 C = 8 的在途数据约 128 MB；B 提到 65536 后同样并发升到约 1 GB。批大小的上界通常由单任务内存预算反推：可用内存除以（行宽 × 并发）再向下取整，得到的值再与上表曲线对照，选吞吐已接近饱和的最小批。</p>
+
+    <h3>7. 失败模式与边界</h3>
+    <p>第一个边界来自存储布局：列存文件的最小可切分单位是行组，单个超大行组无法进一步切碎，读取该文件的任务必须整体解码行组，内存尖峰由行组大小决定，调分区参数无效。准备阶段应控制行组规模（数十万行量级），在写入时显式设置。</p>
+    <p>第二个边界是数据倾斜：少数块集中了大部分行，流水线尾部的长任务拖住整批短任务。症状是计算资源利用率前高后低、任务时长分布呈长尾。修复手段是在进入重计算阶段前做一次均匀重分区打散，把行数不均归约为近似均等。</p>
+    <p>第三个失效模式与闭包有关：批函数若捕获外部大对象（整个模型或大字典），每个任务都要序列化一份副本，任务体积暴涨、调度变慢。修复是缩小捕获范围，重量级状态改用调用池（ActorPool）在进程内加载一次、多批共享。</p>
+    <p>顺序语义容易被忽略：map 与 filter 保序，repartition 与随机重排会打散跨块顺序。对时序敏感的轨迹切分与自举目标计算，相邻步必须落在同一分片内成组处理，否则依赖被拆散，优势估计出现错配。消费端的背压交给有界队列：迭代预取与局部打散叠加时，内存峰值是两者之和，调大打散缓冲区前先复核迭代批数与行宽。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>搭建离线数据流水线的步骤：</p>
+    <ol>
+      <li><strong>确认存储布局</strong>：按文件与行组估计块粒度，必要时先合并小文件，减少调度开销。</li>
+      <li><strong>先过滤后变换</strong>：把过滤条件放在流水线前段，减少后续阶段的处理量；列裁剪同理。</li>
+      <li><strong>按类型选算子</strong>：标量逻辑用批式算子内联实现；重计算放批式并发执行并声明资源。</li>
+      <li><strong>定批大小与并发</strong>：批大小按向量化效率与内存预算定，并发按核数与显存定。</li>
+      <li><strong>对接训练消费</strong>：选择迭代批次或分片方式，验证多轮消费与打散行为符合训练需求。</li>
+      <li><strong>度量吞吐</strong>：记录每秒处理行数或字节数，与训练的消费速率对照，找出瓶颈阶段。</li>
+    </ol>
+    <p>第一步"合并小文件"值得展开算一笔账：存储系统对每个文件的打开与元数据查询有固定开销，量级约数十毫秒。10 万个平均 1 MB 的碎文件，仅打开与列举的开销就达 100000 × 0.05 秒 = 5000 秒；合并为 400 个 256 MB 的大文件后，同一开销约 20 秒，相差两个数量级以上。<strong>准备阶段做一次文件重写，比在流水线里长期忍受碎文件的调度开销划算得多</strong>；列存格式下顺带完成列裁剪与压缩。块的切分位置也有讲究：列存文件按行组边界切块可以只解码用到的部分，跨行组的块会触发额外解码，切块策略应尽量与存储布局对齐。</p>
+    <p>流式迭代内部还会做预取：迭代器提前取好下一批，消费与生产重叠，代价是内存中多驻留若干批。内存预算按"(预取批数 + 1) × 批大小 × 行宽"估算，再与局部打散缓冲区叠加核算，避免多个缓冲项同时放大峰值。</p>
+    <table>
+      <tr><th>参数</th><th>典型取值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>块大小</td><td>数十 MB</td><td>任务粒度</td><td>调度开销与单任务内存的折中</td></tr>
+      <tr><td>map_batches 批大小</td><td>4096–65536 行</td><td>向量化效率</td><td>行宽与向量化库的最佳区间</td></tr>
+      <tr><td>map_batches 并发</td><td>4–64</td><td>同时运行的批任务数</td><td>核数除以单任务声明核数</td></tr>
+      <tr><td>迭代批大小</td><td>4k–64k 步</td><td>训练侧消费粒度</td><td>与训练批次规模对齐</td></tr>
+    </table>
+    <div class="box tip">
+      <span class="box-title">与上一章的差异点</span>
+      <p>第 010 章把数据层定位为"供给者"；本章拆开供给过程：数据如何切块、如何流式变换、如何被训练循环分批取走。下一章的 Serve 则是相反方向：把模型发布出去、把请求收进来。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>以下片段采用 Ray 2.x 时期的通用写法；接口随版本演进，以对应版本官方文档为准。</p>
+    <p><strong>片段 1：惰性构图与触发执行</strong></p>
+    <pre class="code"><code>import ray
+from ray import data
+
+ray.init(num_cpus=16)
+
+# 构图阶段：只登记算子，不读任何数据，调用立即返回
+ds = (data.read_parquet("/data/replay/*.parquet")
+      .map(lambda row: {"obs": row["obs"], "act": row["action"],
+                        "rew": float(row["reward"])})
+      .filter(lambda row: row["rew"] != 0.0)     # 丢弃零收益样本，减少下游量
+      .repartition(32))                           # 32 个块：与 16 核匹配的并行度
+
+print("构图完成，数据集块数: %d" % ds.num_blocks())   # 触发轻量元数据查询
+
+# 触发阶段：真正开始并行读取与变换，结果汇总后返回
+n = ds.count()
+print("有效样本数:", n)
+
+# 物化：把变换结果写入存储，供多轮训练复用（避免重复执行流水线）
+ds.write_parquet("/data/replay_clean")</code></pre>
+    <p>解读：三个动作的边界值得仔细分辨。<code>num_blocks</code> 只查元数据，可以低成本调用；<code>count</code> 触发全量执行，是重操作；<code>write_parquet</code> 同样触发执行，并把结果持久化。<strong>把"清洗后数据集落盘"当成训练前的标准准备步骤，可以显著降低多轮训练的重复计算</strong>：一次写入，后续多轮实验直接读取清洗版。重分区到 32 块是为了让 16 个核有充分的分片可调度，块数略多于核数是数据管道的常规做法。</p>
+
+    <p><strong>片段 2：批式变换与批量推理</strong></p>
+    <pre class="code"><code>import ray
+from ray import data
+import numpy as np
+
+ray.init(num_cpus=16)
+
+def preprocess(batch):
+    """批内向量化变换：一次处理 8192 行，避免逐行解释器开销。"""
+    obs = np.stack(batch["obs"]).astype(np.float32)      # 行集合转为稠密张量
+    norm = (obs - obs.mean(axis=0)) / (obs.std(axis=0) + 1e-8)
+    return {"obs": norm, "rew": np.asarray(batch["rew"], dtype=np.float32)}
+
+def infer(batch):
+    """批量推理示意：这里用确定性函数替代真实模型前向。"""
+    obs = batch["obs"]
+    value = obs @ np.ones((obs.shape[1], 1), dtype=np.float32)   # 简化价值估计
+    return {"obs": obs, "value": value.reshape(-1)}
+
+ds = (data.read_parquet("/data/replay/*.parquet")
+      .map_batches(preprocess, batch_size=8192, batch_format="numpy",
+                   concurrency=8)                    # 8 个批任务并行变换
+      .map_batches(infer, batch_size=4096, concurrency=4))       # 推理并发略低
+print("价值列示例:", ds.take(1)[0]["value"])</code></pre>
+    <p>解读：两个批算子的参数选择各有依据。<code>preprocess</code> 是轻量数值变换，批大小 8192 与并发 8 让 16 核基本跑满；<code>infer</code> 是重计算，批大小降到 4096、并发降到 4，控制单任务内存与计算时长，避免批过大导致尾延迟拖长整条流水线。<strong>批大小与并发应当按算子重量分别设定，避免全链路共用一个值</strong>。在真实的 GPU 推理场景中，还会为批任务声明显存需求，调度器据此把任务分配到有卡的节点，这套资源声明语法与第 008 章完全一致。</p>
+
+    <p><strong>片段 3：流式迭代对接训练循环</strong></p>
+    <pre class="code"><code>import ray
+from ray import data
+
+ray.init(num_cpus=16)
+
+ds = data.read_parquet("/data/replay_clean")     # 清洗后的数据集，一次物化多次消费
+
+def train_step(batch):
+    """占位训练步：返回批内样本数与收益统计，验证数据形态。"""
+    import numpy as np
+    rew = np.asarray(batch["rew"], dtype=np.float32)
+    return len(rew), float(rew.mean())
+
+# 流式消费：每次只取 8192 行，驱动进程内存与数据集总规模无关
+epochs = 2
+for epoch in range(epochs):
+    total_rows, total_rew = 0, 0.0
+    for batch in ds.iter_batches(batch_size=8192, batch_format="numpy",
+                                 local_shuffle_buffer_size=32768):
+        rows, mean_rew = train_step(batch)       # 训练步消费即时批次
+        total_rows += rows
+        total_rew += mean_rew * rows
+    print(f"第 {epoch + 1} 轮: {total_rows} 行, 平均收益 {total_rew / total_rows:.3f}")</code></pre>
+    <p>解读：<code>iter_batches</code> 是流式消费的入口：批大小 8192 与训练侧批次规模对齐，<code>local_shuffle_buffer_size</code> 在三万行量级的缓冲区里做局部打散，兼顾随机性与内存。<strong>外层两轮循环共享同一个数据集对象，流水线每轮重新执行，这正是"数据集是配方"的体现</strong>；若两轮都必须避免重算，应在准备阶段先落盘清洗版（片段 1 已做）。多进程训练场景把这段消费逻辑放进各训练进程，用分片接口替换整体迭代器即可，消费模式不变。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>驱动进程整表拉取</strong>：对百 GiB 数据集调用整表转换接口，驱动内存瞬间打满。症状是转换阶段进程被杀。修复：改用流式迭代或先落盘；驱动进程只做调度与轻量汇总。</li>
+      <li><strong>重复消费重复计算</strong>：同一数据集对象被多轮迭代，每轮完整重跑流水线，预处理耗时叠加。修复：清洗结果落盘物化，或显式缓存中间数据集。</li>
+      <li><strong>块粒度过细或过粗</strong>：块数以千计导致调度开销淹没计算；块过大（单块数 GiB）则单任务内存峰值失控。修复：按数十 MB 量级调整分区数，与核数保持数倍关系。</li>
+      <li><strong>批式算子并发与核数脱节</strong>：并发过高造成内存与上下文切换开销，过低则核数闲置。症状是流水线吞吐与核数不成比例。修复：并发数约等于核数除以单任务声明核数，并用吞吐度量校准。</li>
+      <li><strong>过滤太晚</strong>：把强过滤条件放在流水线末端，前段白白处理了大部分将被丢弃的数据。修复：能前置的裁剪与过滤一律前置，减少全链路工作量。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把片段 2 的 <code>concurrency</code> 从 8 改为 2，预测整条流水线的吞吐瓶颈位置与总耗时变化，运行验证并说明判断依据。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>并发不足时预处理阶段成为最慢阶段，按流水线吞吐等于最慢阶段速度的关系，整体吞吐下降明显；观察下游算子的等待形态即可定位瓶颈。</div></details>
+      </li>
+      <li>预测题：片段 3 中把 <code>local_shuffle_buffer_size</code> 从 32768 提高到 1000000，随机性如何变化？内存峰值如何变化？给出适配本机内存的建议值。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>打散更充分但缓冲区占用剧增。建议值与单行体积、可用内存挂钩，通常取迭代批大小的 4–8 倍。</div></details>
+      </li>
+      <li>设计题：为"十亿行日志筛选、解析、向量化后交训练"的管道设计完整流水线：算子顺序、块与批参数、物化点，并说明每个选择的依据。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>顺序：读取、前置过滤、解析、向量化、落盘物化、流式出训。物化点放在向量化之后，避免训练轮次重复解析。</div></details>
+      </li>
+      <li>分析：某流水线读取阶段 200 MB/s，变换阶段 80 MB/s，消费阶段 150 MB/s。求稳态吞吐，并给出两种提升方案（分别提升哪个阶段、预期上限）。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>稳态约 80 MB/s，由最慢阶段决定。提升变换并发可向 150 逼近；同时优化消费与读取后上限为 min(200, 变换新值)。</div></details>
+      </li>
+      <li>推导：设批大小为 B、并发为 C、单批处理时长与 B 成正比（系数 a），写出吞吐表达式；讨论 B 增大时吞吐与内存的变化趋势，给出最优批大小的定性条件。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>吞吐约 B/(aB)=1/a 与 B 无关，但固定启动开销让大 B 摊薄得更好；内存随 B×C 线性上升。最优 B 让单批时长显著大于任务调度开销，同时内存可控。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>数据集物理上是块的序列，块是并行与调度单位；块大小在调度开销与内存峰值之间折中。</li>
+      <li>执行模型两条规则：变换惰性、流水线重叠；<strong>数据集是配方，重复消费会重复执行，复用前先物化</strong>。</li>
+      <li>批式算子把逐行解释开销摊成向量化计算；批大小与并发按算子重量分别设定。</li>
+      <li>训练对接优先用流式迭代：内存与批大小绑定，与数据集总规模解耦；多进程训练改走分片接口。</li>
+      <li>下一章转向数据流的另一端：<strong>Ray Serve 部署入门</strong>，把训练好的模型发布成可伸缩服务。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch010.html">← 第 010 章：Ray与机器学习生态集成概览</a>
+    <a class="next" href="ch012.html">第 012 章：Ray Serve部署入门 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

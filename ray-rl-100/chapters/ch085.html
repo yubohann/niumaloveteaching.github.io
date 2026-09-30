@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第085章 训练吞吐与采样效率分析 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第五篇 · 训练工程与系统进阶</span>
+    <span class="sep">/</span>
+    <span>第 085 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第五篇 · 训练工程与系统进阶</div>
+    <h1>第 085 章：训练吞吐与采样效率分析</h1>
+    <p class="lead">一句话：本章把训练一轮迭代的时间拆成采样、学习与通信三段账，给出吞吐指标的口径定义、瓶颈定位流程与可复用的基准测试方法。</p>
+    <ul class="meta">
+      <li>主题：训练工程 / 吞吐分析（Throughput Analysis）</li>
+      <li>关键机制：迭代时间分解、硬件效率、瓶颈判定、基准测试协议</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 084 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解四个彼此独立的分析口径：采样吞吐（SPS）、更新吞吐、采样效率、硬件效率，并说明各自回答什么问题。</li>
+      <li>掌握迭代时间分解模型，能把一轮训练的时间拆成采样、学习、通信与聚合四段。</li>
+      <li>学会用"哪一侧在等待"的方法判定瓶颈位于采样端还是学习端。</li>
+      <li>会按固定协议搭建基准测试：预热、重复测量、稳态取值、口径记录。</li>
+      <li>能为自己的训练任务建立一份可复现的吞吐报告模板。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>前面四章的搜索维度（损失系数、复用预算、并行度、内存）最终都会反映到两个数字上：训练一轮要用多少时间，以及同样的时间能推进多少学习。<strong>缺少统一的分析口径时，调优容易陷入"改了配置、时间变了、不知道哪一段变了"的混乱。</strong>例如把并行度加倍后单轮迭代时间反而上升，可能因为采样侧提速但学习侧排队加长，也可能因为通信占比上升；不拆开时间账，就无法给出修正方向。</p>
+    <p>另一个常见混淆是把吞吐当作学习效果：采样吞吐提升三成不意味着达到目标回报更快，因为更大的批可能改变学习轨迹；反之学习质量相近的两套配置，吞吐高者显然更优，因为同样的样本预算消耗更少的墙钟时间。本章把"快"与"好"严格分开计量，先讲全部口径，再讲分解与测量，最后给出瓶颈判定与优化顺序。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p><strong>吞吐分析的核心动作是把一轮迭代的墙钟时间拆开，判断时间花在哪一段，再决定优化哪一段。</strong>本节从口径定义开始，逐层分解到瓶颈判定。</p>
+
+    <h3>1. 四个分析口径</h3>
+    <table>
+      <tr><th>口径</th><th>定义</th><th>单位</th><th>回答的问题</th></tr>
+      <tr><td>采样吞吐 SPS</td><td>每秒推进的环境步数</td><td>步/秒</td><td>数据管道供给能力</td></tr>
+      <tr><td>更新吞吐</td><td>每秒完成的梯度更新次数</td><td>次/秒</td><td>学习侧计算能力</td></tr>
+      <tr><td>采样效率</td><td>达到回报阈值所需的样本量</td><td>步</td><td>算法的数据利用质量</td></tr>
+      <tr><td>硬件效率</td><td>实测 SPS 与理论线性上限之比</td><td>比率</td><td>资源利用是否划算</td></tr>
+    </table>
+    <p>四者相互独立：采样效率高的算法可能在低效硬件配置上跑得慢；吞吐高的系统可能因为批结构变化导致学习质量下降。任何调优结论都应声明关注的是哪一个口径，混用会得出"变快了但没变好"或"变好了但更慢"这类无法行动的报告。</p>
+
+    <h3>2. 迭代时间分解</h3>
+    <p>同步更新模式下，一轮迭代的墙钟时间可以写成四段之和：</p>
+    <div class="formula">
+      T<sub>iter</sub> = T<sub>sample</sub> + T<sub>learn</sub> + T<sub>comm</sub> + T<sub>aggregate</sub>
+      <span class="note">T<sub>sample</sub> 为并行采集时间（由最慢 worker 决定），T<sub>learn</sub> 为学习器更新时间，T<sub>comm</sub> 为权重广播与样本回传，T<sub>aggregate</sub> 为指标聚合与调度开销</span>
+    </div>
+    <p>采样吞吐与迭代时间的关系为 SPS = B / T<sub>iter</sub>，B 为批大小。代入一组典型数值：B = 4000，T<sub>sample</sub> = 5 秒，T<sub>learn</sub> = 2 秒，T<sub>comm</sub> 与 T<sub>aggregate</sub> 合计 1 秒，则 T<sub>iter</sub> = 8 秒，SPS = 500 步/秒。<strong>四段占比决定了优化方向</strong>：采样占 62.5% 时，提高并行度或降低单步成本收益最大；学习占了大头时，优化应转向网络规模、批处理效率与算子选择。</p>
+    <p>各段内部还可再分：T<sub>sample</sub> 包含环境步进时间、策略前向推理与观测预处理；T<sub>learn</sub> 包含前向、反向与优化器更新，反向约是前向的两倍计算量；T<sub>comm</sub> 与策略网络的参数量成正比，小网络低维观测时通常不足总量的百分之几，大视觉网络时可以到一成以上。</p>
+
+    <h3>3. 瓶颈判定："谁在等"</h3>
+    <p>判断瓶颈的可靠依据是等待结构：单轮时间占比会被抖动误导，连续多轮中"谁先完成、谁后完成"才给出稳定信号。在同步模式下，如果采样 worker 每轮结束都空闲等待新一轮权重下发，说明学习侧是瓶颈（采样供给超过学习消化能力）；如果学习器每轮开始处于空闲状态等待样本就绪，说明采样侧是瓶颈。框架计时器里体现为两侧的"空闲比"：采样间隔中学习耗时的占比、学习循环中等待批队列的占比。连续若干轮观察空闲比，比单轮耗时更能稳定地指示瓶颈，因为它排除了偶发抖动。</p>
+    <p>常见的瓶颈形态有三类。<strong>采样受限</strong>：低维观测、简单环境、强并行硬件上常见，表现为学习器长期空闲等待，优化方向是增大采样规模或减少每步预处理开销。<strong>学习受限</strong>：大视觉网络、高复用比配置上常见，表现为 worker 长时间空转，优化方向是改进网络效率与批处理、降低每步更新数量需求。<strong>通信受限</strong>：跨节点部署、大策略网络时常见，表现为 T<sub>comm</sub> 随节点数上升而显著增长，优化方向是减少权重广播频率（降低梯度同步频次）与压缩传输。</p>
+
+    <h3>4. 硬件效率与边际收益</h3>
+    <p>硬件效率的上限是把所有采样实例按单实例步率线性叠加：E = SPS / (N × r)。效率低于 0.8 时，投入更多核的边际收益开始快速递减（第 083 章的缩放曲线）。学习侧同理：GPU 利用率长期低于 50% 说明存在等待空洞，正确方向是扩容采样端，GPU 本身扩容解决不了采样等待。<strong>调优顺序应先解决"等待空洞"，再追求单点速度</strong>：让两侧都接近满负荷之后再优化单步成本，收益才不会被空洞吞掉。</p>
+
+    <h3>5. 基准测试协议</h3>
+    <p>吞吐数字只有在一个固定协议下才有意义，协议包含五项约定：<strong>预热</strong>（丢弃前一到两轮迭代，避开库初始化与缓存建立）；<strong>时长</strong>（至少十轮迭代或两分钟，取较长者，以覆盖调度抖动）；<strong>取值</strong>（报中位数与四分位距，极值单独列示）；<strong>口径</strong>（明确 SPS 按环境步计、批量是否含截断重复样本、计时用单调时钟）；<strong>记录</strong>（并行度、批大小、硬件型号、框架版本随结果一并存档）。对照实验中除被测变量外全部配置冻结。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>建立吞吐分析的流程分五步，产出物是一份可复跑的基准报告。</p>
+    <ol>
+      <li><strong>明确目标口径</strong>：先声明本轮优化关注 SPS 还是采样效率；两者同时看时分开成两张表。</li>
+      <li><strong>搭建基准</strong>：写一个独立脚本，固定随机种子与全部配置，按协议跑测量并输出分解数据。</li>
+      <li><strong>绘制分解表</strong>：逐迭代记录四段耗时与两侧空闲比，形成时间序列；单轮快照不足以判定瓶颈。</li>
+      <li><strong>定位瓶颈与验证</strong>：按"谁在等"给出假设，只改一个变量做对照实验，确认分解结构按预期变化。</li>
+      <li><strong>固化报告</strong>：把协议五项约定与结果一起存档，作为后续变更的对照基线。</li>
+    </ol>
+    <h3>指标与工具对照表</h3>
+    <table>
+      <tr><th>观测项</th><th>来源</th><th>判断用途</th></tr>
+      <tr><td>sample_time / learn_time</td><td>训练结果计时器</td><td>四段分解的主体</td></tr>
+      <tr><td>env_steps_sampled / 墙钟</td><td>结果字段与外部计时</td><td>SPS 口径</td></tr>
+      <tr><td>GPU 利用率采样</td><td>卡侧采样工具</td><td>学习侧空洞检测</td></tr>
+      <tr><td>CPU 利用率采样</td><td>系统采样工具</td><td>采样侧超订检测</td></tr>
+      <tr><td>两侧空闲比</td><td>迭代时间差与等待计数</td><td>瓶颈判定的直接证据</td></tr>
+    </table>
+    <div class="box warn">
+      <span class="box-title">与上一章的差异</span>
+      <p>第 084 章关心"配置能否装进机器"，本章关心"装进去之后跑得多快、快在哪一段"。内存约束决定可行域，吞吐分解决定可行域内的最优点；两章共同构成容量与效率的完整视图。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>以下片段基于 Ray 2.x 时期的通用写法，接口随版本演进，以对应版本的官方文档为准。</p>
+
+    <p><strong>片段 1：从训练结果中提取时间分解</strong></p>
+    <pre class="code"><code>def print_breakdown(result):
+    """把一轮迭代的时间拆成采样、学习与其余部分，打印占比。
+    口径固定为毫秒，来源为框架计时器，便于跨版本核对。"""
+    s = result["timers"]["sample_time_ms"]
+    l = result["timers"]["learn_time_ms"]
+    total = result["time_this_iter_s"] * 1000.0
+    # 分解项相加未必等于总时间：差值即通信与聚合开销
+    other = max(total - s - l, 0.0)
+    steps = result["env_runners"]["num_env_steps_sampled_this_iter"]
+    sps = steps / max(result["time_this_iter_s"], 1e-9)
+    print(f"迭代 {total:.0f} ms | 采样 {s:.0f} ({s/total:.0%}) | "
+          f"学习 {l:.0f} ({l/total:.0%}) | 通信与聚合 {other:.0f}")
+    # SPS 按环境步口径计算：明确它衡量数据供给，不衡量学习质量
+    print(f"采样吞吐 {sps:.0f} 步/秒（批 {steps} 步）")
+    return {"sample": s, "learn": l, "other": other, "sps": sps}</code></pre>
+    <p>解读：这段打印函数刻意保留了"差值项"。<strong>（1）</strong>把总时间减去采样与学习得到"其余"，它吸收了通信、聚合与调度开销；其余项异常大时，说明瓶颈可能落在传输上，两端计算未必是主因。<strong>（2）</strong>占比同时输出绝对值与百分比：跨机器比较看百分比结构，同机回归看绝对值漂移。<strong>（3）</strong>SPS 的注释强调口径分离，避免后续把吞吐变化误读为算法改进，这一约定应写入团队的分析文档。</p>
+
+    <p><strong>片段 2：带预热与重复的基准测量</strong></p>
+    <pre class="code"><code>import statistics
+import time
+
+def benchmark(algo, warmup=2, iters=12):
+    """固定协议基准：预热若干轮后连续测量，报告中位数与四分位距。
+    预热期用于建立算子缓存与稳定内存分配，测量期不改变任何配置。"""
+    for _ in range(warmup):
+        algo.train()                           # 预热样本不进入统计
+    sps_samples = []
+    for _ in range(iters):
+        result = algo.train()
+        steps = result["env_runners"]["num_env_steps_sampled_this_iter"]
+        sps_samples.append(steps / max(result["time_this_iter_s"], 1e-9))
+    sps_samples.sort()
+    mid = statistics.median(sps_samples)
+    # 四分位距反映方差：IQR 大说明存在跨迭代抖动，需先查调度或内存压力
+    q1 = sps_samples[len(sps_samples) // 4]
+    q3 = sps_samples[(3 * len(sps_samples)) // 4]
+    print(f"SPS 中位数 {mid:.0f}，四分位距 [{q1:.0f}, {q3:.0f}]")
+    return mid, (q1, q3)</code></pre>
+    <p>解读：这段基准的每个约定都对应一类测量偏差。<strong>（1）</strong>预热丢弃前两轮，避开库加载、显存分配器扩张与对象存储建连的瞬时开销，这些开销会把首轮时间抬高数倍。<strong>（2）</strong>用中位数与四分位距代替均值，方差信息保留下来：抖动大本身就是结论，指向调度或内存压力。<strong>（3）</strong>测量期不改变任何配置，包括不打日志级别、不改评估频率，保证被测系统处于同一状态。</p>
+
+    <p><strong>片段 3：滚动吞吐与瓶颈信号</strong></p>
+    <pre class="code"><code>class ThroughputTracker:
+    """维护滚动窗口的吞吐与空闲比，用连续观察代替单轮快照。"""
+    def __init__(self, window=8):
+        self.window = window
+        self.history = []
+
+    def update(self, sample_ms, learn_ms, total_ms):
+        # 采样间隔 = 总时间 - 学习时间：其中越大，采样端越闲
+        sample_idle = max(total_ms - learn_ms - sample_ms, 0.0) / total_ms
+        # 学习等待 = 总时间 - 采样时间 - 学习时间：体现学习开始前等样本的时长
+        learn_wait = max(total_ms - sample_ms - learn_ms, 0.0) / total_ms
+        self.history.append((sample_idle, learn_wait))
+        if len(self.history) > self.window:
+            self.history.pop(0)
+        s_idle = sum(h[0] for h in self.history) / len(self.history)
+        l_idle = sum(h[1] for h in self.history) / len(self.history)
+        # 连续多轮采样端空闲高：学习侧是瓶颈；反之采样侧是瓶颈
+        if s_idle > 0.2 and s_idle > l_idle:
+            print("采样端长期空闲：学习侧构成瓶颈，优先优化学习效率")
+        elif l_idle > 0.2:
+            print("学习端长期等待样本：采样侧构成瓶颈，优先扩大采样并行度")</code></pre>
+    <p>解读：这个跟踪器的判定逻辑建立在一个可观测的代理量上。<strong>（1）</strong>同步模式下，两侧的时间差就是空闲证据：采样段用时短于总时间，说明 worker 在等待；学习段用时短于总时间，说明学习器在等待。<strong>（2）</strong>滚动窗口抑制单轮噪声，阈值 20% 是把偶发调度抖动与结构性空闲区分开的经验线。<strong>（3）</strong>输出的是行动指引：两类结论分别指向学习侧与采样侧的优化清单，与第 083、089 章的扩容方法衔接。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>跳过预热直接报告首轮</strong>：首轮包含库初始化与缓存建立，数值常偏高数倍。修复：预热至少两轮，并在报告中注明预热策略。</li>
+      <li><strong>把训练回报变化当作吞吐结论</strong>：吞吐口径只描述数据供给能力，回报变化属于学习质量，两者混用无法归因。修复：报告中分开列示，并注明各自的口径定义。</li>
+      <li><strong>用不同任务或不同环境版本的 SPS 直接比较</strong>：单步代价与终止逻辑不同，数字不可比。修复：对照实验冻结环境版本与终止条件，跨任务比较只用硬件效率与相对值。</li>
+      <li><strong>测量期开启调试日志与高频评估</strong>：日志写盘与评估回合挤占计算时间，测量值系统性偏低。修复：测量期使用生产日志级别与正常评估频率，或固定评估频率后再比较。</li>
+      <li><strong>只看均值不看方差</strong>：均值掩盖迭代间抖动，而抖动往往指向内存压力或调度问题。修复：报告中位数与四分位距，抖动异常时先排查资源竞争。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>计算题：一轮迭代采样 5 秒、学习 2 秒、通信与聚合 1 秒，批 4000 步。求 SPS 与三段占比。若采样并行度加倍使采样时间减半，新的 SPS 是多少？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>原 SPS = 500；采样减半后 T=5.5 秒，SPS ≈ 727，提升 45%。</div></details>
+      </li>
+      <li>预测题：学习端长期等待样本、GPU 利用率不足 50%。把复用轮数从 4 提到 8，预测两侧空闲比与 SPS 的变化。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>学习时间上升、采样等待更久，SPS 可能下降；只有增加采样供给才是对的方向。</div></details>
+      </li>
+      <li>设计题：为跨两台机器的训练任务设计吞吐基准协议：预热、时长、取值、口径与记录字段，并说明跨机通信开销应如何单独测量。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>固定五要素；跨机开销用"其余项"与网络采样工具交叉验证；对照实验只改拓扑一个变量。</div></details>
+      </li>
+      <li>分析题：证明"学习器空闲比高"与"采样端空闲比高"在同步模式下互斥的近似性，并给出两者同时偏高的一种可能解释。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>同步屏障下总时间由较长一段决定，两侧一般不会同时显著空闲；同时偏高通常说明第三类开销（通信、聚合或调度）占比大。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>四个口径彼此独立：采样吞吐、更新吞吐、采样效率与硬件效率，各自回答不同问题。</li>
+      <li>迭代时间拆成采样、学习、通信与聚合四段；分解结构决定优化方向，SPS = 批大小 ÷ 迭代时间。</li>
+      <li>瓶颈判定看"谁在等"：连续多轮的空闲比是比单轮耗时更可靠的证据。</li>
+      <li>基准协议五要素：预热、时长、取值、口径、记录；中位数与四分位距同时报告。</li>
+      <li>下一章进入更新节奏本身：异步与同步两种更新模型在吞吐与偏差上的取舍。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch084.html">← 第 084 章：超参搜索实战：内存与显存预算</a>
+    <a class="next" href="ch086.html">第 086 章：异步更新与同步更新对比 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

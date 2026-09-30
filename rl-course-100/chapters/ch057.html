@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第057章 SAC的模仿学习初始化 | 深度强化学习课程 · PPO、SAC 与多智能体系统</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 离策略方法与 SAC</span>
+    <span class="sep">/</span>
+    <span>第 057 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 离策略方法与 SAC</div>
+    <h1>第 057 章：SAC的模仿学习初始化</h1>
+    <p class="lead">先用一个脚本化专家（能量泵 + PD 稳定）生成 6000 条摆杆示范，再对比三条训练路线：空池从头学、专家数据预填回放池、以及预填 + 行为克隆损失，用 1000/2000 步处的评估回报量化"起跑线"能提前多少。</p>
+    <ul class="meta">
+      <li>主题：模仿学习（Imitation Learning）初始化 / 行为克隆</li>
+      <li>关键公式：L<sub>π</sub> = 𝔼[α·logπ − Q] + λ·𝔼‖μ<sub>θ</sub>(s)·s<sub>scale</sub> − a<sub>expert</sub>‖²</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 056 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解模仿学习初始化的两条通道：专家数据进回放池（数据层）与行为克隆损失（目标层）。</li>
+      <li>实现一个可复用的脚本化专家控制器：能量泵负责起摆、PD 负责稳定。</li>
+      <li>实现带示范数据的预填与行为克隆（Behavior Cloning, BC）辅助损失，并保证 SAC 主目标不被破坏。</li>
+      <li>用早期评估点（1000/2000 步）衡量模仿初始化的价值（最终成绩只作背景参考），并解释 bc_coef 的取舍。</li>
+      <li>会设计"专家池与回放池分离"的工程结构，让 BC 语义在长训练中保持稳定。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>SAC 在 Pendulum 上大多要几千步才开始"像样"，前一千步基本在浪费：策略随机、Q 网络对着零散数据拟合、回放池里没有一条高质量轨迹。如果手头恰好有一个能用的控制器（经典控制律、仿真脚本、甚至人类演示），为什么不用它把起跑线提前？</p>
+    <p>本章做的是"扶上马、送一程"：用专家示范显著改善 SAC 前两千步的表现，然后让 Q 梯度按自己的节奏接管。与第 056 章的元学习不同，元学习靠任务分布训练出先验，本章直接注入<strong>外部知识</strong>。这条路线有明确的适用边界：手里要有"能用的专家"，且专家水平要高于随机策略一个档位以上；如果专家本身接近随机，示范数据的价值主要来自状态覆盖，而 BC 项会把策略拉向一个错误方向，此时应退回到只做预填、不启用 BC。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 数据层：预填回放池</h3>
+    <p>把专家轨迹 (s, a, r, s′) 写进回放池后，SAC 的每个 mini-batch 里都混有高质量样本。对 Q 学习而言，这直接提供了"好动作大概长什么样"的目标值；对策略而言，Q(s,a) 在专家动作附近的估计更准，策略提升有了可信的梯度方向：</p>
+    <div class="formula">
+      𝒟<sub>0</sub> = 𝒟<sub>expert</sub> ∪ 𝒟<sub>online</sub>
+      <span class="note">专家数据不是"作弊"：SAC 仍然用 TD 目标在真实环境奖励上学习，只是起步更快</span>
+    </div>
+    <p>符号说明：𝒟<sub>expert</sub> 是示范转移集合，𝒟<sub>online</sub> 是训练过程中新采的数据。两者共用一条数据接口，后续的采样、更新逻辑一行都不用改。</p>
+
+    <div class="box key">
+      <span class="box-title">数值例子：示范数据的账怎么算</span>
+      <p>示范采集：30 个回合、Pendulum 每回合上限 200 步，约 30×200 = 6000 条转移；训练预算 8000 步，也就是说<strong>开局时池内 6000 条全是专家数据，占训练期总步数的 75%</strong>，每个 mini-batch 里大部分样本来自专家。</p>
+      <p>BC 项的用量：每次更新从专家池抽 64 条，8000 次更新共约 51.2 万次抽取，池内 6000 条平均被重复使用约 85 次；由于池子固定不覆盖，整个训练期 BC 的监督目标保持稳定。</p>
+      <p>专家动作的数值示例：自然下垂附近 θ̇=2、θ≈π（cosθ≈−1，E = 0.5×4 + 15×(−1) = −13），能量泵输出 u = 0.015×2×(15−(−13)) = 0.84，离上限 2.0 尚有余量，持续加能；接近直立后 |θ|<0.4，切换 PD：θ=0.2、θ̇=−0.5 时 u = −6×0.2 − 1.5×(−0.5) = −0.45，小幅修正。解读：两段控制的分工在数字上很清楚，泵负责"攒能量"，PD 负责"稳住角度"（比例增益 6 略高于静态平衡所需的 5，见第 054 章）。</p>
+    </div>
+
+    <h3>2. 目标层：行为克隆辅助损失</h3>
+    <p>在策略损失上加一项监督回归：</p>
+    <div class="formula">
+      L<sub>π</sub> = 𝔼[ α·log π(a|s) − Q(s,a) ] + λ · 𝔼<sub>(s,a)~𝒟<sub>expert</sub></sub>[ ‖ tanh(μ<sub>θ</sub>(s))·s<sub>scale</sub> − a<sub>expert</sub> ‖² ]
+      <span class="note">λ 就是 --bc-coef；前两项是标准 SAC 策略损失，第三项是模仿项</span>
+    </div>
+    <p>符号说明：μ<sub>θ</sub>(s) 是策略网络的均值输出，s<sub>scale</sub> 是动作缩放（Pendulum 为 2.0），a<sub>expert</sub> 是专家动作。它把"策略均值输出"拉向专家动作。注意监督目标取<strong>均值动作</strong>：采样动作带噪声，会干扰监督信号；均值动作才是策略的"意图"。</p>
+    <p>两个通道的关系可以这样理解：数据层改变的是"Q 网络看到什么"，目标层改变的是"策略参数被往哪个方向拉"。只有数据层时，Q 虽然更准，但策略仍要靠 Q 梯度自己走完从随机到可用的距离；加上目标层后，策略的均值输出直接获得一条"抄近路"的监督信号。两者叠加的顺序也有讲究：BC 项必须只进入策略优化器，不能混进 Q 目标或温度损失，否则"专家动作一定好"的先验会污染价值函数，Q 值系统性偏高，后续的策略提升反而失去校准。用一句话概括分工：<strong>预填让评论家开局就有好样本，BC 让演员开局就有好动作</strong>。</p>
+
+    <h3>3. bc_coef 的取舍</h3>
+    <p>λ 太大时，模仿项主导策略更新，策略停在专家水平，如果专家只有 −500 分，SAC 的探索能力就白费了；λ 太小时，早期优势不明显。经验区间是 0.1～1.0，且<strong>可以随训练步数衰减</strong>（练习）。另一个隐患是"分布漂移"：专家数据只覆盖专家走过的状态，训练后期策略访问到专家没见过的状态时，BC 项提供的监督变弱，真正接管的是 Q 梯度，这正是我们要的退出机制：<strong>BC 管起步，Q 管上限</strong>。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+
+    <h3>数据流</h3>
+    <p>主流程四步：<strong>采集示范</strong>（脚本专家跑 30 个回合，动作叠 σ=0.5 噪声，约 6000 条转移）→ 三种模式各自训练 8000 步 → 在 1000/2000/4000/8000 步处评估 → 汇总早期评估点与达标步数。三种模式的差异只在初始化：scratch 空池；prefill 把示范批量写入回放池；prefill+bc 额外建一个只装示范的专家池，每次更新抽 64 条算 BC 项。</p>
+
+    <h3>模块划分</h3>
+    <table>
+      <tr><th>组件</th><th>职责</th><th>关键点</th></tr>
+      <tr><td><code>expert_action(obs)</code></td><td>脚本专家：能量泵 + PD 切换</td><td>由 <code>[cosθ, sinθ]</code> 反推角度；能量目标 15（与 3g/2 系数一致）</td></tr>
+      <tr><td><code>collect_expert_data</code></td><td>带噪声采集示范转移</td><td>噪声 σ=0.5 增加状态覆盖，同时保留可学习的动作质量</td></tr>
+      <tr><td><code>ReplayBuffer.add_batch</code></td><td>批量预填专家数据</td><td>与在线数据共用同一套缓冲结构</td></tr>
+      <tr><td>专家池 <code>expert_buf</code></td><td>行为克隆专用数据源</td><td>只装示范数据，不会被在线数据稀释</td></tr>
+      <tr><td><code>SAC.update(..., bc_batch)</code></td><td>在策略损失上叠加 BC 项</td><td>BC 只影响策略优化器，Q 与温度照常</td></tr>
+    </table>
+
+    <h3>三种模式</h3>
+    <table>
+      <tr><th>模式</th><th>回放池</th><th>BC 损失</th></tr>
+      <tr><td><code>scratch</code></td><td>空池</td><td>无（基线）</td></tr>
+      <tr><td><code>prefill</code></td><td>预填 6000 条示范</td><td>无</td></tr>
+      <tr><td><code>prefill+bc</code></td><td>预填 6000 条示范</td><td>λ=0.5，从专家池抽 64 条/次</td></tr>
+    </table>
+
+    <h3>关键超参数</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用与取值理由</th></tr>
+      <tr><td><code>--expert-episodes</code></td><td>30</td><td>示范回合数，约 6000 条转移；是训练预算的 3/4</td></tr>
+      <tr><td><code>--expert-noise</code></td><td>0.5</td><td>动作噪声；太小状态覆盖差，太大示范质量低</td></tr>
+      <tr><td><code>--bc-coef</code></td><td>0.5</td><td>模仿项权重；0 时等价于 prefill 模式</td></tr>
+      <tr><td><code>--eval-steps</code></td><td>1000,2000,4000,8000</td><td>早期评估点才是主指标；最终点看有没有被拖住</td></tr>
+      <tr><td><code>--threshold</code></td><td>−400</td><td>达标阈值，用于统计达标步数</td></tr>
+    </table>
+
+    <p>专家噪声 σ=0.5 的取值也有两难的背景：噪声越小，示范动作越接近专家的真实意图，BC 的监督信号越干净；但状态覆盖越窄，预填池里几百条轨迹几乎重合，Q 网络在窄分布上过拟合。噪声越大，覆盖越宽，但动作质量下降、TD 目标噪声上升，专家数据的"含金量"被稀释。0.5 的档位选择让噪声幅度（约为动作范围的 25%）落在"覆盖明显改善、质量仍可用"的区间。练习 1 会把两端都跑出来，用 1000 步处的评估做对照，这是确认该档位是否适合当前任务的直接方法。</p>
+
+    <h3>与前一章的差异点</h3>
+    <ul>
+      <li>第 056 章让元参数"学会适应"；本章直接给一批<strong>外部示范</strong>，不依赖任务分布。</li>
+      <li>新增脚本专家、带噪数据采集、批量预填与 BC 辅助损失；SAC 网络结构原样保留。</li>
+      <li>训练循环新增"专家池"这一第二数据源；评估表按早期步数展开。</li>
+      <li>指标从"适应曲线"换成"固定训练预算下的早期评估点对比"。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：脚本专家，能量泵与 PD 的两段式切换</strong></p>
+    <pre class="code"><code>def expert_action(obs) -&gt; np.ndarray:
+    """启发式控制器。
+
+    能量 E = 0.5 * θ̇² + 15 * cos θ（系数 15 与 gymnasium 简化动力学的 3g/2 项对应；
+    直立静止时 E = 15，自然下垂时 E = −15）。
+    远离直立时用能量泵（力矩与角速度同向，把能量推向 15）；靠近直立后切换
+    PD 稳定。θ 由观测 [cos θ, sin θ] 反推。
+    """
+    cos_t, sin_t, thd = float(obs[0]), float(obs[1]), float(obs[2])
+    theta = math.atan2(sin_t, cos_t)          # 反推摆角
+    energy = 0.5 * thd * thd + 15.0 * math.cos(theta)
+    if abs(theta) &lt; 0.4:
+        u = -6.0 * theta - 1.5 * thd          # PD 稳定：增益 6 略高于静态所需的 5
+    else:
+        u = 0.015 * thd * (15.0 - energy)     # 能量泵：沿速度方向注入/耗散能量
+    return np.array([np.clip(u, -2.0, 2.0)], dtype=np.float32)</code></pre>
+    <p>解读：<strong>（1）</strong>摆杆的能量 <code>E = 0.5θ̇² + 15cosθ</code>：系数 15 与 gymnasium 简化动力学里的 (3g/2) 项对应（g=10），直立静止时 E=15，自然下垂时 E=−15。这个标量把"离目标状态还差多少能量"变成一个可比较的数。<strong>（2）</strong>远离直立（|θ| ≥ 0.4）时用能量泵 <code>u = 0.015·θ̇·(15 − E)</code>：能量不足时力矩与角速度同向、持续加能；能量超了则反向耗散。这就是"先来回摆动蓄能"的手工版本；增益取小值是为了让能量平滑逼近目标、避免过冲引起高速掠过顶端。<strong>（3）</strong>靠近直立切换 <code>u = −6θ − 1.5θ̇</code> 的 PD 稳定：比例增益必须高于静态平衡所需的 g/2 = 5（第 054 章的数值例子），6 留了一点余量；两段控制无缝衔接，输出直接作为示范动作。<strong>（4）</strong>控制器不保证最优（能量泵效率一般），但对"初始化"来说足够：它的任务是提供一条像样的轨迹，不是当老师考满分。</p>
+
+    <p><strong>片段 2：带噪采集示范，多样性比纯度更重要</strong></p>
+    <pre class="code"><code>def collect_expert_data(episodes: int, noise: float, seed: int):
+    """采集示范数据（带高斯噪声增加状态覆盖），返回五元组数组。"""
+    env = make_pendulum(seed)
+    obs_buf, act_buf, rew_buf, next_buf, done_buf = [], [], [], [], []
+    for _ in range(episodes):
+        obs, _ = env.reset()
+        done = False
+        while not done:
+            a = expert_action(obs) + np.random.normal(0.0, noise, size=1).astype(np.float32)
+            a = np.clip(a, -2.0, 2.0).astype(np.float32)   # 噪声后仍要在动作范围内
+            next_obs, rew, terminated, truncated, _ = env.step(a)
+            obs_buf.append(np.asarray(obs, dtype=np.float32))
+            act_buf.append(a)
+            rew_buf.append(rew)
+            next_buf.append(np.asarray(next_obs, dtype=np.float32))
+            done_buf.append(float(terminated))              # 只写"真终止"
+            obs = next_obs
+            done = terminated or truncated
+    return (np.asarray(obs_buf, dtype=np.float32), np.asarray(act_buf, dtype=np.float32),
+            np.asarray(rew_buf, dtype=np.float32).reshape(-1, 1),
+            np.asarray(next_buf, dtype=np.float32),
+            np.asarray(done_buf, dtype=np.float32).reshape(-1, 1))</code></pre>
+    <p>解读：<strong>（1）</strong>在专家动作上叠加 σ=0.5 的高斯噪声，表面上让数据变"糙"，实际是让状态分布更宽：没有噪声时每回合轨迹几乎相同，6000 条数据的状态多样性很差。<strong>（2）</strong>噪声让 BC 目标更平滑：策略不必逐点拟合专家的硬切换（能量泵 ↔ PD 的跳变）。<strong>（3）</strong>采集保存完整五元组：Q 目标的 bootstrap 依赖 <code>next_obs</code>，缺了它价值学习会错位。<code>done</code> 只写真终止，截断回合不入库。<strong>（4）</strong>返回整段 numpy 数组，免去逐条写入的循环：批量预填时可以整段导入，效率更高、代码更干净。</p>
+
+    <p><strong>片段 3：BC 损失，只进策略优化器</strong></p>
+    <pre class="code"><code>        new_act, logp = self.policy.sample(obs)
+        logp = logp.squeeze(-1)                            # 与 Q 网络的 (B,) 输出对齐
+        q_pi = torch.minimum(self.q1(obs, new_act), self.q2(obs, new_act))
+        policy_loss = (self.alpha.detach() * logp - q_pi).mean()
+
+        bc_loss = torch.tensor(0.0)
+        if bc_batch is not None and args.bc_coef &gt; 0.0:
+            # 行为克隆：策略均值动作与专家动作的均方误差
+            mean_action = self.policy.mean_action(bc_batch["obs"])
+            bc_loss = F.mse_loss(mean_action, bc_batch["act"])
+            policy_loss = policy_loss + args.bc_coef * bc_loss
+
+        self.opt_policy.zero_grad()
+        policy_loss.backward()
+        self.opt_policy.step()</code></pre>
+    <p>解读：<strong>（1）</strong>BC 项加在 <code>policy_loss</code> 上、跟着策略的优化器走一步，<strong>Q 损失与温度损失完全不受影响</strong>。这一点很重要：如果 BC 混进 Q 目标，等于把"专家动作一定好"的先验灌进价值函数，Q 值会系统性偏高。<strong>（2）</strong>监督对象是 <code>mean_action</code>（均值动作）：采样动作带噪声，用它做目标等于让策略去拟合噪声，学习会变慢。<strong>（3）</strong><code>torch.tensor(0.0)</code> 的默认值让 <code>bc_loss</code> 能在未启用时安全参与返回统计（<code>bc_loss.item()</code> 不报错）。<strong>（4）</strong>系数 λ 乘在模仿项上：它同时控制"多大程度上信任专家"，与 Q 梯度的相对强度就是"模仿 vs 提升"的配比。</p>
+
+    <p><strong>片段 4：专家池与回放池分离</strong></p>
+    <pre class="code"><code>    buffer = ReplayBuffer(args.buffer_size, obs_dim, act_dim)
+    expert_buf = None
+    if mode in ("prefill", "prefill+bc"):
+        buffer.add_batch(*expert_data)  # 预填专家数据（数据层）
+    if mode == "prefill+bc":
+        # 单独的专家池：行为克隆只从示范数据里抽样，不受在线数据稀释
+        expert_buf = ReplayBuffer(len(expert_data[0]) + 10, obs_dim, act_dim)
+        expert_buf.add_batch(*expert_data)
+
+        # 训练循环里每次更新：
+        if step % args.update_every == 0 and buffer.size &gt;= 64:
+            bc_batch = None
+            if mode == "prefill+bc" and args.bc_coef &gt; 0:
+                # 从专家池抽一小批做模仿损失
+                bc_batch = expert_buf.sample(args.bc_batch_size)
+            agent.update(buffer.sample(args.batch_size), args, bc_batch=bc_batch)</code></pre>
+    <p>解读：<strong>（1）</strong>两个池子的分工：<code>buffer</code> 是 Q 学习的训练数据（示范 + 在线混合），<code>expert_buf</code> 只服务 BC，如果 BC 直接从大池抽样，训练几千步后在线数据占多数，BC 项会退化成"模仿自己"的噪声。<strong>（2）</strong>专家池容量设成"示范条数 + 10"：刚好装下全部示范，且尺寸固定、可预期（不覆盖）。<strong>（3）</strong>BC 批次从专家池抽 64 条/次，小批量即可，监督项只需要"对准方向"，不需要大样本。<strong>（4）</strong>这种"演示缓冲区（demonstration buffer）"分离的写法是工程常见设计：它让 λ 的语义在长训练里保持稳定。</p>
+
+    <p>完整可运行脚本（附录）：<a href="../code/ch057.py" download>code/ch057.py</a></p>
+    <pre class="sh"><code>python code/ch057.py                 # 专家采集 + 三种模式各 8000 步，CPU 约 3–4 分钟
+python code/ch057.py --quick         # 快速跑通：约 40 秒
+python code/ch057.py --modes prefill+bc --bc-coef 2.0   # 体验"被模仿拖住"</code></pre>
+    <p>预期（一次种子 0 的参考实跑）：<strong>prefill+bc 在前 1000～2000 步领先 scratch 约 200～300 分，prefill 单独使用时早期优势较小；三种模式到 8000 步基本追平（评估都收敛到 −200 附近）</strong>。把 <code>--bc-coef</code> 调到 2.0，最终评估会卡在专家水平附近（脚本专家带噪后约 −300～−500，随初始条件波动）。不同种子的读数会有明显波动，以实跑为准。三种模式的一次参考读数对照：</p>
+    <table>
+      <tr><th>评估点</th><th>scratch</th><th>prefill</th><th>prefill+bc</th></tr>
+      <tr><td>1000 步</td><td>约 −1650，早期低于随机水平</td><td>约 −1600，与 scratch 接近</td><td>约 −1400，动作方向被监督项对齐</td></tr>
+      <tr><td>2000 步</td><td>约 −1260</td><td>约 −1080</td><td>约 −980</td></tr>
+      <tr><td>4000 步</td><td>约 −590</td><td>约 −745</td><td>约 −460</td></tr>
+      <tr><td>8000 步</td><td>约 −200</td><td>约 −200</td><td>约 −190</td></tr>
+      <tr><td>达标步数（−400）</td><td>约 8000</td><td>约 8000</td><td>约 8000（三种模式都在最后一个评估点越线）</td></tr>
+    </table>
+    <p>读表重点在"1000/2000 步"两行：bc 的早期优势最稳定，prefill 单独使用时优势较弱（本例与 scratch 几乎持平），晚期三者趋同是预期现象。若 prefill 在 1000 步没有领先，先检查预填是否真的写进了训练用的回放池；只写进专家池不会生效。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>BC 用了采样动作，未取均值动作</strong>：采样动作含探索噪声，监督目标自带方差，策略被迫"平均掉"噪声、学习变慢。监督项应当用 <code>mean_action</code>。</li>
+      <li><strong>把专家数据写入缓冲池时忘了 next_obs</strong>：Q 目标的 bootstrap 依赖 next_obs，用 obs 顶替会让价值学习彻底错位。示范转移要存完整五元组。</li>
+      <li><strong>bc_coef 长期不衰减</strong>：策略被钉在专家水平，探索带来的上限提升被抑制。中期衰减或只在早期启用 BC 是常见做法。</li>
+      <li><strong>用专家回报直接比较 SAC 训练曲线</strong>：SAC 的价值在于"最终超越专家"；如果专家本身不强，别期待 SAC 早期就超过它，对比应以"达到同等水平的步数"为准。</li>
+      <li><strong>专家池与在线池混用</strong>：BC 从大池抽样时，在线数据越多、模仿目标越漂移，λ 的语义随训练变化。修复：像本章一样给示范单开一个池。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把 <code>--expert-noise</code> 改成 <code>0.0</code> 与 <code>1.5</code>，比较 prefill 组 1000 步处的评估。噪声的两面性体现在哪里？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>σ=0 时示范状态覆盖窄，6000 条高度重复；σ=1.5 时动作质量下降、TD 目标噪声大。对比早期评估点找中间的平衡。</div></details>
+      </li>
+      <li>实现 bc_coef 线性衰减：前 4000 步 λ 从 0.5 衰减到 0。它能让"早期优势 + 最终性能"兼得吗？<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>在训练循环里按 <code>step</code> 更新 <code>args.bc_coef</code>（或把动态系数传进 <code>update</code>）。对比固定 λ=0.5 与衰减版的最终评估。</div></details>
+      </li>
+      <li>把示范回合数从 30 减到 5（约 1000 条），重跑。预测 prefill 的早期优势还剩多少，再验证。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>数据量决定预填池的覆盖密度。1000 条约等于 5 个 200 步轨迹，1000 步处的领先可能只剩一半左右。</div></details>
+      </li>
+      <li>给专家数据加"质量过滤"：只保留回报高于阈值的示范回合。比较过滤前后的 prefill 表现。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>采集时按回合记录累计回报，低于阈值（如 −600）的整段丢弃。思考：丢坏数据会牺牲状态覆盖，哪个因素在 Pendulum 上更重要。</div></details>
+      </li>
+      <li>把模仿损失从"均值动作 MSE"换成"最大化专家动作的对数概率"（似然版 BC），比较早期与最终评估。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>用 <code>policy.sample</code> 不行，需要构造正态分布后对专家动作求 <code>log_prob</code>。似然版对策略方差更敏感，观察它对早期探索的影响。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>模仿学习初始化用示范数据填满"开场阶段"：数据层预填回放池，目标层加行为克隆辅助损失，两条通道各管一侧。</li>
+      <li>本章的脚本专家由能量泵与 PD 两段控制组成，带噪（σ=0.5）采集约 6000 条转移作为示范。</li>
+      <li>实验显示 prefill+bc 在前 2000 步显著领先 scratch（约 200～300 分；prefill 单独使用时优势较小），最终成绩逐渐趋同。</li>
+      <li>bc_coef 是双刃剑：太小没有早期优势，太大把策略钉在专家水平；专家池与回放池分离能保持 BC 语义稳定。</li>
+      <li>示范数据的账：30 回合约 6000 条转移，开局占总训练预算的 75%；BC 每次抽 64 条，池内样本平均被复用约 85 次且目标稳定。</li>
+      <li>两个通道分工明确：预填让评论家开局有好样本，BC 让演员开局有好动作；BC 只进策略优化器，绝不污染 Q 目标与温度。</li>
+      <li>评估口径要盯着早期：1000/2000 步的差值才是模仿初始化的价值，8000 步趋同属于预期，不算失败。</li>
+      <li>下一章把视角从"学得好"转向"扛得住"：给训练好的策略施加观测噪声、动作噪声、动力学扰动与延迟，测量鲁棒性并比较噪声增强训练的效果。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch056.html">← 第 056 章：SAC的元学习</a>
+    <a class="next" href="ch058.html">第 058 章：SAC的鲁棒性测试 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

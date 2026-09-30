@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第066章 多机器人任务分配 | 多机器人协同学习课程 · ROS2 通信与系统集成</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第四篇 · 系统集成与工程化</span>
+    <span class="sep">/</span>
+    <span>第 066 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第四篇 · 系统集成与工程化</div>
+    <h1>第 066 章：多机器人任务分配</h1>
+    <p class="lead">"谁去做哪件事"是多机器人系统的第一道工程题：把任务分配建模成最小代价匹配，用匈牙利算法一次求出全局最优解，难点从来都在代价矩阵的设计，算法本身有成熟实现。</p>
+    <ul class="meta">
+      <li>主题：系统集成 / 任务分配（集中式、单轮）</li>
+      <li>关键机制：代价矩阵、能力掩码、匈牙利算法、虚拟占位行</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 065 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>把"谁来干活"形式化成指派问题（Assignment Problem）：写出目标函数与约束，理解一对一分配的适用边界。</li>
+      <li>掌握代价矩阵的设计方法：距离/ETA 为主项，电量、能力、连续性作为修正项，能力不符用大而有限的惩罚。</li>
+      <li>理解匈牙利算法的直觉与复杂度，知道它相对贪心策略在什么情况下能省下多少代价。</li>
+      <li>会用 SciPy 一行求解带虚拟占位的无均衡分配，并正确解读结果矩阵。</li>
+      <li>会实现"批量窗口 + 派发确认 + 失败重排"的分发闭环，避免频繁重排的抖动。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第三篇的行为树与状态机解决的是"一台机器人内部怎么决策"；从本章开始处理车队层面的问题：仓库里来了 12 个拣选任务、4 台机器人空闲，谁去哪个任务点？看似简单，但随意分配会带来三类系统性损失：<strong>空驶里程</strong>（机器人跑得比必要远）、<strong>能力错配</strong>（让没有举升机构的机器人去搬托盘）、<strong>负载倾斜</strong>（一台忙死、三台闲死）。</p>
+    <p>任务分配是"给任务找人"的一次性决策；它与第 067 章（分布式协同分配）、第 068 章（优先级）、第 070 章（时序调度）共同构成车队管理的四级台阶。本章先把最基本的集中式单轮分配打牢，它是所有高级机制的基线与对照组。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 指派问题的形式化</h3>
+    <p>设车队有 n 台机器人 R = {r<sub>1</sub>, …, r<sub>n</sub>}，本批次有 m 个任务 T = {t<sub>1</sub>, …, t<sub>m</sub>}，定义代价 c<sub>ij</sub> 为"机器人 i 执行任务 j 的综合代价"。分配变量 x<sub>ij</sub> ∈ {0,1} 表示是否指派，问题写成：</p>
+    <div class="formula">
+      min Σ<sub>i,j</sub> c<sub>ij</sub> x<sub>ij</sub> &nbsp; s.t. &nbsp; Σ<sub>j</sub> x<sub>ij</sub> ≤ 1（每台至多一个任务），Σ<sub>i</sub> x<sub>ij</sub> = 1（每个任务必须有人做）
+      <span class="note">当 n ≠ m 时补"虚拟任务"或"虚拟机器人"（代价 0）使之方阵化；这是工程实现的标准动作</span>
+    </div>
+    <p>为什么约束的右侧是"≤1"和"=1"？<strong>机器人是资源（至多接一个活），任务是需求（必须被满足）</strong>。任务数超过机器人数时，无法全部满足，此时要么排队等下一轮（第 070 章的调度问题），要么在任务侧定义优先级只分配一部分（第 068 章）。本章假设单轮内 m ≤ n 或允许部分任务进入等待队列。</p>
+
+    <h3>2. 代价矩阵：算法之外的全部工程</h3>
+    <p>匈牙利算法保证"给定矩阵求最优"，而矩阵本身错了，最优解也无意义。代价项的经验构成：</p>
+    <table>
+      <tr><th>项</th><th>形式</th><th>量级示例</th><th>作用</th></tr>
+      <tr><td>空驶时间（主项）</td><td>路径距离 / 平均速度</td><td>30 m / 1 m/s = 30</td><td>让近的机器人接近的活</td></tr>
+      <tr><td>电量风险</td><td>max(0, (E<sub>need</sub> − E<sub>now</sub>)/E<sub>max</sub>) × K</td><td>K = 200</td><td>电量不够时把代价抬到"不如换人"</td></tr>
+      <tr><td>能力不符</td><td>不满足 → 加大惩罚 C<sub>big</sub></td><td>C<sub>big</sub> = 10<sup>4</sup></td><td>硬约束的软实现（见下）</td></tr>
+      <tr><td>连续性奖励</td><td>−w 若该机刚做过同区域任务</td><td>w = 10</td><td>减少来回横穿、降低冲突</td></tr>
+    </table>
+    <p><strong>硬约束为什么用"大而有限"的惩罚、不用无穷大？</strong>无穷大在浮点运算里会产生 NaN 或让求解器数值不稳；而 10<sup>4</sup> 这样的量级只要比所有正常代价高一个数量级以上，最优解就会自觉避开违例组合。它的副产品是"软失败"：当全部机器人都不满足能力时，求解器仍会选出"全局损失最小"的组合（代价 10<sup>4</sup> 级），你可以在结果检查阶段捕获这些边并报警，比直接无解更好排查。</p>
+
+    <h3>3. 匈牙利算法直觉</h3>
+    <p>匈牙利算法（Kuhn–Munkres）的经典直觉是"<strong>找一组零代价匹配</strong>"：先对每行每列减去最小值（创造零元素），然后尝试用最少的横竖线覆盖所有零，若覆盖数等于矩阵阶数，零的独立集就是最优解；否则对未覆盖部分做增减调整再试。<strong>等价的对偶视角</strong>：给每行配电位 u<sub>i</sub>、每列配电位 v<sub>j</sub>，始终维持 c<sub>ij</sub> − u<sub>i</sub> − v<sub>j</sub> ≥ 0，当存在一组分配让所有涉及元素恰好取等号时，该分配即最优。两种视角都在回答同一个问题，实现上通常用现代 O(n³) 版本一次性收敛。</p>
+    <p>它与贪心的差距有多大？构造最坏情况：两台机器人 A/B，两个任务 X/Y；c<sub>AX</sub> = 1、c<sub>AY</sub> = 2、c<sub>BX</sub> = 1.2、c<sub>BY</sub> = 100。贪心先给 A 分 X（代价 1），B 只能接 Y（100），总代价 101；最优是 A→Y、B→X，总代价 3.2。<strong>贪心的"局部最好"把另一台推进了灾难任务，差距 30 倍</strong>。规模越大、代价分布越不均匀，贪心越危险，仓库里"差一点就顺路"的任务遍地都是，这正是要用最优匹配的原因。</p>
+    <p>复杂度 O(n³)：n = 20 时约 8000 次基本操作，微秒级；n = 100 也只需约 10<sup>6</sup> 次，毫秒级。所以<strong>中小车队的分配不需要分布式，一台协调者的 CPU 时间根本用不完</strong>，分布式机制（067 章）解决的是"没有中心/中心易失"的问题，算力在中小车队从来不是瓶颈。</p>
+
+    <h3>4. 分配时机：批量窗口与迟滞</h3>
+    <p>任务到达是随机的，如果每来一个任务就重排一次，会出现<strong>分配抖动</strong>：正在赶往任务 X 的机器人被重排去 Y，前一秒的空驶全部浪费。工程解法是<strong>批量窗口</strong>：每 0.5–1.0 s 收集新任务，窗口闭合时统一求解一次；已经派发且被确认的任务默认"锁定"，除非出现更高优先级任务（068 章）或明显更优的重排机会（例如新机器人上线使总代价下降超过 20%）。</p>
+
+    <h3>5. 数值算例：最优解与贪心差在哪里</h3>
+    <p>用一个 3×3 的矩阵手算一遍。代价矩阵（行是机器人、列是任务）为 [[4, 1, 3], [2, 0, 5], [3, 2, 2]]。最优分配是 (1,2)=1、(2,1)=2、(3,3)=2，总代价 5，可以先穷举六种排列验证没有更小的组合。贪心按"当前最小元素"依次指派：先取 (2,2)=0，然后在未占用的行列里选最小值 2（(3,3)），最后剩下 (1,1)=4，总代价 6，比最优高 20%。差距的来源一目了然：贪心拿走 (2,2) 的零元素，把列 2 上本可承载 (1,2)=1 的机会关闭了，迫使机器人 1 去接最贵的任务。这正是"局部最好破坏全局结构"的微型演示；任务越多、分布越不均，代价越大，正文中 30 倍的构造性反例说明差距可以很大。</p>
+    <p>最优性还有一条更适合用来"自检"的判据，来自线性规划对偶。给每行配电位 u<sub>i</sub>、每列配电位 v<sub>j</sub>，要求对所有格子满足 u<sub>i</sub> + v<sub>j</sub> ≤ c<sub>ij</sub>；此时 ∑u + ∑v 是任何分配的代价下界。取 u = (1, 0, 1)、v = (2, 0, 1)，逐格检查九个不等式全部成立，且在被选中的三个格子上恰好取等号（1+0=1、0+2=2、1+1=2），于是下界 5 与分配代价 5 相遇，该分配被证明最优。工程实现不需要手调电位，但这条对偶视角解释了 why 匈牙利算法"找零元素匹配"能保证最优：它就是在构造这组电位，并在等式成立的子图上找完美匹配。写验收测试时也可以直接调用求解器输出与穷举结果比对，作为分配模块的单元测试基线。</p>
+
+    <h3>6. 数值算例：电量风险权重如何翻转选择</h3>
+    <p>构造一个能体现权重设计的场景：任务需要消耗 55% 电量；机器人 A 电量 15%、距任务点 10 m（约 10 s）；机器人 B 电量 90%、距 60 m（约 60 s）。风险项取"缺口 × K"：K = 200 时，A 的代价 = 10 + 200×0.40 = 90，B 的代价 = 60，分配器选择 B，A 被判为"先充电更划算"；把 K 降到 20，A 的代价 = 10 + 20×0.40 = 18，远低于 B 的 60，分配器改选 A。同一个场景、同一批任务，只改一个权重就得到相反的人机决策，这就是为什么参数表把"电量风险项要比时间项大一到两个数量级"写成硬经验：任务时长是分钟级、充电是半小时级，风险折算必须覆盖这个时间尺度差。定权重的可执行方法：列一张"绕行 X 秒 vs 剩余电量 Y%"的等价表，找到你觉得"该去充电"的最小 Y，再反推 K；把这张表和参数一起评审，后续每次调参都有基准。</p>
+    <p>分配器的质量保障靠两层测试。单元层：构造三类固定矩阵（能力违例、电量不足、任务多于机器人），断言输出匹配与"允许代价上界"；再用穷举对照验证最优性，3×3 与 4×4 全排列结果必须与求解器一致，保证换实现或换库之后不回退。性能层：20 阶与 100 阶矩阵各跑 1000 次，记录 P95 求解耗时，验收线设 10 ms（纯 Python 下 100 阶约毫秒级，余量充足）。回归层：把线上日志里的真实矩阵存成用例库，每周重放，观察权重或罚金调整会翻转哪些历史决策；任何参数改动先过这套用例再上线，避免"修一个场景、坏三个场景"。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>集中式分配器的完整管道：</p>
+    <ol>
+      <li><strong>任务汇聚</strong>：订阅 <code>/fleet/task_request</code>（来自人工、上游 WMS 系统或感知事件），去重（同一任务 ID 只入队一次）、校验（任务点是否在地图内）。</li>
+      <li><strong>状态维护</strong>：机器人状态（位置、电量、忙闲）以 2–5 Hz 汇总到分配器，供代价矩阵使用；状态过期的机器人（超过 5 s 未上报）不参与本轮分配。</li>
+      <li><strong>矩阵构造</strong>：按公式逐项累加；ETA 用路网最短路查询（可用预计算的距离矩阵），不要用欧氏距离，多层建筑里欧氏距离会闹笑话。</li>
+      <li><strong>求解</strong>：SciPy 的 <code>linear_sum_assignment</code>；结果校验（代价超过能力惩罚阈值的边视为违例，报警）。</li>
+      <li><strong>分发与确认</strong>：向被选中的机器人发送任务（服务或动作），等待接受确认；超时未确认则任务回队、该机器人本轮拉黑（防止反复投递）。</li>
+      <li><strong>记账</strong>：分配结果与代价写入日志，供后续分析"分配器到底省了多少空驶"。</li>
+    </ol>
+    <h3>关键参数表</h3>
+    <table>
+      <tr><th>参数</th><th>建议值</th><th>理由</th></tr>
+      <tr><td>批量窗口</td><td>0.5–1.0 s</td><td>平衡响应速度与抖动；任务到达率 2 个/s 时窗口内平均积 1–2 个任务</td></tr>
+      <tr><td>能力惩罚 C<sub>big</sub></td><td>10<sup>4</sup></td><td>比正常代价（10<sup>1</sup>–10<sup>2</sup>）高两个数量级即可支配解</td></tr>
+      <tr><td>状态有效期</td><td>5 s</td><td>与状态话题 2 Hz 匹配，容 10 次丢包</td></tr>
+      <tr><td>确认超时</td><td>3 s</td><td>一个 RTT 量级 + 处理时间；超时即回队重排</td></tr>
+      <tr><td>重排收益阈值</td><td>20%</td><td>新方案总代价需低于现方案 20% 才值得打断已派任务</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：为什么派发必须"确认 + 回队"？</span>
+      <p>DDS 的 Reliable 只保证"送到你的队列"，不保证"你的业务逻辑接受了"。机器人可能因电量骤降、定位丢失、被更高优先级任务占用而拒绝新任务。分配器若默认送达即成功，就会出现"任务在人却不干活"的黑洞。用动作（action）派发（第 004 章的"执行复杂任务"语义），天然携带接受/拒绝/超时三态；话题不具备这种应答结构，无法区分"没收到"与"收到了但拒绝"。超时回队机制保证任务永远不会被静默吞掉。<strong>分配器的可靠性 = 求解质量 × 派发闭环完整性</strong>，两者缺一不可。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：构造代价矩阵</strong></p>
+    <pre class="code"><code>import numpy as np
+
+C_BIG = 1e4          # 能力违例惩罚：足够大但仍有限（避免 inf 的数值问题）
+
+def build_cost_matrix(robots, tasks, dist, speed=1.0):
+    """robots/tasks: 状态记录列表；dist(i, j): 路网 ETA（秒）。
+    返回 (n x m) 代价矩阵，行为机器人、列为任务。"""
+    C = np.zeros((len(robots), len(tasks)))
+    for i, r in enumerate(robots):
+        for j, t in enumerate(tasks):
+            eta = dist(r.pose, t.pose) / speed          # 主项：空驶时间
+            risk = max(0.0, t.energy_need - r.battery)  # 电量余量不足的程度
+            C[i, j] = eta + 200.0 * risk                # 风险项权重远大于时间
+            if not set(t.needs).issubset(r.caps):       # 能力不匹配：硬约束软实现
+                C[i, j] += C_BIG
+            if t.zone == r.last_zone:                   # 连续性奖励：少横穿
+                C[i, j] -= 10.0
+    return C</code></pre>
+    <p>解读：这个矩阵把三类信息编码进一个标量。注意几个刻意的选择：<strong>电量风险项的权重 200 是"时间项"的几十倍</strong>，电量 5% 的机器人多绕 10 秒是灾难，多绕 1 秒是日常，量级必须拉开；<strong>能力检查用集合包含</strong>（任务需求 ⊆ 机器人能力），集合运算比逐项 if 干净且易扩展；<strong>连续性奖励是负代价</strong>，允许"顺路"战胜"绝对距离最近"。整段代码没有任何算法，<strong>分配质量的上限在这一段就被决定了</strong>，所以它值得单独测试：给固定输入断言矩阵数值，任何调参都能看到矩阵怎么变。</p>
+
+    <p><strong>片段 2：匈牙利求解与虚拟占位</strong></p>
+    <pre class="code"><code>from scipy.optimize import linear_sum_assignment
+
+def solve_assignment(robots, tasks, cost):
+    """返回 [(robot_idx, task_idx), ...]；任务多于机器人时留部分任务未分配。"""
+    n, m = cost.shape
+    if n &gt;= m:
+        # 机器人多：直接求解，未入选的行自然闲置（每位配一个任务）
+        rows, cols = linear_sum_assignment(cost)
+        return [(r, c) for r, c in zip(rows, cols)]
+    # 任务多于机器人：补 (m - n) 行"虚拟机器人"，代价 0，
+    # 保证每个任务必须被匹配的约束可满足；落到虚拟行的任务即留给下一轮
+    pad = np.zeros((m - n, m))
+    aug = np.vstack([cost, pad])
+    rows, cols = linear_sum_assignment(aug)
+    return [(r, c) for r, c in zip(rows, cols) if r &lt; n]
+
+def report(cost, pairs):
+    total = sum(cost[r, c] for r, c in pairs)
+    banned = [(r, c) for r, c in pairs if cost[r, c] &gt;= C_BIG]
+    return total, banned     # banned 非空说明"矮子里拔将军"，需要报警</code></pre>
+    <p>解读：<code>linear_sum_assignment</code> 返回的永远是"行到列的一对一"匹配，这正是指派问题求解器的通用接口。<strong>任务多时的虚拟行是关键的工程技巧</strong>：补零行的含义是"这个任务本轮没人接，代价 0"，求解器会优先让真实机器人去代价低的列，把"接了比不接还差"的任务留给虚拟行；过滤 <code>r &lt; n</code> 后剩下的就是真正该执行的任务集合。<code>report</code> 检查是否有选中边携带了 C_BIG 惩罚，有则说明存在"能力错配"被迫发生，应触发告警（例如让没有举升能力的机器人去搬托盘），不允许静默执行。<strong>把违例检测写成代码让系统自己报告，是集中式方案相对手工排班的真正优势</strong>。</p>
+
+    <p><strong>片段 3：批量窗口 + 派发确认的分配节点</strong></p>
+    <pre class="code"><code>class TaskAllocator(Node):
+    """集中式分配器：窗口聚合、一次求解、动作派发、超时回队。"""
+    def __init__(self):
+        super().__init__("task_allocator")
+        self.pending = {}        # task_id -&gt; 任务对象（未分配或待确认）
+        self.claimed = {}        # task_id -&gt; robot_id（已确认）
+        self.create_subscription(TaskRequest, "/fleet/task_request",
+                                 self.on_task, 10)
+        self.create_timer(0.5, self.window_close)     # 批量窗口 = 0.5 s
+        self.dispatch = ActionClient(self, ExecuteTask, "execute_task")
+
+    def on_task(self, msg):
+        if msg.task_id not in self.pending and msg.task_id not in self.claimed:
+            self.pending[msg.task_id] = msg     # 去重：重复请求只入队一次
+
+    def window_close(self):
+        if not self.pending:
+            return
+        robots = self.fresh_robots()            # 状态超 5 s 的机器人不参与
+        tasks = list(self.pending.values())
+        cost = build_cost_matrix(robots, tasks, self.road_eta)
+        for r_idx, t_idx in solve_assignment(robots, tasks, cost)[0]:
+            task = tasks[t_idx]
+            rid = robots[r_idx].id
+            if cost[r_idx, t_idx] &gt;= C_BIG:
+                self.get_logger().warn(f"能力违例：{rid} -&gt; {task.task_id}")
+            self.pending.pop(task.task_id, None)      # 先移除，等待确认
+            self.send_with_confirm(rid, task)         # 超时未确认则回队
+
+    def send_with_confirm(self, rid, task, timeout=3.0):
+        goal = ExecuteTask.Goal(task_id=task.task_id, pose=task.pose)
+        fut = self.dispatch.send_goal_async(goal)
+        # 回调里：接受则 claim；拒绝/超时则把 task 放回 self.pending
+        fut.add_done_callback(lambda f: self.on_confirm(f, rid, task, timeout))</code></pre>
+    <p>解读：分配节点的骨架是"窗口—求解—确认"三段。三个设计点：<strong>（1）</strong><code>on_task</code> 里去重时同时查 pending 与 claimed，防止"任务已派出但请求重发"造成双重入队；<strong>（2）</strong><code>fresh_robots()</code> 把状态过期的机器人整体排除，比在矩阵里逐项判空更干净，也避免把任务派给已经掉线的机器；<strong>（3）</strong>派发用动作异步进行，未确认的任务回队 <code>self.pending</code>，下一窗口自然重排，不写重试计数也能保证"任务最终被处理"，因为回队本身就是重试。这段代码刻意没有处理"更具优先级的新任务抢占已确认任务"，那是 068 章的扩展；保持本章分配器的单一职责，是让 066–071 各章机制可以独立测试的原因。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>用无穷大当能力惩罚</strong>：<code>np.inf</code> 进入 Hungarian 后产生 NaN 或返回异常匹配。修复：用 10<sup>4</sup> 量级的有限大值，并在结果里检查违例边。</li>
+      <li><strong>用欧氏距离当 ETA</strong>：直线 5 m 但隔着两道墙，实际要绕 80 m，分配结果"最优"却全程离谱。修复：预计算路网距离矩阵（对 20 个候选点也就 400 次最短路查询，可缓存）。</li>
+      <li><strong>每个任务到达即重排</strong>：机器人频繁被改派，空驶里程反而高于随机分配。修复：0.5 s 批量窗口 + 已确认任务锁定 + 20% 重排收益阈值。</li>
+      <li><strong>忽略"任务点在地图外"</strong>：上游系统发来的坐标落在不可通行区域，机器人导航反复失败。修复：入队前做可通行性校验，失败任务立刻退回上游并附原因，不要让它反复进出分配队列。</li>
+      <li><strong>不记录分配代价</strong>：改了一个权重，好坏全靠感觉。修复：每轮把"总代价、各机器人分到的任务数、违例数"写入日志；连续两周的日志是你调参的唯一依据。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>口算一个 3×3 分配：代价矩阵 [[4, 1, 3], [2, 0, 5], [3, 2, 2]]，分别求贪心（按最小元素顺序指派）与最优解的总代价，体会两者的差距从何而来。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>贪心先取 (2,2)=0；剩余行列里最小是 (3,3)=2，最后 (1,1)=4，总代价 6；最优解 (1,2)=1、(2,1)=2、(3,3)=2 总计 5。局部零元素会破坏后续结构。</div></details>
+      </li>
+      <li>把片段 1 的电量风险权重从 200 改成 20，构造"机器人 A 电量 15% 但距离 10 m，机器人 B 电量 90% 但距离 60 m"的场景，预测分配结果并说明什么场景下小权重是合理的。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>权重 200 时 0.2 的风险差 = 40 秒等效，A 会被跳过；权重 20 时 A 只贵 4 秒，会接下任务。短任务、附近有充电桩时小权重合理；任务链长、充电桩远时必须大权重。</div></details>
+      </li>
+      <li>实现"重排收益阈值"：分配器保存上一次已确认方案的总代价；新窗口求解后，只有当"新方案 + 切换惩罚 × 被改动任务数 < 现方案 × 0.8"时才执行重排。解释 20% 与切换惩罚如何共同抑制抖动。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>切换惩罚按每个被改派的任务计（例如 15 秒等效），代表"已经走了一半的路白走了"；20% 是所有改派机器人的总收益门限，两者叠加后小幅优化不会触发重排，只有结构性变化（大量新任务、机器人离线）才会。</div></details>
+      </li>
+      <li>设计实验：同一批 40 个随机任务、6 台机器人，分别用"最近空闲优先""贪心总代价最小""匈牙利最优"三种策略跑 20 组，比较平均空驶时间与总完工时间。写出你的实验脚本结构（任务生成、策略注入、指标统计）。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>策略注入可把求解函数做成参数；任务点从地图自由栅格均匀采样；指标记录"每任务从请求到完成的时长"与"机器人空驶距离"。预期：匈牙利在空驶时间上稳定领先，但单批任务少时三种策略差距缩小，把结论写进实验报告。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>任务分配 = 最小代价一对一匹配；约束是"机器人至多一项、任务必须被满足"，规模不均衡时用虚拟行/列补齐。</li>
+      <li>算法之外的全部工程在代价矩阵：空驶时间为主项，电量风险要大权重，能力不符用 10<sup>4</sup> 量级有限惩罚并检测违例。</li>
+      <li>匈牙利算法给出全局最优，O(n³) 对中小车队毫秒级完成；构造出的贪心反例说明"局部最优"可能差 30 倍。</li>
+      <li>派发必须闭环：批量窗口抑抖动、动作派发带确认、超时回队兜底；分配器只做分配，不越权做调度与抢占。</li>
+      <li>下一章把中心拿掉：当车队没有稳定的指挥节点时，用<strong>分布式协同任务分配</strong>（拍卖与一致性）让机器人自己谈。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch065.html">← 第 065 章：阶段项目：协同搬运与围捕演练</a>
+    <a class="next" href="ch067.html">第 067 章：多机器人协同任务分配 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

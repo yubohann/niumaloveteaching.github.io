@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第051章 RLlib训练稳定性诊断 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第三篇 · RLlib 算法实现</span>
+    <span class="sep">/</span>
+    <span>第 051 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第三篇 · RLlib 算法实现</div>
+    <h1>第 051 章：RLlib训练稳定性诊断</h1>
+    <p class="lead">把"训崩了"拆成可检验的假设：解释方差（Explained Variance）、KL 散度、裁剪占比（Clip Fraction）与熵四条曲线的物理含义，症状到原因的诊断表，以及"单变量干预"的处置流程。</p>
+    <ul class="meta">
+      <li>主题：RLlib 训练（稳定性诊断）</li>
+      <li>关键机制：指标面板、失败模式分类、干预顺序</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 050 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>掌握训练稳定性四项核心指标的物理含义与健康区间：解释方差、KL 散度、裁剪占比、策略熵。</li>
+      <li>能按"症状到原因"的诊断表定位发散、震荡、塌缩与平台期四类失败模式。</li>
+      <li>理解学习率、批次规模与更新强度之间的定量关系，掌握学习率随批次线性缩放的使用条件。</li>
+      <li>会搭建指标面板与告警回调，把稳定性检查从人工看图变成自动巡检。</li>
+      <li>能执行单变量干预流程，并用多种子对照实验确认修复有效。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>强化学习训练的失败方式比监督学习多样：回报曲线可能发散、震荡、缓慢塌缩或提前进入平台，而每种失败背后对应不同的机制：值函数估计偏差、更新步长过大、探索耗尽、数据陈旧。没有指标体系时，调整靠试错，问题被反复引入。</p>
+    <p>诊断的价值在于把"调参"变成"查因"：先读取指标证据，再对照诊断表提出假设，最后用单变量干预验证。本章的指标都来自 RLlib 标准报表，无需额外埋点；告警回调与多种子协议是把诊断流程工程化的两个部件。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p>本节先定义四项核心指标的物理意义，再给出失败模式与原因映射，最后整理干预顺序。</p>
+
+    <h3>1. 四项核心指标</h3>
+    <ul>
+      <li><strong>解释方差（Explained Variance, EV）</strong>：EV = 1 − Var( G<sub>t</sub> − V(s<sub>t</sub>) ) / Var( G<sub>t</sub> )。它衡量价值函数相对"用均值预测"的改进程度。EV 接近 1 说明价值预测准；EV 为负说明价值网络连均值都不如，优势估计失去意义。<strong>EV 是判断价值侧健康的最直接指标。</strong></li>
+      <li><strong>KL 散度</strong>：更新前后策略分布在采样批次上的平均差异。KL 过大意味着单步更新跳得太远，重要性比值失真、后续批次数据报废；KL 长期接近零意味着策略几乎不更新，学习停滞。</li>
+      <li><strong>裁剪占比</strong>：批次中触发截断的样本比例。健康区间约 0.1 至 0.3。持续高于 0.3 说明更新被反复截断，有效步长与实际需求失配；接近零则说明截断从未启用，更新强度可能不足。</li>
+      <li><strong>策略熵</strong>：动作分布的弥散程度。熵快速下降到接近零，探索耗尽，训练进入平台期；熵居高不下，策略未收窄，回报震荡。</li>
+    </ul>
+    <p>四项指标的联合读法比单项阈值更重要：<strong>例如 KL 偏大同时裁剪占比高、EV 转负，三条证据指向同一次过大的更新；KL 偏低、熵塌缩、回报平台，三条证据指向探索结构问题。</strong></p>
+
+    <h3>2. 失败模式与原因映射</h3>
+    <table>
+      <tr><th>症状</th><th>指标证据</th><th>可能原因</th><th>首选处置</th></tr>
+      <tr><td>训练发散</td><td>价值损失指数上升、EV 急剧转负、梯度范数尖峰</td><td>学习率过大；奖励尺度失控</td><td>降学习率或用学习率衰减；回到 044 章检查归一化</td></tr>
+      <tr><td>回报震荡</td><td>KL 与裁剪占比双高、回报锯齿</td><td>更新步长与批次不匹配；优势噪声大</td><td>开启优势归一化；缩小更新轮数；扩大批次</td></tr>
+      <tr><td>熵塌缩</td><td>熵曲线陡降到近零、KL 转小、回报停滞</td><td>熵系数过小；探索配置与训练时长不匹配</td><td>提高熵系数；复核 043 章的退火计划</td></tr>
+      <tr><td>平台期</td><td>各指标平稳但回报不再上升</td><td>容量不足；数据陈旧；任务进入瓶颈</td><td>对照 048 章增大网络；检查回放新鲜度</td></tr>
+      <tr><td>评估与训练背离</td><td>训练回报高、评估回报低且差距扩大</td><td>评估协议不一致；过拟合</td><td>核对评估映射与探索开关；加正则</td></tr>
+    </table>
+
+    <h3>3. 更新强度的定量框架</h3>
+    <p>单次更新的步长由学习率与批次规模共同决定。梯度估计的噪声随批次扩大而下降，保持"噪声与步长之比"不变的经验规则是学习率随批次线性缩放：</p>
+    <div class="formula">
+      批次 × k  →  学习率 × k （配合短预热），否则更新相对噪声偏大
+      <span class="note">该规则在批次不过大、梯度分布稳定的区间成立；超过临界批次后收益递减，继续按比例提学习率会失稳</span>
+    </div>
+    <p>与更新强度相关的第二个旋钮是批次内的更新轮数：同一批数据重复学习越多，策略偏离数据分布越远，KL 越大。<strong>把"扩大批次"与"减少更新轮数"组合使用，往往能在保持样本量的同时把更新拉回健康区间。</strong></p>
+
+    <h3>3.1 数值算例：解释方差与裁剪占比的读数</h3>
+    <p>取三个回合回报 G=[10,20,30]、价值预测 V=[12,18,33]：残差为 [−2,2,−3]，残差平方均值 5.667，回报方差 66.67，解释方差 EV = 1 − 5.667/66.67 ≈ 0.915，说明价值网络解释了约九成的回报波动。把预测换成三个回合的均值 20：残差平方均值恰好等于回报方差，EV 为 0，这正是"用均值预测"的基准线。把预测换成 [0,40,5]：残差平方均值 375，EV ≈ −4.63，价值网络连常数预测都不如，此时的优势估计建立在失真的价值之上，策略更新失去可靠方向。</p>
+    <p>读数顺序：先看 EV 的符号，再看大小。EV 持续为负的处理优先级高于其他一切指标，因为优势函数的符号结构直接由价值估计决定；EV 稳定为正之后，关注它向 0.8 以上收敛的速度，收敛过慢说明容量或数据覆盖不足，按 048 章与 052 章逐项排查。</p>
+
+    <h3>3.2 裁剪占比与比值离散度的换算</h3>
+    <p>裁剪占比可以反推重要性比值的离散度。设更新前后的比值 r 近似服从标准差为 σ、均值为 1 的正态分布，裁剪范围为 1±0.2，则触发裁剪的概率为 2(1−Φ(0.2/σ))。反解三个档位：裁剪占比 0.1 对应 σ≈0.12，0.2 对应 σ≈0.16，0.3 对应 σ≈0.19。<strong>这组换算把"占比是否异常"翻译成"单步更新的离散度有多大"：σ 超过 0.2 时近三成样本被裁剪，策略分布单步移动的幅度已接近裁剪边界的量级，继续放大步长只会让更多样本落进裁剪区，有效更新反而萎缩。</strong>动作维度高、动作数多时比值分布更厚尾，同样占比对应的 σ 偏小，阈值判定以自己任务的基线为准，不照搬固定数字。</p>
+
+    <h3>3.3 学习率随批次线性缩放的推导与边界</h3>
+    <p>推导分两步。设单样本梯度观测的噪声方差为 σ²，批次 B 的梯度估计噪声方差为 σ²/B。比较两种安排：k 步小批次（每步批量 B）与一步大批次（批量 kB）。<strong>位移匹配：</strong>大批次的期望位移是 lr·E[g]，k 步小批次的累计期望位移是 k·lr·E[g]，要求两者一致给出 lr<sub>新</sub> = k·lr。<strong>噪声匹配：</strong>大批次单步位移的方差正比于 lr<sub>新</sub>²·σ²/(kB)，k 步小批次累计位移的方差正比于 k·lr²·σ²/B，代入 lr<sub>新</sub>=k·lr 后两侧同为 k·lr²σ²/B，自动成立。两者合起来就是线性缩放规则：批量乘 k，学习率乘 k。</p>
+    <p>数值示例：批量从 8192 升到 65536（k=8），学习率从 1×10<sup>−4</sup> 升到 8×10<sup>−4</sup>，配合数百步的短预热。边界条件有三。<strong>（1）临界批次。</strong>批次很大后梯度噪声已不主导，继续按比例升学习率会放大曲率效应、导致失稳，临界批次以上收益递减，学习率升幅要打折。<strong>（2）预热必须保留。</strong>线性缩放只约束稳态行为，早期参数离最优点远，直接使用放大后的学习率会破坏收敛。<strong>（3）尺度不一致的损失项。</strong>价值损失与策略损失对批次的依赖不同，同时放大学习率可能让其中一项失衡，缩放后要点检两路损失的量级。</p>
+
+    <h3>3.4 阈值的两个层次：快筛与趋势</h3>
+    <p>四项指标的阈值有两个层次：绝对阈值用于首轮快筛，趋势用于最终判定。绝对阈值的问题在于量纲随任务漂移：KL 在离散三动作空间与连续六维动作空间里的正常值可以相差一个数量级，裁剪占比也随裁剪系数与批次规模变化；趋势则跨任务可比，例如"KL 连续 5 轮上升且裁剪占比同向爬升"在任何任务里都指向更新过强。操作上先用绝对阈值把明显异常挑出来，再用趋势与多指标一致性确认，单一指标超过阈值不构成处置理由。</p>
+
+    <h3>4. 干预顺序与多种子协议</h3>
+    <p>干预顺序按"离数据最近的问题优先"排列：先核查奖励与数据口径（归一化、口径混用），再调优化器相关参数（学习率、裁剪、更新轮数），最后动结构（宽度、深度、记忆）。每次只改一个变量，改动后跑固定种子复现。<strong>单项修复看起来有效仍可能是种子波动，确认结论需要至少三种子对照。</strong>多种子协议同时给出另一个诊断维度：种子间回报方差大，本身就是稳定性不足的证据。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>稳定性诊断按以下流程执行。</p>
+    <ol>
+      <li><strong>建立面板</strong>：固定记录回报、EV、KL、裁剪占比、熵、梯度范数六条曲线。</li>
+      <li><strong>快筛</strong>：单种子跑到预设步数，对照诊断表定位候选原因。</li>
+      <li><strong>单变量干预</strong>：按顺序逐项尝试候选处置，每次只改一个。</li>
+      <li><strong>多种子确认</strong>：对有效改动跑至少三种子，比较均值与方差。</li>
+      <li><strong>归档</strong>：把症状、证据、处置、结论写入实验记录，供后续任务复用。</li>
+    </ol>
+    <p>多种子验收的判定口径要事先写定：改动前后的对照各跑 3 粒种子，比较最差种子的指标与均值，最有说服力的结论是"最差种子也不劣化"。若均值的改进幅度小于种子间标准差的一半，判定为证据不足，增加重复次数或改看更稳健的指标，避免把一次幸运运行当作修复成功。归档时记录症状、证据、变量与结论四栏，下一次遇到同类症状可以直接检索历史处置。</p>
+    <h3>诊断阈值表</h3>
+    <table>
+      <tr><th>指标</th><th>关注区间</th><th>异常含义</th><th>动作</th></tr>
+      <tr><td>解释方差</td><td>持续大于 0，向 0.8 以上收敛</td><td>转负：价值估计失效</td><td>查奖励尺度与学习率</td></tr>
+      <tr><td>KL 散度</td><td>训练中低幅波动</td><td>持续偏高或归零</td><td>调更新轮数与学习率</td></tr>
+      <tr><td>裁剪占比</td><td>0.1–0.3</td><td>高于 0.3 或长期为零</td><td>调学习率与批次匹配</td></tr>
+      <tr><td>策略熵</td><td>缓慢下降的阶梯</td><td>陡降或长升</td><td>调熵系数与退火</td></tr>
+      <tr><td>梯度范数</td><td>稳定量级</td><td>尖峰或持续增大</td><td>开梯度裁剪；降学习率</td></tr>
+      <tr><td>种子间方差</td><td>小且稳定</td><td>方差大</td><td>按最差种子定验收线</td></tr>
+    </table>
+    <p>面板的采样频率与训练节奏匹配：迭代时间以秒计的任务逐轮记录，以分钟计的任务按窗口聚合记录。曲线做平滑时窗口不超过总训练长度的十分之一，窗口过大把发散前的征兆一并抹平，故障曝光时间被推迟。告警去抖用的耐心计数与窗口对齐，5 轮窗口配 3 至 5 次耐心是常用组合；训练总长很短的任务把耐心降为 2，否则异常还没攒够计数训练已经结束。</p>
+    <p>与上一章的差异：050 章优化的是训练结束后的推理指标，本章优化训练过程中的数值行为；诊断结论常反过来修正 044 至 049 章的配置，理顺这条反馈链是本章的工程价值。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：指标面板提取与阈值巡检</strong></p>
+    <pre class="code"><code>def stability_panel(result):
+    """抽取六项稳定性指标并做阈值巡检，返回结构化面板。"""
+    learner = result["info"]["learner"]["default_policy"]["learner_stats"]
+    ev = learner.get("vf_explained_var", float("nan"))
+    kl = learner.get("mean_kl_loss", float("nan"))
+    clip = learner.get("clip_ratio", float("nan"))   # 字段名因版本而异
+    entropy = learner.get("entropy", float("nan"))
+    gn = learner.get("grad_norm", learner.get("gradients_norm", float("nan")))
+    ret = result["env_runners"]["episode_reward_mean"]
+    flags = []
+    if ev &lt; 0:                       # 负解释方差：价值估计连均值都不如
+        flags.append("EV 转负：检查奖励尺度与学习率")
+    if kl &gt; 0.05:                    # 阈值按算法与动作空间微调
+        flags.append("KL 偏高：更新步长可能过大")
+    if clip &gt; 0.3:
+        flags.append("裁剪占比高：学习率/批次失配")
+    if entropy &lt; 0.1:
+        flags.append("熵接近零：探索可能耗尽")
+    return {"reward": ret, "ev": ev, "kl": kl, "clip": clip,
+            "entropy": entropy, "grad_norm": gn, "flags": flags}
+
+# 每轮记录进列表，训练结束后画六联曲线；阈值仅作首轮筛选用
+panel = stability_panel(algo.train())
+print("回报=%.1f EV=%.2f KL=%.4f 裁剪=%.2f 熵=%.3f 梯度=%.2f 告警=%s"
+      % (panel["reward"], panel["ev"], panel["kl"], panel["clip"],
+         panel["entropy"], panel["grad_norm"], panel["flags"]))</code></pre>
+    <p>解读：三个实现要点。<strong>（1）</strong>字段名按版本有差异，用回退链读取并保留 NaN，不至于个别字段更名就中断巡检。<strong>（2）</strong>阈值只用于"首轮筛选"，真正的判断依赖趋势：KL 的绝对值含义随动作空间与算法变化，代码注释里标注了这点。<strong>（3）</strong>返回结构化面板，便于汇总到实验档案做跨种子统计；直接打印会失去机读性。</p>
+    <p>阈值初筛的组合逻辑：四项指标任意两项同时越界再升级为告警，单项越界只记录。理由来自误报率：设每项指标因噪声单轮越界的概率为 5%，四项独立时至少一项越界的概率约 18.5%，两项同时越界降到约 1.4%，误报率被压低一个数量级；漏报的少量增加由后续轮次复检补回。<strong>把"几项越界"写进告警规则，比给每项配一个固定阈值更稳健，也更贴合故障通常成组出现的经验。</strong></p>
+
+    <p><strong>片段 2：自动告警回调</strong></p>
+    <pre class="code"><code>class StabilityGuard:
+    """回调式巡检：连续多个窗口异常才告警，避免单轮噪声触发误报。"""
+    def __init__(self, patience=5):
+        self.patience, self.ev_bad = patience, 0
+
+    def on_train_result(self, *, algorithm, result, **kwargs):
+        p = stability_panel(result)
+        if p["ev"] &lt; 0.0:
+            self.ev_bad += 1
+        else:
+            self.ev_bad = 0
+        if self.ev_bad &gt;= self.patience:
+            # 连续多轮为负才升级为明确建议：单轮波动不改变训练走向
+            print("[告警] 解释方差连续 %d 轮为负，建议执行降学习率试验"
+                  % self.ev_bad)
+        it = result.get("training_iteration", 0)
+        if it % 10 == 0:
+            print(f"[巡检] 第{it}轮 EV={p['ev']:.2f} KL={p['kl']:.4f} "
+                  f"裁剪={p['clip']:.2f} 熵={p['entropy']:.3f}")
+
+# guard = StabilityGuard(); 挂到 callbacks.on_train_result 即可生效
+# 回调机制见 025 章；字段名以对应版本的官方文档为准</code></pre>
+    <p>解读：逐块说明。<strong>（1）</strong>耐心计数把"瞬时异常"与"持续异常"区分开，这正是诊断与告警的分界：单点告警会把训练正常的抖动错判为故障。<strong>（2）</strong>告警文本给出具体动作建议，巡检信息直接进入处置流程；只报数值则需要巡检者自行判断动作。<strong>（3）</strong>周期性摘要行保留完整面板，便于回溯时用日志重建曲线。</p>
+
+    <p><strong>片段 3：更新强度的组合调节</strong></p>
+    <pre class="code"><code>from ray.rllib.algorithms.ppo import PPOConfig
+
+# 场景：KL 与裁剪占比双高，首选"扩大批次 + 减少更新轮数"的组合
+config = (
+    PPOConfig()
+    .environment("StabilizeEnv")
+    .training(
+        train_batch_size=65536,        # 从 32768 翻倍：降低梯度估计噪声
+        minibatch_size=8192,           # 小批量同步放大，保持轮内步数不变
+        num_epochs=4,                  # 更新轮数从 10 降到 4：限制离数据距离
+        lr=2e-4,                       # 按线性缩放规则的保守版本微调
+        gamma=0.99,
+        lambda_=0.95,
+        use_kl_loss=True,              # 开启 KL 约束项，给单步更新加软上限
+        kl_coeff=0.2,
+        grad_clip=10.0,                # 梯度裁剪兜底，防止单批尖峰
+    )
+)
+# 改动一次只动一组：本片段演示"批次与轮数"一个组合，学习率单独下一轮验证</code></pre>
+    <p>解读：这段配置对应理论部分的更新强度框架。<strong>（1）</strong>批次翻倍与小批量同步翻倍保持轮内的梯度步数不变，减少的是每个梯度的噪声，这是"扩批降噪"的标准组合。<strong>（2）</strong>更新轮数从 10 降到 4 缩短策略偏离数据分布的距离，直接压低 KL。<strong>（3）</strong>KL 约束项与梯度裁剪是兜底手段：前者软限制单步更新幅度，后者防单批尖峰；兜底与主动调节并用，改动上线时更可控。参数名随版本演进，以对应版本文档为准。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>单条曲线下结论</strong>：只看回报曲线的锯齿就断言发散或震荡，忽略 EV 与 KL 的联合证据。修复：四项指标联读，先定位再处置。</li>
+      <li><strong>同时调整多个变量</strong>：一次性改学习率、批次、熵系数，无法归因哪项生效。修复：单变量干预，每次改动跑固定种子复现。</li>
+      <li><strong>以训练回报代替评估回报</strong>：训练回报含探索噪声，评估走确定性路径，两者背离时会被忽略。修复：把评估回报与训练回报同时画入面板，关注差值趋势。</li>
+      <li><strong>忽略种子波动做结论</strong>：单次运行的表现差异可能完全来自种子。修复：有效改动至少跑三种子，按最差种子做验收。</li>
+      <li><strong>阈值当铁律</strong>：不同算法与动作空间的 KL 绝对量级不同，照搬阈值误报频发。修复：以趋势与多指标一致性为主，阈值仅作初筛。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>给出一组指标读数：EV = −0.4、KL = 0.08、裁剪占比 0.45、熵 0.9、回报高方差。对照诊断表写出两个最可能的原因与处置顺序。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>KL 与裁剪双高指向更新步长过大；EV 转负是价值侧被大更新破坏的结果。先降更新强度（批次与轮数组合），再复查奖励尺度。</div></details>
+      </li>
+      <li>推导解释方差的定义式，证明"价值函数恒等于回报均值"时 EV 恰为零，并说明 EV 为负时优势估计为何失去意义。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>均值预测器使残差方差等于回报方差，EV=1−1=0；EV 为负说明残差方差超过回报方差，优势的符号结构几乎不可信。</div></details>
+      </li>
+      <li>设计三种子对照实验验证"批次翻倍降学习率"的改动：写出实验矩阵、验收指标与判定规则。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>改动前后各三种子共六次运行；验收看最差种子回报与 EV 均值；判定规则要求两项同时不劣化才采纳。</div></details>
+      </li>
+      <li>推导学习率线性缩放规则的直觉：设梯度估计标准差随批次扩大按 1/√B 下降，证明保持单步参数位移的期望不变需要学习率随 B 线性变化，并说明该规则的失效条件。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>位移正比于学习率乘梯度均值，噪声正比于学习率乘 1/√B；批次很大后梯度曲率效应与二阶信息不可忽略，线性规则失效。</div></details>
+      </li>
+      <li>为片段 2 的告警回调增加"KL 连续多轮偏高"的监控项，说明 patience 取值与告警升级策略如何设计。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>KL 基线与动作空间相关，建议按滚动窗口中位数偏离比例判定；patience 取 3 至 5 轮平衡灵敏度与误报。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>四项核心指标各有分工：解释方差看价值侧，KL 与裁剪占比看更新强度，熵看探索结构。</li>
+      <li>失败模式与原因存在稳定的映射：发散对应步长与尺度，塌缩对应探索，平台对应容量与数据新鲜度。</li>
+      <li>更新强度由学习率、批次与更新轮数共同决定，扩批降噪与缩减轮数是压低 KL 的常用组合。</li>
+      <li>干预顺序从数据口径到优化器再到结构，单变量改动、多种子确认是结论可靠的两个前提。</li>
+      <li>告警回调用 patience 区分瞬态与持续异常，把人工看图升级为自动巡检。</li>
+      <li>下一章深入训练数据的存储机制：经验回放与优先级采样，理解数据复用与偏差校正的平衡。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch050.html">← 第 050 章：RLlib策略蒸馏与部署衔接</a>
+    <a class="next" href="ch052.html">第 052 章：RLlib经验回放与优先级采样 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

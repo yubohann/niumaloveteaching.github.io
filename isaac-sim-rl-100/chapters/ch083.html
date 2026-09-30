@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第083章 实现平滑控制 | 机器人仿真学习课程 · Isaac Sim 强化学习训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第四篇 · 控制与优化</span>
+    <span class="sep">/</span>
+    <span>第 083 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第四篇 · 控制与优化</div>
+    <h1>第 083 章：实现平滑控制</h1>
+    <p class="lead">上一章的 bang-bang 又快又"硬"，会激励机械结构的柔性模态。本章从 jerk 受限轨迹讲起，把"平滑"变成可训练的目标：动作变化率惩罚、输出低通滤波与频谱评估。</p>
+    <ul class="meta">
+      <li>主题：控制与优化 / jerk 受限与动作平滑</li>
+      <li>相关组件：Isaac Sim / Isaac Lab / Stable-Baselines3</li>
+      <li>预计学时：50 分钟</li>
+      <li>前置章节：第 082 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解振动从哪里来：加速度阶跃（jerk 冲击）如何激励机械结构的柔性模态。</li>
+      <li>掌握 jerk（加加速度）受限的 S 曲线速度剖面，以及它与梯形剖面的频谱差别。</li>
+      <li>掌握 RL 中实现平滑的三条路径：奖励惩罚、输出低通滤波、动作参数化，并会说清各自代价。</li>
+      <li>会正确设置平滑惩罚的权重：量纲归一化、与任务奖励的比例、训练课程。</li>
+      <li>会用频谱分析评估策略的平滑度，并诊断"滤波对抗""动作冻结"等典型病态。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 082 章的时间最优解把力矩在 ±τ<sub>max</sub> 之间阶跃切换，这相当于对机械臂结构施加了近似冲击的激励。真实的机械臂不是刚体：谐波减速器有弹性、铝制连杆有柔性、末端挂着的负载会晃。这些柔性模态的固有频率通常在 10–30 Hz，阻尼比只有 0.02–0.1，一旦被阶跃激励就会持续振动数百毫秒，导致末端定位抖动、装配失败、零件磨损。</p>
+    <p>更麻烦的是仿真与现实的落差：仿真里把机器人建成纯刚体时，bang-bang 策略"看着完美"，上真机却抖成一团。因此<strong>平滑控制的目标是让策略输出在时间上连续、频谱上"干净"</strong>：消除无谓的高频激励，速度本身不必牺牲。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 振动的来源：jerk 就是冲击</h3>
+    <p>定义 jerk（加加速度）为加速度的变化率：</p>
+    <div class="formula">
+      j(t) = da/dt = d³q/dt³
+      <span class="note">位置、速度、加速度、jerk 是运动学"四阶"；jerk 越大，力变化越陡</span>
+    </div>
+    <p>把结构近似为单自由度二阶模态（固有频率 f<sub>n</sub>、阻尼比 ζ）：</p>
+    <div class="formula">
+      ẍ + 2ζω<sub>n</sub>ẋ + ω<sub>n</sub>²x = (1/m)·F(t)
+      <span class="note">ω<sub>n</sub> = 2πf<sub>n</sub>；F 变化越快，模态被激励得越狠</span>
+    </div>
+    <p>时域的"快"与频域的"高频"是同一件事：<strong>加速度阶跃的频谱按 1/f 衰减，而 jerk 受限的平滑加速度按 1/f² 或更快衰减</strong>。以 20 Hz 模态为例，把 jerk 上限降到 1000 rad/s³，该频率附近的激励能量可下降一个数量级以上，这就是"平滑"的物理本质：它关乎的是能量注入。</p>
+
+    <h3>2. S 曲线：把 jerk 当约束</h3>
+    <p>第 082 章的速度剖面是梯形（加速度恒定的两段）。若把 jerk 限制为 J，梯形剖面会变成七段式 S 曲线：</p>
+    <div class="formula">
+      jerk 分段常数 → 加速段三分：J⁺ → 0 → J⁻ → 匀速 → 减速段对称
+      <span class="note">每段的 jerk 停留时间 t<sub>j</sub> = a<sub>max</sub>/J；这就是"S"名字的来源</span>
+    </div>
+    <p>峰值加速度不变（仍为 a<sub>max</sub>），但加速度从"跳变"变成"斜坡"，频谱能量被搬到更低的频段。多花的时间约为 2t<sub>j</sub>：a<sub>max</sub> = 20 rad/s²、J = 200 rad/s³ 时 t<sub>j</sub> = 0.1 s，一段运动多花约 0.2 s，<strong>这是用时间换平稳的明确价格</strong>，也是它与第 082 章目标的折中点。</p>
+
+    <h3>3. 滤波等价性：平滑 = 低通</h3>
+    <p>还有一种更工程化的理解：对原始加速度做一阶低通（时间常数 τ）再积分，得到的运动正是"jerk 近似受限"的轨迹，且约束近似为 J ≈ a<sub>max</sub>/τ。滤波器是线性系统：时域里"软化了拐角"，频域里"砍掉了截止频率 1/(2πτ) 以上的能量"。它同时带来两个副作用，必须心里有数：</p>
+    <table>
+      <tr><th>时间常数 τ</th><th>等效截止频率</th><th>对节拍的影响</th><th>平滑收益</th></tr>
+      <tr><td>20 ms</td><td>≈ 8 Hz</td><td>几乎无感</td><td>去除采样毛刺</td></tr>
+      <tr><td>80 ms</td><td>≈ 2 Hz</td><td>每段延迟约 80 ms</td><td>显著压制 10–30 Hz 模态</td></tr>
+      <tr><td>200 ms</td><td>≈ 0.8 Hz</td><td>明显变慢</td><td>接近"温柔"极限，跟踪误差增大</td></tr>
+    </table>
+
+    <h3>4. RL 中实现平滑的三条路径</h3>
+    <p>策略网络天然倾向输出高频抖动（尤其是用动作噪声探索之后），需要主动治理：</p>
+    <ol>
+      <li><strong>奖励惩罚</strong>：奖励中减去 β·‖Δτ‖² 或 β·‖τ<sub>k</sub> − 2τ<sub>k−1</sub> + τ<sub>k−2</sub>‖²。前者罚一阶变化率、后者真正罚 jerk（二阶差分）。优点是不干扰动作可达域；缺点是 β 需调参，且奖励产生历史依赖。</li>
+      <li><strong>输出低通滤波</strong>：策略输出先过一阶惯性环节 <code>u ← u + α(u<sub>new</sub> − u)</code>，再乘力矩上限。优点是"硬保证"，无论策略输出什么，执行侧都不可能高频跳变；缺点是引入固定延迟，且策略会"学会对抗滤波器"（见常见坑）。</li>
+      <li><strong>动作参数化</strong>：不直接输出力矩，改为输出低维轨迹参数（样条控制点、速度指令的幅值与方向），由底层控制器生成平滑轨迹。平滑性由结构保证，但牺牲策略的高频补偿能力。</li>
+    </ol>
+    <div class="formula">
+      一阶滤波离散实现：u<sub>k</sub> = u<sub>k−1</sub> + α·(u<sub>target</sub> − u<sub>k−1</sub>)，α = dt / (τ + dt)
+      <span class="note">dt=1/60 s、τ=80 ms 时 α≈0.17：每次只走目标差的 17%，天然限速</span>
+    </div>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <ol>
+      <li><strong>先度量再优化</strong>：记录策略的力矩序列，算 jerk RMS 与 10–30 Hz 频段能量占比。没有基线数字，"更平滑"无从谈起。</li>
+      <li><strong>惩罚项的量纲要归一化</strong>：动作先除以 τ<sub>max</sub> 再求差分平方，否则 β 的合理范围随力矩单位漂移；差分再除以 dt 化为"每秒"量纲，与时间税比例更易调。</li>
+      <li><strong>β 从"损失占比"反推</strong>：训练早期让平滑惩罚约占总损失的 5%–15%；占比超过 50% 会"动作冻结"。</li>
+      <li><strong>推荐组合：弱滤波 + 奖励惩罚</strong>。只用滤波，策略会输出反向高频信号去抵消滤波延迟；只用惩罚，末端仍可能残留几百毫秒的抖动。两者结合并让滤波时间常数取小（20–40 ms），效果最稳。</li>
+      <li><strong>观测要补历史</strong>：若奖励依赖 τ<sub>k−1</sub>，严格来说状态不再是马尔可夫的。把上一步动作拼进观测最省事；或用循环网络（第 061 章）保留记忆。</li>
+      <li><strong>训练课程</strong>：任务成功率 &lt;80% 时先别加平滑项，否则既学不会任务也抓不住平滑；成功稳定后再线性提升 β（0 → 0.1 → 0.3），每档重训。评估用三件套：任务指标（到点时间/成功率）、平滑指标（jerk RMS、频谱峰值）、执行器指标（力矩变化率 P99）。</li>
+    </ol>
+    <div class="box key">
+      <span class="box-title">设计思维：平滑与时间最优的折中曲线</span>
+      <p>把 β 从 0 扫到较大值，会得到一条"抖动—时间"折中曲线：横轴 jerk RMS，纵轴到点时间。曲线通常前段很陡（去掉毛刺几乎不花时间）、后段很平（再平滑只是白白变慢），<strong>工程上选在拐点附近</strong>。本课程推荐 τ=40 ms 滤波 + 惩罚占 10%，多数搬运任务能在时间增加 &lt;10% 的前提下把末端振动砍掉一半以上。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：梯形剖面 → 低通平滑 → S 曲线（理解"平滑就是低通"）</strong></p>
+    <pre class="code"><code>import numpy as np
+
+def trap_then_smooth(d, v_max, a_max, dt=1.0 / 60.0, tau=0.08):
+    """生成点到点运动：先算理想梯形速度剖面，再对加速度做一阶低通。
+    tau 是低通时间常数：越大越平滑、总时长越长（近似 jerk 上限 a_max/tau）。"""
+    n = int(4.0 / dt)                     # 预分配 4 秒的序列，够一般短行程用
+    a_ideal = np.zeros(n)
+    v = 0.0
+    x = 0.0
+    for k in range(n):                    # 第一遍：按"剩余距离"开关加速度，得梯形剖面
+        remain = d - x
+        # 能停下的条件：remain 还大于刹车距离 v^2/(2a) 才继续加速，否则减速
+        if v &lt; v_max and remain &gt; v * v / (2.0 * a_max) + v * dt:
+            a_ideal[k] = a_max
+        elif remain &gt; 1e-6:
+            a_ideal[k] = -a_max
+        else:
+            a_ideal[k] = 0.0
+        v = max(v, 0.0) + a_ideal[k] * dt
+        x += v * dt
+    # 第二遍：一阶低通加速度，把"阶跃"变成"斜坡"，这正是 jerk 受限的近似
+    alpha = dt / (tau + dt)               # dt=1/60、tau=0.08 时 alpha≈0.17
+    a_smooth = np.zeros(n)
+    for k in range(1, n):
+        a_smooth[k] = a_smooth[k - 1] + alpha * (a_ideal[k] - a_smooth[k - 1])
+    v_smooth = np.cumsum(a_smooth) * dt   # 平滑加速度积分回速度与位置
+    x_smooth = np.cumsum(v_smooth) * dt
+    return a_ideal, a_smooth, v_smooth, x_smooth
+</code></pre>
+    <p>解读：这个片段把本章两个核心概念连了起来，"S 曲线"与"低通滤波"其实是一回事的两种说法。第一遍按最朴素的"到点刹车"逻辑生成梯形加速度（与第 082 章 bang-bang 同源）；第二遍的 <code>alpha</code> 决定平滑强度：τ=80 ms 时每次只吸收目标差的 17%，加速度拐角被拉成斜坡。<strong>低通会带来总时长增加</strong>，这正是"平滑的代价"在代码里的体现。把 <code>tau</code> 改成 0.02 与 0.2 各跑一次，观察拐角与总时长变化。</p>
+
+    <p><strong>片段 2：在 RL 环境里加入动作变化率惩罚与输出滤波</strong></p>
+    <pre class="code"><code>class SmoothReachEnv:
+    """在普通到点任务上叠加平滑机制：输出低通 + 动作变化率惩罚。"""
+
+    def __init__(self, num_envs, dt=1.0 / 60.0, tau_max=30.0,
+                 filt_tau=0.04, beta=0.1):
+        self.dt = dt
+        self.tau_max = tau_max            # 力矩上限：归一化动作时用
+        self.alpha = dt / (filt_tau + dt) # 40 ms 低通：只削高频，不造成明显延迟
+        self.beta = beta                  # 平滑权重：占任务损失 5%-15% 之间为宜
+        self.filtered = torch.zeros(num_envs, 7)      # 滤波后的动作（7 个关节）
+        self.prev_action = torch.zeros(num_envs, 7)   # 上一步动作，供差分用
+
+    def step(self, raw_action):
+        raw_action = torch.clamp(raw_action, -1.0, 1.0)   # 先截断，防策略输出越界
+        # 一阶低通：执行侧拿到的是"以 alpha 速度逼近目标"的平滑指令
+        self.filtered = self.filtered + self.alpha * (raw_action - self.filtered)
+        tau = self.filtered * self.tau_max                # 再映射到物理力矩
+        # 动作变化率（离散 jerk 代理）：除以 dt 化为"每秒"量纲，与时间税可比
+        rate = (raw_action - self.prev_action) / self.dt
+        self.prev_action = raw_action.clone()
+        obs, task_reward, done = self._physics_step(tau)
+        # 惩罚只作用在变化率上，不动任务奖励的量纲；beta 从小往大升
+        penalty = self.beta * torch.sum(rate ** 2, dim=-1)
+        return obs, task_reward - penalty, done
+</code></pre>
+    <p>解读：这是本章的"最小可运行改造"。（1）<code>alpha</code> 由 <code>filt_tau</code> 反推，不硬编码，让时间常数成为可解释参数：改平滑强度只改 τ；（2）惩罚取 <code>raw_action</code>，滤波已削掉高频，再惩罚滤波序列会低估策略的"抖动意图"；（3）除以 <code>dt</code> 是量纲细节：不除的话训练步长一变，β 的等效强度就变了；（4）<code>prev_action</code> 用 <code>.clone()</code> 防张量别名污染，这是批量环境的常见坑。把 β 从 0.1 提到 1.0，你会看到动作变"肉"、到点变慢。</p>
+
+    <p><strong>片段 3：用 FFT 评估平滑度（找柔性模态的激励峰）</strong></p>
+    <pre class="code"><code>import numpy as np
+
+def jerk_spectrum(tau_series, dt=1.0 / 60.0, band=(10.0, 30.0)):
+    """对力矩序列做频谱分析：检查 10-30 Hz 柔性模态频段的能量占比。
+    tau_series: shape=(T, n_joints)，一次到点运动的力矩记录。"""
+    rate = np.diff(tau_series, axis=0) / dt            # 一阶差分 = 力矩变化率
+    x = rate - rate.mean(axis=0, keepdims=True)        # 去直流：只关心动态分量
+    window = np.hanning(x.shape[0])[:, None]           # 加汉宁窗：抑制频谱泄漏
+    spec = np.fft.rfft(x * window, axis=0)             # 沿时间轴做实数 FFT
+    freqs = np.fft.rfftfreq(x.shape[0], d=dt)
+    power = np.abs(spec) ** 2                          # 功率谱
+    lo, hi = band
+    mask = (freqs &gt;= lo) &amp; (freqs &lt;= hi)
+    ratio = power[mask].sum() / max(power.sum(), 1e-12)  # 模态频段的能量占比
+    peak = freqs[power.sum(axis=1).argmax()]           # 能量最大的频率
+    return ratio, peak
+
+# 用法：分别记录 beta=0 与 beta=0.3 的策略轨迹，比较 ratio 与 peak
+# 预期：beta=0 时 10-30 Hz 占比可达 20%-40%，beta=0.3 后降到 5% 以下
+</code></pre>
+    <p>解读：评估平滑度不能只看"最大力矩"（那衡量的是幅值，变化率才决定冲击），要对<strong>力矩变化率做频谱</strong>。加汉宁窗是必须的：一次到点运动只有 2–4 秒（120–240 个采样点），不加窗会因截断产生假频峰。判据 <code>ratio</code> 直接回答"策略有没有踩到结构模态"；<code>peak</code> 给出主频，帮助区分是策略低频摆动还是采样混叠（接近 25 Hz 的假峰）。预期：不惩罚时频段占比常在 20%–40%，加合理 β 后降到 5% 以下，到点时间只增加 5%–10%。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>只滤波不惩罚</strong>：策略发现输出被滤波器"吃掉"后会主动输出反向高频来预补偿，噪声反而更大。修复：惩罚入口固定在滤波前（如片段 2），或滤波 + 惩罚双管齐下。</li>
+      <li><strong>惩罚项没归一化</strong>：直接用原始力矩（30 N·m 量级）平方差，β 稍微一调就天翻地覆。修复：动作先除以 τ<sub>max</sub> 再差分，β 在 0.01–0.5 间就有清晰效果。</li>
+      <li><strong>β 过大导致"动作冻结"</strong>：策略发现"不动最平滑"，拒绝大动作，到点时间暴涨甚至学不会任务。修复：课程学习，从 β=0 逐步上升。</li>
+      <li><strong>把奖励历史当马尔可夫状态用</strong>：奖励里出现 τ<sub>k−1</sub> 后，策略需要历史信息才能最优；观测不补上会训练不稳（表现为回报震荡）。修复：观测拼接上一步动作，或换循环策略。</li>
+      <li><strong>用未滤波的差分估 jerk</strong>：编码器量化噪声（如 0.001 rad 分辨率）在 60 Hz 下差分出的"jerk"全是噪声。修复：对信号做与物理带宽匹配的滤波后再差分。</li>
+      <li><strong>把平滑当万能药</strong>：与结构模态频率接近的强制往复运动（如 15 Hz）靠惩罚压不住，需要陷波滤波器（notch filter）或改机构；平滑只对宽带冲击有效。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>用片段 1 生成 τ=0.02 s 与 τ=0.2 s 的速度剖面，画出两条曲线，标出总运动时间与峰值加速度的差别。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>低通不改变低频（匀速段）只磨圆拐角，所以峰值加速度几乎不变；总时间差主要来自加速/减速两端的"圆角"。</div></details>
+      </li>
+      <li>在到点任务上扫 β = 0、0.05、0.1、0.3、1.0，记录（jerk RMS，到点时间），画出折中曲线并找到拐点。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>前几个 β 会大幅降 jerk 而时间几乎不变；β≥0.3 后时间开始明显上升。这就是选参数的依据。</div></details>
+      </li>
+      <li>把低通时间常数 τ 分别设为 0、20、80、200 ms 训练，预测并验证跟踪误差与相位延迟的关系。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>一阶低通对正弦的相位滞后约 arctan(2πfτ)：1 Hz 下 τ=80 ms 约滞后 27°，跟踪误差随滞后增大。</div></details>
+      </li>
+      <li>设计实验：把上一步动作加入观测（维度 +7），对比加与不加时的回报曲线与到点时间方差。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>平滑奖励依赖历史，补齐观测后状态近似马尔可夫，训练应更稳；用多次随机种子的标准差衡量。</div></details>
+      </li>
+      <li>在仿真里给机械臂加一个 20 Hz 的柔性模态（如末端加弹簧-阻尼负载），对比 β=0 与 β=0.3 策略的末端振动包络，并用片段 3 验证频段能量变化。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>柔性负载可用小质量块 + 弹簧阻尼关节近似；振动包络用末端位置滑动标准差量化。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>振动的根源是 jerk（力变化率）：bang-bang 的加速度阶跃在 10–30 Hz 频段注入大量能量，激励柔性模态。</li>
+      <li>S 曲线 = jerk 受限的轨迹；一阶低通滤波与 jerk 受限近似等价（J ≈ a<sub>max</sub>/τ），代价是响应变慢。</li>
+      <li>RL 平滑三路径：奖励惩罚 Δτ²（推荐二阶差分）、输出低通滤波、动作参数化；推荐"弱滤波（40 ms）+ 惩罚（占损失 10%）"组合。</li>
+      <li>平滑惩罚必须量纲归一化，β 过大导致动作冻结；观测应包含上一步动作以保证马尔可夫性；用 FFT 检查模态频段能量。</li>
+      <li>验收三件套一起报：任务指标（到点时间/成功率）、平滑指标（jerk RMS、频段能量占比）、执行器指标（力矩变化率 P99）。</li>
+      <li>下一章转向空间侧约束：机械臂在奇异位形附近雅可比退化，末端"想动却动不了"，需要用可操作度来度量并规避，见第 084 章。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch082.html">← 第 082 章：实现时间最优控制</a>
+    <a class="next" href="ch084.html">第 084 章：实现避奇异位形 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

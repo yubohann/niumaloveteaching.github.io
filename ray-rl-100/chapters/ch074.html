@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第074章 随机种子管理 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第四篇 · Ray Tune 超参搜索</span>
+    <span class="sep">/</span>
+    <span>第 074 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第四篇 · Ray Tune 超参搜索</div>
+    <h1>第 074 章：随机种子管理</h1>
+    <p class="lead">强化学习管道里存在多个独立随机源，种子管理的目标是让每个来源可复现、可复用、可对照。本章讲清三层种子的派生与传递、精确复现与统计复现的边界，以及“搜索用单种子、复验用多种子”的预算策略。</p>
+    <ul class="meta">
+      <li>主题：Ray Tune 调优 / 可复现性控制</li>
+      <li>关键机制：种子派生、随机源分层、复现级别、方差驱动预算</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 073 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>能列举强化学习训练管道的全部随机源，并按环境、策略、数据、评估、基础设施五类归层。</li>
+      <li>掌握种子派生规则：从试验种子出发为每个随机源生成独立种子，并保证多 worker 不重复。</li>
+      <li>会区分精确复现与统计复现：各自的判定方法与适用边界。</li>
+      <li>会设计三层种子策略：搜索阶段、复验阶段、评估集合的种子分配与存储要求。</li>
+      <li>会用配置间与种子间的方差分解决定“是否需要给每个配置加种子”，并推演预算代价。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>同一个配置换一个种子，末端回报的浮动可达数十点；同一种子重复运行，管道里任何一个未受控的随机源都会让浮动再次出现。<strong>种子管理的价值在于把“这个差异是真实的，还是噪声”变成可以回答的问题：随机源受控后，噪声可度量、差异可对照、结果可复现。</strong></p>
+    <p>前几章多次触及种子话题：检查点恢复要求随机数状态随检查点保存（第 064 章），配对复验要求同种子对照（第 071、072 章）。本章把它们收拢为完整的种子体系：五类随机源、三层种子策略、两级复现标准。这套体系是搜索实验可审计性的最后一块拼图。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 随机源分层清单</h3>
+    <p>训练管道里的随机性来自五类来源：<strong>环境层</strong>（初始状态分布、环境内部事件、动作执行中的噪声）；<strong>策略层</strong>（网络参数初始化、动作采样与探索噪声、随机失活）；<strong>数据层</strong>（批量洗牌、优先级回放的采样、数据加载顺序）；<strong>评估层</strong>（评估回合的初始状态与评估自身的采样）；<strong>基础设施层</strong>（异步执行的完成顺序、任务重试的时刻）。<strong>前四类可以通过种子控制到可复现，第五类只能通过“记录实际顺序”来降低影响，无法完全消除。</strong>管理动作从前四类开始，第五类用日志留存。</p>
+
+    <h3>2. 种子派生与传递</h3>
+    <p>最小可用方案是一个试验种子（Trial Seed）派生出全部下游种子，派生规则固定且可记录：<strong>环境种子、策略种子、数据种子、评估种子各占一个固定偏移量，互不重叠；多进程采样时每个 worker 在环境种子上再加“worker 标识 × 大步长”，避免所有 worker 用同一条随机流导致轨迹重复。</strong></p>
+    <div class="formula">
+      seed<sub>source</sub> = f(base_seed, source_id), &nbsp; seed<sub>worker,k</sub> = g(seed<sub>env</sub>, k)
+      <span class="note">f、g 为固定函数（偏移或混合函数）；规则与 base_seed 一起写入检查点与实验记录，恢复时逐位重建</span>
+    </div>
+    <p><strong>派生规则本身是实验协议的一部分：改动偏移常量会让历史结果无法对照。</strong>推荐把“试验种子”存进试验配置（作为搜索维度或固定值），把派生规则封装为项目内唯一函数，避免各处手写偏移产生碰撞。</p>
+
+    <h3>3. 精确复现与统计复现</h3>
+    <p>复现标准分两级。<strong>精确复现</strong>要求逐位一致：同版本、同硬件、同步执行、确定性算子配置（关闭卷积基准搜索、启用确定性算法）。<strong>统计复现</strong>要求分布一致：不同硬件或异步执行下，逐位一致不可达，但多个种子的均值与区间应与原实验重叠。</strong>工程上先追求“同机可精确复现”，把跨机目标定为统计复现；判定方法是对两跑结果做逐点差（精确）与尾段均值差（统计）两组检查，容忍度写入复现清单。</p>
+
+    <h3>4. 三层种子策略</h3>
+    <p>按实验阶段分配种子：<strong>搜索阶段</strong>每个配置 1 个种子，宽度优先，把预算花在配置多样性上；<strong>复验阶段</strong>给入围的少数配置配 3 至 5 个新种子（未参与搜索的种子），配对比较；<strong>评估阶段</strong>使用固定评估种子集，全部配置共享同一组评估回合。<strong>“新种子”的纪律是防过拟合：搜索种子决定了谁入围，复验种子测量入围者的真实水平，两组混用会让复验退化为对旧数据的复读。</strong>第 071 章的选择偏差分析给出了量级依据：单种子排序的可信度随噪声增长而下降，复验是购买可信度的手段。</p>
+
+    <h3>5. 方差驱动的预算决策</h3>
+    <p>是否需要给每个配置加种子，由方差分解回答：把总方差拆成配置间差异与种子内差异，<strong>两者比值（信噪比）低于 1 时，单种子排序被噪声主导，加种子的收益高于加配置；信噪比远高于 1 时，单种子筛选足够，把预算留给更多配置。</strong>代价侧的换算很简单：每配置 k 个种子等价于把试验预算扩大 k 倍，或把配置数缩小到 1/k。决策在“宽度”与“可信度”之间分配预算，依据取方差分解，直觉只用于提出假设。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>种子体系建设按五步执行：<strong>列清单、定规则、写配置、验复现、定策略。</strong>与上一章的差异在于，第 073 章控制记录行为，本章控制“不确定性从哪来、到哪去”。</p>
+    <ol>
+      <li><strong>列清单</strong>：逐项核对五类随机源在本项目中的具体表现位置。</li>
+      <li><strong>定规则</strong>：为每类定义派生偏移与多 worker 的次级派生函数，集中放在一个模块。</li>
+      <li><strong>写配置</strong>：试验种子进配置；派生规则版本号进实验记录；恢复路径重建随机流（与第 064 章的检查点内容衔接）。</li>
+      <li><strong>验复现</strong>：同机同配置跑两次，先看逐点差，再看尾段均值差，记录实测的复现级别。</li>
+      <li><strong>定策略</strong>：搜索与复验的种子分配、评估种子集合、方差分解口径写入实验协议。</li>
+    </ol>
+    <table>
+      <tr><th>随机源</th><th>派生种子</th><th>存储位置</th><th>复现级别</th></tr>
+      <tr><td>环境初始与事件</td><td>base + 0</td><td>检查点与配置</td><td>同机精确</td></tr>
+      <tr><td>策略初始化与探索</td><td>base + 1000</td><td>检查点</td><td>同机精确</td></tr>
+      <tr><td>批量洗牌与回放采样</td><td>base + 2000</td><td>检查点</td><td>同机精确</td></tr>
+      <tr><td>评估回合</td><td>base + 3000</td><td>实验记录</td><td>同机精确</td></tr>
+      <tr><td>异步执行顺序</td><td>不可控</td><td>运行日志</td><td>统计一致</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：为什么评估种子要在所有配置间共享？</span>
+      <p>评估回合的初始状态与评估采样构成评估噪声。所有配置使用同一组评估回合时，评估噪声在配置之间同向作用，对差值的影响被抵消，配置差异更容易分辨；评估种子随配置变化时，评估噪声转化为独立干扰项，进入差值方差，结论需要更多种子才能达到同等强度。共享评估种子集的成本为零，收益是把一个噪声源变成对照的公共项。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：种子派生与全链路传递</strong></p>
+    <pre class="code"><code>def derive_seeds(base_seed):
+    """从试验种子派生各随机源的种子；偏移常量是实验协议的一部分。"""
+    return {
+        "env": base_seed,               # 环境初始状态与内部事件
+        "policy": base_seed + 1000,     # 网络初始化与动作采样
+        "shuffle": base_seed + 2000,    # 批量洗牌与回放采样
+        "eval": base_seed + 3000,       # 评估回合布局
+    }
+
+def env_seed_for_worker(seed_env, worker_idx):
+    """多 worker 次级派生：大步长隔离，避免轨迹重复。"""
+    return seed_env + worker_idx * 100000
+
+def train_fn(config):
+    seeds = derive_seeds(config["seed"])
+    algo = build_algo(config, policy_seed=seeds["policy"])
+    for it in range(config["max_iters"]):
+        # 采样：每个环境运行器用各自的派生种子，数据多样性有保证
+        batch = collect_rollout(
+            algo, env_seeds=[env_seed_for_worker(seeds["env"], k)
+                             for k in range(config["num_env_runners"])])
+        # 训练：数据顺序由 shuffle 种子控制，与策略侧解耦
+        algo.train(batch, shuffle_seed=seeds["shuffle"])
+        # 评估：固定评估种子集，全部配置共享同一组回合
+        score = evaluate(algo, seed_set=config["eval_seeds"])
+        tune.report(episode_return_mean=score, epoch=it)
+</code></pre>
+    <p>解读：派生结构体现三个纪律。<strong>（1）</strong>四类种子各用固定偏移隔离，任何一类消耗随机数不会影响其他类的序列；偏移常量写入项目模块，改动视为协议变更。<strong>（2）</strong>worker 次级派生用大步长（10 万）隔离，保证不同 worker 的流在长时间采样下不会交叉；若所有 worker 共享一个环境种子，八并行采样的轨迹会高度相似，样本效率下降。<strong>（3）</strong>评估种子独立成字段并进入配置，使“评估回合共享”成为显式设置。派生规则与基础种子随检查点保存，恢复时按同一函数重建，与第 064 章的随机流恢复衔接。</p>
+
+    <p><strong>片段 2：两级复现判定</strong></p>
+    <pre class="code"><code>def reproducibility_check(run_a, run_b, tol=1e-6, noise_sigma=15.0):
+    """两跑对照：先判精确复现，再看统计复现的尾段差。"""
+    diffs = [abs(a - b) for a, b in zip(run_a, run_b)]
+    max_diff = max(diffs)
+    exact = max_diff &lt;= tol
+    if exact:
+        print(f"精确复现：逐点最大差 {max_diff:.2e}")
+        return "exact"
+    # 非精确时用统计口径：尾段均值差控制在噪声水平以内即视为统计一致
+    tail = min(10, len(run_a))
+    mean_a = sum(run_a[-tail:]) / tail
+    mean_b = sum(run_b[-tail:]) / tail
+    delta = abs(mean_a - mean_b)
+    level = "statistical" if delta &lt;= 2.0 * noise_sigma else "diverged"
+    print(f"逐点最大差 {max_diff:.2e}；尾段均值差 {delta:.1f} -> {level}")
+    return level
+</code></pre>
+    <p>解读：判定函数把“复现”拆成三级输出。<strong>（1）</strong>精确判定用逐点最大差与容差比较，容差取浮点累加误差的量级（1e-6），过高或过低都会产生误判。<strong>（2）</strong>非精确情形退到统计口径：尾段均值差在噪声水平（两倍标准差量级）以内记为统计一致，超过则标记发散，需要排查未受控随机源。<strong>（3）</strong>三个等级直接对应报告措辞：“精确复现”可写逐位一致；“统计复现”需附种子数与区间；“发散”必须查因后才能进入结论。跨硬件运行通常停在统计级，这是可接受的目标。</p>
+
+    <p><strong>片段 3：方差分解驱动的种子预算</strong></p>
+    <pre class="code"><code>def seed_variance(rev_df, metric="episode_return_mean", tail=10):
+    """估计配置间与种子内方差，决定加种子还是加配置。"""
+    finals = (rev_df.sort_values("epoch")
+                .groupby(["config_key", "seed"]).tail(tail)
+                .groupby(["config_key", "seed"])[metric].mean()
+                .unstack("seed"))          # 行=配置，列=种子
+    between = finals.mean(axis=1).std()    # 配置间差异（信号）
+    within = finals.std(axis=1).mean()     # 种子内差异（噪声）
+    ratio = between / max(within, 1e-9)
+    if ratio &lt; 1.0:
+        advice = "噪声主导：先给入围配置加种子，再考虑扩配置"
+    else:
+        advice = "信号充足：单种子筛选可行，预算留给更多配置"
+    print(f"信号 {between:.1f} / 噪声 {within:.1f} = 信噪比 {ratio:.2f}；{advice}")
+    return between, within, ratio
+
+seed_variance(reverify_df)
+</code></pre>
+    <p>解读：分解函数给出的是预算分配判据。<strong>（1）</strong>“配置间差异”用各配置均值序列的标准差度量，“种子内差异”用同一配置跨种子的标准差度量；两者都以尾段均值为单元，与第 071 章的排序口径一致。<strong>（2）</strong>信噪比低于 1 时，排序名次在换种子后大面积翻转，加种子（提高每配置可信度）的边际收益高于加配置。<strong>（3）</strong>信噪比高时说明当前参数范围里差异足够大，单种子筛选可靠，继续扩配置以覆盖空间更划算。<strong>（4）</strong>该函数的输入需要多配置多种子的复验数据，属于复验阶段的分析工具；搜索阶段可先用历史任务的同类比值做先验估计。种子相关配置字段（含 RLlib 侧）随版本演进，以对应版本的官方文档为准。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>只设全局种子</strong>：只调用一次全局随机种子设置，环境与框架各自维护随机数发生器，未被征召的源继续产生“随机”结果。修复：按随机源清单逐项设置，派生规则集中管理。</li>
+      <li><strong>多 worker 共享环境种子</strong>：并行采样的轨迹高度相似，样本多样性下降、吞吐虚高。修复：按 worker 次级派生，步长足够大以隔离随机流。</li>
+      <li><strong>评估种子随配置变化</strong>：评估噪声进入配置差值，对比结论需要更多种子才能成立。修复：评估种子集固定并在配置间共享。</li>
+      <li><strong>挑幸运种子汇报</strong>：从多个种子中选取最好的一次作为方案水平，选择偏差叠加在种子维度上。修复：按种子集均值与区间汇报，种子清单随报告公开。</li>
+      <li><strong>跨硬件追求逐位复现</strong>：把“统计一致”当作失败继续排查，消耗大量精力。修复：复现目标分级，跨机以统计复现为准，把精度声明写进实验协议。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>列出你的训练管道中五类随机源的具体表现位置各两例，并标注哪些能被种子控制、哪些只能记录。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>环境层如初始状态采样与动作噪声；策略层如权重初始化与动作采样；数据层如批量洗牌与回放优先级；评估层如评估回合；基础设施层如异步完成顺序。前四类可控，最后一类靠日志留存。</div></details>
+      </li>
+      <li>预测题：环境运行器从 1 个增加到 8 个，但所有 worker 使用同一环境种子，样本多样性与学习曲线各会怎样变化？<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>八条轨迹高度相似，单迭代内样本的信息量接近单 worker，学习速度提升有限；曲线形态更平滑但收敛位不变，符合“吞吐上升、效率不涨”的特征。</div></details>
+      </li>
+      <li>设计题：为一次搜索设计三层种子策略：搜索种子如何进空间、复验种子如何分配、评估种子集如何选取，并写明每层种子的存储位置与理由。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>搜索层种子作为随机维度进配置；复验层为入围者分配未参与搜索的固定种子列表；评估层固定一小集合（如 20 个评估回合）写进不可变配置。存储上搜索种子进检查点，评估种子进实验协议。</div></details>
+      </li>
+      <li>推导题：设每配置运行成本为 m、种子间标准差为 s，推导“每配置 k 个种子”的排序标准误，并说明信噪比与所需 k 的关系。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>均值标准误为 s/√k；要把标准误压到配置间差异 d 的某个比例以下，需 k=(s/d)<sup>2</sup>×常数。信噪比越低（s/d 越大），所需 k 平方增长，这正是噪声主导时需要大幅加种子的原因。</div></details>
+      </li>
+      <li>实践题：执行一次复现测试：固定全部种子跑两次同一配置，用片段 2 的判定函数给出复现级别，并列出仍未受控的随机源。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>若停在统计级，逐一核对五类来源的设置与硬件差异；把残余来源写进实验记录，作为“本任务复现级别”的官方说明。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>随机源分五层：环境、策略、数据、评估可控，基础设施层的执行顺序只能记录、不能消除。</li>
+      <li>种子派生用固定偏移隔离来源，多 worker 次级派生用大步长隔离，规则属于实验协议。</li>
+      <li>复现分两级：同机同版本追求精确复现，跨硬件以统计复现为目标；判定函数输出三级结论。</li>
+      <li>三层种子策略：搜索单种子求宽度，复验新种子求可信，评估共享种子集抵消评估噪声。</li>
+      <li>方差分解给出预算判据：信噪比低于 1 加种子，高于 1 扩配置。</li>
+      <li>下一章进入阶段实践：把空间、调度、资源、分析、种子串成一次完整搜索。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch073.html">← 第 073 章：检查点频率与日志级别控制</a>
+    <a class="next" href="ch075.html">第 075 章：阶段实践：一次完整的超参搜索 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

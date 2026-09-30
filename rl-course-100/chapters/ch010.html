@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第010章 PPO的早停与模型保存策略 | 深度强化学习课程 · PPO、SAC 与多智能体系统</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · 策略梯度与 PPO</span>
+    <span class="sep">/</span>
+    <span>第 010 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · 策略梯度与 PPO</div>
+    <h1>第 010 章：PPO的早停与模型保存策略</h1>
+    <p class="lead">同一种子、同一预算下对比三种交付策略：不早停的 baseline、KL 早停的 klstop、周期评估保存最优的 ckpt，用首达步数、KL 峰值、最终与最优评估的差距回答"训练何时停、模型交付哪一个"。</p>
+    <ul class="meta">
+      <li>主题：训练控制 / 模型交付</li>
+      <li>关键公式：KL̂<sub>epoch</sub> &gt; κ·KL<sub>target</sub> 则停；θ* = arg max<sub>k</sub> Eval(θ<sub>k</sub>)</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 009 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解 PPO 的三种"停止"：批次内 epoch 早停（KL 阈值）、训练级早停（达标或耐心）、评估驱动的检查点选择。</li>
+      <li>实现按 epoch 汇总的 KL 早停，并统计每批数据实际使用的 epoch 数。</li>
+      <li>实现周期评估 + 最优检查点保存，比较"最终模型"与"最优模型"的评估差距。</li>
+      <li>掌握模型交付的工程习惯：分开保存最终/最优、记录评估轨迹与保存路径。</li>
+      <li>认识早停与检查点的代价与风险：误停、评估噪声、选择偏差，以及缓解手段。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>前几章都在解决"怎么学得好"，本章解决"怎么收得住"。PPO 的更新循环里有两类浪费：一类是<strong>单批数据被过度使用</strong>，同一个 batch 更新十几个 epoch 后，策略早已远离采样时刻，比率大量越界、梯度被裁剪吃掉，KL 冲高还伤稳定性；另一类是<strong>训练过量</strong>，策略学成之后继续跑，遇到环境波动或价值误差，成绩可能回退，而你手上最后一个模型恰好是回退后的那个。</p>
+    <p>针对这两类浪费，标准答案是两个机制：<strong>KL 早停</strong>（一个 epoch 后若 KL 超过目标，直接放弃本批剩余 epoch）与<strong>最优检查点</strong>（周期性评估，保存成绩最好的模型）。本章把二者与 baseline 放在同一预算下对比，量化它们各自挽回多少：早停省多少更新、检查点比最终模型高多少分。这些数字决定了你在真实项目里要不要多写这几十行代码。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. KL 早停：把"信任域"用在停止上</h3>
+    <p>裁剪目标是软约束：比率越界后梯度归零，但参数仍可能被人为推远。实践建议是给 KL 再加一道闸：每跑完一个 epoch，统计该 epoch 的平均近似 KL，如果超过阈值的倍数就停止本批剩余 epoch：</p>
+    <div class="formula">
+      若　KL̂<sub>epoch</sub> &gt; κ · KL<sub>target</sub>　则放弃本批剩余 epoch
+      <span class="note">κ 默认 1.5～2；KL 估计用采样形式 (1/N)Σ[log π<sub>old</sub> − log π<sub>θ</sub>]</span>
+    </div>
+    <p>它和 KL 惩罚目标（第 003 章）的区别在于<strong>作用点</strong>：惩罚目标是"边更新边拉回"，KL 早停是"越线就退出本批"。两者的共同直觉都是：数据已经被用旧了，继续更新只会把策略带向不可信的方向。注意阈值用<strong>相对形式</strong>（目标 KL × 倍数），因为不同任务、不同批量下 KL 的合理水平不同。</p>
+
+    <div class="box key">
+      <span class="box-title">数值算例：一批数据的早停省钱账</span>
+      <p>设 <code>--epochs</code>=10、<code>--target-kl</code>=0.02、<code>--kl-stop-mult</code>=1.5，实际阈值 0.03。某批数据逐 epoch 的平均 KL 序列为 0.004、0.008、0.015、0.026、0.038、0.052、0.071（后面继续增长）。检查点在第 1 到第 4 个 epoch 结束时都不触发（0.004～0.026 小于 0.03），第 5 个 epoch 结束时 0.038 超过 0.03，早停生效，本批只用了 5 个 epoch，省下 5 个，占本批预算的 50%。</p>
+      <p>换一批 KL 增长更慢的数据：0.005、0.009、0.014、0.021、0.028、0.031，那么停止点在第 6 个 epoch，用 6 省 4，省下 40%。注意判定用的是<strong>逐 epoch 均值</strong>，不能用累计 KL：累计和在第 4 个 epoch 就达到 0.028+0.021=0.049，若按累计判断会提早停错。训练早期的批次 KL 增长慢（策略变化小），往往跑满 10 个 epoch；后期批次两三个 epoch 就越线。所以"平均使用 epoch 数"这个统计量从训练早期到后期是递减的，最终值通常在 4～8 之间，早停省下的梯度步约占 20%～60%。</p>
+    </div>
+
+    <h3>2. 检查点选择：为什么最优往往不在最后</h3>
+    <p>on-policy 训练的策略在收敛后会继续波动：价值估计的误差、批次噪声、偶尔的 KL 尖峰，都可能让某次评估比前一次低 50 分。因此"训练结束时的模型"与"整个过程中最好的模型"常常不是同一个。周期性评估 + 保存最优，把模型选择从"时间点赌博"变成"过程最优"：</p>
+    <div class="formula">
+      θ* = arg max<sub>k</sub> Eval(θ<sub>k</sub>)，　k 遍历周期评估的时刻
+      <span class="note">评估必须用确定性策略（argmax），并且每次评估的回合数要足够压住噪声</span>
+    </div>
+    <p>代价是额外的评估开销：每 5 次更新跑 5 个回合，训练后期每个回合约 500 步、合计约 2500 步，等于一个更新周期（5×2048 步）的四分之一；按全程 12 个评估点、平均回合约 250 步估算，总评估步数约 1.5 万，约为训练步数的 12%。评估没有反向传播，墙钟开销低于这个比例，但预算表里应按环境步数记账。另一个代价是隐蔽的偏差：<strong>用同一组评估回合反复挑选检查点，会把"运气好"的那次选出来</strong>。选择乐观偏差的量级约是评估标准误的 1.6 倍（11 个评估点的期望最大值，见下表），所以"最优评估"这个读数本身就带向上偏。</p>
+
+    <div class="box key">
+      <span class="box-title">数值算例：评估噪声与选择乐观偏差</span>
+      <p>CartPole 单回合回报在收敛附近的波动标准差取 σ<sub>ep</sub>=50（训练前期更大）。用 m 个回合做一次评估时，评估均值的标准误是 σ<sub>ep</sub>/√m：m=5 时 22.4 分，m=20 时 11.2 分；若 σ<sub>ep</sub>=80，则分别是 35.8 与 17.9 分。想让两次评估的差距"可信"，差距至少要大于两倍标准误。</p>
+      <p>再用这组数算选择偏差：全程约 11 个评估点，若各点真实水平相同、读数只含噪声，则"最大值"的期望比真实水平高约 1.59×SE（k=11 的极值期望系数为 1.586）。SE=22.4 时约 +36 分，换成 20 回合评估（SE=11.2）降到约 +18 分。这解释了两件事：为什么 5 回合评估选出来的 best 分数看起来高，换 20 个回合复测往往掉一截；以及为什么"最终与最优差 5～40 分"里有一部分是真实回落，另一部分是选择噪声。评估回合数翻四倍，选择偏差减半，这就是 --checkpoint-episodes 调大的直接收益。</p>
+    </div>
+
+    <h3>3. 训练级早停的两条线</h3>
+    <p>本章给所有策略共享"100 回合滑窗 ≥ 475 即停"的达标线，它是样本效率指标也是省时机制。它的风险是<strong>把偶然的窗口当成能力</strong>：某个种子可能靠运气摸到 475 又退回去。工程上的加固手段是耐心机制（连续 K 次评估未改进才停）或"达标后至少再跑 N 步确认"，这两点留给练习实现。</p>
+    <p>达标线的数值可以定量评估。100 回合滑窗的均值，其标准误约 σ<sub>ep</sub>/√100；取 σ<sub>ep</sub>=50 得 5 分（回合间相关会让真实值略大）。这意味着窗口读数 475 对应的真实水平大约是 475±10 分，真实水平 468 的策略也有几个百分点的机会摸到 475 触发停止。把窗口扩到 200 回合，标准误降到约 3.5 分；把阈值抬到 480，误判概率同步下降。两条调整都要花代价：窗口翻倍等于停止反应慢一倍，阈值抬高可能让"差一点学会"的种子跑满预算，这正是"早停"与"误停"之间的权衡，没有免费选项。</p>
+    <p>耐心机制的成本同样可算：评估每 5 次更新一次，耐心 K=5 意味着最坏情况多跑 25 次更新，约 5 万环境步，占 12 万预算的四成。若训练在中期就接近目标，这笔钱值得花；若预算紧张，把耐心降到 3 次并配合更大的评估回合数是更省的选择。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+
+    <h3>模块划分</h3>
+    <table>
+      <tr><th>组件</th><th>职责</th><th>与第 009 章的关系</th></tr>
+      <tr><td><code>ppo_update(kl_stop)</code></td><td>按 epoch 汇总 KL，超阈值即停止本批更新</td><td><strong>新增</strong>：批次内早停分支</td></tr>
+      <tr><td>周期评估</td><td>每 5 次更新用贪婪策略评估若干回合，记录轨迹</td><td><strong>新增</strong>：训练中评估</td></tr>
+      <tr><td>检查点</td><td>ckpt 策略下 <code>deepcopy</code> 最优 <code>state_dict</code> 并保存</td><td><strong>新增</strong>：模型选择</td></tr>
+      <tr><td><code>train_one(strategy)</code></td><td>一套代码支持三种策略，返回评估轨迹与保存路径</td><td>实验轴换成"训练控制策略"</td></tr>
+      <tr><td>汇总输出</td><td>策略对比表 + 评估轨迹 + 模型文件清单</td><td>新增交付视角的结果呈现</td></tr>
+    </table>
+
+    <h3>关键超参数</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用与取值理由</th></tr>
+      <tr><td><code>--strategies</code></td><td>baseline / klstop / ckpt</td><td>三种控制的单变量对照</td></tr>
+      <tr><td><code>--target-kl</code></td><td>0.02</td><td>KL 早停的目标水平；乘 1.5 得实际阈值 0.03</td></tr>
+      <tr><td><code>--kl-stop-mult</code></td><td>1.5</td><td>阈值倍数，PPO 社区常用</td></tr>
+      <tr><td><code>--eval-every</code></td><td>5</td><td>每 5 次更新评估一次；12 万步约 58 次更新，得到 11 个评估点</td></tr>
+      <tr><td><code>--checkpoint-episodes</code></td><td>5</td><td>周期评估回合数，短但够用；想降低选择噪声可调大</td></tr>
+      <tr><td><code>--max-steps</code></td><td>120000</td><td>每种策略的预算上限；达标即停</td></tr>
+    </table>
+
+    <h3>数据流</h3>
+    <p>每个策略一条完整训练：重设种子 → 采样 2048 步 → <code>ppo_update</code>（klstop 可在 epoch 间 <code>break</code>，返回早停次数）→ 每 5 次更新做一次周期评估并推进评估轨迹（ckpt 同步维护最优）→ 100 回合滑窗达标则记录并停止 → 结束后 20 回合终评 → 保存 <code>final.pt</code>（ckpt 另存 <code>best.pt</code>）→ 汇总"首达步数 / 最终 vs 最优评估 / KL 峰值 / 早停次数"。</p>
+    <p>流里有<strong>两个评估口径</strong>要分清：达标判定看训练采样回报（策略带探索噪声），交付报告看贪婪评估。同一套参数下两者相差几十点很常见，报告数字必须注明口径；反过来，若用贪婪评估去触发达标早停，判定会偏乐观、容易误停，所以达标线坚持用采样回报是更保守的选择。</p>
+
+    <div class="box key">
+      <span class="box-title">三层"停止"各管一段</span>
+      <p><strong>epoch 级 KL 早停</strong>：管"这批数据别用过头"，省下的是无效梯度步；<strong>训练级达标/耐心早停</strong>：管"别跑了"，省下的是环境步数；<strong>检查点选择</strong>：管"交付谁"，省不下时间但能救回分数。三者互相独立，可以叠加使用，本章把它们拆成三个策略，各自单独展示价值。</p>
+    </div>
+
+    <h3>成本与收益对照</h3>
+    <table>
+      <tr><th>机制</th><th>省下什么</th><th>直接代价</th><th>观测指标</th><th>本章设置下的典型量级</th></tr>
+      <tr><td>epoch 级 KL 早停</td><td>无效梯度步</td><td>判定滞后一个 epoch，个别批次误停</td><td><code>breaks_total</code></td><td>每批省 0～6 个 epoch，全程占 20%～60%</td></tr>
+      <tr><td>训练级达标早停</td><td>环境步</td><td>运气窗口造成误停</td><td><code>solved_at</code></td><td>达标即停可省下剩余预算的大头</td></tr>
+      <tr><td>检查点选择</td><td>不省时间，挽回分数</td><td>评估环境步约 12%，选择乐观偏差约 1.6×SE</td><td><code>best_eval − final_eval</code></td><td>5～40 分，虚高部分可用 20 回合评估压到约 18 分</td></tr>
+    </table>
+    <p>三行分别是"省算力"、"省样本"与"保分数"三类收益。决策顺序建议与其行序一致：先确认策略真的学到东西（否则省什么都是假的），再用达标线控制预算，最后用检查点保证交付物是过程最优。若三者只允许保留一个，保留检查点：它不省时间，但直接决定你交出去的模型是不是最好的那个。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：一套训练代码，两个开关</strong></p>
+    <pre class="code"><code>    kl_stop = (strategy == "klstop")         # 两个布尔开关决定三类策略
+    use_ckpt = (strategy == "ckpt")          # baseline 二者皆 False
+
+    all_returns = []
+    kls_max, breaks_total = [], 0
+    eval_history = []          # (步数, 平均评估回报)：评估轨迹要落盘
+    best_eval, best_state, best_step = -np.inf, None, None
+    total_steps, n_updates, obs_t = 0, 0, to_tensor(obs, device)
+    solved_at = None</code></pre>
+    <p>解读：<strong>（1）</strong>"策略"被降维成两个布尔量：<code>kl_stop</code> 控制更新路径，<code>use_ckpt</code> 控制保存路径。baseline、klstop、ckpt 走同一段代码，只有一个变量不同，这是受控对比在实现层的体现。<strong>（2）</strong><code>eval_history</code> 记录每个评估点的 (步数, 回报)：它既是 ckpt 的选择依据，也是最后诊断"什么时候开始退化"的证据。<strong>（3）</strong><code>best_eval/best_state/best_step</code> 三个变量一起维护：分数用于比较，参数用于保存，步数用于说明"最优出现在哪"，交付报告缺了步数就没法解释。<strong>（4）</strong>换法会怎样：如果给三种策略各写一个训练函数，任何小改动都要同步三份，对比公平性也难以证明；开关式写法把差异压缩到两行。</p>
+
+    <p><strong>片段 2：KL 早停，最后一个 epoch 不需要检查</strong></p>
+    <pre class="code"><code>            epoch_kl_sum += kl                        # 逐 minibatch 累计本 epoch 的 KL
+            epoch_cnt += 1
+
+        if kl_stop and epoch_i &lt; args.epochs - 1:      # 最后一个 epoch 无需早停
+            mean_epoch_kl = epoch_kl_sum / max(epoch_cnt, 1)
+            if mean_epoch_kl &gt; threshold:               # threshold = 1.5 × target_kl
+                kl_breaks += 1
+                break                                 # 放弃本批剩余 epoch
+
+    for k in stats:
+        if k != "n_updates":
+            stats[k] /= max(stats["n_updates"], 1)
+    return stats, kl_breaks</code></pre>
+    <p>解读：<strong>（1）</strong>判断发生在 <strong>epoch 结束处</strong>，用的是这个 epoch 内所有 minibatch 的平均 KL，单 minibatch 的 KL 噪声大，逐批判断会频繁误触发。<strong>（2）</strong><code>epoch_i &lt; args.epochs - 1</code> 这个条件容易被漏掉：最后一个 epoch 结束后没有"剩余更新"可省，检查它只会让 <code>kl_breaks</code> 多记一次、实际什么都没省。这类"边界无害但统计失真"的细节在写日志指标时要格外小心。<strong>（3）</strong>返回 <code>kl_breaks</code>（0 或 1）：调用方累加得到整场的早停次数，直接进对比表，它是"早停到底生效了几次"的硬证据。<strong>（4）</strong>注意早停只 <code>break</code> 内层 epoch 循环，不改写 <code>stats</code> 的统计口径：KL、裁剪比例仍然按实际发生的更新次数平均，日志才可信。</p>
+
+    <p><strong>片段 3：周期评估与最优检查点</strong></p>
+    <pre class="code"><code>        # 周期评估：贪婪策略跑 checkpoint_episodes 个回合
+        if n_updates % args.eval_every == 0 or total_steps &gt;= args.max_steps:
+            ev_ret = float(np.mean(evaluate(reward_env, net, args.checkpoint_episodes, device)))
+            eval_history.append((total_steps, ev_ret))
+            if use_ckpt and ev_ret &gt; best_eval:
+                best_eval = ev_ret
+                best_step = total_steps
+                best_state = copy.deepcopy(net.state_dict())   # 必须深拷贝</code></pre>
+    <p>解读：<strong>（1）</strong>评估条件带一个 <code>or total_steps &gt;= args.max_steps</code> 的尾巴：保证训练结束前必定有一次评估，"最终评估点"永远存在，不至于最后一段没有记录。<strong>（2）</strong><code>copy.deepcopy(net.state_dict())</code> 是这段的核心：<code>state_dict()</code> 返回的张量与网络<strong>共享存储</strong>，如果只存引用、继续训练，之前"存下来"的参数会被后续更新改掉，最后保存的"最优模型"其实是最终模型。这是最隐蔽也最常见的检查点 bug。<strong>（3）</strong>比较用 <code>&gt;</code> 严格大于：平分时保留更早的检查点（更接近训练稳定期，通常更泛化）。<strong>（4）</strong>评估环境 <code>reward_env</code> 与训练环境分开构造：评估回合不消耗、不污染训练环境的随机状态。</p>
+
+    <p><strong>片段 4：达标早停与交付，final 与 best 分开保存</strong></p>
+    <pre class="code"><code>        if solved_at is None and len(all_returns) &gt;= 100 and np.mean(all_returns[-100:]) &gt;= args.target_reward:
+            solved_at = total_steps                 # 100 回合窗口：比单次评估稳
+            print(f"  [{strategy}] 达到 {args.target_reward}：步数 {solved_at}")
+            if args.stop_when_solved:
+                break                               # 样本效率早停
+
+    final_eval = float(np.mean(evaluate(reward_env, net, args.eval_episodes, device)))
+    os.makedirs(args.save_dir, exist_ok=True)
+    final_path = os.path.join(args.save_dir, f"{strategy}_final.pt")
+    torch.save(net.state_dict(), final_path)        # 最终模型：训练结束时刻
+    ckpt_path = None
+    if use_ckpt and best_state is not None:
+        ckpt_path = os.path.join(args.save_dir, f"{strategy}_best.pt")
+        torch.save(best_state, ckpt_path)           # 最优检查点：评估轨迹的峰值</code></pre>
+    <p>解读：<strong>（1）</strong>达标判定用 100 回合滑窗（单次评估噪声太大）：窗口统计天然抗噪，价格是反应慢一点，这是"少误停"与"早停"之间的折中。<strong>（2）</strong>终评用更多回合（默认 20）：它是要写进结论的数字，值得比周期评估花更多时间。<strong>（3）</strong>文件名带策略名（<code>klstop_final.pt</code>、<code>ckpt_best.pt</code>）：三种策略一轮跑完后目录里六份文件一目了然，避免覆盖。<strong>（4）</strong>只保存 <code>state_dict</code>（不含优化器状态）：对"训练完、只做评估/推理"的场景足够；要支持续训还必须存优化器与步数，练习 3 会补全。<strong>（5）</strong>保存路径写进返回字典并打印：交付物必须可追溯，文件散落在临时目录里等于没保存。</p>
+
+    <p>完整可运行脚本（附录）：<a href="../code/ch010.py" download>code/ch010.py</a></p>
+    <pre class="sh"><code>python code/ch010.py                       # 3 种策略各 12 万步上限，CPU 约 4–8 分钟
+python code/ch010.py --quick               # 8000 步、达标 300、关闭达标早停，约 30–60 秒
+python code/ch010.py --no-stop-when-solved # 跑满预算，观察后期回落与检查点价值</code></pre>
+    <p>预期结论（<strong>以实跑为准</strong>）：klstop 通常比 baseline 更快达标、KL 峰值更低（典型 0.030 vs 0.039），因为它在"策略已被用旧"的批次上少走无效更新；ckpt 的最后一次评估经常不是全过程最优，最终与最优间常见 5～40 分差距，保存后成绩立刻回到过程最优；三种策略耗时差距多在 10% 以内（省下的更新与评估开销部分抵消）。若三种策略差异很小，用 <code>--no-stop-when-solved</code> 跑满 12 万步再看：后期波动越大，检查点的价值越明显。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>KL 早停的阈值写成绝对常数</strong>：不同任务、不同采样批量下 KL 的合理水平不同（0.01 在 CartPole 正常，在别的任务可能偏大）。用 <code>目标 KL × 倍数</code> 的相对形式，并随任务一起调。</li>
+      <li><strong>检查点只存了引用、没做副本</strong>：<code>torch.save(net.state_dict(), ...)</code> 没问题，但把 <code>state_dict()</code> 存进 Python 变量后继续训练，变量里的张量会随之更新（共享存储）。要 <code>deepcopy</code>。</li>
+      <li><strong>用训练滑窗回报挑检查点</strong>：滑窗回报来自采样策略（含随机性），噪声更大，而且与最终交付的贪婪策略口径不同。挑模型请用独立评估。</li>
+      <li><strong>达标即停 + 5 回合评估的组合陷阱</strong>：短评估容易让"运气窗口"触发达标并停训，交付的模型其实不稳。缓解手段：达标判定用 100 回合窗口（本章做法），或提高评估回合数、加耐心机制。</li>
+      <li><strong>检查最后一个 epoch 的早停条件</strong>：最后一个 epoch 结束后无"剩余更新"可省，把它算进早停次数会让日志虚高；条件里要显式排除。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>给所有策略加上"耐心早停"：若连续 5 次周期评估都没有超过历史最优，则停止训练。比较它省下的步数与误停风险。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>在 <code>train_one</code> 里维护 <code>no_improve</code> 计数与 <code>patience</code> 参数，评估后更新；触发时打印原因并 <code>break</code>。注意耐心太小会在上升期误停。</div></details>
+      </li>
+      <li>把 <code>--checkpoint-episodes</code> 从 5 调到 20，比较"最优评估"的稳定度（多跑几个种子）。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>5 回合评估的标准误约 15～25 分（CartPole 方差大时更高），20 回合明显更稳。观察 best_eval 是否更接近最终真实水平。</div></details>
+      </li>
+      <li>给保存函数加上优化器状态、<code>total_steps</code> 与 Python/NumPy/torch 的随机状态，实现 <code>--resume</code> 从检查点继续训练。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div><code>torch.save</code> 一个字典：<code>{"model": state_dict, "optimizer": opt.state_dict(), "steps": total_steps, "seed": seed}</code>；恢复时对应 <code>load_state_dict</code>。重新播种可以近似复现，但精确续跑需要把 RNG 状态也存下来。</div></details>
+      </li>
+      <li>做一个"KL 早停阈值扫描"：把 <code>--kl-stop-mult</code> 设为 1.0 / 1.5 / 3.0，比较三种阈值下的达标步数与 KL 峰值，找出本任务的最优值并解释。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>阈值太小（1.0）会频繁早停、学习变慢；太大（3.0）形同摆设。固定种子逐个跑 klstop 策略即可，比较首达步数与 early-stop 次数。</div></details>
+      </li>
+      <li>给检查点选择加一道独立验证：周期评估仍用于挑选，但另开一批固定种子的回合只评"当前最优参数"，最后报告这批评分与 <code>best_eval</code> 的差。用 k=11、SE=22.4 的模型预测这个差约为 36 分，再与实测对照。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>在 <code>evaluate</code> 上多传一个种子参数即可隔离两批回合；报告集只在保存 best 后评一次。实测差距通常小于理论值，因为真实水平并不恒定，训练后期确实在提升。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>PPO 有三层停止机制：批次内 epoch 的 KL 早停、训练级的达标/耐心早停、以及评估驱动的检查点选择；它们解决不同层面的浪费。</li>
+      <li>KL 早停把"数据用旧"的批次及时切断，通常降低 KL 峰值并加快达标；阈值建议用"目标 KL × 1.5～2"的相对形式。</li>
+      <li>最优检查点能挽回训练后期的回落：本实验里最终模型与过程最优常差 5～40 分，这一差距就是保存策略的价值。</li>
+      <li>交付习惯：final 与 best 都存、评估回合数够多、评估轨迹落盘、必要时保存优化器状态以支持续训。</li>
+      <li>下一章进入连续动作空间：把离散 Categorical 策略换成高斯策略，在 Pendulum-v1 上比较"共享方差"与"状态相关方差"两种高斯参数化。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch009.html">← 第 009 章：PPO的时序差分与蒙特卡洛混合</a>
+    <a class="next" href="ch011.html">第 011 章：PPO的连续动作空间的高斯策略 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

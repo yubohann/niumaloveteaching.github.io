@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第013章 分布式编程调试与性能诊断 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · Ray 基础与分布式编程</span>
+    <span class="sep">/</span>
+    <span>第 013 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · Ray 基础与分布式编程</div>
+    <h1>第 013 章：分布式编程调试与性能诊断</h1>
+    <p class="lead">把排障从"看日志猜"升级成"看状态定"：四层观测工具（状态、日志、时间线、剖析）各管一段，先定位阶段，再定位热点。</p>
+    <ul class="meta">
+      <li>主题：Ray 核心 / 可观测性与性能分析</li>
+      <li>关键机制：状态接口（State API）、工作进程日志、时间分解、代码剖析（Profiling）</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 012 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解分布式调试的三个难点：异常延迟暴露、跨进程调用栈、非确定性调度，以及对应的观测手段。</li>
+      <li>掌握状态接口的用法：按状态过滤任务与 Actor，快速区分"排队中"与"执行中"的负载。</li>
+      <li>会用时间分解定位瓶颈：把端到端耗时拆成提交、排队、执行、传输四段，逐段归因。</li>
+      <li>掌握工作进程内的轻量剖析方法，识别计算热点而不被观测开销误导。</li>
+      <li>能诊断三类典型形态：空闲等待型、资源饱和型、尾延迟型。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>分布式程序的故障与性能问题都以间接方式呈现：异常发生在工作进程里，驱动进程只在取值时看到一行封装后的错误；性能瓶颈可能来自计算、排队、序列化或网络，四者在现象上都是"慢"。<strong>直接猜测哪个环节慢，命中率极低；正确路径是先把时间与状态分解开，再针对异常段落深入</strong>。</p>
+    <p>Ray 提供的观测面与它的执行模型一一对应：任务有生命周期状态（待调度、运行、完成），对象有引用与位置，节点有资源账本，工作进程有独立日志。把这些观测面对上号，排障就有了系统方法：状态接口回答"卡在哪一段"，日志回答"那里发生了什么"，时间线回答"各段各占多少"，剖析回答"计算热点在代码哪一行"。</p>
+    <p>本章按这四层组织，每层配一个可直接复用的诊断脚本；诊断对象限定在 Ray 核心层，RLlib 与 Tune 的专项诊断留到第 051 章与第 085 章。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 三个调试难点</h3>
+    <table>
+      <tr><th>难点</th><th>现象</th><th>应对工具</th></tr>
+      <tr><td>异常延迟暴露</td><td>提交处无声，取值处报错</td><td>围绕取回点做异常分类处理；状态接口确认失败任务</td></tr>
+      <tr><td>跨进程调用栈</td><td>调用栈断开，只见上层帧</td><td>工作进程日志中的完整栈与原因链</td></tr>
+      <tr><td>非确定性调度</td><td>同样的代码两次表现不同</td><td>时间线与状态快照；用探针任务记录顺序</td></tr>
+    </table>
+    <p>异常延迟暴露的根源在第 001 章的"提交与取回解耦"：任务执行期间的异常被封装进对象引用，直到取回才抛出。调试时的基本原则是<strong>让每一次取回都有上下文</strong>：记录任务标识与参数摘要，失败时能立刻对应到具体输入，把孤立的异常还原为一次具体的调用。</p>
+
+    <h3>2. 时间分解：把"慢"拆成四段</h3>
+    <p>一次远程调用的端到端耗时可以分解为：</p>
+    <div class="formula">
+      T<sub>总</sub> = T<sub>提交</sub> + T<sub>排队</sub> + T<sub>执行</sub> + T<sub>取回</sub>
+      <span class="note">排队含资源等待与本地性等待；取回含对象封存与跨节点传输</span>
+    </div>
+    <ul>
+      <li><strong>提交段</strong>：参数序列化与任务登记。大对象在此处产生开销，症状是提交循环本身变慢。</li>
+      <li><strong>排队段</strong>：任务等待资源与依赖就绪。空闲核充足时接近零；资源饱和时主导总时长。</li>
+      <li><strong>执行段</strong>：函数体计算。纯计算任务的主体；调用外部服务时叠加等待。</li>
+      <li><strong>取回段</strong>：结果封存、通知与（跨节点时）网络传输。大返回值或大量小对象在此显现。</li>
+    </ul>
+    <p><strong>在任务内部记录"开始执行时刻与提交时刻"，在驱动端记录"提交时刻与取回时刻"，四段即可闭环</strong>。这个探针模式在第 007 章的分布验证中已经用过雏形，本章把它补全为完整的时间分解。</p>
+    <p>取回段的成本可以粗算：一亿个 float32 结果共 400 MB，在 1 Gbps 链路上传输约 3.2 秒，在 10 Gbps 链路上约 0.32 秒，同节点共享内存则降到毫秒级。量级差直接决定结果该拉回驱动再聚合，还是留在工作进程内先聚合再上交小摘要。提交段同理：任务参数携带大对象时，序列化开销随字节数线性增长，把大对象切成一次提交、多次引用（对象引用传参）比每个任务各带一份更省。四段分解的第一价值，正是把这些平时隐形的成本摆到明面上。</p>
+
+    <h3>3. 状态与日志：四个观测面</h3>
+    <ul>
+      <li><strong>任务状态</strong>：按状态（待调度、运行中、完成、失败）枚举任务，统计各状态数量与持续时间。长期处于待调度的任务指向资源或依赖问题。</li>
+      <li><strong>Actor 状态</strong>：枚举 Actor 及其所在节点与状态，识别崩溃重启与分布不均。</li>
+      <li><strong>对象视图</strong>：查看对象位置与大小，识别内存高压与对象异常膨胀。</li>
+      <li><strong>工作进程日志</strong>：每个工作进程有独立日志文件，任务的打印与异常栈落在这里；集中查看比逐个登录节点更高效。</li>
+    </ul>
+    <p>日志使用有两个纪律：<strong>打印内容包含任务标识与关键参数摘要</strong>，便于与状态视图对齐；<strong>高频循环内的打印要限速</strong>，日志本身会成为可观测性开销。需要时序细节时用时间线工具（按进程与任务绘制时间条带），它把排队与执行的重叠关系画出来，是理解流水线行为的直观材料。</p>
+
+    <h3>4. 剖析：从时间分解到函数热点</h3>
+    <p>定性时间分解答案"哪一段慢"，剖析回答"段内的哪个函数慢"。两种手段：</p>
+    <ol>
+      <li><strong>确定性剖析</strong>：在工作进程内用标准剖析器包裹目标函数，返回按累计耗时排序的函数清单。开销中等，适合单个任务的采样分析。</li>
+      <li><strong>采样剖析</strong>：外部注入采样器抓取运行中进程的调用栈，不做代码侵入，适合长任务与生产环境。</li>
+    </ol>
+    <p><strong>剖析会改变被观测对象的行为</strong>，尤其对短任务：剖析开销可能超过计算本身。纪律是：先粗后细、采样优先、只对已确认的热点任务做深剖析。</p>
+
+    <h3>5. 数值算例：排队代理与并行尾延迟</h3>
+    <p>沿用片段 1 的形状算一遍：32 个任务、每个执行 0.1 秒、每核同时跑一个任务。核数 4 时排成 8 波，排队代理（开始时刻减提交时刻）中位 0.35 秒、最高 0.7 秒，总完成时间约 0.8 秒；核数 8 时 4 波，中位 0.15 秒、最高 0.3 秒、总时间约 0.4 秒；核数 16 时 2 波，中位 0.05 秒、最高 0.1 秒、总时间约 0.2 秒。中位排队满足一条简式：排队中位 = （波数 − 1） × 单任务时长 ÷ 2，波数 = 任务数 ÷ 核数向上取整。这条关系让探针读数直接换算成容量缺口：观测到中位排队 0.15 秒、单任务 0.1 秒，说明任务量约达核数的 4 倍，扩核到两倍以上才能让排队显著回落。</p>
+    <table>
+      <tr><th>核数</th><th>波数</th><th>排队中位</th><th>排队最高</th><th>总完成时间</th></tr>
+      <tr><td>4</td><td>8</td><td>0.35 s</td><td>0.70 s</td><td>约 0.8 s</td></tr>
+      <tr><td>8</td><td>4</td><td>0.15 s</td><td>0.30 s</td><td>约 0.4 s</td></tr>
+      <tr><td>16</td><td>2</td><td>0.05 s</td><td>0.10 s</td><td>约 0.2 s</td></tr>
+    </table>
+    <p>第二个算例量尾延迟的放大效应。执行耗时近似服从均值为 0.1 秒的指数分布，n 个任务并行时完成时间由最慢者主导，期望最大值约等于调和数 H<sub>n</sub> 乘以均值：n = 32 时 H<sub>32</sub> ≈ 4.06，期望最慢耗时约 0.41 秒，是均值的 4 倍；n = 256 时 H<sub>256</sub> ≈ 6.12，期望最慢约 0.61 秒。分片越多，尾部越被抬高，这条一阶关系解释了为什么吞吐型作业必须盯住 P99：并行完成时间由最慢分片书写，均值下降无法弥补尾部抬升。</p>
+
+    <h3>6. 观测手段的对比与失效边界</h3>
+    <table>
+      <tr><th>手段</th><th>单次成本</th><th>粒度</th><th>最适合回答</th><th>盲区</th></tr>
+      <tr><td>状态快照</td><td>低</td><td>任务与 Actor 级</td><td>排队还是运行</td><td>看不到段内细分</td></tr>
+      <tr><td>工作进程日志</td><td>中</td><td>事件级</td><td>异常与重试痕迹</td><td>高频打印反噬性能</td></tr>
+      <tr><td>时间线</td><td>中高</td><td>任务与进程级</td><td>各段重叠关系</td><td>长作业数据量巨大</td></tr>
+      <tr><td>剖析</td><td>高</td><td>函数与行级</td><td>计算热点在哪一行</td><td>短任务结论失真</td></tr>
+    </table>
+    <p>三条失效边界必须记住。其一，跨节点时钟不可直接相减，时间分解只在同节点内可靠；跨节点比较应使用任务自测的持续时长，回避时刻差。其二，剖析对毫秒级任务失真严重，确定性剖析可让短任务慢数倍，采样剖析的统计偏差也要用对照运行校准。其三，状态快照读取的是一瞬间，任务状态快速流转时可能错过中间态；多取几次快照或把探针写进任务内部，才能固定住现场。</p>
+    <p>还有一种被忽略的形态是重试风暴：外部依赖抖动导致任务批量失败并重试，状态视图上失败与调度任务交替出现，资源被重试占满，根因却藏在日志尾部的外因调用栈里。修复方向是给重试加退避与上限，把连续失败的错误类型聚合计数展示，避免在噪声里逐条翻找堆栈。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>排查一次"训练变慢"的标准流程：</p>
+    <ol>
+      <li><strong>缩小范围</strong>：先确认是全链路变慢还是某个阶段变慢；用阶段计时把范围切到单点。</li>
+      <li><strong>看状态快照</strong>：枚举任务状态，若大量待调度则查资源与依赖；若大量运行中则查饱和与尾延迟。</li>
+      <li><strong>做时间分解</strong>：对可疑阶段插入探针，输出四段耗时分布（均值与高位分位数）。</li>
+      <li><strong>对照日志</strong>：在高耗时任务的日志里找异常、重试与外部调用痕迹。</li>
+      <li><strong>剖析热点</strong>：对确认的计算型任务做采样剖析，定位函数级热点。</li>
+      <li><strong>固化观测</strong>：把有效探针留在代码里，指标接入常规日志，避免同类问题重复排查。</li>
+    </ol>
+    <table>
+      <tr><th>观测项</th><th>正常形态</th><th>异常形态与指向</th></tr>
+      <tr><td>待调度任务数</td><td>接近零或短暂脉冲</td><td>持续为正：资源不足或依赖未就绪</td></tr>
+      <tr><td>排队时间占比</td><td>低于总时长一成</td><td>占比过半：容量不足或负载倾斜</td></tr>
+      <tr><td>执行时间分散度</td><td>高位分位与均值同量级</td><td>高位超出数倍：尾延迟，查慢分片</td></tr>
+      <tr><td>对象存储水位</td><td>随在途块波动</td><td>持续抬升：引用泄漏或结果未消费</td></tr>
+    </table>
+    <p>阈值的设法决定诊断效率：为每个观测项记录稳态基线的均值与 P90，告警线放在 P90 的 1.5 倍，既吸收正常波动，又能在形态变化时及时亮灯。对象存储水位按单调性判读：随在途块起伏属正常，跨多个周期持续抬升而不回落说明引用未释放，常见于把对象引用长期存进全局列表或 Actor 状态。诊断闭环的最后一步是把探针产出写成可复盘的记录（时间、负载形态、读数、结论），下一次同类问题从记录对照起步，省下从零观测的成本。</p>
+    <div class="box tip">
+      <span class="box-title">与上一章的差异点</span>
+      <p>第 012 章的服务诊断看"排队与批"；本章的诊断看"四段时间与状态分布"。两套指标体系共享同一条原则：先把等待与计算分离，再讨论优化。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>以下片段采用 Ray 2.x 时期的通用写法；接口随版本演进，以对应版本官方文档为准。</p>
+    <p><strong>片段 1：时间分解探针</strong></p>
+    <pre class="code"><code>import ray
+import time
+
+ray.init(num_cpus=8)
+
+@ray.remote(num_cpus=1)
+def timed_task(task_id, submit_ts, work_iters=200000):
+    start = time.perf_counter()           # 任务真正开始执行的时刻
+    state = 0.0
+    for i in range(work_iters):
+        state = 0.7 * state + (i % 13) / 13.0
+    end = time.perf_counter()
+    # 返回三段原始时间戳，由驱动端统一换算，避免各进程时钟口径不一
+    return {"id": task_id, "submit": submit_ts,
+            "start": start, "end": end, "acc": state}
+
+refs = []
+for i in range(32):
+    refs.append(timed_task.remote(i, time.perf_counter()))   # 提交时刻随任务传入
+
+results = ray.get(refs)                  # 粗略端点：含最后一个任务的取回耗时
+got = time.perf_counter()
+exec_times = [r["end"] - r["start"] for r in results]
+# 排队时间的近似：执行开始时刻减去提交时刻（同机时钟，误差可接受作相对比较）
+queue_proxy = [r["start"] - r["submit"] for r in results]
+exec_times.sort(); queue_proxy.sort()
+print("执行耗时 中位 %.4fs 最高 %.4fs" % (exec_times[16], exec_times[-1]))
+print("排队代理 中位 %.4fs 最高 %.4fs" % (queue_proxy[16], queue_proxy[-1]))
+print("取回段（含末任务）约 %.4fs" % (got - max(r["end"] for r in results)))</code></pre>
+    <p>解读：探针把四段中的三段直接测出：提交时刻由驱动随参数传入，开始与结束时刻在工作进程内打点，取回段由驱动在 <code>ray.get</code> 返回后估算。<strong>用时序数据说话的收益是巨大的</strong>：排队代理中位数接近零说明容量充足，问题在执行段；反之若排队高位与核数成正比，瓶颈在容量。精度上只需相对可比：同一台机器内的时间戳来自同一时钟源，跨节点比较时应改用统一时间基准或只比较同节点任务。</p>
+
+    <p><strong>片段 2：状态快照，区分排队与运行</strong></p>
+    <pre class="code"><code>import ray
+import time
+from ray.util.state import list_tasks, list_actors, summarize_tasks
+
+ray.init(num_cpus=4)
+
+@ray.remote(num_cpus=1)
+def slow_lane(task_id):
+    time.sleep(0.4)                       # 模拟 0.4 秒任务
+    return task_id
+
+# 提交 12 个任务到 4 核上：必然出现 8 个排队
+refs = [slow_lane.remote(i) for i in range(12)]
+time.sleep(0.2)                           # 让调度器完成分派后再取快照
+
+summary = summarize_tasks()               # 按状态与函数聚合的统计视图
+print("任务状态统计:", summary)
+
+pending = list_tasks(filters=[("state", "=", "PENDING_ARGS_AVAIL")])  # 等资源
+running = list_tasks(filters=[("state", "=", "RUNNING")])
+print("等资源任务数:", len(pending), "运行中任务数:", len(running))
+ray.get(refs)                             # 收尾</code></pre>
+    <p>解读：状态接口的价值是"不用等程序结束就能看到中间态"。<code>summarize_tasks</code> 给出全局概览，<code>list_tasks</code> 按状态过滤细节，两者配合能快速区分两种完全不同的现象：<strong>待调度任务多说明资源或依赖供给不上；运行中任务多而吞吐低则指向执行段或尾延迟</strong>。状态名随版本演进，以对应版本官方文档的枚举为准；过滤条件的写法也应查阅同版本示例。快照要在负载进行中取，任务全部完成后状态视图只剩历史记录，诊断价值大减。</p>
+
+    <p><strong>片段 3：工作进程内的轻量剖析</strong></p>
+    <pre class="code"><code>import ray
+import cProfile
+import pstats
+import io
+
+ray.init(num_cpus=4)
+
+@ray.remote(num_cpus=1)
+def profiled_task(work_iters):
+    """在任务内部做确定性剖析，返回热点函数清单的前若干条。"""
+    def hot_body(work_iters):
+        total = 0.0
+        for i in range(work_iters):
+            total += (i * 2654435761) % 97 / 97.0
+        return total
+
+    profiler = cProfile.Profile()
+    profiler.enable()
+    value = hot_body(work_iters)          # 只剖析目标片段，不包整个进程
+    profiler.disable()
+    buf = io.StringIO()
+    stats = pstats.Stats(profiler, stream=buf).sort_stats("cumulative")
+    stats.print_stats(5)                  # 取累计耗时前 5 条函数
+    return value, buf.getvalue().splitlines()[:12]
+
+value, lines = ray.get(profiled_task.remote(300000))
+print("返回摘要:", value)
+print("\n".join(lines))</code></pre>
+    <p>解读：这段代码示范了"剖析范围最小化"原则：剖析器只包住疑似热点函数，其余代码不受影响；结果取前几条并随返回值交回驱动，避免登录节点逐个翻日志。<strong>清单要按累计耗时排序，按调用次数排序会让深层热点漏网</strong>，因为热点常隐藏在少量深层调用里；得到清单后针对具体行优化（改用向量化、减少属性查找、把循环移出热路径）。对无法改码的长任务改用外部采样剖析器，侵入更小；剖析结论必须用一次关闭剖析的对照运行验证，排除观测本身的影响。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>把工作进程打印当驱动打印看</strong>：远程函数里的输出落在工作进程日志，驱动终端看不到，误以为任务没执行。修复：用集中日志视图查看，或让任务把关键信息随返回值带回。</li>
+      <li><strong>存取回超时不区分原因</strong>：超时抛错后不查状态，无法区分死锁、资源饥饿与真实长时间计算。修复：超时后立即取状态快照，按状态归类再处理。</li>
+      <li><strong>误读时间线</strong>：把片段间的空隙都当调度延迟，忽略依赖等待与对象传输各占一段。修复：对照四段分解表逐段核对，空隙形态与任务依赖关系一起看。</li>
+      <li><strong>剖析开启后下结论</strong>：对毫秒级任务做确定性剖析，开销淹没真实分布，优化方向被带偏。修复：先粗后细，只对确认的热点做剖析，并用对照运行验证。</li>
+      <li><strong>只看均值不看高位分位</strong>：均值掩盖尾延迟，训练吞吐的下降常由少数慢分片驱动。修复：始终保留 P90 与 P99 分位，与均值一起观察。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>用片段 1 的探针在同一台机器上分别以 4、8、16 个 worker 运行 32 个任务，预测排队代理中位数与最高值的变化，并解释结论。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>核数充足时排队接近零；核数不足时排队量与超额任务数成正比。最高值出现在最后一批任务，形态随时间呈阶梯。</div></details>
+      </li>
+      <li>预测题：片段 2 中把任务耗时从 0.4 秒降到 0.04 秒，其他不变。预测快照时各状态的数量变化，以及 12 个任务总耗时的量级。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>任务变短后快照可能已无排队（分派与执行重叠），总耗时从约 1.2 秒降到约 0.12 秒量级。调度开销占比上升，可能看到排队时间相对占比反而变大。</div></details>
+      </li>
+      <li>设计题：为一条"数据预处理、模型推理、结果汇总"的三段链路设计诊断方案：每段的观测指标、探针插入点与判定阈值。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>预处理段看批吞吐与排队，推理段看设备利用率与批直方图，汇总段看对象传输量。每段用时间分解探针，阈值按各自稳态基线的 P90 设置。</div></details>
+      </li>
+      <li>分析：某作业的吞吐从 8000 步/秒降到 5000 步/秒，状态快照显示运行中任务数不变、排队为零，执行耗时均值不变但 P99 翻倍。给出两种可能原因与验证方法。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>可能一：少数慢分片拖尾，验证是看分片耗时分布与输入尺寸相关性；可能二：对象传输变慢，验证是看取回段耗时与跨节点流量。两者都会抬高 P99 而不动均值。</div></details>
+      </li>
+      <li>推导：设 n 个任务的执行耗时独立同分布，单核串行执行总时间与 m 核并行的总时间之差。写出"并行收益随尾延迟衰减"的一阶关系，解释为什么 P99 是吞吐型作业的核心指标。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>并行完成时间由最慢分片主导，期望最大值随 n 增大而上移；分片越多，尾部越被放大。控制 P99 即控制完成时间的期望。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>分布式调试三难点：异常延迟暴露、跨进程栈、非确定性调度；对应策略是取回点留上下文、查工作进程日志、用状态快照固定现场。</li>
+      <li>时间分解四段：提交、排队、执行、取回；<strong>先把等待与计算分离，再决定优化方向</strong>。</li>
+      <li>状态接口回答"卡在哪一段"，日志回答"发生了什么"，时间线回答"各段占多少"，剖析回答"热点在哪一行"。</li>
+      <li>剖析遵守"先粗后细、采样优先、最小范围"纪律，结论要用对照运行验证。</li>
+      <li>下一章进入第一篇的收官实践：<strong>用前十三章的工具搭一条分布式数据流水线</strong>，把采样、聚合、统计拼成完整系统。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch012.html">← 第 012 章：Ray Serve部署入门</a>
+    <a class="next" href="ch014.html">第 014 章：阶段实践：分布式数据流水线 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

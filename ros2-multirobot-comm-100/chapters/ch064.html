@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第064章 基于行为树的协同决策 | 多机器人协同学习课程 · ROS2 通信与系统集成</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第三篇 · 协同控制与任务协同</span>
+    <span class="sep">/</span>
+    <span>第 064 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第三篇 · 协同控制与任务协同</div>
+    <h1>第 064 章：基于行为树的协同决策</h1>
+    <p class="lead">当协同逻辑从三四个状态涨到十几个状态，状态机就画不动了：用行为树（Behavior Tree, BT）把"顺序、选择、抢占、超时"拆成可组合的小积木，一台机器人一棵树，靠黑板共享完成车队的协同决策。</p>
+    <ul class="meta">
+      <li>主题：任务协同 / 决策架构</li>
+      <li>关键机制：Sequence/Selector、装饰器、黑板（blackboard）、异步动作叶节点</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 063 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解行为树三种节点（控制、装饰、叶）与三种 tick 返回状态（SUCCESS / FAILURE / RUNNING）的语义。</li>
+      <li>说清行为树相对有限状态机（FSM）在协同决策上的优势与代价，知道什么场景不该用行为树。</li>
+      <li>掌握多机器人行为树的两种组织方式：每机一棵子树 + 共享黑板、指挥者树 + 角色子树。</li>
+      <li>会写异步动作叶节点（封装 ROS2 action/service 调用），避免阻塞 tick 的经典错误。</li>
+      <li>能读懂 Nav2 风格的 XML 行为树并为自己项目设计一棵可测试的协同决策树。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>前两章的巡逻与覆盖都需要"状态机式"的决策：巡逻→响应→恢复、覆盖→再分配。状态少时 FSM 够用，但协同任务的状态会组合爆炸：一台机器人有 6 个状态、两个协作方各 6 个状态，笛卡尔积就是 216 种联合状态，转移表根本画不完。<strong>FSM 把逻辑写成"状态×事件→状态"的二维表，行为树把它写成"从根往下按需展开的树"</strong>，新增一个行为只需往树上挂一个节点，不用动其他分支。</p>
+    <p>本章位于协同系统的决策层：向下调用 041–063 章学过的导航、编队、覆盖能力，向上服务 065 章阶段项目的整体编排。核心在于掌握一种<strong>把复杂协同逻辑拆解、组合、可测试化</strong>的思维方式，它比"再写一个库"更值钱。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. tick 机制：树上的一次"检查—推进"</h3>
+    <p>行为树的执行模型极简：以固定频率（例如 10 Hz）从根节点发起一次 <strong>tick</strong>，每个节点被访问时返回三态之一：<strong>SUCCESS</strong>（完成）、<strong>FAILURE</strong>（失败）、<strong>RUNNING</strong>（进行中）。控制节点据此决定下一步 tick 谁：</p>
+    <ul>
+      <li><strong>Sequence（顺序）</strong>：依次 tick 子节点，全部 SUCCESS 才 SUCCESS；任一 FAILURE 立即 FAILURE；遇到 RUNNING 就停在这里，下个 tick 从该子节点继续，表达"依次完成 A、B、C"。</li>
+      <li><strong>Selector（选择/回退）</strong>：依次尝试子节点，任一 SUCCESS 即 SUCCESS；全 FAILURE 才 FAILURE，表达"优先做 A，不行再做 B"。</li>
+      <li><strong>Decorator（装饰器）</strong>：包装一个子节点，改变其语义。最常用的三个：<em>Inverter</em>（取反）、<em>Retry</em>（失败重试 k 次）、<em>Timeout</em>（超过 t 秒还没结束就强判 FAILURE）。</li>
+    </ul>
+    <p>决策的响应时延由树的深度决定：</p>
+    <div class="formula">
+      t<sub>react</sub> ≈ tick 周期 × 从根到目标叶的深度
+      <span class="note">10 Hz、深度 4 → 最坏 0.4 s 响应；需要更快反应的条件应放在树的上层</span>
+    </div>
+    <p>这解释了一条设计准则：<strong>越紧急的分支越靠近根</strong>。急停、避障类条件挂在根部的 Selector 最左侧，每几次 tick 就能被评估到；慢速的业务逻辑放深处。</p>
+
+    <h3>2. 为什么行为树比 FSM 更适合协同</h3>
+    <table>
+      <tr><th>维度</th><th>FSM</th><th>行为树</th></tr>
+      <tr><td>扩展方式</td><td>加状态要改所有相关转移，转移数最坏 O(N²)</td><td>挂节点即可，子树独立、不动别的分支</td></tr>
+      <tr><td>复用</td><td>状态绑定在具体机器上，很难跨项目复用</td><td>"充电子树""巡逻子树"可整块复用</td></tr>
+      <tr><td>优先级表达</td><td>靠显式转移优先级，易漏</td><td>Selector 从左到右即优先级，直观</td></tr>
+      <tr><td>可测试性</td><td>要构造整机状态序列</td><td>每个叶节点可单独 mock 测试</td></tr>
+      <tr><td>代价</td><td>简单任务代码量最小</td><td>需要引擎/框架，叶节点的异步化有门槛</td></tr>
+    </table>
+    <p><strong>判断标准：状态数 ≤ 3 且无复用需求时 FSM 更省事；状态数 ≥ 5 或有"共享行为片段"时行为树胜出。</strong>行为树管理的是<em>离散决策</em>，不是连续控制，底层 100–500 Hz 的控制器仍由专门节点负责，行为树以 10 Hz 左右决策并调用它们。</p>
+
+    <h3>3. 多机器人行为树的两种组织</h3>
+    <ul>
+      <li><strong>每机一棵子树 + 共享黑板</strong>（去中心化）：每台机器人运行自己的树，树里通过黑板读取"全局公告"（如任务分配表、队友角色）。适合巡逻、覆盖这类"各干各的、松耦合"的任务。黑板是一块进程内的键值存储，跨机器人同步靠 ROS2 话题把黑板条目映射出去。</li>
+      <li><strong>指挥者树 + 角色子树</strong>（中心化）：车队级节点运行一棵"指挥树"，其中包含一个"分配任务"动作（内部可以是第 066 章的拍卖/匈牙利分配），再把子任务作为 goal 发给各机器人的导航/行为动作服务器。适合搬运、围捕这类需要全局时序的任务。指挥者是单点，但决策简单、调试直观；进阶时用 074 章的故障切换托管。</li>
+    </ul>
+    <p>两种方式可以嵌套：指挥者树负责"谁搬哪块"，每台机器人的子树负责"怎么搬"。黑板里最小需要放三类键：<strong>角色（role）、当前任务（task）、共享状态（如货物位置）</strong>。写黑板时约定"谁写谁负责"，角色键只由指挥者写，机器人只读；这避免了多写者竞争（与第 069 章的资源竞争同源的问题）。</p>
+
+    <h3>4. 叶节点必须是异步的</h3>
+    <p>行为树最常见的架构错误是<strong>在 tick 里同步等待</strong>：调用一个耗时 10 s 的服务并 sleep 等结果，tick 就被卡死 10 s，期间树的抢占能力完全失效。正确做法是把每个耗时行为写成异步状态机：</p>
+    <ol>
+      <li>第一次被 tick（内部状态 IDLE）：发起异步请求（send_goal_async / call_async），状态转为 WAITING，返回 RUNNING；</li>
+      <li>后续 tick（WAITING）：检查 future/回调结果，未完成继续 RUNNING，完成返回 SUCCESS，失败返回 FAILURE；</li>
+      <li>被抢占或重试（如 Timeout 触发）：主动取消未完成的请求（cancel_goal），清理回调，避免"孤儿 goal"。</li>
+    </ol>
+    <div class="box warn">
+      <span class="box-title">注意：RUNNING 不等于"一直在动"</span>
+      <p>RUNNING 的语义是"这个行为尚未终结，稍后再 tick 我"。如果叶节点发起了 goal 却永远不检查回调，树会永远停在 RUNNING，表现为"机器人到了目标却卡在决策里"。所以每个异步叶节点都必须有超时装饰器兜底，<strong>Timeout(30 s, MoveTo)</strong> 这类写法属于标配。</p>
+    </div>
+
+    <h3>5. 数值算例：Retry、Timeout 与 Selector 的概率账</h3>
+    <p>装饰器不是"多一层保险"的直觉，它的收益可以算。设某航段的导航单次成功率 p = 0.7、Timeout 取 40 s，套一层 Retry(1)（失败重试一次）后整段成功率变为 1 − (1 − p)² = 1 − 0.09 = 0.91，从七成提升到九成以上；代价是时间分布变长：成功或最终失败之前的期望耗时 = 40 + 0.3×40 = 52 s，比单次多了 12 s。如果这个航段位于关键路径，12 s 的期望延迟要计入调度预算；如果它只是可恢复的偶发失败（定位瞬时丢失、行人挡路），这笔账划算。把同一个计算反过来用：凡是不满足"重试能改变结果"的失败（找不到充电桩、权限被拒绝），Retry 只是把失败时间翻倍，装饰器清单里要给它们明确排除。</p>
+    <p>Selector 的成败同样可以合成。两个回退分支的成功率分别是 0.8 与 0.5，且失败相互独立时，整棵 Selector 的成功率 = 1 − 0.2×0.5 = 0.9。这个乘法视角提醒一件事：<strong>每多一层回退分支，整体成功率的上界由"漏到最后一层仍失败"的概率决定</strong>，兜底分支的质量和主分支同样重要。再看阻塞的代价：同步等一个 30 s 的服务调用，在 10 Hz 的 tick 下等于跳过 300 次评估，急停条件在这 30 s 内完全失明；同一棵树如果深度为 4，从根到叶的正常决策时延是 100 ms × 4 = 0.4 s 量级（内存中的 tick 远快于 100 ms，这是保守上界），深度 1 的紧急分支则是 0.1 s 量级。两个数字放在一起，异步化的收益（0.4 s vs 30 s）一目了然。</p>
+
+    <h3>6. 决策树的隐性开销与两种失效形态</h3>
+    <p>行为树的运行成本主要不在 tick 本身。N 个节点的树、10 Hz 的 tick 频率，每秒节点访问量约 10×N：200 个节点也不过每秒 2000 次访问，单核占用可忽略。真正让 CPU 上来的是叶节点条件里的"重查询"：如果条件节点每次 tick 都去查点云、调服务、读大文件，成本会乘在访问量上。纪律是条件节点保持 O(1) 的本地读取，数据由订阅回调提前写进黑板，树只做判断。</p>
+    <p>两种典型失效值得单列。其一是<strong>停机漏取消</strong>：巡逻分支正执行一个 90 s 的导航，告警分支抢占后若没有在 halt() 钩子里取消旧 goal，机器人会继续向巡逻点走完再折返，白白浪费几十秒，表现为"响应了告警但慢得离谱"；修法是引擎在被切换的节点上统一执行 halt()，并断言"切换后无孤儿 goal"（统计 cancel 次数与切换次数相等）。其二是<strong>非记忆序列的重启放大</strong>：非记忆 Sequence 每 tick 从头执行，前缀动作只要带副作用（开门、发指令、对接）就会被反复触发；把这类动作全部改成记忆型序列，纯检查条件才可以保持非记忆。两者都在 065 章的演练里以"响应慢、动作重复"的形态暴露，调试时优先从树的记忆策略与取消链路查起。</p>
+    <p>把响应时延做成分层预算，评审新分支时就有统一标尺：10 Hz tick 下，挂在根 Selector 最左侧的急停与故障分支最坏响应 0.1 s；第二层的充电、告警响应 0.2 s；第四层的巡逻航点与日志上报 0.4 s。规则是"先回答需要多快，再决定挂多高"：把本质是分钟级的日志上传挂在根层，会让每次 tick 都为它付出遍历成本，却换不来任何时效收益。</p>
+    <table>
+      <tr><th>层级</th><th>典型分支</th><th>最坏响应（10 Hz tick）</th></tr>
+      <tr><td>第 1 层</td><td>急停、故障保护</td><td>0.1 s</td></tr>
+      <tr><td>第 2 层</td><td>充电、告警响应</td><td>0.2 s</td></tr>
+      <tr><td>第 4 层</td><td>巡逻航点、日志上报</td><td>0.4 s</td></tr>
+    </table>
+    <p>黑板键的读写纪律再补一组数值：若 battery 键被两个写者以不同节奏写入（电池服务的 1 Hz 与决策分支的 10 Hz 各写一次），读到的值平均每 0.5 s 抖动一次，BatteryLow 条件在阈值附近就会以 0.5 s 的周期翻转，表现为"时而进充电分支时而退出来"。修法是单写者加数值滞回的双保险：单写者消除竞争，滞回（例如 25% 进入、30% 退出）消除边界抖动。经验规则：任何"接近阈值就会切换行为"的条件都要同时具备单写者与迟滞两个属性，缺任何一个都会在长期运行中暴露为随机告警或动作反复。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>以"两台机器人协同巡逻 + 低电量自动充电 + 告警响应"为例，规划一棵车的设计步骤：</p>
+    <ol>
+      <li><strong>列行为清单</strong>：把动词列出来，充电、巡逻、响应告警、等待队友……每个动词对应一个叶节点草案。</li>
+      <li><strong>定优先级</strong>：按紧急度从高到低排 Selector 分支：急停/故障 → 充电（电量低于 25%）→ 告警响应 → 常规巡逻 → 待命。<strong>优先级顺序就是 Selector 的左右顺序</strong>。</li>
+      <li><strong>组合子树</strong>：把"去充电桩→对接→充到 80%"用 Sequence 串成 Charging 子树；"收到派单→前往→驻留确认→返回断点"串成 Respond 子树。</li>
+      <li><strong>定义黑板键</strong>：role（patrol/respond/charge）、battery_pct、task_id、resume_index。约定写者：role 由本机决策转换写；battery 由电池节点写；task_id 由派发节点通过话题写入镜像。</li>
+      <li><strong>加装饰器</strong>：所有导航类叶节点套 Timeout；Retry 只给"可恢复失败"（定位丢失重试一次），不给"资源不存在"（找不到充电桩重试只是浪费时间）。</li>
+      <li><strong>测试</strong>：叶节点用假实现（mock）注入 SUCCESS/FAILURE/RUNNING 序列，验证树的转移路径；再用仿真做整机联调。</li>
+    </ol>
+    <h3>节点与参数设计表（示例）</h3>
+    <table>
+      <tr><th>树元素</th><th>类型</th><th>关键参数</th><th>依据</th></tr>
+      <tr><td>BatteryLow</td><td>条件</td><td>阈值 0.25</td><td>预留返程电量：返程时间 × 单位耗电 + 20% 安全余量</td></tr>
+      <tr><td>Charging 子树</td><td>Sequence</td><td>目标电量 0.80</td><td>充满最后 20% 耗时占比大，80% 即可离桩</td></tr>
+      <tr><td>RespondAlarm</td><td>Sequence</td><td>Timeout 120 s</td><td>响应超时视为失败，回退到巡逻分支</td></tr>
+      <tr><td>PatrolSegment</td><td>Sequence+Retry</td><td>Retry 1，Timeout 40 s/航点</td><td>路点偶发导航失败重试一次；持续失败说明路段不可通行</td></tr>
+      <tr><td>tick 周期</td><td>引擎</td><td>10 Hz</td><td>决策层 100 ms 响应足够；再快只是空转耗 CPU</td></tr>
+    </table>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：最小行为树引擎，三态与控制节点</strong></p>
+    <pre class="code"><code>SUCCESS, FAILURE, RUNNING = "S", "F", "R"
+
+class BTNode:
+    """所有节点的基类：tick 返回三态。children 顺序即优先级（Selector）。"""
+    def __init__(self, name):
+        self.name = name
+        self.children = []
+    def tick(self, bb):
+        raise NotImplementedError
+
+class Sequence(BTNode):
+    """顺序：从当前活跃子节点继续（记忆型），避免每个 tick 都从头执行。"""
+    def __init__(self, name):
+        super().__init__(name)
+        self.active = 0
+    def tick(self, bb):
+        while self.active &lt; len(self.children):
+            st = self.children[self.active].tick(bb)
+            if st == RUNNING:
+                return RUNNING                    # 停在原地，下 tick 继续
+            if st == FAILURE:
+                self.active = 0                   # 失败重置：整条序列下轮从头
+                return FAILURE
+            self.active += 1                      # 该子节点完成，推进
+        self.active = 0                           # 全成功：重置供下轮
+        return SUCCESS
+
+class Selector(BTNode):
+    """选择：从左到右找第一个不失败的子节点，即"优先级回退"。"""
+    def tick(self, bb):
+        for child in self.children:
+            st = child.tick(bb)
+            if st != FAILURE:
+                return st                         # SUCCESS 或 RUNNING 都算命中
+        return FAILURE</code></pre>
+    <p>解读：这个引擎只有几十行，却固定了行为树的全部语义。<strong>（1）Sequence 用 <code>active</code> 游标实现"记忆"</strong>：如果不记忆，每 tick 都从第一个子节点重来，前面的动作会被反复重建，比如"去桩→对接"会被无限重启。记忆的代价是：进入序列前要确保前置条件仍成立（用上层条件节点保证）。<strong>（2）Selector 遇到 RUNNING 直接返回</strong>，后面更低优先级的分支不会被评估：一个分支正在执行时，不应被更低优先级的分支"盖住"；若需要抢占（如告警打断巡逻），把告警分支放在巡逻分支<em>左侧</em>，由更高优先级先命中，<strong>铺垫了"用树结构表达抢占"</strong>，无需显式状态迁移。</p>
+
+    <p><strong>片段 2：异步动作叶节点，封装 ROS2 action 调用</strong></p>
+    <pre class="code"><code>from rclpy.action import ActionClient
+from nav2_msgs.action import NavigateToPose   # 以本机发行版实际包名为准
+
+class MoveTo(BTNode):
+    """导航叶节点：异步发起目标，tick 期间只检查状态，绝不阻塞。"""
+    def __init__(self, name, node, blackboard_key):
+        super().__init__(name)
+        self.node = node
+        self.key = blackboard_key              # 目标位姿放在黑板键上
+        self.client = ActionClient(node, NavigateToPose, "navigate_to_pose")
+        self.handle = None                     # 未完成的 goal 句柄
+        self.result = None
+
+    def tick(self, bb):
+        if self.handle is None:                # 首次 tick：发起异步目标
+            goal = NavigateToPose.Goal()
+            goal.pose = bb[self.key]
+            future = self.client.send_goal_async(goal)
+            future.add_done_callback(self.on_goal_accepted)
+            self.handle = future               # 标记"已发起"，下 tick 查状态
+            return RUNNING
+        if not self.handle.done():             # 目标还没被服务器接受
+            return RUNNING
+        gh = self.handle.result()
+        if gh is None or not gh.accepted:      # 被拒绝：视为失败，交给上层回退
+            self.reset()
+            return FAILURE
+        if self.result is None:                # 已接受但未结束：监听结果
+            gh.get_result_async().add_done_callback(self.on_result)
+            return RUNNING
+        code = self.result.status                # action 的终态码
+        self.reset()
+        return SUCCESS if code == 4 else FAILURE  # SUCCEEDED 以文档常量为准
+
+    def reset(self):
+        self.handle = None
+        self.result = None</code></pre>
+    <p>解读：异步叶节点是全章最关键的工程模式。三次 tick 分别走三个阶段：<strong>发起（fire）→ 等待接受（wait accept）→ 等待结果（wait result）</strong>，每阶段立即返回 RUNNING，控制权还给引擎。这样即使导航要 90 秒，树的其余条件分支（电量、急停）仍以 10 Hz 被评估，<strong>响应性没有被长任务绑架</strong>。两个细节：goal 被拒绝与任务失败要区分开（前者通常重发无用，后者可 Retry）；<code>reset()</code> 让叶节点可重复使用，树在下一轮巡逻会再次 tick 到同一个节点，状态必须清干净。真实项目建议直接用成熟引擎（行为树 C++ 库或 Python 的 py_trees），本章自研引擎的目的是让你看清 tick 语义后再用框架，免得被框架的黑盒吓住。</p>
+
+    <p><strong>片段 3：Nav2 风格 XML，生产环境的声明式表达</strong></p>
+    <pre class="code"><code>&lt;!-- 车队级"协同搬运"指挥树示意（BehaviorTree.CPP / Nav2 风格） --&gt;
+&lt;root main_tree_to_execute="FleetTransport"&gt;
+  &lt;BehaviorTree ID="FleetTransport"&gt;
+    &lt;!-- 顶层回退：优先处理中止，其次尝试完整搬运流程 --&gt;
+    &lt;Fallback&gt;
+      &lt;Sequence&gt;                                  &lt;!-- 安全优先，最高优先级 --&gt;
+        &lt;Condition ID="EmergencyStop"/&gt;
+        &lt;Action ID="BrakeAll"/&gt;
+      &lt;/Sequence&gt;
+      &lt;Sequence&gt;                                  &lt;!-- 正流程：分配-前往-协同搬运 --&gt;
+        &lt;Action ID="AuctionAssignTask"/&gt;           &lt;!-- 内部走第 066/067 章分配 --&gt;
+        &lt;Action ID="FormUpAtPickup"/&gt;              &lt;!-- 编队到位（第 042 章能力） --&gt;
+        &lt;Action ID="LiftAndMove" port="cargo_id"/&gt;
+        &lt;Action ID="ReleaseCargo"/&gt;
+      &lt;/Sequence&gt;
+    &lt;/Fallback&gt;
+  &lt;/BehaviorTree&gt;
+&lt;/root&gt;</code></pre>
+    <p>解读：XML 版本的树把"结构"与"实现"彻底分离：结构（Fallback/Sequence 嵌套）由这份文件描述，每个 Action ID 背后是一个注册过的 C++/Python 实现。它的价值在<strong>运维期</strong>，调参、换流程顺序不需要重新编译代码，甚至可以在运行时重载树文件（Nav2 支持通过服务替换行为树）。代价是 XML 里的端口传递与黑板机制更隐晦，调试要靠 Groot 可视化工具看 tick 状态。给你的判断：<strong>单一机器人或标准 Nav2 栈，直接用 XML；需要复杂自定义协同逻辑且团队熟悉 Python，自研/嵌入 py_trees 更顺手</strong>，两者也可以共存（指挥树用 XML，机器子树用 Python）。端口 <code>port="cargo_id"</code> 的写法提示：任务 ID、货物 ID 这类跨节点共享量走黑板，不要塞进全局变量。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>叶节点同步等待</strong>：在 tick 里 <code>spin_until_future_complete</code>，整棵树被一个 30 秒的导航卡住，期间急停条件无法评估。修复：异步发起 + 回调收集 + 三阶段 RUNNING（见片段 2）。</li>
+      <li><strong>没有 Timeout 装饰器</strong>：目标点被障碍挡住，导航 goal 永远不返回终态，树永远 RUNNING，机器人静止但系统"正常"。修复：所有导航类叶节点统一套 Timeout，超时后 cancel goal 并返回 FAILURE 交给回退分支。</li>
+      <li><strong>Sequence 不记忆导致动作重启</strong>：每 tick 从序列头重跑，"对接充电桩"被无限重启。修复：记忆型 Sequence（active 游标），并保证进入序列前前置条件由条件节点校验。</li>
+      <li><strong>黑板多写者竞争</strong>：机器人的电池节点与响应分支同时写 <code>battery</code> 键，数据来回覆盖。修复：一个键只允许一个写者角色，其余经话题同步；写者约定写进代码注释与设计文档。</li>
+      <li><strong>抢占后未取消旧 goal</strong>：告警分支抢占巡逻分支时，旧导航 goal 仍在执行，机器人先扭向巡逻点再折返告警点。修复：叶节点被切换时统一在 <code>halt()</code> 钩子里取消未完成请求，这是行为树引擎必须实现的第四个生命周期方法。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>写出"巡逻 + 低电量充电"的树：画出根 Selector 的分支顺序，标注每个叶节点的类型（条件/动作）与预期 tick 频率。解释为什么充电分支要放在告警分支左侧还是右侧。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>电量低于阈值若不处理会导致任务整体失败，通常放在告警之前（左侧）；但"立即回充"会让正在响应的告警中断，折中是充电分支内先判断 role == patrol 才允许打断，用黑板条件做门控。</div></details>
+      </li>
+      <li>把片段 1 的 Sequence 改成"不记忆"版本（每 tick 从头 tick 子节点），构造一个包含"计数动作"的测试树，观察输出差异并解释哪种任务必须用记忆型。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>非记忆 version 会把已完成的前缀动作重复执行；凡是"执行有副作用"的动作（对接、开门、发布指令）都必须用记忆型，纯检查类条件可以非记忆。</div></details>
+      </li>
+      <li>给片段 2 的 MoveTo 加一个 Timeout 装饰器：写出装饰器的 tick 逻辑（首次 tick 记下开始时间；RUNNING 超时则调用子节点 halt() 并返回 FAILURE），并说明 halt() 里必须做哪两件事。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>halt() 至少要做：取消未完成 action goal（cancel_goal_async）；清空内部句柄与结果缓存，使节点可被重新使用。TimeOut 后返回 FAILURE 让上层回退，不抛异常。</div></details>
+      </li>
+      <li>设计双机器人"围捕"指挥树：包含任务分配、编队前往、目标监控、收拢包围、任务结束五个阶段，标注哪些节点需要黑板键同步、哪些是单机子树。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>指挥树持有 target_id 与角色分配（左翼/右翼）两个黑板键；"收拢包围"用并行（Parallel）节点让两台机器人同时执行各自子树；完成条件由共享状态（距离与角度）判定，参考 055 章的围捕几何。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul>
+      <li>行为树三要素：三态 tick、控制节点（Sequence/Selector）、装饰器（Retry/Timeout/Inverter）；优先级由 Selector 的左右顺序表达。</li>
+      <li>相对 FSM 的优势在组合与复用，代价是引擎与异步化门槛；状态少、无复用需求的场景不必上树。</li>
+      <li>多机器人两种组织：每机子树 + 共享黑板（松耦合任务），或指挥树 + 角色子树（紧时序任务）；黑板一个键只留一个写者。</li>
+      <li>叶节点必须异步：发起→等接受→等结果三阶段 RUNNING；Timeout 与 halt() 是标配，否则树会被长任务绑架或留下孤儿 goal。</li>
+      <li>下一章进入本篇的阶段项目：用覆盖、巡逻、行为树与协同搬运能力，搭一个<strong>协同搬运与围捕演练</strong>并定义验收指标。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch063.html">← 第 063 章：多机器人协同巡逻</a>
+    <a class="next" href="ch065.html">第 065 章：阶段项目：协同搬运与围捕演练 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

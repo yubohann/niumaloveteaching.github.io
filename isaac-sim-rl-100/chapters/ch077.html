@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第077章 实现模型预测控制 | 机器人仿真学习课程 · Isaac Sim 强化学习训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第四篇 · 控制与优化</span>
+    <span class="sep">/</span>
+    <span>第 077 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第四篇 · 控制与优化</div>
+    <h1>第 077 章：实现模型预测控制</h1>
+    <p class="lead">每一步都在线求解一个有限时域优化问题，只执行第一个动作、下一帧重来：本章讲透滚动时域原理、QP 与 MPPI 两类解法，并在 Isaac Sim 里搭一个带约束的 MPC 控制器。</p>
+    <ul class="meta">
+      <li>主题：最优控制 / 滚动时域优化</li>
+      <li>相关组件：Isaac Sim / Isaac Lab / NumPy（含 GPU 采样）</li>
+      <li>预计学时：70 分钟</li>
+      <li>前置章节：第 076 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>说清滚动时域（receding horizon）的机制：在线求解有限时域问题、只执行首动作、用测量滚动更新。</li>
+      <li>理解为什么"开环求解"能变成"闭环控制"：反馈来自每步重解，与控制器结构无关。</li>
+      <li>掌握两类主流解法：线性/二次型问题的 QP 与非线性问题的采样法 MPPI，各自的适用条件与算力账。</li>
+      <li>会设计带终端代价的 MPC：预测时域 N、控制周期、权重 Q/R、约束（力矩/速度/关节限位）。</li>
+      <li>会在 Isaac Sim 里实现 MPC 闭环循环：热启动、解算失败处理、与物理步长对齐。</li>
+      <li>能诊断"抖动、迟滞、直接发散"三类典型 MPC 故障，并给出对应修复。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>到此为止你手里的控制器都来自"离线学习"：策略网络把复杂性消化在训练阶段，部署时只做一次前向推理。模型预测控制（Model Predictive Control, MPC）走反方向：不训练网络，改为<strong>每一步在线求解一个优化问题</strong>，用系统模型往前预测 N 步，在满足约束的前提下，找一条能让代价最小的动作序列，执行其中第一步，然后下一帧重新预测、重新求解。</p>
+    <p>为什么工业界（化工、无人机、自动驾驶）半个世纪都在用它？三个原因：<strong>显式约束</strong>（力矩不能超、关节不能越界，直接写进优化问题）、<strong>可解释</strong>（代价与约束都是物理量）、<strong>无需训练数据</strong>（只要有模型）。它的代价是每步都要真金白银算一遍：N=20 步、每步都要解优化，算力与延迟是主要的工程约束。在 Isaac Sim 里复现 MPC 的价值在于：你可以廉价地试验时域、权重、约束与模型误差的影响，再迁移到真机；同时它与 RL 是互补的（MPC 当教师、RL 当提速器，或两者混合），是理解第 078–081 章的前提。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 滚动时域：求解、执行、丢弃、重解</h3>
+    <p>设系统 x<sub>k+1</sub> = f(x<sub>k</sub>, u<sub>k</sub>)，代价为每步的瞬时代价 l(x, u) 加终端代价。MPC 在每个控制时刻 t 求解：</p>
+    <div class="formula">
+      min<sub>u<sub>0..N−1</sub></sub>　Σ<sub>k=0</sub><sup>N−1</sup> l(x<sub>k</sub>, u<sub>k</sub>) + V<sub>f</sub>(x<sub>N</sub>)　s.t.　x<sub>k+1</sub> = f(x<sub>k</sub>, u<sub>k</sub>)，x<sub>0</sub> = x(t)，u<sub>k</sub> ∈ U，x<sub>k</sub> ∈ X
+      <span class="note">只执行解出的 u<sub>0</sub>，然后在 t+Δt 用新测量的 x(t+Δt) 重新求解整个问题</span>
+    </div>
+    <p>关键理解："每步只执行第一个动作"不是浪费，它是<strong>反馈的来源</strong>。开环最优轨迹在模型误差和扰动下会漂，但下一帧的现实状态会立刻重设预测的起点，把扰动吸收进新的优化。这解释了 MPC 为什么对模型误差有一定容忍度：<strong>它用测量值锚定未来，不依赖对模型的假设</strong>。反面也成立：如果重解频率太低（例如 60 Hz 的重解周期大于系统最快时间常数的一半），滚动反馈来不及，MPC 会退化为开环。</p>
+
+    <h3>2. 代价与约束：把工程语言写进数学</h3>
+    <p>瞬时代价的标准二次型：l(x, u) = (x − x<sub>ref</sub>)<sup>T</sup>Q(x − x<sub>ref</sub>) + u<sup>T</sup>Ru。Q 与 R 的配比决定"更在意跟踪误差还是更在意动作开销"；物理量的量纲必须先在 Q、R 里归一（位置误差用米、速度用米/秒，直接混在一起是灾难）。约束分三类：<strong>控制约束</strong>（力矩限幅、速度限幅，硬约束，写死）、<strong>状态约束</strong>（关节限位、安全区域，可以软化）、<strong>终端约束/代价</strong>（保证稳定性的理论工具）。工程提示：<strong>宁可软约束 + 大惩罚，也不要硬约束导致无解</strong>，硬约束问题在状态接近边界时经常不可行，而"无解"的 MPC 现场只能靠兜底逻辑（保持上一动作），很容易引发更糟的连锁。</p>
+    <div class="formula">
+      V<sub>f</sub>(x) = (x − x<sub>ref</sub>)<sup>T</sup>P(x − x<sub>ref</sub>)；P 由无约束 LQR 的 Riccati 方程给出，N 短时靠它"补稠密"
+    </div>
+
+    <h3>3. 两类解法：QP 与 MPPI</h3>
+    <table>
+      <tr><th>方法</th><th>适用</th><th>算力特征</th></tr>
+      <tr><td>QP（二次规划）</td><td>线性/线性化动力学 + 二次代价 + 线性约束</td><td>毫秒级（N=20、状态 12 维的典型机械臂问题），依赖 QP 求解器</td></tr>
+      <tr><td>iLQR / SQP</td><td>非线性动力学（姿态、接触）</td><td>迭代求解，每步 5–20 次雅可比与展开，算力大但精度高</td></tr>
+      <tr><td>MPPI（采样）</td><td>非线性 + 非凸 + 并行友好</td><td>采样 K 条轨迹全部前向仿真，天然向量化；K=512 时 GPU 上 1–3 ms</td></tr>
+    </table>
+    <p>本章主推 MPPI（Model Predictive Path Integral）：它不需要求导，只做"采样—评分—加权"：</p>
+    <div class="formula">
+      w<sub>i</sub> ∝ exp( −(C<sub>i</sub> − C<sub>min</sub>) / λ )；u* = Σ<sub>i</sub> w<sub>i</sub>·u<sub>i</sub>
+      <span class="note">C<sub>i</sub> 是第 i 条采样轨迹的总代价；λ 是"温度"：越小越贪心、越大越平均</span>
+    </div>
+    <p>它的直觉与第 071 章的指数权重完全同源：代价小的样本权重大，加权平均给出平滑的更新方向。相比 QP，MPPI 无法严格满足硬约束（只能通过大惩罚逼近），但对接触、姿态、非光滑动力学更鲁棒，而且是纯并行计算，正好适合 Isaac Sim 的 GPU 张量计算。选择准则：<strong>动力学可精确线性化且约束必须严格 → QP；动力学非线性、接触丰富、要快速实现 → MPPI</strong>。</p>
+
+    <h3>4. 热启动：把"每步重解"变成"每步微调"</h3>
+    <p>相邻时刻的问题几乎一样：最优序列只整体平移一格加一个小修正。热启动（warm start）就是拿上一步的解（去掉第一个元素、末尾补一个）作为下一步求解的初始猜测，对QP减少迭代次数，对 MPPI 用"解序列 + 噪声"直接作为采样中心（取代零均值盲采样）。实测收益：同样的解质量，采样数 K 可以减少 30–50%，或者迭代时间降低一半以上。<strong>热启动是 MPC 上真机的前提</strong>：不热启动的逐帧求解在 50 Hz 下经常超时。</p>
+
+    <h3>5. MPC 与 RL 的关系：互补的两条路线</h3>
+    <p>RL 把优化"摊"在训练阶段，部署时零求解；MPC 把优化"摊"在每一步，部署时贵、但换模型即换任务。两者的接口很多：<strong>教师-学生</strong>（MPC 产生高质量轨迹，RL 蒸馏成快策略，见第 076 章）；<strong>RL 学习 MPC 的代价/模型</strong>（第 073 章 IRL 的一种用法）；<strong>残差控制</strong>（MPC 提供基线，RL 学习修正项，吸收建模误差与接触）；<strong>MPC 当安全层</strong>（策略输出参考轨迹，MPC 在约束内跟踪）。理解 MPC 的代价与约束语言，能让你在未来选择"哪里用学习、哪里用优化"时不拍脑袋。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>以"平面移动机械臂末端跟踪圆弧轨迹"为例，搭 MPPI-MPC 控制器：</p>
+    <ol>
+      <li><strong>模型</strong>：末端动力学用二阶积分器近似（状态 = 位置 + 速度，共 4 维；控制 = 加速度指令，2 维），同时机械臂逆解由仿真里的 IK 完成，每步把 MPC 的加速度指令积分成目标点，交给 IK。模型简单是刻意的：MPC 的第一版永远先用最小可行模型跑通闭环。</li>
+      <li><strong>离散化</strong>：控制周期 50 Hz（dt=0.02 s），前向欧拉离散：p←p+v·dt，v←v+a·dt。与物理步长（60 Hz）不一致没关系，控制器按自己的节拍跑，仿真按自己的节拍推进（第 079 章会深入异构频率）。</li>
+      <li><strong>参数</strong>：预测时域 N=20（0.4 s，覆盖一次圆弧段的时间尺度）；采样数 K=512；温度 λ=0.5（先按代价尺度标定：让 exp 的输入落在 −10 到 0 之间）；Q=diag(50, 50, 5, 5)，R=diag(0.1, 0.1)；终端代价 P 用 2 倍 Q 起步。</li>
+      <li><strong>约束</strong>：加速度 |a| ≤ 8 m/s²（等效力矩约束的代理）、速度 |v| ≤ 1.5 m/s、工作空间边界（软约束：越界时给 100 倍代价）。</li>
+      <li><strong>闭环</strong>：每 20 ms 求解一次；热启动用上一步的解；记录解算时间 P95，若超预算就降 K 或缩短 N；执行首动作后立即进入下一次求解。评测：轨迹跟踪 RMSE（应 &lt;1 cm）、速度约束违反率（应 0）、解算时间分布。</li>
+    </ol>
+    <div class="box key">
+      <span class="box-title">设计思维：为什么约束违反率是 0 而跟踪误差允许有几毫米？</span>
+      <p>MPC 把约束写在优化问题里，控制约束（加速度）通过采样裁剪严格保证，软约束（边界）通过大代价近似保证，"违反率 0"是可以承诺的；而跟踪误差受模型误差、逆解精度、离散化影响，只能给统计目标。这两类指标分开验收，恰好是 MPC 相对 RL 的招牌：<strong>它给得出硬承诺</strong>。反过来说，如果你把全部指标都写成"尽量小"，MPC 就失去了相对优势，该考虑混合方案。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：动力学与批量轨迹展开（GPU 友好）</strong></p>
+    <pre class="code"><code>import numpy as np
+
+class PointMassModel:
+    """二阶积分器：ṗ=v，v̇=a；离散前向欧拉。向量化 rollout 是 MPPI 的核心。"""
+    def __init__(self, dt=0.02):
+        self.dt = dt
+
+    def rollout(self, x0, U, clamp_v=1.5, clamp_a=8.0):
+        """x0: [K, 4] 初始状态（由当前测量广播）；U: [K, N, 2] 控制序列。
+        返回 predictions: [K, N, 4]。整个过程无 Python 循环，适合 GPU。"""
+        K, N = U.shape[0], U.shape[1]
+        x = x0.copy()
+        preds = np.zeros((K, N, 4), dtype=np.float32)
+        for k in range(N):                       # N=20 的小循环：外层转成张量运算更快
+            a = np.clip(U[:, k], -clamp_a, clamp_a)   # 控制约束在采样后立刻裁剪
+            p_next = x[:, 0:2] + x[:, 2:4] * self.dt
+            v_next = np.clip(x[:, 2:4] + a * self.dt, -clamp_v, clamp_v)
+            x = np.concatenate([p_next, v_next], axis=1)
+            preds[:, k] = x
+        return preds</code></pre>
+    <p>解读：这段代码是 MPPI 的算力账本，<strong>K 条轨迹的展开必须全部并行</strong>，任何逐样本的 Python 循环都会让 K=512、N=20 的前向仿真从毫秒级掉到百毫秒级。把当前状态 <code>x0</code> 广播成 K 份是标准套路：所有采样共享同一个起点（这样代价比较才有意义）。控制约束在 <code>np.clip</code> 里立即生效，采样后先裁剪再展开，保证每条候选轨迹都是"物理上可执行"的，避免用大代价惩罚已经无意义的序列。速度同样裁剪（软限速用大惩罚会更平滑，硬裁剪在边界处引入折角，练习里对比）。真实工程写 PyTorch/JAX 版本时，<code>for k in range(N)</code> 这种固定小循环可以保留（JIT 展平），或者用 <code>scan</code> 类原语；关键是避免 <code>for 每条轨迹</code> 的循环。模型上，二阶积分器对平面臂末端只是近似，但 MPC 的意义正在于此：<strong>反馈会吸收模型误差，先用粗模型跑通闭环，再按第 067/068 章的流程提升模型精度</strong>。</p>
+
+    <p><strong>片段 2：MPPI 求解器，采样、评分、指数加权更新</strong></p>
+    <pre class="code"><code>class MPPIController:
+    """采样法 MPC：噪声采样 → 代价评分 → softmax 加权 → 更新名义序列。"""
+    def __init__(self, model, N=20, K=512, lam=0.5,
+                 sigma=2.0, Q=(50, 50, 5, 5), R=0.1, U_init=None):
+        self.model, self.N, self.K, self.lam = model, N, K, lam
+        self.sigma = sigma                    # 采样噪声标准差：探索幅度（加速度单位）
+        self.Q = np.diag(Q); self.R = R * np.eye(2)
+        self.U = np.zeros((N, 2)) if U_init is None else U_init.copy()  # 名义序列
+
+    def solve(self, x_now, ref_traj):
+        # 1) 以名义序列为均值叠加高斯噪声：热启动让采样围绕"上一步的解"展开
+        noise = self.sigma * np.random.randn(self.K, self.N, 2)
+        U_sam = np.clip(self.U[None] + noise, -8.0, 8.0)
+        # 2) 批量前向仿真 + 代价评分
+        preds = self.model.rollout(np.tile(x_now, (self.K, 1)), U_sam)
+        err = preds - ref_traj[None]          # [K, N, 4]：与参考轨迹的偏差
+        cost = np.einsum("kni,ij,knj->k", err, self.Q, err)          # 状态代价
+        cost += self.R[0, 0] * np.sum(U_sam ** 2, axis=(1, 2))       # 动作代价
+        cost += 100.0 * np.sum(np.abs(preds[:, :, 0:2]) &gt; 1.2)       # 软边界惩罚
+        # 3) softmax 加权：减去最小值做数值稳定，避免 exp 溢出
+        w = np.exp(-(cost - cost.min()) / self.lam)
+        w /= w.sum() + 1e-12
+        # 4) 加权平均更新名义序列；热启动：平移一格、末尾复制
+        self.U = np.einsum("k,kni->ni", w, U_sam)
+        self.U[:-1] = self.U[1:]               # 丢弃首动作后整体前移……
+        self.U[-1] = self.U[-2]                # 末尾延拓，下一次求解从"预测的延续"开始
+        return self.U[0]                        # 只执行第一个动作，下一帧重解</code></pre>
+    <p>解读：四步全是"为什么"的教科书。<strong>围绕名义序列采样</strong>（取代零均值全局采样）是 MPPI 与"随机打靶"的分水岭：热启动把搜索集中在已知良好解附近，K 才不用开到几千。<code>einsum</code> 一次算完 K×N 的二次代价：NumPy/PyTorch 的批量矩阵乘在 GPU 上比循环快两个数量级。<strong>减去 <code>cost.min()</code> 再取指数</strong>是数值稳定的固定动作：λ=0.5、代价差 200 时 exp(−400) 直接下溢成 0，而减去最小值后最大的权重恰好是 1。<code>w /= w.sum() + 1e-12</code> 防止全零。末端延拓 <code>self.U[-1] = self.U[-2]</code> 是小技巧：让序列尾部保持"匀速延续"，否则下一步求解时尾部动作会突然衰减为零，产生末端抖动。<strong>温度 λ 的标定</strong>：先打印代价散布（95 分位与 5 分位之差），把 λ 设在"最大代价差 / 10"附近，太小则只学最优样本（高方差、抖），太大则所有样本平均（迟钝）。</p>
+
+    <p><strong>片段 3：Isaac Sim 闭环主循环与解算时间监控</strong></p>
+    <pre class="code"><code>import time
+import numpy as np
+
+class MPCControlLoop:
+    """与仿真节拍解耦的 MPC 主循环：控制周期制、超时兜底、指标记账。"""
+    def __init__(self, world, mpc, sim_dt=1.0 / 60.0, ctrl_dt=0.02, max_solve_ms=12.0):
+        self.world, self.mpc = world, mpc
+        self.sim_dt, self.ctrl_dt = sim_dt, ctrl_dt
+        self.max_solve_ms = max_solve_ms       # 解算预算：超过就用备用动作
+        self.acc = 0.0                          # 时间累加器：把 60 Hz 仿真对齐到 50 Hz 控制
+        self.solve_times, self.last_u = [], np.zeros(2)
+
+    def run(self, n_steps, ref_fn):
+        for step in range(n_steps):
+            self.acc += self.sim_dt
+            if self.acc &gt;= self.ctrl_dt:       # 到达控制时刻：求解并更新目标
+                self.acc -= self.ctrl_dt
+                x_now = self.read_state()      # 从仿真读当前末端状态（含速度）
+                t0 = time.perf_counter()
+                u = self.mpc.solve(x_now, ref_fn())
+                solve_ms = (time.perf_counter() - t0) * 1000.0
+                self.solve_times.append(solve_ms)
+                if solve_ms &gt; self.max_solve_ms:
+                    u = self.last_u        # 超时兜底：沿用上一动作，避免时基错乱
+                self.last_u = u
+                self.send_target(u)        # 交给 IK / 底层控制器
+            self.world.step(render=False)  # 物理照常推进；MPC 与仿真节拍解耦
+
+    def report(self):
+        t = np.array(self.solve_times)
+        return {"p50_ms": float(np.percentile(t, 50)), "p95_ms": float(np.percentile(t, 95)),
+                "over_budget_rate": float(np.mean(t &gt; self.max_solve_ms))}</code></pre>
+    <p>解读：<code>self.acc</code> 时间累加器解决"60 Hz 物理 + 50 Hz 控制"的节拍对齐：只有累计达到控制周期才求解，仿真步数不会被 50/60 的除不尽关系打乱（不允许在物理步中间的"半个控制周期"处求解，物理量也没有意义）。<strong>超时兜底</strong>是 MPC 上真机的生存技能：真机解算偶尔超预算（GK 编译、内存抖动），此时<strong>沿用上一动作比用"迟到的新动作"更安全</strong>，迟到动作对应的是过期状态，贸然执行等价于引入未知延迟。记账 <code>report</code> 给出 P50/P95 与超预算率三个数：P95 必须留在控制周期内（这里 20 ms 周期对 12 ms 预算），超预算率 &gt;1% 就该降 K/N 或优化实现。注意读状态要用"当前时刻"，别用上一次控制时刻缓存的旧值，旧状态让滚动反馈变成"隔夜新闻"，系统会发抖甚至发散。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>时域 N 太短或太长</strong>：N 太短（0.1 s）时"只顾眼前"，遇到需要提前减速的场景（接近障碍）来不及规划，表现为"到跟前才刹车、刹不住"；N 太长则每一步要展开的轨迹太长，解算超预算，或者远期代价把近期行为带偏。修复：N 覆盖"最慢好行为"的时间尺度（0.4–1 s 起），用解算时间与跟踪误差双指标调。</li>
+      <li><strong>控制周期与解算时间倒挂</strong>：解算 P95 超过控制周期，MPC 每步迟到、状态过期。症状是高频抖动、超调。修复：先测 P95 再定周期；降 K/N、上热启动、把模型简化到"够用"；预算留 40% 余量。</li>
+      <li><strong>Q/R 量纲没归一</strong>：位置误差（米）与速度误差（米/秒）混入同一 Q，慢速维度的误差被数量级压过。症状是"位置追得紧、速度乱"。修复：每个状态量先除以各自的典型尺度，再进 Q/R；权重的相对值才是有意义的旋钮。</li>
+      <li><strong>硬约束导致无解</strong>：状态靠近障碍时约束集为空，求解器报不可行，控制器没有兜底逻辑。症状是"正常跟踪、一靠近边界就停摆"。修复：约束软化（大惩罚）+ 无解兜底（上一动作）双保险；把"无解率"写进监控。</li>
+      <li><strong>模型不匹配还指望反馈全吸收</strong>：用二阶积分器控制带摩擦、柔性、延迟的真机，反馈能吸收随机的、小量的误差，吸收不了系统性偏差（例如恒定摩擦导致稳态偏差）。症状是稳态误差大、来回小幅振荡。修复：按第 067/068 章的流程辨识模型；或在 MPC 前加积分项补偿稳态偏差。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把预测时域 N 从 10 调到 40（其余不变），记录跟踪 RMSE 与解算 P95，画出两条曲线，找出你的"够用 N"。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>RMSE 会先随 N 增大而改善后趋平；P95 基本线性增长。拐点就是性价比最高的 N。</div></details>
+      </li>
+      <li>把温度 λ 从 0.1 调到 2.0，观察动作平滑度（相邻控制量差的均方）与跟踪误差的权衡。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>λ 小→接近"只取最优样本"，高方差、动作抖；λ 大→动作平滑但滞后、误差大。找平滑度与误差的双低点。</div></details>
+      </li>
+      <li>把采样数 K 从 128 调到 2048，测量解算时间与成功率的关系，验证"K 的边际收益递减"并解释噪声方差的直觉。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>K 的采样方差按 1/K 收敛；K=512 后性能提升通常已 &lt;5%，但算力翻 4 倍。</div></details>
+      </li>
+      <li>设计"模型误差注入"实验：给真实被控对象加 20% 的动力学增益偏差，比较 MPC 与 PID 的稳态表现，解释滚动反馈吸收了什么、吸收不了什么。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>MPC 对随机扰动的抑制优于固定增益 PID；对系统性的模型偏差两者都需要积分/辨识来消除残差。</div></details>
+      </li>
+      <li>对比"零热启动"与"热启动"两种模式在相同 K 下的跟踪性能与解算时间，给出上真机前的推荐配置。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>热启动在相同 K 下通常同时改善两者；无热启动要开大 K 才追平，但 K 大了 P95 更容易超预算，这就是热启动的"免费午餐"本质。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>MPC = 每步求解有限时域最优控制、只执行首动作、下一帧用新测量重解；反馈来自重解；控制器结构本身不含反馈。</li>
+      <li>代价与约束是它的语言：Q/R 配比决定"跟踪 vs 开销"，硬约束给承诺、软约束保可行，终端代价补短时域。</li>
+      <li>解法选择：线性化可行且约束必须严格用 QP；非线性、接触丰富、要并行用 MPPI（采样—评分—指数加权）。</li>
+      <li>热启动把"每步重解"变成"每步微调"，是 50–100 Hz 上机的关键；解算预算与超时兜底是安全底线。</li>
+      <li>与 RL 的关系是互补：教师-学生、学习代价、残差控制、安全层，四种接口都常见。</li>
+      <li>下一章处理模型本身也在变的问题：载荷变了、磨损了、环境变了，自适应控制在线估计参数、实时修正控制律。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch076.html">← 第 076 章：实现策略蒸馏</a>
+    <a class="next" href="ch078.html">第 078 章：实现自适应控制 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

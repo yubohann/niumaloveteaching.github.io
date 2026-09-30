@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第040章 SAC的奖励归一化 | 深度强化学习课程 · PPO、SAC 与多智能体系统</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 离策略方法与 SAC</span>
+    <span class="sep">/</span>
+    <span>第 040 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 离策略方法与 SAC</div>
+    <h1>第 040 章：SAC的奖励归一化</h1>
+    <p class="lead">上一章归一化观测，这一章归一化奖励：用在线统计让缩放系数自己动。在 Pendulum 上对比"每步奖励标准差"与"折扣回报标准差"两种口径，看看为什么后者的 scale 会一路缩到千分之几。</p>
+    <ul class="meta">
+      <li>主题：奖励预处理 / 在线缩放</li>
+      <li>关键公式：step_std：scale = clamp(1/std(r))；return_std：scale = clamp(1/std(G))；Var(G) = σ²/(1−γ²)</li>
+      <li>预计学时：50 分钟</li>
+      <li>前置章节：第 039 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解奖励归一化的两种口径：每步奖励的标准差与折扣回合回报的标准差，以及它们的量级关系。</li>
+      <li>实现基于 Welford 递推的 <code>RewardNormalizer</code>，只观察原始奖励避免反馈回路。</li>
+      <li>在 <code>Pendulum-v1</code> 上对比 none / step_std / return_std 三种设置的评估回报、scale 与 alpha 轨迹。</li>
+      <li>说清"把 PPO 的回报归一化直接搬给 SAC"为什么容易失稳，以及自动温度在其中扮演的角色。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 035 章我们确认了一个事实：奖励乘常数 c 等价于把温度系数除以 c。既然缩放系数这么关键，能不能让它<strong>自己动起来</strong>？思路很自然：跑训练的同时估计奖励的"典型量级"，用它做分母，让进入网络的奖励始终保持在一个稳定的尺度上。这就是奖励归一化。</p>
+    <p>工程上它几乎是标配，PPO 实现里常见 reward / std(G) 的写法（G 是折扣回报），也常见 reward / std(r)（r 是单步奖励）。两种写法在论文伪代码里都出现过，很多人会混着用。但在 SAC 里它们的效果差异很大：回报是多步奖励的折扣累加，它的标准差天然比单步奖励大一个量级，作为分母会把奖励压得极小，而 SAC 的策略损失对"奖励与熵的相对价格"又特别敏感。</p>
+    <p>本章把两种口径都实现出来，再加上不缩放的对照组，让三条 scale 轨迹和三条回报曲线把这件事讲清楚。第 039 章动的是观测的尺度，本章动的是奖励的尺度，都在回答"数据进网络前应该长什么样"，但奖励侧还额外牵动 alpha。读完本章你应该能回答一个实践问题：当有人告诉你"把奖励归一化一下就好"时，你要追问的第一个问题是"用哪个统计量做分母"，因为这个选择比"归一化与否"本身影响更大。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 归一化的形式</h3>
+    <p>训练时把奖励乘上 scale 再存进回放池：</p>
+    <div class="formula">
+      step_std：scale = clamp( 1 / std(r), 0.05, 5 )<br>
+      return_std：scale = clamp( 1 / std(G), 1e-3, 100 )
+      <span class="note">std 在训练中在线估计；评估与日志始终用原始奖励</span>
+    </div>
+    <p>两个 clip 区间只是防止早期统计量不稳定时缩放爆炸或归零。学习到后期，统计量稳定，clip 几乎不再起作用。</p>
+
+    <h3>2. 两种标准差的量级差距</h3>
+    <p>假设各步奖励近似独立同分布，均值为 μ、方差为 σ²，折扣回报 G = Σγ<sup>t</sup>r<sub>t</sub> 的方差是：</p>
+    <div class="formula">
+      Var(G) = σ² · (1 + γ² + γ⁴ + …) = σ² / (1 − γ²)
+      <span class="note">γ=0.99 时 1/(1−γ²) ≈ 50.3，即 std(G) ≈ 7.1·σ</span>
+    </div>
+    <p>推导只有一行：方差的和等于和方差（奖励近似独立时），Var(G) = Σ<sub>t</sub> γ<sup>2t</sup>·σ<sup>2</sup> = σ<sup>2</sup>·Σ(γ<sup>2</sup>)<sup>t</sup> = σ<sup>2</sup>/(1−γ<sup>2</sup>)。也就是说，<strong>return_std 的 scale 天生比 step_std 小约 7 倍</strong>；再叠加训练过程中回报从 −1200 涨到 −200 的跨度，std(G) 会被撑到几百，scale 掉到 0.005 量级也正常。同一条环境，两个"看起来都合理"的归一化口径，给出的缩放差出两个数量级。</p>
+
+    <div class="box key">
+      <span class="box-title">数值例子：Pendulum 上两种 scale 的估算</span>
+      <p>Pendulum 每步奖励在 −16 到 0 之间波动，取训练中期每步奖励标准差 std(r) ≈ 3.5：</p>
+      <p><strong>step_std</strong>：scale = 1/3.5 ≈ 0.29，落在 clip 区间 [0.05, 5] 内。奖励进入网络的量级从 [−16, 0] 压到约 [−4.6, 0]，|Q| 相应缩到原始值的约三成。</p>
+      <p><strong>return_std（平稳假设）</strong>：若回报分布不随时间变化，std(G) ≈ 7.1×3.5 ≈ 25，scale ≈ 0.04。</p>
+      <p><strong>return_std（实际训练）</strong>：训练早期回合回报约 −1200，后期升到 −250 附近，运行统计混着这两个时期，std(G) 被撑到 200～300，scale 落到 0.003～0.005 之间（clip 下界 1e-3 尚未触发）。</p>
+      <p>解读：同一个环境、同一个 Welford 统计器，只因为统计对象不同，scale 差出约 60 倍。奖励被压到千分之几后，Q 值的量级、TD 目标的量级、策略损失里 Q 项与熵项的相对权重全部随之改变；自动温度能调整的只有熵项一侧，因此 alpha 会跟着 scale 一起往下走。</p>
+    </div>
+
+    <h3>2.1 边界：奖励正相关时，7.1 倍还会更大</h3>
+    <p>公式 Var(G) = σ<sup>2</sup>/(1−γ<sup>2</sup>) 依赖"各步奖励独立"的假设，而 Pendulum 的状态连续变化、单步奖励带正相关：这一步转得快，下一步通常也转得快。把一步滞后相关系数记为 ρ，折扣回报方差更准确的形式为 σ<sup>2</sup>·[1 + 2Σ<sub>k≥1</sub>(ργ)<sup>k</sup>]/(1−γ<sup>2</sup>)。取 ρ=0.9、γ=0.99：内层级数 Σ(0.891)<sup>k</sup> ≈ 0.891/0.109 ≈ 8.17，整个倍数从 50.25 涨到约 872，std(G)/σ 从 7.1 升到约 29.5。也就是说真实回报的波动比独立假设下大约 4 倍，return_std 估出的 scale 还要再小一截。这条边界给出的实践建议是：用独立公式做量级估计可以，但别把 7.1 当精确换算，它与任务的相关结构直接相关。反过来看，ρ=0 时公式正好回到 50.25，独立假设给出的是下界，真实系统里 std(G) 只会更大，return_std 的 scale 只会更小。</p>
+
+    <h3>3. 自动温度能补偿多少</h3>
+    <p>第 032 章的自动温度只追熵目标：奖励被压小后策略偏向随机、熵升高，alpha 就会被压低来恢复平衡。它能救回一部分，但救不了全部，Q 的量纲、梯度信噪比、以及"慢速回报与快速熵项"之间的时间尺度差都随 scale 一起变了。第 035 章的实测已经给出参考：scale=0.1 时修正有限，scale 更小时差距只会更大。所以 scale 轨迹与 alpha 轨迹往往成反比：<strong>scale 越低，alpha 越低</strong>。</p>
+
+    <h3>3.1 三种设置的对照预期</h3>
+    <table>
+      <tr><th>维度</th><th>none</th><th>step_std</th><th>return_std</th></tr>
+      <tr><td>统计对象</td><td>无</td><td>每步奖励 r</td><td>折扣回合回报 G</td></tr>
+      <tr><td>典型 scale</td><td>1.0</td><td>约 0.2～0.5</td><td>约 0.003～0.005</td></tr>
+      <tr><td>奖励进入网络的量级</td><td>原始量级</td><td>约为原始的三成</td><td>千分之几</td></tr>
+      <tr><td>alpha 终值</td><td>约 0.2</td><td>约 0.14</td><td>约 0.02</td></tr>
+      <tr><td>|Q| 量级</td><td>约 42</td><td>约 12</td><td>个位数以内</td></tr>
+      <tr><td>预期评估表现</td><td>基准</td><td>接近基准，常略慢</td><td>明显落后</td></tr>
+    </table>
+    <p>读表顺序建议自上而下：先看统计对象是否与你的意图一致，再看 scale 是否落在预期量级（差一个数量级就说明口径选错），最后才比较回报。若 return_std 组的评估回报"惨不忍睹"，先核对 |Q| 是否只有个位数以内，确认问题出在缩放口径，排除实现错误的可能。</p>
+
+    <p>把 alpha 的联动机制再写具体一点：奖励被压小后，策略损失里熵项的相对话语权变大，策略趋向随机，实测熵高于目标熵，温度损失里的熵缺口变号，log_alpha 被梯度压着往下走。alpha 变低后，熵项的话语权又被削弱一部分，系统在一个"更随机、更低温"的新平衡点附近停下来。这个新平衡点与 scale=1 的平衡点并不等价：Q 的量纲小了几十倍，TD 目标的信噪比、策略损失里 Q 项的更新速度都变了，所以回报会实实在在变差，"只是换了一组坐标"的直觉在此失效。判断一个归一化口径是否可用，标准就是它给出的平衡点是否让策略照样学得动。</p>
+
+    <h3>4. 实现的纪律：统计量只看原始奖励</h3>
+    <p>如果用"缩放后的奖励"去更新统计量，scale 会自己影响自己的分母，形成反馈回路（典型症状是 scale 周期性振荡，定量分析见第 4.1 小节）。本章的 <code>observe_step</code> 与 <code>observe_return</code> 都只接收<strong>原始</strong>奖励与原始折扣回报，缩放只发生在一个地方：<code>rew_train = rew_raw * scale</code>。</p>
+
+    <h3>4.1 反馈回路的定量刻画：为什么必须切在源头</h3>
+    <p>把错误路线写成递推就能看到它为什么不能收敛。设每步奖励真实标准差 σ=3.5，第 t 步的缩放为 s<sub>t</sub>，统计器看到的是 s<sub>t−1</sub>·r，在统计量响应足够快的极限下，下一次缩放满足 s<sub>t</sub> = 1/(s<sub>t−1</sub>·σ)。这是一个对合映射：s<sub>t+1</sub> = s<sub>t−1</sub>，映射的平方等于恒等，因此系统不会收敛到固定点 s* = 1/√σ ≈ 0.53，任何初值都变成两周期摆动。从 s<sub>0</sub>=1 出发得到序列 1 → 0.286 → 1 → 0.286……幅度恒定，不会衰减。缩放系数每隔一步来回跳约 3.5 倍，奖励的训练口径跟着抖，三条 scale 轨迹之间的比较也就失去意义。这就是"统计量只吃原始奖励"的定量理由：递推里不再出现 s，回路从源头被切断。</p>
+    <p>另一个量级差异藏在样本率里：step_std 每步更新一次，12000 步有 1.2 万个样本；return_std 每回合只进一条 G，Pendulum 每回合 200 步，12000 步只有约 60 条样本。用 k 条样本估计标准差，其相对波动约为 1/√(2k)：60 条时仍有约 9% 的估计噪声，10 条时高达 22%。这意味着 return_std 的 scale 在前 2000 步（约 10 个回合）带着两成上下的抖动，评估点之间 scale 的漂移既可能来自策略进步，也可能只是统计噪声，解读轨迹时要给这一点留出余地。</p>
+    <p>把"忘记重置 disc_return"这类 bug 的后果也算清楚，便于对照症状。正确实现里 G 的样本是每回合不超过 200 步的折扣和，量级几百；若不重置，第二条 G 会从 discount=γ<sup>200</sup>≈0.134 的位置继续累加，样本值变成 −1200 + 0.134×(−300) ≈ −1240 一类"上一回合残留 + 本回合小量"的和。这类样本同时带着跨回合的常量大偏置与被缩小的局部波动，std(G) 被抬高、scale 被压低并持续漂移。与对合摆动不同，这个错误的症状是单向下滑；日志上如果 scale 单调下滑且不再与 alpha 同步，再叠加回放池里 done 列正常，就该依次检查 disc_return 与 discount 的重置点、以及 observe_return 是否只在回合边界被调用。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+
+    <h3>模块划分</h3>
+    <table>
+      <tr><th>组件</th><th>职责</th><th>关键点</th></tr>
+      <tr><td><code>RewardNormalizer</code></td><td>按模式维护 Welford 统计，输出 scale</td><td>三个模式共用一个类；仅统计口径不同</td></tr>
+      <tr><td>折扣回报累计</td><td>训练循环里维护 <code>disc_return</code> 与 <code>discount</code></td><td>回合结束时把 G 交给 <code>observe_return</code>，然后重置</td></tr>
+      <tr><td>缩放点</td><td><code>rew_train = rew_raw * scale</code> 后入池</td><td>日志与评估都用原始奖励，保证三组可比</td></tr>
+      <tr><td><code>alpha</code> 轨迹</td><td>每个评估点记录当前 alpha</td><td>用来验证"scale 低 → alpha 低"的联动</td></tr>
+      <tr><td><code>maybe_plot()</code></td><td>评估回报 + scale 双图</td><td>scale 图建议用对数纵轴观察</td></tr>
+    </table>
+
+    <h3>关键超参数</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用与取值理由</th></tr>
+      <tr><td><code>--reward-norms</code></td><td>none,step_std,return_std</td><td>本章唯一自变量</td></tr>
+      <tr><td><code>--max-steps</code></td><td>12000</td><td>三种设置共享；return_std 的劣势在前 1/3 就会显现</td></tr>
+      <tr><td><code>--gamma</code></td><td>0.99</td><td>折扣因子，决定"7.1 倍"这个换算系数</td></tr>
+      <tr><td><code>--alpha</code> / <code>--target-entropy</code></td><td>0.2 / −1</td><td>自动温度开启，观察它如何被 scale 牵动</td></tr>
+      <tr><td><code>--eval-every</code></td><td>3000</td><td>记录 scale 与 alpha 的联动轨迹</td></tr>
+    </table>
+
+    <h3>数据流</h3>
+    <p>每步：环境返回原始奖励 → <strong>统计量只吃原始值</strong>（<code>observe_step</code> 或回合末 <code>observe_return</code>）→ 读当前 scale、<code>rew_train = rew_raw * scale</code> 入池 → 折扣回报累计 <code>disc_return += discount·rew_raw</code> → 每步一次 SAC 更新 → 评估永远用原始奖励（评估函数不接收 normalizer）。三种模式只有统计口径一个变量。</p>
+
+    <h3>与前一章的差异点</h3>
+    <ul>
+      <li>第 039 章归一化<strong>观测</strong>（进网络前处理，不影响奖励）；本章归一化<strong>奖励</strong>（影响 Bellman 目标与策略损失的量纲）。</li>
+      <li>新增 <code>RewardNormalizer</code> 与两种统计口径；折扣回报需要在训练循环里额外累计。</li>
+      <li>相比第 035 章的"固定 scale"，本章的 scale 是<strong>在线估计的动态量</strong>，因此日志必须记录它的轨迹。</li>
+      <li>评估函数完全复用：原始奖励口径在 035 / 040 两章保持一致。</li>
+    </ul>
+
+    <div class="box key">
+      <span class="box-title">收与发：统计侧只进不出，缩放侧只出不改</span>
+      <p>数据流是一个单向管道：原始奖励<strong>进</strong>统计器（<code>observe_*</code>），scale <strong>出</strong>去乘在入池的奖励上。缩放后的数值永远不再回流统计器，这条纪律切割了"scale 影响自己的分母"的反馈回路。三条 scale 轨迹才能干净地反映"这种口径会缩到多少"；振荡的自激系统无从比较。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：RewardNormalizer，一个类、三种口径</strong></p>
+    <pre class="code"><code>class RewardNormalizer:
+    """按模式维护运行统计，输出奖励缩放系数 scale。
+
+    none      : scale 恒为 1
+    step_std  : 统计每步奖励 r，scale = clamp(1/std(r), 0.05, 5)
+    return_std: 统计折扣回合回报 G，scale = clamp(1/std(G), 1e-3, 100)
+    """
+
+    def __init__(self, mode, clip_low=0.0, clip_high=0.0):
+        assert mode in ALL_NORMS
+        self.mode = mode
+        self.mean = 0.0
+        self.m2 = 0.0
+        self.count = 1e-4
+        if mode == "step_std":
+            self.clip_low, self.clip_high = 0.05, 5.0     # 每步奖励的口径
+        elif mode == "return_std":
+            self.clip_low, self.clip_high = 1e-3, 100.0   # 回报口径更宽
+        else:
+            self.clip_low, self.clip_high = 0.0, 0.0
+
+    def _update(self, x):
+        self.count += 1.0
+        delta = x - self.mean
+        self.mean += delta / self.count
+        self.m2 += delta * (x - self.mean)                # Welford 递推
+
+    def observe_step(self, rew):
+        if self.mode == "step_std":
+            self._update(rew)          # 只有 step_std 模式喂每步奖励
+
+    def observe_return(self, ret):
+        if self.mode == "return_std":
+            self._update(ret)          # 只有 return_std 模式喂折扣回报
+
+    def std(self):
+        return float(np.sqrt(self.m2 / self.count + 1e-12))
+
+    def scale(self):
+        if self.mode == "none":
+            return 1.0
+        s = 1.0 / (self.std() + 1e-8)
+        return float(np.clip(s, self.clip_low, self.clip_high))</code></pre>
+    <p>解读：一个类同时承载三种行为，靠"入口分派"实现，未使用继承。 <strong>（1）</strong><code>_update</code> 是标量版 Welford 递推：强化学习的奖励是标量（不是观测向量），三个变量就够了。<strong>（2）</strong><code>observe_step</code> 与 <code>observe_return</code> 各自带模式判断：step_std 只吃每步奖励、return_std 只吃回合回报，none 模式两个都不更新、scale 恒 1，<strong>三种模式共用同一份代码，实验的控制变量才可能唯一</strong>。<strong>（3）</strong>两套 clip 区间不同：<code>1/std(r)</code> 的合理范围在 0.05～5，<code>1/std(G)</code> 因为分母大、范围放宽到 1e-3～100。clip 是"统计量还没稳"时的保险丝。<strong>（4）</strong><code>std()</code> 里的 <code>1e-12</code> 与倒数里的 <code>1e-8</code> 都是防除零的兜底，Pendulum 在极端策略下某些维度的统计可能退化。</p>
+
+    <p><strong>片段 2：主循环，统计只吃原始值，缩放只有一处</strong></p>
+    <pre class="code"><code>        next_obs, rew_raw, terminated, truncated, _ = env.step(action)
+        # 统计量只观察原始奖励 / 回报，避免"缩放反馈回路"
+        normalizer.observe_step(rew_raw)
+        scale = normalizer.scale()
+        rew_train = rew_raw * scale        # 全流程唯一的缩放点
+        buf.add(obs, action, rew_train, next_obs, float(terminated))
+        obs = next_obs
+        ep_ret_raw += rew_raw              # 原始回报：日志与对照用
+        disc_return += discount * rew_raw  # 折扣回报：只喂 return_std 统计器
+        discount *= args.gamma
+
+        if terminated or truncated:
+            normalizer.observe_return(disc_return)   # 回合边界：交付 G
+            ep_returns_raw.append(ep_ret_raw)
+            ep_ret_raw = 0.0
+            disc_return = 0.0
+            discount = 1.0
+            obs, _ = env.reset()</code></pre>
+    <p>解读：这段循环把"三列账本"维护得清清楚楚。<strong>（1）</strong><code>observe_step(rew_raw)</code> 收的是<strong>原始</strong>奖励：若收缩放后的值，scale 会进入自己的分母，产生自激回路，这是本章的头号实现红线。<strong>（2）</strong><code>rew_train = rew_raw * scale</code> 是全流程唯一的缩放点，直接入池；训练侧之后看到的奖励都是这个口径，日志侧则用 <code>ep_ret_raw</code> 独立累计。<strong>（3）</strong><code>disc_return += discount * rew_raw</code> 与 <code>discount *= args.gamma</code> 逐字对应 G = Σγ<sup>t</sup>r<sub>t</sub> 的定义；注意乘的是原始奖励，且 discount 在回合结束后重置为 1.0。<strong>（4）</strong>回合结束时才把整个 G 交给 <code>observe_return</code>：回合回报是"一个样本"，一回合一条，与每步奖励的样本率不同，这也意味着 return_std 的统计量更新得慢得多。忘了在回合边界重置 <code>disc_return</code>，std(G) 会被系统性放大、scale 越缩越小，这是最隐蔽的一类 bug。</p>
+
+    <p><strong>片段 3：评估与缩放彻底隔离</strong></p>
+    <pre class="code"><code>@torch.no_grad()
+def evaluate(env, agent, episodes):
+    """原始奖励口径，不接收 normalizer；任何缩放都不许出现在这里。"""
+    returns = []
+    for _ in range(episodes):
+        obs, _ = env.reset()
+        done = False
+        ep_ret = 0.0
+        while not done:
+            action = agent.act(obs, deterministic=True)
+            obs, r, terminated, truncated, _ = env.step(action)
+            ep_ret += r                    # 原始奖励，绝不乘 scale
+            done = terminated or truncated
+        returns.append(ep_ret)
+    return float(np.mean(returns))</code></pre>
+    <p>解读：这十行评估函数与第 035 章逐字相同，连注释都在强调同一件事。<strong>（1）</strong>参数表里<strong>没有</strong> normalizer：缩放无法悄悄泄漏进评估，这是结构性约束。<strong>（2）</strong>三组（none / step_std / return_std）的回报因此同处一个量纲，"谁的策略更好"与"谁的缩放更狠"这两件事被彻底分开，后者由 scale 轨迹单独呈现。<strong>（3）</strong>如果评估也乘 scale，return_std 组的成绩会看起来差得离谱（被压了上百倍），那是数值假象，不是策略差异。评估的职责只有一个：问"策略在真实环境里表现如何"。</p>
+
+    <p><strong>片段 4：日志三列，把联动关系摆出来</strong></p>
+    <pre class="code"><code>        if step % args.eval_every == 0 or step == args.max_steps:
+            eval_ret = evaluate(eval_env, agent, args.eval_episodes)
+            recent = float(np.mean(ep_returns_raw[-20:])) \
+                if ep_returns_raw else float("nan")
+            history["steps"].append(step)
+            history["eval_return"].append(eval_ret)
+            history["scale"].append(scale)                  # 缩放轨迹
+            history["alpha"].append(agent.current_alpha)    # 温度轨迹
+            print(f"[{mode}] 步数 {step:6d} | 近20原始回报 {recent:9.1f} | "
+                  f"评估 {eval_ret:8.1f} | scale {scale:.5f} | "
+                  f"alpha {agent.current_alpha:.4f} | |Q| {last_stats['mean_abs_q']:7.1f}")</code></pre>
+    <p>解读：日志的列选择就是本章的论证结构。<strong>（1）</strong><code>scale</code> 与 <code>alpha</code> 同框出现：前者是"人为缩了多少"，后者是"自动温度压了多少"。三组日志横向对比，两列的同向变化（scale 低 → alpha 低）直接可视化了理论分析。<strong>（2）</strong>"近 20 原始回报"与"评估"都用原始口径，与 scale 列并排却不混口径，读者既能看策略水平，又能看缩放强度。<strong>（3）</strong>训练结束后的汇总再打印每组的 scale 末值与 alpha 末值：step_std 组典型 scale≈0.3、alpha≈0.14；return_std 组 scale≈0.005、alpha≈0.02，三条数字链彼此印证。</p>
+
+    <p>完整可运行脚本（附录）：<a href="../code/ch040.py" download>code/ch040.py</a></p>
+    <pre class="sh"><code>python code/ch040.py           # none / step_std / return_std：CPU 约 6–10 分钟
+python code/ch040.py --quick   # 快速跑通：约 1 分钟
+python code/ch040.py --reward-norms step_std,return_std --max-steps 20000</code></pre>
+    <p>以实跑为准：<strong>none 与 step_std 评估接近（step_std 常略慢一点），return_std 明显落后</strong>；scale 轨迹上 step_std 稳定在 0.2～0.5，return_std 掉到 0.02 以下；<strong>alpha 与 scale 同向下降</strong>；return_std 的 |Q| 只有个位数。重点是三条变化的相对关系。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>用缩放后的奖励更新统计量</strong>：scale 影响它自己的分母，容易产生振荡回路。<strong>修复</strong>：统计量只吃原始奖励。</li>
+      <li><strong>评估也用归一化后的奖励</strong>：三组回报不同口径，无法比较。<strong>修复</strong>：评估函数不接收 normalizer，用结构约束代替口头纪律。</li>
+      <li><strong>把 std(G) 当成常数</strong>：训练早期策略变化剧烈，std(G) 里混着"学习进步"这一系统性成分，估计值会持续漂移，scale 轨迹前段必然下滑，要等统计稳定后再解读。</li>
+      <li><strong>忘了重置 disc_return</strong>：回报会跨回合累加，std(G) 估计被系统性放大，scale 越缩越小。<strong>修复</strong>：重置点必须与回合边界严格对齐。</li>
+      <li><strong>clip 区间设得太窄</strong>：把 1e-3 的下界卡在 0.05，scale 就被人为抬高，看起来"救"了 return_std，实际是把归一化目标改掉了。调 clip 要做成对照实验，不能当作偷偷兜底。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把 return_std 的 clip 下界从 1e-3 调到 0.05，让 scale 不能被压到 0.05 以下，再跑一次。评估回报会改善多少？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>clip 相当于给"最小缩放"设地板，本质是承认归一化估计不可信时的兜底。对比 6000 步处的评估回报。</div></details>
+      </li>
+      <li>把 step_std 的统计对象改成"每步奖励的绝对值均值"（scale = 1/mean(|r|)），与标准差版本对比。两者有什么区别？<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>均值绝对值对奖励分布的重尾不那么敏感，估计更稳，但保留了精度却丢掉了"波动幅度"信息。观察 scale 曲线的平滑度。</div></details>
+      </li>
+      <li>关掉自动温度（固定 alpha=0.2）后重跑三种归一化，看差距是否比开启时更大。这验证了第 3 节哪一句话？<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>固定 alpha 时 reward 侧没有任何补偿机制，scale 的差异会直接放大。实现上把 <code>alpha_loss</code> 一段跳过并冻结 log_alpha。</div></details>
+      </li>
+      <li>给 return_std 换一个更"跟得上"的估计：只统计最近 50 个回合回报的标准差（滑动窗口）。与全历史 Welford 版本对比，说明"非平稳统计"的利弊。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>滑动窗口会跟上策略变化，但也更容易被噪声拉低 scale。用 <code>collections.deque(maxlen=50)</code> 存回报即可。</div></details>
+      </li>
+      <li>用手算核对框中的估算：取 std(r)=3.5，按 Var(G)=σ²/(1−γ²) 算出 std(G)，再与 7.1 倍的近似对照，说明两者为什么一致。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>1/(1−0.99²) = 1/0.0199 ≈ 50.25，开根号约 7.09。若用 γ=0.95 重算，系数变成约 3.2，说明折扣因子直接决定两种口径的差距倍数。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>奖励归一化用在线统计自动决定 scale，是第 035 章"固定缩放"的动态版本，但统计口径的选择会直接决定 scale 的量级。</li>
+      <li>两种口径量级不同：std(G) ≈ 7.1·std(r)（γ=0.99），return_std 会把奖励压小约一个数量级甚至更多。</li>
+      <li>Pendulum 上：none ≈ step_std 且明显优于 return_std；自动温度只能部分补偿，表现为 alpha 随 scale 同向下降。</li>
+      <li>实现纪律：统计量只看原始奖励、缩放只发生在一处、评估永远用原始口径。三者缺一，实验结论都会被数值假象污染。</li>
+      <li>alpha 的联动是"部分补偿"的典型：它能沿熵这一侧找到新平衡，但无法恢复 Q 的量纲与梯度尺度，所以 return_std 组依然明显落后。</li>
+      <li>选择归一化口径的经验法则：先看它把奖励压到哪个量级，再决定是否采用；量级差一个数量级以上时，优先怀疑口径本身，训练技巧的嫌疑排在其后。</li>
+      <li>下一章从"数据缩放"转到"温度调度"：给 alpha 设计线性、余弦等显式时间表，与自动温度做最后一轮对照实验。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch039.html">← 第 039 章：SAC的观测归一化</a>
+    <a class="next" href="ch041.html">第 041 章：SAC的熵系数调度 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

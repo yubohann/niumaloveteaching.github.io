@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第036章 RLlib实现A3C算法 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第三篇 · RLlib 算法实现</span>
+    <span class="sep">/</span>
+    <span>第 036 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第三篇 · RLlib 算法实现</div>
+    <h1>第 036 章：RLlib实现A3C算法</h1>
+    <p class="lead">A3C（Asynchronous Advantage Actor-Critic）用多份并行采样器替代回放池，靠优势加权与熵正则稳定策略梯度。本章讲清演员评论家结构、n-step 回报与优势估计、并行采样的数据组织，以及 RLlib 中 A3C 与 A2C 的关系。</p>
+    <ul class="meta">
+      <li>主题：RLlib 算法 / 同策略演员评论家</li>
+      <li>关键机制：优势函数、n-step 回报、熵正则、并行采样、异步与同步变体</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 035 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解演员评论家结构的分工：策略网络产出动作分布，价值网络提供基线。</li>
+      <li>掌握 n-step 回报与优势估计的计算方式，说明基线为何能降低梯度方差。</li>
+      <li>理解熵正则的作用与系数量级，会诊断探索过度与探索不足两类症状。</li>
+      <li>掌握并行采样在 A3C 中的角色，理解它与回放池方案在数据组织上的差别。</li>
+      <li>会配置 A3C 的并行度、学习率与损失系数，并区分异步与同步变体的取舍。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>策略梯度方法直接优化策略的参数，方向由回报估计给出。原始形式的梯度方差很大：同一状态下的动作后果带有强随机性，单条轨迹的回报在策略更新前后变化剧烈。演员评论家结构引入价值网络作为基线，用优势函数（Advantage）替代原始回报，把"绝对好坏"换成"相对平均水平的好坏"，方差显著下降。</p>
+    <p>与 DQN 的回放路线相比，A3C 不保存历史数据，改用大量并行采样器同时产出多样的在策略数据。<strong>回放消除相关性靠记忆，并行采样靠同时性，两条路线各有代价。</strong>上一章讨论回放池方案，本章分析并行采样方案。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p>A3C 的核心是三件事：用优势度量动作好坏、用并行采样制造数据多样性、用熵正则维持探索。</p>
+
+    <h3>1. 演员评论家与优势函数</h3>
+    <p>策略梯度对参数的更新方向是"优势乘以动作的对数概率梯度"：优势为正的动作被鼓励，为负的被抑制。优势由回报减去状态价值基线得到：</p>
+    <div class="formula">
+      A<sub>t</sub> ≈ Σ<sub>k=0</sub><sup>n−1</sup> γ<sup>k</sup>r<sub>t+k</sub> + γ<sup>n</sup>V(s<sub>t+n</sub>) − V(s<sub>t</sub>)
+      <span class="note">n 步回报加尾端自举再减去价值基线；基线不改变梯度的期望，只压缩方差，n 越小方差越小、偏差越大</span>
+    </div>
+    <p>价值网络与策略网络共享输入特征时，梯度在两层目标间竞争：价值损失推动特征拟合回报尺度，策略损失推动特征区分动作。共享省参数并加速早期学习，分离更稳。<strong>共享与否需要消融验证。</strong></p>
+
+    <h3>2. n-step 回报与广义优势估计</h3>
+    <p>n-step 回报在偏差与方差之间取折中：n 取 1 时几乎全靠自举，方差小但依赖价值估计的准确度；n 增大时累积真实奖励，偏差下降但方差回升。广义优势估计（Generalized Advantage Estimation, GAE）用指数加权把不同步长的优势平滑组合，参数 λ 控制折中位置，λ 取 0 退化为单步、取 1 退化为全程回报。<strong>A3C 系列实现常按片段批量计算回报与优势，超长片段在环境步数处截断，</strong>截断点的价值自举依赖下一状态估计，回合边界的处理与第 021 章的终止语义一致。</p>
+
+    <h3>3. 熵正则与探索</h3>
+    <p>策略熵度量动作分布的随机程度。损失中的负熵项让分布保持随机性：系数越大探索越持久、收敛越慢；系数越小确定化越快，早期可能把概率堆到少数动作上。<strong>症状区分很清楚：</strong>熵长期贴近分布上限且回报不涨，说明探索过度；熵在少数迭代内跌到接近零且回报停滞，说明过早固化。两种症状对应系数的两个调整方向。</p>
+
+    <h3>4. 并行采样与异步更新</h3>
+    <p>并行采样器各自持有环境副本与策略副本，独立推进若干个环境步后提交片段；训练侧汇总片段计算损失并更新参数，把新参数广播回采样器。异步变体让采样器不等广播、按本地参数继续推进，吞吐更高，样本带一定陈旧度；同步变体每轮等待全部采样器完成，样本全部来自同一版本参数，语义简单但存在最慢者等待。<strong>RLlib 的 A3C 入口按采样异步开关区分两个变体，A2C 即该算法族的同步采样形态；</strong>接口名称随版本演进，以对应版本文档为准。</p>
+
+    <h3>5. 广义优势估计的逐步演算</h3>
+    <p>取片段长度 3、γ = 0.99、λ = 0.95，奖励均为 1，价值估计为 [2, 3, 4]，末端自举值 5。按逆序递推：</p>
+    <table>
+      <tr><th>步 t</th><th>时间差分误差 δ<sub>t</sub></th><th>累积递推</th><th>优势 A<sub>t</sub></th><th>回报 A+V</th></tr>
+      <tr><td>2</td><td>1 + 0.99×5 − 4 = 1.95</td><td>1.95</td><td>1.95</td><td>5.95</td></tr>
+      <tr><td>1</td><td>1 + 0.99×4 − 3 = 1.96</td><td>1.96 + 0.9405×1.95 ≈ 3.79</td><td>3.79</td><td>6.79</td></tr>
+      <tr><td>0</td><td>1 + 0.99×3 − 2 = 1.97</td><td>1.97 + 0.9405×3.79 ≈ 5.54</td><td>5.54</td><td>7.54</td></tr>
+    </table>
+    <p>递推系数 γλ = 0.9405 决定相邻步优势的传播衰减。验证：从第 0 步的折扣真实回报为 1 + 0.99 + 0.9801 + 0.9703×5 ≈ 7.82，优势加价值得到的 7.54 与之接近，差异来自价值估计的滞后。<strong>末端自举值直接决定最后一步优势：置零对应回合终止，取价值估计对应片段截断，两类边界的混淆会让片段端点出现系统性偏差。</strong></p>
+
+    <h3>6. A3C 算法族的对比</h3>
+    <table>
+      <tr><th>维度</th><th>A3C（异步采样）</th><th>A2C（同步采样）</th><th>PPO（同步加复用）</th></tr>
+      <tr><td>更新时机</td><td>采样器独立提交</td><td>整轮等待全部片段</td><td>整轮等待并多轮复用</td></tr>
+      <tr><td>样本陈旧度</td><td>存在，随异步程度上升</td><td>无，同版本参数</td><td>无，比率裁剪限制偏移</td></tr>
+      <tr><td>样本复用次数</td><td>1</td><td>1</td><td>多次（多轮更新）</td></tr>
+      <tr><td>吞吐特征</td><td>高，无最慢者等待</td><td>受最慢者约束</td><td>受最慢者与复用轮数约束</td></tr>
+      <tr><td>稳定性措施</td><td>熵正则、梯度裁剪</td><td>同左，另加同步语义</td><td>策略比率裁剪、优势标准化</td></tr>
+      <tr><td>适用情形</td><td>仿真便宜、追求采样吞吐</td><td>默认起点，语义干净</td><td>样本效率要求高、愿意调裁剪</td></tr>
+    </table>
+    <p>选择依据：默认从同步形态起步，样本语义干净、诊断容易；吞吐不可接受且环境仿真成本低时再评估异步。同步与异步的差别集中在样本陈旧度，任何切换都要用回报曲线与优势分布重新验证。</p>
+
+    <h3>7. 三分量损失的量级示例</h3>
+    <p>优势标准化后典型量级为 1；5 个动作的均匀分布熵约为 ln 5 ≈ 1.61。策略损失量级约 1 至 2，熵项乘系数 0.01 后贡献约 0.016，占策略项约百分之一，探索信号温和。价值侧：回报标准差为 2 时平方误差约 4，系数 0.5 使价值项权重约 2，与策略项同一量级。</p>
+    <div class="formula">
+      总损失 = 策略损失 + vf_coeff × 价值损失 − entropy_coeff × 熵
+      <span class="note">系数校准的判据是三项分量的梯度量级接近；某项长期比其余项大一个数量级以上时先调整系数，熵项占比过低会让探索过早收缩，过高会稀释策略信号</span>
+    </div>
+
+    <h3>8. 基线降方差与陈旧度的数值账户</h3>
+    <p>基线的降方差能力可以按相关系数算。设回报 R 的方差为 4（标准差 2），基线 b 与回报的相关系数为 ρ，采用最优基线时剩余方差为 (1 − ρ²) × 4：ρ = 0.7 时剩 2.04（标准差从 2 降到 1.43），ρ = 0.9 时剩 0.76（标准差 0.87），方差分别压缩 49% 与 81%。<strong>价值网络与回报的相关性越高，优势的噪声越小；价值学不好时优势方差向原始回报回退，策略梯度的噪声同步上升。</strong>这也解释了同策略算法对学习率敏感的来源：优势尺度随价值拟合质量漂移，固定学习率在两个极端下的有效步长并不相同。</p>
+    <div class="formula">
+      Var(R − b) = (1 − ρ²) · Var(R)（最优基线 b = E[R | s]）
+      <span class="note">Var(R) = 4、ρ = 0.7 时剩 2.04；ρ = 0.9 时剩 0.76。相关性的上界由价值网络的拟合能力决定，这是共享结构取舍的定量依据</span>
+    </div>
+    <p>熵的量纲值得记住几个锚点：5 个动作的均匀分布熵为 ln 5 ≈ 1.61，3 个动作为 ln 3 ≈ 1.10，向确定性收敛时趋于 0。系数 0.01 时，满额熵贡献约 0.016 的损失，与标准化后量级为 1 至 2 的策略损失相差约两个数量级；系数升到 0.05 时贡献约 0.08，接近策略损失的百分之五，探索压力明显抬升。系数档位表的经验区间由此得到量纲解释。</p>
+    <p>滞后账户按片段时长分解：单采样器每秒推进约 250 步时，20 步的片段在 80 毫秒内采完；提交、汇总与参数回传按 60 毫秒估算，整条往返约 140 毫秒，相当于 1.75 个片段。异步形态下采样器在等待期间继续用本地参数推进，落后样本量约 1.75 × 20 = 35 步每采样器；8 个采样器合计约 280 步，约占单批 1600 步的 17.5%。<strong>陈旧占比是异步形态的核心指标，控制在两成以内时回报曲线通常无可见抖动；控制手段是缩短片段、降低往返时延，或改用同步形态对照。</strong>批量时间账一并成立：1600 步在每秒 2000 步的汇总采样速度下对应 0.8 秒一次更新，每分钟约 75 次更新，更新频率与片段长度由此可以互相校核，配置改动后两处数字同步复核。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>配置顺序：确定采样并行度与片段长度，再定学习率与损失系数，最后做共享结构的消融。</p>
+    <table>
+      <tr><th>参数</th><th>示例值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>采样并行度</td><td>8</td><td>并行采样器数量</td><td>核心数减一至二，单核配一个环境副本</td></tr>
+      <tr><td>片段长度</td><td>20</td><td>每次提交的环境步数</td><td>n-step 或 GAE 的折扣视野与提交频率的折中</td></tr>
+      <tr><td><code>lr</code></td><td>5e-4</td><td>策略与价值的共享学习率</td><td>同策略算法对步长敏感，从 1e-3 量级向下校准</td></tr>
+      <tr><td><code>vf_loss_coeff</code></td><td>0.5</td><td>价值损失的权重</td><td>使价值损失与策略损失量级相当</td></tr>
+      <tr><td><code>entropy_coeff</code></td><td>0.01</td><td>熵正则强度</td><td>0.001 到 0.02 区间起步，按熵曲线调整</td></tr>
+      <tr><td>n-step / GAE</td><td>n=5 或 λ=0.95</td><td>优势估计方式</td><td>按任务噪声水平选择，长程任务倾向 GAE</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：没有回放池，A3C 如何避免样本相关性问题？</span>
+      <p>并行采样器在各自环境副本上独立探索，同一时刻提交的片段覆盖不同的状态区域与随机事件，批次内部的相关性被"同时性"打散；每个批次用完即弃，不存在历史数据与当前策略的版本差。代价是样本效率低于回放方案：同一段数据只参与一次更新。<strong>选择 A3C 意味着用样本效率换实现简单与新鲜度，任务仿真成本低时这一交换很划算。</strong></p>
+    </div>
+    <p>优势标准化的统计量随批次组成变化，批次规模较小或回合长度浮动大时，标准化前后的尺度差异明显；记录标准化前后的均值与标准差，作为批次质量的诊断项。并行采样的种子由调度层分发，各采样器独立推进，轨迹多样性来自种子差异，随机跳过会连带破坏可复现性；复现实验时固定目录级种子即可还原整批轨迹。片段长度的调节有明确的数量含义：8 个采样器、片段 20、批次 1600 时，每个采样器每轮提交十个片段、合计 200 步；片段翻倍则提交次数减半、单批方差上升，两者在回报曲线上的表现分别为"更新更碎"与"噪声更大"。</p>
+    <p>熵系数的档位可按下表理解：</p>
+    <table>
+      <tr><th>entropy_coeff</th><th>熵曲线形态</th><th>收敛节奏</th><th>适用情形</th></tr>
+      <tr><td>0.001</td><td>快速下行接近零</td><td>快，易固化</td><td>动作空间小、奖励稠密</td></tr>
+      <tr><td>0.01</td><td>缓慢下行保留余量</td><td>中</td><td>通用起点</td></tr>
+      <tr><td>0.05</td><td>长期高位</td><td>慢</td><td>早期需要广泛覆盖的难探索任务</td></tr>
+    </table>
+    <p>γ 与 λ 的职责相互独立：折扣因子决定有效视野长度，λ 决定优势估计在偏差与方差之间的位置；调参时一次只动一个。优势标准化后出现超过若干倍标准差的极端值时应停下排查：先查回报裁剪与价值拟合质量，再查边界掩码是否完整，极端优势进入损失会让单批更新方向被少数样本主导。片段长度与并行度参与同一个整除关系，改动任一项后核对更新频率与单批方差的变化方向。并行采样器的启动顺序与种子分发由调度层完成，进程重启后按新的调度序列分配种子，轨迹多样性由调度机制兜底。</p>
+    <p>与上一章差异：第 035 章的批次来自回放池的历史数据混合，本章批次只来自当轮并行采集；训练循环从"采样、存储、抽样、更新"简化为"并行采样、汇总、更新"。下一章讨论 SAC：把演员评论家结构与离策略回放重新组合，并引入最大熵目标。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：A3C 配置与并行采样</strong></p>
+    <pre class="code"><code>from ray.rllib.algorithms.a3c import A3CConfig
+
+config = (
+    A3CConfig()
+    .environment(env=LineGoalEnv)
+    .training(
+        lr=5e-4,                     # 同策略步长敏感，从 1e-3 量级向下校准
+        train_batch_size=1600,       # 训练批次：八路采样器各十个 20 步片段
+        vf_loss_coeff=0.5,           # 价值损失权重：与策略损失量级对齐
+        entropy_coeff=0.01,          # 熵正则：保留适度探索
+        use_gae=True,                # 用 GAE 平滑优势，长程任务更稳
+        lambda_=0.95,
+    )
+    .env_runners(
+        num_env_runners=8,           # 并行采样器：同时性制造数据多样性
+        num_envs_per_env_runner=1,
+        rollout_fragment_length=20,  # 每次提交 20 步，控制更新频率
+    )
+)
+algo = config.build_algo()
+result = algo.train()</code></pre>
+    <p>解读：配置体现同策略算法三个纪律：批次规模与并行度联动、片段长度与优势视野匹配、熵系数保守起步。<strong>同策略算法没有回放兜底，批次中的每条数据只更新一次，配置偏差会直接反映到回报曲线。</strong>采样异步开关在部分版本中决定 A3C 与 A2C 形态，键名与默认值随版本演进，以对应版本文档为准。</p>
+
+    <p><strong>片段 2：n-step 回报与优势计算</strong></p>
+    <pre class="code"><code>import numpy as np
+
+
+def compute_advantages(rewards, values, last_value, gamma=0.99, lam=0.95):
+    """按片段逆序计算 GAE 优势；last_value 为片段末端的价值自举。"""
+    n = len(rewards)
+    advantages = np.zeros(n, dtype=np.float32)
+    running = 0.0
+    # 逆序遍历：每步的优势由当步的 TD 误差加折扣累积构成
+    for t in reversed(range(n)):
+        next_value = last_value if t == n - 1 else values[t + 1]
+        delta = rewards[t] + gamma * next_value - values[t]   # TD 误差
+        running = delta + gamma * lam * running               # 指数加权累积
+        advantages[t] = running
+    returns = advantages + np.asarray(values, dtype=np.float32)
+    return advantages, returns
+
+
+# 优势标准化：批次内减均值除标准差，压缩尺度过大带来的更新跳变
+# adv = (adv - adv.mean()) / (adv.std() + 1e-8)</code></pre>
+    <p>解读：逆序递推是 GAE 的实现核心：每步优势等于当步时间差分误差加上折扣累积的后续误差。<strong>末端自举值决定片段最后一步的优势估计，</strong>截断片段用下一状态的价值估计，回合边界则置零，两类情形必须由边界标志区分。返回值为优势与回报两路：优势用于策略损失，回报用于价值损失。注释中的标准化是批次级稳定手段，实现位置在优势计算之后、损失构造之前。</p>
+
+    <p><strong>片段 3：损失组合与熵项</strong></p>
+    <pre class="code"><code>def actor_critic_loss(log_probs, advantages, values, returns,
+                      entropy, vf_coeff=0.5, entropy_coeff=0.01):
+    """组合三路损失：策略、价值与熵正则。"""
+    # 策略损失：负的优势加权对数概率（优势已标准化）
+    policy_loss = -(log_probs * advantages).mean()
+    # 价值损失：回报与预测的平方误差；实现中常对价值做裁剪限制幅度
+    value_loss = ((values - returns) ** 2).mean()
+    # 熵项取负号：损失下降方向等价于熵上升方向
+    entropy_bonus = entropy.mean()
+    total = policy_loss + vf_coeff * value_loss - entropy_coeff * entropy_bonus
+    return total, {
+        "policy_loss": float(policy_loss),
+        "value_loss": float(value_loss),
+        "entropy": float(entropy_bonus),
+    }
+
+
+# 三项分量分别记录：回报停滞时用分量曲线判断是价值侧欠拟合还是探索塌缩</code></pre>
+    <p>解读：三项损失的组合顺序即训练信号的优先级：策略损失提供主方向，价值损失支撑优势估计的质量，熵项维持探索。<strong>系数是相对的：vf_coeff 偏离过大时价值估计滞后，优势带系统性偏差；entropy_coeff 偏离过大时策略长期分散。</strong>返回的分量字典是诊断的基础：三条曲线与回报曲线并排观察，能在一屏内区分"价值学不好"与"策略不敢探索"两类问题，这一步对同策略算法尤其重要，因为异常会直接体现在下一批样本的质量上。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>学习率照搬离策略设置</strong>：在策略算法对步长敏感，过大时策略一夜之间退化。症状是回报曲线断崖。修复：从 1e-3 量级向下校准，配合回报与熵曲线监控。</li>
+      <li><strong>熵系数过大或过小</strong>：探索过度时回报长年低位徘徊，过小时少数迭代内策略固化。修复：以熵曲线为准调整，系数先小步后稳定。</li>
+      <li><strong>片段端自举处理错误</strong>：截断片段未传入末端价值估计。症状是片段边界附近的优势系统性偏移。修复：区分回合终止与片段截断，分别处理自举。</li>
+      <li><strong>并行度超过核心数</strong>：采样器相互争抢，吞吐不升反降。症状是采样时间随并行度上升。修复：并行度取核心数减一至二，用吞吐曲线找拐点。</li>
+      <li><strong>异步更新的陈旧样本</strong>：切换异步采样后未评估陈旧度影响。症状是回报曲线抖动加剧。修复：控制片段长度与广播频率，或用同步变体作为基线对照。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>并行度 8、片段长度 20、训练批次 1600，说明每轮每个采样器提交的片段数与样本量，并预测并行度翻倍后的吞吐与等待时间变化。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>批次 1600 按 8 路摊派，每采样器 200 步、即十个 20 步片段；并行度翻倍受核心数与最慢者等待制约，吞吐改善有限。</div></details>
+      </li>
+      <li>把 GAE 的 λ 从 0.95 改到 1.0，预测偏差、方差与训练稳定性的走向。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>λ 趋近 1 时优势接近全程回报，偏差下降、方差上升，训练噪声增大；λ 取 0.9 到 0.95 通常是稳定区间。</div></details>
+      </li>
+      <li>推导：说明价值基线为何不改变策略梯度的期望而只降低方差。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>状态基线与动作无关，乘上对数概率的梯度后期望为零，因此不引入偏差；减去基线后优势的波动幅度下降，理论方差随之减小。</div></details>
+      </li>
+      <li>设计实验：共享特征与分离网络两组配置对照，说明观察指标与切换判据。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>对比策略损失与价值损失的收敛速度及评估回报；价值损失长期滞后或回报方差大时倾向分离结构。</div></details>
+      </li>
+      <li>设计诊断流程：回报停滞时按熵曲线、优势分布、价值损失三个信号逐一排查，给出每个信号的判读规则。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>熵贴近上限说明探索过度，接近零说明固化；优势分布方差过大指向基线不准；价值损失高说明回报尺度未拟合。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>演员评论家结构用价值基线把原始回报换成优势，显著降低策略梯度的方差。</li>
+      <li>n-step 回报与 GAE 在偏差和方差之间取折中，λ 或 n 是折中旋钮。</li>
+      <li>熵正则维持探索；熵曲线是判断探索过度与过早固化的直接依据。</li>
+      <li>A3C 用并行采样器的同时性替代回放池，样本新鲜但只使用一次，样本效率低于离策略方法。</li>
+      <li>RLlib 中 A3C 与 A2C 是同一算法族的异步与同步采样形态，以版本文档为准。</li>
+      <li>下一章讨论 SAC：最大熵目标与离策略回放的组合方案。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch035.html">← 第 035 章：RLlib实现DQN算法</a>
+    <a class="next" href="ch037.html">第 037 章：RLlib实现SAC算法 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

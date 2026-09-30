@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第082章 多智能体SAC：对手建模 | 深度强化学习课程 · PPO、SAC 与多智能体系统</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第四篇 · 多智能体强化学习</span>
+    <span class="sep">/</span>
+    <span>第 082 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第四篇 · 多智能体强化学习</div>
+    <h1>第 082 章：多智能体SAC：对手建模</h1>
+    <p class="lead">在连续空间的追逐-逃逸博弈中给每个 SAC 智能体配一个"对手模型"：评论家改为先预测对手的动作再评估自己的价值，不再假设对手静止，看它能否把追获率抬上去。</p>
+    <ul class="meta">
+      <li>主题：多智能体机制 / 对手建模与非平稳性</li>
+      <li>关键公式：Q<sub>i</sub>(s<sub>i</sub>, a<sub>i</sub>, μ̂<sub>φ</sub>(o<sub>−i</sub>)) 与 detach 的监督对手模型</li>
+      <li>预计学时：50 分钟</li>
+      <li>前置章节：第 081 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解多智能体环境中的<strong>非平稳性（non-stationarity）</strong>：为什么"环境转移随对手的学习而变"会破坏单智能体 SAC 的价值估计。</li>
+      <li>掌握对手模型的监督学习形式：从对手观测预测对手动作，梯度只进模型本身、不进策略与评论家。</li>
+      <li>理解"评论家输入拼接对手动作"的三种模式：<code>off</code>（独立基线）、<code>pred</code>（预测动作）、<code>true</code>（真实动作上界），并说清各自可用性。</li>
+      <li>学会用 <code>pending_idx</code> 按回合边界回填"下一状态的对手动作"，让 Bellman 目标在时间上保持自洽。</li>
+      <li>在零和追逐-逃逸环境上对比三种模式的贴获率与回报曲线，会读对手模型 MSE 与性能增益的对应关系。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>独立 SAC（第 076 章）把每个智能体都当成"单智能体 RL"来训练：自己的评论家只看自己的状态和动作。但在博弈场景里，你下一步能拿到多少回报，很大程度取决于<strong>对手会怎么动</strong>。对手的策略在训练中一直在变，评论家学到的 Q(s,a) 实际上在追踪一个移动目标，这就是多智能体里的非平稳性。</p>
+    <p>第 081 章的信用分配解决"团队回报怎么分"，本章处理另一个方向：<strong>对手怎么动</strong>。一个自然的补救办法是让评论家"看见"对手的动作。训练时我们能拿到对手的真实动作（数据是联合采集的），但执行时拿不到，所以要么用真实动作当上界（MADDPG 式集中评论家），要么训练一个对手模型，只从对手的观测推断其动作。后者更接近"预测对手"的本意，也是本章主角。追逃环境还自带一个好处：每个智能体的观测里天然包含对手的位置与速度，预测任务的信息基础是现成的。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 非平稳性如何伤害评论家</h3>
+    <p>单智能体 SAC 的 Bellman 目标假设环境转移 p(s′|s,a) 固定，同一个 (s,a) 总能得到相近回报。博弈中转移里隐含了对手策略 π<sub>−i</sub>：</p>
+    <div class="formula">
+      p(s′ | s, a<sub>i</sub>) = Σ<sub>a<sub>−i</sub></sub> π<sub>−i</sub>(a<sub>−i</sub> | s) · p(s′ | s, a<sub>i</sub>, a<sub>−i</sub>)
+    </div>
+    <p>其中 a<sub>i</sub> 是自己的动作、a<sub>−i</sub> 是除自己外所有对手的动作，π<sub>−i</sub> 是对手策略。当 π<sub>−i</sub> 随对手训练而改变时，p(s′|s,a) 也在变，Q 值回归目标就带着"对手版本号"的漂移。把对手动作显式放进评论家（哪怕只是预测值），等价于把这份漂移资产化：Q 网络至少知道"我评估的这对 (s,a) 是在对手做了 â<sub>−i</sub> 的前提下"。</p>
+
+    <h3>2. 对手模型的监督学习</h3>
+    <p>每个智能体 i 维护一个对手模型 μ̂<sub>φ</sub>，输入<strong>对手自己的观测</strong> o<sub>−i</sub>，输出对对手动作的预测 â<sub>−i</sub>，训练就是普通的 MSE 回归：</p>
+    <div class="formula">
+      L<sub>opp</sub>(φ) = ½ · 𝔼[ ‖ μ̂<sub>φ</sub>(o<sub>−i</sub>) − a<sub>−i</sub> ‖<sup>2</sup> ]
+    </div>
+    <p>关键约束：评论家使用预测值时必须 <code>detach()</code>。否则策略梯度会"为了让 Q 看起来高"而去篡改对手模型，模型就不再是对手行为的无偏估计，MSE 可能不降反升。只有当 a<sub>−i</sub> 是真实数据、φ 只被上面这个监督损失驱动时，预测才可信。</p>
+
+    <h3>3. 三种评论家输入构成信息阶梯</h3>
+    <div class="formula">
+      off&nbsp;&nbsp;: Q<sub>i</sub>( s<sub>i</sub>, a<sub>i</sub> )<br>
+      pred : Q<sub>i</sub>( s<sub>i</sub>, a<sub>i</sub>, μ̂<sub>φ</sub>(o<sub>−i</sub>) )<br>
+      true : Q<sub>i</sub>( s<sub>i</sub>, a<sub>i</sub>, a<sub>−i</sub> )
+    </div>
+    <p><code>true</code> 只在集中训练时可用，是"知道对手下一步会怎么做"的信息上界；<code>pred</code> 执行阶段也能持续预测，是真正可部署的方案；<code>off</code> 是所有对比的基线。<strong>预期排序是 true ≥ pred ≥ off</strong>，但差距取决于预测准不准，对手模型 MSE 居高不下时，pred 的增益会明显缩水。</p>
+
+    <h3>4. 零和奖励：让"军备竞赛"成为实验装置</h3>
+    <p>追者每步拿 −d<sub>t</sub>（当前双方距离），逃者拿 +d<sub>t</sub>，两人之和恒为 0；追者贴上逃者时一次性 +10 / −10 并终止。每步都有塑形信号，避免了稀疏奖励冷启动；零和结构又让"两个 SAC 同时学习"变成一场军备竞赛，正好检验对手建模对非平稳性的缓解效果。注意距离本身的量级：场地边长 2.4，最长对角距离约 3.4，所以每步塑形项在 −3.4～0 之间，与 +10 的一次性奖励差一个量级，这正是后面"奖励尺度"坑的来源。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+
+    <h3>模块划分</h3>
+    <table>
+      <tr><th>组件</th><th>职责</th><th>关键点</th></tr>
+      <tr><td><code>PursuitEvaderEnv</code></td><td>纯 numpy 的连续空间追逃环境</td><td>观测 8 维（双方位置+速度），动作 2 维加速度，零和奖励</td></tr>
+      <tr><td><code>SquashedGaussianActor</code></td><td>tanh 压缩的高斯策略</td><td>重参数化采样 + tanh 对数概率修正</td></tr>
+      <tr><td><code>QNet</code> × 2</td><td>双 Q 评论家（在线 + 目标）</td><td>输入维度随 <code>--opp-model</code> 变化：10 / 12 / 12</td></tr>
+      <tr><td><code>OpponentModel</code></td><td>从对手观测预测对手动作</td><td>tanh 输出与动作范围匹配；只在历史数据上做 MSE</td></tr>
+      <tr><td><code>SACAgent</code></td><td>封装单个智能体的网络、缓冲、更新</td><td>自动温度、软更新、<code>pending_idx</code> 回填下一状态对手动作</td></tr>
+      <tr><td><code>evaluate</code></td><td>确定性策略评估</td><td>输出贴获率、双方回报、平均回合长度</td></tr>
+    </table>
+
+    <h3>关键超参数</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用与取值理由</th></tr>
+      <tr><td><code>max_steps</code></td><td>40000</td><td>联合环境步数上限；这个 8 维小环境 4 万步已能分出胜负</td></tr>
+      <tr><td><code>warmup</code></td><td>2000</td><td>随机动作预热，先填缓冲区再开始学习</td></tr>
+      <tr><td><code>update_every</code></td><td>2</td><td>每 2 步一次梯度更新，更新/采样比 1:2</td></tr>
+      <tr><td><code>batch_size</code></td><td>128</td><td>SAC 常用批量；小环境不宜过大</td></tr>
+      <tr><td><code>gamma</code></td><td>0.95</td><td>回合上限 80 步，用 0.99 会让远期信号过弱</td></tr>
+      <tr><td><code>tau</code></td><td>0.01</td><td>目标网络软更新系数</td></tr>
+      <tr><td><code>opp_lr</code></td><td>1e-3</td><td>对手模型是监督任务，学习率高于 RL 学习率是常见做法</td></tr>
+      <tr><td><code>opp_train_every</code></td><td>250</td><td>每 250 步做 2 次对手模型梯度步，保持预测"新鲜"</td></tr>
+    </table>
+
+    <h3>数据流</h3>
+    <p>每个联合步：双方策略各出动作 → 环境推进一次 → 两个智能体<strong>各自</strong>存转移（自己的 obs/act/rew 加上对手的观测与动作）→ 每 2 步各做一次 SAC 更新 → 每 250 步各做 2 次对手模型监督训练 → 回合结束重置。<code>off</code> 模式不训练也不使用对手模型，<code>true</code> 模式直接用采样时的对手动作，两者共用同一套主循环。</p>
+
+    <h3>与前一章的差异</h3>
+    <p>第 081 章改动的是<strong>回报归属</strong>：用反事实基线把团队回报拆到每个智能体头上，回答"功劳算谁的"。本章不改变回报归属，追逃是零和的，每个智能体的回报就是自己的回报；改动发生在<strong>评论家的输入端</strong>：从只看自己，到显式建模对手动作。两者共同点是都保留"每个智能体一个独立 SAC"的骨架，区别是 081 处理"钱怎么分"、本章处理"对手怎么动"。</p>
+
+    <div class="box key">
+      <span class="box-title">两个容易忽略的实现细节</span>
+      <p>1) <strong>下一状态的对手动作</strong>：Bellman 目标里的 Q(s′, a′) 也需要对手动作。样本按时间顺序存储时，可以在存入下一条转移时"回填"上一条的 <code>next_opp_act</code>（代码里的 <code>pending_idx</code>）；真实终止处不回填，因为 bootstrap 已被切断。</p>
+      <p>2) <strong>预测动作必须 detach</strong>：否则策略学习会通过对手模型产生梯度，把对手模型带偏成"让 Q 值好看"的样子，模型越训越离真相远。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：环境动力学与零和奖励</strong></p>
+    <pre class="code"><code>def step(self, actions: np.ndarray):
+    """动作 shape=(2,2)。返回 obs, rewards, terminated, truncated, info。"""
+    a = np.clip(actions, -1.0, 1.0).astype(np.float32)
+    # 一阶惯性动力学：速度先按摩擦衰减，再叠加加速度；动作是"推力"，位移由速度积分而来
+    self.vel = np.clip(self.friction * self.vel + self.accel * a,
+                       -self.v_max, self.v_max)
+    # 位置积分速度并夹在场地内；边界硬截断，防止飞出观测分布
+    self.pos = np.clip(self.pos + self.vel, -self.bound, self.bound)
+    self.steps += 1
+
+    dist = float(np.linalg.norm(self.pos[0] - self.pos[1]))
+    # 零和塑形奖励：追者每步 -d、逃者 +d，逐帧有信号，双方目标完全相反
+    rewards = np.array([-dist, dist], dtype=np.float32)
+    terminated = False
+    if dist &lt;= self.tag_radius:          # 追者贴住逃者：一次性 ±10 并立即终止
+        rewards[0] += 10.0
+        rewards[1] -= 10.0
+        terminated = True
+    # 80 步上限只是时间截断，不能当"真终止"；Bellman 目标仍要 bootstrap
+    truncated = (not terminated) and self.steps &gt;= self.max_steps
+    return self._obs(), rewards, terminated, truncated, {"dist": dist}</code></pre>
+    <p>解读：这段环境代码决定了实验的"物理规则"。<strong>（1）</strong>速度用一阶惯性（旧速度×0.8 + 加速度×0.12），意味着策略不能瞬移，必须提前规划减速与转向，这正是连续控制该有的手感。<strong>（2）</strong>摩擦与加速度的比例决定机动能力：满输入时单轴稳态速度为 <code>0.12/(1−0.8) = 0.6</code>，约 10 步达到其九成，追者的"转向半径"由此确定；声明中的 <code>v_max=1.2</code> 是安全夹断，正常动作幅度下不会触发。<strong>（3）</strong>奖励每步 −d / +d，量级 0～3.4，比贴获的 ±10 小一个数量级：塑形负责"引导"，终局奖励负责"宣判"。<strong>（4）</strong><code>truncated</code> 与 <code>terminated</code> 分开返回，后面入缓冲时才只把真终止写进 <code>done</code>。</p>
+
+    <p><strong>片段 2：存转移与"下一状态对手动作"的回填</strong></p>
+    <pre class="code"><code>def store(self, obs, act, rew, next_obs, terminated, opp_obs, next_opp_obs, opp_act):
+    """存一条转移；并把上一条转移的 next_opp_act 补齐（回合内相邻）。"""
+    entry = {
+        "obs": obs, "act": act, "rew": rew, "next_obs": next_obs,
+        "done": float(terminated),   # 只把"真终止"写进 done，截断回合要保留 bootstrap
+        "opp_obs": opp_obs, "next_opp_obs": next_opp_obs,
+        "opp_act": opp_act, "next_opp_act": None,
+    }
+    self.buffer.append(entry)
+    if len(self.buffer) &gt; self.args.buffer_size:
+        del self.buffer[: len(self.buffer) // 2]  # 满了删最早一半，近似 FIFO
+        self.pending_idx = None                   # 下标失效，放弃这次回填
+    if self.pending_idx is not None:
+        # 上一条转移的"下一状态对手动作"就是本步刚采到的对手动作，按时间回填
+        self.buffer[self.pending_idx]["next_opp_act"] = opp_act
+    # 真终止处断开 pending：跨回合的两步不属于同一轨迹，回填会张冠李戴
+    self.pending_idx = None if terminated else len(self.buffer) - 1
+    self.opp_data.append((opp_obs, opp_act))      # 同时攒监督数据，喂给对手模型</code></pre>
+    <p>解读：这是本章最"不起眼但最容易写错"的一段。<strong>（1）</strong>Bellman 目标 <code>Q(s,a) ← r + γ·Q(s′, a′)</code> 里，a′ 既包含自己的下一动作（由目标策略现算），也包含对手的下一动作，后者在采样时还不知道，只能等下一步采样发生后再"回填"。<strong>（2）</strong>回填的前提是两次采样在<strong>同一条轨迹</strong>上：<code>pending_idx</code> 在真终止处清空，防止把上一回合末尾的样本和下一回合开头的对手动作错误配对。<strong>（3）</strong>缓冲区删除一半时下标整体失效，代码直接放弃这次回填，受影响的只有极少数边界样本，对训练无影响，比维护"下标平移"简单得多。<strong>（4）</strong>顺手攒 <code>opp_data</code>，一个环境步喂两路数据，零额外采样成本。</p>
+
+    <p><strong>片段 3：评论家输入的三种拼法</strong></p>
+    <pre class="code"><code>def _critic_input(self, obs, act, opp_obs, opp_act, next_opp_act=None):
+    """按模式拼装评论家输入：off=[obs,act]；pred=+预测对手动作；true=+真实对手动作。"""
+    if self.args.opp_model == "off":
+        return torch.cat([obs, act], dim=-1)     # 基线：评论家对对手一无所知
+    if self.args.opp_model == "true":
+        # 训练期上界：Bellman 目标缺未来动作时用零向量占位（bootstrap 边界，占比极小）
+        oat = opp_act if next_opp_act is None else next_opp_act
+        return torch.cat([obs, act, oat], dim=-1)
+    pred = self.opp_model(opp_obs).detach()      # detach：策略梯度绝不能流进对手模型
+    return torch.cat([obs, act, pred], dim=-1)</code></pre>
+    <p>解读：一个函数切换三种实验条件，评估对象完全一致，只换"评论家看到多少对手信息"。<strong>（1）</strong>输入维度在 <code>SACAgent.__init__</code> 里按模式算好（obs_dim + act_dim + extra），网络结构不变，所以对照实验不受模型容量差异干扰。<strong>（2）</strong><code>detach()</code> 是红线：对手模型只接受 <code>train_opp_model</code> 里的监督梯度。<strong>（3）</strong><code>true</code> 模式的占位零向量只出现在"目标 Q 的未来动作未知"这一种边界情况（缓冲区截断处），量级极小，不会把 Q 值带偏。<strong>（4）</strong>想换成"拼对手观测"做消融，只改这一个函数即可，这正是把开关集中到一处的好处。</p>
+
+    <p><strong>片段 4：SAC 更新里的 Bellman 目标</strong></p>
+    <pre class="code"><code>alpha = self.log_alpha.exp().detach()            # 温度以常数出现，不参与 Q 的梯度
+# 1) 双 Q 的 Bellman 回归目标：目标动作由"当前策略"重采样，对手动作来自回填
+with torch.no_grad():
+    next_a, next_logp = self.actor(next_obs)
+    q_in = self._critic_input(next_obs, next_a, next_opp_obs, opp_act, next_opp_act)
+    q1_next = self.q1_target(q_in)
+    q2_next = self.q2_target(q_in)
+    # 最小双 Q 抑制过估计；减去 alpha*logp 是 SAC 最大熵项的体现
+    y = rew + self.args.gamma * (1.0 - done) * (
+        torch.min(q1_next, q2_next) - alpha * next_logp)
+# 2) 双 Q 都向同一个目标回归；取 min 用于目标值，更新本身是两条独立 MSE
+q_in = self._critic_input(obs, act, opp_obs, opp_act)
+critic_loss = F.mse_loss(self.q1(q_in), y) + F.mse_loss(self.q2(q_in), y)</code></pre>
+    <p>解读：这段是 086 章之前所有多智能体 SAC 的公共骨架，本章只动了 <code>_critic_input</code> 的拼接。<strong>（1）</strong>未来动作 <code>next_a</code> 由当前策略重采样（SAC 的 on-policy 味道），<code>next_logp</code> 进入目标里的熵项。<strong>（2）</strong>目标里的对手动作分两路：评估当前对 (s,a) 时用本步的 <code>opp_act</code>；评估未来对 (s′,a′) 时要的是<strong>下一步</strong>的对手动作 <code>next_opp_act</code>，没有回填机制的话这三行就是错的。<strong>（3）</strong><code>(1.0 - done)</code> 掩码保证真终止后未来价值归零；截断不置零，因为环境只是被时间打断。<strong>（4）</strong>Q 目标全程在 <code>no_grad</code> 里计算，只有在线双 Q 的参数收到梯度，这是"目标网络"能稳定回归的前提。</p>
+
+    <p>完整可运行脚本（附录）：<a href="../code/ch082.py" download>code/ch082.py</a></p>
+    <pre class="sh"><code>python code/ch082.py                  # 默认 pred：CPU 约 4–8 分钟
+python code/ch082.py --quick          # 快速跑通：约 40–70 秒
+python code/ch082.py --opp-model off  # 基线：不做对手建模
+python code/ch082.py --opp-model true # 上界：评论家看到对手真实动作</code></pre>
+    <p>日志每 2000 步打印一行：追者/逃者近 20 回合均值和贴获率。<strong>预期：贴获率随训练上升，pred 通常高于 off、true 最高</strong>；对手模型 MSE 从 0.3 量级降到 0.1 以下时 pred 才明显见效，MSE 不降说明预测没学会、pred 接近 off。以实跑为准，换种子会有波动，对比时务必固定 <code>--seed</code>。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>忘记 detach 预测动作</strong>：<code>_critic_input</code> 里漏掉 <code>.detach()</code>，策略梯度会流进对手模型，把它训练成"讨好评论家"的假预测器，MSE 可能不降反升。</li>
+      <li><strong>把 terminated 和 truncated 混用</strong>：追逃的 80 步上限是时间截断，Q 目标仍应 bootstrap；只有贴到（<code>terminated=True</code>）才切断。代码里入缓冲的 <code>done</code> 用 <code>float(terminated)</code>，别手滑混用。</li>
+      <li><strong>预测输入用错观测</strong>：对手模型要预测"对手会做什么"，输入必须是<strong>对手自己的观测</strong>；用自己观测去预测对手动作，对称环境里也许勉强能学，对手策略一变就立刻失效。</li>
+      <li><strong>忘记回填 next_opp_act</strong>：图省事把 <code>next_opp_act</code> 恒置为零，Bellman 目标里的对手动作就失真了，<code>true</code> 模式会退化成"半个 off"，<code>pred</code> 模式则报错或学歪。症状：MSE 正常但贴获率不涨。</li>
+      <li><strong>奖励尺度失衡</strong>：一次性 ±10 远大于每步 ±d（最大约 3.4）。如果把塑形项再放大 10 倍，Q 值会被稀疏大奖励主导，逃者在前 2 万步几乎学不到"拉开距离"的中间信号。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把 <code>--opp-model</code> 三种取值各跑一遍，记录评估贴获率与对手模型 MSE，画出"预测精度 vs 性能增益"的对应关系。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>命令只是换参数，不用改代码。注意 <code>off</code> 模式没有对手模型 MSE 输出（日志里是 nan），对比时只比贴获率。结论至少用 3 个种子验证。</div></details>
+      </li>
+      <li>把对手模型训练频率从 250 步改成 50 步（<code>--opp-train-every 50</code>），先预测 MSE 下降速度会怎么变，再实跑验证。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>更频繁的监督训练能让模型追上对手最新策略，但每步计算量增加 5 倍。看日志里"最近 512 条"数据的 MSE 是否更贴合当前分布，过时数据是 MSE 居高不下的主因之一。</div></details>
+      </li>
+      <li>给对手模型加一个"预测对手下一步位置"的辅助任务（多一个头，回归 <code>next_opp_obs</code> 里的对手位置）。它能否换来更低的动作预测 MSE？<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>在 <code>OpponentModel</code> 加第二个输出头，在 <code>train_opp_model</code> 里对 <code>next_opp_obs</code> 的位置部分做 MSE，总损失是两项之和。这是"多任务辅助监督"，动作预测通常是受益方。</div></details>
+      </li>
+      <li>把 <code>off</code> 模式的评论家输入改成拼接"对手观测"（<code>opp_obs</code>），先从信息量角度分析它和 <code>pred</code> 的本质区别，再改代码验证。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>预测动作相当于让独立的小模型学"对手观测→动作"，直接拼观测则把这份映射工作扔给评论家，还引入了本步与未来的信息泄漏问题（未来的 opp_obs 在 Bellman 目标里同样缺失）。</div></details>
+      </li>
+      <li>把追者的速度限幅改成比逃者快 15%（给 <code>PursuitEvaderEnv.step</code> 加一个按智能体下标的限幅数组），先预测平衡被打破后"对手建模增益"会变大还是变小，再实跑验证。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>最省事的改法：加 <code>self.v_max_agent = np.array([v_max*1.15, v_max])</code>，clip 时按行广播。思考方向：追者优势越大，"预测对手动向"的边际价值是升高（赢得更轻松）还是降低（已经随便赢）？用 off / pred 两条曲线的间距说话。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>多智能体博弈的非平稳性来自"对手策略在变"，独立 SAC 的评论家本质上是在追一个移动的 Q 目标。</li>
+      <li>对手建模的最简形式是监督回归：从对手观测预测对手动作；评论家输入拼接该预测（<code>detach</code>），执行阶段也能用。</li>
+      <li>三种模式构成清晰的<strong>信息阶梯</strong>：<code>off</code> 基线、<code>pred</code> 可部署、<code>true</code> 训练期上界，共享同一套训练代码。</li>
+      <li>实现上两处硬细节：预测动作必须 detach；Bellman 目标里"下一状态的对手动作"要按回合边界正确回填（<code>pending_idx</code>）。</li>
+      <li>下一章把博弈结构变得更复杂：同一批智能体里既有组内合作也有组间竞争（混合任务），用团队内共享回报 + 团队间对抗来检验多智能体 SAC 的表现。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch081.html">← 第 081 章：多智能体SAC：信用分配</a>
+    <a class="next" href="ch083.html">第 083 章：多智能体SAC：混合任务 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

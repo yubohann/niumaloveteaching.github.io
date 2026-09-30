@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第098章 多智能体环境：电网调度 | 深度强化学习课程 · PPO、SAC 与多智能体系统</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第五篇 · 多智能体环境与实践</span>
+    <span class="sep">/</span>
+    <span>第 098 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第五篇 · 多智能体环境与实践</div>
+    <h1>第 098 章：多智能体环境：电网调度</h1>
+    <p class="lead">三个区域电网各自决策机组出力与储能充放，通过有限的联络线互济：用共享网络的离散 PPO 训练，考察"日均成本、缺电惩罚、可再生利用率"之间的取舍（实测：缺电几乎清零、成本与规则基线持平，利用率反而被牺牲）。</p>
+    <ul class="meta">
+      <li>主题：环境设计 / 经济调度与跨时段储能</li>
+      <li>关键公式：cost = Σ(0.4g + 0.05g²) + 0.02·#充放 + 4.0·缺电电量</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 097 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>把经济调度形式化成多智能体 MDP：状态（负荷、可再生、储能）、动作（机组档位 × 储能模式）、成本函数。</li>
+      <li>掌握"日负荷曲线 + 光伏型可再生 + 储能效率 + 联络线互济"的最小电力系统模型。</li>
+      <li>用共享奖励的离散 PPO（参数共享 + 共享 GAE）训练 3 个区域，理解强共享奖励下的协作学习。</li>
+      <li>构建规则调度基线：本区域贪心补缺口，它不做跨时段套利，也不跨区域协调。</li>
+      <li>用"日均成本 / 未满足电量 / 可再生利用率 / 储能循环"四指标评价调度策略，解释它们之间的权衡。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>电网调度是"工程 + 经济"双重约束的经典多智能体问题：每个区域每小时都要决定发多少电、电池充电还是放电，既要供上电（否则付出高额缺电惩罚），又要省钱（机组有成本曲线），还要尽量消纳波动性可再生。区域之间用联络线互济，你富余、我缺电，能互相拉一把，但这条线的容量有限。</p>
+    <p>把它写成能在几万步内训完的环境需要抓住三个建模要点：<strong>需求是时间的函数</strong>（早晚双峰）、<strong>可再生是天气的函数</strong>（中午高、云量抖）、<strong>储能是跨时段资产</strong>（今天的充电是明天的放电）。三者叠加后，"规则调度"（有缺口就开机、有富余就充电）不做跨时段套利、也不跨区域协调，看似留有改进空间；但实测里学习策略先学会的是"简单可靠"（机组恒出力、几乎不用电池），跨时段套利并没有被学出来。这提醒你：折扣因子与奖励定价只是必要条件，想优化什么，就必须把什么写进成本。本章与前两章的"空间协调"也由此区分：这里的耦合发生在<strong>时间轴与功率平衡</strong>上。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 单区域功率平衡</h3>
+    <p>区域 i 在第 t 小时的净功率：</p>
+    <div class="formula">
+      net<sub>i</sub> = r<sub>i,t</sub> + g<sub>i,t</sub> + b<sub>i,t</sub> − d<sub>i,t</sub>
+    </div>
+    <p>其中 r 是可再生出力、g 是机组出力（0～3 档）、b 是储能（放电 +0.9、充电 −1.0，效率 90%）、d 是负荷。net &lt; 0 表示缺电、net &gt; 0 表示富余。注意充电的物理约束：<strong>只有本小时自身供大于求时才允许充电</strong>，不能靠联络线送来的电充电，也不能"赊账"。</p>
+
+    <h3>2. 成本函数与缺电惩罚</h3>
+    <div class="formula">
+      cost = Σ<sub>i</sub> (0.4·g<sub>i</sub> + 0.05·g<sub>i</sub><sup>2</sup>) + 0.02·#充放 + 4.0·缺电电量
+    </div>
+    <p>机组成本随出力<strong>超线性</strong>上升（二次项），所以"多开机组"并不划算；缺电惩罚 4.0/单位远高于任何机组成本（g=3 时单台机组成本 1.65），因此<strong>供电可靠性是第一优先级</strong>。储能充放有 0.02 的磨损费，抑制无意义的来回充放。</p>
+
+    <h3>3. 联络线互济</h3>
+    <p>区域内富余与缺口先各自汇总，再按联络线容量传输：</p>
+    <div class="formula">
+      transfer = min( 全系统富余, 全系统缺口, line_capacity=1.5 )<br>
+      unmet = max(0, 缺口 − transfer)，curtailed = max(0, 富余 − transfer)
+    </div>
+    <p>这个"先内部结算、再总量调拨"的简化把空间结构压缩成一个容量约束，但保留了最关键的耦合：<strong>一个区域多发电可以救另一个区域的急</strong>。因此奖励取全系统总成本的负值，三个区域在数学上构成纯合作博弈，这也是全课程里"共享奖励"最自然的一次应用。</p>
+
+    <h3>4. 跨时段套利为什么难学</h3>
+    <p>储能的收益不在当下：低谷充电（付 0.02 磨损 + 承担充电时的功率平衡）换来高峰放电，价值延迟 7～10 步，而单步成本信号只回答"现在省了没有"。折扣因子 0.97 让十步之外的收益保留约 0.74 的权重，为学习这一模式提供了条件；但实测（种子 0）策略停在"不用电池"的简单解上（循环次数 0），跨时段套利没有被学出来。这是本章最值得追踪的行为：储能循环次数与日成本的联动。</p>
+
+    <h3>5. 共享奖励下的 GAE</h3>
+    <p>奖励是标量（全系统成本），价值函数是每区域一份：</p>
+    <div class="formula">
+      δ<sub>t,i</sub> = r<sub>t</sub> + γ·V<sub>i</sub>(o<sub>t+1</sub>) − V<sub>i</sub>(o<sub>t</sub>)
+    </div>
+    <p>每个区域的观测不同（本地负荷/可再生/储能各异），所以价值估计不同、优势也不同，<strong>共享奖励不等于共享信息</strong>，信用仍然通过各自的局部价值函数体现。这是第 083 章 (T,N) 共享奖励 GAE 的又一次复用。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+
+    <h3>模块划分</h3>
+    <table>
+      <tr><th>组件</th><th>职责</th><th>关键点</th></tr>
+      <tr><td><code>GridDispatchEnv</code></td><td>3 区域电力系统（纯 numpy）</td><td>日负荷曲线、光伏模型、储能、互济结算</td></tr>
+      <tr><td><code>PPOActorCritic</code></td><td>离散 12 动作策略 + 价值头</td><td>参数共享；共享奖励的 GAE</td></tr>
+      <tr><td><code>evaluate</code></td><td>学习 / 规则 / 随机三种调度</td><td>四指标统一口径；利用率截断到 [0,1]</td></tr>
+      <tr><td>动作编码</td><td>a = g×3 + 储能模式</td><td>g∈{0..3}，储能∈{放电,待机,充电}</td></tr>
+    </table>
+
+    <h3>关键超参数</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用与取值理由</th></tr>
+      <tr><td><code>episode_steps</code></td><td>24</td><td>一局 = 一天；跨时段行为在 24 步内完成</td></tr>
+      <tr><td><code>gamma</code></td><td>0.97</td><td>让 10 步后的储能收益仍保留约 0.74 权重</td></tr>
+      <tr><td><code>line_capacity</code></td><td>1.5</td><td>互济上限；调到 3.0 系统几乎不再缺电</td></tr>
+      <tr><td><code>wear</code></td><td>0.02/次</td><td>储能磨损费：抑制无意义充放，可调到 0.1 做对照</td></tr>
+      <tr><td><code>rollout_episodes</code></td><td>25 天</td><td>每次更新采 600 步，一天内多次储能决策都能覆盖</td></tr>
+      <tr><td><code>lr / clip</code></td><td>3e-4 / 0.2</td><td>与全书 PPO 默认一致；离散 Categorical 策略</td></tr>
+    </table>
+
+    <h3>数据流</h3>
+    <p>每步（1 小时）：3 个区域读各自的 8 维观测 → 策略输出 12 选 1（机组档 × 储能模式）→ 环境生成当小时需求/可再生、逐区功率平衡与储能结算、全系统互济、按成本给共享奖励 → 每 25 天（600 步）一次更新，GAE 用共享奖励的 (T, N) 形式 → 每 1 万步评估四指标，对照随机与规则基线。</p>
+
+    <h3>与前一章的差异</h3>
+    <p>第 097 章是"需求侧争夺"的市场博弈（独立奖励），本章是"供电侧协同"的纯合作博弈（共享奖励）；前者的难点在偏好漂移与不完全信息，后者的难点在<strong>时间耦合</strong>，储能的收益延迟与可再生的波动共同要求"前瞻"。两章合起来覆盖了多智能体环境的两大奖励范式：独立奖励的竞争 vs 共享奖励的合作。</p>
+
+    <div class="box key">
+      <span class="box-title">为什么充电必须"先有富余"</span>
+      <p>物理上电池只能吸收本区域已经发出、且没被负荷消耗掉的电。若把充电写成"无条件加电量"，模型会凭空获得能量：成本虚低、缺电量虚降，策略学到的跨时段权衡全是假的。环境里 <code>supply − demand ≥ 1.0</code> 的判定就是这道物理闸门，<strong>所有能量流动都必须可追溯到电源</strong>，这比任何奖励项都重要。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：需求与可再生的时间模型</strong></p>
+    <pre class="code"><code>def _demand(self, t: float) -&gt; np.ndarray:
+    """日负荷曲线：早晚双峰 + 区域差异 + 噪声。"""
+    base = np.array([1.5, 1.7, 1.4], dtype=np.float32)   # 三个区域的基础负荷
+    amp = np.array([0.8, 0.9, 0.7], dtype=np.float32)    # 各自的峰谷幅度
+    shape = 0.5 * (1.0 - np.cos(2.0 * np.pi * (t / 24.0)))   # 0→1→0 的日内包络
+    d = base + amp * shape * (1.0 + 0.6 * np.sin(2.0 * np.pi * (t - 6.0) / 24.0))
+    return (d + self.rng.uniform(-0.1, 0.1, size=3)).astype(np.float32)
+
+def _renewable(self) -&gt; np.ndarray:
+    """可再生出力：中午高、夜间低，叠加云量噪声。"""
+    t = float(self.steps)
+    solar = np.maximum(0.0, np.sin(np.pi * (t % 24.0 - 6.0) / 12.0))  # 6~18 点的日照窗
+    base = np.array([1.8, 1.4, 2.0], dtype=np.float32) * solar        # 三区装机不同
+    noise = self.rng.uniform(0.0, 0.6, size=3).astype(np.float32)
+    return (base + noise * solar).astype(np.float32)   # 云量噪声按日照强度缩放</code></pre>
+    <p>解读：供给与需求两个时间序列定义了整场调度的节奏。<strong>（1）</strong>需求曲线用"余弦包络 × 修正项"：<code>shape</code> 从 0（午夜）爬到 1（正午）再回落，乘一个 6 点相位的正弦修正后形成早晚双峰的日常节奏；base/amp 按区域微调，让三个区域不完全同步（这是互济有意义的前提）。<strong>（2）</strong>噪声 ±0.1 让每天不同，评估必须多天取均值。<strong>（3）</strong>光伏模型 <code>sin(π(t−6)/12)</code> 截断在 6～18 点：日出到日落的正弦；<code>np.maximum(0, ...)</code> 保证夜间为零。<strong>（4）</strong>云量噪声 <code>U(0,0.6)·solar</code> 乘了日照强度，夜里没有云也没有电，噪声不该在夜间"凭空发电"，这是物理一致性最简单的一条检查。</p>
+
+    <p><strong>片段 2：8 维观测，每区一台"仪表盘"</strong></p>
+    <pre class="code"><code>def _obs(self) -&gt; np.ndarray:
+    demand = self.demand
+    renew = self.renewable
+    t = float(self.steps)
+    obs = []
+    for i in range(self.n_agents):
+        others = [float(demand[j]) for j in range(3) if j != i]
+        o = np.concatenate([
+            [demand[i] / 3.0, renew[i] / 3.0, self.battery[i] / self.battery_cap],
+            [np.sin(2 * np.pi * t / 24.0), np.cos(2 * np.pi * t / 24.0)],  # 时间编码
+            np.asarray(others) / 3.0,          # 另两区的负荷：互济的线索
+            [self.last_g[i] / 3.0],            # 自己上步机组出力
+        ])
+        obs.append(o.astype(np.float32))
+    return np.stack(obs)</code></pre>
+    <p>解读：观测把"调度员面前的仪表盘"精确翻译成 8 个数字。<strong>（1）</strong>本区三件套：负荷、可再生、储能余量（除以容量 3 归一化），这是决策的直接输入。<strong>（2）</strong>时间用 sin/cos 双编码：相位角的连续表示让策略能区分"23 点"与"0 点"的相邻关系（直接给单值 t/24 时，0.96 与 0.0 会被网络当成远亲）。这是周期性任务编码时间的主流做法。<strong>（3）</strong>另外两区的负荷进观测：本区缺电时能否指望邻居，取决于邻居是否也在高峰，互济的判断依据必须可见。<strong>（4）</strong>自己上步机组出力：让策略感知"我的机组刚开了多大"，避免阶跃式调整造成成本抖动。注意<strong>没有</strong>把邻区储能放进来：跨区 SOS 的信息粒度不必那么细，这也是控制观测维度的取舍。维度账：3+2+2+1 = 8。</p>
+
+    <p><strong>片段 3：逐区结算，储能与净功率</strong></p>
+    <pre class="code"><code>for i in range(3):
+    gen_cost += 0.4 * g[i] + 0.05 * g[i] ** 2      # 机组成本的二次曲线
+    supply = float(self.renewable[i]) + float(g[i])
+    if batt_mode[i] == 0 and self.battery[i] &gt;= 1.0:      # 放电：需要至少 1.0 存量
+        self.battery[i] -= 1.0
+        supply += self.battery_eff                          # 放出 0.9（效率 90%）
+        wear_cost += self.wear
+        self.battery_cycles += 1
+    elif batt_mode[i] == 2 and self.battery[i] &lt;= self.battery_cap - 0.9:
+        # 充电：需要 1.0 的富余电量，实际存 0.9
+        if supply - float(self.demand[i]) &gt;= 1.0:
+            supply -= 1.0
+            self.battery[i] += self.battery_eff
+            wear_cost += self.wear
+            self.battery_cycles += 1
+    net[i] = supply - float(self.demand[i])         # 本区净功率：正=富余，负=缺额</code></pre>
+    <p>解读：这段是电力系统的"每一度电都要对上账"。<strong>（1）</strong>机组成本二次项 <code>0.4g+0.05g²</code>：g=1 时 0.45、g=3 时 1.65，边际成本随出力上升，"需要 2 就开 2，别开 3"是成本最优，这条曲线就是"经济调度"里的经济二字。<strong>（2）</strong>放电条件 <code>battery ≥ 1.0</code>：电池以"单位电量"为粒度管理，存量不足 1.0 就不能放；充电条件 <code>≤ cap−0.9</code>：留出装下 0.9 的空间。<strong>（3）</strong>充放 <strong>不是对称的</strong>：放电放出 0.9、充电消耗 1.0 存 0.9，效率损失 10% 体现在两条路径上（充的时候吃 1.0 吐 0.9，放的时候扣 1.0 吐 0.9），这种写法让功率平衡守恒到每一步。<strong>（4）</strong>充电的物理闸门 <code>supply − demand ≥ 1.0</code>：必须本小时先有 1.0 的富余才能充，电池不能透支未来、也不能吸联络线的电。被拒绝的充电动作"静默失效"（不扣磨损），策略得从观测里学会预判。</p>
+
+    <p><strong>片段 4：互济结算与共享奖励</strong></p>
+    <pre class="code"><code># 区域互济：富余区支援缺额区（容量受限的"总调拨"简化）
+surplus = float(np.sum(np.maximum(net, 0.0)))     # 全系统富余
+deficit = float(np.sum(np.maximum(-net, 0.0)))    # 全系统缺口
+transfer = min(surplus, deficit, self.line_capacity)
+unmet = max(0.0, deficit - transfer)              # 传不过去的缺口：缺电惩罚
+curtailed = max(0.0, surplus - transfer)          # 送不出去的富余：弃风弃光
+
+self.tot_gen += float(g.sum())
+self.tot_unmet += unmet
+self.tot_curtail += curtailed
+self.steps += 1
+self.last_g = g.copy()
+
+# 共享奖励：全系统总成本的负值，三个区域是纯合作博弈
+cost = gen_cost + wear_cost + 4.0 * unmet
+reward = -cost
+truncated = self.steps &gt;= self.max_steps</code></pre>
+    <p>解读：四行公式定义了"互联电网"的价值与局限。<strong>（1）</strong><code>min(surplus, deficit, line_capacity)</code> 三重取小：调拨量受限于富余、缺口与线路容量，任何一方成为瓶颈都会造成浪费或缺口。<strong>（2）</strong>缺口减不掉的记 <code>unmet</code>（×4.0 惩罚）、富余送不出的记 <code>curtailed</code>（弃风弃光，无直接罚款但体现在利用率指标里）：两类"没用好"分开统计，让问题可诊断。<strong>（3）</strong>奖励是<strong>全系统标量</strong>的负成本，复制给三个区域：这是全书共享奖励链条的又一次出现（083/087/095→098），协作动机完全内生。提醒：奖励是对称的、但观测不对称，各区域的价值函数会学到"我这一份责任"。<strong>（4）</strong>成本三项的量级决定行为优先级：缺电 4.0 ≫ 机组满开 1.65 ≫ 磨损 0.02，策略先保证不缺电、再省钱、最后省电池寿命，这个排序直接写在一串系数里。</p>
+
+    <p>完整可运行脚本（附录）：<a href="../code/ch098.py" download>code/ch098.py</a></p>
+    <pre class="sh"><code>python code/ch098.py          # 完整训练：CPU 约 3–5 分钟
+python code/ch098.py --quick  # 快速跑通：约 30–60 秒</code></pre>
+    <p>日志先打印随机与规则两条基线，之后每 1 万步打印四指标。<strong>预期（以实跑为准）：学习策略的改进集中在可靠性：未满足电量降到约 0（规则基线 5.09），日均成本与规则基线基本持平（约 72.0 对 71.9）；可再生利用率反而更低（约 0.08 对 0.77），储能循环归零（0.0 对 1.4）</strong>。原因是成本函数里没有弃风弃光的罚款、储能套利又难学：学习器用"机组稳定输出第二档"无脑满足负荷，可靠性拉满但丢弃了大部分可再生。这是一条直接可用的环境设计教训：报告指标若不写进奖励就不会被优化；想把利用率拉起来，需要给弃风弃光定价（或压低储能磨损），并把训练预算拉长。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>reset 时没有初始化 demand/renewable</strong>：观测要读当前小时的需求与可再生；若它们只在 step 里生成，reset 后第一次观测直接 AttributeError。本实现让 reset 显式调用一次生成函数。</li>
+      <li><strong>把充电写成"无条件加电量"</strong>：不给充电加"先有富余"的约束，模型会凭空获得能量，成本虚低、策略学不到跨时段权衡。功率平衡必须守恒到每一步。</li>
+      <li><strong>可再生利用率算法越界</strong>：浪费的富余里既有弃风弃光也有机组过发，直接用 curtail/renew 会算出负利用率；本实现把浪费量截断到可再生总量内，指标才落在 [0,1]。</li>
+      <li><strong>用单日成本比较不同随机种子</strong>：每天的需求/可再生噪声不同，单日成本波动可达 ±15%。评估必须多天取均值，且学习策略与基线用完全相同的种子序列。</li>
+      <li><strong>把 γ 设回 0.95</strong>：储能收益延迟 7～10 步，0.95 时十步外只剩 0.6 的权重、且策略更短视，"囤电"行为会明显变弱。本章 γ=0.97 是为跨时段任务专门选的。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把联络线容量从 1.5 调到 0.5 和 3.0 各跑一次，先预测成本与缺电量的走向，再画"容量—成本"曲线找拐点。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>容量越大缺电越少、成本越低，但边际收益递减，拐点之后继续扩容几乎不省钱，这解释了实际电网里"新建一条线值不值"的评估逻辑。</div></details>
+      </li>
+      <li>把储能磨损费从 0.02 提到 0.1，先预测储能循环次数的变化方向，再观察成本的联合变化。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>磨损费是"使用电池的价格"。观察模型是否把循环次数压到精细化后的水平；如果直接归零，说明训练退化成"机组直供"。</div></details>
+      </li>
+      <li>把可再生噪声幅度从 0.6 加到 1.2，先论证"谁的劣势更大"（规则还是学习），再实测两者差距的变化。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>波动越大，规则调度越难应对、学习策略的潜在优势越大；但训练也更难，可能需要把预算加到 10 万步。</div></details>
+      </li>
+      <li>把储能效率从 0.9 降到 0.7，先推导最优调度哲学的变化，再观察循环次数与成本。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>效率越低、往返损失越大，最优策略应"只做高价值套利"；循环次数随效率下降而减少是可检验的预测。</div></details>
+      </li>
+      <li>把 3 区"总调拨"改成 6 区只有两条联络线的拓扑，先分析哪些区会失去互济、协作难度如何变，再实现一个简单的逐边迭代结算。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>把"全系统统一调拨"替换成按边传输的迭代结算。拓扑连通性越差，各区越接近独立，学习收益主要来自储能管理，互济贡献有限，正好用来验证"耦合强度决定协作价值"。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>电网经济调度 = 逐小时功率平衡 + 成本最小化：机组成本递增、缺电惩罚极高、储能是跨时段资产。</li>
+      <li>联络线互济让区域间形成纯合作博弈，共享奖励 + 逐区域价值函数是自然的学习配置。</li>
+      <li>可再生的波动与储能的延迟收益让"前瞻"成为学习策略超越规则基线的关键能力，但实测种子 0 下学习器尚未用起储能，超越只体现在未满足电量上（≈0 对 5.09）；充电必须先有富余是物理底线。</li>
+      <li>四指标里"未满足电量"是硬约束、"成本"是效率、"可再生利用率"是外部性的代理，三者要一起报告。</li>
+      <li>下一章进入金融市场：四个交易者面对带私有信号的噪声市场，用策略梯度学习下单，观察知情交易与价格发现效率。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch097.html">← 第 097 章：多智能体环境：推荐系统</a>
+    <a class="next" href="ch099.html">第 099 章：多智能体环境：金融交易 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

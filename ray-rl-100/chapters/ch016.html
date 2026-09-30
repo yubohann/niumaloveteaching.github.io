@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第016章 RLlib训练第一个策略 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · RLlib 核心接口与训练</span>
+    <span class="sep">/</span>
+    <span>第 016 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · RLlib 核心接口与训练</div>
+    <h1>第 016 章：RLlib训练第一个策略</h1>
+    <p class="lead">观察一次训练迭代的完整生命周期：环境副本并行采样、批次汇总、策略网络多轮更新、指标回传。把第一个 PPO 训练循环跑通，并学会读迭代返回值。</p>
+    <ul class="meta">
+      <li>主题：RLlib 训练 / 首个端到端训练循环</li>
+      <li>关键机制：采样与学习阶段划分、批次规模配置、迭代指标</li>
+      <li>预计学时：65 分钟</li>
+      <li>前置章节：第 015 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解一次训练迭代的内部结构：采样阶段与学习阶段的分工、权重同步的时机。</li>
+      <li>掌握最小 PPO 配置的构建方式：环境、采样副本数、训练批次、学习率的设置依据。</li>
+      <li>会读取迭代返回结果中的关键指标，并解释指标口径与采样规模的关系。</li>
+      <li>会用训练好的策略做单步推理，理解推理路径与训练路径共享权重的机制。</li>
+      <li>能诊断三类问题：批次过小导致的更新噪声、副本数与核数失衡、指标键名跨版本差异。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>环境实现正确之后，下一步是让策略在环境中学习。RLlib 把训练组织成迭代（Iteration）：每轮先并行采样若干步，再用这批数据更新策略网络，循环往复。<strong>理解迭代结构是理解一切后续调参的前提</strong>：批次规模、学习轮数、副本数量这些参数的调整，本质上都在改变两个阶段的时间与数据量分配。</p>
+    <p>为什么从 PPO 起步：它的学习过程稳定、对超参不敏感（相对而言），配置项数量适中，适合作为第一个完整的训练案例。<strong>本章关注"训练循环如何运转"，算法内部的损失构造与裁剪细节留到第 038 章</strong>，两者的关系相当于先学会开车、再学发动机原理。</p>
+    <p>学完本章，会得到一条可复现的训练曲线、一份迭代耗时数据，以及用策略做推理的最小代码。它们是后续所有实验的模板。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 迭代结构：采样与学习的二相循环</h3>
+    <p>一次迭代由两个阶段构成，边界清晰：</p>
+    <table>
+      <tr><th>阶段</th><th>执行者</th><th>输入输出</th><th>扩缩手段</th></tr>
+      <tr><td>采样</td><td>环境副本组（EnvRunner 组）</td><td>以当前策略与环境交互，产出固定步数的批次</td><td>增加副本数、提高单副本步速</td></tr>
+      <tr><td>学习</td><td>学习器（Learner）</td><td>消费批次，做多轮小批量梯度更新，产出新权重</td><td>提高批大小、调整更新轮数</td></tr>
+    </table>
+    <p>两阶段之间有一次权重同步：学习产出的新权重被分发回各环境副本，下一轮采样使用更新后的策略。<strong>同步点的存在意味着采样阶段与学习阶段无法完全重叠</strong>，这是同步式训练（相对于异步式）的本质特征；第 086 章会专门对比两种节奏的吞吐与稳定性。</p>
+    <div class="formula">
+      迭代产出 = 训练批次大小（train_batch_size）步样本；每步 = 一个环境帧
+      <span class="note">8192 步的批次、4 个副本，每副本每轮约采集 2048 步；数值量级取 4k–64k 是偏差与吞吐的折中</span>
+    </div>
+    <p>权重同步的成本可以估算：本章网络约 6.7 万个参数，序列化与广播在毫秒级，可以忽略；换成千万参数的视觉网络（约 40 MB 单精度权重），在 1 Gbps 链路上单次同步约 0.32 秒，若单轮迭代总耗时 5 秒，同步税近 6.4%。模型越大、迭代越短，同步税占比越高，这也是大规模训练需要权衡同步粒度的原因之一。</p>
+
+    <h3>2. 采样批次：好批次的标准</h3>
+    <p>批次大小是第一个要理解的关键参数：</p>
+    <ul>
+      <li><strong>统计学上的充分性</strong>：策略梯度是对期望的蒙特卡洛估计，批次越小估计方差越大，单次更新方向越不稳定。批次趋大则方差趋小，但每轮计算量增加。</li>
+      <li><strong>数据新鲜度</strong>：PPO 属于同策略算法，数据必须来自"离当前策略不远"的行为策略。批次过大意味着同一批数据被更新得更久，策略偏移更多，超出裁剪机制的纠正范围。</li>
+      <li><strong>与更新轮数的联动</strong>：批次确定后，更新轮数（对同一批数据反复学习的次数）决定策略能走多远。批次偏小节数偏多，等价于用陈旧数据的风险换取计算效率。</li>
+    </ul>
+    <p><strong>经验配置的起点是"批次 4k 至 32k 步、更新 4 至 10 轮、小批量 512 至 2048"</strong>，再按任务难度与观测复杂度调整。任务越难、策略改进越慢，批次宜越大、轮数宜越多；相反，简单任务上大配置会拖慢进展速度。</p>
+    <p>小批量的选择同样可以量化：批次 8192、小批量 1024 时每轮 8 次梯度更新；小批量降到 256 则每轮 32 次，更新更频繁，但每次向量化规模变小，单次更新的信噪比按平方根下降到一半（√(256 ÷ 1024) = 0.5）。显存充裕时把小批量控制在一千至数千区间，让设备利用率与更新质量兼顾。</p>
+
+    <h3>3. 指标口径：看懂迭代返回值</h3>
+    <p>每轮迭代返回一个结果字典，核心指标分四类：</p>
+    <ul>
+      <li><strong>进度类</strong>：累计采样步数、训练轮数。用来判断"训练走到哪了"。</li>
+      <li><strong>回报类</strong>：回合回报均值与极值。最直观的学习效果指标，注意它来自采样过程，受探索影响。</li>
+      <li><strong>优化类</strong>：损失项、裁剪比例、熵系数相关量。用来判断"策略更新是否健康"，第 051 章专讲诊断。</li>
+      <li><strong>时间类</strong>：迭代耗时、采样与学习的时间占比。用来判断"吞吐瓶颈在哪一阶段"。</li>
+    </ul>
+    <p><strong>指标键名随版本演进</strong>，不同版本对同名概念使用不同的键。写日志代码时按"先取主键、失败回退备选键"的方式防御，避免升级版本时监控脚本静默失效。<strong>回报均值要结合回合长度解读</strong>：负值奖励任务中回报上升可能表现为绝对值下降，判断学习进展要看趋势方向，符号本身会给出误导信息。</p>
+
+    <h3>4. 推理路径：权重同步的另一端</h3>
+    <p>训练好的策略可以独立调用：把单条观测交给策略，得到动作分布或确定性动作。这条推理路径与训练采样共享同一份权重，差别只在探索噪声与批处理的处理方式。<strong>先推理测试、后做评估：用固定观测序列检查动作的合理性，比等评估指标更有诊断价值</strong>。第 018 章会把这套推理接进正式的评估与检查点流程。推理路径的成本也要心里有数：浅层网络单次前向在中央处理器上约一毫秒量级，一次 1 万步的评估要数秒；评估频率过高会把训练预算切走一块，把它做成周期性动作并用固定种子序列保证可比，是标准流程的一部分。</p>
+
+    <h3>5. 数值算例：一轮迭代的数据账与加速上限</h3>
+    <p>把片段 1 的配置展开成一笔数据账：训练批次 8192 步由 4 个副本平摊，每个副本每轮采集 2048 步；小批量 1024 步时一批数据切成 8 个小批量，更新 6 轮共执行 48 次梯度更新；30 轮迭代累计采样 245,760 步。批次规模改变时这组数字同步变化：批次 1024 时只有 1 个小批量、每轮 6 次更新，梯度噪声相对 8192 批次放大约 2.83 倍（按标准差与批次的平方根成反比）；批次 32768 时小批量 32 个、每轮 192 次更新，标准差噪声降到 8192 批次的一半（表中以 1024 批次为基准时记 0.18 倍），代价是单轮墙钟时间拉长。</p>
+    <table>
+      <tr><th>训练批次</th><th>小批量个数</th><th>每轮梯度更新次数</th><th>相对梯度噪声</th><th>数据新鲜度压力</th></tr>
+      <tr><td>1024</td><td>1</td><td>6</td><td>1.00</td><td>低</td></tr>
+      <tr><td>8192</td><td>8</td><td>48</td><td>0.35</td><td>中</td></tr>
+      <tr><td>32768</td><td>32</td><td>192</td><td>0.18</td><td>高</td></tr>
+    </table>
+    <p>副本扩展的加速同样可算。设单轮迭代中采样占 70%、学习占 30%，把副本从 4 提到 16（采样时间理想降到四分之一），单轮耗时从 1.0 变为 0.30 + 0.175 = 0.475，加速比约 2.1 倍，远低于 4 倍；若采样占比高达 85%，同样四倍扩展的加速约 2.76 倍，理论上限为 1 ÷ (1 − 0.85) ≈ 6.7 倍。这组数字说明同步式训练的加速被学习阶段封顶，加副本只对采样占比高的运行有效。</p>
+
+    <h3>6. 边界与失效模式</h3>
+    <p>同步点带来的空闲是结构性成本：采样阶段学习器闲置，学习阶段副本闲置，各自的利用率约等于对方阶段的时间占比。要压低这项成本，只能压缩对方阶段：采样快而学习慢时调小批次或小批量；学习快而采样慢时加副本或简化环境。试图同时提高两边的利用率是矛盾目标，这台机器的最优状态是两边耗时接近。与之配套的资源纪律是：为学习器与驱动进程留出余量，副本数取不超过核数减二的值。</p>
+    <p>更新轮数存在新鲜度边界。轮数越多，同一批数据被反复使用，策略偏离行为策略越远，裁剪机制纠正的比例越高。裁剪比例是现成的监控量：它随轮数上升而抬升，数值接近上限时继续增加轮数只会放大偏差而不增加有效进展。经验上把轮数控制在 10 以内，或观察裁剪比例超过两成时回退。以批次 8192 为例，轮数从 6 提到 10，每轮梯度更新次数从 48 升到 80，数据利用率提高约 67%；这条收益要以新鲜度为代价换取，报酬与风险的平衡点是下一步实验要标定的量。</p>
+    <p>回报指标的噪声与回合长度挂钩：批次 8192 步、平均回合 100 步时，单轮约完成 82 个回合，均值噪声按回合数的平方根估算；平均回合缩到 20 步时单轮约 410 个回合，同样口径下噪声降到约 0.45 倍。这解释了长回合任务曲线更锯齿的现象，滑动平均窗口要随回合长度加长；这类锯齿来自采样噪声，调整算法参数之前先把窗口口径对齐。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>搭建第一个训练循环的步骤：</p>
+    <ol>
+      <li><strong>注册环境</strong>：沿用第 015 章的注册模式，确认名字与配置都可用。</li>
+      <li><strong>构建配置</strong>：环境段落（名字与配置）、采样段落（副本数与批次）、训练段落（学习率与更新轮数）、资源段落（核与卡）。</li>
+      <li><strong>构建算法对象</strong>：由配置产出算法实例，观察启动日志中的资源分配信息。</li>
+      <li><strong>训练循环</strong>：限定迭代次数或累计步数作为停止条件；每轮打印进度与回报，保留近若干轮的滑动均值。</li>
+      <li><strong>推理测试</strong>：训练结束后用重置后的环境做若干回合的确定性推理，核对行为。</li>
+    </ol>
+    <table>
+      <tr><th>参数</th><th>典型取值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>num_env_runners</td><td>4–16</td><td>采样并行度</td><td>核数以内，单副本声明 1 核</td></tr>
+      <tr><td>train_batch_size</td><td>4096–32768 步</td><td>单轮样本量</td><td>梯度方差与数据新鲜度的折中</td></tr>
+      <tr><td>小批量大小</td><td>512–2048</td><td>梯度更新粒度</td><td>显存约束下的向量化效率</td></tr>
+      <tr><td>更新轮数</td><td>4–10</td><td>数据利用深度</td><td>同策略数据可重复利用的次数上限</td></tr>
+      <tr><td>学习率</td><td>3e-4</td><td>步长</td><td>PPO 常用起点，按训练稳定性微调</td></tr>
+    </table>
+    <div class="box tip">
+      <span class="box-title">与上一章的差异点</span>
+      <p>第 015 章交付的是"合规的环境"；本章交付的是"环境与训练端的第一次完整对话"。接口错误在上一章暴露，系统错误（资源失衡、批次噪声）从本章开始暴露。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>以下片段采用 Ray 2.x 时期的通用写法；接口随版本演进，以对应版本官方文档为准。</p>
+    <p><strong>片段 1：最小 PPO 训练循环</strong></p>
+    <pre class="code"><code>import ray
+from ray.tune.registry import register_env
+from ray.rllib.algorithms.ppo import PPOConfig
+from rl_lab.envs import LineTrackerEnv
+
+ray.init(num_cpus=12, ignore_reinit_error=True)   # 本地练手：12 核预算
+
+register_env("line_tracker", lambda cfg: LineTrackerEnv(cfg))   # 第 015 章的注册
+
+config = (PPOConfig()
+          .environment(env="line_tracker", env_config={"max_steps": 200, "goal": 5.0})
+          .env_runners(num_env_runners=4)         # 4 个环境副本并行采样
+          .training(train_batch_size=8192,        # 每轮 8192 步样本
+                    minibatch_size=1024,          # 梯度小批量 1024
+                    num_epochs=6,                 # 同批数据更新 6 轮
+                    lr=3e-4)                      # 学习率按 PPO 常用起点
+          .resources(num_gpus=0))                 # 本机无卡：声明为 0 更清晰
+
+algo = config.build()                             # 构建算法：此时分配副本资源
+
+history = []
+for it in range(30):                              # 固定 30 轮，便于对照实验
+    result = algo.train()                         # 一次迭代：采样 + 学习
+    mean_rew = result.get("env_runners", {}).get("episode_return_mean",
+        result.get("episode_reward_mean", float("nan")))   # 兼容两代键名
+    history.append(mean_rew)
+    recent = sum(history[-5:]) / len(history[-5:])        # 近 5 轮滑动均值
+    print(f"轮 {it:02d} 回报均值 {mean_rew:8.2f} 近5轮 {recent:8.2f}")</code></pre>
+    <p>解读：整个循环只有"构建、迭代、读指标"三步，复杂度都收进了配置。三个设计点值得注意。<strong>其一，资源声明显式化</strong>：本地练手也把核与卡声明清楚，便于日后原样迁移到集群。<strong>其二，指标读取用回退链</strong>：结果字典的结构随版本演化，主键取不到时回退到旧键，监控代码不会因升级而失效。<strong>其三，固定迭代数加滑动均值</strong>：单轮回报受批次随机性影响波动明显，用近几轮均值判断趋势，比看单轮值可靠。30 轮是演示规模，真实任务按收敛曲线决定停止点。</p>
+
+    <p><strong>片段 2：测量两阶段耗时占比</strong></p>
+    <pre class="code"><code>import time
+
+profiles = []                                     # 每轮的粗粒度时间画像
+last_steps = 0
+for it in range(10):
+    t0 = time.perf_counter()
+    result = algo.train()                         # 采样与学习在内部串行推进
+    dt = time.perf_counter() - t0
+
+    # 从结果里读取两阶段的内部计时（键名随版本演进，取不到就回退）
+    timers = result.get("timers", {})
+    sample_t = timers.get("sample_time_ms", 0.0) / 1000.0
+    learn_t = timers.get("learn_time_ms", 0.0) / 1000.0
+    profiles.append((dt, sample_t, learn_t))
+    last_steps = result.get("num_env_steps_sampled_lifetime",
+                            result.get("timesteps_total", last_steps))
+
+# 汇总：总时长、采样占比、学习占比、端到端吞吐
+total = sum(p[0] for p in profiles)
+sample = sum(p[1] for p in profiles)
+learn = sum(p[2] for p in profiles)
+print(f"10 轮总耗时 {total:.1f}s 采样占比 {sample/total:.0%} "
+      f"学习占比 {learn/total:.0%}")
+print(f"累计采样步数 {last_steps} 吞吐 {last_steps/total:,.0f} 步/秒")</code></pre>
+    <p>解读：这段脚本把"训练快不快"拆成两个可归因的数字。<strong>采样占比高</strong>说明瓶颈在环境推进或副本不足，方向是增加副本、优化环境单步；<strong>学习占比高</strong>说明瓶颈在梯度计算，方向是调整批次与小批量、核对显存利用率。占比数据也是配置迁移的依据：在 4 核上标定的比例，扩到 64 核时若环境与环境副本同步扩展，比例基本保持；只扩一边则比例失衡、加速比缩水。时间键名同样用回退方式读取，与片段 1 的策略一致。</p>
+
+    <p><strong>片段 3：策略推理，验证训练结果</strong></p>
+    <pre class="code"><code>import numpy as np
+from rl_lab.envs import LineTrackerEnv
+
+# 用策略做确定性推理：关闭探索噪声，观察策略的真实行为
+env = LineTrackerEnv({"max_steps": 200, "goal": 5.0})
+obs, _ = env.reset(seed=2024)
+trajectory = []
+done = False
+while not done:
+    action = algo.compute_single_action(obs, explore=False)   # 单条观测推理
+    obs, reward, terminated, truncated, _ = env.step(action)
+    trajectory.append((float(obs[0]), float(reward)))
+    done = terminated or truncated
+
+positions = [p for p, _ in trajectory]
+print(f"回合步数 {len(trajectory)} 终点位置 {positions[-1]:.2f}")
+print(f"回报总和 {sum(r for _, r in trajectory):.1f}")
+print(f"轨迹前五步位置 {[round(p, 2) for p in positions[:5]]}")</code></pre>
+    <p>解读：推理接口把"观测进、动作出"变成一行调用，这与训练采样共享同一份权重。<code>explore=False</code> 关闭探索噪声，得到的动作序列反映策略的真实偏好：训练良好的策略会让位置单调逼近目标，前五步的位移方向与步长是比回报更快的行为信号。<strong>把轨迹与回报一起打印</strong>，能区分两类问题：回报正常但轨迹抖动，往往是探索噪声或评估环境差异；轨迹方向正确但回报低，则回到奖励设计。这份推理脚本会在第 018 章升级为带评估配置的标准流程。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>训练批次过小</strong>：单轮样本不足导致梯度噪声大、回报曲线锯齿明显，误判为算法不稳定。修复：把批次提到 4k 步以上，同时观察回报曲线的平滑度变化。</li>
+      <li><strong>副本数与核数失衡</strong>：副本数乘以单副本核数超过预算，副本启动排队，首轮迭代前出现长停顿。修复：按资源段落逐项核对，启动日志中的分配信息是唯一事实来源。</li>
+      <li><strong>硬编码指标键名</strong>：新版本结果字典结构调整，监控脚本取到空值却不报错。修复：键名读取带回退链，或先打印结果字典的顶层结构再编写提取代码。</li>
+      <li><strong>用单轮回报下结论</strong>：训练早期单轮回报的随机波动被当成策略退化，频繁中断实验。修复：固定评估窗口，用滑动均值与更长跨度判断趋势。</li>
+      <li><strong>忘记停止条件</strong>：循环写成无限迭代，实验忘记终止条件持续占用资源。修复：循环限定轮数或步数上限，训练脚本的终止条件与检查点策略一起设计（第 018 章）。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把片段 1 的 <code>train_batch_size</code> 从 8192 改成 1024 与 32768，各跑 30 轮，对比回报曲线的平滑度与到达同等回报水平的轮数，解释差异。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>小批次曲线锯齿大、单轮方差显著；大批次每轮成本高但方向稳定。同等样本量下两者最终水平接近，达到该水平的墙钟时间取决于任务特性。</div></details>
+      </li>
+      <li>预测题：把 <code>num_env_runners</code> 从 4 提到 16（核预算充足），采样阶段耗时占比如何变化？总吞吐的加速上限由什么决定？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>采样占比下降，加速上限受学习阶段的固定成本约束，即阿姆达尔定律：加速上限为 1 除以学习阶段占比。</div></details>
+      </li>
+      <li>设计题：为"学习率与更新轮数"设计一组 2×2 对照实验（学习率 1e-4 与 3e-4、轮数 4 与 10），写明控制变量、评估口径与预期观察。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>控制变量：环境、批次、副本、随机种子一致；评估口径：同等采样步数下的近窗口回报；预期：高学习率加快早期进展但后期可能波动，大轮数提升数据利用率但有过拟合同批数据的风险。</div></details>
+      </li>
+      <li>分析：某训练运行中采样占比 85%，学习占比 8%，其余为汇总开销。给出两种不同的优化路径，并说明如何验证选择。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>路径一：增加副本或优化环境单步（针对采样）；路径二：减少每轮采样量并提高更新频率（针对整体节奏）。验证方法：分别改动后对比每墙钟秒的有效学习进展。</div></details>
+      </li>
+      <li>推导：设单轮采样耗时与副本数成反比、学习耗时与批次大小成正比，写出"单位墙钟时间的策略更新量"表达式，并讨论副本数与批次同时翻倍的效果。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>单轮更新量约为批次除以（采样时间加学习时间）。两参数同步翻倍时单轮时间约增半、更新量翻倍，净效率约提升到 4/3 倍，推导可验证配置等比扩展的价值。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>一次迭代等于"并行采样固定步数、多轮小批量更新、权重同步"的三段式；同步点是吞吐的固有成本。</li>
+      <li>批次大小在同策略算法里同时受梯度方差与数据新鲜度约束，4k–32k 步是稳健起点。</li>
+      <li>迭代结果分进度、回报、优化、时间四类指标；<strong>回报看趋势，单轮值波动大；时间看两阶段占比，总时长只作参考</strong>。</li>
+      <li>指标键名跨版本漂移，读取代码使用回退链；推理接口与训练共享权重，是验证行为的快速通道。</li>
+      <li>下一章把配置从代码里抽出来：<strong>配置体系与命令行训练</strong>，支持不改代码切换参数。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch015.html">← 第 015 章：RLlib环境接口实现</a>
+    <a class="next" href="ch017.html">第 017 章：RLlib配置与命令行训练 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

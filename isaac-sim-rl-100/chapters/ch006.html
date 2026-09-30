@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第006章 实现关节力矩控制 | 机器人仿真学习课程 · Isaac Sim 强化学习训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · 仿真环境与训练框架</span>
+    <span class="sep">/</span>
+    <span>第 006 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · 仿真环境与训练框架</div>
+    <h1>第 006 章：实现关节力矩控制</h1>
+    <p class="lead">最底层的控制模式：把广义力矩直接写进关节。理解为什么它是开环的、为什么重力补偿必须先做好、以及如何为策略设计一个既不"抽搐"也不"无力"的力矩动作空间。</p>
+    <ul class="meta">
+      <li>主题：控制模式 / 关节力矩（直接力控制）</li>
+      <li>相关组件：Isaac Sim（effort 驱动、广义力计算）</li>
+      <li>预计学时：50 分钟</li>
+      <li>前置章节：第 005 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解力矩控制的定义：绕过引擎内的 PD，广义力直接注入自由度；物理上是纯粹的 J·q̈ = Στ 积分。</li>
+      <li>说清"开环"的含义：没有内置稳定项，小误差会积分成明显漂移。</li>
+      <li>会实现重力补偿：τ<sub>cmd</sub> = τ<sub>g</sub>(q) + a·τ<sub>scale</sub>，并解释为什么这是力矩型 RL 任务能训起来的前提。</li>
+      <li>掌握力矩动作空间的缩放准则（关节上限的 20%–50%），理解缩放对探索的影响。</li>
+      <li>了解力矩控制相对其他模式的优缺点，知道什么任务值得用它（力交互、柔顺、对齐真机接口）。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>004、005 章里，物理引擎帮你兜底：位置伺服维持姿态光滑，速度伺服保证跟随。力矩控制把这些"自动扶梯"全部撤掉，策略输出的每一个数都直接变成关节上的力，没有任何控制器替它纠错。这让力矩控制既是最强大的模式（可以做柔顺、力控、接触丰富的任务），也是最难的模式（策略要自己学会站稳）。</p>
+    <p>为什么还要学它？<strong>真机接口就是力/电流级</strong>，力矩控制与真机语义最接近，sim2real 最直接；也只有在力矩层面，你才能研究"用力"本身，抓得稳而不捏碎、推得动而不推飞。019、048 章都会回到这里。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 力矩控制 = 开环注入广义力</h3>
+    <p>以单关节为例，忽略科氏力与接触力，动力学方程是：</p>
+    <div class="formula">
+      J·q̈ = τ<sub>cmd</sub> + τ<sub>g</sub>(q)
+      <span class="note">τ_cmd 是你的命令力矩，τ_g(q) 是该姿态下重力在关节上的投影，方向通常把关节往"下垂"方向拉</span>
+    </div>
+    <p>注意与位置控制对比：位置控制的实际力矩含 −K<sub>p</sub>Δq − K<sub>d</sub>q̇ 两个自动稳定项；力矩控制里它们不存在，动力学是"加速度 = 净力矩/惯量"的纯积分链。<strong>纯积分链临界不稳定</strong>：偏差力矩 2 N·m 作用在 J = 0.1 kg·m² 的关节上，0.3 秒后角位移约 0.9 rad，半秒就能从水平砸到限位。</p>
+
+    <h3>2. 重力补偿：把"维持姿态"从策略的作业里拿掉</h3>
+    <p>静止姿态下维持不动需要 τ<sub>cmd</sub> = τ<sub>g</sub>(q)。τ<sub>g</sub> 是随构型变化的 7 维函数，用神经网络去精确回归它是"用大炮打蚊子"，物理模型里明明有解析式。工程做法是<strong>先补偿、再学习</strong>：</p>
+    <div class="formula">
+      τ<sub>cmd</sub> = τ<sub>g</sub>(q) + a ∘ τ<sub>scale</sub>，&nbsp; a ∈ [−1, 1]<sup>n</sup>
+      <span class="note">∘ 表示逐元素乘；策略只负责"相对于平衡点的修正"，不再是全部力矩</span>
+    </div>
+    <p>补偿之后，机器人处于"理论上可静止"的临界状态；策略的输出 a 从"学会怎么站"变成"学会怎么动"，这就是物理先验的价值。重力项由引擎直接给出（接口名随版本变化），也可按质量-质心模型自算。</p>
+
+    <h3>3. 力矩动作空间：缩放与饱和</h3>
+    <p>τ 的单位是 N·m，而每个关节的可用范围差两个数量级（Franka 大臂 87 N·m，腕部 12 N·m，夹爪手指约 60 N）。动作设计有两条原则：</p>
+    <ul>
+      <li><strong>逐关节缩放</strong>：τ<sub>i</sub> = a<sub>i</sub>·k<sub>i</sub>，其中 k<sub>i</sub> 取该关节上限的 20%–50%。取满上限的动作意味着"一拳打到底"，探索期出现概率不低，事故率高；取 20% 又会让重负载任务"推不动"。</li>
+      <li><strong>显式饱和</strong>：无论如何缩放，最终命令都要 clip 到 ±τ<sub>max,i</sub>。引擎本身也会饱和，但显式裁剪让"策略发出的动作"与"实际执行的力矩"一致，日志里一眼能看出探索是否长期打满。</li>
+    </ul>
+    <p>对比 004 章的 Δq<sub>max</sub>：位置动作缩放的是"目标距离"，力矩动作缩放的是"力量大小"。前者有引擎兜底，后者没有，同一个越界动作，位置模式的后果是"目标超出一点"，力矩模式的后果是"机器人大力出奇迹"。</p>
+
+    <h3>4. 什么时候值得用力矩控制</h3>
+    <table>
+      <tr><th>场景</th><th>推荐模式</th><th>原因</th></tr>
+      <tr><td>到达、抓取、放置（位置精度优先）</td><td>位置</td><td>伺服兜底，样本效率最高</td></tr>
+      <tr><td>力控装配、扶持、擦拭</td><td>力矩</td><td>需要控制"用力大小"本身，位置会顶死</td></tr>
+      <tr><td>四足/人形的动态运动</td><td>力矩（或混合）</td><td>需要利用被动动力学，位置伺服太"僵硬"</td></tr>
+      <tr><td>研究 inertia-aware 策略</td><td>力矩</td><td>状态-动作对齐到经典控制理论，便于分析与对照</td></tr>
+    </table>
+    <p>一个比喻：位置控制像"扶着栏杆走路"，力矩控制像"放开手走路"。力矩策略迁移真机时面对的就是真实的力环境；位置策略迁移时，真机伺服环差异会悄悄改变训练成果（执行器层面差距）。</p>
+
+    <h3>5. 无补偿漂移的时间预算</h3>
+    <p>把第 1 节"纯积分链临界不稳定"落成数字。设关节等效惯量 J = 0.1 kg·m²，存在 2 N·m 的净力矩（重力补偿遗漏的常见量级），角加速度 a = τ / J = 20 rad/s²。由 θ = ½·a·t² 得：0.1 秒偏移 0.1 rad（60 Hz 下仅 6 步）；0.3 秒偏移 0.9 rad；0.5 秒偏移 2.5 rad，足以从水平姿态砸到关节限位。这条抛物线说明力矩型任务的"失稳"以秒为单位上演，策略若还要额外学习"托住手臂"，有效学习时间会被压缩到很短。</p>
+    <p>反过来算误差预算：若要求 0.2 秒内漂移不超过 0.1 rad，允许的净力矩为 J × (2 × 0.1 / 0.2²) = 0.5 N·m，只占 Franka 力矩上限 87 N·m 的 0.57%。这就是重力补偿必须做到"模型级精度"的量化含义：残差要压在半牛米量级。工程上的核对方法是做一次姿态扫描：把手臂停在若干个典型构型，读取 τ<sub>g</sub> 并实测静止漂移速度，漂移速度乘以 J 就是残余净力矩，超过 0.5 N·m 时先查补偿项的符号与坐标系，再查质量-质心参数。</p>
+
+    <h3>6. 力矩变化率与响应速度的取舍</h3>
+    <p>片段 3 的 TorqueLimiter 取 max_rate = 5 N·m/步，换成速率语言：60 Hz 下等效 300 N·m/s，从零爬到 87 N·m 满力矩需要 87 / 300 ≈ 0.29 s。平滑的价值在第 3 节已经说明，代价在这里量化：若任务要求 0.05 s 内爆发满力矩（快速避险、插拔冲击），需要的变化率是 87 / 0.05 = 1740 N·m/s，即每步 29 N·m，是默认档的近 6 倍。两档的差别是"平滑稳定"与"敏捷响应"的取舍：训练早期用默认档保护探索稳定性；进入高动态任务后，在物理模型通过被动测试的前提下逐步放宽，并保证观测里含有足够的速度信息，让策略能预判自己的快速动作。</p>
+
+    <h3>7. 缩放档位与重力需求的核对</h3>
+    <p>τ<sub>scale</sub> 取上限的 30% 时，肩部可用探索力矩约 0.3 × 87 ≈ 26.1 N·m；取 10% 时只剩 8.7 N·m。这两个数要与任务的持续力矩需求对照：肩关节水平持 3 kg、质心距轴 0.3 m 时，持续重力矩约 3 × 9.81 × 0.3 ≈ 8.8 N·m，10% 档的探索空间刚够静态托举、几乎没有加速余量；换到 10 kg 负载（约 29.4 N·m）时，连 30% 档也不够，需要提到 40%–50% 或先做负载评估。缩放档位的下界由最重工况的持续力矩加加速需求决定，上界由"探索噪声被放大成危险动作"决定，30% 是本课程在两者之间取的中间档。</p>
+    <p>三个量的组合核对清单：<strong>重力补偿残差 < 0.5 N·m</strong>（否则漂移）；<strong>τ<sub>scale</sub> > 最重工况的持续重力矩</strong>（否则推不动）；<strong>τ<sub>scale</sub> 与 TAU_MAX 之间保留约 3 倍余量</strong>（否则饱和成为常态）。三项都过，力矩动作空间才算配置完成。</p>
+
+    <h3>8. 被动测试的判读标准</h3>
+    <p>片段 2 的零力矩测试会得到一条摆动衰减曲线，但"衰减多少算正常"需要一把尺子。欠阻尼系统的相邻摆幅比值约为 exp(−2πζ / √(1 − ζ²))，折算成"每周期衰减百分比"后可以直接对照：ζ = 0.01 时每周期衰减约 6%，ζ = 0.02 约 12%，ζ = 0.05 约 27%，ζ = 0.10 约 47%。</p>
+    <table>
+      <tr><th>每周期摆幅衰减</th><th>反推阻尼比 ζ</th><th>判读</th></tr>
+      <tr><td>发散或持平</td><td>接近 0</td><td>物理模型或求解器异常，先修物理</td></tr>
+      <tr><td>小于 5%</td><td>小于 0.01</td><td>关节摩擦过低，真机迁移会面临更大的实际阻力</td></tr>
+      <tr><td>10% – 30%</td><td>0.02 – 0.06</td><td>健康区间：能量被摩擦稳定耗散</td></tr>
+      <tr><td>大于 40%</td><td>0.08 以上</td><td>阻尼偏大，检查关节阻尼属性是否被意外调高</td></tr>
+    </table>
+    <p>测量方法是取测试窗口里前三个完整摆动周期，记录每周期峰值，算出相邻比值再取平均；一个周期对应约 4 个采样点以上的分辨率即可稳定读数。健康区间落在 10%–30% 的原因与真机一致：真实的谐波减速器加关节轴承会贡献 0.02–0.05 量级的等效阻尼比，仿真调到这个区间，被动行为与真机形态最接近。低于 5% 时手臂"荡秋千"，策略学到的减速行为在真机上会显得动力过度；高于 40% 时手臂"泡在糖浆里"，策略会低估真机的动态幅度。</p>
+
+    <h3>9. 从仿真到真机：力矩命令会打多少折</h3>
+    <p>力矩控制与真机接口最近，但也最容易被执行器层面的误差打折。三项主要误差及其量级：<strong>力矩常数误差 ±5%</strong>，命令 26 N·m 时偏差约 1.3 N·m，比第 5 节算出的 0.5 N·m 漂移预算大 2.6 倍，意味着"仿真里补偿得刚刚好"的姿态在真机上仍会缓慢漂移；<strong>减速器摩擦损耗 10%–20%</strong>，在小力矩区还叠加静摩擦的粘滞效应，精细力操作（拧、按、插）最容易吃亏；<strong>关节弹性与电流环延迟</strong>把高频力矩指令的幅值再削一层。三条合起来，真机上的重力补偿必须带在线估计或自适应项，且部署前要在真机上重做一次被动测试对照。</p>
+    <p>仿真侧的对应手段是域随机化（021 章）：把"力矩增益 0.9–1.1 倍、关节摩擦 ×1 到 ×3"扫进训练分布，让策略学会在补偿有残差的环境里保持稳定。量化目标很清楚：补偿残差从 0.5 N·m 放宽到 2 N·m 时策略仍能站住，才算跨过了 sim2real 的力矩门槛。另一条基础要求是观测里必须包含关节速度（并且最好是历史速度）：快速运动时科氏力与离心力的合力量级可达 2–5 N·m，比漂移预算大近一个数量级，策略看不到速度就无法预判这些耦合项，动作会表现为"越挥越飘"。</p>
+
+    <h3>10. 探索噪声、平滑器与决策频率的联动核对</h3>
+    <p>力矩模式下策略的探索噪声会被平滑器削幅，削多少可以算出来。设探索噪声的标准差为动作的 0.3，肩部 τ<sub>scale</sub> = 26.1 N·m，则单次更新可能带来约 0.3 × 26.1 ≈ 7.8 N·m 的力矩跳变；按每物理步更新（dt = 16.7 ms）计算，等效变化率约 7.8 / 0.0167 ≈ 470 N·m/s。默认平滑器上限是 300 N·m/s，相当于把探索动作的幅度压掉约三成（300 / 470 ≈ 0.64）。这个相互牵制有三条解法：把力矩模式的 decimation 提高到 4（更新率降到 15 Hz，等效变化率降到约 118 N·m/s，平滑器不再压制）；把 max_rate 提到 500 N·m/s 并把更快的变化交给物理；或者接受削幅，把 τ<sub>scale</sub> 相应加大。选哪条都行，关键是意识到三个参数互为约束，不要只调其中一个再看结果。</p>
+    <p>被动测试的记录窗口也值得量化：取 10 个以上摆动周期，前三个完整周期用于计算衰减率，其余周期用于确认"持续衰减且不复发"。周期本身可以预估：小摆幅下摆周期约 2π·√(J / (m·g·r))，用整臂参数估算约 1–2 秒，因此 10 秒的测试窗口（600 步）刚好覆盖。窗口太短时衰减率读数被瞬态污染，窗口太长则浪费算力；10 秒是两者的折中。</p>
+    <p>三条失效边界收尾：decimation 取到 8 以上时，力更新率降到 7.5 Hz，接触反应变迟钝，抓取类任务不宜超过 4；平滑器把 max_rate 压到 1 N·m/步（60 N·m/s）以下时，重力补偿之外的主动动作几乎无法起步，表现为"软绵绵够不到"；探索噪声标准差设为动作幅度的 0.6 以上时，等效跳变超过 900 N·m/s，训练早期的撞击与抖动概率显著上升。三条边界的共同修复思路是把"噪声幅度、平滑速率、更新频率"当作一个三角同时调整。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>实现力矩控制的步骤：</p>
+    <ol>
+      <li><strong>确认关节为 effort 模式</strong>（把位置/速度增益清零，避免两个环同时出力打架）。</li>
+      <li><strong>获取重力项</strong>（引擎接口优先；取不到时用质量-质心模型自算，两者差异要量出来）。</li>
+      <li><strong>定义 τ<sub>scale</sub></strong>（逐关节：大臂取上限的 30%、腕取 50%、手指取 40% 之类，依据是任务对"力分辨率"的需求）。</li>
+      <li><strong>合成命令</strong>（τ = τ<sub>g</sub> + a∘τ<sub>scale</sub>，clip 到 ±τ<sub>max</sub>）。</li>
+      <li><strong>加安全平滑</strong>（对 a 做低通或对 τ 做变化率限制；尤其策略早期输出抖，会让关节"嗡嗡"）。</li>
+      <li><strong>被动动力学验证</strong>（发 τ=0，观察手臂在重力下自然摆动并被摩擦耗散，确认模型没有异常能量注入）。</li>
+    </ol>
+    <div class="box key">
+      <span class="box-title">设计思维：为什么"被动动力学"是对的试金石？</span>
+      <p>主动控制可以掩盖物理模型的缺陷，策略用力把误差"糊"过去。而 τ=0 时机器人只暴露物理本身：重力、摩擦、关节阻尼。如果手臂在零力矩下越摆越大，说明模型变量（阻尼、惯量错配或数值不稳定）出了问题；如果摆动逐渐衰减、最终停在自然垂位，物理是可信的。这个"半步测试"在部署真机前也适用：真机打开伺服但不下发命令，看它是不是也能自然垂下去。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：重力补偿 + 策略力矩的合成与下发</strong>（接口名随版本有差异，以官方文档为准）</p>
+    <pre class="code"><code>import numpy as np
+from isaacsim.core.utils.types import ArticulationAction  # 动作容器，路径随版本有差异
+
+TAU_MAX = np.array([87, 87, 87, 87, 12, 12, 12, 60, 60], dtype=float)  # 逐关节力矩上限
+TAU_SCALE = 0.3 * TAU_MAX     # 策略可用的探索范围：取上限的 30%，兼顾力量与安全
+
+controller = robot.get_articulation_controller()
+
+def policy_torques(action):
+    """a ∈ [-1,1]^9 → 合成后的关节力矩命令。"""
+    action = np.clip(action, -1.0, 1.0)             # 防御性裁剪：越界动作在此拦下
+    tau_g = robot.get_generalized_gravity_forces()  # 引擎算出的重力补偿项（名称随版本变化）
+    tau = tau_g + action * TAU_SCALE                # 策略力矩叠加在重力补偿之上
+    return np.clip(tau, -TAU_MAX, TAU_MAX)          # 显式饱和：命令与实际执行保持一致
+
+action = policy(obs)                                 # 示意：策略输出 9 维连续动作
+tau_cmd = policy_torques(action)
+controller.apply_action(ArticulationAction(joint_efforts=list(tau_cmd)))</code></pre>
+    <p>解读：逐行看设计意图。TAU_SCALE 取 30% 上限不是随便定的：太小（如 5%）时，策略面对重力的"油门"不够，任何需要加速的动作都力不从心；太大（如 100%）时，探索噪声会被放大成危险的大力矩，训练早期机器人像发癫痫。重力项由引擎计算比自算准；注意它是"当前姿态的重力投影"，必须每个决策步重新取。<strong>最后一步显式 clip 是为了可观测性</strong>：训练日志里统计"被裁剪的力矩比例"，如果长期超过 10%，说明 τ_scale 或者奖励设计需要调整。</p>
+
+    <p><strong>片段 2：被动动力学测试（τ = 0 的自由摆动）</strong></p>
+    <pre class="code"><code>import numpy as np
+
+zero_tau = np.zeros(robot.num_dofs)     # 全零力矩：让物理完全"放开"
+q_hist = []
+for i in range(600):                    # 10 秒：足够看到摆动被耗散的过程
+    controller.apply_action(ArticulationAction(joint_efforts=list(zero_tau)))
+    world.step(render=False)
+    q_hist.append(robot.get_joint_positions().copy())  # 记录每个关节角的时间序列
+
+q_hist = np.array(q_hist)               # 形状 (600, 9)
+swing = q_hist.max(axis=0) - q_hist.min(axis=0)        # 每个关节的摆动幅度
+decay = np.abs(q_hist[-60:] - q_hist[-1]).mean(axis=0) # 最后 1 秒的残余波动
+print("摆动幅度(rad):", np.round(swing, 3))
+print("末端残余波动:", np.round(decay, 4))  # 应该接近 0：说明能量被耗散，模型稳定</code></pre>
+    <p>解读：这个测试有三个用途。第一，<strong>验证稳定性</strong>：若 q_hist 出现发散（数值随步数放大），说明物理参数或求解器设置有问题，后面所有训练都别做了，先修物理。第二，<strong>观察摩擦耗散</strong>：摆幅应逐周期衰减，衰减速率反映关节摩擦与阻尼参数，衰减太慢意味着摩擦系数偏低，策略在真机上会遇到比仿真更大的阻力。第三，<strong>建立对"被动行为"的直觉</strong>，后面训练中的异常你会更容易察觉。注意用 <code>copy()</code> 记录：直接存 <code>get_joint_positions()</code> 的返回对象可能在后续步进中被复用，数组内容会被改写。</p>
+
+    <p><strong>片段 3：命令平滑与饱和诊断</strong></p>
+    <pre class="code"><code>import numpy as np
+
+class TorqueLimiter:
+    """对策略力矩做变化率限制：避免命令高频跳变激励关节振动。"""
+    def __init__(self, num_joints, max_rate):
+        self.tau_prev = np.zeros(num_joints)
+        self.max_rate = max_rate        # 每步允许的力矩增量（N·m），如 5.0
+
+    def update(self, tau_want):
+        delta = np.clip(tau_want - self.tau_prev, -self.max_rate, self.max_rate)
+        self.tau_prev = self.tau_prev + delta
+        return self.tau_prev
+
+limiter = TorqueLimiter(robot.num_dofs, max_rate=5.0)   # 5 N·m/步 @60Hz = 300 N·m/s
+tau_cmd = limiter.update(policy_torques(policy(obs)))   # 平滑后才下发
+saturation = np.mean(np.abs(policy_torques(policy(obs))) &gt;= TAU_MAX - 1e-6)  # 饱和比例
+print(f"饱和关节比例: {saturation:.2%}")  # 长期高于 10% 说明动作空间或任务难度失衡</code></pre>
+    <p>解读：为什么力矩命令也要平滑？关节的力矩跳变等效于冲击激励，频谱上宽频，容易激起连杆弹性与求解器的高频噪声。限制变化率 = 给命令加一个 300 N·m/s 的" slew rate"，这在真机上是伺服驱动器的常规保护（电流变化率限制），仿真里照做可以缩小差距。<code>saturation</code> 的统计是训练监控的重要指标：它衡量策略是否"贴墙输出"，长期饱和意味着策略想要的力超出执行器能力，通常是 TAU_SCALE 太小、重力补偿缺失或任务太难的信号。（浮点相等判断要留 <code>1e-6</code> 容差。）</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>忘记重力补偿</strong>：机器人一开训就"垮"在关节限位上，策略怎么学都在"托着"手臂。修复：每步重取 τ<sub>g</sub> 并叠加，或者先用 PD 做基线控制器过渡。</li>
+      <li><strong>力矩缩放太极端</strong>：太小则重负载任务推不动、学习信号弱；太大则早期探索充满危险动作。修复：从 30%–50% 上限起步，根据饱和统计调。</li>
+      <li><strong>位置/速度模式与力矩同时生效</strong>：驱动增益没清零，PD 与你的力矩叠加，策略学到的动力学与看到的代码不一致（最隐蔽的一类错误）。修复：确保模式互斥，并做被动动力学测试确认零命令时没有莫名的力。</li>
+      <li><strong>把零力矩当成"松弛"</strong>：τ=0 只代表没有主动力，重力、摩擦照旧作用；机械臂"自由下落"是正常物理。用片段 2 的测试建立预期。</li>
+      <li><strong>忽略科氏力/离心力</strong>：7 自由度同时快速运动时，这些项可达几 N·m，策略若没有观测关节速度就难以预测。修复：把关节速度放进观测；极端情况加科氏补偿项。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>对 Franka 关节 2 在某个姿态下读出重力补偿力矩，用它反推"等效负载臂长"（τ<sub>g</sub> = m·g·r·cos(θ) 的近似），验证数量级是否合理。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>取手臂伸直水平姿态，τ_g 最大；假设整臂质量 5–8 kg，看反推的 r 是否落在 0.2–0.3 m。</div></details>
+      </li>
+      <li>做被动动力学测试：先记录摆动衰减时间，再把关节摩擦系数调成原来的 1/5，重测并解释差异。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>衰减时间与摩擦成反比；更小的摩擦意味着真机迁移时策略需要更长的时间"停下来"。</div></details>
+      </li>
+      <li>给关节 1 施加恒定 +5 N·m 力矩 0.5 秒，预测并实测速度与位移，与 J·q̈ = τ 的解析解对比。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>加速度 a = τ/J，先算速度 v = a·t，再算位移 ½·a·t²；实测偏小是摩擦与惯量估计差异造成的。</div></details>
+      </li>
+      <li>讨论：为什么重力补偿让系统回到"近临界、可学"的状态，而没有补偿时策略要先"修复一个被破坏的系统"？用漂移量级支持你的论点。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>无补偿时净力矩的常值偏差直接产生抛物线漂移；补偿后偏差只剩模型误差量级（通常小一个数量级）。</div></details>
+      </li>
+      <li>实验设计：把 TAU_SCALE 从 30% 降到 10%，先预测"饱和比例"与"任务成功率"的变化方向，再设计一个 3 组参数 × 3 个种子的小规模训练矩阵验证。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>小缩放降低危险探索，但可能达不到任务所需力矩；观察饱和比例变化与最终成功率的非单调关系。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>力矩控制是开环注入广义力：没有 PD 兜底，微小偏差通过双积分漂移放大，<strong>稳定性是策略自己的责任</strong>。</li>
+      <li>重力补偿（τ<sub>g</sub>(q)）是力矩型任务能训起来的前提：把"维持姿态"交给物理模型，让策略专注"决策用力"。</li>
+      <li>动作空间设计 = 逐关节缩放（上限的 20%–50%）+ 显式饱和 + 命令平滑；用饱和比例监控策略是否长期"贴墙"。</li>
+      <li>被动动力学测试（τ=0）是物理可信度的试金石，也为 sim2real 前的模型检查提供标准动作。</li>
+      <li>下一章：007 读取传感器数据，三种控制模式就绪后，策略要"看见"世界：关节状态、IMU、接触力的读取与整理方式。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch005.html">← 第 005 章：实现关节速度控制</a>
+    <a class="next" href="ch007.html">第 007 章：读取传感器数据 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

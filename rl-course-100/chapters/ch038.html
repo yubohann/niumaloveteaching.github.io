@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第038章 SAC的循环策略网络 | 深度强化学习课程 · PPO、SAC 与多智能体系统</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 离策略方法与 SAC</span>
+    <span class="sep">/</span>
+    <span>第 038 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 离策略方法与 SAC</div>
+    <h1>第 038 章：SAC的循环策略网络</h1>
+    <p class="lead">把 Pendulum 的角速度"遮住"，任务瞬间变成部分可观测。挡板 MLP 策略注定学不好，循环 GRU 策略却能从上几帧角度里推出速度，在同一个 SAC 框架里对比这两种策略。</p>
+    <ul class="meta">
+      <li>主题：部分可观测 / 循环策略（GRU）</li>
+      <li>关键公式：π(a<sub>t</sub> | o<sub>t−L+1</sub>, …, o<sub>t</sub>)：动作以最近 L 帧历史窗口为条件</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 037 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解部分可观测马尔可夫决策过程（POMDP）与挡板策略（reactive policy）的局限。</li>
+      <li>用观测窗口 + GRU 构建能利用历史信息的循环策略，并保持与 MLP 策略相同的采样接口。</li>
+      <li>实现"训练时策略看窗口、评估时窗口随回合重置"的完整数据流。</li>
+      <li>在屏蔽角速度的 <code>Pendulum-v1</code> 上量化 MLP 与 GRU 的评估回报差距。</li>
+      <li>认识本实现的教学简化：只做窗口式循环、不做完整 BPTT，以及它的代价。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>前面所有章节都默认一件幸福的事：<strong>观测就是状态</strong>。但真实系统里传感器往往缺失或延迟，机器人只有关节角度没有角速度，自动驾驶只有前视相机，交易系统看不到别人手里的订单。这类问题叫部分可观测 MDP（Partially Observable MDP, POMDP）：当前观测不足以决定最优动作，你还得记住最近发生了什么。</p>
+    <p>挡板策略（只看当前帧的 MLP）在 POMDP 里会遇到信息天花板：<strong>无论网络多大都补不出根本没测量的量</strong>。同一个角度观测可能对应"正在回升"与"正在坠落"两种相反状态，而挡板策略只能给出同一个动作。</p>
+    <p>循环神经网络（Recurrent Neural Network, RNN）的思路是把"最近几帧"当成序列：角度在几帧间的差值就近似了角速度。本章把 Pendulum 的角速度维度强制置零，构造一个受控的 POMDP，再把 MLP 与 GRU 两种策略放进同一套 SAC 里做对照。选用 Pendulum 还有一个好处：它的动力学足够简单、时间尺度明确（每步 0.05 秒），"窗口要覆盖多长"这个问题可以用物理量估算，不必凭感觉调参。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 为什么挡板策略有信息天花板</h3>
+    <p>挡板策略形如 a = π(o<sub>t</sub>)，动作只依赖当前观测。若真实状态 s<sub>t</sub> = (θ, θ̇) 被观测成 o<sub>t</sub> = (cosθ, sinθ, 0)，两个不同的真实状态（θ̇ &gt; 0 与 θ̇ &lt; 0）可能抛出完全相同的观测。此时任何 a = π(o<sub>t</sub>) 都必须对这两种状态选同一个动作，至少在其中一种状态下是错的。要打破这个天花板，策略必须以历史为条件：</p>
+    <div class="formula">
+      π(a<sub>t</sub> | o<sub>t−L+1</sub>, …, o<sub>t</sub>) &nbsp;（条件从单帧 o<sub>t</sub> 扩展为最近 L 帧）
+      <span class="note">窗口长度 L 决定"记忆"能覆盖的时间尺度</span>
+    </div>
+    <p>"感知混叠"（perceptual aliasing）的程度可以精确描述：在本章的遮蔽方式下，任何一个观测 (cosθ, sinθ, 0) 都可能来自 θ̇=+v 与 θ̇=−v 两个相反的隐藏状态，两者的先验可能性还完全相同。歧义覆盖整个状态空间，不是偶发现象；挡板策略对这成对状态只能输出同一个动作，其中至少一半情形会选错，这正是它长期停在 −1100 附近（仅略好于随机策略的 −1200）的原因。窗口只要包含相邻两帧，叉积就能给出运动方向的符号，歧义成对的局面被打破；窗口继续加长，速度幅度的估计被平滑，回报曲线随之抬升，这条因果链就是本章实验要展示的全部内容。</p>
+
+    <h3>2. GRU 如何压缩历史</h3>
+    <p>门控循环单元（Gated Recurrent Unit, GRU）逐步处理序列，每一步把新观测与上一时刻隐状态 h<sub>t−1</sub> 融合：</p>
+    <div class="formula">
+      r<sub>t</sub> = σ(W<sub>r</sub>[o<sub>t</sub>, h<sub>t−1</sub>]) &nbsp;（重置门）<br>
+      z<sub>t</sub> = σ(W<sub>z</sub>[o<sub>t</sub>, h<sub>t−1</sub>]) &nbsp;（更新门）<br>
+      h<sub>t</sub> = (1−z<sub>t</sub>)⊙h<sub>t−1</sub> + z<sub>t</sub>⊙tanh(W[o<sub>t</sub>, r<sub>t</sub>⊙h<sub>t−1</sub>])
+    </div>
+    <p>这里不需要你手推门控公式，只要记住一个直觉：<strong>隐状态是一个可学习的"提炼器"，把窗口里哪些信息重要、哪些可以忘掉自动决定</strong>。我们把窗口最后一帧的隐状态接两个线性头，分别输出高斯策略的 μ 与 log σ。窗口长度取 8：Pendulum 每步 0.05 秒，8 帧覆盖约 0.35 秒，足够测出角速度的量级。</p>
+
+    <h3>2.1 数值例子：从角度窗口估计角速度</h3>
+    <p>Pendulum 的隐藏量 θ̇ 可以用窗口里的角度差分近似。把观测写成 (cosθ, sinθ)，两帧之间的转角差可以由叉积恢复：sin(θ<sub>t</sub>−θ<sub>t−1</sub>) = sinθ<sub>t</sub>·cosθ<sub>t−1</sub> − cosθ<sub>t</sub>·sinθ<sub>t−1</sub>。取一帧具体数字：上一帧 θ<sub>t−1</sub>=0.5，当前帧 θ<sub>t</sub>=0.6（单位弧度）：</p>
+    <div class="formula">
+      cos0.5=0.8776, sin0.5=0.4794；cos0.6=0.8253, sin0.6=0.5646<br>
+      sinΔθ = 0.5646×0.8776 − 0.8253×0.4794 = 0.0998 ≈ 0.1 = Δθ<br>
+      ω̂ ≈ Δθ / Δt = 0.1 / 0.05 = 2 (rad/s)，Pendulum 的角速度上限为 8 rad/s
+    </div>
+    <p>用整个窗口估计时，差分公式推广为 ω̂ ≈ (θ<sub>t</sub> − θ<sub>t−L+1</sub>)/((L−1)·Δt)。窗口 L=8 时覆盖 7×0.05 = 0.35 秒，本例中两帧差分已经给出 2 rad/s 的估计，多帧平均还能进一步压噪声。解读：<strong>GRU 不需要显式实现这个公式，但它的任务等价于学会类似的差分算子</strong>；这也解释了窗口为什么不能太短：两帧的角度差只有 0.1 弧度，乘以环境噪声后信噪比有限，L 越小估计越抖。</p>
+
+    <h3>3. 为什么评论家可以"看得更多"</h3>
+    <p>本章让两组的评论家都吃完整窗口。这不是作弊：评论家只在训练时使用，给出更准的价值估计以降低策略梯度方差。副作用要在解读时记住：<strong>评论家更强会整体抬高学习上限，两组的差距纯粹来自策略能不能利用历史</strong>。</p>
+
+    <h3>4. 本实现的教学简化</h3>
+    <p>严格的循环 SAC 要把隐状态沿时间前推（BPTT）并跨 batch 存储，工程复杂度高。本章采用<strong>窗口式循环</strong>：每步只把最近 8 帧喂给 GRU，隐状态从零开始。它牺牲了窗口以外的长期记忆，但保留了"用历史推断隐藏变量"的核心能力，对 Pendulum 这个 0.35 秒内足以看出速度的任务已经够用。</p>
+
+    <h3>5. 两组策略的对照预期</h3>
+    <table>
+      <tr><th>维度</th><th>MLP 挡板策略</th><th>GRU 循环策略</th></tr>
+      <tr><td>策略输入</td><td>窗口最后一帧（等价于当前观测）</td><td>整个 8 帧窗口</td></tr>
+      <tr><td>能否推断角速度</td><td>不能：同一帧对应两种相反运动</td><td>能：从角度差分近似 θ̇</td></tr>
+      <tr><td>特征提取开销</td><td>最低，两层全连接</td><td>增加一个 GRU 单元，单步成本略升</td></tr>
+      <tr><td>典型评估回报</td><td>长期停在约 −1100</td><td>约 −500 ~ −350</td></tr>
+      <tr><td>与全观测 SAC 的关系</td><td>受信息天花板限制</td><td>窗口式近似，仍差于全观测（约 −300 ~ −150）</td></tr>
+      <tr><td>主要风险</td><td>无（稳定但学不动）</td><td>窗口口径错误会引入假关联</td></tr>
+    </table>
+    <p>这张表把"实验要验证什么"前置了：若 GRU 组的回报没有明显高于 MLP，优先怀疑窗口数据流（重置、快照、形状），模型容量的嫌疑排在其后；若两组都停在 −1100 附近，优先检查速度维度是否真的被遮住。</p>
+
+    <h3>6. 窗口长度的统计学账与参数量账</h3>
+    <p>窗口差分估计角速度的精度有解析公式可用。设单帧角度噪声标准差为 σ、帧间隔 Δt，L 帧等间隔最小二乘斜率估计的方差为 12σ<sup>2</sup>/(Δt<sup>2</sup>·L(L<sup>2</sup>−1))，两帧差分的系数恰为 2σ<sup>2</sup>/Δt<sup>2</sup>。代入 L=2 与 L=8：系数从 2 降到约 0.024，估计标准差降到约 1/9，相当于把速度噪声压掉约 89%。把 L=4 也代进去：系数约 12/(4×15)=0.2，是两帧差分的十分之一，标准差约为它的三分之一。这给"窗口不能太短"提供了定量下限：两帧估计在噪声下几乎不可用，8 帧才把信噪比拉进可用区间；而继续加长到 16 帧，降噪收益按 1/√L 的量级递减。</p>
+    <p>参数量账同样可以摊开。本实现里 GRU 单元约 20 万参数（三组门的输入权重、隐状态权重与偏置合计 200448），后接一层 256 宽全连接约 6.6 万；MLP 对照组两层全连接合计约 6.7 万。GRU 前端参数约为 MLP 的 4 倍，但在 Pendulum 这种小任务上仍属轻量；真正上涨的是每个 batch 里 8 个时间步的序列计算量，调窗口大小时这一项需要重新评估。</p>
+    <p>还要留意窗口式循环的能力边界：它等价于"只保留最近 0.35 秒记忆"的智能体，任何依赖更长时间线才能推断的隐藏量都拿不到。极端情形是任务需要数十步之前的事件才能决策，此时 GRU 再大也会失效。另一个边界在数据流上：窗口对齐规则一旦不一致（例如评估时忘了清零），历史信息会串回合，症状是"GRU 组反而不如 MLP"；遇到这个症状，诊断顺序永远是先查数据流，再考虑模型容量。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+
+    <h3>模块划分</h3>
+    <table>
+      <tr><th>组件</th><th>职责</th><th>关键点</th></tr>
+      <tr><td><code>MaskVelocity</code></td><td>把 Pendulum 观测第 3 维置零</td><td>观测量纲不变，只是信息被抹掉</td></tr>
+      <tr><td><code>ObsWindow</code></td><td>维护最近 L 帧；<code>reset()</code> 用首帧填满</td><td>回合边界重置窗口，避免串回合记忆</td></tr>
+      <tr><td><code>ReplayBuffer</code></td><td>存 (L×obs_dim) 窗口，单帧不再单独存储</td><td>容量按"条"算，本题 5 万条约占几 MB</td></tr>
+      <tr><td><code>MLPPolicy</code></td><td>只用 <code>win[:, -1, :]</code>（最后一帧）</td><td>对照组，接口与 GRU 完全一致</td></tr>
+      <tr><td><code>GRUPolicy</code></td><td>GRU 处理整窗，取最后隐状态</td><td>与 MLP 共享 <code>GaussianPolicyBase</code> 的采样与对数概率</td></tr>
+      <tr><td><code>QNetWindow</code></td><td>Q(展平窗口, a)</td><td>两组共用同一评论家结构，隔离变量</td></tr>
+    </table>
+
+    <h3>关键超参数</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用与取值理由</th></tr>
+      <tr><td><code>--policies</code></td><td>mlp,gru</td><td>本章唯一自变量：策略特征提取方式</td></tr>
+      <tr><td><code>--window</code></td><td>8</td><td>历史帧数；太短估不准速度，太长增加开销</td></tr>
+      <tr><td><code>--max-steps</code></td><td>12000</td><td>每组步数预算；部分可观测任务更难，别指望达到全观测水平</td></tr>
+      <tr><td><code>--batch-size</code></td><td>256</td><td>窗口让单条样本变成 L×obs，显存/内存仍很小</td></tr>
+      <tr><td><code>--target-entropy</code></td><td>−1</td><td>与第 032 章一致，两组共享</td></tr>
+    </table>
+
+    <h3>数据流</h3>
+    <p>每步：<strong>窗口入策略</strong>（MLP 只用末帧、GRU 用整窗）→ 动作进环境 → 环境返回下一观测 → <strong>窗口前推一帧</strong>得到 <code>next_win</code> → <code>(cur_win, a, r, next_win, done)</code> 入回放池 → 每步一次 SAC 更新（Q 吃展平窗口）→ 回合结束用 <code>reset</code> 把窗口重填为新回合首帧。评估走同一套 <code>ObsWindow</code> 逻辑。</p>
+
+    <p>窗口长度取 8 的账可以算清楚：单条回放样本从 3 个浮点数变成 8×3 = 24 个，5 万条约合数 MB 量级，内存可忽略；GRU 每步要处理 8 个时间步，单次前向的序列计算量按时间步线性增长，相比两层全连接网络仍很小。把窗口增到 16，两项成本大致翻倍，而速度估计的精度提升会递减。8 帧覆盖约 0.35 秒，与摆动周期的量级匹配，这是本任务下精度与成本的折中点。</p>
+    <p>内存账再算细一点：单条窗口样本 24 个 float32 是 96 字节，5 万条约 4.8 MB，加上动作、奖励、终止标记与下一窗口，总量仍在 10 MB 以内；一个 batch 的窗口张量只有 256×24×4≈24 KB，无论 CPU 还是 GPU 都毫无压力。窗口拉长到 16 时字节数翻倍，仍远低于常见设备的内存门槛，真正的制约还是序列计算的时间成本。</p>
+
+    <h3>与前一章的差异点</h3>
+    <ul>
+      <li>环境侧新增 <code>MaskVelocity</code>：把 Pendulum 变成 POMDP，这是本章的实验前提。</li>
+      <li>数据侧新增 <code>ObsWindow</code>：回放池从存单帧改为存窗口，训练/评估的窗口逻辑必须一致。</li>
+      <li>策略侧新增 <code>GRUPolicy</code>，<code>MLPPolicy</code> 退化为"只看最后一帧"的同接口实现。</li>
+      <li>评论家输入从 (obs, a) 变成 (窗口展平, a)；两组共享，保证对照公平。</li>
+      <li>第 037 章的离散动作与本章无关，本章回到连续 Pendulum，专注"记忆"这一个变量。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：遮住速度 + 维护窗口</strong></p>
+    <pre class="code"><code>class MaskVelocity(gym.ObservationWrapper):
+    """把观测的角速度维度置零：制造部分可观测的 Pendulum。"""
+
+    def observation(self, obs):
+        masked = np.asarray(obs, dtype=np.float32).copy()
+        masked[2] = 0.0            # 丢掉 theta_dot：信息被抹掉，量纲不变
+        return masked
+
+class ObsWindow:
+    def __init__(self, size, obs_dim):
+        self.size = size
+        self.buf = np.zeros((size, obs_dim), dtype=np.float32)
+
+    def reset(self, obs):
+        """新回合开始：用同一帧填满整个窗口。"""
+        obs = np.asarray(obs, dtype=np.float32)
+        for i in range(self.size):
+            self.buf[i] = obs      # 填满（不留零）：避免把"没观测"误读成"速度为零"
+        return self.buf.copy()
+
+    def push(self, obs):
+        """把新观测塞进窗口尾部，返回新的对齐副本。"""
+        self.buf = np.roll(self.buf, shift=-1, axis=0)
+        self.buf[-1] = np.asarray(obs, dtype=np.float32)
+        return self.buf.copy()</code></pre>
+    <p>解读：两个小类，一个是"制造问题"，一个是"组件化的记忆"。<strong>（1）</strong><code>MaskVelocity</code> 是 <code>gym.ObservationWrapper</code>：不改变环境动力学、只改观测输出，第 3 维（角速度）被置零，所有智能体都"看不见"速度，问题定义对各方公平。<strong>（2）</strong><code>reset()</code> 用<strong>同一帧填满</strong>整个窗口：置零会把"没有历史"编码成"速度为零"的假信息；用首帧填满让开局几帧的窗口是"静止"状态，与真实情况一致。<strong>（3）</strong><code>push()</code> 用 <code>np.roll</code> 整体左移后写尾部，返回 <code>copy()</code> 的快照，绝不返回引用：回放池要保存"当时"的窗口，共享引用会让所有历史条目被后续操作污染。</p>
+
+    <p><strong>片段 2：两种策略的差异被压缩进 features()</strong></p>
+    <pre class="code"><code>class GaussianPolicyBase(nn.Module):
+    """两种策略共享的采样/对数概率逻辑，特征提取交给子类。"""
+
+    def __init__(self, act_dim, hidden=256, act_scale=1.0):
+        super().__init__()
+        self.mean_layer = nn.Linear(hidden, act_dim)
+        self.log_std_layer = nn.Linear(hidden, act_dim)
+        self.register_buffer("act_scale", torch.tensor(float(act_scale)))
+
+    def features(self, win):
+        raise NotImplementedError          # 子类唯一的实现义务
+
+    def sample(self, win, deterministic=False):
+        h = self.features(win)
+        mean = self.mean_layer(h)
+        log_std = torch.clamp(self.log_std_layer(h), LOG_STD_MIN, LOG_STD_MAX)
+        dist = torch.distributions.Normal(mean, log_std.exp())
+        if deterministic:
+            return torch.tanh(mean) * self.act_scale, None
+        x = dist.rsample()
+        y = torch.tanh(x)
+        return y * self.act_scale, (dist.log_prob(x)
+                                    - torch.log(1.0 - y.pow(2) + 1e-6)).sum(dim=-1)
+
+class GRUPolicy(GaussianPolicyBase):
+    """循环策略：用 GRU 汇总整个窗口，取最后时刻的隐状态。"""
+
+    def __init__(self, obs_dim, act_dim, hidden=256, act_scale=1.0):
+        super().__init__(act_dim, hidden, act_scale)
+        self.gru = nn.GRU(obs_dim, hidden, batch_first=True)   # 输入 (B, L, obs)
+        self.post = nn.Sequential(nn.Linear(hidden, hidden), nn.ReLU())
+
+    def features(self, win):
+        out, _ = self.gru(win)             # (B, L, H)：逐时刻输出序列
+        return self.post(out[:, -1, :])    # 只取最后一刻：整窗的摘要</code></pre>
+    <p>解读：继承结构把"变"与"不变"分得很清，这是对照实验可归因的关键。<strong>（1）</strong><code>GaussianPolicyBase</code> 实现全部"策略力学"：μ、log σ 的头、tanh 压缩、rsample、雅可比修正。它们与第 031—036 章逐字相同，换策略结构不需要重新理解这些。<strong>（2）</strong>子类的义务只有一个 <code>features(win)</code>：把 (B, L, obs) 的窗口压成 (B, H) 的特征。MLP 子类返回 <code>win[:, -1, :]</code>（与旧章节完全同构），GRU 子类返回 <code>out[:, -1, :]</code>（最后隐状态）。<strong>（3）</strong><code>nn.GRU(obs_dim, hidden, batch_first=True)</code> 的 <code>batch_first</code> 让张量形状自然对应 (B, L, obs)；取最后时刻，不做 mean/pool 聚合，最优聚合方式交给门控自己学。<strong>（4）</strong>两组共享同一个评论家结构（<code>QNetWindow</code>），实验的变量因此只剩"特征提取方式"。</p>
+
+    <p><strong>片段 3：训练循环，窗口的三个生命周期</strong></p>
+    <pre class="code"><code>    for step in range(1, args.max_steps + 1):
+        if step &lt;= args.start_steps:
+            action = env.action_space.sample()
+        else:
+            action = agent.act(cur_win, deterministic=False)
+
+        next_obs, rew, terminated, truncated, _ = env.step(action)
+        done_ep = terminated or truncated
+        next_win = win.push(next_obs)          # 窗口前推一帧
+        buf.add(cur_win, action, rew, next_win, float(terminated))
+
+        ep_ret += rew
+        if done_ep:
+            ep_returns.append(ep_ret)
+            ep_ret = 0.0
+            obs, _ = env.reset()
+            cur_win = win.reset(obs)           # 新回合：窗口重填，记忆清空
+        else:
+            cur_win = next_win</code></pre>
+    <p>解读：窗口数据的"生命周期"必须每一帧都维护正确，否则整个实验失真。<strong>（1）</strong>动作由 <code>cur_win</code> 决定；环境返回 <code>next_obs</code> 后立刻 <code>push</code> 得到 <code>next_win</code>；两者<strong>一起</strong>存进回放池，存的是"决策时刻看到的窗口"和"下一步看到的窗口"这一对，与 (s, a, r, s′) 的语义严格对应。<strong>（2）</strong>回放里 <code>done</code> 存 <code>float(terminated)</code>：Pendulum 达 200 步是时间截断，照样 bootstrap。<strong>（3）</strong>回合结束时 <code>win.reset(obs)</code> 把窗口重填为新回合首帧，如果忘记这步，上一回合结尾的帧会把"记忆"串进新一轮，GRU 会学到假的跨回合关联，表现甚至可能比 MLP 还差。<strong>（4）</strong>注意 <code>cur_win</code> 与 <code>next_win</code> 的分工：前者用于决策与存 <code>obs</code>，后者留给下一帧决策与存 <code>next_obs</code>，一环扣一环。</p>
+
+    <p><strong>片段 4：评估也走同一套窗口逻辑</strong></p>
+    <pre class="code"><code>def evaluate(env, agent, episodes, window):
+    obs_dim = env.observation_space.shape[0]
+    win = ObsWindow(window, obs_dim)           # 评估用独立窗口实例
+    returns = []
+    for _ in range(episodes):
+        obs, _ = env.reset()
+        cur = win.reset(obs)                   # 每个评估回合：重填窗口
+        done = False
+        ep_ret = 0.0
+        while not done:
+            action = agent.act(cur, deterministic=True)
+            obs, r, terminated, truncated, _ = env.step(action)
+            ep_ret += r
+            done = terminated or truncated
+            if not done:
+                cur = win.push(obs)            # 与训练循环完全一致的窗口推进
+        returns.append(ep_ret)
+    return float(np.mean(returns))</code></pre>
+    <p>解读：评估函数存在的意义是"与控制变量原则对齐"。<strong>（1）</strong>评估必须用<strong>与训练完全相同</strong>的窗口构造：从 <code>reset</code> 填满首帧、每步 <code>push</code>、回合开始清空。任何一处不一致（例如评估时窗口留了上一回合的帧），评估回报就会莫名偏低，还会误伤 GRU 组。<strong>（2）</strong>评估用 <code>deterministic=True</code>：tanh(μ) 的确定性动作，与前面所有章节的评估口径一致。<strong>（3）</strong><code>win</code> 是评估专用实例：不与训练窗口共享状态，避免评估过程污染训练的数据流。<strong>（4）</strong>这套"训练/评估共用组件"的写法在本章尤其重要，窗口是跨时间步的有状态对象，两份实现分头维护几乎必然出现口径漂移。</p>
+
+    <p>完整可运行脚本（附录）：<a href="../code/ch038.py" download>code/ch038.py</a></p>
+    <pre class="sh"><code>python code/ch038.py           # mlp vs gru：CPU 约 6–10 分钟
+python code/ch038.py --quick   # 快速跑通：约 1–2 分钟
+python code/ch038.py --policies gru --window 16 --max-steps 20000</code></pre>
+    <p>以实跑为准：<strong>MLP 组长期停在 −1100 附近</strong>（信息缺失让它做不出正确动作）；<strong>GRU 组明显更好，通常收敛到 −500 ~ −350</strong>；但仍不及第 031 章全观测 SAC 的 −300 ~ −150，窗口式循环只能近似速度。<strong>趋势（GRU &gt; MLP）比单个数字重要。</strong></p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>评估窗口与训练窗口构造不一致</strong>：评估从不同状态开始 push，前几帧的窗口内容与训练不同，评估回报莫名偏低。<strong>修复</strong>：两处共用 <code>ObsWindow</code>。</li>
+      <li><strong>忘了在回合结束重置窗口</strong>：上一回合最后几帧混进新回合的输入，GRU 学到假关联，表现比 MLP 还差。<strong>修复</strong>：<code>done_ep</code> 时调用 <code>win.reset(obs)</code>。</li>
+      <li><strong>把窗口当作 batch 维</strong>：<code>win.reshape(-1)</code> 这类展平若发生在错误维度，序列结构被破坏，GRU 收到错误形状也能"跑起来"但学不对。<strong>修复</strong>：用形状断言或打印检查。</li>
+      <li><strong>以为 GRU 能解决所有 POMDP</strong>：窗口式循环的记忆上限是 L 帧，关键信息在窗口之外就永远拿不到；窗口过短时速度估计噪声大，需要与任务时间尺度匹配。</li>
+      <li><strong>窗口快照共享引用</strong>：<code>push()</code> 返回的若是内部数组引用，回放池里的历史条目会被后续帧改写。<strong>修复</strong>：返回 <code>.copy()</code>。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把 <code>--window</code> 改成 2、4、16 各跑一次 GRU，画出"窗口长度—评估回报"的关系。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>窗口过短时速度估计噪声大，过长时样本效率可能下降；用同样的 max-steps 对比。</div></details>
+      </li>
+      <li>把 MLP 策略的输入改成"最近两帧之差"（即 <code>win[:, -1, :] - win[:, -2, :]</code>），再跑一次。它能不能部分替代 GRU？<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>两帧差分就是对角速度的手工估计：若它把回报拉到 GRU 附近，说明一阶差分已够用；不够则说明门控有额外价值。</div></details>
+      </li>
+      <li>把评估函数里的 <code>win.reset</code> 去掉（评估时窗口跨回合不清零），观察评估回报的异常波动，并解释原因。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>评估回合的第一个动作会被上一回合结尾的帧污染，回报因此变得不稳定。这是最隐蔽的"训练评估不一致"bug 之一。</div></details>
+      </li>
+      <li>实现窗口内隐状态的"截断 BPTT"：GRU 每步只吃最近 4 帧，隐状态从上一 batch 的 detach 副本继续，对比样本效率与耗时。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>关键是跨 batch 维护并 detach 隐状态，避免梯度回溯到远古时间步。先在 2000 步的小预算上验证不报错，再跑完整对比。</div></details>
+      </li>
+      <li>用手工差分给 MLP 组"开小灶"：在输入里显式加入 ω̂ = (θ<sub>t</sub>−θ<sub>t−1</sub>)/Δt 的估计（由 cos、sin 叉积恢复），看它能否追平 GRU。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>这相当于把"特征工程"与"表示学习"对比。若手工差分已能追平，说明 GRU 的价值主要是自动发现同一算子；若仍差一截，多帧门控聚合才有额外贡献。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>POMDP 里挡板策略存在信息天花板：当前观测不含的隐藏量（如角速度）必须从历史推断，网络再大也只能逼近这个上限。</li>
+      <li>窗口 + GRU 是最小可用的"记忆"方案：把最近 L 帧编码成隐状态，接两个头输出高斯参数。</li>
+      <li>实现三要素：回放池存窗口、回合边界重置窗口、训练与评估共用同一套窗口逻辑。</li>
+      <li>在屏蔽角速度的 Pendulum 上，GRU 明显优于 MLP（典型 −450 对 −1100），但仍不如全观测 SAC；本章用窗口式循环做教学简化。</li>
+      <li>角速度可以从角度窗口差分恢复：两帧叉积给出 sinΔθ，除以 Δt 就是估计值。GRU 的价值在于自动学习这类算子，而不需要手工设计。</li>
+      <li>窗口长度要与任务的时间尺度匹配：Pendulum 上 8 帧覆盖 0.35 秒，约等于摆动周期的五分之一，再短就难以稳定测速。</li>
+      <li>下一章转向输入预处理：观测归一化如何改变 SAC 的收敛速度，Pendulum 的角速度维度会成为主角，并解释归一化与奖励缩放为什么是两类不同的问题。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch037.html">← 第 037 章：SAC的离散动作扩展</a>
+    <a class="next" href="ch039.html">第 039 章：SAC的观测归一化 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第005章 PPO的熵正则化系数影响 | 深度强化学习课程 · PPO、SAC 与多智能体系统</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · 策略梯度与 PPO</span>
+    <span class="sep">/</span>
+    <span>第 005 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · 策略梯度与 PPO</div>
+    <h1>第 005 章：PPO的熵正则化系数影响</h1>
+    <p class="lead">把熵正则系数从 0 扫到 0.05，跟踪策略熵从 0.693（均匀分布）开始的下降轨迹，看"熵崩溃"怎么发生、代价是什么，以及 0.01 这个默认值到底稳在哪里。</p>
+    <ul class="meta">
+      <li>主题：探索机制 / 熵正则化</li>
+      <li>关键公式：H(π(·|s)) = −Σ π(a|s) ln π(a|s)；loss = L<sup>clip</sup> + c<sub>vf</sub>L<sup>V</sup> − c<sub>ent</sub>H</li>
+      <li>预计学时：50 分钟</li>
+      <li>前置章节：第 004 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解熵正则项在 PPO 总损失中的位置，以及"最大化回报 + 保持随机性"的双目标含义。</li>
+      <li>实现熵系数扫描实验，记录每轮更新的策略熵、熵项占损失比例、KL 与回报。</li>
+      <li>识别熵崩溃（entropy collapse）：熵快速塌到 0.1 以下意味着什么、什么时候是良性收敛、什么时候是过早锁定。</li>
+      <li>掌握用"训练熵 + 评估熵 + 评估回报"三件套判断熵系数是否合适。</li>
+      <li>为后续探索主题（第 021–023 章）建立参照基线：熵正则只是众多探索机制中的一种。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>PPO 的损失由三块组成：策略损失、价值损失和熵奖励。前两块的目标很直观，第三块经常被当成"照抄默认值 0.01"的仪式。其实熵系数是<strong>直接控制策略随机性的旋钮</strong>：设为 0，策略会迅速收敛到"某个动作概率接近 1"的确定形态；设大，策略长期保持高熵，梯度里探索的成分压过利用的成分。</p>
+    <p>这个旋钮的风险在于两个方向都会出事。熵太低时，softmax 输出接近 one-hot，被压死的动作梯度几乎为零，如果压错方向，策略就锁死在次优解上；熵太高时，价值/优势信号被大量随机动作稀释，CartPole 这种简单任务迟迟学不到位。本章用一个受控扫描把两端都演示出来，并给出一个量化工具：<strong>熵项在总损失中的相对占比</strong>，它告诉你熵项从什么时候开始"接管"梯度。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 熵的定义与取值范围</h3>
+    <p>策略在状态 s 的熵衡量动作分布的"平坦程度"：</p>
+    <div class="formula">
+      H(π(·|s)) = − Σ<sub>a</sub> π(a|s) ln π(a|s)
+      <span class="note">两个动作时最大熵为 ln2 ≈ 0.693（各 0.5）；最小熵为 0（某个动作概率为 1）</span>
+    </div>
+    <p>PPO 优化的目标是"期望回报 + c<sub>ent</sub>·熵"的折中，熵项梯度会把 logits 往"更平"的方向推。c<sub>ent</sub> 越大，推得越狠，策略变确定的时点被推迟得越晚。总损失里它带负号：</p>
+    <div class="formula">
+      L = L<sup>CLIP</sup> + c<sub>vf</sub> · L<sup>V</sup> − c<sub>ent</sub> · H
+      <span class="note">最小化 L 等价于最大化"回报 − c<sub>vf</sub>·价值误差 + c<sub>ent</sub>·熵"</span>
+    </div>
+    <p>熵对 logits 的梯度有闭式解，把它写出来才能理解"熵项什么时候推不动策略"：</p>
+    <div class="formula">
+      ∂H/∂z<sub>i</sub> = − π<sub>i</sub> ( ln π<sub>i</sub> + H )
+      <span class="note">推导：softmax 的雅可比为 ∂π<sub>j</sub>/∂z<sub>i</sub> = π<sub>j</sub>(δ<sub>ij</sub> − π<sub>i</sub>)，代入 H = −Σ<sub>j</sub> π<sub>j</sub> ln π<sub>j</sub> 后求导、合并同类项即得</span>
+    </div>
+    <p>代入具体数字体会这个梯度：π=(0.8, 0.2) 时 H ≈ 0.500，错动作对应的梯度分量 −0.2×(ln0.2+0.500) ≈ +0.222，把它的 logit 向上推；π=(0.99, 0.01) 时 H ≈ 0.056，对应分量 −0.01×(ln0.01+0.056) ≈ +0.045，推的力量小了一个量级。极端情况下 π→(1, 0)，H→0 且 ln π<sub>i</sub>→0，梯度整体趋于 0：<strong>策略一旦接近 one-hot，熵项自身也失去把分布推平的能力</strong>，这就是后面"熵崩溃难以逆转"的数学根源。</p>
+    <p>熵的数值对照：π=(0.5, 0.5) 时 H=0.693；π=(0.9, 0.1) 时 H≈0.325；π=(0.99, 0.01) 时 H≈0.056；π=(0.999, 0.001) 时 H≈0.008。从 0.9 到 0.99 只差一次"看起来不大"的概率变化，熵却掉了 5.8 倍，这解释了为什么日志里熵会以肉眼可见的速度塌到 0.1 以下。</p>
+    <p>把熵值与梯度分量并排列表，能看清熵项"什么时候推得动、什么时候推不动"（第二个动作是被压制的那个，梯度 ∂H/∂z<sub>2</sub> 就是把它推起来的力）：</p>
+    <table>
+      <tr><th>π(动作1, 动作2)</th><th>H（nats）</th><th>∂H/∂z<sub>2</sub></th><th>解读</th></tr>
+      <tr><td>(0.5, 0.5)</td><td>0.693</td><td>0.000</td><td>均匀分布是熵的最大点，一阶梯度为零</td></tr>
+      <tr><td>(0.6, 0.4)</td><td>0.673</td><td>0.097</td><td>轻微不平衡，推力很小</td></tr>
+      <tr><td>(0.7, 0.3)</td><td>0.611</td><td>0.178</td><td>进入推力较大的区间</td></tr>
+      <tr><td>(0.8, 0.2)</td><td>0.500</td><td>0.222</td><td>接近峰值</td></tr>
+      <tr><td>(0.9, 0.1)</td><td>0.325</td><td>0.198</td><td>越过峰值，开始回落</td></tr>
+      <tr><td>(0.99, 0.01)</td><td>0.056</td><td>0.046</td><td>接近饱和，推力约为峰值的五分之一</td></tr>
+      <tr><td>(0.999, 0.001)</td><td>0.008</td><td>0.007</td><td>数值死区，熵项几乎失效</td></tr>
+    </table>
+    <p>三个结构性事实从表里读出来。其一，梯度在 π=(0.5,0.5) 处恰好为零：均匀分布是熵函数的最大点，一阶导数必为零，所以"熵项把策略推向均匀"这个说法只在策略已经偏离均匀时才成立，对已经均匀的策略它无事可做。其二，推起被压制动作的力在 π<sub>错</sub>≈0.2 附近达到峰值约 0.22，之后随 π<sub>错</sub>→0 掉头下降，<strong>熵项最有效的区间是"已经有点偏、还没偏死"的中间地带</strong>；表中 0.99 档的推力只有峰值的约五分之一，0.999 档只剩 3%，这就是"熵崩溃难以逆转"的数量表述。其三，两个分量的梯度恒等相反：g<sub>1</sub>+g<sub>2</sub> = 0，因为 softmax 对全体 logits 加同一常数不变，熵的梯度必与全 1 方向正交，熵项只能改变 logits 的差，不能改变它们的绝对水平。</p>
+
+    <h3>2. 熵项什么时候开始主导</h3>
+    <p>熵项的梯度尺度是"常数级"的（对每个状态都推动分布变平），而策略损失的梯度尺度正比于优势 Â 的大小。训练早期优势大，策略损失主导；训练后期策略接近最优，优势缩小，熵项的相对权重上升。用比值来观察：</p>
+    <div class="formula">
+      熵项占比 ≈ c<sub>ent</sub> · H / ( |L<sup>policy</sup>| + ε )
+      <span class="note">持续大于 1 意味着策略几乎不再向优势方向更新，只是在"变平"</span>
+    </div>
+    <p>注意 Â 在更新前被标准化过，所以 |L<sup>policy</sup>| 的绝对值被压到 1 附近量级；这解释了为什么 c<sub>ent</sub>=0.05 时熵项很容易抢占主导，0.05 乘上接近 0.7 的熵，本身就是 0.035 量级的位移，和策略损失同量级。</p>
+    <p>把占比公式代入几组参数感受量级。设训练后期的策略损失量级 |L<sup>policy</sup>|=0.1、熵 H=0.4：c<sub>ent</sub> 取 0.001 / 0.01 / 0.05 / 0.2 时，熵项占比分别是 0.004 / 0.04 / 0.2 / 0.8。占比 0.8 意味着熵项的梯度接近策略损失项的八成，两者在总损失里几乎等权；若处在训练早期（H≈0.69）而 c<sub>ent</sub>=0.2 且策略损失只有 0.1，占比达到 1.38，熵项在损失里占主导，参数更新的主要成分变成了"把分布变平"，"把好动作选出来"只占小头。这份换算的用途是判读：对照日志里两项的规模，就能判断当前处于探索主导还是利用主导，再决定是降低 c<sub>ent</sub> 还是延长训练。</p>
+    <p>顺带统一度量单位：代码中的熵按自然对数计算，单位是 nats（奈特），二元均匀分布的 0.6932 nats 恰好等于 1 bit；文献表格常以 bit 为单位，换算系数是 1 nat ≈ 1.4427 bit。本章表格统一用 nats，读到论文里的熵数值时先确认单位再比较。</p>
+    <p>用数字走一遍这件事：训练第 1 轮，熵 0.69、策略损失量级约 1.0，c<sub>ent</sub>=0.01 时熵项占比约 0.01×0.69/1.0 ≈ 0.007，可以忽略；训练后期，熵降到 0.34、优势变小让策略损失量级降到 0.1 附近，熵项占比变成 0.01×0.34/0.1 ≈ 0.034；若把系数换成 0.05，同样的 0.34 熵得到 0.05×0.34/0.1 = 0.17，权重提高约 5 倍。三个时刻的对比说明：<strong>同一个 c<sub>ent</sub>，在训练不同阶段的相对权重并不相同</strong>，读数时必须结合当时的策略损失一起看。</p>
+
+    <h3>3. 熵崩溃与恢复成本</h3>
+    <p>当 c<sub>ent</sub>=0 且优势持续为正时，正确动作的 logit 单调增大，softmax 进入饱和区：π(错动作) 指数级变小，对应 log π 的梯度虽然理论上仍非零，但数值上被指数压缩，策略几乎不可能再翻身。这就是熵崩溃。它在两类情况下发生：<strong>良性</strong>，策略已经学会全部任务，锁死高分动作；<strong>恶性</strong>，早期偶然把错动作推高，随后被困在低分策略上。区分方法：同时看熵与回报，熵低但回报高是前者，熵低且回报停滞是后者。</p>
+    <p>把区分方法写成可执行的三条规则：评估熵 &lt; 0.05 且评估回报明显低于任务水平（CartPole 上低于 300），判为恶性锁定，优先提高 c<sub>ent</sub> 或改用第 021 章的噪声探索；评估熵 &lt; 0.05 但评估回报稳定在高位，判为良性收敛，不做干预；评估熵落在 0.05～0.2 的灰区时，用多种子重跑再下结论，单次运行在这个区间最容易给出误导性的判断。再补一条量级参照：评估熵 0.69 附近表示策略在评估轨迹上接近均匀随机，0.3～0.5 是本任务默认系数下的健康区间，只有掉进 0.05 以下才触发上面两条规则。</p>
+
+    <h3>4. 熵正则不是万能的探索</h3>
+    <p>熵奖励鼓励"动作概率均等"，它不度量"状态空间覆盖率"。在稀疏奖励或需要长程记忆的任务里，均匀随机动作并不能提供有效探索信号，这会由第 020 章的稀疏奖励处理、第 021 章的参数空间噪声分别应对。评估一个探索机制是否有效，标准是"它是否提高了找到高回报区域的速度"，熵值本身只是随机性的度量。本章先把它作为默认机制，把适用边界研究清楚。</p>
+
+    <h3>5. 五档系数的经验对照</h3>
+    <p>把常见的取值档位与预期表现列成一张表，便于换任务时快速定位起点：</p>
+    <table>
+      <tr><th>c<sub>ent</sub></th><th>后期熵（二元动作）</th><th>典型表现</th><th>风险</th></tr>
+      <tr><td>0.0</td><td>0.05～0.2，掉得最快</td><td>简单任务常常"赌对"高分，曲线上升最陡</td><td>方差大，一旦锁错方向无法自救；稍难任务明显受损</td></tr>
+      <tr><td>0.001</td><td>0.1～0.25</td><td>接近无正则，探索保留略多</td><td>对后期锁定只能延缓、不能阻止</td></tr>
+      <tr><td>0.01</td><td>0.3～0.5</td><td>本章与后续章节的默认值，探索与利用均衡</td><td>几乎没有，代价是策略始终保留少量随机性</td></tr>
+      <tr><td>0.05</td><td>0.55～0.65</td><td>学习明显变慢，近 100 均可能低 50～150 分</td><td>熵项占比接近 0.5，策略更新方向被"变平"稀释</td></tr>
+      <tr><td>0.2</td><td>维持 0.65 以上</td><td>基本停留在均匀随机附近，回报上不去</td><td>熵项占比超过 1，梯度被熵主导，训练几乎失效</td></tr>
+    </table>
+    <p>表中"后期熵"以 8 万步预算、CartPole 为参照；换到动作数更多的任务时，先按 ln(动作数) 的比值折算，再从 0.01 附近微调。扫描实验的价值在于：把这条连续区间里两端的症状都亲眼看过，以后遇到不熟悉的系数时能对照这张表定位。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+
+    <h3>模块划分</h3>
+    <table>
+      <tr><th>组件</th><th>职责</th><th>与第 004 章的关系</th></tr>
+      <tr><td><code>train_one(ent_coef)</code></td><td>按给定系数训练一次，记录熵轨迹</td><td>实验轴由 lr/批量改为熵系数</td></tr>
+      <tr><td><code>ppo_update</code></td><td>更新时用入参 ent_coef，额外统计熵项占比</td><td><strong>新增</strong> <code>ent_ratio</code> 诊断</td></tr>
+      <tr><td><code>policy_entropy</code></td><td>评估阶段逐状态收集纯策略熵</td><td><strong>新增</strong>：区分"训练熵"与"评估熵"</td></tr>
+      <tr><td>日志</td><td>每 5 次更新打印熵与熵项占比</td><td>从 004 的 KL/裁剪扩展为熵视角</td></tr>
+      <tr><td>对比表</td><td>前 5 轮熵、后 5 轮熵、评估熵、首达 400 步数</td><td><strong>新增</strong>熵轨迹摘要列</td></tr>
+    </table>
+
+    <h3>关键超参数</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用与取值理由</th></tr>
+      <tr><td><code>--ent-coefs</code></td><td>0.0 0.01 0.05</td><td>无正则 / 默认 / 强正则三档，覆盖两端</td></tr>
+      <tr><td><code>--max-steps</code></td><td>80000</td><td>单系数预算；足以让 0.0 与 0.01 拉开差距</td></tr>
+      <tr><td><code>--steps-per-update</code></td><td>2048</td><td>沿用 001 的设置，保证与其他章节可比</td></tr>
+      <tr><td><code>--stage-reward</code></td><td>400.0</td><td>记录首达 400 的步数；不提前终止</td></tr>
+      <tr><td><code>--seed</code></td><td>0</td><td>三个系数共享随机流，受控对比</td></tr>
+    </table>
+
+    <h3>数据流</h3>
+    <p>每个系数一个完整训练：重设种子 → 采样 2048 步 → GAE 与标准化 → 10 epochs 更新（<code>c_ent</code> 作为入参进入损失，统计熵、熵项占比）→ 记录熵轨迹 → 跑满 8 万步 → 贪婪评估时<strong>逐状态收集纯策略熵</strong> → 汇总"首达 400 的步数 / 前 5 轮熵 / 后 5 轮熵 / 评估熵 / 熵项占比"。</p>
+
+    <div class="box key">
+      <span class="box-title">为什么要在评估时单独算熵</span>
+      <p>训练日志里的熵是"采样批数据的动作分布熵"，它受两个因素影响：策略本身有多确定、以及这批状态落在分布的什么位置。评估熵把第二个因素固定住：在<strong>同一条贪婪轨迹</strong>上逐个状态计算策略的熵。这样得到的数字才真正回答"策略现在有多确定"。当评估熵 &lt; 0.05 而评估回报却不高时，就是过早锁定的铁证。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：熵项进入损失与"熵项占比"统计</strong></p>
+    <pre class="code"><code>            ratio = torch.exp(logp - logp_old[mb])
+            surr1 = ratio * adv[mb]
+            surr2 = torch.clamp(ratio, 1.0 - args.clip, 1.0 + args.clip) * adv[mb]
+            policy_loss = -torch.min(surr1, surr2).mean()
+            value_loss = F.mse_loss(value, ret[mb])
+            entropy = dist.entropy().mean()
+            # 熵奖励带负号：目标里是“最大化熵”，损失里要最小化它的相反数
+            loss = policy_loss + args.vf_coef * value_loss - ent_coef * entropy
+
+            optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(net.parameters(), 0.5)
+            optimizer.step()
+
+            with torch.no_grad():
+                stats["entropy"] += entropy.item()
+                stats["policy_loss"] += abs(policy_loss.item())
+                # 熵项占比 = |c_ent·H| / (|策略损失| + eps)：观察熵项何时接管更新
+                stats["ent_ratio"] += (ent_coef * entropy.item()) / (abs(policy_loss.item()) + 1e-8)
+                stats["n_updates"] += 1</code></pre>
+    <p>解读：<strong>（1）</strong><code>dist.entropy()</code> 直接给出当前 minibatch 动作分布的熵，<code>.mean()</code> 后参与损失，它既是正则项也是诊断量。<strong>（2）</strong>符号是本章最不能错的地方：目标是最大化熵，所以损失里是 <code>− ent_coef * entropy</code>；写成加号会把策略推向均匀随机（练习里会看到它熵停在 0.693、回报上不去）。<strong>（3）</strong><code>ent_ratio</code> 的分母取 <code>abs(policy_loss)</code>：策略损失在优势为负的样本上可能是负数，比值只是量级比较。<strong>（4）</strong>统计放在 <code>no_grad()</code> 里且用 <code>.item()</code> 转成标量：它只用于日志，绝不参与反向图。<strong>（5）</strong><code>ent_coef</code> 走函数入参传入，没有从 <code>args</code> 直接取，这是为了让 <code>train_one</code> 能把"当前系数"传进来，也为练习里的"系数调度"留了接口。</p>
+
+    <p><strong>片段 2：评估熵，把策略的确定性单独量出来</strong></p>
+    <pre class="code"><code>    @torch.no_grad()
+    def policy_entropy(self, obs: torch.Tensor) -&gt; float:
+        """当前策略在给定观测上的熵，用于评估阶段的“纯策略熵”诊断。"""
+        logits, _ = self.forward(obs)
+        return float(Categorical(logits=logits).entropy().item())
+
+@torch.no_grad()
+def evaluate(env, net, episodes, device):
+    returns, entropies = [], []
+    for _ in range(episodes):
+        obs, _ = env.reset()
+        done = False
+        ep_ret = 0.0
+        while not done:
+            entropies.append(net.policy_entropy(to_tensor(obs, device)))
+            logits, _ = net(to_tensor(obs, device))
+            action = int(torch.argmax(logits, dim=-1).item())
+            obs, r, terminated, truncated, _ = env.step(action)
+            ep_ret += r
+            done = terminated or truncated
+        returns.append(ep_ret)
+    return returns, float(np.mean(entropies))</code></pre>
+    <p>解读：<strong>（1）</strong><code>policy_entropy</code> 是网络上的一个独立方法：它只前向、不采样，返回该状态下策略分布的熵。注意它和训练时 <code>dist.entropy()</code> 用的是同一个函数，只是作用点不同。<strong>（2）</strong>评估用贪婪动作（<code>argmax</code>），执行的动作不带随机性，但收集的"熵"是<strong>策略分布</strong>的熵，两者互不矛盾：策略可以很确定（低熵）也可以很随机（高熵），评估动作的选择方式不影响策略本身的形态。<strong>（3）</strong>为什么不在评估里直接用采样策略？因为评估回报要可比：贪婪评估排除了动作随机性的噪声，同一策略的两次评估才稳定；否则回报的波动会让人误判策略质量。<strong>（4）</strong>只把 <code>entropies</code> 的均值返回，是为了表格展示；如果你要做练习里的"分布直方图"，可以在这里顺手扩展成返回列表。</p>
+
+    <p><strong>片段 3：熵轨迹的跟踪与摘要</strong></p>
+    <pre class="code"><code>        stats = ppo_update(net, optimizer, batch, args, ent_coef)
+        entropies.append(stats["entropy"])         # 训练熵轨迹
+        kl_list.append(stats["approx_kl"])
+        ent_ratios.append(stats["ent_ratio"])
+
+        if reached_at is None and len(all_returns) &gt;= 100 and np.mean(all_returns[-100:]) &gt;= args.stage_reward:
+            reached_at = total_steps              # 只记录，不提前停：要完整熵轨迹
+
+        if n_updates % 5 == 0:
+            print(f"  c_ent={ent_coef:&lt;5} 步数 {total_steps:7d} | "
+                  f"近20均 {np.mean(all_returns[-20:]):7.1f} | 熵 {stats['entropy']:.3f} | "
+                  f"熵项占比 {stats['ent_ratio']:.3f} | KL {stats['approx_kl']:.4f}")
+
+    eval_returns, eval_entropy = evaluate(gym.make("CartPole-v1"), net, args.eval_episodes, device)
+    first5 = float(np.mean(entropies[:5]))        # 前 5 轮：熵的下降速度
+    last5 = float(np.mean(entropies[-5:]))        # 后 5 轮：最终的确定性程度</code></pre>
+    <p>解读：<strong>（1）</strong>三个列表各司其职：<code>entropies</code> 看下降速度，<code>ent_ratios</code> 看熵项权重，<code>kl_list</code> 做交叉验证。<strong>（2）</strong>"前 5 轮 / 后 5 轮"是本章的信息浓缩手法：完整曲线在日志里，对比表只留首尾，首尾差告诉你下降多快，末值告诉你最后多确定。<strong>（3）</strong>仍然只记录不提前停：如果 0.0 组在 3 万步达标就停，你就看不到它后 5 轮的熵了，而这正是本章要研究的东西。<strong>（4）</strong>评估生成新的环境实例（<code>gym.make</code> 再传一次），避免评估回合把训练环境的随机状态搅乱，训练环境的 reset 序列属于"受控随机流"的一部分，不能污染。</p>
+
+    <p>完整可运行脚本（附录）：<a href="../code/ch005.py" download>code/ch005.py</a></p>
+    <pre class="sh"><code>python code/ch005.py                        # 0.0 / 0.01 / 0.05 各 8 万步，CPU 约 3–6 分钟
+python code/ch005.py --quick                # 三个系数各 1 万步，约 30–60 秒
+python code/ch005.py --ent-coefs 0.01 0.05  # 只比较默认值与强正则</code></pre>
+    <p>典型日志：<code>c_ent=0.0 | 近20均 462.8 | 熵 0.083 | 熵项占比 0.000 | KL 0.0041</code>；<code>c_ent=0.01 | 近20均 438.5 | 熵 0.336 | 熵项占比 0.121</code>；<code>c_ent=0.05 | 近20均 330.6 | 熵 0.601 | 熵项占比 0.482</code>。预期结论（<strong>以实跑为准</strong>）：c_ent=0 的熵掉得最快（后 5 轮常在 0.05～0.2），CartPole 简单时它常常"赌对"高分，但在稍难任务上这种运气会变成风险；c_ent=0.01 的熵平滑滑向 0.3～0.5、综合最稳；c_ent=0.05 的熵长期停在 0.55～0.65、学习明显变慢，近 100 均可能低 50～150 分。评估熵一列会清晰展示三档的差别。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>熵项符号写反</strong>：目标是最大化回报与熵，损失里必须是 <code>− ent_coef * entropy</code>。若写成加号，训练会把策略推向均匀随机，熵停在 0.693 且回报上不去。症状：熵曲线从不下降。</li>
+      <li><strong>把采样策略的熵当成最终策略的熵</strong>：评估用贪婪动作时不再有随机性，评价"探索保住了多少"要看评估轨迹上的策略分布熵（本章的 <code>eval_entropy</code>）；训练日志里的平均熵受采样状态分布影响，口径不同。</li>
+      <li><strong>跨任务比较 c_ent</strong>：动作数不同，熵上限不同（二元 0.693，四元 1.386）。跨任务比较应看"熵 / ln(动作数)"的归一化值。</li>
+      <li><strong>忽略优势标准化对熵项相对权重的影响</strong>：优势被标准化后策略损失量级固定，熵项占比只由 c_ent 和熵决定；如果哪天把标准化去掉，同样的 c_ent 效果会完全不同。</li>
+      <li><strong>看到熵下降就以为是坏事</strong>：熵下降是训练的正常结果，坏的是"熵下降 + 回报停滞"。只看熵不看回报容易把良性收敛误判成崩溃，反向误判同样常见。</li>
+      <li><strong>在评估里统计采样动作的熵</strong>：评估用 argmax 执行动作，动作本身没有随机性，但"策略分布的熵"仍然可以逐状态计算。把二者混起来会得到恒为 0 的假熵。修复：用 <code>policy_entropy(obs)</code> 在评估轨迹上单独统计，与执行动作解耦。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把 <code>--ent-coefs</code> 改成 <code>0.0 0.2</code>，跑完比较评估回报与熵项占比，解释为什么 0.2 会在早期就"压住"学习。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>0.2 × 熵(0.69) ≈ 0.14，比标准化后的策略损失量级还大。观察日志里熵项占比何时超过 1，以及近 20 均曲线的斜率。</div></details>
+      </li>
+      <li>把熵正则改成线性衰减：前一半训练用 0.02，后一半线性降到 0.001。与固定 0.01 对比曲线。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>在 <code>train_one</code> 里按 <code>total_steps / max_steps</code> 计算当前系数并传给 <code>ppo_update</code>。直觉是"先探索后收敛"，注意后段熵是否真的降下来。</div></details>
+      </li>
+      <li>固定一组观测（从一次 rollout 里取 256 个状态），每次更新后统计动作概率的分布直方图，观察 c_ent=0 时分布何时变成尖峰。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>用 <code>torch.softmax(net(obs)[0], dim=-1)</code> 统计 π(动作0) 的均值与最大值占比；c_ent=0 且回报不高时，若 π 已经接近 one-hot，说明已经锁死。</div></details>
+      </li>
+      <li>用三个种子分别跑 c_ent=0.0 与 0.01，比较"首达 400 步数"的均值和方差，判断哪个更稳。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>外层循环种子、内层循环系数，各跑 6 次，汇总到一张表。你会发现 c_ent=0 的方差通常更大，单次跑得好不代表稳。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>熵奖励把"保持随机性"写进目标，c<sub>ent</sub> 越大策略越晚变确定；二元动作的熵上限是 ln2 ≈ 0.693。</li>
+      <li>熵项的相对权重随训练上升：早期策略损失主导，后期若熵项占比持续大于 1，更新方向基本被"变平"接管。</li>
+      <li>扫描结果：c_ent=0 熵掉得最快、有时"赌对"高分；c_ent=0.01 综合最稳；c_ent=0.05 明显拖慢学习。</li>
+      <li>良性熵崩溃与恶性熵锁定的区分靠"熵 + 回报"一起看；后者需要熵正则或更彻底的探索机制。</li>
+      <li>熵对 logits 的梯度为 −π<sub>i</sub>(ln π<sub>i</sub> + H)，概率越接近 one-hot 梯度越小：熵项只能延缓锁定、不能逆转锁定，这是"预防优先"的原因。</li>
+      <li>下一章换到结构维度：比较不同隐藏层宽度/深度的 Actor-Critic，看看"网络容量"这个变量在 CartPole 上的收益是否值得它的计算成本。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch004.html">← 第 004 章：PPO的批量大小与学习率调优</a>
+    <a class="next" href="ch006.html">第 006 章：PPO的神经网络架构设计 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第039章 RLlib实现APPO算法 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第三篇 · RLlib 算法实现</span>
+    <span class="sep">/</span>
+    <span>第 039 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第三篇 · RLlib 算法实现</div>
+    <h1>第 039 章：RLlib实现APPO算法</h1>
+    <p class="lead">APPO（Asynchronous Proximal Policy Optimization）把采样与学习解耦：采样进程持续产出，学习侧按批消费，用有界缓冲与回放比例控制样本新鲜度。本章讲清解耦结构的收益与代价、缓冲参数的作用，以及与同步 PPO 的取舍。</p>
+    <ul class="meta">
+      <li>主题：RLlib 算法 / 异步同策略方法</li>
+      <li>关键机制：采样学习解耦、有界缓冲、回放比例、样本陈旧度、吞吐与效率取舍</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 038 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解采样与学习解耦的结构：有界队列连接两侧的执行节奏。</li>
+      <li>掌握缓冲相关参数的作用：小批缓冲、回放比例与缓冲槽位。</li>
+      <li>理解样本陈旧度对目标有效性的影响，以及批次内混版本的后果。</li>
+      <li>会用吞吐与样本效率两个视角对照 APPO 与同步 PPO，判断收益条件。</li>
+      <li>会配置 APPO 的关键参数并诊断缓冲积压、陈旧度过高等异常。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>同步 PPO 的每轮迭代是严格的交替结构：采样阶段所有工作进程采集完毕，学习阶段才开始消耗数据，学习期间采样资源闲置。当采样阶段耗时占比高（环境仿真昂贵）或学习阶段耗时占比高（网络较大）时，交替结构都会浪费另一侧的资源。</p>
+    <p>APPO 把两侧解耦：采样进程持续产出片段，学习侧从有界缓冲取批更新，参数经广播周期回到采样侧。代价是样本来自若干步之前的策略版本，不再同源。<strong>APPO 的缓冲参数都在回答同一个问题：用多少陈旧度换取多少吞吐。</strong>上一章讨论同步方案，本章分析同一目标在异步数据流下的改造。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p>APPO 的结构可以概括为：有界队列加版本差管理，目标函数沿用 PPO 的裁剪与优势机制。</p>
+
+    <h3>1. 解耦结构与有界缓冲</h3>
+    <p>采样进程完成片段后把数据放入队列，学习侧按批取出；队列容量有限，满时采样侧等待或被丢弃策略处理，空时学习侧等待。参数更新后经广播节奏回到采样进程，广播间隔决定采样策略相对学习策略的滞后程度。<strong>队列容量与广播间隔是两个节流阀：</strong>容量大允许更深积压（吞吐高、陈旧度高），广播密让采样侧更快跟上新参数（新鲜、开销上升）。</p>
+    <div class="formula">
+      样本陈旧度 ≈ 队列积压批数 × 广播间隔（批数为队列深度除以批大小）
+      <span class="note">陈旧度以策略版本差或近似的更新次数衡量；裁剪目标对轻度陈旧有容忍度，超过容忍范围后优势估计与比率修正都会失准</span>
+    </div>
+
+    <h3>2. 小批缓冲与回放比例</h3>
+    <p>学习侧维护小批缓冲（minibatch buffer）：小批依次消费，缓冲深度决定待用批数。回放比例（replay proportion）控制从历史缓冲取批的概率：比例为零只用最新数据，比例提高则数据利用率上升、新鲜度下降。<strong>两个参数共同决定训练分布的时间跨度：</strong>分布越宽越接近离策略场景，对重要性修正的依赖越强。缓冲槽位限制历史批的保留数量，是容量与内存的上界。</p>
+
+    <h3>3. 陈旧度的传播与修正</h3>
+    <p>陈旧样本进入裁剪目标时，比率天然偏离 1，裁剪频繁触发、梯度信号被大量截断。症状是"更新像被冻住"：回报曲线变平、裁剪触发比例高。修正手段有三条：降低回放比例或缓冲深度、提高广播频率、下调学习率让单轮步幅变小。批次内混版本还会破坏 KL 统计口径，监控时应按采集版本分组统计。</p>
+
+    <h3>4. 收益条件与对照方法</h3>
+    <p>APPO 的收益来自重叠：采样与学习同时进行，硬件利用率高于交替结构。收益取决于两侧耗时比例：两侧接近时重叠收益最大，一侧占绝对主导时收益被上界压住。<strong>判断是否值得启用 APPO 的实验设计：</strong>同一任务、同一采样预算，分别跑同步 PPO 与 APPO，比较墙钟时间、评估回报与每秒样本吞吐；若 APPO 的回报明显低于基线，说明陈旧度代价超过了吞吐收益，应减缓冲或退回同步。</p>
+
+    <h3>5. 重叠收益的数值演算</h3>
+    <p>记单轮采样耗时为 S、学习耗时为 L。同步结构的迭代时间为 S + L，理想重叠下趋近两者的较大值，加速比上界为：</p>
+    <div class="formula">
+      加速比上界 = ( S + L ) / max(S, L)
+      <span class="note">两侧相等时上界为 2；S = 2L 时约 1.5；S = 5L 时约 1.2；一侧占绝对主导时重叠收益被压住，这是简单任务无需异步改造的数量原因</span>
+    </div>
+    <table>
+      <tr><th>两侧耗时比 S : L</th><th>同步迭代时间</th><th>理想重叠时间</th><th>加速比上界</th></tr>
+      <tr><td>1 : 1</td><td>2L</td><td>L</td><td>2.00</td></tr>
+      <tr><td>2 : 1</td><td>3L</td><td>2L</td><td>1.50</td></tr>
+      <tr><td>3 : 1</td><td>4L</td><td>3L</td><td>1.33</td></tr>
+      <tr><td>5 : 1</td><td>6L</td><td>5L</td><td>1.20</td></tr>
+    </table>
+    <p>读表：上界在两侧均衡时最高；实际值还要扣除缓冲等待、参数广播与丢弃损失。启用 APPO 之前，先用同步基线的时间分解估算这个上界，上界接近 1 时不需要进入异步改造。</p>
+
+    <h3>6. 陈旧度的参数组合表</h3>
+    <p>按陈旧度估算式（深度 × 广播间隔 × 每批更新次数）计算，取每批更新 3 次：</p>
+    <table>
+      <tr><th>缓冲深度 \ 广播间隔</th><th>1</th><th>2</th><th>4</th></tr>
+      <tr><td>2 批</td><td>6</td><td>12</td><td>24</td></tr>
+      <tr><td>4 批</td><td>12</td><td>24</td><td>48</td></tr>
+      <tr><td>8 批</td><td>24</td><td>48</td><td>96</td></tr>
+    </table>
+    <p>十余次更新的容忍区间对应表中数值不超过 12 的组合；超过 24 的组合需要实验证据支撑。<strong>深度与间隔的乘积决定版本差，两个旋钮的作用等价；工程上优先缩短广播间隔，因为它同时改善队列中所有在途样本的新鲜度，而减小深度只影响最深的那部分。</strong></p>
+
+    <h3>7. 参数广播的流量核算</h3>
+    <p>广播流量 = 广播次数 × 参数字节 × 采样进程数。数值示例：模型 100 万参数按 float32 计约 4 MB，每 2 次学习更新广播一次，训练 1000 次更新，8 个采样进程：广播约 500 次，累计流量约 500 × 4 MB × 8 = 16 GB。<strong>广播频率提高一倍，流量同步翻倍；调参时把广播间隔与采样进程数一起核算，避免新鲜度收益被通信开销抵消。</strong></p>
+
+    <h3>8. 同步与异步结构的对照</h3>
+    <table>
+      <tr><th>维度</th><th>同步 PPO</th><th>APPO</th></tr>
+      <tr><td>采样学习关系</td><td>严格交替</td><td>重叠运行</td></tr>
+      <tr><td>迭代时间</td><td>S + L</td><td>趋近 max(S, L) 加等待与广播开销</td></tr>
+      <tr><td>样本版本差</td><td>零，同版本采集</td><td>由深度与广播间隔决定</td></tr>
+      <tr><td>每批更新轮数</td><td>较高，10 量级</td><td>较低，3 量级，消化版本差</td></tr>
+      <tr><td>额外监控对象</td><td>无</td><td>队列深度、丢弃率、样本年龄、裁剪触发比例</td></tr>
+      <tr><td>适用情形</td><td>两侧耗时短、调参预算有限</td><td>两侧耗时较长且接近、追求墙钟吞吐</td></tr>
+    </table>
+    <p>缓冲槽位与回放比例的联合调整有一个先验起点：比例取 0、深度取 1 先跑通链路，确认解耦生效后逐档加深，每一档记录吞吐与回报两项，增益归零即停止加深。调整前在实验记录中写明当前取值与调整方向，避免多次实验后无法还原配置历史。</p>
+    <p>选择依据：先用同步 PPO 建立基线与时间分解数据；重叠上界明显大于 1 且能接受额外的缓冲调参时，再切换 APPO 并按对照实验的判据决定是否保留。回放比例与陈旧度存在叠加效应：从历史缓冲取出的批其版本差大于队列中最旧批，比例每提高一档，有效陈旧度按加权值上升，监控中按取出位置记录年龄分布。队列满载时的处理顺序：缩短广播间隔与压缩深度对陈旧度乘积的作用等价，但缩短间隔同时改善队列中所有在途样本的新鲜度，实践顺序是先间隔后深度。同步基线的三类耗时（采样、学习、拼装）要先采集齐，启用异步后继续按同一口径记录，对比才有共同基准。预填充阶段缓冲为空、样本年龄为零，预热期的指标不参与陈旧度判断。</p>
+
+    <h3>9. 数值算例：供需匹配与队列水位</h3>
+    <p>给解耦链路代入一组读数：8 个采样器各产 400 步/秒，合计供给 3200 步/秒；学习侧每批 4000 步、单批学习耗时 1.6 秒，消费能力 2500 步/秒。供给超出消费 700 步/秒，队列按此速度蓄水：容量 32 槽 × 4000 步 = 128,000 步，蓄满需要约 183 秒。蓄满之后进入丢弃模式，多余供给被丢掉的比率为 700 ÷ 3200 ≈ 21.9%，折合每秒丢弃 0.175 个批。这组数字给出监控的读数窗口：队列从空到满约三分钟，评估面板的观察周期要覆盖这个尺度，才能看到丢弃率从零抬升的过程。</p>
+    <p>同步结构的利用率也能列成表：采样利用率等于 S ÷ (S + L)，学习利用率等于 L ÷ (S + L)。两侧 1 比 1 时各约 50%，2 比 1 时约 67% 与 33%，5 比 1 时约 83% 与 17%。APPO 的重叠把两者同时推向饱和，上限增益与表中差值对应；这解释了为什么两侧接近时才值得解耦，也解释了单侧主导的任务上异步收益有限。</p>
+    <table>
+      <tr><th>两侧耗时比 S : L</th><th>同步采样利用率</th><th>同步学习利用率</th><th>可回收的空闲</th></tr>
+      <tr><td>1 : 1</td><td>约 50%</td><td>约 50%</td><td>最大</td></tr>
+      <tr><td>2 : 1</td><td>约 67%</td><td>约 33%</td><td>中等</td></tr>
+      <tr><td>5 : 1</td><td>约 83%</td><td>约 17%</td><td>最小</td></tr>
+    </table>
+
+    <h3>10. 边界与失效模式</h3>
+    <p>参数广播本身也占用采样侧的时间：接收权重、替换网络、恢复推进的过程会让采样短暂停顿，停顿乘以频率构成吞吐税。按停顿 50 毫秒、每 2 秒广播一次估算，税负约 2.5%；广播间隔从 2 秒缩到 0.5 秒，税负升到约 10%，新鲜度的改善要以这段停顿时长为代价。缩短广播间隔的决策要连同模型体积与网络带宽一起复核。</p>
+    <p>价值目标的陈旧问题是隐性失效：优势估计用行为策略的价值自举，混版本批次里每条样本取自不同版本的价值网络，批内目标的时间基准不统一，优势分布被抹宽。症状是价值损失高位波动、优势标准化后的分布异常。修复手段是让价值目标与样本采集版本绑定，或限制批内版本跨度。</p>
+    <p>丢弃与回放的联动要一起判读：丢弃从队列头部剔除最旧数据，回放比例又从更深位置取旧数据，两者方向相反且都作用于年龄分布。丢弃率高时年龄中位数下降、最长年龄却可能因回放而抬升，只盯单一统计量会得出矛盾结论。监控口径建议同时记录年龄中位数、最长年龄与丢弃率三项，任何一项越界都要回到缓冲参数重新配平。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>配置顺序：先用同步 PPO 建立基线，再开解耦结构，从浅缓冲起步逐级加深，每一步对照评估回报。</p>
+    <table>
+      <tr><th>参数</th><th>示例值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>采样进程数</td><td>8</td><td>持续的样本供给</td><td>核心数减一至二，供给需覆盖学习消耗</td></tr>
+      <tr><td><code>train_batch_size</code></td><td>4000</td><td>学习侧的消费批次</td><td>与同步 PPO 基线保持一致便于对照</td></tr>
+      <tr><td>小批缓冲深度</td><td>2</td><td>待用小批数量</td><td>从 1 起步，按吞吐曲线加深</td></tr>
+      <tr><td><code>replay_proportion</code></td><td>0.1</td><td>从历史缓冲取批的概率</td><td>0 到 0.5 区间小步试探，陈旧度随比例上升</td></tr>
+      <tr><td>缓冲槽位</td><td>32</td><td>历史批保留数量</td><td>按内存预算与陈旧度容忍度取值</td></tr>
+      <tr><td><code>num_sgd_iter</code></td><td>3</td><td>每批更新轮数</td><td>低于同步 PPO 的轮数，抵消陈旧度影响</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：为什么 APPO 的更新轮数通常低于同步 PPO？</span>
+      <p>轮数越多，策略偏离采集分布越远，裁剪会截断大部分更新；同步结构中偏离只在同一批数据内，APPO 的数据自带版本差，两者叠加迅速超出容忍范围。降低轮数让每批利用更温和，把吞吐收益留给解耦结构本身。<strong>轮数的下降是陈旧度的"预算内消化"，不是配置失误。</strong></p>
+    </div>
+    <p>队列状态与丢弃率的联动判读：深度长期低于容量的两成且丢弃为零，说明供给不足，应增加采样器或提高单核副本数；深度贴顶且丢弃率高，说明学习侧是瓶颈，应减少采样器或压缩批次；深度中等且丢弃率接近零，供需匹配。<strong>样本年龄按批内中位数与最长年龄两个统计量记录：中位数反映常态新鲜度，最长年龄对应裁剪触发的最坏情形。</strong>队列内存按槽位、批大小与单步字节数核算：32 槽、每批 8000 步、每步 40 字节时队列占用约 10 MB，低维任务下可以忽略，图像任务需按单步体积放大后再核对预算。</p>
+    <p>与上一章差异：第 038 章的迭代是采样与学习的严格交替；本章让两侧并行运行，训练循环从"阶段切换"变为"缓冲生产者与消费者模型"，配置与监控对象随之增加一组缓冲指标。下一章讨论 IMPALA：用 V-trace 修正把异步容忍度推到更高的采样规模。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：APPO 配置骨架</strong></p>
+    <pre class="code"><code>from ray.rllib.algorithms.appo import APPOConfig
+
+config = (
+    APPOConfig()
+    .environment(env=LineGoalEnv)
+    .training(
+        train_batch_size=4000,          # 与同步 PPO 基线一致，便于对照
+        num_sgd_iter=3,                 # 轮数低于同步：消化样本版本差
+        lr=3e-4,
+        gamma=0.99,
+        lambda_=0.95,
+        clip_param=0.2,
+        replay_proportion=0.1,          # 小比例混入历史批，提高数据利用率
+        minibatch_buffer_size=2,        # 待用小批缓冲深度：吞吐与陈旧度的旋钮
+        replay_buffer_num_slots=32,     # 历史批保留槽位：内存与分布宽度的上界
+    )
+    .env_runners(num_env_runners=8, num_envs_per_env_runner=1)
+)
+algo = config.build_algo()
+result = algo.train()
+print(result["info"]["timers"]["learn_time_ms"])   # 学习与采样是否真正重叠</code></pre>
+    <p>解读：配置的参数分三组：目标函数组（轮数、裁剪、GAE）与 PPO 同源；解耦组（缓冲深度、回放比例、槽位）控制样本新鲜度；资源组维持供给覆盖。键名与默认值随版本演进，以对应版本文档为准。<strong>验证解耦是否生效的直接指标是时间分解：</strong>采样与学习耗时在迭代报告中不再严格相加，重叠生效时迭代时间应小于两侧之和。</p>
+
+    <p><strong>片段 2：有界缓冲的消费逻辑</strong></p>
+    <pre class="code"><code>from collections import deque
+
+
+class BatchQueue:
+    """有界批队列：满时按策略处理，空时返回等待信号。"""
+
+    def __init__(self, capacity=32):
+        self.buffer = deque(maxlen=capacity)   # 超出容量自动丢弃最旧批
+
+    def push(self, batch):
+        # 队列满时 deque 丢弃左端最旧数据：丢弃比阻塞更保护吞吐，
+        # 但丢弃率必须被监控，否则学习侧长期消费陈旧数据
+        self.buffer.append(batch)
+
+    def pop(self, replay_proportion=0.0, rng=None):
+        if not self.buffer:
+            return None                        # 空队列：学习侧进入等待
+        if rng is not None and rng.random() &lt; replay_proportion:
+            # 回放分支：从较旧的位置取批，样式上等价于历史复用
+            index = max(0, len(self.buffer) - 1 - int(rng.integers(1, 4)))
+            return self.buffer[index]
+        return self.buffer.popleft()           # 默认分支：取最新批
+
+
+# 监控口径：丢弃次数、平均队列深度、取出批的"位置年龄"三项
+# 位置年龄持续偏大说明回放比例或积压深度超出预算</code></pre>
+    <p>解读：队列实现展示解耦结构的最小形态：有界容量、满时丢弃旧数据、空时返回等待信号、回放分支从更深位置取批。<strong>"丢弃最旧"与"阻塞生产者"是两种反压策略，</strong>前者保护吞吐但损失新鲜度管理，后者保护数据完整但让采样进程空转；选择取决于任务对陈旧度的容忍度。回调应把队列深度与年龄写入监控，队列长期半空说明供给不足，长期满触发丢弃说明学习侧是瓶颈。</p>
+
+    <p><strong>片段 3：陈旧度与收益的快速估算</strong></p>
+    <pre class="code"><code>def staleness_budget(queue_depth, broadcast_interval, updates_per_batch):
+    """估算最旧样本的策略版本差：队列深度乘消费节奏。"""
+    # 队列中最旧批的等待时间约等于队列深度除以吞吐，
+    # 换算成版本差即等待期间完成的更新次数
+    return queue_depth * broadcast_interval * updates_per_batch
+
+
+# 深度 4 批、广播间隔 2、每批约 3 次更新：最旧样本约落后 24 次更新
+print(staleness_budget(4, 2, 3))
+# 版本差超出裁剪容忍的经验区间（个位数到十余次更新）时，
+# 应减小缓冲深度或缩短广播间隔，再观察评估回报是否回升</code></pre>
+    <p>解读：估算函数把"陈旧度"从概念变成可核对的数字：队列深度乘以广播间隔乘以每批更新次数，给出最旧样本的版本落后量。<strong>经验上把版本差控制在十余次更新以内</strong>，裁剪与比率修正在这个范围内保持有效；超出后应优先缩短广播间隔，因为它同时改善所有在途样本的新鲜度。估算值应与实测的裁剪触发比例对照：估算保守而触发比例高，说明还有批次混版本等结构因素在起作用。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>回放比例设置过大</strong>：更新建立在大量历史数据上，策略改进被旧分布拖住。症状是回报曲线变平且裁剪触发比例高。修复：比例回到 0.1 量级小步校准，或先设为 0 建立基线。</li>
+      <li><strong>缓冲深度与广播间隔失衡</strong>：积压深而广播稀，样本版本落后过多。症状是 KL 与比率统计失真。修复：按陈旧度估算公式调整两者，先缩间隔再减深度。</li>
+      <li><strong>小任务盲目启用异步结构</strong>：两侧耗时接近且都短，重叠收益抵不过复杂度。症状是调参成本上升而墙钟收益不明显。修复：以同步 PPO 为基线做两组对照，用数据决定。</li>
+      <li><strong>队列丢弃未监控</strong>：满队列静默丢弃旧批，训练数据实际由新批构成。症状是行为与回放比例配置不符。修复：把丢弃次数与队列深度纳入诊断面板。</li>
+      <li><strong>学习率未随结构下调</strong>：异步结构下更新更密集，原学习率过强。症状是价值损失高频震荡。修复：相对同步基线下调学习率或减少每批轮数。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>队列深度 8、广播间隔 1、每批 4 次更新时，估算最旧样本的版本差并判断是否超出容忍范围。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>约 32 次更新，超出十余次的经验区间；应先缩短广播间隔或降低深度。</div></details>
+      </li>
+      <li>把 replay_proportion 从 0 提到 0.3，预测数据利用率、样本陈旧度与评估回报的变化方向。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>利用率上升、陈旧度上升；回报先升后降的形态常见，拐点由任务对分布偏移的敏感度决定。</div></details>
+      </li>
+      <li>推导：说明异步重叠对迭代时间的理论上界，以及两侧耗时不均时收益如何被压住。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>理想重叠下迭代时间趋近两侧耗时的较大值；一侧占比越高，交替结构的空转越小，可重叠部分越小。</div></details>
+      </li>
+      <li>设计对照实验：同步 PPO 与 APPO 在相同采样预算下的墙钟时间与评估回报对比，给出结论判据。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>同一硬件、同一种子、同批次；判据是墙钟缩短比例与回报差值同时可接受，任一不达标则退回同步。</div></details>
+      </li>
+      <li>设计监控面板：为异步结构选择队列深度、丢弃率、样本年龄与裁剪触发比例四项指标，说明各自的告警阈值设计思路。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>深度与丢弃率联动看供需匹配；年龄与陈旧度估算对照；裁剪触发比例超过两成时检查广播间隔与回放比例。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>APPO 把采样与学习解耦，有界队列连接两侧节奏，参数广播周期决定新鲜度。</li>
+      <li>缓冲深度与回放比例共同决定训练分布的时间跨度，是吞吐与陈旧度的交换旋钮。</li>
+      <li>陈旧度以策略版本差度量，进入裁剪目标后表现为触发比例上升与更新冻结。</li>
+      <li>轮数与学习率相对同步 PPO 下调，消化版本差带来的目标偏移。</li>
+      <li>是否启用 APPO 由对照实验决定：重叠收益与回报代价同时入账。</li>
+      <li>下一章讨论 IMPALA：以 V-trace 修正支持更高采样规模的解耦结构。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch038.html">← 第 038 章：RLlib实现PPO算法</a>
+    <a class="next" href="ch040.html">第 040 章：RLlib实现IMPALA算法 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

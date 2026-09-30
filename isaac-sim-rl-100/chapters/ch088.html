@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第088章 实现视觉伺服 | 机器人仿真学习课程 · Isaac Sim 强化学习训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第四篇 · 控制与优化</span>
+    <span class="sep">/</span>
+    <span>第 088 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第四篇 · 控制与优化</div>
+    <h1>第 088 章：实现视觉伺服</h1>
+    <p class="lead">让相机进入控制回路：不先"看清、算出位姿、再运动"，改为用图像误差直接驱动机械臂。本章讲透 IBVS 与 PBVS 的分野、交互矩阵的直觉，以及 RL 如何在延迟、遮挡与未标定下工作。</p>
+    <ul class="meta">
+      <li>主题：控制与优化 / 视觉反馈闭环</li>
+      <li>相关组件：Isaac Sim / Isaac Lab / Stable-Baselines3</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 087 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解视觉伺服（visual servoing）与"看一次再走"（look-then-move）开环方案的本质差别。</li>
+      <li>掌握 IBVS 与 PBVS 两类方法的原理、交互矩阵的直觉，以及各自对标定误差/视野约束的敏感度。</li>
+      <li>会设计视觉伺服的 RL 环境：图像特征观测、归一化、奖励、延迟与遮挡建模。</li>
+      <li>会写一个最小的 IBVS 控制律，并解释 1/z 因子为何让它对深度误差"钝感"。</li>
+      <li>能诊断图像坐标未归一化、视觉延迟振荡、特征丢失处理缺失等问题。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>上一章我们让机械臂学会了"摸着干"，用力反馈稳住接触。但很多任务连"目标在哪"都不知道：来料箱里的零件每次位置都不同，传送带上的工件在动。传统方案是"看一次、算位姿、然后盲走"（look-then-move），中途的误差只能等下一轮再看。视觉伺服（visual servoing）把相机放进闭环：<strong>每一帧都据此修正运动，误差被持续地压向零</strong>。</p>
+    <p>这套方法在经典机器人学里已很成熟（IBVS/PBVS 从 1990 年代起有完整理论），但落地始终受限于标定、深度与特征提取。强化学习恰好补在这三处：可以直接吃像素、可以学"看不到目标时怎么办"、可以在未标定相机下工作。本章两者都讲，让你知道什么时候信经典、什么时候用学习。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 从开环到闭环：误差驱动 vs 位姿驱动</h3>
+    <p>look-then-move 的流程是"观测→估计目标位姿→规划路径→执行"，误差只在下一次观测时才被纠正；视觉伺服则把图像测量 s(I) 与期望 s* 的差直接接进控制律。两种主流定义：</p>
+    <table>
+      <tr><th>方法</th><th>误差定义</th><th>控制律形态</th><th>敏感点</th></tr>
+      <tr><td>IBVS（基于图像）</td><td>e = s(I) − s*（像素）</td><td>v = −λ·L<sub>s</sub><sup>+</sup>·e</td><td>深度未知只影响增益；轨迹在 3D 中可能绕</td></tr>
+      <tr><td>PBVS（基于位置）</td><td>e = 目标位姿误差（3D）</td><td>v = −λ·e</td><td>依赖标定与位姿估计精度；3D 轨迹可预期</td></tr>
+    </table>
+    <p>一句话选型：<strong>相机没标定好、但特征好提取，用 IBVS；标定准、要求 3D 轨迹可解释（如避障），用 PBVS</strong>。经典的第一课往往是 IBVS，因为它对参数误差不敏感，这份鲁棒性几乎是白送的。</p>
+
+    <h3>2. 交互矩阵：像素速度与相机速度的桥</h3>
+    <p>对相机坐标系下的一个三维点 P = (X, Y, Z)，其投影图像坐标为 (u, v) = (fX/Z, fY/Z)（f 为焦距）。对时间求导，得到像素速度与相机六维速度 ξ = (v, ω) 的线性关系：</p>
+    <div class="formula">
+      ṡ = L<sub>s</sub> · ξ，&nbsp; 对点特征：
+      L<sub>s</sub> = [ −1/Z,&nbsp; 0,&nbsp; u/Z,&nbsp; uv,&nbsp; −(1+u²),&nbsp; v；&nbsp; 0,&nbsp; −1/Z,&nbsp; v/Z,&nbsp; 1+v²,&nbsp; −uv,&nbsp; −u ]
+      <span class="note">两行对应 (u, v)；前 3 列是平移贡献（1/Z 因子），后 3 列是旋转贡献（u、v 的乘积项）</span>
+    </div>
+    <p>不用背矩阵，记住三个直觉：（1）<strong>平移的贡献被 1/Z 缩放</strong>，目标越远，同样的运动在图像上"走得越少"，所以深度未知时控制增益会偏，但方向不变：这就是 IBVS 鲁棒的来源；（2）旋转贡献包含 uv 交叉项，相机转动时图像特征的运动是"非线性耦合"的，靠近图像边缘时尤其明显；（3）由 e 反推速度需要 L<sub>s</sub><sup>+</sup>（伪逆），当特征退化（如点共线、面对相机后退）时退化。</p>
+
+    <h3>3. 著名的"出视野"问题</h3>
+    <p>IBVS 直勾勾地最小化像素误差，可能出现戏剧性场面：误差单调下降，但相机在 3D 空间绕了大圈，中途特征点滑出画面，误差定义直接失效。数学原因是 L<sub>s</sub> 伪逆解只保证"误差下降快"，不保证"特征留在视野内"。治法：把视野边界写成约束（二次规划）、改用 PBVS、或用 RL，把"目标是否在视野内"纳入观测与奖励，学习"先退后进"的战略性运动。</p>
+
+    <h3>4. 学习型视觉伺服：三种接入方式</h3>
+    <ol>
+      <li><strong>端到端像素</strong>（第 027 章的延伸）：CNN 直接吃图像，输出末端速度。隐式完成了特征提取与伺服，但需要大量数据，且黑盒难得解释。</li>
+      <li><strong>特征输入</strong>：用传统检测器输出特征点坐标/框中心，归一化后加入观测。训练样本量下降一个数量级，本课推荐起步方案。</li>
+      <li><strong>混合残差</strong>：经典 IBVS 提供基准速度指令，RL 学一个修正量。训练最容易，部署最稳。</li>
+    </ol>
+
+    <h3>5. 延迟：视觉伺服的头号敌人</h3>
+    <p>相机一般 30 Hz，控制 60 Hz；再加上曝光、传输与推理，视觉闭环的纯滞后可达 60–100 ms。用"当前帧"的误差去控制"当前关节"相当于给系统注入延迟，闭环带宽稍大就会振荡。数字感：一阶延迟 τ=80 ms 时，环路增益超过约 1/(2πτ) ≈ 2 Hz 的带宽就危险，<strong>视觉伺服的带宽通常被压到 0.5–1 Hz，靠底层 10–50 Hz 的位置/速度环"内环"撑住快速动态</strong>。RL 侧的对策：观测里拼接 2–3 帧历史（隐式速度估计），策略天然学会对延迟的反应方式。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <ol>
+      <li><strong>任务定义</strong>：相机对准目标=目标出现在图像中心（期望特征 s*）且距离约 0.5 m。成功判据用像素误差（&lt;10 px）加 3D 距离区间。</li>
+      <li><strong>特征选择</strong>：四个点的角点（如 ArUco 板的四角）信息最丰富；本课用简化的"目标框中心 + 框面积"（面积隐含深度 1/Z² 关系）。</li>
+      <li><strong>观测</strong>：归一化像素坐标（(u−c<sub>x</sub>)/W → [−0.5, 0.5]）、框面积、关节位置/速度、以及两帧历史特征。归一化必须做，像素值几百，不归一化会压死其它观测维度。</li>
+      <li><strong>动作</strong>：末端六维速度指令（有限幅，如线速度 ≤0.3 m/s、角速度 ≤0.6 rad/s），经底层 IK/控制器执行。比直接关节力矩学得快。</li>
+      <li><strong>奖励</strong>：r = −‖s−s*‖<sub>norm</sub> − 0.01·超时 − 0.1·(特征出界) + 1.0·到达。出界惩罚是必须的：没有它，IBVS 式策略会重演"绕圈出画"。 </li>
+      <li><strong>延迟与噪声</strong>：观测使用 2 帧前的图像（模拟 66 ms 延迟），加像素噪声 ±1 px、光照±20%；这些也是域随机化（第 021 章）的组成部分。</li>
+      <li><strong>课程</strong>：初始偏差从 20 px 开始，逐步加到 150 px（接近出画）；训练后期再叠加目标的小幅运动。</li>
+    </ol>
+    <div class="box key">
+      <span class="box-title">设计思维：像素误差不等于物理误差</span>
+      <p>图像上"目标在左边 30 px"与"目标在近处偏左"对应的物理动作完全不同，前者可能是横移，也可能是纯旋转（视差不同）。<strong>单帧图像无法区分深度，必须靠运动视差（motion parallax）：相机横向移动时，远近物体的像移动速度不同。</strong>所以视觉伺服的观测几乎总要包含历史帧，让策略能"从运动推断深度"。这也是为什么第 027 章的纯单帧像素策略在深度敏感任务上表现差。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：最小 IBVS 控制律（理解交互矩阵）</strong></p>
+    <pre class="code"><code>import numpy as np
+
+def ibvs_step(uv, uv_star, Z_est, K=0.5, v_max=0.3, w_max=0.6):
+    """单点 IBVS：由像素误差与深度估计计算相机六维速度指令。
+    uv/uv_star: (2,) 当前/期望像素坐标（已除以焦距，即归一化坐标）。
+    Z_est: 目标点深度的估计（相机系，米），不需要精确！"""
+    e = uv - uv_star                                # 像素误差（归一化坐标）
+    u, v = uv[0], uv[1]
+    # 交互矩阵的两行：前 3 列平移（1/Z 缩放），后 3 列旋转（乘积/平方项）
+    L = np.array([
+        [-1.0 / Z_est, 0.0, u / Z_est, u * v, -(1 + u * u), v],
+        [0.0, -1.0 / Z_est, v / Z_est, 1 + v * v, -u * v, -u],
+    ])
+    # 伪逆解：6 自由度最小范数速度；2 个方程 6 个未知数，有无穷多解
+    L_pinv = np.linalg.pinv(L)
+    xi = -K * L_pinv @ e                            # 期望相机速度（相机系）
+    # 分别限幅：线速度 0.3 m/s、角速度 0.6 rad/s，超了就按比例缩放保方向
+    v_lin, w_ang = xi[:3], xi[3:]
+    s_lin = min(1.0, v_max / max(np.linalg.norm(v_lin), 1e-6))
+    s_ang = min(1.0, w_max / max(np.linalg.norm(w_ang), 1e-6))
+    return np.concatenate([v_lin * s_lin, w_ang * s_ang])
+</code></pre>
+    <p>解读：这段 20 行把 IBVS 的骨架说完了。（1）<code>Z_est</code> 只出现在 <code>1/Z_est</code> 因子中，把真实深度 1.0 m 估成 0.7 m，增益放大 1.4 倍，但<strong>速度方向完全不变</strong>，闭环只是收敛快慢不同；这是 IBVS 对深度误差鲁棒的机制（若增益过大会在近处振荡）；（2）<code>pinv</code> 是"最小范数解"：2 个误差方程解 6 个速度自由度，多余 4 维留给"让其它特征同时更好"或用阻尼（第 084 章 DLS）；（3）分别对线/角速度限幅并保方向（按比例缩放）比逐分量 clip 更合理，逐分量 clip 会改变速度方向，误差反而增大。真机上还要把相机速度转到末端/基座系（手眼变换），片段里省略但注释保留。</p>
+
+    <p><strong>片段 2：RL 环境的视觉特征观测与奖励</strong></p>
+    <pre class="code"><code>class VisualServoEnv:
+    """目标框中心 + 面积的简化视觉伺服环境（Isaac Lab 风格片段）。"""
+
+    def __init__(self, num_envs, img_w=640, img_h=480, delay_frames=2):
+        self.W, self.H = img_w, img_h
+        self.delay = delay_frames               # 模拟 66 ms 视觉延迟（2 帧@30Hz）
+        self.hist = deque(maxlen=3)             # 历史特征：供策略推断运动视差
+
+    def _extract_features(self, seg_map):
+        # 用分割图/色块求目标框中心与面积；真实系统里换成检测器输出
+        ys, xs = torch.where(seg_map &gt; 0.5)
+        if xs.numel() == 0:
+            return None                          # 目标丢失：调用方给丢失编码
+        cx = xs.float().mean() / self.W          # 归一化到 [0,1]，防尺度压死观测
+        cy = ys.float().mean() / self.H
+        area = xs.numel() / (self.W * self.H)    # 面积 ∝ 1/Z^2，隐含深度信息
+        return torch.stack([cx, cy, area])
+
+    def compute_obs(self, features, joints):
+        # 延迟注入：用 delay 帧之前的特征（模拟相机 + 推理滞后）
+        self.hist.append(features)
+        s_delayed = self.hist[0] if len(self.hist) &gt; self.delay else features
+        if s_delayed is None:                    # 丢失时给 (0.5, 0.5, 0) 的"无目标"
+            s_delayed = torch.tensor([0.5, 0.5, 0.0])
+        return torch.cat([s_delayed, joints], dim=-1)
+
+    def compute_reward(self, features, s_star, time_scale=0.01):
+        if features is None:
+            return -time_scale - 0.1             # 目标丢失：小惩罚，别让策略怕探索
+        err = torch.linalg.norm(features - s_star)
+        return -err - time_scale                 # 误差用归一化单位，与时间税同量级
+</code></pre>
+    <p>解读：（1）<code>area</code> 是 2D 视觉里唯一"深度代理"，远小近大（∝1/Z²），没有它，单帧图像对深度完全盲；（2）延迟注入用 <code>deque</code> 延迟 2 帧，<strong>训练时有延迟、评估时才不会失稳</strong>；如果你在仿真里用零延迟训练、真机 66 ms 延迟部署，振荡几乎必然；（3）目标丢失的编码 (0.5, 0.5, 0) 表示"图像中心无目标"，策略可以学到"后退搜索"的行为；丢失时的惩罚必须小（−0.1 量级），否则策略会为了"不丢目标"而不敢动；（4）奖励误差在归一化单位下（图像对角小于 1），与时间税 −0.01 同量级，避免"误差项主导一切"。</p>
+
+    <p><strong>片段 3：历史帧拼接与运动视差线索</strong></p>
+    <pre class="code"><code>def build_parallax_obs(feat_hist, joint_hist):
+    """拼接最近 3 帧特征与关节：让策略从"移动中的像移速度"推断深度。
+    feat_hist: 长度为 3 的列表，每个 (B, 3)；joint_hist 同理 (B, n)。"""
+    import torch
+    # 差分构造"像速度"：帧间像素位移，即视差的核心量
+    d1 = feat_hist[-1] - feat_hist[-2]          # 最近一步的像移
+    d2 = feat_hist[-2] - feat_hist[-3]          # 前一步的像移
+    # 关节差分 = 相机自身运动（末端速度的代理），与像移配对即构成视差线索
+    jd1 = joint_hist[-1] - joint_hist[-2]
+    return torch.cat([feat_hist[-1], d1, d2, joint_hist[-1], jd1], dim=-1)
+
+# 训练提示：观测维度 = 3(特征) + 3(像移) + 3(像移) + n(关节) + n(关节差分)
+# 策略网络只需 MLP（256x2）即可，不必上 CNN，特征已降维到十几维
+</code></pre>
+    <p>解读：为什么"像移 ÷ 相机运动"能推深度：相机横移 Δx 时，深度 Z 的物体像移 ∝ Δx/Z，<strong>同样运动下像移越小，目标越远</strong>。策略从 <code>d1/d2</code> 与 <code>jd1</code> 的比值里读出深度，这正是单帧观测缺失的维度。十几维特征用 <code>MLP 256×2</code> 即可，不必上 CNN，"特征提取交给传统视觉、决策交给 RL"能极大降低样本需求。注意目标静止时像移完全来自相机自身运动：若训练中初始位姿固定，策略学不到视差，初始随机化在这里是刚性需求。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>像素坐标未归一化</strong>：直接喂 (320, 240) 这类数值，网络第一层权重被大尺度输入主导，训练发散或极慢。修复：减中心、除宽高，映射到 0–1。</li>
+      <li><strong>训练无延迟、部署有延迟</strong>：仿真用即时图像训练，真机 60–100 ms 延迟导致振荡。修复：训练时注入 2 帧延迟 + 历史观测，评估时空延迟应更优。</li>
+      <li><strong>深度增益不保守</strong>：IBVS 的 K 按"最有把握的深度"调大，目标靠近时 1/Z 变大导致振荡甚至发散。修复：按最小深度（最大 1/Z）设计增益，或在线估计深度自适应调 K。</li>
+      <li><strong>出视野没有惩罚</strong>：策略学会"直线冲向目标"但中途目标出画，训练后期成功率突然崩溃。修复：显式惩罚出界 + 丢失时给小惩罚。</li>
+      <li><strong>特征丢失返回 NaN/None 未处理</strong>：检测器丢目标时直接进入观测，网络输出 NaN。修复：统一丢失编码 + 丢失重置/搜索行为课程。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>用片段 1 的控制器把深度估计从真实值改为 0.6 倍与 1.5 倍，观察收敛时间与是否振荡。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>深度低估（Z_est 小）→ 增益变大 → 收敛快但可能振荡；高估则过阻尼。这正是"1/Z 只改增益不改方向"的实验验证。</div></details>
+      </li>
+      <li>把观测中的 <code>area</code>（面积）去掉，训练后评估深度控制精度（用最终 3D 距离误差衡量）。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>只剩 (cx, cy) 时图像中心对齐仍可学，但"停在 0.5 m"没有信号，策略只能靠历史帧视差间接推断，精度显著下降。</div></details>
+      </li>
+      <li>把视觉延迟从 0 调到 4 帧（133 ms），观察成功率崩溃的临界点，并解释与视觉环带宽的关系。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>纯滞后 τ 对应的相位裕度损耗随频率线性增加，闭环带宽约被压到 1/(2πτ)；记录成功率 vs 延迟曲线找拐点。</div></details>
+      </li>
+      <li>设计：写一个 IBVS 出视野的复现案例（初始位姿使直线解会经过大旋转），再训练一个带出界惩罚的 RL 策略对比。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>那种经典 case：相机几乎正对目标但绕一个大圆弧才对准；RL 会学到"先沿视线靠近再对中"的更优路径。</div></details>
+      </li>
+      <li>把特征坐标加 ±2 px 高斯噪声在训练与评估中，比较"只在评估加噪声"与"训练也加"的鲁棒性差异。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>典型域随机化结论：训练跟评估一致时性能最好；训练见过噪声的策略在评估噪声下退化更慢。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul>
+      <li>视觉伺服把图像误差直接接进控制闭环；IBVS 定义在像素域、PBVS 定义在 3D 位姿域，前者对标定误差鲁棒、后者轨迹可预期。</li>
+      <li>交互矩阵 L<sub>s</sub> 的三条直觉：平移被 1/Z 缩放（深度不准只改增益）、旋转含 uv 交叉项、伪逆解可能失去视野。</li>
+      <li>RL 三条接入路线：端到端像素、特征输入、经典+残差；本课推荐"特征输入"起步，观测含历史帧做运动视差。</li>
+      <li>视觉延迟是头号敌人：训练必须注入延迟与历史观测；增益按最小深度保守设计；出视野与丢失必须有惩罚与编码。</li>
+      <li>下一章把视觉与动作"提速"：目标不再静止，抓取发生在毫秒级的时间窗口里，动态抓取，见第 089 章。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch087.html">← 第 087 章：实现力位混合控制</a>
+    <a class="next" href="ch089.html">第 089 章：实现动态抓取 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第043章 联合训练中的批次大小影响 | 具身智能学习课程 · VLA 与世界模型联合训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第三篇 · 策略与世界模型深化</span>
+    <span class="sep">/</span>
+    <span>第 043 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第三篇 · 策略与世界模型深化</div>
+    <h1>第 043 章：联合训练中的批次大小影响</h1>
+    <p class="lead">批次大小通过梯度噪声改变优化轨迹：本章讲清噪声尺度、临界批量与学习率缩放规则，再处理联合训练特有的问题，两个损失头的采样配比与梯度累积的实现细节。</p>
+    <ul class="meta">
+      <li>主题：训练机制 / 批量与优化（Batch Size and Optimization）</li>
+      <li>关键公式：Var[g<sub>B</sub>] = σ² / B，lr ∝ B（线性缩放规则）</li>
+      <li>预计学时：50 分钟</li>
+      <li>前置章节：第 042 章 世界模型的模型架构选择</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <p>本章把批次大小从"显存参数"改写为"优化参数"，覆盖噪声统计、缩放规则与联合训练配比。</p>
+    <ul>
+      <li>理解小批量梯度是真实梯度的带噪估计，噪声方差与批量成反比，信噪比随批量开方提升。</li>
+      <li>掌握梯度噪声尺度（Gradient Noise Scale, GNS）与临界批量（Critical Batch Size）的含义，能估计当前训练处在收益区还是饱和区。</li>
+      <li>掌握线性缩放规则与平方根缩放规则的适用边界，以及预热（Warmup）为什么不可省略。</li>
+      <li>理解联合训练中两个损失头的采样配比与损失权重是两种不同的调节手段，能说明各自的副作用。</li>
+      <li>能正确实现梯度累积（Gradient Accumulation），识别归一化、裁剪位置与批归一化统计三类实现错误。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>批次大小表面上是显存旋钮，实质上是优化器的噪声参数。<strong>批量越大，梯度的方向估计越准，但单步成本越高，且超过临界批量后每步的进展不再随之提升。</strong>联合训练让这个问题更复杂：策略损失在世界模型产生的想象数据上计算，世界模型损失在真实与想象混合数据上计算，两个数据源的可得量、噪声水平与梯度尺度都不同。</p>
+    <p>工程上常见的两个错误都源于把批次当作单纯的速度参数：其一，把批量扩大 4 倍却不调整学习率，训练曲线表现为步数减少但收敛点变差；其二，为节省显存改梯度累积却没有修正归一化位置，等效批量与名义批量不符。本章先建立噪声统计的量纲感，再给出联合训练中的配比原则。前一章决定世界模型的骨干，本章讨论骨干确定后如何配置优化器的批量与步长。</p>
+    <p>量纲参考：视觉语言主干微调的学习率惯例在 1 × 10<sup>−4</sup> 至 3 × 10<sup>−4</sup>，批量惯例在 32 至 256；世界模型训练的场景批量常取 128 至 512。批量与学习率不是自由的两维搜索空间：先按显存确定可用批量上限，再用噪声尺度判断是否值得继续放大，最后按缩放规则与预热锁定学习率曲线；顺序颠倒会反复推翻前一步的结论，配置流程本身就是一条纪律。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p>从单批梯度的统计性质出发，逐步推进到联合训练的配比问题。</p>
+
+    <h3>1. 批量与梯度噪声</h3>
+    <p>设每个样本给出梯度估计 g<sub>i</sub>，批量 B 的梯度为样本梯度的平均：g<sub>B</sub> = (1/B)Σ<sub>i</sub> g<sub>i</sub>。若样本梯度独立同分布，期望与全量梯度一致，方差满足：</p>
+    <div class="formula">
+      Var[g<sub>B</sub>] = σ² / B
+      <span class="note">σ² 为单样本梯度方差；批量放大 4 倍，噪声标准差减半，信噪比提升 2 倍</span>
+    </div>
+    <p>把梯度分解为信号部分 g（训练集上的真实方向）与噪声部分 ε（标准差 σ/√B），单步的更新方向偏离信号的角度随 σ/√B 增大而增大。<strong>小批量训练依靠噪声本身提供探索与隐式正则，大批量训练需要显式补偿，常见手段是提高学习率或增加权重衰减。</strong></p>
+    <p>数值算例：单样本梯度标准差 σ = 1（按全维度聚合），信号范数 ‖g‖ = 0.1。批量 64 时噪声标准差为 1 / √64 = 0.125，信噪比 0.1 / 0.125 = 0.8，更新方向明显受噪声牵引；批量 256 时标准差 0.0625、信噪比 1.6；批量 512 时标准差约 0.0442、信噪比约 2.26。噪声减半需要批量四倍，信噪比翻倍同样需要批量四倍，批量收益的次线性在这个数列里直接可见。</p>
+
+    <h3>2. 临界批量与收益递减</h3>
+    <p>梯度噪声尺度把信号与噪声的比值写成一个等效批量：</p>
+    <div class="formula">
+      B<sub>noise</sub> ≈ tr(Σ) / ‖g‖²
+      <span class="note">tr(Σ) 为梯度协方差的迹；B<sub>noise</sub> 的物理含义是"噪声与信号等价时的批量"</span>
+    </div>
+    <p>当实际批量远小于 B<sub>noise</sub> 时，训练处于噪声主导区，增大批量能近似按比例减少达到同一损失所需的步数，学习率可以同步放大；当批量超过 B<sub>noise</sub> 一个量级后，每步的进展上限由损失曲率决定，继续加大批量只增加成本。<strong>临界批量的量级随训练进程变化：训练初期梯度信号强、噪声小，临界批量较大；接近收敛时信号衰减，临界批量随之下降。</strong>这解释了为何固定超大批量在训练后期显得浪费。</p>
+    <p>数值算例：全维聚合的信号强度 ‖g‖<sup>2</sup> = 0.01、单样本梯度方差 σ<sup>2</sup> = 1 时，B<sub>noise</sub> = σ<sup>2</sup> / ‖g‖<sup>2</sup> = 100。批量在 100 以下时增大批量近似按比例减少达到同一损失的步数；批量升到 1000 以上后每步进展受限，继续加码只增加成本。代码片段 3 的估计口径与这个算例一致：micro = 32 时两个独立梯度的差分平方期望为 2σ<sup>2</sup> / 32 = 0.0625，代入估计式得 32 × 0.0625 / (2 × 0.01) = 100。</p>
+
+    <h3>3. 学习率缩放规则</h3>
+    <p>批量从 B<sub>0</sub> 放大 m 倍时，两种缩放规则各有适用条件：</p>
+    <ul>
+      <li><strong>线性缩放</strong>：lr = m · lr<sub>0</sub>。依据是批量扩大 m 倍后单步的噪声等效于原批量走 m 步的累积效应，在批量不超临界值、优化接近随机梯度下降（Stochastic Gradient Descent, SGD）行为时成立。</li>
+      <li><strong>平方根缩放</strong>：lr = √m · lr<sub>0</sub>。自适应优化器（如 Adam）中梯度尺度被逐参数归一化，方差的直接效应减弱，实证研究对这一规则的支持更常见。</li>
+    </ul>
+    <p>数值算例：基础批量 64、基础学习率 1 × 10<sup>−4</sup>，批量扩到 256（m = 4）时线性规则给出峰值 4 × 10<sup>−4</sup>，平方根规则给出 2 × 10<sup>−4</sup>；预热 800 步内，第 400 步的学习率分别为峰值之半 2 × 10<sup>−4</sup> 与 1 × 10<sup>−4</sup>。两种规则的差距随 m 放大：m = 16 时线性是平方根的四倍，这一差距足以决定训练是否发散，切换规则前必须做对照实验，并以收敛点作为判据；初始下降速度更快不代表最终收敛更好。</p>
+    <table>
+      <tr><th>规则</th><th>lr / lr<sub>0</sub></th><th>适用条件</th><th>用错的症状</th></tr>
+      <tr><td>线性</td><td>m</td><td>小批量区、SGD 类优化器</td><td>大批量下震荡或发散</td></tr>
+      <tr><td>平方根</td><td>√m</td><td>自适应优化器、大批量区</td><td>小批量下训练过慢</td></tr>
+      <tr><td>常数</td><td>1</td><td>批量变化幅度不超过两倍</td><td>等效步长漂移不易察觉</td></tr>
+    </table>
+    <p>无论选择哪种规则，预热都不可省略：训练初期的梯度方向在参数空间中波动大，直接使用峰值学习率容易把参数推入难以恢复的区域。前 1% 至 5% 的步数内线性升到峰值，是成本极低的保险手段。</p>
+
+    <h3>4. 联合训练中的配比问题</h3>
+    <p>联合训练的两个损失头共享参数子集（融合层与动作头同时接收策略与世界模型梯度）。在总批量受限时，存在两种调节手段：</p>
+    <ol>
+      <li><strong>损失权重</strong>：放大弱信号头的权重，等效提高它的学习率，容易放大其梯度噪声。</li>
+      <li><strong>采样配比</strong>：为两个头分配不同的样本数，等效调整各头的批量，噪声水平随之改变。</li>
+    </ol>
+    <p><strong>当某个头的数据稀缺（例如真实交互样本远少于离线帧）时，优先用采样配比保护它的噪声水平，再微调权重实现尺度对齐。</strong>反之，只调权重而不动配比，会在提高权重的同时放大该头的噪声，训练震荡往往是这两种效应叠加的结果。</p>
+    <p>累积归一化的细节在 micro 批次样本数不等时不可忽略：若总累积样本数为 N、某 micro 批次的样本数为 n<sub>i</sub>，该批次的缩放系数应为 n<sub>i</sub> / N；统一的 1 / accum 只对等长批次成立。样本数相等的常见情形两者一致；末尾批次不足或样本过滤后长度变化时，统一除法会让不等批次被过度加权，梯度估计出现与批次结构相关的偏置，症状是训练对数据顺序敏感。</p>
+    <p>配比失衡的数值例子：策略批量 64、世界模型批量 128 时样本配比 1 : 2；若两个头的平均梯度范数分别为 0.02 与 0.2（相差 10 倍），联合梯度方向被世界模型头主导，策略头的有效步长被压低约一个量级。对齐手段有两类：把世界模型损失乘 0.1 做尺度归一，不改噪声水平；或把策略批量放大（例如提到 640）提升策略头信噪比，缩小两头的有效步长差距。选择取决于瓶颈是尺度失衡还是噪声过大，记录两支梯度范数的比值曲线是判断失衡最快的信号；比值在百步窗口内持续单向漂移时，先核对配比再动权重。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>本节给出一套可落地的批量配置：物理批量受显存限制时用累积放大有效批量，学习率按规则同步调整，两个损失头分别记录噪声指标。</p>
+    <h3>配置表</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>策略批量</td><td>64</td><td>动作损失样本数</td><td>想象数据充足，居中取值兼顾噪声与吞吐</td></tr>
+      <tr><td>世界模型批量</td><td>128</td><td>帧预测样本数</td><td>重建目标方差大，需要更大批量稳定梯度</td></tr>
+      <tr><td>累积步数</td><td>4 × 32</td><td>物理显存与有效批量解耦</td><td>micro-batch 32 适配单卡显存，累积后等效 128</td></tr>
+      <tr><td>基础学习率</td><td>1e-4（基础批量 64）</td><td>Adam 步长</td><td>视觉语言主干微调的常见起点，按批量线性缩放</td></tr>
+      <tr><td>预热步数</td><td>总步数的 3%</td><td>抑制初期震荡</td><td>低于 1% 保护不足，高于 10% 浪费训练步</td></tr>
+      <tr><td>梯度裁剪</td><td>1.0</td><td>抑制尖峰</td><td>在累积完成后按全局范数裁剪</td></tr>
+    </table>
+    <div class="box warn">
+      <span class="box-title">实现警告：累积与批归一化并不天然等价</span>
+      <p>梯度累积在数学上等价于大批量求平均，前提是每 micro 批次的损失按样本数正确归一。批归一化（BatchNorm）的滑动统计仍来自 micro 批量，若骨干中使用批归一化，累积得到的是"小批量统计加大批量梯度"的混合行为。修复方式：改用层归一化（LayerNorm），或者在累积前同步各 micro 批次的统计。以 Transformer 与主流 VLA 主干普遍采用的层归一化为例，这个问题通常不出现，混合结构需要单独确认。</p>
+    </div>
+    <p>吞吐与延迟的取舍：累积用时间换显存，micro 批量接近显存上限时它是唯一的放大途径；micro 批量过小则算子利用率下降，同样的等效批量需要更长的总时间。micro 批量的选法是取显存允许的最大值再回退一档，为显存碎片留出余量，避免训练中途出现偶发内存不足。等效批量确定后，micro 批量与累积步数的组合不影响梯度数学，只影响吞吐与显存峰值；实验结论因此以等效批量口径记录，避免不同 micro 组合之间的数字互相矛盾。</p>
+    <h3>与前一章的差异点</h3>
+    <p>第 042 章确定骨干结构，属于静态设计；本章处理同一个骨干下的优化动态，参数（批量、学习率、配比）在训练过程中可调。骨干选择影响可行批量的上界（注意力显存），优化配置在可行域内寻找最优点，两者构成层级关系。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>三个片段分别处理梯度累积、批量缩放调度与噪声尺度估计。命名以公开实现风格为参照，细节随版本演进。</p>
+
+    <p><strong>片段 1：双损失头的梯度累积</strong></p>
+    <pre class="code"><code>import torch
+import torch.nn.functional as F
+
+def train_step_accum(model, optimizer, micro_batches, accum=4):
+    """梯度累积：逐 micro 批次前向反传，累计完成后统一更新一次参数。
+    设计意图：显存只承担 micro 批量的激活，梯度数学上等价于大批量平均。"""
+    optimizer.zero_grad()
+    total = 0.0
+    for micro in micro_batches:
+        obs, actions, frames, next_frames = micro
+        # 策略损失使用想象与真实动作样本，世界模型损失使用帧预测样本
+        loss_policy = F.mse_loss(model.policy(obs), actions)
+        loss_world = F.mse_loss(model.world_model(frames, actions), next_frames)
+        loss = loss_policy + loss_world
+        # 除以累积步数：让累积后的梯度尺度与单次大步更新一致
+        (loss / accum).backward()
+        total += loss.item()
+    # 裁剪放在累积之后：按 micro 批次裁剪会系统性低估真实梯度范数
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    optimizer.step()
+    return total / accum</code></pre>
+    <p>解读：<strong>（1）</strong><code>(loss / accum).backward()</code> 中的除法不可省，省去后梯度是目标值的 accum 倍，等效学习率被意外放大，这类错误在日志上表现为损失前几步抖动后缓慢发散。<strong>（2）</strong>裁剪位置放在累积完成之后，是对完整上游梯度的范数做约束；放在循环内会让每次裁剪独立作用于部分梯度，约束口径不一致。<strong>（3）</strong>两个损失直接相加的前提是量纲接近，若世界模型重建损失量级远大于动作损失，应先做尺度归一化再相加，否则弱信号头在梯度中被淹没。</p>
+
+    <p><strong>片段 2：批量缩放与预热的统一调度</strong></p>
+    <pre class="code"><code>import math
+
+def scaled_lr(step, base_lr=1e-4, base_batch=64, batch=256, warmup=800, total=40000):
+    """线性缩放加余弦退火：批量放大 m 倍，学习率同步放大 m 倍。
+    依据：批量低于临界值时，梯度噪声随批量下降，容许同步放大步长。"""
+    m = batch / base_batch
+    peak = base_lr * m
+    if step &lt; warmup:
+        # 预热期线性上升：训练初期梯度方向波动大，直接上峰值容易破坏权重
+        return peak * step / warmup
+    progress = (step - warmup) / max(1, total - warmup)
+    # 余弦退火在后期平滑收尾，避免峰值步长在收敛区反复震荡
+    return peak * 0.5 * (1.0 + math.cos(math.pi * progress))</code></pre>
+    <p>解读：<strong>（1）</strong>缩放系数取当前批量与基础批量的比值，意味着整个课程里学习率的口径统一挂在"基础批量"上，批量变化时只需改一个入参。<strong>（2）</strong>预热步数与总步数挂钩，数据规模或训练轮次变化时无需重新调参。<strong>（3）</strong>若使用平方根缩放，仅需把 <code>m</code> 改为 <code>math.sqrt(m)</code>；切换前应做一次对照实验，观察两种规则的收敛曲线是否一致。</p>
+
+    <p><strong>片段 3：梯度噪声尺度估计</strong></p>
+    <pre class="code"><code>def flat_grad(model, batch):
+    """把一个 micro 批次的梯度展平成向量，供噪声估计使用。"""
+    model.zero_grad()
+    loss = model.loss(batch)
+    loss.backward()
+    return torch.cat([p.grad.flatten() for p in model.parameters() if p.grad is not None])
+
+def est_gns(model, pool, micro=32):
+    """估计梯度噪声尺度 B_noise = tr(Sigma) / norm(g)^2 的简化形式。
+    原理：两个独立小批梯度的差分反映噪声强度，其均值近似真实梯度方向。"""
+    g1 = flat_grad(model, pool[:micro])
+    g2 = flat_grad(model, pool[micro:2 * micro])
+    diff = (g1 - g2).pow(2).sum().item()      # 差分平方期望 = 2 * sigma^2 / micro
+    mean = 0.5 * (g1 + g2)
+    signal = mean.pow(2).sum().item()         # 均值的平方范数近似 ||g||^2
+    return micro * diff / (2.0 * max(signal, 1e-12))</code></pre>
+    <p>解读：<strong>（1）</strong>估计量由两部分组成：差分平方项度量噪声强度，均值平方项度量信号强度，两者之比乘 micro 批量得到等效噪声批量。<strong>（2）</strong>单次估计的方差很大，工程上跨步做指数滑动平均，观察其随训练推进的变化趋势：趋势下降说明接近饱和区，此时继续加大批量的收益有限。<strong>（3）</strong>该估计需要对参数做一次零梯度与反传，开销约等于一次额外的训练步；建议每 500 至 1000 步记录一次，不进入高频循环。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>扩大批量不调学习率</strong>：症状是步数减少但收敛点变差，验证集指标回落。修复：按线性或平方根规则缩放，并配 3% 步数的预热。</li>
+      <li><strong>梯度累积忘记除以累积步数</strong>：等效学习率被放大 accum 倍，损失曲线初期剧烈震荡。修复：损失先除以累积步数再反传，或使用自动缩放的梯度平均接口。</li>
+      <li><strong>损失权重与采样配比混用不可追溯</strong>：某一头指标异常时无法判断是权重调整还是批量变化所致。修复：固定配比调权重、固定权重调配比，一次只动一个旋钮并记录。</li>
+      <li><strong>用 micro 批次的批归一化统计冒充大批量</strong>：等效行为与真实大批量存在分布差异，指标对不上。修复：改用层归一化，或同步累积期间的统计。</li>
+      <li><strong>临界批量以上继续加码</strong>：吞吐翻倍而效果持平，训练成本浪费。修复：用噪声尺度估计监控，超饱和后把资源转向增加训练步数或数据量。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>推导：若单样本梯度方差为 σ²，证明批量 B 的平均梯度方差为 σ²/B，并解释信噪比为何只按 √B 提升。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>独立同分布下方差按 1/B 缩放是标准结果；信噪比是均值与标准差之比，标准差按 1/√B 下降，所以提升因子为 √B。这解释了批量收益的次线性。</div></details>
+      </li>
+      <li>把世界模型批量从 128 提高到 512，策略批量保持 64，预测三个变化：单步用时、世界模型损失曲线平滑度、两头的相对梯度幅度，并给出需要同步调整的参数。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>单步用时上升但次线性；曲线更平滑；世界模型头梯度信噪比提高，相对幅度可能超过策略头。需要同步调整学习率缩放与损失权重，并检查策略头是否被压制。</div></details>
+      </li>
+      <li>设计实验测量当前训练的临界批量：至少说明如何构造两组不同批量的对照、比较口径（相同样本消耗下的损失下降量）、以及如何判断饱和。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>固定样本预算，用批量 B 与 4B 各训一段，画"损失对样本消耗量"的曲线：两条曲线重合说明批量偏小仍有收益，4B 曲线前段更陡但很快持平说明进入饱和。噪声尺度估计可交叉验证。</div></details>
+      </li>
+      <li>在一块显存受限的卡上，基础批量 64、可用 micro 批量 16，写出梯度累积的实现要点清单：归一化、裁剪位置、随机数种子、批归一化处理。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>损失按 4 归一后再反传；裁剪在累积后执行；每个 micro 批次使用独立随机增强但记录同一随机种子链保证可复现；批归一化改用层归一化或同步统计。</div></details>
+      </li>
+      <li>计算：σ = 1、信号范数 ‖g‖ = 0.1，求批量 64、256、512 下的噪声标准差与信噪比；再说明噪声减半需要批量几倍。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>标准差为 σ / √B：0.125、0.0625、约 0.0442；信噪比为 0.8、1.6、约 2.26。噪声减半需要批量四倍，信噪比翻倍同样要四倍批量，收益严格次线性，批量加码的边际价值随规模衰减。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>批量是优化参数：梯度噪声方差与批量成反比，信噪比随批量平方根提升。</li>
+      <li>梯度噪声尺度 tr(Σ)/‖g‖² 给出临界批量的量级，超过饱和区后加大批量只剩成本。</li>
+      <li>线性缩放适用于小批量区与 SGD 类优化器，平方根缩放更适合自适应优化器；预热始终必要。</li>
+      <li>联合训练中损失权重与采样配比是两种调节手段，数据稀缺的头优先保护其批量。</li>
+      <li>梯度累积必须按累积步数归一，裁剪在累积后执行，批归一化与累积的组合需要单独处理。</li>
+      <li>下一章转向奖励设计：<strong>势函数塑形（Potential-Based Shaping）如何在不改变最优策略的前提下提供稠密学习信号</strong>。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch042.html">← 第 042 章：世界模型的模型架构选择</a>
+    <a class="next" href="ch044.html">第 044 章：VLA策略的奖励塑形 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第006章 节点发现与计算图监控 | 多机器人协同学习课程 · ROS2 通信与系统集成</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · 通信基础与系统搭建</span>
+    <span class="sep">/</span>
+    <span>第 006 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · 通信基础与系统搭建</div>
+    <h1>第 006 章：节点发现与计算图监控</h1>
+    <p class="lead">20 台机器人上线后，第一句话应该是"谁在线、谁和谁连着、谁在偷偷死亡"。本章把计算图变成可查询、可巡检、可告警的对象。</p>
+    <ul class="meta">
+      <li>主题：通信基础 / 系统可观测性</li>
+      <li>关键机制：图发现 API、看门狗心跳、分层监控、滑动窗口频率检测</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 002 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解 ROS2 计算图的动态属性：节点与端点的出现、匹配、消失都在运行中发生，监控必须"活"着做。</li>
+      <li>掌握图查询 API 与 CLI 的关系：<code>get_node_names</code>、<code>count_publishers</code> 等能直接问出"发现状态"，不依赖外部工具。</li>
+      <li>会设计分层监控：进程层、图层、应用层各自解决什么问题，为什么要三层都建。</li>
+      <li>掌握心跳（heartbeat）与看门狗（watchdog）的定量设计：周期、超时、误报与漏报的权衡。</li>
+      <li>能写一个图巡检节点：对照"预期节点清单"检测缺失、静默话题与端点异常，并输出可行动的告警。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>多机器人系统代价最高的故障是<strong>静默死亡</strong>，它比显式崩溃更隐蔽：3 号机器人的定位节点因为一次异常退出了，进程管理器不知道，遥控台不知道，其他机器人照常发协同消息但永远等不到它的状态。没有监控的系统里，这类问题往往是在任务失败数小时后靠"人肉发现"暴露的。</p>
+    <p>ROS2 的一大优势是：通信底座（DDS）本来就在持续交换"谁存在、有哪些端点"的信息，ROS 又把它们暴露成了图查询接口，<strong>监控不需要额外协议，只需要把这些已有的信息读出来、对照预期、及时告警</strong>。本章讲清计算图监控的三个层次与两个核心工具（图巡检、心跳看门狗），它们将在第 018 章（日志与监控）、第 039 章（系统级健康监测）中升级成完整体系，是阶段项目验收指标里"谁掉线多久被发现"的直接答案。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 计算图是"活"的：监控的对象是变化</h3>
+    <p>ROS2 的计算图（computation graph）由节点（node）与各类端点（话题、服务、动作、参数）组成。与静态配置文件不同，它是<strong>运行时持续变化的场景</strong>：机器人接入网络 → 它的节点被其他成员发现；某节点退出 → 它的端点从图中消失；QoS 匹配成功 → 一条数据通路"点亮"。监控的第一个认知是：<strong>监控的对象是"图的变化与预期之间的偏差"，静态的"一张图"没有意义</strong>。</p>
+    <p>DDS 的发现机制（第 010 章详述）让每个参与者天然掌握"域内有哪些成员"。ROS 客户端库把这些信息整理成图查询 API 和 CLI：</p>
+    <table>
+      <tr><th>问题</th><th>API / CLI</th><th>说明</th></tr>
+      <tr><td>有哪些节点？</td><td><code>get_node_names()</code> / <code>ros2 node list</code></td><td>节点全名列表，含命名空间</td></tr>
+      <tr><td>某话题有几个发/收端点？</td><td><code>count_publishers/subscribers()</code> / <code>ros2 topic info</code></td><td>端点计数：匹配失败时数字会不对</td></tr>
+      <tr><td>端点细节（QoS/类型）？</td><td><code>get_publishers_info_by_topic()</code> / <code>--verbose</code></td><td>排障静默不匹配的最终依据</td></tr>
+      <tr><td>图中有什么话题/服务？</td><td><code>get_topic_names_and_types()</code> 等</td><td>用于自动巡检与文档生成</td></tr>
+    </table>
+    <p>一个实践细节：CLI 的图查询走本机守护进程（daemon）的缓存，追求"打字快"；程序里直接调用图 API 拿到的是客户端库视角的实时数据。发现"CLI 与程序看到的不一致"时，<code>ros2 daemon stop</code> 重启守护进程往往能解决，但更本质的原因是<strong>发现本身有时间差</strong>，任何图快照都只是"此刻的近似"。</p>
+
+    <h3>2. 三层监控：进程活着 ≠ 节点活着 ≠ 数据流动</h3>
+    <p>很多团队只装了一层监控（进程守护），然后在故障复盘时才发现盲区。三层各自的职责：</p>
+    <ul>
+      <li><strong>进程层</strong>：操作系统视角，进程在不在、CPU/内存多少。工具是 systemd、supervisor 或容器健康检查。它能发现"整个进程死了"，但发现不了"进程活着、里面的节点早退出了"。</li>
+      <li><strong>图层</strong>：ROS 视角，节点是否注册、关键端点的发布者/订阅者计数是否符合预期。这一层能发现"节点半死""发现没完成""QoS 静默不匹配"（计数与预期不符）。</li>
+      <li><strong>应用层</strong>：业务视角，话题频率、心跳、端到端延迟。图层说"数据通路存在"，应用层才回答"数据真的在流"。一个订阅者匹配上了但发布者卡死，只有应用层能发现。</li>
+    </ul>
+    <p>三层是递进的推理链：进程死了 → 图里节点消失；节点崩了但进程还在 → 图里缺节点；图正常但数据不流 → 应用层频率掉零。<strong>故障定位的效率完全取决于你把探测点放在哪一层。</strong>探测点放置还有一条原则：<strong>探测要能代表被测对象，又不能被它的失效一并带走</strong>。本机体检放在同一台机器上的独立节点里，生产节点崩了它还在，取数也不经过网络；中心看门狗只看心跳流，业务流量再乱也不影响它对"在不在"的判断。反例是把频率统计写死在业务节点自身：节点一崩，指标与节点一起消失，监控看到的最后一条数据永远是"正常"。</p>
+
+    <h3>3. 心跳与看门狗：把"活着"变成数字</h3>
+    <p>应用层最通用、成本最低的机制是心跳：每个机器人周期发布一条极小的心跳消息（标识 + 时间戳 + 关键状态），监控端记录"最后一次收到的时间"。若超过 <strong>超时阈值 = 心跳周期 × N</strong> 没收到，判定失联。参数量化：</p>
+    <div class="formula">
+      检测时间上限 ≈ 心跳周期 × N；稳态带宽 = 心跳大小 × 频率 × 台数
+      <span class="note">1 Hz 心跳、N=3：最坏 3 s 发现失联，稳态带宽 20 台 × 64 B ≈ 1.3 KB/s，廉价的可靠性保险</span>
+    </div>
+    <p>周期与阈值直接决定两种错误的比例：阈值太紧（比如周期 100 ms、阈值 150 ms），网络抖动就会疯狂误报"失联"（误报），值班员很快对它脱敏；阈值太松（阈值 30 s），真失联半小时才发现（漏报）。<strong>合理起点：心跳 1–2 Hz、阈值 3–5 个周期，并要求"连续 K 次超时"才升级为告警</strong>，用连续判定滤掉偶发丢包。</p>
+    <p><strong>算例：连续 N 次判定把误报压到多少？</strong>设单次心跳丢失概率为 p 且各次相互独立，连续 N 次全丢的概率为 p<sup>N</sup>。1 Hz 心跳、p = 5% 时，N=3 的误报概率 1.25×10⁻⁴，按一天 86400 次判定计，每台机器人每天约 <strong>11 次</strong>误报，值班员必然脱敏；把 N 提到 5，误报降到约 <strong>37 天一次</strong>。三档对比：</p>
+    <table>
+      <tr><th>单次丢包率 p</th><th>N=3：误报频率</th><th>N=5：误报频率</th><th>取值建议</th></tr>
+      <tr><td>1%</td><td>约 12 天一次</td><td>数百年一次</td><td>N=3 已够用</td></tr>
+      <tr><td>5%</td><td>每台每天约 11 次</td><td>约 37 天一次</td><td>必须 N=5</td></tr>
+      <tr><td>10%</td><td>每台每天约 86 次</td><td>约 1.2 天一次</td><td>先修网络，再谈阈值</td></tr>
+    </table>
+    <p>换算成设计规则：若目标是"每台机器人每月不超过 1 次误报"，在 p = 1%、5%、10% 三档下分别需要 N ≥ 4、5、7。注意上表假设各次丢失独立；真实无线网络的丢包常成串出现（漫游、干扰突发），连带丢失会让误报率高于估值，<strong>所以 N 要按"实测网络最差时段"来定</strong>。顺带把心跳计入带宽表：64 B 载荷经 UDP/IP/RTPS 封装后线上约 162 B，20 台 1 Hz 共约 3.2 KB/s，相对控制流量可以忽略，但写进预算就不会在扩容时被忘掉。</p>
+    <p>还有一个拓扑问题："谁监视谁"。两种基本结构：<strong>中心监控</strong>（一个监控节点收全队心跳，简单、有全局视图，但监控端是单点）与<strong>去中心互相监视</strong>（每台机器人监视邻居，无单点、但全局视图要靠聚合）。工程折中很常见：中心监控做全局视图 + 每台机器人本地看门狗（监视遥控/调度链路），互相兜底。</p>
+
+    <h3>4. 图巡检：把"预期拓扑"文档化并自动对照</h3>
+    <p>监控要回答"图对不对"，前提是有"标准答案"。做法是把预期拓扑写成清单：<strong>每台机器人应有哪些节点、每个关键话题应有几个发布者/订阅者</strong>。巡检节点周期（如每 5 s）扫描图，逐项对照：</p>
+    <ul>
+      <li>预期节点缺失 → 节点没起来或崩了（线索交给进程层与日志）；</li>
+      <li>话题发布者数 = 0 而预期 ≥ 1 → 发布端异常；订阅者数为 0 而预期 ≥ 1 → 消费端异常或命名/匹配问题；</li>
+      <li>发现超过阈值时间仍不达标 → 可能是发现故障（对比第 010 章的排查）。</li>
+    </ul>
+    <p>巡检与心跳互补：巡检回答"结构对不对"（可以在数据静默前就发现端点消失），心跳回答"数据流是否活着"。两者叠加，才能覆盖"静默死亡"的全部形态。</p>
+    <table>
+      <tr><th>维度</th><th>图巡检</th><th>心跳看门狗</th></tr>
+      <tr><td>回答的问题</td><td>结构对不对：节点与端点是否齐全</td><td>数据流是否活着</td></tr>
+      <tr><td>时间尺度</td><td>秒到十几秒，跟随发现收敛</td><td>秒级：心跳周期 × N</td></tr>
+      <tr><td>运行开销</td><td>查询图 API，接近零流量</td><td>每台持续发送一条极小消息</td></tr>
+      <tr><td>发现不了的故障</td><td>端点都在、数据不流（发布者卡死）</td><td>单个子节点退出但整机心跳照常</td></tr>
+      <tr><td>误报来源</td><td>发现尚未收敛、预期清单过期</td><td>网络抖动、丢包成群</td></tr>
+    </table>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>以 20 台机器人车队设计监控系统，按"清单 → 分层 → 拓扑 → 告警"四步：</p>
+    <ol>
+      <li><strong>写监控清单</strong>：把"系统健康的定义"落成表格，检查项、方法、阈值、动作。没有清单的监控会退化成"凭感觉加告警"。</li>
+      <li><strong>分层落点</strong>：进程层交给部署工具（systemd 自动重启 + 日志）；图层与应用层由本章的巡检节点与本地体检节点承担。</li>
+      <li><strong>定拓扑</strong>：每台机器人跑"本地体检"（测自己的话题频率，本机测量不受网络影响）；中央"车队监控"节点订阅各机的体检报告与心跳，做全局状态聚合与告警。</li>
+      <li><strong>设计告警策略</strong>：分级（INFO/WARN/CRITICAL）、连续判定（连续 3 次异常才告警）、恢复通知（失联恢复也要发一条）。</li>
+    </ol>
+
+    <h3>监控清单（节选）</h3>
+    <table>
+      <tr><th>检查项</th><th>层</th><th>方法</th><th>阈值/条件</th><th>动作</th></tr>
+      <tr><td>节点进程存活</td><td>进程</td><td>systemd/容器状态</td><td>退出即事件</td><td>自动重启 + 记日志</td></tr>
+      <tr><td>预期节点在图中</td><td>图</td><td>图巡检对照清单</td><td>缺失 &gt; 10 s</td><td>WARN→CRITICAL</td></tr>
+      <tr><td>关键话题端点计数</td><td>图</td><td>count_publishers/subscribers</td><td>与预期不符 &gt; 10 s</td><td>告警（疑发现或 QoS 问题）</td></tr>
+      <tr><td>里程计话题频率</td><td>应用</td><td>本机滑动窗口</td><td>&lt; 45 Hz（预期 50）</td><td>本机告警 + 上报</td></tr>
+      <tr><td>心跳</td><td>应用</td><td>中心看门狗</td><td>连续 3 周期未收到</td><td>CRITICAL：失联</td></tr>
+    </table>
+
+    <div class="box key">
+      <span class="box-title">设计决策：为什么频率检测要放在每台机器人的本地体检节点里，中央监控端行不行？</span>
+      <p>如果中央监控跨网络订阅 20 台机器人的话题来测频率，测出的数字混入了网络损耗与调度抖动，一台 WiFi 信号差的机器人会被误判为"话题异常"，而问题根源在网络，不在发布端。把频率检测放在<strong>生产数据的本机</strong>（甚至直接在发布者的定时器里统计），得到的是"系统真实产出率"；网络层的损耗另外由心跳与延迟指标衡量。<strong>让每一层只回答自己能回答的问题</strong>，是监控系统可信度的来源。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：图巡检节点，对照清单检查节点与端点</strong></p>
+    <pre class="code"><code>class GraphInspector(Node):
+    """每 5 秒对照"预期清单"巡检计算图：缺节点、端点计数异常都要报。"""
+    def __init__(self):
+        super().__init__("graph_inspector")
+        # 预期清单：图中"必须存在"的节点与"最小端点计数"，应由部署配置生成
+        self.expected_nodes = {f"/robot{r}/odom_pub" for r in range(1, 5)}
+        self.expected_edges = {                 # 话题 -&gt; (最少发布者, 最少订阅者)
+            "/robot1/cmd_vel": (1, 1),
+            "/fleet/battery_min": (0, 1),
+        }
+        self.create_timer(5.0, self.inspect)    # 巡检周期：与发现时间尺度匹配
+
+    def inspect(self):
+        live = set(self.get_node_names())       # 实时图查询：不需要额外协议
+        for n in self.expected_nodes - live:    # 预期存在但图中没有：缺失告警
+            self.get_logger().error(f"节点缺失: {n}")
+        for topic, (min_pub, min_sub) in self.expected_edges.items():
+            npub = self.count_publishers(topic)
+            nsub = self.count_subscribers(topic)
+            # 端点计数不符时，可能是节点问题，也可能是发现/QoS 匹配问题
+            if npub &lt; min_pub or nsub &lt; min_sub:
+                self.get_logger().warn(
+                    f"{topic}: pub={npub}(&gt;={min_pub}), sub={nsub}(&gt;={min_sub})")</code></pre>
+    <p>解读：<strong>（1）</strong>巡检的价值在于"对照"，没有预期清单，图上有什么都不算异常。清单应该由部署配置（launch 里的机器人列表）自动生成；在监控代码里手抄一份会导致每次扩编都要改两处。<strong>（2）</strong>节点缺失与端点计数分开报：前者通常是进程问题，后者也可能是发现或 QoS 问题（第 010、012 章的排查工具在这里被程序化）。<strong>（3）</strong>巡检周期 5 s 是刻意的：小于发现收敛时间会误报（图还没稳定），太长则故障发现慢；与心跳的秒级检测配合，覆盖不同时间尺度。</p>
+
+    <p><strong>片段 2：本地体检，滑动窗口频率检测与心跳</strong></p>
+    <pre class="code"><code>class HealthReporter(Node):
+    """本机体检：测关键话题的真实频率，同时向车队广播心跳。"""
+    def __init__(self, robot_id, watch_topics):
+        super().__init__("health", namespace=f"robot{robot_id}")
+        self.robot_id = robot_id
+        self.stamps = {t: deque(maxlen=100) for t in watch_topics}   # 每话题的到达时刻窗口
+        for t in watch_topics:
+            # 用与生产者一致的 QoS 订阅，才能测到"真实"频率，避免被过滤后测出假象
+            self.create_subscription(Header, t, partial(self.on_msg, t), QoSProfile(depth=50))
+        # 心跳：1 Hz、极小载荷；失联检测的原料
+        self.hb_pub = self.create_publisher(Heartbeat, f"/robot{robot_id}/heartbeat",
+                                            QoSProfile(depth=1))
+        self.create_timer(1.0, self.beat)
+        self.create_timer(5.0, self.report)
+
+    def on_msg(self, topic, _msg):
+        self.stamps[topic].append(self.get_clock().now().nanoseconds)  # 只记录时刻
+
+    def beat(self):
+        msg = Heartbeat()
+        msg.robot_id = self.robot_id
+        msg.stamp = self.get_clock().now().to_msg()
+        msg.state = "active"
+        self.hb_pub.publish(msg)                # 心跳语义：我还活着（内容从简）
+
+    def report(self):
+        for t, q in self.stamps.items():
+            if len(q) &lt; 2:
+                self.get_logger().warn(f"{t} 无数据")
+                continue
+            # 窗口频率 = (样本数-1) / 时间跨度：跨过"窗口里到底几个"的歧义
+            span = max(q[-1] - q[0], 1)
+            hz = (len(q) - 1) / (span / 1e9)
+            if hz &lt; 45.0:                       # 预期 50 Hz：低于 90% 即告警
+                self.get_logger().warn(f"{t} 频率异常: {hz:.1f} Hz")</code></pre>
+    <p>解读：<strong>（1）</strong>频率用"滑动窗口"测：窗口太短（如 1 秒）量化误差大，50 Hz 的期望在 1 秒窗里天然是 ±2% 抖动；<code>deque(maxlen=100)</code> 让窗口兼顾"长到能平均"与"短到能及时发现"。<strong>（2）</strong>体检节点用自己的 QoS 订阅被测话题，注意注释：若生产者是 Best-effort、体检端用 Reliable，匹配不上会测出"零频率"的假象，所以 QoS 要对齐（第 012 章会给完整规则）。<strong>（3）</strong>心跳与告警分离：心跳走极简负载（失联检测只需要"到达"这件事），频率等细节走 5 s 一次的本地报告，<strong>把"我在"和"我好"分成两条信息，各自用合适的频率</strong>，避免心跳被大报文拖累。</p>
+
+    <p><strong>片段 3：中心看门狗，连续判定防误报</strong></p>
+    <pre class="code"><code>class FleetWatchdog(Node):
+    """中心看门狗：收敛全队心跳，连续缺失才判失联，恢复也要报。"""
+    def __init__(self, robot_ids, period=1.0, miss_limit=3):
+        super().__init__("fleet_watchdog")
+        self.last_seen = {}                      # rid -&gt; 最近一次心跳的本地时刻
+        self.missed = {r: 0 for r in robot_ids}  # 连续未收到次数
+        self.down = {r: False for r in robot_ids}
+        for rid in robot_ids:
+            # 心跳用绝对名订阅；参数与调度器共用一份"失联阈值"配置（第 005 章）
+            self.create_subscription(Heartbeat, f"/robot{rid}/heartbeat",
+                                     partial(self.on_beat, rid), QoSProfile(depth=1))
+        self.create_timer(period, self.check)
+
+    def on_beat(self, rid, _msg):
+        self.missed[rid] = 0                     # 任何一次到达都清零：连续判定
+        self.last_seen[rid] = self.get_clock().now()
+
+    def check(self):
+        now = self.get_clock().now()
+        if not self.last_seen:                   # 还没有任何首跳：由图巡检盯启动，不在此误报
+            return
+        for rid, t0 in list(self.last_seen.items()):
+            gap = (now - t0).nanoseconds / 1e9
+            if gap &gt; 1.5:                        # 一个周期 1 s，1.5 s 未见记一次
+                self.missed[rid] += 1
+                # 连续 3 次（≈3.5 s）才升级为失联：滤掉偶发丢包与抖动
+                if self.missed[rid] &gt;= 3 and not self.down[rid]:
+                    self.down[rid] = True
+                    self.get_logger().error(f"robot{rid} 失联（连续 {self.missed[rid]} 次）")
+            elif self.down[rid]:                  # 恢复也是事件：值班界面要看到"康复"
+                self.down[rid] = False
+                self.get_logger().info(f"robot{rid} 已恢复心跳")</code></pre>
+    <p>解读：<strong>（1）</strong>核心是<strong>连续判定</strong>：任何一次心跳到达就清零计数，只有连续 3 个检查周期都没有心跳才判失联，"心跳阈值 ×N"的工程化实现，把偶发丢包与真实失联区分开。<strong>（2）</strong>注意代码里一个细节：<code>check</code> 遍历 <code>last_seen</code>，从不"假设刚启动时所有机器人都该有心跳"（那些机器人还没有首跳记录，不该立刻炸出 20 条告警），首次心跳缺失是启动问题，交给图巡检的清单去管。这种"两种监控各管一件事"的分工让告警更可解释。<strong>（3）</strong>恢复通知（<code>已恢复心跳</code>）与告警同等重要：如果只有故障没有恢复，值班员无法确认状态回稳，也无法统计"失联持续了多久"，而后者恰是第 020 章验收指标里的量化项。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>信任 CLI 的第一眼</strong>：刚启动就 <code>ros2 node list</code> 看不到全部节点就断言"发现坏了"，其实是发现尚未收敛（秒级到十几秒，规模越大越久）。修复：给巡检加"连续 N 次不达标才告警"的时间窗；单点判断会被发现收敛期的正常波动触发。</li>
+      <li><strong>只监控进程不监控图</strong>：systemd 显示 20 个进程全部 active，但其中 3 个节点的主循环早就崩在回调里（进程靠残留线程活着）。修复：图巡检 + 心跳，把"节点级活着"与"业务级活着"补上。</li>
+      <li><strong>心跳阈值拍脑袋</strong>：设成 100 ms 一次、200 ms 判失联，WiFi 一次漫游就全队报失联。修复：按"检测目标 × 网络 p99 抖动"反推（例如要求 3 s 内发现，就取 1 Hz + 连续 3 次）；先在真实网络测一周再收紧。</li>
+      <li><strong>中心监控自己失联没人知道</strong>：全舰队依赖一个监控节点，它死了，整个面板"全绿"（因为没有数据被显示成"没有异常"）。修复：监控节点也要心跳；面板对"数据源断流"要显示为显式告警，静默等于掩盖。</li>
+      <li><strong>告警风暴与脱敏并行</strong>：一次网络抖动引发 40 条重复告警，值班员开始忽略所有告警，真正的事故来了也没人看。修复：分级 + 聚合（同一故障只报一次+计数）、连续判定、恢复通知，让每条告警都携带"该做什么"。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把片段 3 的心跳周期从 1 s 改为 0.2 s，同时保持"连续 3 次"判定。预测：检测时间、带宽、误报率各如何变化？给出你为巡检场景选择周期的理由。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>检测时间从 3 s 缩到 0.6 s；带宽 ×5（仍很小）；但 0.2 s 粒度会暴露更多网络抖动，误报率上升，公共卫生级巡检 1 Hz 足够，只有安全联锁场景才需要亚秒级。</div></details>
+      </li>
+      <li>推导题：滑动窗口长度 W 秒、真实频率 f，窗口内计数的量化误差最大是多少？若 f=50 Hz，要求频率判读误差 &lt; 5%，W 至少要多少？<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>计数误差 ±1 帧，频率误差 ≈ 1/W Hz；要求 1/W &lt; 2.5 Hz → W ≥ 0.4 s。但还要覆盖抖动，实践取 1–2 s 窗口再平滑。</div></details>
+      </li>
+      <li>给一个双机器人 Demo 设计监控方案：列出至少 8 个检查项，标注层次（进程/图/应用）、检测方法与阈值，并说明哪一项能在"遥控链路断开"时最先触发。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>遥控链路断开：心跳（应用层）最先触发；cmd_vel 订阅者计数（图层）其次；若机器人侧有本地看门狗，它会先自停并用日志记录。参考本章清单模板。</div></details>
+      </li>
+      <li>模拟三种故障，(a) 杀掉一个节点进程；(b) 节点活着但发布者为 0；(c) 节点与发布者都在但没有数据，写出你的监控栈分别靠哪一层、哪条规则发现，并给出修复动作。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>(a) 图巡检缺节点 + 进程层事件；(b) 端点计数告警；(c) 只有应用层频率/心跳能发现，这就是三层都要建的理由。</div></details>
+      </li>
+      <li>设计"监控面板信息架构"：为 20 台机器人车队画一屏（草图）：全局健康分、失联清单、频率异常榜、最近 10 条告警流。说明每个元素的数据来源与刷新率。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>全局分=心跳在线率；失联清单来自看门狗；频率异常来自各机体检报告（5 s 上报）；告警流来自分级告警总线。刷新率从 1 s（心跳）到 5 s（体检）分层。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>计算图是活的：监控对象是"图与预期的偏差"，不是静态截图；图查询 API 让你不写新协议就能巡检。</li>
+      <li>三层监控缺一不可：进程层看存活、图层看端点与匹配、应用层看数据真的在流动。</li>
+      <li>心跳设计 = 周期 × 连续判定：1 Hz + 连续 3 次是通用起点；误报与漏报由这两个参数直接决定。</li>
+      <li>频率检测放在数据产生的本机做；跨网络测频率会把网络问题误记为话题问题。</li>
+      <li>告警要分级、聚合并携带动作建议；恢复通知与故障通知同等重要。</li>
+      <li>下一章进入隔离设计：<strong>命名空间</strong>，20 台机器人的话题、服务、参数如何在同一个域里各归其位。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch005.html">← 第 005 章：参数服务器共享配置</a>
+    <a class="next" href="ch007.html">第 007 章：分布式命名空间隔离 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第059章 实现多智能体强化学习 | 机器人仿真学习课程 · Isaac Sim 强化学习训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第三篇 · 高级强化学习专题</span>
+    <span class="sep">/</span>
+    <span>第 059 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第三篇 · 高级强化学习专题</div>
+    <h1>第 059 章：实现多智能体强化学习</h1>
+    <p class="lead">049 章搭好了协作的"舞台"，这一章给出"演技"：非平稳性的来源、CTDE 架构、MAPPO 的集中 critic，以及 QMIX 单调混音背后的信用分配数学。</p>
+    <ul class="meta">
+      <li>主题：高级专题 / MARL 算法与信用分配</li>
+      <li>相关组件：Isaac Sim / Isaac Lab（多智能体环境接口）/ PyTorch / rsl_rl 风格 PPO</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 058 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>能说清多智能体问题的两大理论困难：联合动作空间指数增长与非平稳性（他人即环境）。</li>
+      <li>掌握 CTDE（集中训练、分散执行）的架构语义，能区分"critic 看什么"与"actor 看什么"。</li>
+      <li>会实现 MAPPO 的集中式 critic 与逐智能体优势，并解释共享价值基线为什么可行。</li>
+      <li>理解信用分配的思路：VDN 的加性分解与 QMIX 的单调混音，以及 IGM 条件为什么要求单调性。</li>
+      <li>知道 IPPO 与 MAPPO 的差异与选择依据，以及并行环境下的多智能体训练要点。</li>
+      <li>能把这套算法接到 049 章的协作任务上，用"团队回报 + 逐智能体回报分解"评估信用分配质量。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 049 章从任务工程角度搭了"双机械臂抬托盘"的环境，但训练用的还是"把两个智能体拼成一个大智能体"的朴素做法：观测拼接、动作拼接、然后跑单智能体 PPO。这种做法在小规模任务上能用，却有两个隐患。第一，<strong>联合动作空间指数增长</strong>：N 个智能体、每个 7 维动作，联合空间是 7N 维，探索效率随 N 恶化。第二，<strong>非平稳性</strong>：对每个智能体来说，其他智能体是环境的一部分，而它们的策略在训练中不断变化，"环境"每时每刻都在改变，标准 RL 的马尔可夫假设被打破了。</p>
+    <p>本章是算法章节，专门解决这两件事：CTDE 架构让训练时利用全局信息、执行时保持分散；信用分配机制（VDN/QMIX）把团队回报拆解到每个智能体头上。它与 049 章互补：那边是"问题长什么样"，这边是"用什么工具解"。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 非平稳性：为什么标准 Q 学习会失效</h3>
+    <p>把联合状态记为 s = (o<sub>1</sub>, …, o<sub>N</sub>)，联合动作 a = (a<sub>1</sub>, …, a<sub>N</sub>)。从智能体 i 的视角看，转移概率是：</p>
+    <div class="formula">
+      P(s′ | s, a<sub>i</sub>) = P(s′ | s, a<sub>i</sub>, a<sub>−i</sub>), &nbsp; 而 a<sub>−i</sub> 由他人的策略 π<sub>−i</sub> 决定
+      <span class="note">当 π<sub>−i</sub> 在学习中变化时，i 面对的环境转移是非平稳的</span>
+    </div>
+    <p>后果：TD 的"同一状态同一价值"假设失效，同一个 (s, a<sub>i</sub>) 在不同训练阶段的最优价值可能不同，因为队友变了。经验上表现为策略来回震荡、单人实验里收敛稳定的超参在多人场景彻底失灵。缓解手段分两层：<strong>结构层</strong>用 CTDE 让训练信号"稳定"（critic 能看到全局、不受视角偏差的影响）；<strong>机制层</strong>用参数共享（049 章）与课程（先易后难的队友行为）减少非平稳的冲击。</p>
+
+    <h3>2. CTDE：集中训练、分散执行</h3>
+    <p>CTDE（centralized training with decentralized execution）是现代 MARL 的默认范式，它把两类信息通道分开：</p>
+    <table>
+      <tr><th>通道</th><th>训练时</th><th>执行时</th><th>作用</th></tr>
+      <tr><td>Actor（策略）</td><td>只看局部观测 o<sub>i</sub></td><td>只看局部观测 o<sub>i</sub></td><td>保证可部署：每个机器人只用自己的传感器</td></tr>
+      <tr><td>Critic（价值）</td><td>看全局状态 s（或全部观测拼接）</td><td>不用</td><td>提供无偏、低方差的优势估计</td></tr>
+    </table>
+    <p>关键洞察：<strong>critic 只在训练时存在，所以可以让它"作弊"看全局</strong>；而 actor 从训练第一天起就只用局部观测，部署时不需要任何额外信息。训练时的全局 critic 同时缓解了两个问题：它把"他人行为"作为显式输入，价值估计不再被视角偏差污染；它的目标（团队回报）对所有智能体一致，信用分配的基准更稳。MAPPO 就是"PPO + 集中式 critic"的组合，凭实现简单、性能稳，成为协作任务的事实标准。</p>
+
+    <h3>3. 信用分配：把团队回报拆给每个人</h3>
+    <p>团队奖励（比如"托盘到位 +10"）对每个智能体都一样，谁贡献了多少？如果完全均分，就会回到 049 章讲的"搭便车"。信用分配方法给出结构化的拆解：</p>
+    <div class="formula">
+      VDN：Q<sub>tot</sub>(s, a) = Σ<sub>i</sub> Q<sub>i</sub>(o<sub>i</sub>, a<sub>i</sub>) &nbsp;&nbsp;（加性分解）<br>
+      QMIX：Q<sub>tot</sub> = f<sub>θ</sub>(Q<sub>1</sub>, …, Q<sub>N</sub>; s), &nbsp; 且 ∂Q<sub>tot</sub>/∂Q<sub>i</sub> ≥ 0
+      <span class="note">单调性约束：团队价值对每个成员价值的偏导非负</span>
+    </div>
+    <p>为什么要求单调性？这来自 <strong>IGM 条件</strong>（individual-global max）：我们希望"全局最优联合动作"能由"每个智能体各自贪心选自己的最优动作"凑成，即 argmax<sub>a</sub>Q<sub>tot</sub> = (argmax<sub>a<sub>i</sub></sub>Q<sub>i</sub>)<sub>i</sub>。对单调混合函数（每个 Q<sub>i</sub> 的系数非负）这条性质成立，数学上因为"增加任意一个 Q<sub>i</sub> 不会让 Q<sub>tot</sub> 下降"，所以各人贪心指向同一方向。这保证了<strong>执行阶段不需要全局信息也能近似全局最优</strong>，与 CTDE 的精神吻合。QMIX 用超网络（hypernetwork：以全局状态为输入生成混合权重）+ 绝对值保非负，是工程上最常用的实现。</p>
+
+    <h3>4. MAPPO 的训练细节</h3>
+    <p>MAPPO 的公式与单智能体 PPO 相同，差别集中在"价值与优势怎么算"：</p>
+    <ul>
+      <li><strong>集中 critic</strong>：V(s) 以全局状态（所有智能体观测拼接）为输入；执行时不需要，训练时显著降方差。</li>
+      <li><strong>逐智能体优势</strong>：A<sub>i</sub> = 用同一个 V(s) 做基线、用智能体 i 自己的奖励序列算 GAE。团队奖励时所有 A<sub>i</sub> 相同；一旦有 049 章的个体塑形（跟踪误差、力对齐），各 A<sub>i</sub> 就分化，这正是信用分配真正起作用的地方。</li>
+      <li><strong>参数共享</strong>：同构智能体共享 actor/critic 参数（加上 id 嵌入），MAPPO 论文的经验是共享 + 集中 critic 的组合对样本效率最友好。</li>
+      <li><strong>批处理</strong>：把 N 个智能体当作 N 个"并行样本"塞进同一个 minibatch，PPO 的裁剪与归一化照常生效。</li>
+    </ul>
+
+    <h3>5. IPPO 还是 MAPPO？一张决策表</h3>
+    <table>
+      <tr><th>算法</th><th>精确描述</th><th>优势</th><th>劣势</th></tr>
+      <tr><td>IPPO</td><td>独立 PPO：每个智能体自己的 actor + 自己的 critic</td><td>实现最简单；对异构智能体天然友好</td><td>每个 critic 都面对非平稳环境，方差大</td></tr>
+      <tr><td>MAPPO</td><td>共享 critic 看全局；actor 看局部</td><td>价值估计更准、普遍更省样本</td><td>需要全局状态可达（仿真里容易，真机要通信）</td></tr>
+      <tr><td>QMIX</td><td>off-policy 值分解</td><td>样本复用、能显式控制信用结构</td><td>离散动作更自然；连续动作扩展复杂</td></tr>
+    </table>
+    <p>经验结论：协作任务优先从 MAPPO 起步；如果真机上全局状态通信带宽受限，退到 IPPO，并接受样本效率损失；动作空间是离散且样本宝贵（或需要精细信用结构）时考虑 QMIX 家族。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>把算法接到 049 章的双臂协作任务上：</p>
+    <ol>
+      <li><strong>环境接口</strong>：沿用 049 章的联合 <code>step</code>；Isaac Lab 里对应多智能体环境接口（不同版本有 <code>DirectMARLEnv</code> 或相关设定，返回每个智能体的观测/奖励字典，以官方文档为准）。</li>
+      <li><strong>观测切分</strong>：actor 输入 = 049 章的局部观测（自身 + 队友 + 任务 + id）；critic 输入 = 全部智能体局部观测的拼接（必要时再补工件状态）。</li>
+      <li><strong>奖励</strong>：团队项与个体项按 7:3 合成（049 章），逐智能体返回，这是 MAPPO 相对朴素实现的第一个接口要求。</li>
+      <li><strong>网络</strong>：共享 actor（256×2 + id 嵌入）；集中 critic（256×2，输入 2×local_dim）。为什么 critic 不共享 id？critic 拿的是全局状态，不需要身份。</li>
+      <li><strong>训练</strong>：4096 并行环境 × horizon 24；逐智能体 GAE；优势按"智能体维度"整体归一化（不要逐智能体归一化，会抹掉个体差异）。</li>
+      <li><strong>评估</strong>：团队成功率、两端个体塑形项的分别回报、信用分配的直观检查（纱布实验：固定一端策略，看另一端的行为是否会"补偿"）。</li>
+      <li><strong>对照</strong>：同任务跑"朴素拼接 PPO"（049 章的做法）与 IPPO，三方对比样本效率与最终成绩。</li>
+    </ol>
+    <table>
+      <tr><th>配置</th><th>典型样本量（到 80% 成功率）</th><th>备注</th></tr>
+      <tr><td>朴素拼接 PPO</td><td>基准（1×）</td><td>联合空间大、非平稳，学习慢</td></tr>
+      <tr><td>IPPO</td><td>0.6–1.0×</td><td>实现差异大；小规模任务接近 MAPPO</td></tr>
+      <tr><td>MAPPO</td><td>0.3–0.6×</td><td>集中 critic 的方差收益在 N 越大时越明显</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计思维：为什么"去中心化执行"是硬约束？</span>
+      <p>因为部署时的物理条件：两块控制板之间可能只有 10–100 Hz 的低带宽通信、甚至断连；机器人必须能在"只知道自己观测"的前提下做决策。CTDE 的训练自由度全部花在"让信号更准"上；"执行时看更多"不在它的设计目标之内，这是它相对"直接给每个人全局状态"的根本区别。真机上如果通信可靠（共总线、同机箱），你当然可以在观测里少走弯路直接给全局信息；但那不再叫 CTDE，部署约束也随之不同。先想清楚部署时的信息可得性，再写观测拼装代码。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：集中 critic + 分散 actor 的网络结构</strong></p>
+    <pre class="code"><code>import torch
+import torch.nn as nn
+
+class DecentralizedActor(nn.Module):
+    # 执行时唯一存在的网络：只看局部观测 + 自己的 id
+    def __init__(self, local_dim, n_agents, act_dim, hidden=256):
+        super().__init__()
+        self.trunk = nn.Sequential(
+            nn.Linear(local_dim + n_agents, hidden), nn.Tanh(),
+            nn.Linear(hidden, hidden), nn.Tanh(),
+        )
+        self.mean = nn.Linear(hidden, act_dim)          # 动作均值
+        self.logstd = nn.Parameter(torch.full((act_dim,), -0.5))
+
+    def forward(self, local_obs, agent_id_onehot):
+        h = self.trunk(torch.cat([local_obs, agent_id_onehot], dim=-1))
+        return torch.tanh(self.mean(h)), torch.exp(self.logstd)
+
+class CentralizedCritic(nn.Module):
+    # 训练时存在的网络：输入所有智能体的局部观测拼接（全局状态代理）
+    # 部署时不需要它：这就是 CTDE 里"集中"的全部含义
+    def __init__(self, local_dim, n_agents, hidden=256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(local_dim * n_agents, hidden), nn.Tanh(),
+            nn.Linear(hidden, hidden), nn.Tanh(),
+            nn.Linear(hidden, 1),
+        )
+
+    def forward(self, all_local_obs):
+        # all_local_obs: (B, n_agents * local_dim)，固定顺序拼接
+        return self.net(all_local_obs).squeeze(-1)      # (B,) 团队价值</code></pre>
+    <p>解读：两个网络的接口设计承载了整个 CTDE 哲学。Actor 的输入里拼了 one-hot id：即使参数共享，它也必须知道自己是谁，两臂位置不同、可行动作空间不同，没有 id 的策略会在两种角色间取折中（049 章练习里验证过）。Critic 输入是所有观测的<strong>固定顺序</strong>拼接：顺序必须永远一致（比如 [左臂, 右臂]），训练与评估都不能换序；如果智能体数量可变（比如"最多 5 个，实际可能只有 3 个"），拼接式 critic 会失效，那时应该换成基于注意力的结构（060 章正是讲这个）。最后注意 critic 输出维度是 1（团队价值），而 actor 的 logstd 是共享参数：对同构智能体，共享探索噪声尺度是合理的先验，也省参数。</p>
+
+    <p><strong>片段 2：逐智能体 GAE 与共享基线</strong></p>
+    <pre class="code"><code>import numpy as np
+
+def per_agent_gae(rewards, values, terminated, gamma=0.99, lam=0.95):
+    # rewards:   (T, n_env, n_agents) 每个智能体自己的奖励（团队+个体塑形）
+    # values:    (T+1, n_env) 全局价值 V(s)：所有智能体共享同一个基线
+    # 为什么共享基线可行：价值是"团队未来回报"的估计，对所有成员天然一致；
+    # 各智能体的优势差别来自"自己的奖励序列"，这正是信用分配的来源
+    T, n_env, n_agents = rewards.shape
+    adv = np.zeros_like(rewards, dtype=np.float32)
+    gae = np.zeros((n_env, n_agents), dtype=np.float32)
+    for t in reversed(range(T)):
+        # 广播：V(s) 对每个智能体复制一份，作为共同的基线
+        delta = (rewards[t] + gamma * values[t + 1][:, None] * (1.0 - terminated[t])
+                 - values[t][:, None])                        # (n_env, n_agents)
+        gae = delta + gamma * lam * (1.0 - terminated[t])[:, None] * gae
+        adv[t] = gae
+    returns = adv + values[:-1][:, :, None]                   # 广播成逐智能体目标
+    return adv, returns</code></pre>
+    <p>解读：逐智能体 GAE 与 057 章的向量化版几乎是同一个循环，只是多了一个智能体维度。三个设计点。第一，<strong>共享基线广播</strong>：values[t+1][:, None] 把每个环境标量的 V 值广播到所有智能体，这是"团队价值"对个人的"平均待遇"，优势的正负表达的是"我的表现超出/低于团队均值多少"。第二，优势归一化的位置：标准做法是在 (T, n_env, n_agents) 上全局归一化；每个智能体单独归一化会把"左臂普遍强于右臂"这样的信号抹平，而它恰恰是有用信息。第三，终止掩码同样只对 terminated 生效（截断不归零），与 057 章完全一致。若使用团队奖励（无个体塑形），所有行的 rewards 相同，算出的 A<sub>i</sub> 也会完全相同，此时若策略仍能分化协调，靠的是 one-hot id 与局部观测差异；想要更精细的分工，还是需要 049 章那种个体塑形项。</p>
+
+    <p><strong>片段 3：QMIX 单调混音与信用分配</strong></p>
+    <pre class="code"><code>import torch
+import torch.nn as nn
+
+class QMixer(nn.Module):
+    # 把每个智能体的 Q_i 混合成团队 Q_tot；权重由"全局状态"生成的超网络产生
+    # 关键约束：所有权重经过 abs() 强制非负 -> Q_tot 对每个 Q_i 单调不减
+    def __init__(self, n_agents, state_dim, mix_dim=32):
+        super().__init__()
+        self.n_agents = n_agents
+        self.hyper_w1 = nn.Linear(state_dim, n_agents * mix_dim)  # 第一层权重
+        self.hyper_b1 = nn.Linear(state_dim, mix_dim)             # 第一层偏置
+        self.hyper_w2 = nn.Linear(state_dim, mix_dim)             # 第二层权重
+
+    def forward(self, q_agents, state):
+        # q_agents: (B, n_agents) 各智能体的 Q；state: (B, state_dim) 全局状态
+        q = q_agents.unsqueeze(-1)                       # (B, n_agents, 1)
+        w1 = torch.abs(self.hyper_w1(state))             # abs 保非负（单调性的载体）
+        w1 = w1.reshape(-1, self.n_agents, 32)           # (B, n_agents, 32)
+        b1 = self.hyper_b1(state).reshape(-1, 1, 32)
+        h = torch.relu(torch.bmm(q.transpose(1, 2), w1) + b1)   # (B, 1, 32)
+        w2 = torch.abs(self.hyper_w2(state)).reshape(-1, 32, 1) # 第二层也非负
+        q_tot = torch.bmm(h, w2).squeeze(-1).squeeze(-1)        # (B,)
+        return q_tot</code></pre>
+    <p>解读：QMIX 混音网络的三处细节都是为了"既灵活又保持单调"。超网络（hypernetwork）：普通 MLP 的权重是自由的，而这里每层权重是"全局状态经过线性层"动态生成的，网络可以根据当前局面调整"重视哪个智能体"（比如托盘倾斜时更看重力大那端的 Q），但生成出来的权重都过一遍 <code>abs</code>，保证非负。单调性的数学效果：∂Q<sub>tot</sub>/∂Q<sub>i</sub> ≥ 0，于是"某个 Q<sub>i</sub> 变大"绝不会让 Q<sub>tot</sub> 变小，每个智能体的贪心方向与团队一致（IGM 条件）。注意 <code>torch.relu</code> 只用在隐藏层：输出层不加激活，Q<sub>tot</sub> 才能表达任意大小的团队价值。使用场景提醒：QMIX 是 off-policy 值方法，需要回放池与目标网络，工程复杂度高于 MAPPO；且它天然适合离散/低维连续动作（连续动作需要采样版 Q 或加策略网络）。对本书的协作操作任务，先跑通 MAPPO，再用 QMIX 对照信用分配的效果，是比较高效的学习路径。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>critic 输入顺序不稳定</strong>：不同批次里智能体拼接顺序变化（比如按字典序 vs 按创建顺序），全局状态的语义漂移，价值网络难以收敛。修复：环境层定义固定的智能体索引，拼接顺序处处一致并写进文档。</li>
+      <li><strong>把"集中训练"理解成"执行时也能看全局"</strong>：actor 观测里偷偷加了队友的精细状态（真机拿不到），评估一上真机就崩。修复：写两个观测函数 <code>local_obs()</code> 与 <code>global_state()</code>，actor 只允许调用前者。</li>
+      <li><strong>逐智能体归一化优势</strong>：把"某智能体长期承担更多责任"的信号抹平，学分分配失效。修复：在 (T, env, agent) 整张量上归一化，或只做全局缩放。</li>
+      <li><strong>QMIX 权重忘了 abs</strong>：单调性失效，执行时的"各自贪心"可能选到比联合最优差很多的组合。症状是训练时 Q_tot 很高、分散执行的收益低。修复：所有生成权重的路径都过激活为正值（abs 或 exp），并写单测检查单调性。</li>
+      <li><strong>拿"个体最佳"当目标</strong>：评估时只看单个智能体的指标，忽略了协作本身。修复：评估三件套，团队成功率、个体塑形分、以及"队友退化测试"（把一端换成弱策略，看另一端能否补偿）。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把 MAPPO 的集中 critic 换成 IPPO（每个智能体各一个只吃局部观测的 critic），在双臂任务上对比至 80% 成功率的样本量。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>N=2 时差距可能不大；把任务改成 4 个智能体（或者把观测噪声加大）后再对比，集中 critic 的方差收益会更明显。</div></details>
+      </li>
+      <li>在 QMixer 上写一个单调性单测：随机采样 Q 向量与状态，验证"任意提高一个 Q_i 后 Q_tot 不降低"。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>对 100 组随机 (q, state)，构造 q + Δ（Δ 只在第 i 维为正），断言 Q_tot(q+Δ) 大于等于 Q_tot(q) − 1e-6。这个测试能在重构时保护核心性质。</div></details>
+      </li>
+      <li>把团队奖励改成"纯团队"（去掉个体塑形），观察逐智能体优势 A<sub>i</sub> 是否完全相同，以及分工是否退化。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>纯团队奖励下 A 相同；分工仍可能靠 id 与局部观测涌现，但"补偿行为"会变弱。对比两版的力对齐指标。</div></details>
+      </li>
+      <li>设计一个"信用分配有效性"实验：故意让左臂可控性变差（比如加 10 ms 动作延迟），观察 MAPPO 是否学会把更多角色分给右臂。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>先证明策略能在延迟下保持团队成功，再奖励它把"主导权"移给右臂：统计两端的动作幅度与贡献（例如对工件位移的因果影响）。</div></details>
+      </li>
+      <li>在 Isaac Lab 的多智能体环境接口上，写一份"观测可达性审查表"：逐字段标注"训练可得/部署可得"，并给出三个真机通信受限时的替代方案。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>替代方案可以是：队友状态降频广播、用上一时刻的预测值代替、或者干脆用注意力机制从历史里推断队友状态（060 章）。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>多智能体的两大困难：联合动作空间指数增长与"他人即环境"的非平稳性；结构解法是 CTDE，机制解法是信用分配与参数共享。</li>
+      <li>CTDE = actor 只看局部观测（可部署）+ critic 训练时看全局状态（降方差）；MAPPO 是 PPO 加集中 critic 的工程标准。</li>
+      <li>信用分配：VDN 加性、QMIX 单调混音；单调性（∂Q<sub>tot</sub>/∂Q<sub>i</sub> ≥ 0）保证"各自贪心 = 联合最优"（IGM），是分散执行的数学依据。</li>
+      <li>逐智能体优势用共享的团队价值做基线、各自奖励算 GAE；优势全局归一化；参数共享 + one-hot id 保持同构任务的数据效率。</li>
+      <li>评估三件套：团队成功率 + 个体指标 + 队友退化测试；与 IPPO/朴素拼接 PPO 对照样本效率，N 越大集中 critic 收益越明显。</li>
+      <li>下一章升级网络结构：<strong>注意力机制</strong>，当实体数量可变、关系复杂时，用注意力替代拼接，让策略学"关注谁"。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch058.html">← 第 058 章：实现离线强化学习</a>
+    <a class="next" href="ch060.html">第 060 章：实现注意力机制 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

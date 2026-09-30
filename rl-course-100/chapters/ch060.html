@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第060章 SAC的模型预测控制结合 | 深度强化学习课程 · PPO、SAC 与多智能体系统</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 离策略方法与 SAC</span>
+    <span class="sep">/</span>
+    <span>第 060 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 离策略方法与 SAC</div>
+    <h1>第 060 章：SAC的模型预测控制结合</h1>
+    <p class="lead">给 SAC 装上"未来模拟器"：用回放数据训练三个动力学模型的集成，评估时对 K 条候选动作序列做 H 步滚动预测，用"预测折扣奖励 + 评论家终端价值"打分，执行最优序列的第一步，纯策略与 SAC+MPC 同台对比回报与规划耗时。</p>
+    <ul class="meta">
+      <li>主题：模型预测控制（Model Predictive Control, MPC）/ 规划与学习融合</li>
+      <li>关键公式：max Σ<sub>l</sub> γ<sup>l</sup>r(ŝ<sub>t+l</sub>,a<sub>t+l</sub>) + γ<sup>H</sup>·min(Q<sub>1</sub>,Q<sub>2</sub>)(ŝ<sub>t+H</sub>,·)</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 059 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解模型预测控制的滚动时域思想：每次只执行最优序列的第一步，下一步重新规划。</li>
+      <li>实现基于随机打靶（random shooting）的 MPC：候选动作采样、集成模型滚动预测、奖励与终端价值打分。</li>
+      <li>训练一个预测状态增量的动力学模型集成，理解集成为什么能抑制模型偏差。</li>
+      <li>量化"预测深度 H 与候选数 K"对回报和规划耗时的双向影响。</li>
+      <li>会读"回报 − 算力"折中表：知道什么时候 MPC 值得、什么时候纯策略更划算。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>SAC 是反应式控制器：看一眼当前状态，吐一个动作，不考虑"三步之后会发生什么"。这种短视在多数任务里没问题，价值函数已经压缩了未来的信息。但价值函数的估计误差会直接变成动作的偏差，尤其在策略欠拟合或状态处于训练分布边缘时。MPC 换了一条路：<strong>改用显式的动力学模型"推演未来"，不依赖价值函数的直觉</strong>。</p>
+    <p>本章把两者拼在一起：SAC 提供先验动作与终端价值，学习出的动力学模型提供多步预测，规划器在两者的基础上做局部搜索。这属于"（深度）RL + 规划"的混合范式，也是 model-based RL 的最小可运行版本。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 滚动时域与打分函数</h3>
+    <p>在第 t 步，MPC 求解一个 H 步开环优化问题，然后只执行解的首个动作：</p>
+    <div class="formula">
+      max<sub>a<sub>t:t+H−1</sub></sub> &nbsp; Σ<sub>l=0</sub><sup>H−1</sup> γ<sup>l</sup>·r(ŝ<sub>t+l</sub>, a<sub>t+l</sub>) + γ<sup>H</sup>·min(Q<sub>1</sub>,Q<sub>2</sub>)(ŝ<sub>t+H</sub>, a<sub>t+H−1</sub>)<br>
+      s.t. &nbsp; ŝ<sub>t+l+1</sub> = ŝ<sub>t+l</sub> + f̂(ŝ<sub>t+l</sub>, a<sub>t+l</sub>)
+      <span class="note">ŝ 是模型预测的状态；终端项 γ<sup>H</sup>·Q 近似"第 H 步之后的所有未来"</span>
+    </div>
+    <p>符号说明：γ 是折扣因子，r 是奖励函数（本任务里解析已知，直接计算），f̂ 是学出来的动力学（预测状态增量），H 是视界。终端价值用裁剪双 Q 的最小值，与 SAC 的目标口径一致，避免乐观偏差。为什么只执行第一步？因为预测误差随步数累积，H 步之后的世界已不可信；下一步用最新的真实状态重新规划，误差不会滚雪球。</p>
+
+    <h3>2. 随机打靶与梯度优化：本章的选择依据</h3>
+    <p>动作序列优化可以用梯度（对 a 求导）或采样（随机打靶/交叉熵法）。本章选采样：<strong>不需要对模型求二阶信息、天然支持非光滑奖励、实现只有几十行</strong>。代价是维度灾难，动作维度越高、序列越长，K 条候选要想覆盖有效空间就越难。对 Pendulum 的 1 维动作，K=32、H=6 已经足够；换成 6 维机械臂，同样预算会明显不够（练习里可以感受这个规律）。</p>
+
+    <h3>3. 集成模型的作用</h3>
+    <p>单个模型在训练分布外会自信地犯错，而 MPC 恰恰会主动把候选序列推到分布边缘。用 3 个独立初始化的模型对预测取平均：</p>
+    <div class="formula">
+      f̂(s, a) = (1/M)·Σ<sub>m=1</sub><sup>M</sup> f̂<sub>m</sub>(s, a)
+      <span class="note">成员间的分歧还能作为不确定度信号（本章只用平均，练习里用它加权惩罚）</span>
+    </div>
+    <p>平均把"单模型尖峰误差"抹平一些。代价是 M 倍前向计算，耗时表里会体现。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+
+    <h3>数据流</h3>
+    <p>三段流程。<strong>SAC 训练</strong>：15000 步（沿用标准配置）。<strong>模型训练</strong>：在回放池上训练 3 个增量动力学 MLP，2000 步梯度，验证集为池中最近 5000 条，输出集成验证 MSE。<strong>评估对比</strong>：纯策略一次；SAC+MPC 对 H ∈ {2,6} 各一次，每次环境步做完整规划（候选采样 → 滚动预测 → 终端价值 → 取最优首动作），并统计每步规划耗时。</p>
+
+    <h3>模块划分</h3>
+    <table>
+      <tr><th>组件</th><th>职责</th><th>关键点</th></tr>
+      <tr><td><code>DynamicsModel</code></td><td>预测状态增量 Δs = f(s,a)</td><td>学增量比学绝对状态更稳（尺度小、均值近零）</td></tr>
+      <tr><td><code>train_dynamics_models</code></td><td>在回放池上训练集成</td><td>各成员独立优化器；同一批数据、不同初始化</td></tr>
+      <tr><td><code>plan_action</code></td><td>随机打靶 MPC</td><td>候选以策略输出为中心加噪声，避免纯随机浪费样本</td></tr>
+      <tr><td><code>pendulum_reward</code></td><td>解析奖励函数</td><td>用预测状态直接算 −(θ² + 0.1θ̇² + 0.001u²)</td></tr>
+      <tr><td><code>evaluate_mpc</code></td><td>MPC 评估并统计耗时</td><td>用 <code>perf_counter</code> 只统计规划部分</td></tr>
+    </table>
+
+    <h3>关键超参数</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用与取值理由</th></tr>
+      <tr><td><code>--horizons</code></td><td>2,6</td><td>对比短视界与中视界；收益通常随 H 递减</td></tr>
+      <tr><td><code>--mpc-samples</code></td><td>32</td><td>候选序列数 K；增大提升质量但线性增加耗时</td></tr>
+      <tr><td><code>--mpc-noise</code></td><td>0.5</td><td>候选动作的探索噪声；太大近似乱采样、太小退化为策略</td></tr>
+      <tr><td><code>--ensemble</code></td><td>3</td><td>模型成员数；3 是质量与耗时的平衡点</td></tr>
+      <tr><td><code>--model-steps</code></td><td>2000</td><td>模型训练梯度步数；验证 MSE 收敛即可停</td></tr>
+    </table>
+
+    <h3>与前一章的差异点</h3>
+    <ul>
+      <li>第 059 章改"感知鲁棒性"；本章新增<strong>动力学模型与规划器</strong>两套组件，SAC 算法本身不动。</li>
+      <li>回放池从"训练用"扩展为"模型的数据源"，SAC 训练结束后还要再被采样。</li>
+      <li>评估协议新增 MPC 分支与耗时统计，纯策略作为对照保留。</li>
+      <li>汇总表第一次出现"回报与算力成本的折中"这个维度。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：增量动力学模型与集成训练</strong></p>
+    <pre class="code"><code>class DynamicsModel(nn.Module):
+    """预测状态增量：next_obs - obs = f(obs, act)。"""
+
+    def __init__(self, obs_dim: int, act_dim: int, hidden: int = 128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(obs_dim + act_dim, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden), nn.ReLU(),
+            nn.Linear(hidden, obs_dim),
+        )
+
+    def forward(self, obs: torch.Tensor, act: torch.Tensor) -&gt; torch.Tensor:
+        return self.net(torch.cat([obs, act], dim=-1))
+
+    # train_dynamics_models 的训练循环：
+    for step in range(1, steps + 1):
+        batch = buffer.sample(batch_size)
+        delta_target = batch["next_obs"] - batch["obs"]   # 目标：状态增量
+        for i, m in enumerate(models):
+            pred = m(batch["obs"], batch["act"])
+            loss = F.mse_loss(pred, delta_target)
+            opts[i].zero_grad()
+            loss.backward()
+            opts[i].step()
+        if step % max(steps // 4, 1) == 0:
+            with torch.no_grad():
+                mses = [F.mse_loss(m(val_obs, val_act), val_delta).item()
+                        for m in models]
+            print(f"[模型] 训练步 {step:5d} | 集成验证 MSE "
+                  f"{np.mean(mses):.2e}（各成员 {[f'{v:.2e}' for v in mses]}）")</code></pre>
+    <p>解读：<strong>（1）</strong>回归目标选<strong>状态增量</strong>：Pendulum 的状态量级在 ±8 之间，而一步内的变化只有 0.1 上下。直接回归 next_obs 会让网络把大部分容量花在"复读"输入上；增量目标均值近零、方差小，训练更稳、外推更平滑。<strong>（2）</strong>三个成员共用同一批数据、独立优化器与初始化：独立性是"分歧可当不确定度"的前提。<strong>（3）</strong>验证集取池中最近 5000 条，与训练采样有交集，它衡量的是"拟合当前数据分布"的能力，够用为诊断；严格泛化评估应留出不相交的集合。<strong>（4）</strong>训练日志打印每个成员的 MSE：成员之间差一个数量级时说明训练不稳定，该调学习率或步数。</p>
+
+    <p><strong>片段 2：plan_action，随机打靶的完整闭环</strong></p>
+    <pre class="code"><code>def plan_action(models, agent: SAC, obs: np.ndarray, horizon: int,
+                n_samples: int, gamma: float, noise_std: float) -&gt; np.ndarray:
+    """随机打靶：采样 K 条动作序列，用集成模型滚动预测，选得分最高者的首动作。"""
+    obs_t = torch.as_tensor(np.asarray(obs, dtype=np.float32))
+    with torch.no_grad():
+        base = agent.policy.mean_action(obs_t.unsqueeze(0)).squeeze(0)  # 以策略为中心采样
+    noise = torch.randn(n_samples, horizon, base.shape[0]) * noise_std
+    actions = (base.view(1, 1, -1) + noise).clamp(-2.0, 2.0)
+
+    states = obs_t.unsqueeze(0).repeat(n_samples, 1)
+    total = torch.zeros(n_samples)
+    for t in range(horizon):
+        a_t = actions[:, t]
+        ins = torch.cat([states, a_t], dim=-1)
+        with torch.no_grad():
+            deltas = torch.stack([m(ins) for m in models], dim=0).mean(dim=0)
+        states = states + deltas                            # 增量式状态推进
+        total = total + (gamma ** t) * pendulum_reward(states, a_t)
+    with torch.no_grad():
+        q_term = torch.minimum(agent.q1(states, actions[:, -1]),
+                               agent.q2(states, actions[:, -1]))
+    total = total + (gamma ** horizon) * q_term             # 终端价值补齐 H 步之后
+    best = int(torch.argmax(total).item())
+    return actions[best, 0].numpy()                         # 只取第一步</code></pre>
+    <p>解读：<strong>（1）</strong>候选动作<strong>以策略均值动作为中心</strong>加高斯噪声：纯随机采样在 1 维下勉强可用，但会浪费大量候选在明显糟糕的方向上（比如给直立状态乱加力矩）。σ=0.5 是策略分布附近合理的探索半径。<strong>（2）</strong>张量形状自始至终是 <code>[K, H, act_dim]</code> 与 <code>[K, obs_dim]</code>：所有候选并排计算，没有 Python 逐条循环，这是规划速度的关键。<strong>（3）</strong>滚动预测两步走：集成预测取平均 → <code>states + deltas</code> 前进。终端价值的 Q 输入是<strong>预测出来的状态</strong>：H 太长时模型误差让终端态漂移出可信区域，终端价值会误导规划，这就是"H 越大越好"不成立的原因。<strong>（4）</strong>最后只返回 <code>actions[best, 0]</code>：滚动时域的精髓，计划一整条、执行第一步，下一步用新的真实状态重新规划。</p>
+
+    <p><strong>片段 3：解析奖励与耗时统计</strong></p>
+    <pre class="code"><code>def pendulum_reward(obs: torch.Tensor, act: torch.Tensor) -&gt; torch.Tensor:
+    """Pendulum 的真实奖励函数（用于 MPC 的逐步打分）。"""
+    cos_t, sin_t, thd = obs[:, 0], obs[:, 1], obs[:, 2]
+    theta = torch.atan2(sin_t, cos_t)
+    return -(theta ** 2 + 0.1 * thd ** 2 + 0.001 * act.squeeze(-1) ** 2)
+
+
+def evaluate_mpc(models, agent: SAC, env, episodes: int, horizon: int,
+                 n_samples: int, gamma: float, noise_std: float):
+    """MPC 评估：返回 (平均回报, 每步平均规划耗时 ms)。"""
+    returns = []
+    plan_times = []
+    for _ in range(episodes):
+        obs, _ = env.reset()
+        done = False
+        ep_ret = 0.0
+        while not done:
+            t0 = time.perf_counter()
+            action = plan_action(models, agent, obs, horizon, n_samples, gamma, noise_std)
+            plan_times.append((time.perf_counter() - t0) * 1000.0)   # 毫秒
+            obs, rew, terminated, truncated, _ = env.step(action)
+            ep_ret += rew
+            done = terminated or truncated
+        returns.append(ep_ret)
+    return float(np.mean(returns)), float(np.mean(plan_times))</code></pre>
+    <p>解读：<strong>（1）</strong>奖励用解析式重算，省去训练奖励模型：Pendulum 的奖励完全由状态与动作决定，直接算最准；真实任务里奖励模型往往也需要学（或干脆用稀疏误差信号）。<strong>（2）</strong>计时用 <code>perf_counter</code> 只包住 <code>plan_action</code>：MPC 的价值是"用算力换性能"，规划耗时必须与环境步进分开报告，否则无法判断代价值不值。<strong>（3）</strong>实际部署时还要叠加感知与执行延迟，报告的数字是规划算力的<strong>下界</strong>；CPU 上 H=6、K=32 通常在个位数毫秒，已接近多数实时控制回路的预算边缘。</p>
+
+    <p>完整可运行脚本（附录）：<a href="../code/ch060.py" download>code/ch060.py</a></p>
+    <pre class="sh"><code>python code/ch060.py                 # SAC 15000 步 + 模型训练 + MPC 评估，CPU 约 3–5 分钟
+python code/ch060.py --quick         # 快速跑通：约 40 秒
+python code/ch060.py --mpc-samples 64 --horizons 2,6,10   # 更多候选、更长视界</code></pre>
+    <p>预期：<strong>SAC+MPC 的回报与纯策略接近（±15 分内浮动），通常略优；H=6 比 H=2 略好，但耗时增长约 3 倍</strong>。模型验证 MSE 在 1e-4～1e-5 量级时规划可用；超过 1e-3 则明显恶化（终端态漂移）。以实跑为准。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>模型输出加在错误的状态表示上</strong>：预测增量后忘了 <code>states = states + deltas</code>，或在 next_obs 上再加一次增量（重复计算），规划会在错误的轨迹上打分。务必对齐状态定义。</li>
+      <li><strong>终端价值用了单 Q，未取 min(Q1,Q2)</strong>：SAC 的双 Q 意义就在于悲观目标，MPC 的终端项若用单 Q 会引入乐观偏差，规划倾向冒险。</li>
+      <li><strong>H 过大而模型不稳</strong>：长视界的预测误差指数累积，终端态已失去可信度，打分退化成了噪声。先看验证 MSE，再决定 H 的上限。</li>
+      <li><strong>把规划耗时算进环境耗时</strong>：计时口径混在一起，就无法回答"这点回报提升值不值几毫秒"，而这是 MPC 部署与否的核心问题。</li>
+      <li><strong>候选动作不做中心化</strong>：纯随机打靶要求 K 大到覆盖有效空间；预算不匹配时，规划质量会低于纯策略。修复：以策略输出为中心采样，让先验与搜索各司其职。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把 <code>--mpc-samples</code> 改成 <code>8</code> 与 <code>128</code>，比较回报与耗时。候选数的边际收益在哪里开始消失？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>K 从 8 到 32 通常有可见提升，32 到 128 提升很小、耗时翻倍。关注"回报 ÷ 毫秒"的最优点，单看回报会忽略成本。</div></details>
+      </li>
+      <li>把 MPC 的候选动作改成"完全随机均匀采样"（去掉策略中心），比较回报。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>改 <code>plan_action</code> 的采样行即可。均匀采样浪费候选，看它需要多大的 K 才能追平策略中心的版本，这就是"先验"的价值。</div></details>
+      </li>
+      <li>用集成成员的分歧（预测方差）给序列打分加惩罚：score − λ·var。它能减少"被模型骗"的规划吗？<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>滚动预测时同时算成员预测的方差并累加，λ 取 0.1～1.0 试。分歧大 = 模型不熟；惩罚后规划偏好"熟悉区域"，代价是探索性下降。</div></details>
+      </li>
+      <li>把模型训练数据限制在回放池的"后半段"（更接近最终策略的数据），比较验证 MSE 与 MPC 回报。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>只取后 50% 数据训练，分布覆盖变窄但更贴合当前策略。这正是"模型该覆盖谁"的问题：全历史 vs 近期数据各有利弊。</div></details>
+      </li>
+      <li>实现"MPC 与策略混合"：动作 = w·a<sub>MPC</sub> + (1−w)·a<sub>policy</sub>，扫描 w ∈ {0, 0.5, 1}。混合能兼顾规划质量与策略平滑吗？<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>评估循环里同时取两个动作加权。MPC 动作与策略动作可能方向相反，加权是一种折中；观察回报与动作抖动（相邻动作差）两个指标。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>MPC 用显式动力学模型做 H 步滚动预测，只执行最优序列的第一步，天然支持约束与多步风险规避。</li>
+      <li>本章的混合架构：集成动力学模型 + 解析奖励 + 评论家终端价值，候选动作围绕策略输出采样。</li>
+      <li>SAC+MPC 在 Pendulum 上与纯策略打平或略优；H 增大收益递减、耗时线性增长，模型 MSE 决定规划可信度。</li>
+      <li>集成平均抑制单模型的尖峰误差，是"用算力换稳定"的低成本手段。</li>
+      <li>下一章进入一个新的数据范式：完全不给环境交互，只用一批固定回放数据训练 SAC，离线强化学习及其保守化修正。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch059.html">← 第 059 章：SAC的对抗攻击防御</a>
+    <a class="next" href="ch061.html">第 061 章：SAC的离线强化学习 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

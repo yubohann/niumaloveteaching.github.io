@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第070章 实验导入、克隆与合并 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第四篇 · Ray Tune 超参搜索</span>
+    <span class="sep">/</span>
+    <span>第 070 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第四篇 · Ray Tune 超参搜索</div>
+    <h1>第 070 章：实验导入、克隆与合并</h1>
+    <p class="lead">实验结果不止服务于当下：导入用于复盘，克隆用于分叉，合并用于把多组搜索结果拼成一个分析视图。本章讲清三种数据流的适用边界、状态文件的重定位要点，以及跨实验合并的口径统一与冲突检测。</p>
+    <ul class="meta">
+      <li>主题：Ray Tune 调优 / 实验数据流转</li>
+      <li>关键机制：只读导入、目录克隆、状态重定位、数据帧合并、热启动</li>
+      <li>预计学时：50 分钟</li>
+      <li>前置章节：第 069 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>分清三种数据流：只读导入、克隆续跑、合并分析，各自的前置条件与风险面。</li>
+      <li>掌握克隆的技术要点：目录复制、状态文件内名称与路径的重定位、命名的唯一性约束。</li>
+      <li>会用数据帧级合并拼装多组搜索结果，并实施口径统一与试验标识冲突检测。</li>
+      <li>理解热启动（Warm Start）的实现方式：以上一阶段最优值为中心构造精搜空间，并会用边界判读校准半径。</li>
+      <li>会为阶段式搜索设计“粗搜到精搜”的完整数据链路，说明两阶段结果分开统计的理由。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>一次搜索很少孤立存在：粗搜之后要精搜，分片的并行搜索要汇总，历史实验的结果要用于新问题的起点。<strong>实验数据的流转有三种形态，代价与风险各不相同：只读导入最安全，克隆续跑居中，状态级合并风险最高。</strong>把三者的边界划清，就能在多数需求上用低成本方案，只在必要时触碰高风险操作。</p>
+    <p>上一章把单个实验固化为归档，本章解决多个实验之间的搬运与拼装。核心约束只有一条：<strong>任何跨实验的操作都必须保持试验的可标识性与口径的可比较性</strong>，前者靠命名与冲突检测，后者靠统一的指标口径与预算定义。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 三种数据流与风险面</h3>
+    <p><strong>只读导入</strong>从实验目录或归档加载分析接口，不写入任何数据，适合复盘与跨实验统计。<strong>克隆</strong>复制整个实验目录并在副本上继续运行：原实验冻结，副本可改空间、改调度参数后 <code>resume</code> 续跑或作为新实验起点。<strong>合并</strong>把多个实验的记录拼成一个分析视图，默认只在数据帧层进行，不触碰状态文件。风险面依次递增：导入不产生副作用；克隆要保证状态引用全部重定位；状态级合并要重写试验清单与状态索引，任何遗漏都会让恢复路径指向错误位置。</p>
+    <div class="formula">
+      导入（只读） ⊂ 克隆（目录 + 状态重定位） ⊂ 状态级合并（重写清单，风险最高）
+      <span class="note">需求能用左侧方案满足时不要上移；状态级合并仅在实验全部停止且命名空间唯一时执行</span>
+    </div>
+
+    <h3>2. 克隆的状态重定位</h3>
+    <p>实验目录里有两类对“名字”的引用：<strong>目录名</strong>与<strong>状态文件内容</strong>。克隆必须同时处理：复制后的顶层目录改名，状态文件内记录的实验名与目录引用同步替换。浅拷贝（符号链接或硬链接）在这里不适用：副本会被继续写入，链接会把写入传导回原实验。<strong>克隆的前置条件是被克隆实验已停止：运行中的实验状态文件持续变化，拷贝结果会是拼接不一致的快照。</strong></p>
+
+    <h3>3. 合并的分析与状态两个层次</h3>
+    <p>数据帧级合并把各实验的记录表拼接成一张长表，添加来源列后统一统计。它的适用范围覆盖绝大多数分析需求：排名、分位带、对比。状态级合并把试验目录并入单个实验，使合并结果可以继续 <code>resume</code>。<strong>两个层次的差别在“是否需要继续运行”：分析止于数据帧，续跑才需要状态级。状态级合并要解决试验标识冲突与状态索引重写两个问题，成本和风险都显著更高。</strong>实践建议是默认数据帧级，状态级只在明确要续跑且实验规模小的情况下使用。</p>
+
+    <h3>4. 合并的口径统一</h3>
+    <p>来自不同实验的记录表在合并前要通过三项检查：<strong>指标列一致</strong>（同名指标必须同义、同量纲，版本差异导致的列名变化在此拦截）；<strong>预算定义一致</strong>（迭代计数与环境步数不能混用，混用时必须换算或分层）；<strong>试验标识唯一</strong>（不同实验的标识可能出现同名，用来源列检测并重映射）。三项检查通过后拼接，来源列随数据保留，后续统计可以按来源分层。</p>
+
+    <h3>5. 热启动与阶段式搜索</h3>
+    <p>热启动把上一阶段的最优配置作为新阶段的先验：读出最优值，以其为中心构造新的搜索空间。半径的选择是核心参数：<strong>半径覆盖约一个数量级时（5 倍上下界），既能验证最优点周围的局部结构，又保留跳出局部峰值的余地；半径过大时精搜退化为原搜索，预算浪费；半径过小时最优值可能恰好落在新空间的边界上，边界判读会提示继续外扩。</strong>阶段式搜索的完整链路是：粗搜（宽范围、中预算）→ 边界判读 → 精搜（窄范围、高预算）→ 复验（多种子），两阶段的记录分开统计，因为预算口径不同。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>数据流转按需求选择操作，每种操作配一组前置条件与验证点。与上一章的差异在于，第 069 章面向单个实验的固化，本章面向多实验的搬运与拼装。</p>
+    <table>
+      <tr><th>操作</th><th>适用场景</th><th>前置条件</th><th>验证点</th></tr>
+      <tr><td>只读导入</td><td>复盘、跨实验统计</td><td>目录或归档完整</td><td>记录数与试验数一致</td></tr>
+      <tr><td>克隆续跑</td><td>分叉实验、改参数继续</td><td>原实验已停止、目标名唯一</td><td>状态文件内名称全部替换、resume 可读</td></tr>
+      <tr><td>数据帧合并</td><td>分片汇总、阶段汇总</td><td>口径三项检查通过</td><td>来源列完整、无标识冲突</td></tr>
+      <tr><td>状态级合并</td><td>小规模续跑</td><td>实验停止、标识空间无重叠</td><td>清单重写后 resume 演练通过</td></tr>
+    </table>
+    <p>操作流程三步：</p>
+    <ol>
+      <li><strong>冻结来源</strong>：所有来源实验停止写入；归档（第 069 章）作为搬运载体。</li>
+      <li><strong>执行转换</strong>：按上表选择最小风险的操作，转换后先做验证点检查，再进入下一步。</li>
+      <li><strong>记录链路</strong>：把“从哪个实验、经何种操作、生成哪个新实验”写进来源记录，合并视图保留来源列。</li>
+    </ol>
+    <div class="box key">
+      <span class="box-title">设计决策：为什么阶段间只传递配置不传递权重？</span>
+      <p>粗搜与精搜的目标是确定超参区域，策略权重与超参区域的结论无关。传递权重会引入额外变量：精搜的起点偏向粗搜最优者的训练轨迹，掩盖超参本身的作用。只传递配置（热启动的空间中心）让每个精搜试验独立训练，统计口径干净；真正需要权重迁移的场景属于 PBT 的机制范围（第 062 章），它服务于训练过程的继续，与搜索阶段的划分是两件事。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：实验克隆与状态重定位</strong></p>
+    <pre class="code"><code>import shutil
+from pathlib import Path
+
+def clone_experiment(src_dir, dst_dir, old_name, new_name):
+    """克隆实验目录：复制后重定位名称引用；要求原实验已停止。"""
+    src, dst = Path(src_dir), Path(dst_dir)
+    if dst.exists():
+        raise FileExistsError(f"目标已存在：{dst}")   # 禁止静默覆盖
+    shutil.copytree(src, dst)
+    # 状态文件记录实验名与路径：逐文件替换，替换后校验是否残留旧名
+    for state_file in dst.glob("experiment_state-*.json"):
+        text = state_file.read_text(encoding="utf-8")
+        if old_name not in text:
+            raise RuntimeError(f"{state_file.name} 中未找到旧名称，停止克隆")
+        text = text.replace(old_name, new_name)
+        if old_name in text:
+            raise RuntimeError("替换不完整，检查名称是否出现在非常规位置")
+        state_file.write_text(text, encoding="utf-8")
+    print(f"克隆完成：{src.name} -> {dst.name}")
+    return dst
+
+clone_experiment("/shared/tune_results/ppo_sweep_v2",
+                 "/shared/tune_results/ppo_sweep_v2_fork",
+                 old_name="ppo_sweep_v2", new_name="ppo_sweep_v2_fork")
+</code></pre>
+    <p>解读：克隆函数的防护点比功能点更多。<strong>（1）</strong>目标存在即抛错：静默覆盖会毁掉别人已提交的副本，宁可失败也不做破坏性操作。<strong>（2）</strong>替换前后各有一次检查：替换前确认旧名确实存在（否则说明状态文件结构与预期不符），替换后确认无残留。<strong>（3）</strong>字符串替换的隐含假设是实验名足够独特，不与配置中的其它文本重合；名字里避免使用常见词、替换前抽查状态文件内容，是对该假设的例行验证。<strong>（4）</strong>克隆完成后再以新名字提交 <code>resume</code>，即得到一条独立的分叉实验线，原实验不受影响。</p>
+
+    <p><strong>片段 2：数据帧级合并与冲突检测</strong></p>
+    <pre class="code"><code>from pathlib import Path
+import pandas as pd
+from ray.tune import ExperimentAnalysis
+
+def merged_results(dirs):
+    """合并多个实验的记录表：标注来源、检测标识冲突、统一拼接。"""
+    frames = []
+    for d in dirs:
+        df = ExperimentAnalysis(d).results_df.copy()
+        # 来源列随数据保留：合并后仍可按实验分层统计
+        df["source_experiment"] = Path(d).name
+        frames.append(df)
+    merged = pd.concat(frames, ignore_index=True, sort=False)
+    # 冲突检测：同一 trial_id 出现在多个实验，说明标识空间重叠
+    dup = merged.groupby("trial_id")["source_experiment"].nunique()
+    conflicts = dup[dup &gt; 1]
+    if len(conflicts) &gt; 0:
+        raise RuntimeError(f"试验标识冲突：{conflicts.index.tolist()[:3]}")
+    # 口径检查：预算列必须存在且为数值，防止把不同轴的数据混拼
+    if "epoch" not in merged.columns \
+            or not pd.api.types.is_numeric_dtype(merged["epoch"]):
+        raise RuntimeError("预算列缺失或非数值，先统一预算定义")
+    return merged
+
+merged = merged_results(["/shared/tune_results/ppo_shard_a",
+                         "/shared/tune_results/ppo_shard_b"])
+print(merged.groupby("source_experiment")["trial_id"].nunique())
+</code></pre>
+    <p>解读：合并函数把三项口径检查写成可执行代码，流程说明只留设计意图。<strong>（1）</strong>来源列是合并视图的审计基础：后续任何统计都可以按来源拆分，避免“合并后无法回溯”的困局。<strong>（2）</strong>标识冲突检测针对的是不同实验生成同名试验的情况；冲突时不要强行去重，先回查两个实验的命名来源，因为同名标识往往意味着试验族定义重合。<strong>（3）</strong>预算列的数值类型检查拦截最常见的混拼事故：一次实验用迭代数、另一次用环境步数时，两轴拼接出的“曲线”没有物理意义。<strong>（4）</strong>合并结果只用于分析；如果后续还要续跑，走状态级方案并单独评估风险。记录表的列名随版本演进，以对应版本的官方文档为准。</p>
+
+    <p><strong>片段 3：热启动构造精搜空间</strong></p>
+    <pre class="code"><code>import json
+from pathlib import Path
+from ray import tune
+
+def centered_space(best_json, radius=5.0):
+    """以上一阶段最优值为中心构造精搜空间：半径 5 倍约覆盖一个数量级。"""
+    best = json.loads(Path(best_json).read_text(encoding="utf-8"))
+    lr0 = best["best_config"]["lr"]
+    return {
+        # 中心两侧各留半个数量级：radius=5 时区间跨 25 倍
+        "lr": tune.loguniform(lr0 / radius, lr0 * radius),
+        # 非主效应参数沿用上一阶段结论：分类参数保持候选集
+        "train_batch_size": tune.choice([2048, 4096, 8192]),
+        "entropy_coeff": tune.loguniform(1e-4, 1e-2),
+    }
+
+space_fine = centered_space("/shared/archive/ppo_sweep_v2/best.json")
+tune.run(
+    train_fn,
+    config=space_fine,
+    num_samples=20,          # 精搜试验数小于粗搜，样本集中在窄区间
+    name="ppo_sweep_v2_fine",
+    storage_path="/shared/tune_results",
+    scheduler=asha,
+)</code></pre>
+    <p>解读：热启动的构造逻辑包含三个决策。<strong>（1）</strong>中心点来自上一阶段归档的 <code>best.json</code>，终端输出与记忆都不可靠；归档的可追溯性在这里兑现价值。<strong>（2）</strong>半径按对数尺度设置：5 倍半径对应中心两侧各半个数量级，精搜覆盖 25 倍区间，能在兼顾局部加密的同时保留一个方向的探索余地。半径过小时最优值会贴在新空间边界，由第 061 章的边界判读规则决定是否外扩。<strong>（3）</strong>精搜只对主效应参数加密：批量与熵系数沿用函数项或经验区间，把预算集中在上一阶段显示敏感的参数上；每增加一个加密参数，精搜预算按维数效应放大。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>克隆正在运行的实验</strong>：状态文件与试验目录在拷贝期间变化，副本状态不一致，resume 后行为随机。修复：克隆前先停止写入，必要时以归档副本为克隆源。</li>
+      <li><strong>状态文件名称替换不彻底</strong>：目录改名而状态内容残留旧名，resume 时找不到对应目录，或把新实验写回旧路径。修复：替换前后各做一次检查，残留即中止。</li>
+      <li><strong>合并前未统一指标口径</strong>：两次实验的回报统计口径不同（一次含截尾一次未截），合并排名失真。修复：口径三项检查写入合并函数，检查不通过先修数据。</li>
+      <li><strong>直接做状态级合并</strong>：试验标识冲突、状态索引指向错误，续跑后出现“影子试验”。修复：默认数据帧级合并；状态级仅在实验规模小、标识无重叠时执行，并做 resume 演练。</li>
+      <li><strong>热启动半径失控</strong>：半径过大时精搜等价于重复粗搜；半径过小时新空间没有包含真最优。修复：按一个数量级起步，依据边界判读调整，并保留少量宽范围对照试验。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>为三个场景选择数据流操作：复盘上季度搜索、在旧实验基础上换调度器重跑、汇总两个分片实验的结果。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>复盘用只读导入；换调度器继续用克隆续跑（原实验冻结）；分片结果用数据帧合并。选择依据是“是否需要写入”与“是否需要续跑”。</div></details>
+      </li>
+      <li>预测题：把热启动半径从 5 改为 50，精搜的采样分布、最优值与边界判读结果各会如何变化？<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>区间跨 2500 倍，采样在原点附近极稀疏，精搜退化为宽范围搜索；最优值提升有限但预算浪费明显；边界判读大概率显示“无聚集”，因为样本分布过散。</div></details>
+      </li>
+      <li>设计题：为两分片搜索设计从提交到合并的完整流程：命名规则、来源标记、冲突检测、合并后的统计口径，各写出一个验证点。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>命名规则用“同一实验名前缀 + 分片后缀”；来源标记在合并时写入；冲突检测按标识唯一性断言；统计口径按来源分层后再合并，验证点包括分片试验数之和等于合并总数。</div></details>
+      </li>
+      <li>实现题：扩展片段 2：当检测到标识冲突时，不抛错，改为给冲突试验添加来源前缀生成新标识，并输出重映射表。说明重映射可能破坏什么。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>重映射把 (来源, 旧标识) 映射到新标识；破坏的是与外部记录的关联，例如报告里引用的试验标识、检查点目录名，需要同步更新引用或保留对照表。</div></details>
+      </li>
+      <li>实践题：执行一次克隆续跑演练：克隆一个已完成实验，改名后以新空间 resume 2 个试验，验证状态重定位与归档可读性。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>演练重点是“不改动原实验”与“新实验可正常续跑”两条；验证点包括原实验目录时间戳未变、新实验有 2 个新试验记录、旧试验保持原配置。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>三种数据流风险递增：只读导入、克隆续跑、状态级合并；能用左侧方案就不上移。</li>
+      <li>克隆的前提是原实验停止；状态文件内名称与路径必须完整重定位，替换前后各做检查。</li>
+      <li>合并默认在数据帧层进行：来源列、标识冲突检测、指标与预算口径三项检查缺一不可。</li>
+      <li>热启动只传递配置不传递权重；半径以覆盖一个数量级起步，按边界判读调整。</li>
+      <li>阶段式搜索的粗搜与精搜预算口径不同，记录分开统计，合并视图仅用于整体叙事。</li>
+      <li>下一章回到结果侧深化统计：筛选、排序与不确定性度量。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch069.html">← 第 069 章：调优报告生成与实验导出</a>
+    <a class="next" href="ch071.html">第 071 章：实验筛选、排序与统计 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

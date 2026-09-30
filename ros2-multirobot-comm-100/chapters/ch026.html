@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第026章 静态地图合并 | 多机器人协同学习课程 · ROS2 通信与系统集成</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 数据分发与协同感知</span>
+    <span class="sep">/</span>
+    <span>第 026 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 数据分发与协同感知</div>
+    <h1>第 026 章：静态地图合并</h1>
+    <p class="lead">两台机器人各建了半张地图，如何拼成一张不失真的全局栅格？本章讲清占用栅格的数据语义、坐标重采样与概率融合的完整链条。</p>
+    <ul class="meta">
+      <li>主题：地图协同 / 栅格融合</li>
+      <li>关键机制：OccupancyGrid 语义、对数几率（log-odds）融合、坐标重采样、transient-local 发布</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 025 章（统一坐标框架设计与标定）</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>掌握 <code>nav_msgs/OccupancyGrid</code> 的全部关键字段：分辨率、原点、数据取值与行列序。</li>
+      <li>理解地图合并的本质：把两张"本机坐标系栅格"重采样到同一张"世界坐标系栅格"上做概率融合。</li>
+      <li>会用对数几率表示与融合概率证据，知道为什么"直接取最大/相加像素"会出错。</li>
+      <li>会用重叠区冲突率定量评估合并质量，判断标定/定位误差是否超标。</li>
+      <li>能把合并结果以正确的 QoS（transient-local）发布，让晚加入的机器人和工具都能取到。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 024、025 章解决了"坐标对齐"，现在可以直接问一个非常工程的问题：<strong>三台机器人分头跑完一整层楼，怎么得到一张完整的楼层地图</strong>？每台机器人的 SLAM 只会输出它自己走过区域的地图，而且是"以自己地图原点为基准"的栅格。当机器人 A 的地图上某个格子在（50, 30），这张图要回答"它在全局世界的哪个位置"，就必须经过坐标变换重投影。</p>
+    <p>地图合并不是把两张图片并排放，它有三个本质操作：<strong>几何上</strong>做坐标重采样（不同原点、不同分辨率、不同朝向）；<strong>概率上</strong>做证据融合（两块地图重叠处，每个格子收到多条互相独立或矛盾的观测）；<strong>系统上</strong>做分发（合并结果要能让任意时刻加入的机器人拿到）。本章把这三件事一次做完，产出"静态地图合并"这个可复用模块；它也是第 027/033 章动态与分布式地图体系的静态底座。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 占用栅格的数据语义：先看懂字段再谈合并</h3>
+    <p><code>nav_msgs/OccupancyGrid</code> 的全部关键信息在 <code>info</code> 与 <code>data</code> 里：</p>
+    <ul>
+      <li><code>info.resolution</code>：每个栅格单元的边长（米/格），室内常用 0.05 m；</li>
+      <li><code>info.width / height</code>：栅格的列数与行数；</li>
+      <li><code>info.origin</code>：栅格左下角在世界（地图）坐标系中的位姿，含位置与朝向；</li>
+      <li><code>data</code>：长度为 width×height 的整数数组，<strong>行优先（row-major），第一行是地图底部（y 最小的那行）</strong>；取值 −1 表示未知、0 表示空闲、100 表示占用，中间值表示概率。</li>
+    </ul>
+    <p>最容易踩的两个坑都藏在上面的细节里：<strong>（1）</strong>行序方向，如果误把第一行当顶部，合并出的地图会上下翻转，而局部看每一块都"很正常"；<strong>（2）</strong>origin 指的是格子左下角，不是中心，也不是右下角。写重采样代码前，先把这两条用一张已知小地图验证一遍，比事后 debug 便宜得多。</p>
+
+    <h3>2. 重采样的几何：两张栅格之间的"像素级"变换</h3>
+    <p>合并的第一步是选定<strong>输出栅格</strong>：世界坐标系下一张足够覆盖所有输入的大栅格，通常取与输入相同的分辨率（加粗会丢细节、变细会引入插值伪影）。然后对输出栅格中每个单元计算其中心的世界坐标，再反查每张输入地图：</p>
+    <div class="formula">
+      x<sub>w</sub> = x<sub>o</sub> + (j + 0.5)·r，y<sub>w</sub> = y<sub>o</sub> + (i + 0.5)·r
+      <br>i<sub>in</sub> = ⌊(x<sub>w</sub> − x<sub>in</sub>)/r<sub>in</sub>⌋，j<sub>in</sub> = ⌊(y<sub>w</sub> − y<sub>in</sub>)/r<sub>in</sub>⌋
+      <span class="note">(i, j) 为输出行列；(x<sub>in</sub>, y<sub>in</sub>) 为输入地图 origin 位置；朝向非零时先做旋转再查表</span>
+    </div>
+    <p>坐标取整用<strong>向下取整</strong>，保证每个输出格落在哪个输入格是确定性的，不会因为 0.4 格的临界值产生整列偏差。整个过程是纯查表，numpy 向量化后几百万格的合并在百毫秒量级完成。</p>
+    <p>补一个细节：当输入图与输出图分辨率相同、且只相差平移时，上述索引公式会退化为"每个输出格恒等于某个输入格"，不存在重复采样或漏采样（0.3 格、0.6 格偏移都不会改变取整结果的规律性）。真正引入采样损失的是<strong>旋转</strong>：朝向不为零时，输出格中心在输入图的像素网格上是斜着走的，最近邻查表会沿扫描线出现"有的输入列被采两次、有的一次没采到"的阶梯。误差幅度上界是半个格对角线，即 r·√2/2 ≈ 0.035 m（r = 0.05 m 时）。因此对朝向非零的输入图，若精度敏感，应先旋转重采样为轴对齐栅格再做融合，或接受 3–4 cm 的阶梯误差并在验收里计入。</p>
+
+    <h3>3. 概率融合：对数几率是"证据的加法器"</h3>
+    <p>重叠区的每个格子会收到多张地图的观测。直觉上"取最确定的那个"或"占用优先"都不够好，正确做法来自贝叶斯证据叠加。把每个格子的占用概率 p 换成对数几率（log-odds）：</p>
+    <div class="formula">
+      l = ln( p / (1 − p) )，融合时 l<sub>fused</sub> = Σ<sub>k</sub> l<sub>k</sub>（− l<sub>prior</sub>）
+      <span class="note">独立观测的证据在 log-odds 域直接相加；先验 0.5 对应 l = 0，方向即正负</span>
+    </div>
+    <p>这样做的三个好处：<strong>（1）</strong>两条"占用"证据相加变得更强（0.7 + 0.7 → 0.84），而常识上的"取最大"永远停在 0.7，丢掉了重复证据的增益；<strong>（2）</strong>占用与空闲证据相遇时相互抵消，天然表达"有争议"，不会让某一方武断覆盖；<strong>（3）</strong>数值上把乘法/除法变成加法，适合大规模向量化。工程实现时把概率截断在 [0.01, 0.99] 再取 log-odds，避免 0 与 1 带来的无穷大。</p>
+
+    <h3>4. 质量指标：重叠区冲突率</h3>
+    <p>两张地图在重叠区应该"意见一致"。冲突率定义为：在两张地图都有已知值的格子里，一方说占用、另一方说空闲的比例。它是<strong>标定/定位误差的直接体温计</strong>：</p>
+    <ul>
+      <li>冲突率 &lt; 3%：几何对齐良好，可以直接融合；</li>
+      <li>3%–10%：存在厘米级错位，融合可用但边缘会出现"双墙"；</li>
+      <li>&gt; 10%：先回去检查标定（第 025 章）与定位，不要继续融合。</li>
+    </ul>
+    <p>注意冲突率只统计"双方都已知"的格子，未知区域不参与，否则半张空白地图会给出虚假的"零冲突"。</p>
+
+    <h3>5. 数值算例：格子的证据合成与整图规模</h3>
+    <p>先算一个格子的账。某格子在机器人 1 的地图上取值 70（占用概率 0.7），在机器人 2 的地图上也是 70。单张图的对数几率 l = ln(0.7 ÷ 0.3) = 0.847；两张独立证据相加得 1.695，反解 p = 1 ÷ (1 + e<sup>−1.695</sup>) = 0.845，折回整数栅格是 85。同一个格子如果一份证据说占用 0.7、另一份说空闲 0.3（对数几率 −0.847），相加恰好为 0，融合结果回到 0.5，即"无法裁决"；第三张图再投一票 0.6（对数几率 0.406），结果变成 0.60，方向由净证据决定。<strong>这套算术的工程含义是：重复一致的证据会增强置信，矛盾证据会互相抵消，而"取最大值"永远停在 0.7，无法表达 85 这个更强结论。</strong></p>
+    <p>再算整图规模，它决定发布与订阅的开销。一层 100 m × 60 m 的场地，分辨率 0.05 m，栅格数 = (100 ÷ 0.05) × (60 ÷ 0.05) = 240 万格；<code>data</code> 以 int8 传输是 2.4 MB。以百兆网络（线速 12.5 MB/s）传输一次约 0.19 s，千兆网络（线速 125 MB/s）约 19 ms。这解释了设计里两个数字的来源：<strong>合并定时器取 2 s</strong>（相对 0.19 s 的传输时间留出约 10 倍余量，且地图本身是慢变量）；<strong>发布必须 Reliable + transient-local</strong>（整张地图不能容忍半途丢半张）。还要小心实现侧的隐性放大：Python 里 <code>data</code> 若按整数列表构造，240 万个 Python int 对象占用的内存可达几十 MB，序列化耗时也会明显变长，生产实现应使用 <code>array</code> 或 numpy 缓冲，避免"数据只有 2.4 MB、节点却吃掉上百 MB"。</p>
+
+    <h3>6. 失效模式与边界条件</h3>
+    <ul>
+      <li><strong>证据重复计数</strong>：同一台机器人的地图被缓存两次（重启后没清空），或两台机器人用的是同一份先验地图，log-odds 会按份数放大置信度。症状：融合后的占用值异常接近 100。对策：订阅键用机器人 ID 去重，定时器重算时清空累加器。</li>
+      <li><strong>未知格语义混淆</strong>：把"没探测过"与"探测过但概率 0.5"混为一谈。前者应保持 −1，后者在整数栅格里几乎不出现（50 与未知 −1 仍是两个值）。对策：融合前统计各输入图的未知占比，占比异常（例如整图都是未知）时先查 SLAM 输出。</li>
+      <li><strong>部分重叠</strong>：两图重叠区不足时，冲突率统计样本太少，指标本身噪声大。边界动作：重叠已知格少于 1000 格时拒绝给出冲突率结论（返回 nan），并驱动一次补采。</li>
+      <li><strong>时相不一致</strong>：一张地图采集于家具摆放前、另一张在摆放后，重叠区冲突来自真实变化，标定误差不是原因。边界动作：地图携带时间戳，超过可接受时差时只做"变化区域"标注，不强行融合成单一结论。</li>
+      <li><strong>内存与并发</strong>：合并大图时分配新数组，若与 SLAM 同进程会引发峰值内存翻倍。边界动作：合并放到独立进程/节点，限制并发地图数。</li>
+    </ul>
+    <p>还有一条数值边界要写进文档：整数栅格的取值范围是 −1 与 0–100，融合结果的舍入必须先把概率截断在 [0.01, 0.99] 再映射，否则 <code>log(p/(1−p))</code> 在 p = 0 或 1 处发散。截断本身损失的信息量很小（0.99 与 1.0 的差别在导航决策里可以忽略），但它换来的是整个数值管线的稳定性。</p>
+    <p>冲突率的数值还依赖"占用/空闲"的判定阈值：整数栅格里 50 与 10 是常用划分，但把占用阈值从 50 调低到 30 会把"较有把握的占用"也计入冲突，指标随之上升几个百分点。做跨系统对比或写验收标准时，阈值必须与冲突率一起记录，否则两组数字没有可比性。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>合并模块的实现流程分五步：</p>
+    <ol>
+      <li><strong>收集输入</strong>：每台机器人的静态地图（<code>/robotN/map</code>）以 transient-local QoS 发布；合并器订阅并缓存最新一张。等所有机器人到齐或超时后开始。</li>
+      <li><strong>定输出栅格</strong>：取所有输入地图世界包围盒的并集，外扩 1 m 余量；分辨率与输入一致。记录输出 origin。</li>
+      <li><strong>重采样与融合</strong>：按上节公式把每张输入图映射到输出栅格，在 log-odds 域累加，未知格不投票。</li>
+      <li><strong>质量门控</strong>：计算重叠冲突率并写日志/告警；超过阈值时仍然发布地图，但把"降级标记"放进发布状态（第 039 章的健康监测会用到）。</li>
+      <li><strong>发布与固化</strong>：以 Reliable + transient-local 发布合并地图；同时支持保存为 map_server 的 PNG+YAML 格式，供下次直接加载而不必重算。</li>
+    </ol>
+    <p>保存格式也值得说明：map_server 的约定是把栅格存成灰度 PNG（占用 0、空闲 254、未知 205，配合 <code>negate</code> 语义）加一份 YAML 描述分辨率与 origin。它的优点是几乎所有工具链都能读，缺点是 PNG 无损压缩后仍有几 MB，且"重读旧图"与"重新融合"可能得到不同的像素级结果（浮点舍入差异）。工程上的纪律是：<strong>合并结果落盘一次、全系统分发这一份文件，把"重新融合"只留给几何参数真正变化的时候</strong>，这样每台机器人的世界是同一张画布。</p>
+    <div class="box key">
+      <span class="box-title">设计决策：为什么合并结果必须 transient-local？</span>
+      <p>地图是"状态型"数据（描述当前世界），不是"事件型"数据（描述发生了什么）。晚加入的导航节点、可视化工具、新上电的机器人，都需要立刻拿到完整地图，等下一帧太迟。transient-local 的语义正是"为每个晚到的订阅者重放最后一条"，与地图的语义完全匹配。对比之下，odom 这类变化快的数据用 volatile 即可，没人需要"五分钟前的 odom"。</p>
+    </div>
+    <table>
+      <tr><th>参数</th><th>建议值</th><th>依据</th></tr>
+      <tr><td>输出分辨率</td><td>0.05 m（与输入一致）</td><td>不引入二次重采样误差</td></tr>
+      <tr><td>包围盒余量</td><td>1 m</td><td>容纳机器人本体与后续扩展</td></tr>
+      <tr><td>log-odds 截断</td><td>p ∈ [0.01, 0.99]</td><td>避免无穷大，保持数值稳定</td></tr>
+      <tr><td>冲突率告警阈值</td><td>3%</td><td>室内标定良好时的经验值</td></tr>
+      <tr><td>发布 QoS</td><td>Reliable + transient-local</td><td>状态型数据，晚加入者必须可得</td></tr>
+    </table>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：合并核心，重采样 + 对数几率融合</strong></p>
+    <pre class="code"><code>import numpy as np
+
+def prob_to_logodds(v):
+    """把 OccupancyGrid 的整数值转成 log-odds；未知(-1)返回 0（不投票）。"""
+    p = np.where(v == -1, 0.5, np.clip(v / 100.0, 0.01, 0.99))
+    return np.log(p / (1.0 - p))
+
+def merge_maps(maps, out_res=None, margin=1.0):
+    """maps: [(info, data_2d)] 列表，data 已是 (height, width) 的 numpy 数组。
+    返回合并后的 (origin_xy, resolution, grid_2d)（单位为米）。"""
+    res = out_res or maps[0][0].resolution
+    xs, ys = [], []
+    for info, _ in maps:                       # 收集每张图在世界系的包围盒
+        w = info.width * info.resolution
+        h = info.height * info.resolution
+        xs += [info.origin.position.x, info.origin.position.x + w]
+        ys += [info.origin.position.y, info.origin.position.y + h]
+    ox, oy = min(xs) - margin, min(ys) - margin   # 输出栅格左下角
+    Wc = int(np.ceil((max(xs) + margin - ox) / res))
+    Hc = int(np.ceil((max(ys) + margin - oy) / res))
+    # 输出栅格每个单元中心的世界坐标（网格向量化，避免逐格循环）
+    cx = ox + (np.arange(Wc) + 0.5) * res
+    cy = oy + (np.arange(Hc) + 0.5) * res
+    gx, gy = np.meshgrid(cx, cy)
+    acc = np.zeros((Hc, Wc))                   # log-odds 证据累加器
+    for info, data in maps:
+        # 世界坐标 -> 该输入图的像素索引：向下取整保证确定性
+        jj = np.floor((gx - info.origin.position.x) / info.resolution).astype(int)
+        ii = np.floor((gy - info.origin.position.y) / info.resolution).astype(int)
+        inside = (jj &gt;= 0) &amp; (jj &lt; info.width) &amp; (ii &gt;= 0) &amp; (ii &lt; info.height)
+        vals = np.full(gx.shape, -1)
+        vals[inside] = data[ii[inside], jj[inside]]   # 图外按"未知"处理
+        acc += prob_to_logodds(vals)           # 独立证据在 log-odds 域相加
+    p = 1.0 / (1.0 + np.exp(-acc))             # 融合概率 -> 整数值
+    out = np.where(acc == 0, -1, np.rint(p * 100)).astype(np.int8)
+    return (ox, oy), res, out</code></pre>
+    <p>解读：逐块来看。<strong>（1）</strong><code>prob_to_logodds</code> 把"未知"映射为 log-odds 0，这让未知格子在后续加法里自动"不投票"，不需要额外的掩码逻辑，是这套表示最优雅的地方。<strong>（2）</strong>包围盒先扫描全部输入再定输出栅格：合并模块必须"先看全局再画布"，否则后一张地图会被裁掉。<strong>（3）</strong><code>np.floor</code> 与 <code>inside</code> 掩码共同保证越界安全：落在输入图外的输出格得到 −1（未知），既有物理意义又避免了数组越界。<strong>（4）</strong>最后 <code>acc == 0</code> 的判据：所有输入都没投票的格子才是未知，只要有一张图说了"空闲"（log-odds 为负），格子就不再是未知。注意 row-major 的方向约定：<code>ii</code> 对应行（y 方向）、<code>jj</code> 对应列（x 方向），倒置会得到上下翻转的地图。</p>
+
+    <p><strong>片段 2：合并节点，订阅、门控与发布</strong></p>
+    <pre class="code"><code>from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
+from nav_msgs.msg import OccupancyGrid
+
+class MapMerger(Node):
+    """等待各机器人静态地图到齐后合并，并按状态语义发布。"""
+    def __init__(self, n_robots=2):
+        super().__init__("map_merger")
+        self.expected = {f"robot{r}": None for r in range(1, n_robots + 1)}
+        # 状态型数据的订阅 QoS：transient-local 让我们迟到也能拿到最后一张
+        map_qos = QoSProfile(depth=1)
+        map_qos.reliability = ReliabilityPolicy.RELIABLE
+        map_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
+        for rid in self.expected:
+            self.create_subscription(OccupancyGrid, f"/{rid}/map",
+                                     lambda m, k=rid: self.store(k, m), map_qos)
+        self.pub = self.create_publisher(OccupancyGrid, "/fleet/map", map_qos)
+        self.create_timer(2.0, self.try_merge)     # 低频尝试：地图是慢变量
+
+    def store(self, rid, msg):
+        self.expected[rid] = msg                   # 缓存最新静态地图
+
+    def try_merge(self):
+        if any(m is None for m in self.expected.values()):
+            self.get_logger().info("地图未到齐，继续等待", throttle_duration_sec=10.0)
+            return
+        maps = [(m.info, np.array(m.data, dtype=np.int8).reshape(
+                 m.info.height, m.info.width)) for m in self.expected.values()]
+        (ox, oy), res, grid = merge_maps(maps)
+        conflict = conflict_rate(maps[0], maps[1])  # 重叠区一致性体检
+        self.get_logger().info(f"合并完成，冲突率 {conflict:.1%}")
+        out = OccupancyGrid()
+        out.header.frame_id = "world"              # 关键：输出挂在全局根下
+        out.info.resolution = res
+        out.info.width, out.info.height = grid.shape[1], grid.shape[0]
+        out.info.origin.position.x, out.info.origin.position.y = ox, oy
+        out.data = grid.ravel().tolist()           # row-major：与字段约定一致
+        self.pub.publish(out)</code></pre>
+    <p>解读：合并节点的设计要点有三个。<strong>（1）</strong>订阅与发布使用同一套状态型 QoS：RELIABLE + TRANSIENT_LOCAL。前者保证整张地图（可能几百 KB 到几 MB）不半途丢包，后者保证任何时刻订阅的工具/机器人都能立刻得到"当前地图"。<strong>（2）</strong>合并触发用低频定时器：地图是慢变量，2 秒一次的节奏足以响应新机加入，同时避免"每收到一张就重算"把回调线程打满（重算一次在百万格量级约几十到几百毫秒）。<strong>（3）</strong><code>reshape(height, width)</code> 与 <code>ravel()</code> 必须严格对称：读进来怎么切、发出去怎么排，行优先约定任何一处弄反，地图就会转置或翻转，而且只在与其他工具对比时才暴露。</p>
+
+    <p><strong>片段 3：冲突率体检，合并质量的量化抓手</strong></p>
+    <pre class="code"><code>def conflict_rate(map_a, map_b, occupied=50, free=10):
+    """重叠区冲突率：双方都已知的格子里，一方占用一方空闲的比例。
+    输入是 (info, data_2d) 二元组，要求同分辨率（不同则先重采样到公共栅格）。"""
+    (info_a, a), (info_b, b) = map_a, map_b
+    if (info_a.resolution != info_b.resolution
+            or (info_a.width, info_a.height) != (info_b.width, info_b.height)
+            or (info_a.origin.position.x != info_b.origin.position.x)
+            or (info_a.origin.position.y != info_b.origin.position.y)):
+        return float("nan")                    # 简化演示：先要求公共栅格
+    known = (a != -1) &amp; (b != -1)             # 未知区域不参与统计
+    if known.sum() == 0:
+        return float("nan")                    # 无重叠交集：无意义
+    a_occ, b_occ = a &gt;= occupied, b &gt;= occupied
+    a_free, b_free = a &lt;= free, b &lt;= free
+    conflict = ((a_occ &amp; b_free) | (a_free &amp; b_occ)) &amp; known
+    return float(conflict.sum() / known.sum())</code></pre>
+    <p>解读：这个函数是整个合并流程的"质检员"。<strong>（1）</strong>阈值参数把"占用/空闲"的判断下放为参数：不同应用对"多少概率算占用"的定义不同（导航保守、建图宽松），写死会埋雷。<strong>（2）</strong>"无重叠/无法比较"的情形返回 <code>nan</code>，不返回 0：0 冲突率是"极好"的含义，绝不能与"无法评估"混淆，这是监控指标设计的通用纪律。<strong>（3）</strong>此处的简化版要求两图同栅格；生产版本应先分别重采样到同一张公共栅格再统计（复片段 1 的重采样逻辑），或者直接对合并前后的重合区做统计。把冲突率送进健康监测（第 039 章）后，标定退化会以"指标缓慢爬升"的形式提前曝光，把"等地图明显错位才发现"的时间点大大提前。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>行序颠倒</strong>：把 data 第一行当顶部处理，地图上下翻转；局部检查一切正常，全局拼接才露馅。修复：用一张非对称小地图做单元测试，断言四个角的取值。</li>
+      <li><strong>origin 语义弄错</strong>：把 origin 当格子中心或右上角，全图平移半格到整格，重叠区出现"重影墙"。修复：牢记 origin 是左下角；用公式（j+0.5）反查验证。</li>
+      <li><strong>用 max 或"占用优先"做融合</strong>：丢失证据强度信息，冲突格被武断覆盖。修复：log-odds 求和，未知格自动不投票。</li>
+      <li><strong>不同分辨率硬合</strong>：输入 0.05 m、输出 0.02 m 却不做插值，细栅格里出现锯齿状空洞。修复：输出分辨率取输入同一档；确需变分辨率时用最近邻/面积加权重采样并重测冲突率。</li>
+      <li><strong>忽略朝向字段</strong>：origin 四元数非零（地图旋转过）时只用平移查表，整张图绕原点旋转错位。修复：先按 origin 的旋转把查询点变换到输入图坐标系，再做像素索引。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>构造两张 10×10 的小地图，origin 分别平移 0.5 m，验证重采样后重叠区域的取值方向正确。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>用手算一个格子：输出格中心的世界坐标减去输入 origin，再除以分辨率向下取整，与代码输出对拍。</div></details>
+      </li>
+      <li>把融合策略从 log-odds 改为"占用优先"，预测一张有噪声的地图合并后会怎样（把远处一次错误占用"传染"给整个重叠区），并解释原因。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>占用优先把单次噪声观测固化为最终结论，且无法被后续空闲证据修正；log-odds 求和允许证据累计与抵消。</div></details>
+      </li>
+      <li>设计实验：把一台机器人的地图人为平移 0.05 m / 旋转 1°，观察冲突率随扰动量的变化曲线，找出你场地上的"冲突率告警阈值"。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>冲突率与错位/分辨率的比值近似同增；室内结构化场景可在 3%–5% 处观察到明显拐点，把拐点前一点设为阈值。</div></details>
+      </li>
+      <li>设计题：为 3 台机器人设计静态地图合并管线，输出栅格怎么定、融合顺序是否影响结果（log-odds 加法可交换，请论证）、冲突率超标时的降级策略。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>log-odds 求和满足交换律，融合顺序不影响结果（浮点误差除外），这是选择它的深层原因之一；降级策略可以是"发布但标记质量"或"只用冲突率最低的一对"。</div></details>
+      </li>
+      <li>思考：合并地图与各机本地地图长期并存，导航节点应该订哪张？如果合并地图更新了，正在执行任务的机器人如何平滑切换？<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>本地地图适合本体避障（新鲜、无传输延迟），合并地图适合跨区域规划；切换要点是"新地图不破坏当前路径"，先校验再切换，或对新旧地图做差异提示。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>OccupancyGrid 的语义三件套：分辨率、左下角 origin、行优先且 −1/0/100 的 data，任何一处弄反都会得到"局部正常全局错"的地图。</li>
+      <li>合并 = 几何重采样（输出格中心世界坐标反查输入像素） + 概率融合（log-odds 求和，未知不投票）。</li>
+      <li>重叠冲突率是标定与定位误差的体温计：&lt; 3% 良好，超阈值先查几何对齐再谈融合。</li>
+      <li>发布必须符合状态型语义：Reliable + transient-local；保存为 map_server 格式可避免重复计算。</li>
+      <li>静态地图合并只是起点。下一章处理活的版本：<strong>动态地图更新共享</strong>，让地图随环境变化持续更新，同时不被增量流量压倒。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch025.html">← 第 025 章：统一坐标框架设计与标定</a>
+    <a class="next" href="ch027.html">第 027 章：动态地图更新共享 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

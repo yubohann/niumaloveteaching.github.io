@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第062章 协同覆盖路径规划 | 多机器人协同学习课程 · ROS2 通信与系统集成</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第三篇 · 协同控制与任务协同</span>
+    <span class="sep">/</span>
+    <span>第 062 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第三篇 · 协同控制与任务协同</div>
+    <h1>第 062 章：协同覆盖路径规划</h1>
+    <p class="lead">把"扫完这片区域"变成可执行的工程问题：单元分解、牛耕式路径、多机分区与进度再分配，一台机器人的覆盖算法怎么升级成 N 台机器人的协同覆盖。</p>
+    <ul class="meta">
+      <li>主题：任务协同 / 覆盖路径规划</li>
+      <li>关键机制：BCD 单元分解、Boustrophedon 扫描、空间分区、负载均衡</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 061 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解覆盖路径规划（Coverage Path Planning, CPP）的问题定义与四个核心指标：覆盖率、重复率、完工时间、负载均衡度。</li>
+      <li>掌握精确单元分解（BCD）与牛耕式（Boustrophedon）扫描的原理，会由传感器幅宽推算条带间距与转向代价。</li>
+      <li>掌握多机器人覆盖的三种分工方式（空间分区、路径切分、时间轮换）及其适用条件。</li>
+      <li>会设计"分区—执行—监控—再分配"的闭环，用累计进度计数驱动失效兜底。</li>
+      <li>能为自己的课程项目写出可验收的覆盖指标与参数表。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 061 章回答了"为什么要协同覆盖"：清扫、植保、巡检、区域搜索都要求把一片已知区域尽量无遗漏地走一遍。但知道目标不等于知道路径，如果只让每台机器人各自跑单机覆盖算法，它们会互相抢地盘、重复扫同一块区域，台数越多浪费越大。</p>
+    <p>本章解决的是协同覆盖的<strong>规划层</strong>：先决定"怎么把区域拆成不冲突的块"，再决定"每块内部怎么走"，最后用一个监控节点保证"有人掉队时区域还能被扫完"。它向前衔接 061 章的覆盖任务语义，向后给 063 章巡逻、065 章阶段项目提供可复用的分区与进度机制。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 覆盖问题：把"扫干净"量化</h3>
+    <p>给定二维区域内所有可通行栅格，多机器人覆盖的目标可以写成四个可测量的指标：</p>
+    <ul>
+      <li><strong>覆盖率 c</strong>：已覆盖栅格数 / 可通行栅格总数，工程验收一般要求 98% 以上（剩余 2% 往往是贴墙、家具背面等死角）。</li>
+      <li><strong>重复率</strong>：被重复覆盖的栅格数 / 总栅格数，反映"抢地盘"的浪费，越小越好，经验上控制在 15% 以内。</li>
+      <li><strong>完工时间（makespan）</strong>：从任务下达到最后一个机器人停下的时间，由最慢的那台决定，这正是"均衡"比"快"更重要的原因。</li>
+      <li><strong>负载均衡度</strong>：各机器人工作量最大值与均值之比，1.0 表示完美均衡。</li>
+    </ul>
+    <div class="formula">
+      c = N<sub>covered</sub> / N<sub>total</sub>（目标 ≥ 0.98），均衡度 = T<sub>max</sub> / T<sub>mean</sub>（目标 ≤ 1.15）
+      <span class="note">验收时四指标要一起看：覆盖率达标但重复率 50%，说明分区失效，换汤不换药</span>
+    </div>
+
+    <h3>2. 单机覆盖的经典解法：单元分解 + 牛耕式扫描</h3>
+    <p>单机覆盖最成熟的路线是"先分解、再扫描"。<strong>精确单元分解</strong>（Boustrophedon Cellular Decomposition, BCD）沿一个方向扫描区域，每当障碍物数量发生变化（出现"IN 事件"或"OUT 事件"）就把自由空间切成若干个<strong>单元（cell）</strong>，每个单元内部没有障碍物，因此可以用简单的往复路径扫完。</p>
+    <p>每个单元内部的扫描方式是<strong>牛耕式（Boustrophedon）路径</strong>：像耕地一样一行扫过去、下一行扫回来。条带间距由传感器幅宽决定：</p>
+    <div class="formula">
+      w = 2r × (1 − o)
+      <span class="note">r 为感知半径，o 为重叠率（取 0.10–0.20）；r = 3 m、o = 0.15 时 w = 5.1 m</span>
+    </div>
+    <p>单元内路径长度可粗略估为 <strong>面积 / w + 转向次数 × 单次转向代价</strong>。转向代价常被低估：一次 180° 调头往往要走一段小弧线、减速再加速，等效 1–3 秒。对 10 m × 6 m 的小房间，条带数 6/5.1 ≈ 2 条，转向一次；对 200 m × 50 m 的厂房，条带 50/5.1 ≈ 10 条，转向九次，<strong>扫描方向应沿长边，让条带又长又少，转向次数最小化</strong>。</p>
+
+    <h3>3. 多机器人分工的三种方式</h3>
+    <table>
+      <tr><th>方式</th><th>做法</th><th>优点</th><th>代价 / 适用</th></tr>
+      <tr><td>空间分区</td><td>先把地图分成 N 块（Voronoi 最近邻、按行切格、按单元分配），每个机器人独立扫自己的块</td><td>通信量小、分区后互不干扰、掉线影响局部</td><td>块间负载可能不均，需要均衡策略；适合静态已知地图</td></tr>
+      <tr><td>路径切分</td><td>先算一条全局覆盖路径，再切成 N 段（如 STC 生成生成树后切子树）</td><td>路径平滑、重复少</td><td>对动态障碍敏感，任务中途改切分代价高</td></tr>
+      <tr><td>时间轮换</td><td>所有机器人共享同一条大路径，按时间片接力，前一台扫过的区域后一台跳过</td><td>无需分区、天然防重</td><td>对进度同步要求高，网络差时容易重复扫描</td></tr>
+    </table>
+    <p><strong>实务默认选空间分区</strong>：它把"协同"退化成"每人一单"，与第 066 章的任务分配天然衔接；只有在区域极窄（走廊）或需要顺序推进时才考虑路径切分与时间轮换。</p>
+    <p>分区的直觉来自 <strong>Voronoi 最近邻分配</strong>：每个栅格归给离它最近的机器人。它自动产生"势力范围"式的连续区域，但<strong>不保证面积相等</strong>，四台机器人扎堆在角落时，最近的机器人会拿到巨大的区域。修正办法是迭代挪动边界：算出各块面积偏差，把最大的块沿边界让一部分给相邻块，两三轮即可把均衡度压进 1.1 附近。</p>
+
+    <h3>4. 负载模型与再分配</h3>
+    <p>分区是否合理，靠一个简单的工作量模型验证：</p>
+    <div class="formula">
+      T<sub>i</sub> ≈ A<sub>i</sub> / (v × w) + N<sub>turn,i</sub> × t<sub>turn</sub>
+      <span class="note">A<sub>i</sub> 为第 i 块的面积，v 为平均速度，t<sub>turn</sub> 为单次转向代价（含加减速）</span>
+    </div>
+    <p>它解释了两个反直觉现象：面积相等的两块，条带短的块更慢（转向多）；有障碍的块比空地慢（单元切换本身也是转向）。因此分区的目标是 <strong>"预估工时相等"</strong>，不追求"面积相等"。</p>
+    <p>执行阶段还要留一手：任何一台卡住，原本平衡的调度都会失衡。监控节点订阅各机器人上报的<strong>累计覆盖数</strong>（不是增量，这样消息重复也幂等），当全局进度趋近目标就收工；当某个机器人的剩余量长期异常，把它的未完成单元标记为"待再分配"，由空闲或先扫完的机器人接管。触发阈值要留迟滞：剩余 200 格以上才动作，避免刚慢了几秒就被抢单、产生分区抖动。</p>
+
+    <h3>5. 数值算例：植保地块的条带、工时与方向账</h3>
+    <p>用本章公式把一次植保任务算穿。地块 300 m × 200 m，4 台无人机速度 5 m/s，喷洒幅宽 2r = 4 m，重叠率 o = 0.10，则条带间距 w = 4 × 0.9 = 3.6 m。每台负责 300 m × 50 m 的条带区，沿 300 m 长边扫描：条带数 = 50/3.6 ≈ 14 条，扫描路径总长 14 × 300 = 4200 m，行驶时间 4200/5 = 840 s；条带之间调头 13 次、每次等效 2 s，共 26 s；单机合计 866 s ≈ 14.4 min。用面积公式估算行驶时间为 15000/(5×3.6) = 833 s，与 14 条满扫的 840 s 相差不到 1%，差额来自最后一条不满幅的条带，规模越大这个偏差越小；验收工时则要用含转向的 866 s。</p>
+    <p>扫描方向的影响同样可以算清。若沿 50 m 短边扫描同一块地：条带数 = 300/3.6 ≈ 84 条，路径总长仍是 84 × 50 = 4200 m，但调头次数升到 83 次、耗时 166 s，总时间 1006 s ≈ 16.8 min，比沿长边多出 16%。路径长度一模一样，差别全在转向次数：这正是"转向代价决定扫描方向"的定量证据。再把幅宽误差代入：若传感器实际有效幅宽从 4.0 m 缩到 3.4 m（标定误差或作物高度影响），相邻条带之间每次出现 0.2 m 的漏扫缝隙，13 条缝隙 × 300 m ≈ 780 m²，占 15000 m² 的 5.2%，直接击穿"覆盖率 ≥ 98%"的验收线。o = 0.10 对应的容错余量是 0.4 m 幅宽收缩，超出这个数就必须提高重叠率或重新标定幅宽，二者在参数上必须联动。</p>
+
+    <h3>6. BCD 单元划分小算例与边界情形</h3>
+    <p>先看一个可以手算的分解例子。10 m × 6 m 的房间正中有一根 2 m × 2 m 的柱子（x ∈ [4, 6]、y ∈ [2, 4]），沿 x 方向扫描：x = 4 处扫描线进入障碍（IN 事件），自由区间从一条分裂成上下两条；x = 6 处离开障碍（OUT 事件），区间重新合并。于是区域被切成 4 个单元：左侧整高单元、中部上条带、中部下条带、右侧整高单元。每个单元内部无障碍，分别用牛耕式扫完后，再用单元邻接图决定切换顺序（常用深度优先），单元切换次数就等于图的遍历边数，这也是分区估算里"单元切换也是转向"的来源。</p>
+    <p>边界情形有三种必须提前处理。<strong>窄缝</strong>：柱与墙之间只剩 0.6 m 通道，而机器人膨胀半径取 0.25 m 时，膨胀后名义可通宽度只有 0.1 m，栅格规划器勉强能找到路径，实车在定位误差下根本挤不过去，工程上小于 0.7–0.8 m 的缝隙应直接膨胀为障碍，宁可绕行也不要生成一条"理论可行"的窄走廊单元。<strong>贴墙障碍</strong>：障碍与墙相连时不会产生 IN/OUT 事件分裂，单元数减少，但贴墙一侧会退化出细长条带，需要检查每条条带的"长宽比"，超过阈值就把它并入相邻单元统一扫描。<strong>CO 事件</strong>：两个障碍在扫描线上同时合并或分裂时，事件顺序变复杂，实现里要对同一 x 坐标的多个事件排序后再处理，否则单元边界会错位，产生互相重叠的单元，分配后表现为两台机器人重复扫同一片区域。</p>
+    <p>单元粒度的通信账同样值得算一次。200 m × 100 m 场地按 0.1 m 栅格约 2×10⁶ 个格子，逐格分配表按每格 8 字节计约 16 MB，任何无线网络都难以承受；BCD 之后单元通常只有几十个，按单元序列化分配表约 60 × 200 B = 12 kB，两者相差三个数量级，这就是"分配粒度选在单元"的量化理由。验收抽样也有口径可循：在 0.1 m 网格上随机抽 300 个点，若真实漏覆盖率为 1%，至少命中一个漏点的概率约 95%（三分律：漏覆盖率为 p 时，约需 3/p 个样本才能以 95% 置信度至少命中一个漏点），这是"漏覆盖 0"结论的最少样本量；若要把结论收紧到 0.1% 级漏覆盖，样本量要升到约 3000 点，抽样预算应提前写进验收方案。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>完整流水线分五步，每一步都对应一个可测试的产物：</p>
+    <ol>
+      <li><strong>栅格化与可通行标注</strong>：把共享地图（第 033 章的全局栅格）转成统一分辨率的占用栅格；膨胀障碍物一个机器人半径，得到"位姿可通行"栅格。膨胀半径选机器人外接圆半径，宁大勿小。</li>
+      <li><strong>单元分解</strong>：对可通行栅格做 BCD，得到单元列表。单元是后续所有分配和再分配的最小单位，按单元分配比按栅格分配通信量小两个数量级。</li>
+      <li><strong>分区与均衡</strong>：按机器人初始位置做最近邻分配，再按工时模型迭代挪动边界两三轮，输出"机器人 → 单元集合"的分配表。</li>
+      <li><strong>单元内路径生成</strong>：对每个单元生成 Boustrophedon 路径，扫描方向取单元长边。</li>
+      <li><strong>执行与监控</strong>：机器人按路径行走并上报累计覆盖数；监控节点做全局进度汇聚与再分配。</li>
+    </ol>
+    <h3>关键参数起点表</h3>
+    <table>
+      <tr><th>参数</th><th>建议值</th><th>理由</th></tr>
+      <tr><td>重叠率 o</td><td>0.10–0.20</td><td>抵消定位漂移；巡检不清扫可选 0.10，清扫吸尘幅宽小要 0.20</td></tr>
+      <tr><td>覆盖率目标</td><td>0.98</td><td>剩余死角靠补扫通道处理；设 1.0 会导致收不了工</td></tr>
+      <tr><td>进度上报频率</td><td>1–2 Hz</td><td>覆盖是慢变量，1 Hz 足够；事件驱动（每覆盖 50 格）也行</td></tr>
+      <tr><td>再分配阈值</td><td>剩余 200 格</td><td>低于此值抢单收益不抵通信与重规划开销</td></tr>
+      <tr><td>栅格分辨率</td><td>0.05–0.10 m</td><td>太细：分解与传输变慢；太粗：覆盖率计算失真</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：为什么把分配粒度选在"单元"？</span>
+      <p>一个 200 m × 100 m 的场地按 0.1 m 栅格是 200 万个格子：传输全量栅格地图是 2 MB 级，再把格子逐个分配是不可能的。BCD 之后单元数通常只有几十个，分配表几 KB 就能装下，一台机器人只需知道"我负责的 3 个单元的多边形"，其余细节本地生成，<strong>把优化粒度选在"单元"是协同覆盖最重要的降复杂度手段</strong>。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：BCD 扫描列上的事件提取</strong></p>
+    <pre class="code"><code>def scan_events(grid, x):
+    """在扫描线 x 上提取 IN/OUT 事件：自由空间的拓扑在事件之间保持不变。
+    这是 BCD 的核心直觉：事件把区域切成"内部无障碍"的单元。"""
+    events = []
+    in_obstacle = False
+    for y in range(grid.height):
+        blocked = grid.is_occupied(x, y)      # 当前扫描点是否被障碍占据
+        if blocked and not in_obstacle:
+            events.append(("IN", y))          # 进入障碍：上方单元在此收口
+            in_obstacle = True
+        elif not blocked and in_obstacle:
+            events.append(("OUT", y))         # 离开障碍：新单元在此开口
+            in_obstacle = False
+    return events</code></pre>
+    <p>解读：这段代码只做一件事，把"障碍物沿扫描线的起止"翻译成事件。为什么值得单独成段？因为<strong>整个多机分配的最小单位由事件决定</strong>：IN/OUT 事件序列在相邻扫描线之间只会在障碍物"合并/分裂"时变化，单元识别只需比对相邻列的连通段交集，不需要逐格区域生长（后者在大地图上慢一个数量级）。注意栅格必须先做障碍膨胀，否则贴边的窄缝会被当成可通行单元，规划出的路径机器人根本挤不进去。</p>
+
+    <p><strong>片段 2：单元内的牛耕式路径</strong></p>
+    <pre class="code"><code>def boustrophedon(cell, swath, sweep_along_x=True):
+    """在矩形化的单元内生成往复扫描路径；swath 为条带间距。
+    sweep_along_x=True 时沿长边扫描（调用方保证），转向次数最少。"""
+    path = []
+    lo, hi = (cell.x_min, cell.x_max) if sweep_along_x else (cell.y_min, cell.y_max)
+    cross_lo, cross_hi = (cell.y_min, cell.y_max) if sweep_along_x else (cell.x_min, cell.x_max)
+    forward = True
+    s = cross_lo + swath / 2                  # 从半条带处起步：贴边会浪费半幅感知
+    while s &lt; cross_hi:
+        pts = [lo, hi] if forward else [hi, lo]  # 相邻行反向，形成"之"字
+        for p in pts:
+            path.append((p, s) if sweep_along_x else (s, p))
+        s += swath                            # 推进一条带
+        forward = not forward                 # 翻转扫描方向
+    return path</code></pre>
+    <p>解读：牛耕式路径的每个细节都对应一个工程考虑。<strong>起点定在 swath/2</strong> 的半条带处：传感器是圆形覆盖，贴边走会导致靠墙一侧留出半个幅宽的空白；<strong>行末反向</strong>避免空驶回起点，这是与"逐行回原点"最本质的差别；<strong>步进用 swath、不直接用 2r</strong>，让相邻条带留出重叠区，抵消定位漂移造成的条带间隙。若把重叠率调到 0，代码没有任何保护，覆盖率会因漂移悄悄滑坡，所以 s 的步进和传感器实际幅宽必须在同一参数源里定义，不允许两处各写一个数。</p>
+
+    <p><strong>片段 3：进度汇聚与再分配触发</strong></p>
+    <pre class="code"><code>class CoverageMonitor(Node):
+    """车队覆盖监控：聚合累计进度，对长期落后机器人发起再分配。"""
+    def __init__(self):
+        super().__init__("coverage_monitor")
+        self.declare_parameter("coverage_target", 0.98)
+        self.declare_parameter("lag_threshold", 200)     # 剩余格数阈值
+        self.covered = {}          # robot_id -&gt; 已覆盖格数（累计值）
+        self.assigned = {}         # robot_id -&gt; 分配格数
+        self.create_subscription(CoverageProgress,
+            "/fleet/coverage_progress", self.on_progress, 10)
+        self.update_pub = self.create_publisher(TaskUpdate, "/fleet/task_update", 10)
+        self.create_timer(1.0, self.check_progress)
+
+    def on_progress(self, msg):
+        # 累计值（不用增量）：消息重复、乱序都不会算错，从机制上消灭幂等问题
+        self.covered[msg.robot_id] = msg.covered_cells
+        self.assigned[msg.robot_id] = msg.assigned_cells
+
+    def check_progress(self):
+        total = sum(self.assigned.values())
+        done = sum(self.covered.get(r, 0) for r in self.assigned)
+        if total == 0:
+            return                                   # 未收到任何进度：不动作
+        if done / total &gt;= self.get_parameter("coverage_target").value:
+            self.get_logger().info(f"覆盖达标：{done/total:.1%}")
+            return
+        for rid, a in self.assigned.items():
+            remain = a - self.covered.get(rid, 0)
+            if remain &gt; self.get_parameter("lag_threshold").value:
+                upd = TaskUpdate()                   # 只标记"需要支援"，不指定谁接
+                upd.robot_id = rid
+                upd.action = "REASSIGN"
+                upd.remaining = remain
+                self.update_pub.publish(upd)</code></pre>
+    <p>解读：监控节点是三个设计的组合。<strong>（1）</strong>进度用累计计数：如果上报百分比，丢一条消息就永远算不准；累计值让系统对丢包天然免疫，这与第 021 章状态同步的思路一致。<strong>（2）</strong>再分配信号只声明"谁落后了多少"，由分配器决定接管者，监控与决策解耦，方便单独测试。<strong>（3）</strong>阈值化触发：剩余量在一个采样周期内波动很正常，若对每个波动都动作，系统会陷入"抢单—重规划—再抢单"的抖动。参数用 declare_parameter 暴露，车队规模变化时（4 台与 20 台的最优阈值不同）可以在 launch 里覆盖而不用改代码。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>条带间距大于实际幅宽</strong>：把 swath 设置成 2r 而忘了重叠，加上定位漂移 0.2–0.5 m，地图上出现一条条漏扫的"跑道"。修复：swath = 2r × (1−o)，并在验收脚本里用"已扫栅格 ∪ 传感器幅宽"做覆盖判定的膨胀，不拿机器人轨迹点当覆盖证据。</li>
+      <li><strong>沿短边扫描</strong>：10 m × 2 m 的走廊如果沿 2 m 方向扫，条带只有几条但每条 2 m，转向占比极高。修复：扫描方向取单元的最小外接矩形长边，转向次数约减半。</li>
+      <li><strong>分区后不校验工时</strong>：四台机器人按面积切成均等的四块，结果含两间小房间的块因为单元切换多而慢一倍。修复：用本章工时模型预估 T<sub>i</sub>，按预测工时做均衡。</li>
+      <li><strong>覆盖率用轨迹点判定</strong>：用机器人走过的位姿点算覆盖率，结果永远是 100% 却漏扫一片。修复：覆盖率以"感知幅宽扫过的区域"为准，把轨迹按幅宽膨胀后再与地图求交。</li>
+      <li><strong>再分配时新机器人从头开始扫</strong>：接管者拿到单元后从头执行，把已扫部分重新扫一遍，重复率飙升。修复：分配表里携带"单元内进度"（按条带索引记录），接管者从断点条带续扫。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>某植保场景：喷洒幅宽 4 m（即 2r = 4 m，o 取 0.10），地块 300 m × 200 m，4 台无人机速度 5 m/s，单次转向等效 2 s。用本章公式估算各机完工时间与总 makespan（假设均分面积、每块条带沿 300 m 方向）。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>w = 4 × 0.9 = 3.6 m；每块 300 × 50 m，条带数 ≈ 50/3.6 ≈ 14 条，转向约 13 次；单机时间 ≈ 15000/(5×3.6) + 13×2 ≈ 833 + 26 s ≈ 14.3 min。重点体会转向占比随地块细长化而上升。</div></details>
+      </li>
+      <li>两台机器人初始位置都在区域左下角，用"最近邻分配"会得到什么分区？如果换成"按工时均衡迭代挪边界"，预测三轮后两块的边界大概挪到哪里。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>最近邻会让左下机器人吃掉大部分区域；均衡迭代每轮把最大块的边界条带让给相邻块，最终近似穿过区域中点、与两台机器人位置连线垂直的分界，均衡度收敛到 1.1 附近。</div></details>
+      </li>
+      <li>把片段 3 的 lag_threshold 从 200 改成 20，重启系统并观察再分配消息的频率。预测会发生什么，再解释为什么阈值不能太小。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>剩余量在正常执行中每秒下降几十格，阈值 20 会让所有机器人几乎每帧都触发；系统陷入"支援消息风暴"与分区抖动，接收端重规划来不及收敛。迟滞阈值必须显著大于一个采样周期内的正常进度波动。</div></details>
+      </li>
+      <li>设计"一台机器人在覆盖中途失联"的恢复方案：给出检测手段、再分配策略、验收指标（覆盖率、重复率上限、恢复时延），并说明为什么恢复方案要限制重复率。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>检测：进度心跳超时 + DDS LIVELINESS；再分配：把失联者的未完成单元按距离最近原则二次分配，携带断点条带索引；验收：覆盖率 ≥ 98%、重复率增量 ≤ 10%、恢复决策 ≤ 2 s、续扫启动 ≤ 5 s。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>覆盖问题用四指标验收：覆盖率 ≥ 98%、重复率 ≤ 15%、makespan、均衡度 ≤ 1.15，四者要一起看。</li>
+      <li>单机路线：BCD 把自由空间切成无障碍单元，单元内用牛耕式往复扫描；条带间距 w = 2r × (1−o)，扫描沿长边以最小化转向。</li>
+      <li>多机分工首选空间分区（Voronoi 分配 + 工时均衡迭代），按"单元"粒度分配把通信与优化复杂度降低数个量级。</li>
+      <li>进度上报用累计计数、再分配用迟滞阈值与断点续扫，两个机制分别解决丢包幂等与系统抖动。</li>
+      <li>下一章把"覆盖一条固定区域"升级为"周期性巡查一条路线"：<strong>多机器人协同巡逻</strong>的图论模型与调度。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch061.html">← 第 061 章：多机器人协同覆盖</a>
+    <a class="next" href="ch063.html">第 063 章：多机器人协同巡逻 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

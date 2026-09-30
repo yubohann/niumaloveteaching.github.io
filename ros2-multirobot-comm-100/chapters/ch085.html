@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第085章 阶段项目：带故障恢复的任务系统 | 多机器人协同学习课程 · ROS2 通信与系统集成</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第四篇 · 系统集成与工程化</span>
+    <span class="sep">/</span>
+    <span>第 085 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第四篇 · 系统集成与工程化</div>
+    <h1>第 085 章：阶段项目：带故障恢复的任务系统</h1>
+    <p class="lead">第四篇闭环：把任务池、心跳监视、租约重分配、降级模式焊成一个 4 台机器人的任务系统，并用故障注入实验逐项验收，完成率、恢复时间、零重复执行。</p>
+    <ul class="meta">
+      <li>主题：系统集成与工程化（第四篇阶段项目）</li>
+      <li>关键机制：任务生命周期、心跳检测、租约重分配、幂等执行、降级模式</li>
+      <li>预计学时：90 分钟（含动手）</li>
+      <li>前置章节：第 084 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>把第四篇的各机制（任务分配、优先级、故障检测、动态重构、配置管理）集成为一个可运行的 4 机器人任务系统。</li>
+      <li>掌握"租约（lease）+ 心跳（heartbeat）"的故障恢复组合：为什么心跳负责"发现"，租约负责"收回"，两者职责不能混淆。</li>
+      <li>会为任务生命周期设计状态机与幂等执行，杜绝"重分配导致同一任务被做两遍"。</li>
+      <li>能设计并执行故障注入实验矩阵（三种故障 × 三个时机 × 多次重复），产出可信的验收数据。</li>
+      <li>交出一份含量化指标的验收报告：完成率、故障检出时间、重分配时间、重复执行率、降级切换时延、makespan 劣化。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>单点技术你已经分别练过了：任务分配（第 066 章）、优先级（第 068 章）、故障检测与恢复（第 074 章）、动态重构（第 075 章）、版本与配置（第 081 章）。但工程系统的难点从来都在<strong>把它们接起来之后冒出来的新问题</strong>，单项技术本身早已分别练过：重分配时任务会不会被做两遍？监视器误判一次会不会引发全队抢单大战？机器人复联后它的旧状态会不会污染新任务？</p>
+    <p>本项目就是把这些"接缝问题"暴露出来并逐一定刑。场景设定：4 台差速轮式机器人在 10 m × 10 m 的仿真场地里执行 20 个取送任务（取货点 → 卸货点），任务池统一派单，任意一台机器人可能在任意时刻"失联"（进程崩溃、网络中断或急停），系统必须在几秒内把它的未完成任务转交他人，且不乱、不重、不停摆。</p>
+    <p>本项目同时是第四篇的验收门槛：过不了本章的指标，说明前面某章的机制只停留在"能跑 demo"，没有到"能交付"。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 任务生命周期：状态机是第一件设计</h3>
+    <p>系统中每个任务在任何时刻必须处于且仅处于一个状态：<strong>待派（PENDING）→ 已派（ASSIGNED）→ 执行中（EXECUTING）→ 完成（DONE）</strong>，加上两个异常终态：失败（FAILED，执行了但没成功）与撤销（ABORTED，执行前被收回）。状态迁移只能沿箭头走，每条迁移都要有触发者与凭据（谁能把 ASSIGNED 改成 EXECUTING？只有持租约的机器人）。状态机的价值在于：<strong>分布式系统的混乱几乎都能追到"某个对象的状态没有单一权威"</strong>，任务状态由任务池统一维护，机器人只上报事实，不自行宣布任务完成后的去向。</p>
+    <div class="formula">
+      完成率 = DONE / 总任务数；重复执行率 = 被两个不同机器人执行过的任务数 / 总任务数
+      <span class="note">重复执行率必须是 0，这是重分配机制是否设计正确的试金石</span>
+    </div>
+
+    <h3>2. 心跳：负责"发现"；租约：负责"收回"</h3>
+    <p>职责分离是本项目最重要的一个设计决策。心跳（heartbeat）是周期性的"我还活着"消息（建议 2 Hz，32 字节级），监视器若 <strong>timeout = 2.0 s</strong> 没收到某机器人心跳，判定其"疑似死亡"。为什么 timeout 取 4 个心跳周期？取 1 个会怎样？因为无线网络偶发丢几拍是常态：timeout 约等于周期时误报率极高，一次误报就可能触发全队抢单。检测时延与误报率是一对矛盾：</p>
+    <div class="formula">
+      检出时延 ∈ [timeout − 周期, timeout]；误报率 ≈ P(连续 k 拍心跳丢失)，k = timeout / 周期
+      <span class="note">周期 0.5 s、timeout 2.0 s → 检出时延 1.5–2.0 s；连续 4 拍全丢在稳定 WiFi 上概率约 10⁻⁶ 量级（工程按 10⁻⁴ 估算留余量）</span>
+    </div>
+    <p>但"发现死亡"不等于"敢收回任务"，如果监视器一发话就把任务转给别人，而原机器人其实只是网络卡了一下，它复活后就会和别人抢着做同一个任务。解法是<strong>租约</strong>：任务被机器人领取时，任务池给出一个到期时间（如 10 s），持有者必须周期性续租（如每 2 s 一次），<strong>租约到期不续，任务自动回到可派状态</strong>。租约把"谁拥有任务"的裁决权放在任务池的时间轴上；若改为依赖各机器人对故障判断的一致，就需要共识，昂贵且缓慢。</p>
+
+    <h3>3. 幂等执行：对抗"至少一次"语义的必然产物</h3>
+    <p>重分配机制的天然语义是"至少一次"（at-least-once）：任务可能被原持有者做完但上报丢包、也可能被新持有者重做。要保证业务语义上是"恰好一次"，标准手法是<strong>幂等执行</strong>：每个任务有唯一 task_id，执行端记录"已完成的 task_id 集合"；任务池收到 DONE 上报时，若该任务已被标记完成，则忽略重复上报。真正危险的是<strong>两边都真的执行了</strong>（重复上报无害），所以执行端还有一个纪律：上报前检查任务是否仍属于自己（租约是否还有效），租约被收回则立刻停手并回滚到安全状态。角度差一点点：宁可让任务多花几秒被别人重新做一遍，也不能让两台机器人同时做同一取送动作。</p>
+
+    <h3>4. 降级模式：分区时的保守行为</h3>
+    <p>当机器人发现自己与任务池失联（连续未收到任务池广播或服务调用超时），不能傻站在那儿等：进入<strong>降级模式</strong>，停止接受新任务、完成当前任务后原地待命、速度上限减半、保留本地避障。降级模式的三条原则：行为可预测（别人知道你会干什么）、安全优先（慢即安全）、可恢复（保持重连尝试并上报回归）。恢复连接后由任务池下发全量状态快照；分区期间双方的状态都可能变过，增量同步的基准已不可信。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>系统由四个逻辑组件组成，全部挂在同一个 ROS2 域与命名空间约定下（<code>/fleet/...</code> 车队级，<code>/robotN/...</code> 机器人级）。</p>
+    <table>
+      <tr><th>组件</th><th>所在</th><th>职责</th><th>接口（话题/服务）</th></tr>
+      <tr><td>任务池 task_pool</td><td>中心（可兼任）</td><td>任务队列、租约发放与过期回收</td><td><code>/fleet/claim</code>(服务)、<code>/fleet/renew</code>(服务)</td></tr>
+      <tr><td>执行端 executor</td><td>每台机器人</td><td>心跳、领任务、幂等执行、状态上报</td><td><code>/fleet/heartbeat</code>(话题 2 Hz)、<code>/fleet/status</code>(事件)</td></tr>
+      <tr><td>监视器 supervisor</td><td>中心或任一机</td><td>心跳超时判定、触发提醒</td><td>订阅心跳、发布 <code>/fleet/alerts</code></td></tr>
+      <tr><td>指标记录器 metrics</td><td>中心</td><td>事件打点：领取/完成/超时/重分配</td><td>订阅状态与告警，落盘 CSV</td></tr>
+    </table>
+    <p>接口设计的三个决定及其理由：<strong>（1）领取与续租用服务（不用话题）</strong>，它们是"请求-应答"语义，必须知道成功与否，且天然串行化（任务池单点串行处理，避免并发抢单竞态）。<strong>（2）心跳用 Best-effort + 小消息</strong>，丢一两拍没关系（下一拍 0.5 s 后到），用可靠重传反而在拥塞时加剧拥塞。<strong>（3）状态上报用事件驱动</strong>，只在状态迁移时发，别做成周期流：一天 20 个任务不该产生上万条状态消息。</p>
+    <h3>验收指标与故障注入矩阵</h3>
+    <table>
+      <tr><th>指标</th><th>目标值</th><th>测量方法</th></tr>
+      <tr><td>任务完成率（无故障基线）</td><td>≥ 95%</td><td>20 任务 × 5 次运行统计</td></tr>
+      <tr><td>故障检出时延</td><td>≤ 2.5 s</td><td>注入时刻 → alerts 事件时间戳</td></tr>
+      <tr><td>重分配完成时延</td><td>≤ 1.0 s（检出后）</td><td>alerts 事件 → 新机器人 EXECUTING 事件</td></tr>
+      <tr><td>重复执行率</td><td>= 0</td><td>指标记录器比对 task_id 的执行机器人集合</td></tr>
+      <tr><td>降级切换时延</td><td>≤ 3.0 s</td><td>断开网络 → 机器人进入降级模式的事件</td></tr>
+      <tr><td>makespan 劣化（含故障 vs 基线）</td><td>≤ 30%</td><td>两次运行的总时长对比</td></tr>
+    </table>
+    <table>
+      <tr><th>故障注入</th><th>注入时机</th><th>预期行为</th></tr>
+      <tr><td>杀进程（模拟崩溃）</td><td>任务 25% / 50% / 75% 进度</td><td>2.5 s 内检出；租约到期后重分配；零重复</td></tr>
+      <tr><td>断网络（模拟失联）</td><td>同上</td><td>机器人进降级模式；任务被收回；复联后全量快照同步</td></tr>
+      <tr><td>急停（模拟卡死但心跳在）</td><td>同上</td><td>任务超时机制兜底（执行超时 = 任务预计时长 × 2）</td></tr>
+    </table>
+    <p>注意第三种故障：<strong>心跳还在但机器人不动了</strong>，心跳检测抓不到它，必须由"任务执行超时"兜底：每类任务定义预计时长（如取送单程 30 s），超过 2 倍仍未完成，任务池强制收回。三个机制（心跳、租约、执行超时）覆盖三类故障，缺一不可。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：带租约的任务池，领取、续租、到期回收</strong></p>
+    <pre class="code"><code>class LeaseTaskPool:
+    """任务池：任务以租约形式"被租用"：租约到期自动回到可派状态。"""
+    def __init__(self, lease_sec=10.0):
+        self.lease_sec = lease_sec         # = 5 倍心跳超时（2 s）：容忍连续多拍丢失
+        self.pending = {}                  # task_id -> payload（未完成任务）
+        self.leases = {}                   # task_id -> (robot_id, expire_at)
+
+    def is_available(self, tid, now):
+        holder = self.leases.get(tid)
+        # 无租约或租约已过期 → 可派；过期即回收，无需任何"死亡确认"流程
+        return holder is None or holder[1] &lt; now
+
+    def claim(self, robot_id, now):
+        for tid in sorted(self.pending):   # 排序保证高速并发下派单顺序确定
+            if self.is_available(tid, now):
+                self.leases[tid] = (robot_id, now + self.lease_sec)
+                return tid, self.pending[tid]
+        return None, None
+
+    def renew(self, tid, robot_id, now):
+        holder = self.leases.get(tid)
+        if holder and holder[0] == robot_id:   # 只有现持有者能续租，防抢单
+            self.leases[tid] = (robot_id, now + self.lease_sec)
+            return True
+        return False
+
+    def finish(self, tid):
+        self.leases.pop(tid, None)         # 完成后立即释放租约并从队列移除
+        self.pending.pop(tid, None)
+</code></pre>
+    <p>解读：<strong>claim 只在租约过期后允许领取</strong>，这条规则把"重分配"从特殊流程降级成普通流程：新机器人根本不需要知道前任死没死，它只是在租约过期后正常领单。这就是租约机制最优雅的地方：<strong>把分布式故障问题转化成了本地时间问题</strong>。<code>sorted(self.pending)</code> 让派单顺序可复现（调试与验收都要求确定性）。finish 在收到 DONE 时调用；如果原持有者其实还活着但租约被别人拿走（网络分区过长），它下一次 renew 会失败（holder 已换人），必须立刻停手，这条协议写在了执行端（片段 3）。</p>
+
+    <p><strong>片段 2：心跳监视，超时判定与"只报一次"</strong></p>
+    <pre class="code"><code>class HeartbeatMonitor:
+    """心跳监视器：记录每台机器人的最近到达时刻，超时则报告。"""
+    def __init__(self, timeout=2.0):
+        self.timeout = timeout             # 4 个心跳周期：权衡检出时延与误报
+        self.last_seen = {}                # robot_id -> 本地接收时刻
+
+    def on_heartbeat(self, robot_id, now):
+        # 用"本地接收时刻"，不用消息里的发送时间戳：
+        # 发送端时钟可疑（甚至它卡死后时间戳不再前进）时更稳健
+        self.last_seen[robot_id] = now
+
+    def check(self, now):
+        dead = []
+        for rid, t0 in list(self.last_seen.items()):
+            if now - t0 &gt; self.timeout:
+                dead.append(rid)
+                del self.last_seen[rid]    # 移除：同一故障只报警一次
+        return dead
+</code></pre>
+    <p>解读：两个工程细节。<strong>（1）用本地接收时刻</strong>：如果用心跳消息里的发送端时间戳，"时钟不同步"和"机器人卡死"会难以区分；用本地钟只看"有没有按时到达"，判据单一且不依赖对端时钟。<strong>（2）报警即移除记录</strong>：防止每个检查周期重复报同一台死亡机器人（报警风暴）。移除后若该机器人恢复心跳（复联），on_heartbeat 会重新登记它，监视器不需要"复活"特殊逻辑。注意监视器只负责<strong>发现并广播信息</strong>，不直接改任务状态：任务状态只有任务池能动，避免多脑决策。</p>
+
+    <p><strong>片段 3：执行端主循环，心跳、续租、幂等、让手</strong></p>
+    <pre class="code"><code>class RobotExecutor:
+    """执行端：一条主循环把"活着、持有、干活、上报"四件事串起来。"""
+    def __init__(self, robot_id, pool, hb_pub, status_pub):
+        self.rid, self.pool = robot_id, pool
+        self.hb_pub, self.status_pub = hb_pub, status_pub
+        self.done_tasks = set()            # 已完成 task_id：幂等去重的依据
+        self.current = None                # (task_id, payload)
+
+    def tick(self, now):
+        self.hb_pub.publish(heartbeat_msg(self.rid))          # 2 Hz 心跳
+        if self.current is None:
+            tid, payload = self.pool.claim(self.rid, now)
+            if tid is not None:
+                self.current = (tid, payload)
+                self.status_pub.publish(status_msg(tid, "EXECUTING"))
+            return
+        tid, _ = self.current
+        if not self.pool.renew(tid, self.rid, now):
+            # 续租失败 = 租约已被收回（自己曾被判死）：立即让手，不许继续
+            self.current = None
+            return
+        if self.task_input_missing():
+            # 急停/卡死类故障：执行超时后任务池也会回收，这里主动放弃更干净
+            self.status_pub.publish(status_msg(tid, "ABORTED"))
+            self.current = None
+            return
+        if self.is_finished(tid):
+            if tid not in self.done_tasks:     # 幂等：重复完成只上报一次
+                self.status_pub.publish(status_msg(tid, "DONE"))
+                self.done_tasks.add(tid)
+            self.pool.finish(tid)
+            self.current = None
+</code></pre>
+    <p>解读：主循环的四个动作对应四条设计原则。<strong>心跳先行</strong>：任何情况下心跳优先发出，它是全系统判断"我还活着"的唯一凭据。<strong>续租即时校验</strong>：renew 失败是"我曾被判定失联、任务已被/将被他人接手"的最早信号，立刻清空 current，保证物理执行动作在此刻停止（安全语义优先于任务完成语义）。<strong>幂等上报</strong>：done_tasks 保证同一任务在本机的重复完成判定只产生一次 DONE 消息。<strong>主动放弃</strong>：与其等任务池超时回收，执行端在确认无法继续时主动报 ABORTED，让重分配提前发生，两条路径终点相同，主动上报让恢复更快、指标更好看（但正确性不依赖它：即使 ABORTED 消息丢失，租约与执行超时仍然兜底）。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>心跳超时设得太短</strong>：timeout = 1 个周期，误报频发，网络抖动一次全队抢单。修复：timeout ≥ 4 个周期，并把误报率按连续丢拍概率估算进设计文档。</li>
+      <li><strong>没有幂等设计导致任务被做两遍</strong>：验收时发现某个取货点被两台机器人先后到达（重复执行率 &gt; 0）。修复：done_tasks 集合 + 任务池端"完成去重"双保险；验收报告必须单独列这一项。</li>
+      <li><strong>重分配风暴</strong>：监视器判定机器人死亡后直接改任务状态，多台机器人同时被通知去抢同一任务。修复：状态只由任务池在租约过期时释放，所有机器人通过正常 claim 竞争，租约天然串行化。</li>
+      <li><strong>时钟不一致污染租约</strong>：任务池用各机器人上报的时间戳算租约过期，机器间时钟差几秒，租约时长形同虚设。修复：租约的到期时刻一律用任务池自己的单调钟计算（本项目的 lease_sec 相加都在接收方本地完成）。</li>
+      <li><strong>降级模式没定义清楚</strong>：失联机器人继续全速执行旧计划，复联时状态与任务池期望完全不符。修复：降级行为写进配置并测试，停接新任务、完成当前任务、速度减半、周期重连、复联后全量快照对齐。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>算一算：心跳周期 0.5 s、timeout 2.0 s 时，故障检出时延的范围是多少？若把 timeout 改为 0.6 s，连续丢几拍就会误报？按 WiFi 单拍丢包率 1% 估算误报概率的量级。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>时延范围 = timeout − 周期 到 timeout，即 1.5–2.0 s。timeout 0.6 s 只需连续丢约 1–2 拍即误报；单拍丢 1% 时连续 2 拍 ≈ 10⁻⁴，每台机器人每天误报多次，不可接受。</div></details>
+      </li>
+      <li>改配置并预测结果：把租约从 10 s 缩短到 3 s（心跳周期仍 0.5 s）。预测对"任务被误收回并重分配"的概率和"真故障后重分配速度"的影响，各给一个方向性结论。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>租约 3 s 意味着续租消息连续丢失两轮（按每 2 s 一次续租、心跳 0.5 s，约 4–5 拍）就会被收回，误收回概率上升；真故障后的回收等待变短，恢复更快。经验法则：租约 ≥ 5 倍心跳超时（本设计 10 s = 5 × 2.0 s），且大于最坏续租往返时延的 3 倍。</div></details>
+      </li>
+      <li>设计：为本章系统补一个"任务执行超时"机制（应对"心跳在但卡死"），写出：超时时长怎么定、由谁判定、判定后任务状态如何迁移、如何避免与租约机制互相打架。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>超时 = 任务预计时长 × 2（按任务类型查表）；由任务池判定（它有全部时间信息）；触发后把任务租约强制置为过期并重入队列；与租约的兼容点是统一走"过期即回收"的通道，不要另建一套状态。</div></details>
+      </li>
+      <li>推导：设任务池每 0.2 s 处理一轮派单，某任务被原持有者完成但 DONE 消息丢失的概率为 p。证明：在"租约到期回收 + 幂等上报"机制下，任务最终完成且只有一次物理执行的充分条件是什么，并指出哪个环节失效会打破该条件。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>充分条件：任一时刻至多一台机器人持有有效租约（由任务池单点串行派发保证）且执行端在上报前校验租约。若执行端在租约失效后仍继续物理执行（片段 3 的 renew 检查被删掉），条件被打破，这就是"让手"检查不可省的原因。</div></details>
+      </li>
+      <li>完整验收：按本章验收表跑 5 次基线 + 9 个注入场景（3 故障 × 3 时机），生成一页验收报告：指标表（目标 vs 实测）、3 个最差案例的现象与根因、2 条"下个迭代要修"的问题清单。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>报告要点：最差案例要写清楚时间线（注入 → 检出 → 重分配 → 完成）；根因分析指向机制缺口（如执行超时缺失）；问题清单按"影响 × 修复成本"排序，别按发现的先后堆。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>第四篇项目闭环：任务状态机 + 心跳发现 + 租约回收 + 幂等执行 + 降级模式，五个机制合起来才构成"可交付"的任务系统。</li>
+      <li>职责分离是设计灵魂：心跳负责发现（本地钟判超时、只报一次），租约负责收回（时间轴裁决、无需共识），执行超时兜底"活着但卡死"。</li>
+      <li>幂等是重分配机制的孪生兄弟：done_tasks 去重 + 执行前校验租约，双重保证重复执行率为 0。</li>
+      <li>验收必须量化且可复现：完成率 ≥ 95%、检出 ≤ 2.5 s、重分配 ≤ 1.0 s、降级 ≤ 3 s、重复执行 = 0、makespan 劣化 ≤ 30%。</li>
+      <li>故障注入矩阵（3 故障 × 3 时机 × 5 重复）是验收报告的证据链，也是下一轮迭代的问题输入。</li>
+      <li>第四篇到此收官。下一章进入第五篇：<strong>协同机制设计方法论</strong>，从"会做系统"迈向"会设计机制、会做研究"。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch084.html">← 第 084 章：多机器人协同运动规划</a>
+    <a class="next" href="ch086.html">第 086 章：多机器人协同机制设计方法论 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

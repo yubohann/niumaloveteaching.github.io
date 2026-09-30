@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第062章 调度器机制深入 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第四篇 · Ray Tune 超参搜索</span>
+    <span class="sep">/</span>
+    <span>第 062 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第四篇 · Ray Tune 超参搜索</div>
+    <h1>第 062 章：调度器机制深入</h1>
+    <p class="lead">调度器（Trial Scheduler）决定每个试验何时运行、何时让位、何时终止。本章打开调度器的接口契约：试验状态机如何转移、暂停为什么必须依赖检查点、ASHA 与 PBT 的内部分配逻辑如何推演，以及自定义调度器需要履行哪些状态序列化义务。</p>
+    <ul class="meta">
+      <li>主题：Ray Tune 调优 / 调度器内部机制</li>
+      <li>关键机制：TrialScheduler 接口、状态机、暂停恢复、ASHA 分档、PBT 权重迁移</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 061 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>掌握调度器接口契约：<code>on_trial_add</code>、<code>on_trial_result</code>、<code>choose_trial_to_run</code>、<code>on_trial_complete</code> 各自的调用时机与职责边界。</li>
+      <li>理解试验状态机（PENDING、RUNNING、PAUSED、TERMINATED、ERROR）的转移路径，以及每条路径由谁触发。</li>
+      <li>能推演 ASHA 的分档结构：由最大预算与淘汰比例推导各档预算、保留比例与总资源需求。</li>
+      <li>理解 PBT 的利用（Exploit）与探索（Explore）两步循环，掌握它与 ASHA 在机制上的根本差异。</li>
+      <li>会实现一个满足状态序列化义务的自定义调度器，并以相对判据替代绝对阈值。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 060 章把 ASHA 当作工具使用：配置参数、观察早停收益。使用时不需要知道内部机制，但只要出现“该停的没停、不该停的被停了、恢复后行为翻转”这类现象，就必须下沉到调度器的接口与状态层面排查。<strong>调度器的全部输出是三选一决策：继续（CONTINUE）、暂停（PAUSE）、终止（STOP）；它本身不执行任何操作，执行由试验运行器（Trial Runner）完成。</strong>理解这条分工是看懂一切调度行为的前提。</p>
+    <p>本章同时回答一个工程问题：调优实验会中断、会恢复、会扩容。调度器内部积累的统计量（各 trial 的历史指标、当前分档位置）如何跨恢复存活，直接决定恢复后淘汰决策是否与中断前一致。这个问题把调度器机制与检查点、序列化、试验标识三件事绑定在一起。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 接口契约：决策三选一</h3>
+    <p>调度器通过回调接收试验生命周期事件，并在每个事件上返回决策。核心回调的职责如下：<code>on_trial_add</code> 在新试验加入时调用，用于登记；<code>on_trial_result</code> 在试验每次上报指标后调用，返回 CONTINUE、PAUSE 或 STOP；<code>choose_trial_to_run</code> 在有空闲资源时调用，决定待运行队列中谁先上；<code>on_trial_complete</code> 与 <code>on_trial_remove</code> 在试验结束时清理登记。回调的返回值只表达意图，实际的状态修改、检查点保存与资源回收由运行器执行。</p>
+    <div class="formula">
+      decide(trial, result) → {CONTINUE, PAUSE, STOP}
+      <span class="note">调度器是纯决策组件：读状态、出决策、不碰执行；状态的读写必须通过运行器提供的接口</span>
+    </div>
+
+    <h3>2. 试验状态机</h3>
+    <p>试验从 PENDING 开始，获得资源后进入 RUNNING；被判定需要观察时转入 PAUSED 并释放资源；有资源时从 PAUSED 回到 RUNNING；达到停止条件或被淘汰进入 TERMINATED；异常进入 ERROR。<strong>关键约束：进入 PAUSED 之前必须保存检查点，否则试验没有起跑线可以回到。</strong>这也是“暂停需要 checkpoint”这条规则的来源：运行器会向试验请求一次检查点保存，保存失败或训练函数未提供检查点能力时，暂停请求会被拒绝，调度器只能退回 CONTINUE 或改用 STOP。</p>
+    <p>PAUSED 试验回到待运行队列后，与 PENDING 试验竞争资源。<code>choose_trial_to_run</code> 通常让恢复试验优先，因为它的已投入预算可以继续兑现；这个默认行为允许被自定义覆盖。</p>
+    <table>
+      <tr><th>状态转移</th><th>触发者</th><th>前置条件</th></tr>
+      <tr><td>PENDING → RUNNING</td><td>运行器</td><td>资源就绪且被 <code>choose_trial_to_run</code> 选中</td></tr>
+      <tr><td>RUNNING → PAUSED</td><td>调度器决策、运行器执行</td><td>检查点保存成功</td></tr>
+      <tr><td>PAUSED → RUNNING</td><td>运行器</td><td>资源重新可用且优先级选到</td></tr>
+      <tr><td>RUNNING → TERMINATED</td><td>调度器或训练函数</td><td>STOP 决策或到达停止条件</td></tr>
+      <tr><td>任意状态 → ERROR</td><td>训练进程</td><td>异常抛出且重试预算耗尽</td></tr>
+    </table>
+    <p>表格读法：每一行的触发者不同，排障的入口就不同。转移没有发生时要先确认是哪一环缺失，例如 RUNNING 到 PAUSED 的链条上有调度器决策、检查点请求、保存成功三个环节，任何一环失败时暂停都不会成立，日志会留下对应的拒绝记录。<code>choose_trial_to_run</code> 的默认优先序是"恢复试验优先、其余按加入顺序"，自定义调度器可以把它改成按已投入预算或按指标排序，改动的副作用要在恢复测试里验证，验证口径与 064 章一致：预算轴连续、配置标识一致，两项都通过才算改动生效。</p>
+
+    <h3>3. 决策的数据基础：同预算可比性</h3>
+    <p>淘汰类调度器的判据都是相对比较：把当前结果与“同预算下的其他试验”或“自己的历史”做对比。<strong>前提是所有比较发生在同一资源轴刻度上</strong>，即 <code>time_attr</code> 指定的量（常用训练迭代数或累计环境步数）。不同预算的指标混入同一比较池时，决策会系统性偏向较长的试验或较短的试验，取决于指标随预算的增长方向。ASHA 用分档（Rung）从结构上保证可比性：只有到达同一档预算的试验才互相淘汰。</p>
+
+    <h3>4. ASHA 分档推演</h3>
+    <p>设最大预算为 B、淘汰比例为 η，分档预算序列为 b<sub>k</sub> = η<sup>k</sup>（第 0 档归一化），档数约为 log<sub>η</sub>B + 1。每档保留前 1/η 晋级。总资源需求可以精确推算：以 B=81、η=3 为例，分档为 1、3、9、27、81。若初始试验数 N=27，则第 0 档运行 27 个，晋级 9 个；第 1 档运行 9 个，晋级 3 个；第 2 档运行 3 个，晋级 1 个；第 3、4 档各运行 1 个。总消耗为 27×1 + 9×3 + 3×9 + 1×27 + 1×81 = 189 个迭代单位，而全部跑满需要 27×81 = 2187 个迭代单位。<strong>激进的淘汰把总预算压到不足十分之一（约 1/11.6），代价是最优配置可能在第 0 档被噪声误杀。</strong></p>
+    <div class="formula">
+      总消耗 = Σ<sub>k</sub> N·η<sup>−k</sup>·b<sub>k</sub>, &nbsp; b<sub>k</sub> = b<sub>0</sub>·η<sup>k</sup>
+      <span class="note">N=27、η=3、B=81 时约 189 个迭代单位；重复试验或增大 D 可降低误杀概率，代价是线性增加前期消耗</span>
+    </div>
+    <p>把淘汰比例改为 2 做同预算对照：档位变为 1、2、4、8、16、32、64 共 7 档，初始 32 个试验时每档保留一半。逐档成本为 32×1+16×2+8×4+4×8+2×16+1×32+1×64=256 个迭代单位，全量 32×64=2048，比值 8.0；与 η=3 一例的 11.6 相比，淘汰更温和、总消耗更高，但到达高预算的试验更多，噪声下的误杀风险下降。<strong>这条对照把淘汰比例的双向代价摆在同一根数轴上：省预算与保质量由同一个 η 控制。</strong></p>
+
+    <h3>5. PBT 的利用与探索</h3>
+    <p>种群训练（Population Based Training, PBT）维护固定规模的种群，每个成员是“权重 + 一组超参”的组合。每经过一个扰动周期，调度器把当前成员按指标分位划分：优于上分位的成员复制权重的来源，劣于下分位的成员被覆盖。复制完成后，所有成员的超参按扰动分布再采样：一部分做局部扰动（在现值附近乘性变化），一部分完全重采样。两种机制的分工是<strong>权重迁移（知识的继承）与超参变异（继续探索）</strong>。PBT 与 ASHA 的差异可以一句话概括：ASHA 只在试验之间分配预算，PBT 还会搬运已有训练成果。</p>
+    <p>PBT 的实现依赖检查点与权重加载：复制动作通过“读来源成员的检查点、写目标成员的训练状态”完成，因此要求训练函数支持从检查点恢复。种群规模不足（<code>num_samples</code> 小于种群大小）时，淘汰与复制得不到足够成员，PBT 退化为带随机扰动的独立训练。</p>
+
+    <h3>6. 自定义调度器的义务</h3>
+    <p>自定义调度器需要履行三项义务：<strong>其一，决策函数读取的状态必须可以在恢复后重建，因此要实现状态导出与导入（不同版本提供的接口名称与形式不同，亦有整体序列化调度器的实现，以对应版本的官方文档为准）；其二，所有登记表的键使用 <code>trial.trial_id</code>，不使用对象引用，因为恢复后的对象标识会变化；其三，判据避免绝对阈值，改用相对量（同预算中位数、自身历史斜率），使决策在不同任务与不同指标量纲下保持稳健。</strong>判据样本不足时应保守返回 CONTINUE，把误杀的代价降到最低；保守放行只会多花一些评估预算，误杀一个优质配置却会直接改变搜索结论的方向。</p>
+    <p>状态的粒度要克制：只序列化"由历史结果推导、恢复后无法重算"的量（指标表、连败计数、分档位置），能从报表重放的量在恢复后重建即可；把大对象（模型权重、数据帧）塞进调度器状态会让实验级检查点膨胀。恢复契约的测试方法是构造一次中断恢复，比较中断前后同一预算处的淘汰决策是否一致，出现不一致就说明状态缺项。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>调度器选型从三个问题出发：<strong>是否需要早停、是否需要跨试验转移训练成果、是否需要动态改变资源。</strong>与上一章的差异在于，第 061 章定义样本从哪里来，本章决定样本活多久、拿多少资源。</p>
+    <p>三问的判定顺序固定为：先看是否需要跨试验搬运成果（要则进入 PBT 类，否则排除）；再看试验数是否够分档（少于 20 个时排除 ASHA）；最后看是否需要在搜索中引入代理模型（预算紧、评估贵时考虑 BOHB）。顺序固定后，选型结论可以逐问复述依据，评审与复盘都能对得上口径。</p>
+    <table>
+      <tr><th>调度器</th><th>适用条件</th><th>机制前提</th><th>主要代价</th></tr>
+      <tr><td>中位数规则（Median Stopping）</td><td>单指标、希望温和早停</td><td>同预算可比</td><td>节省有限，依赖初始样本</td></tr>
+      <tr><td>ASHA</td><td>试验多、预算差异大、噪声可接受</td><td>可暂停（有检查点）</td><td>前期误杀风险</td></tr>
+      <tr><td>PBT</td><td>长训练、超参敏感、种群可承受</td><td>检查点读写、种群严格并行</td><td>资源占用为种群规模整数倍</td></tr>
+      <tr><td>BOHB</td><td>预算紧、需要建议机制与早停协同</td><td>贝叶斯建议 + 分档</td><td>并发提案质量受批量影响</td></tr>
+    </table>
+    <p>自定义调度器的实现按三步走：</p>
+    <ol>
+      <li><strong>定义判据</strong>：选择相对量作为比较基准，例如“同预算下全部存活试验指标的 40 分位”。判据在样本数不足时返回 CONTINUE。</li>
+      <li><strong>定义动作</strong>：明确 CONTINUE 与 STOP（或 PAUSE）的边界；若使用 PAUSE，训练函数必须支持检查点。</li>
+      <li><strong>定义状态</strong>：列出所有需要跨恢复存活的量（历史指标表、连续劣绩计数、分位阈值），实现序列化；其余临时量在恢复时可以重建。</li>
+    </ol>
+    <div class="box key">
+      <span class="box-title">设计决策：判据优先用“同预算”，规避“同步数”的失真</span>
+      <p>同步数比较假设所有试验从同一时刻起跑且速度一致。分布式环境下，节点算力差异、暂停恢复造成的空档都会破坏这条假设，同一迭代数对应的墙上时间可以相差数倍。预算轴（迭代数或环境步数）是每个试验自己的记账，与物理时间解耦，跨节点仍然可比。需要警惕的是恢复后计数器未还原造成的预算错位，这属于检查点内容的完整性问题。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：ASHA 配置与分档结构</strong></p>
+    <pre class="code"><code>from ray import tune
+from ray.tune.schedulers import ASHAScheduler
+
+# B=81、η=3：分档预算为 1、3、9、27、81，共 5 档
+asha = ASHAScheduler(
+    # time_attr 是所有淘汰比较的公共横轴：恢复后必须保持同一语义
+    time_attr="training_iteration",
+    metric="episode_return_mean",
+    mode="max",
+    max_t=81,
+    # 淘汰比例：每档保留前 1/3 晋级，前 0 档消耗 N、第 1 档消耗 N/3
+    reduction_factor=3,
+    # 单括号：等待每一档收齐后统一淘汰；并发充足时可用多括号降低空转
+    brackets=1,
+    # 起步保护：前 1 次迭代不淘汰，防止慢热配置被首帧噪声误杀
+    grace_period=1,
+)
+
+# 训练函数必须支持检查点，否则 PAUSE 决策无法执行
+def train_fn(config):
+    for it in range(81):
+        # training_iteration 由 Tune 自动记录；需要可暂停时随上报附上检查点
+        tune.report(episode_return_mean=run_one_iteration(config, it))</code></pre>
+    <p>解读：配置项对应分档推演的四个变量。<strong>（1）</strong><code>max_t</code> 与 <code>reduction_factor</code> 共同决定档数与每档预算，改参数前先按上一节公式重算总资源需求。<strong>（2）</strong><code>grace_period</code> 是抵抗噪声误杀的第一道防线，取值应覆盖指标从启动噪声进入稳定区所需的迭代数。<strong>（3）</strong>训练函数中 <code>tune.report</code>（2.x 各版本中亦写作 <code>session.report</code>）在暂停场景下必须携带检查点，检查点内容要包含迭代计数器；“暂停恢复后曲线错位”几乎都源于计数器未随检查点保存。接口细节以对应版本的官方文档为准。</p>
+
+    <p><strong>片段 2：自定义调度器与状态序列化</strong></p>
+    <pre class="code"><code>from ray.tune import TrialScheduler
+
+class WeakStreakStopper(TrialScheduler):
+    """连续多次落后于同预算中位数即终止，适合未实现检查点的训练函数。"""
+    def __init__(self, metric="episode_return_mean", mode="max",
+                 patience=2, min_peers=4):
+        super().__init__()
+        self.metric, self.mode = metric, mode
+        self.patience, self.min_peers = patience, min_peers
+        # 键使用 trial_id：恢复后对象引用会变，字符串标识不变
+        self.history = {}
+        self.weak = {}
+
+    def on_trial_result(self, tune_controller, trial, result):
+        budget = result.get("training_iteration", 0)
+        value = result.get(self.metric)
+        self.history.setdefault(trial.trial_id, {})[budget] = value
+        # 只在同一预算上收集同伴，保证比较发生在同一横轴刻度
+        peers = sorted(h[budget] for h in self.history.values()
+                       if budget in h)
+        if len(peers) &lt; self.min_peers:
+            return TrialScheduler.CONTINUE   # 样本不足时不决策，避免误杀
+        median = peers[len(peers) // 2]
+        behind = value &lt; median if self.mode == "max" else value &gt; median
+        streak = self.weak.get(trial.trial_id, 0) + 1 if behind else 0
+        self.weak[trial.trial_id] = streak
+        if streak &gt;= self.patience:
+            return TrialScheduler.STOP
+        return TrialScheduler.CONTINUE
+
+    def get_state(self):
+        # 状态导出：若所用版本改为整体序列化调度器，则统计表只需可被序列化
+        return {"history": self.history, "weak": self.weak}
+
+    def set_state(self, state):
+        # 恢复契约：实验恢复时先用保存的统计重建调度器，再回放试验结果
+        self.history = state["history"]
+        self.weak = state["weak"]</code></pre>
+    <p>解读：这段代码把接口契约落到四个要点。<strong>（1）</strong>决策选择 STOP 动作，训练函数因此可以不提供检查点，代价是落后试验的已投入算力无法回收再利用。<strong>（2）</strong>判据是“同预算中位数”，相对量让调度器不依赖指标量纲与任务规模；<code>min_peers</code> 给出最小样本护栏。<strong>（3）</strong>计数状态按 <code>trial_id</code> 归档，<b>（4）</b><code>get_state</code> 与 <code>set_state</code> 构成恢复契约：运行器在实验级检查点中保存调度器状态，恢复时先重建调度器再回放试验结果，缺失这一步会造成恢复后决策翻转。Ray Tune 的调度器基类名称与目录在 2.x 内经历过调整，以对应版本文档为准。</p>
+
+    <p><strong>片段 3：PBT 种群与扰动配置</strong></p>
+    <pre class="code"><code>from ray import tune
+from ray.tune.schedulers import PopulationBasedTraining
+
+pbt = PopulationBasedTraining(
+    time_attr="training_iteration",
+    metric="episode_return_mean",
+    mode="max",
+    # 扰动周期：每 5 次迭代做一次利用 + 探索；周期过短会打断策略学习
+    perturbation_interval=5,
+    # 分位切分：后 25% 被前 25% 覆盖，中间 50% 仅参与超参扰动
+    quantile_fraction=0.25,
+    # 25% 的概率完全重采样，其余做“乘性局部扰动”，两者分工明确
+    resample_probability=0.25,
+    hyperparam_mutations={
+        # 对数分布给出乘性扰动，适合学习率等尺度参数
+        "lr": tune.loguniform(1e-5, 1e-2),
+        "entropy_coeff": tune.loguniform(1e-4, 1e-2),
+        # 列表给出分类扰动：等概率改选其中一个取值
+        "activation": ["relu", "tanh"],
+    },
+)
+
+# 种群规模由 num_samples 控制：PBT 要 8 个成员，就必须生成 8 个试验
+tune.run(train_fn, config=search_space, num_samples=8, scheduler=pbt)</code></pre>
+    <p>解读：PBT 配置的三个关键量在这里都有对应。<strong>（1）</strong><code>perturbation_interval</code> 是权重迁移的节拍：太密时策略尚未学到可迁移的知识，太疏时优秀成员的领先无法被继承。<strong>（2）</strong><code>quantile_fraction</code> 与 <code>resample_probability</code> 分别控制“谁被覆盖”与“覆盖后怎么变”，前者影响种群多样性，后者影响探索强度。<strong>（3）</strong><code>hyperparam_mutations</code> 的取值类型决定扰动方式：分布对象给局部乘性扰动，列表给分类重选；两类可以混用匹配不同参数。片段省略了训练函数内部的检查点读写细节，它的实现方式与片段 1 相同，PBT 的复制动作完全构建在这套机制上。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>暂停决策遇到无检查点的训练函数</strong>：调度器不断请求 PAUSE，运行器无法执行，日志出现反复的恢复请求。症状是资源利用率抖动但没有淘汰发生。修复：给训练函数补上检查点，或把调度器判据改为 STOP 语义。</li>
+      <li><strong>time_attr 在不同试验间语义不一致</strong>：有的试验按迭代数上报、有的按环境步数上报，比较池被污染。症状是淘汰结果与肉眼观察曲线相矛盾。修复：统一上报字段，并在训练函数中把该字段纳入检查点。</li>
+      <li><strong>自定义调度器状态未序列化</strong>：实验恢复后历史统计归零，判定为“样本不足”而全部放行，或计数错位导致批量误杀。修复：实现 <code>get_state</code> 与 <code>set_state</code>，保存所有跨结果依赖的登记表。</li>
+      <li><strong>登记表以对象引用为键</strong>：恢复后 <code>trial</code> 对象重建，旧键全部悬空，历史丢失且内存泄漏。修复：统一使用 <code>trial.trial_id</code>。</li>
+      <li><strong>PBT 种群不足或被叠加使用</strong>：<code>num_samples</code> 小于种群规模导致淘汰逻辑空转；把 PBT 与 ASHA 叠加使用造成两套淘汰互相干扰。修复：按种群规模设置样本数，调度器保持单例。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>画出试验状态机：PENDING、RUNNING、PAUSED、TERMINATED、ERROR 五个状态，标出每条转移的触发者（运行器或调度器）与前置条件。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>重点是 RUNNING 到 PAUSED 的条件链：调度器返回 PAUSE、运行器请求检查点、保存成功后释放资源；任一环节失败则转移不成立。ERROR 到运行态的转移取决于重试策略，属于第 064 章范围。</div></details>
+      </li>
+      <li>预测题：把 ASHA 的 <code>reduction_factor</code> 从 3 改为 2，<code>max_t=81</code> 时档数与每档保留比例如何变化？初始 32 个试验的总迭代消耗与原来相比升还是降？<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>档数从 5 增到 7（1、2、4、8、16、32、64）；每档保留 1/2，淘汰更温和。总消耗上升，但到达高预算的试验更多，误杀风险下降。</div></details>
+      </li>
+      <li>设计题：设计一个以“改进斜率”为判据的自定义调度器：比较最近两个结果区间上的平均改进量，低于同预算群体下分位时终止。写出判据伪代码、需要保存的状态清单，并说明它相对“绝对值判据”的优势。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>状态需要保存每个 trial 的预算到指标映射与斜率缓存；优势在于对指标绝对水平不敏感，能识别“平台期”，对“低水平”不误报，适合不同奖励尺度的任务共享同一套调度逻辑。</div></details>
+      </li>
+      <li>实现题：给片段 2 增加一个功能：若某试验连续两次进入弱绩计数后又有回升，则清零计数。修改哪些方法？新增哪些状态？恢复时如何保证一致性？<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>修改 <code>on_trial_result</code> 的计数逻辑即可，清零本身不需要额外状态；“回升”的定义建议用同预算中位数上穿，避免使用自身的历史峰值造成判据漂移，新增状态仅为弱绩计数本身。</div></details>
+      </li>
+      <li>对比题：从“预算分配”与“知识迁移”两个维度对比 ASHA、PBT、BOHB 三种调度器，各给一个它们明显不适用的场景。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>ASHA 不搬运权重，对“前期劣后期优”的配置不利；PBT 需要长训练与严格种群，短任务里种群开销占比过高；BOHB 的建议机制在极度非平稳指标上优势减弱，且并发批量的提案质量需要额外控制。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>调度器是纯决策组件：输出 CONTINUE、PAUSE、STOP 三选一，执行由试验运行器完成。</li>
+      <li>PAUSE 以检查点为前提；比较判据必须以同一预算轴为刻度，否则决策系统性失真。</li>
+      <li>ASHA 的总资源需求可按分档公式精确推演，淘汰比例决定节省力度与误杀风险的平衡。</li>
+      <li>PBT 在分配预算之外搬运训练成果：利用负责权重迁移，探索负责超参扰动。</li>
+      <li>自定义调度器必须履行状态序列化义务：以 <code>trial_id</code> 为键、实现 <code>get_state</code> 与 <code>set_state</code>、样本不足时保守放行。</li>
+      <li>下一章处理单指标之外的搜索目标：多目标优化的帕累托前沿表达与约束优化的可行性处理。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch061.html">← 第 061 章：自定义搜索空间</a>
+    <a class="next" href="ch063.html">第 063 章：多目标优化与约束优化 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

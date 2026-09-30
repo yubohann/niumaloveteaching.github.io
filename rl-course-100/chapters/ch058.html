@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第058章 SAC的鲁棒性测试 | 深度强化学习课程 · PPO、SAC 与多智能体系统</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 离策略方法与 SAC</span>
+    <span class="sep">/</span>
+    <span>第 058 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 离策略方法与 SAC</div>
+    <h1>第 058 章：SAC的鲁棒性测试</h1>
+    <p class="lead">训练两个 Pendulum 策略，一个干净训练、一个在观测噪声增强下训练，然后让它们一起通过十项"扰动体检"：观测噪声、动作噪声、重力偏移与动作延迟，用保持率看清"在哪里变强、在哪里照旧脆弱"。</p>
+    <ul class="meta">
+      <li>主题：鲁棒性评估 / 噪声增强训练</li>
+      <li>关键公式：保持率 = J<sub>0</sub> / J(T)（干净回报 ÷ 扰动回报；本任务回报恒为负，见正文口径说明）</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 057 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解策略鲁棒性的四个维度：感知扰动（观测噪声）、执行扰动（动作噪声）、模型扰动（动力学偏移）、时序扰动（动作延迟）。</li>
+      <li>实现一个统一的扰动评估函数，把四类扰动参数化并在固定种子下批量执行。</li>
+      <li>实现观测噪声增强训练，让策略的训练分布覆盖感知扰动。</li>
+      <li>用"保持率 = 干净回报 ÷ 扰动回报"横向比较两个策略（回报恒为负，口径说明见正文），并解释为什么噪声增强只改善它覆盖过的那一维。</li>
+      <li>会为鲁棒性结论设计合理的评估预算（回合数、种子安排、组合扰动）。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>仿真里学到 −200 分不意味着部署后能用：真实传感器有噪声、执行器有延迟、负载会变。这些失效模式不会出现在"干净的评估"里，策略在训练分布上表现完美，一换条件就崩。第 042 章关心价值估计的偏差，这一章关心的是<strong>策略在分布扰动下的存活能力</strong>。</p>
+    <p>本章的做法是"体检 + 对照"：先设计一套覆盖四类扰动的评估电池，再用观测噪声增强训练制造一个对照组，看增强到底买到了哪一维的鲁棒性，以及哪些维度它根本买不到。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 四类扰动的形式化</h3>
+    <p>设策略 π 在干净条件下的期望回报为 J<sub>0</sub>，扰动算子为 T，则条件回报与保持率为：</p>
+    <div class="formula">
+      J(T) = 𝔼<sub>τ~π,T</sub>[ Σ<sub>t</sub> γ<sup>t</sup> r<sub>t</sub> ] &nbsp;&nbsp;·&nbsp;&nbsp; 保持率 = J<sub>0</sub> / J(T)
+      <span class="note">回报恒为负，采用"干净回报 ÷ 扰动回报"（等价于幅度比 |J<sub>0</sub>|/|J(T)|）：1 表示无损失，越小损失越大</span>
+    </div>
+    <p>四类扰动的定义：</p>
+    <ul>
+      <li><strong>感知</strong>：π(a | s + ε<sub>obs</sub>)，ε<sub>obs</sub> ~ 𝒩(0, σ²)，传感器噪声；</li>
+      <li><strong>执行</strong>：环境实际收到 a + ε<sub>act</sub>，执行器误差；</li>
+      <li><strong>模型</strong>：动力学参数 g 从 10 变为 8 或 12，负载/环境变化；</li>
+      <li><strong>时序</strong>：实际执行 a<sub>t−k</sub>（k 步延迟），通信与作动延迟。</li>
+    </ul>
+
+    <h3>2. 噪声增强训练为什么有效</h3>
+    <p>训练时给策略观测加噪声，等于把"观测噪声"变成训练分布的一部分。策略与 Q 网络会学到：</p>
+    <div class="formula">
+      Q(s̃, a) ≈ 𝔼<sub>ε</sub>[ Q(s + ε, a) ]，策略对 ε 的敏感度被平滑
+      <span class="note">从"在精确状态上最优"变成"在状态邻域内平均最优"</span>
+    </div>
+    <p>这是数据增强思路在 RL 的翻版。代价是干净条件下的性能可能轻微下降（策略不再为精确观测做极限操作），而且<strong>它只覆盖被增强的那一维</strong>：观测噪声训练不会让策略对动作延迟更宽容，因为延迟改变的是闭环系统的相位，不是输入分布。这个"覆盖哪一维、改善哪一维"的规律是本实验最值得记住的结论。</p>
+
+    <h3>3. 保持率的读法</h3>
+    <p>保持率高于 1 说明扰动下反而更好（可能噪声起了正则作用）；0.7～1.0 是"稳健"；低于 0.5 表示扰动已明显破坏行为；逼近 0 则意味着扰动把回报幅度放大了约十倍（例如基线 −300 被拉成 −3000），行为已彻底失效。口径上要留意一个符号陷阱：Pendulum 的回报恒为负，直接写 J(T)/J<sub>0</sub> 会把"幅度变大"读成大于 1，本章统一采用 J<sub>0</sub>/J(T)（等价于 |J<sub>0</sub>|/|J(T)| 的幅度比），1 表示无损、数值越小越糟。对比两个策略时看<strong>同一行的差值</strong>，不要被"绝对回报更高"误导，绝对水平已经在干净基线里归一化掉了。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+
+    <h3>数据流</h3>
+    <p>流程两步。<strong>训练</strong>：clean 与 noisy 两个策略同种子、同预算各训练 12000 步；noisy 训练时策略输入与回放池（含 next_obs）都叠加 σ=0.05 的高斯观测噪声。<strong>评估</strong>：10 项扰动电池（1 个干净基线 + 3 档观测噪声 + 2 档动作噪声 + 2 档重力偏移 + 2 档延迟）逐项执行，每个条件用独立种子、两个策略共用同一条件的种子；最后按各自干净基线换算保持率并输出差值列。</p>
+
+    <h3>模块划分</h3>
+    <table>
+      <tr><th>组件</th><th>职责</th><th>关键点</th></tr>
+      <tr><td><code>train_agent(noise, tag)</code></td><td>训练策略；噪声增强时策略与回放池都用带噪观测</td><td>两个策略共用种子与超参数，仅噪声开关不同</td></tr>
+      <tr><td><code>evaluate_robust(...)</code></td><td>统一的扰动评估：g / 观测噪声 / 动作噪声 / 延迟</td><td>延迟用长度 delay+1 的 deque 实现"执行旧动作"</td></tr>
+      <tr><td>扰动电池</td><td>10 个条件覆盖四类扰动</td><td>每个条件独立种子，避免评估间相互关联</td></tr>
+      <tr><td>保持率汇总</td><td>按干净基线归一化的表</td><td>差值列直接看"鲁棒性增益"</td></tr>
+    </table>
+
+    <h3>关键超参数</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用与取值理由</th></tr>
+      <tr><td><code>--train-noise</code></td><td>0.05</td><td>噪声增强的 σ；与评估档位 0.05 对应，形成"覆盖验证"</td></tr>
+      <tr><td><code>--max-steps</code></td><td>12000</td><td>两个策略各自预算；噪声训练需要更长才会收敛</td></tr>
+      <tr><td><code>--eval-episodes</code></td><td>4</td><td>每种扰动的评估回合数；条件多，回合数不宜过大</td></tr>
+      <tr><td><code>--eval-every</code></td><td>3000</td><td>训练期间的干净评估点，确认两个策略都学到东西</td></tr>
+      <tr><td><code>--train-noise</code> 对照</td><td>0.0 / 0.05</td><td>clean 与 noisy 的唯一差异</td></tr>
+    </table>
+
+    <h3>与前一章的差异点</h3>
+    <ul>
+      <li>第 057 章的专家数据用于"加速学习"；本章的噪声增强用于"覆盖扰动分布"，目的不同。</li>
+      <li>新增 <code>evaluate_robust</code> 扰动电池与保持率归一化。</li>
+      <li>训练循环多了"带噪观测"分支；回放池存的是带噪观测（连同 next_obs）。</li>
+      <li>评估协议从"干净环境固定回合"扩展为"10 种扰动条件 × 固定种子"。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：扰动评估函数，四类扰动一个接口</strong></p>
+    <pre class="code"><code>def evaluate_robust(agent: SAC, g: float, obs_noise: float, act_noise: float,
+                    delay: int, seed: int, episodes: int) -&gt; float:
+    """在指定扰动组合下评估：观测噪声、动作噪声、重力偏移、动作延迟。"""
+    env = make_pendulum(seed, g)              # 重力偏移：g 传入环境构造
+    returns = []
+    for _ in range(episodes):
+        obs, _ = env.reset()
+        # 延迟缓冲：保留最近 delay+1 个动作，执行最旧的那个，实现 delay 步延迟
+        hist_len = delay + 1 if delay &gt; 0 else 1
+        action_hist = deque([np.zeros(env.action_space.shape, dtype=np.float32)] * hist_len,
+                            maxlen=hist_len)
+        done = False
+        ep_ret = 0.0
+        while not done:
+            obs_in = obs + np.random.normal(0.0, obs_noise, size=obs.shape).astype(np.float32) \
+                if obs_noise &gt; 0 else obs
+            a = agent.act(obs_in, deterministic=True)
+            if act_noise &gt; 0:
+                a = a + np.random.normal(0.0, act_noise, size=a.shape).astype(np.float32)
+            a = np.clip(a, -2.0, 2.0)         # 加噪后仍要落在合法动作范围
+            if delay &gt; 0:
+                action_hist.append(a)
+                executed = action_hist[0]     # 执行 delay 步之前的旧动作
+            else:
+                executed = a
+            obs, rew, terminated, truncated, _ = env.step(executed)
+            ep_ret += rew
+            done = terminated or truncated
+        returns.append(ep_ret)
+    return float(np.mean(returns))</code></pre>
+    <p>解读：<strong>（1）</strong>四类扰动全部参数化在一个函数里：<code>g</code> 走环境构造、<code>obs_noise</code> 加在策略输入、<code>act_noise</code> 加在执行前、<code>delay</code> 用缓冲实现，组合扰动只要同时传参。<strong>（2）</strong>延迟的实现：长度为 <code>delay+1</code> 的 deque，每步 append 新动作、取队首执行。常见错误是用长度 delay 的队列，那实现的是 delay−1 步延迟。初始用 0 填充，等价"系统启动时输出为零"。<strong>（3）</strong>动作噪声后 <code>np.clip</code> 回合法范围：测试的是"执行器在被扰动后仍受物理限幅约束"的真实情形。<strong>（4）</strong>评估用确定性策略（<code>deterministic=True</code>）：把扰动作为唯一的随机来源，差值才可归因。</p>
+
+    <p><strong>片段 2：噪声增强训练，整条数据链一致施加</strong></p>
+    <pre class="code"><code>    for step in range(1, args.max_steps + 1):
+        if step &lt;= args.start_steps:
+            action = env.action_space.sample()
+            obs_in = obs
+        else:
+            # 训练噪声增强：策略与回放池都看到带噪观测
+            obs_in = obs + np.random.normal(0.0, train_obs_noise, size=obs.shape).astype(np.float32) \
+                if train_obs_noise &gt; 0 else obs
+            action = agent.act(obs_in, deterministic=False)
+        next_obs, rew, terminated, truncated, _ = env.step(action)
+        next_in = next_obs + np.random.normal(0.0, train_obs_noise, size=next_obs.shape).astype(np.float32) \
+            if train_obs_noise &gt; 0 else next_obs
+        buffer.add(obs_in, action, rew, next_in, float(terminated))
+        obs = next_obs
+        ep_ret += rew
+        if terminated or truncated:
+            ep_returns.append(ep_ret)
+            ep_ret = 0.0
+            obs, _ = env.reset()
+
+        if step % args.update_every == 0 and buffer.size &gt;= min(args.start_steps, 1000):
+            agent.update(buffer.sample(args.batch_size), args)</code></pre>
+    <p>解读：<strong>（1）</strong>噪声施加在<strong>两个地方</strong>：策略推理的输入 <code>obs_in</code> 与存池的 <code>obs_in / next_in</code>。只在推理加噪、<code>next_in</code> 不加，Q 目标就仍在"精确下一状态"上估计，价值函数的鲁棒性不完整。<strong>（2）</strong>环境交互本身用带噪观测决策，这正是"训练分布覆盖扰动"的含义：策略学会在噪声下做动作。<strong>（3）</strong>预热期不加噪：随机动作阶段本来就没有策略参与，加噪没有意义。<strong>（4）</strong>评估时噪声施加在 <code>evaluate_robust</code> 内部，训练代码完全不感知评估扰动，训练与评估解耦，避免"测试集泄漏"式的实现错误。</p>
+
+    <p><strong>片段 3：扰动电池与保持率归一化</strong></p>
+    <pre class="code"><code>    conditions = [("干净（基线）", 10.0, 0.0, 0.0, 0),
+                  ("观测噪声 0.02", 10.0, 0.02, 0.0, 0),
+                  ("观测噪声 0.05", 10.0, 0.05, 0.0, 0),
+                  ("观测噪声 0.10", 10.0, 0.10, 0.0, 0),
+                  ("动作噪声 0.10", 10.0, 0.0, 0.10, 0),
+                  ("动作噪声 0.30", 10.0, 0.0, 0.30, 0),
+                  ("重力偏移 g=8", 8.0, 0.0, 0.0, 0),
+                  ("重力偏移 g=12", 12.0, 0.0, 0.0, 0),
+                  ("动作延迟 2 步", 10.0, 0.0, 0.0, 2),
+                  ("动作延迟 4 步", 10.0, 0.0, 0.0, 4)]
+
+    results = []
+    for i, (name, g, on, an, dl) in enumerate(conditions):
+        row = {}
+        for tag, agent in agents.items():
+            ret = evaluate_robust(agent, g=g, obs_noise=on, act_noise=an, delay=dl,
+                                  seed=args.seed + 200 + i, episodes=args.eval_episodes)
+            row[tag] = ret                    # 同一条件、两个策略共用种子
+        if name.startswith("干净"):
+            base = row                        # 干净基线留作归一化分母
+        results.append((name, row))
+    for name, row in results:
+        r_clean = base["clean"] / min(row["clean"], -1e-9)
+        r_noisy = base["noisy"] / min(row["noisy"], -1e-9)
+        print(f"{name:&lt;16}{row['clean']:&gt;12.1f}{r_clean:&gt;13.2f}"
+              f"{row['noisy']:&gt;12.1f}{r_noisy:&gt;13.2f}{row['noisy'] - row['clean']:&gt;11.1f}")</code></pre>
+    <p>解读：<strong>（1）</strong>扰动电池用"元组列表"声明：名称加四个扰动参数，加条件只需加一行。<strong>（2）</strong>种子安排是关键：每个条件用 <code>seed + 200 + i</code>（条件间独立），同一条件下两个策略共用同一种子（比较公平），这样差值才归因于策略，随机流被排除在外。<strong>（3）</strong>"干净基线"行同时作为归一化分子：每个策略用"自己的干净回报 ÷ 该条件的回报"得到保持率，剔除"水平差异"，让差值列纯粹代表鲁棒性增益。<strong>（4）</strong>回报恒为负，除零保护要用 <code>min(分母, -1e-9)</code> 向负方向截断；<code>max(·, 1e-9)</code> 会把负的分母顶成 1e-9，比例瞬间变成天文数字。打印时绝对回报与保持率并排，避免只看比例被小基数误导。</p>
+
+    <p>完整可运行脚本（附录）：<a href="../code/ch058.py" download>code/ch058.py</a></p>
+    <pre class="sh"><code>python code/ch058.py                 # 训练两个策略 + 10 项扰动评估，CPU 约 2–4 分钟
+python code/ch058.py --quick         # 快速跑通：约 40 秒
+python code/ch058.py --train-noise 0.1   # 更强的噪声增强</code></pre>
+    <p>预期（一次种子 0 的参考实跑，每种条件 4 回合）：<strong>干净基线上两个策略都在 −150 附近；观测噪声档位上两者的保持率几乎相同，噪声增强没有带来可辨的差异；出现差异的是重力偏移 g=12 与动作延迟 4 步档位（noisy 的保持率分别高出约 0.17 与 0.06）</strong>。4 回合的条件评估噪声很大（可达几十点），任何方向性结论都需要多种子、更多回合的复核；这本身就是本章要示范的实验纪律。以实跑为准。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>只在策略输入加噪、next_obs 不加</strong>：Q 目标仍在精确状态上估计，价值函数的鲁棒性不完整。增强要沿整条数据链一致施加。</li>
+      <li><strong>训练扰动和评估扰动的量纲不一致</strong>：比如训练噪声加在归一化后的观测上、评估加在原始观测上，两种 σ 根本不可比。本章全程使用原始观测，量纲一致。</li>
+      <li><strong>评估回合数太少</strong>：Pendulum 的 4 回合评估在这类条件下标准差可达 30～60 分，差值列容易被噪声淹没。结论性对比建议不少于 10 回合或多评估点取均值。</li>
+      <li><strong>把保持率当绝对指标跨任务比较</strong>：保持率依赖任务与扰动尺度，只能在同任务、同扰动定义下横向比策略。</li>
+      <li><strong>延迟队列长度写成 delay</strong>：长度 delay 的 deque 实现的是 delay−1 步延迟，语义整整差一步。正确写法是 <code>delay + 1</code>（外加"先 append 再取队首"的操作次序）。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把 <code>--train-noise</code> 改成 <code>0.1</code> 与 <code>0.2</code> 重跑。噪声增强的边际收益何时开始递减？干净基线恶化到什么程度？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>对比不同 σ 下"观测噪声 0.10"行的保持率与干净基线。增强过强时策略变得过度保守，干净与扰动两头都变差。</div></details>
+      </li>
+      <li>给噪声增强加"课程"：训练前半段 σ=0.02，后半段升到 0.05。对比固定 σ=0.05 的最终成绩。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>按 <code>step</code> 切换噪声强度即可。课程式增强的目标是"先站稳再练抗干扰"，观察干净基线与噪声档位的折中是否更优。</div></details>
+      </li>
+      <li>先预测再验证：增加"动作噪声增强"训练变体，它能否复制观测噪声的收益模式？<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>把加噪后的动作同时用于环境交互与存池。预计动作噪声档位的保持率提升、观测噪声档位不变，又一次验证"覆盖哪一维才能改善哪一维"。</div></details>
+      </li>
+      <li>把延迟从评估搬进训练：用延迟 2 步的执行动作采集数据。延迟训练需要多少步才能恢复到干净训练的水平？<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>训练循环里加动作队列、执行 <code>delay</code> 步前的动作。延迟破坏马尔可夫假设，SAC 学习更慢，但仍能学到"提前动作"的补偿策略。</div></details>
+      </li>
+      <li>把扰动电池换成"组合扰动"：观测噪声 0.05 + 动作噪声 0.1 + 延迟 2 步同时施加。比较两个策略的保持率，讨论单维鲁棒性是否可以叠加。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>直接在 <code>evaluate_robust</code> 调用时同时打开多个参数。组合扰动往往比单维更陡（1+1 大于 2），这正是鲁棒性研究里"分布外泛化"的难点。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>鲁棒性分四个维度：感知（观测噪声）、执行（动作噪声）、模型（动力学偏移）、时序（延迟），必须分开测量。</li>
+      <li>本章实现了统一的扰动评估函数与保持率指标，并用观测噪声增强训练作为对照条件。</li>
+      <li>结果读数：本例中噪声增强在重力偏移与延迟档位上带来数十到数百点的改善，观测噪声档位两者几乎相同；单次 4 回合评估的噪声很大，收益模式需要在多种子、更多回合下复核。</li>
+      <li>保持率需要以各自的干净基线归一化，才能把"策略水平"与"鲁棒性"分开。</li>
+      <li>下一章把扰动升级为"攻击"：对手不再随机加噪声，改为朝着最坏方向主动构造扰动，更强的威胁模型，以及对抗训练防御。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch057.html">← 第 057 章：SAC的模仿学习初始化</a>
+    <a class="next" href="ch059.html">第 059 章：SAC的对抗攻击防御 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

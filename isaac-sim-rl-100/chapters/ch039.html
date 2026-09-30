@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第039章 实现推动任务 | 机器人仿真学习课程 · Isaac Sim 强化学习训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 任务与技能实现</span>
+    <span class="sep">/</span>
+    <span>第 039 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 任务与技能实现</div>
+    <h1>第 039 章：实现推动任务</h1>
+    <p class="lead">不用爪子也能操作世界：把方块推到任意目标点，非夹持操作的接触门控奖励、滑动动力学与 HER 的回归。</p>
+    <ul class="meta">
+      <li>主题：任务实现 / 非夹持操作</li>
+      <li>相关组件：Isaac Sim、Stable-Baselines3（SAC + HER）、PyTorch</li>
+      <li>预计学时：50 分钟</li>
+      <li>前置章节：第 038 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解非夹持操作（non-prehensile manipulation）的任务特征：物体只能被"推出"而不能被"带走"。</li>
+      <li>掌握接触门控的进度奖励：为什么物体的位移必须经由接触才给信用，以及它防住的"悬停刷分"病态。</li>
+      <li>认识推动任务的滑动动力学：摩擦、推进高度、偏心推力的旋转效应与它们的随机化设置。</li>
+      <li>会把第 031 章的 HER 管线复用到推动任务，并说清"稠密塑形 + 稀疏目标"两种奖励的组合方式。</li>
+      <li>能定义推动任务的评估指标并诊断"推得动但推不准"的分层失败。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>抓取很强，但不是万能的：物体太重（推箱子）、太薄（书）、形状怪（盘子）、或者你没有手（单指工具、移动机器人）。<strong>推动是最基础的"非夹持操作"：用工具（这里用夹爪的侧面）接触物体，通过摩擦把它滑到目标位置。</strong>它和抓取的任务结构完全不同，抓取是"建立约束再搬运"，推动是"持续接触实时改变物体运动"。</p>
+    <p>推动也是"目标条件"思想最自然的落点：目标就是"把物体送到任意点"，与第 031 章的目标条件 RL 完美对齐，同一个策略，目标采样到哪里就推到哪里。<b>本章的教学价值在于三个"奖励陷阱"的正面处理：位移进度的接触门控（防悬停）、滑动扰动的随机化（防过拟合摩擦）、以及距离塑形与稀疏成功的关系（防在旁边停住）。</b>这三个陷阱在移动机器人导航（043 章）里会以另三种面貌再次出现。</p>
+  </section>
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 接触门控：物体位移的信用只能经由接触发放</h3>
+    <p>推动任务的"进度"定义在物体身上，而动作施加在工具上。如果直接奖励"物体—目标距离的减少"，会出现一条匪夷所思但极其常见的作弊路径：<b>策略保持工具悬停在物体附近空转</b>，虽然没推动物体，但也没有后退，某些随机扰动下距离偶尔减少，就被"奖励"强化。更隐蔽的版本：用工具把物体"蹭"一下再松开，微小位移恰好朝向目标就领奖。</p>
+    <p>解法是给进度项加接触门控：</p>
+    <div class="formula">
+      r<sub>push</sub> = k · ( d<sub>t−1</sub> − d<sub>t</sub> ) · 1[ pusher 与 object 持续接触 ]
+      <span class="note">d 为物体到目标的距离；只有"手在物体上"时物体位移才计入奖励，且接触需去抖（第 030 章状态机复用）</span>
+    </div>
+    <p>门控的实现要点：接触判定必须用去抖后的稳定状态（连续 2–3 帧），因为推动过程中接触会短暂断开（滑动跳跃），单帧判定会让奖励断断续续；连续帧窗口取 2 帧即可（推动接触比抓取更"黏"，不需要长窗口）。<strong>门控也在观测里有对偶：策略必须知道"当前有没有接触"，否则它无法预测"我的动作会不会产生奖励"。</strong></p>
+
+    <h3>2. 滑动动力学：摩擦与推高的三件事</h3>
+    <p>推动的物理模型比抓取更依赖摩擦：物体与桌面的滑动摩擦系数 μ 决定"推得动多快"与"放手后滑多远"。三件必须理解的动力学事实：</p>
+    <ul>
+      <li><b>推力高度决定翻转风险</b>：接触点高于物体重心时，推力矩会把物体压翻；低于重心则容易推出"翘起"。推动任务的工具（夹爪侧面）应接触在<b>重心高度附近</b>，且物体越高越要注意，4 cm 小方块的风险远低于 15 cm 的盒子。</li>
+      <li><b>偏心推力产生旋转</b>：接触点偏离物体中心轴线会同时施加力矩，物体边滑边转。策略要学会"推中间"；评估指标里的"物体朝向漂移"就是量化它的。</li>
+      <li><b>摩擦决定停止距离</b>：松手后物体靠惯性滑行 d<sub>slide</sub> = v²/(2μg)，μ=0.3、0.5 m/s 时滑行约 4 cm，<strong>这个量级与成功容差（5 cm）同阶，意味着"松手时机"本身是一项技能</strong>：要早于目标几厘米松手，让物体自己滑到位。这也是推动任务比 Reach 更"有手感"的原因。</li>
+    </ul>
+    <p>随机化设置：桌面摩擦 0.2–0.6（宽范围，覆盖"涩桌面"与"滑桌面"两种策略）、物体质量 ±20%、推杆摩擦固定较高（0.8，避免打滑）。<strong>摩擦是推动任务最关键的随机化轴，单摩擦训练的策略换到另一个摩擦的桌面会系统性偏近或偏远，因为"松手时机"的训练记忆全部失效。</strong></p>
+
+    <h3>2.1 数值算例：滑行距离的摩擦敏感度与瞄准偏差</h3>
+    <p>把滑行公式 d = v²/(2μg) 展开成一张数字表：松手速度 0.5 m/s 时，μ = 0.2 的滑桌面上滑行 6.4 cm，μ = 0.3 滑 4.2 cm，μ = 0.4 滑 3.2 cm，μ = 0.6 滑 2.1 cm。<b>摩擦从 0.6 降到 0.2，滑行距离涨到 3 倍。</b>这对策略的含义是算术性的：如果它学会"距离目标 4 cm 时松手"这一条固定规则，在滑桌面上会过冲 2.4 cm、在涩桌面上会欠滑 1.9 cm；而成功容差只有 5 cm，一条与摩擦无关的固定瞄准规则几乎吃光全部余量。这就是"摩擦是推动任务最关键随机化轴"的量化版本：策略必须学会从滑行后的位移反馈里在线修正瞄准点（观察物体减速快慢、依据上一次滑行的结果调整下一次松手位置），把"瞄准点"变成状态量的函数；与摩擦无关的常数瞄准规则只能当初始猜测，不足以单独支撑任务。</p>
+    <p>再看"推得动"的力学门槛：μ = 0.3、m = 200 g 的方块，静摩擦下限为 μmg = 0.59 N，工具必须以高于它的力接触，低于这个力的接触在物理上不产生任何位移；这与接触门控里"力 &gt; 1 N 才算有效接触"的阈值相互印证，1 N 阈值的作用是把"压上了但推不动"的无效接触拦在奖励之外。时间预算最后核一遍：典型推动速度 0.15 m/s、决策 10 Hz 时每步物体前进 1.5 cm，把物体从 0.25 m 外送进 5 cm 容差需要约 14 步的纯推动时间，加上绕到物体后方与末段减速，整局 30–60 步与设计一致；120 步的上限给了探索与多次修正的空间，超时率应主要出现在学习早期。</p>
+    <p>成功判据的两个参数也核算：容差 5 cm 与滑行距离 2.1–6.4 cm 同阶，说明"最后几厘米"的物理尺度就是滑行段本身；速度阈值 2 cm/s、保持 5 步（0.5 s）时，物体在窗口内的漂移上限 0.02×0.5 = 1 cm，小于容差的一半，<b>这保证"判定成功之后物体不会自己滑出容差"</b>。若把速度阈值放宽到 10 cm/s，同样 5 步窗口的漂移上限涨到 5 cm，与容差相当，成功判定会偏向运气成分，评估重测的方差随之上升。</p>
+
+    <h3>3. 距离塑形与稀疏成功：谁主谁辅</h3>
+    <p>推动任务的奖励一般用"距离塑形 + 成功事件"的双层结构：</p>
+    <div class="formula">
+      r<sub>t</sub> = k·Δd·contact + 0.1·contact − 0.01 + [ 成功：+10 ]
+      <span class="note">距离塑形让早期有梯度；成功事件定义"真正完成"；−0.01 时间税防拖沓</span>
+    </div>
+    <p>数量级关系：把物体从 30 cm 外推到 5 cm 内，距离塑形的累计收益约 k×0.25（k=1.0 时 0.25）；成功 +10 是它的数十倍，<strong>结构上保证"塑形只是导航，成功才是终点"</strong>。第 031 章讲过另一个极端：纯稀疏奖励（无塑形）要靠 HER 用重标记补梯度；本章用"塑形 + HER 双管"，塑形让有效率探索，HER 让"推到别处"的失败轨迹也变成对某个目标的成功样本。两者并不冲突：HER 重标记时按新目标重算，距离塑形项也要按新目标重算（重算的是 <code>‖achieved − desired‖</code> 的差分，用一步的 achieved 序列即可批量计算）。</p>
+
+    <h3>4. 滑动接触下的"停顿策略"</h3>
+    <p>一个推动任务特有的策略现象：最优策略的典型形态是"快推到目标附近，轻点修正"；全程匀速推进得不到同样的收益。原因：距离塑形奖励是每步的，而滑动不可精确控制，接近目标后大步推进会过冲（过冲的负差分会立即吃掉奖励）。策略学出的典型行为是：远距离大力推（差分大、收益高）→ 距离缩短后减小推进（降低过冲风险）→ 最后在目标 5–10 cm 处利用滑行与轻推把物体送到位。<strong>观察这个"力度渐变"是否出现，是判断训练是否健康的直观信号；如果策略全程用最大力度推，说明惩罚过冲的信号不足，可加入"过冲后的额外惩罚"或降低速度上限。</strong></p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p><strong>任务规格：</strong>桌面上一个 4 cm 立方体（或圆盘），目标点在工作区内随机采样（距离物体初始位置 0.1–0.4 m）；Franka 用夹爪侧面接触并推动物体，使物体进入目标点 5 cm 内。</p>
+    <table>
+      <tr><th>规格</th><th>设计</th><th>理由</th></tr>
+      <tr><td>观测（28 维）</td><td>本体(14) + 物体位置/速度(6) + 目标相对物体的向量(3) + 工具相对物体的位置(3) + 接触标志与力(2)</td><td>"目标−物体"与"工具−物体"两个相对向量给足几何；接触标志让策略可预测奖励门控</td></tr>
+      <tr><td>动作（7 维）</td><td>7 关节位置增量 ×0.05 rad；夹爪保持固定闭合宽度</td><td>推动不需要开合手；夹爪姿态由策略自行选择（用腕关节控制）</td></tr>
+      <tr><td>奖励</td><td>门控进度 1.0 + 接触保持 0.1/步 + 时间 −0.01 + 成功 +10 + 出桌 −2</td><td>门控防悬停；成功与塑形量级 40:1</td></tr>
+      <tr><td>成功判据</td><td>物体距目标 &lt; 5 cm 且速度 &lt; 2 cm/s，连续 5 步</td><td>速度条件防"路过即成功"；5 步 = 0.5 s 的稳定确认</td></tr>
+      <tr><td>终止</td><td>成功｜物体出桌（掉落）−2｜超时 120 步</td><td>出桌是不可恢复失败</td></tr>
+      <tr><td>随机化</td><td>桌面摩擦 0.2–0.6、质量 ±20%、物体初始位姿、目标位置（距离 0.1–0.4 m）</td><td>摩擦是最关键的泛化轴（原理 2）</td></tr>
+      <tr><td>课程</td><td>目标距离 0.1 → 0.25 → 0.4 m；目标区域从"物体正前方"扩到"全平面"</td><td>先直线后侧向：侧向推动需要绕到物体另一侧，是独立的技能</td></tr>
+    </table>
+    <p>权重与门控的三点推理：<b>(1) 接触保持项 0.1/步</b>：给"贴着推"一点甜头，避免策略总在 1 cm 外"瞄准"而不接触；但它远小于进度项的单步量级（0.02–0.05×k），不会诱导"贴着不动"（贴不动还有时间税）。<b>(2) 成功阈值配速度条件</b>：5 cm 是"滑行余量"与"瞄准精度"的折中，要求比滑行距离（4 cm）略大，否则策略必须精确到依赖具体摩擦值；速度 &lt; 2 cm/s 排除"恰好滑过目标"的一次性通过。<b>(3) 超时 120 步</b>：推动任务的最优用时约 30–60 步，120 步给了探索与修正的余量。</p>
+    <div class="box warn">
+      <span class="box-title">警告：HER 与塑形奖励的组合坑</span>
+      <p>用 SB3 的 HerReplayBuffer 时，<code>compute_reward</code> 必须把"距离塑形 + 成功"一起按新目标重算，但塑形项是<b>差分</b>（依赖上一步的 achieved），而 HER 重标记的奖励函数只拿到单个 (achieved, desired) 对。<strong>工程解法：把塑形改造成"伪势能"形式再差分，在缓冲区里存"上一步 achieved"作为附加字段，或把塑形从"每步差分"改成"相对势能的单步近似"。</strong>最省事的替代：训练用塑形奖励 + HER 只负责目标重采样（不重标记奖励），即"目标随机化 + 塑形"模式；代价是丢掉一部分失败轨迹利用率。两条路都要在配置里写清，别混着做。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：接触门控的进度奖励</strong></p>
+    <pre class="code"><code>def push_reward(prev_obj_goal_d, obj_goal_d, contact_stable,
+                pusher_force, success, off_table):
+    """门控进度：物体靠近目标的位移必须"经由接触"才发放信用"""
+    r_push = 1.0 * (prev_obj_goal_d - obj_goal_d) * contact_stable.float()
+    # 无接触时的位移来自滑动惯性，记不到本步动作头上；门控把它关掉
+    r_contact = 0.1 * contact_stable.float()        # 贴着推的甜头：防"1 cm 外空瞄"
+    r_contact = torch.where(pusher_force &lt; 1.0,
+                            torch.zeros_like(r_contact), r_contact)
+    # 力太小（虚接触）不发：接触状态机同时要求力阈值，双重过滤
+    r_time = -0.01                                   # 时间税：贴而不动仍有成本
+    r_success = 10.0 * success.float()               # 成功：塑形累计的数十倍（量级主张）
+    r_off = -2.0 * off_table.float()                 # 出桌：不可恢复失败
+    return r_push + r_contact + r_time + r_success + r_off</code></pre>
+    <p>解读：门控的三层过滤值得拆开看。<b>第一层是接触状态</b>（去抖后的稳定标志）：挡住"没碰着也拿进度"。<b>第二层是力阈值</b>（&gt;1 N）：挡住"数值上的虚接触"（PhysX 求解残差可能瞬时报告接触对但力近乎为零）；接触保持奖励被这一层直接清零，进度项则保留（万一物理状态错了，至少进度信号正确）。<b>第三层是时间税</b>：接触保持 + 时间税在"贴住但不动"时净值 0.09/步，为正但不诱人；而一旦物体移动超过约 0.1 m 每步距离改善，进度项立即碾压它。<b>换个写法会怎样？</b>若把接触保持项设成 1.0/步（与进度同量级），"贴着不动"的收益变成 0.99/步，策略会心安理得地贴住物体，这就是"甜头给大了"的典型失败模式。</p>
+
+    <p><strong>片段 2：成功判据与出桌检测</strong></p>
+    <pre class="code"><code>class PushSuccessTracker:
+    """成功 = 距离达标 + 速度低，连续 5 步；出桌 = 物体离开台面范围"""
+    def __init__(self, num_envs, goal_tol=0.05, vel_tol=0.02, hold=5,
+                 table_half=0.45, device="cuda"):
+        self.goal_tol, self.vel_tol, self.hold = goal_tol, vel_tol, hold
+        self.table_half = table_half             # 桌面半宽 0.45 m：工作区边界
+        self.count = torch.zeros(num_envs, dtype=torch.long, device=device)
+
+    def update(self, obj_pos, obj_vel, goal_pos, reset_mask):
+        d = (obj_pos - goal_pos).norm(dim=-1)
+        stable = (d &lt; self.goal_tol) &amp; (obj_vel.norm(dim=-1) &lt; self.vel_tol)
+        self.count = torch.where(stable, self.count + 1, torch.zeros_like(self.count))
+        success = self.count &gt;= self.hold          # 速度条件防"路过目标"的瞬时命中
+        off = (obj_pos[:, :2].abs().max(dim=-1).values &gt; self.table_half) | \
+              (obj_pos[:, 2] &lt; -0.1)               # 出了台面或掉下桌子
+        self.count[reset_mask] = 0                 # 重置清单：0 步计数必须清零
+        return success, off</code></pre>
+    <p>解读：<b>速度条件的意义要量化理解</b>：滑行物体经过目标的窗口时间里（±5 cm、速度 0.3 m/s 时约 0.3 s ≈ 20 帧），若无速度条件，策略只要"发射"物体飞过目标就能成功，一个不需要瞄准的技能。加上速度 &lt; 2 cm/s 后，成功必须"停下来」，逼迫策略掌握"减速轻推"的精细控制。<b>出桌判定的两个条件</b>（超出台面半宽、z 低于桌面）分别对应"滑飞出界"与"掉下桌子"，二者都给 -2 并终止。z 阈值取 -0.1 是"物体中心明显低于桌面"的安全值，避免误伤正常推挤时的小起伏。注意推送过程的频繁接触可能让物体短暂离桌 1–2 mm 弹跳，阈值不能设得太紧。<b>重置清零</b>：count 与其他跨步状态一样，是本任务第 N 次出现的"重置清单"纪律，到了 039 章你应该已经形成肌肉记忆。</p>
+
+    <p><strong>片段 3：HER 与塑形的组合配置</strong></p>
+    <pre class="code"><code>from stable_baselines3 import SAC
+from stable_baselines3.her.her_replay_buffer import HerReplayBuffer
+
+model = SAC(
+    "MultiInputPolicy", vec_env,           # 推块环境用字典观测（第 031 章接口）
+    replay_buffer_class=HerReplayBuffer,
+    replay_buffer_kwargs=dict(
+        n_sampled_goal=4,                  # 每条轨迹派生 4 个重标记目标
+        goal_selection_strategy="future",  # 取未来状态：可达性最强（第 031 章）
+        handle_timeout_termination=True,
+    ),
+    # 关键决策：奖励走"稀疏 + 塑形"哪条路；本课默认走稀疏 + HER 重标记（配目标课程）
+    learning_rate=3e-4, batch_size=256, buffer_size=1_000_000,
+    learning_starts=10_000, train_freq=1, tau=0.05, gamma=0.99,
+    device="cuda",
+)
+# 若重标记奖励也要带塑形：把"上一步 achieved"存进 info，compute_reward 里读它做差分
+# 最简替代（本课默认）：HER 只做目标重采样，compute_reward 用"到新目标距离的负值"单步势能
+def compute_reward_simple(achieved, desired, info):
+    d = torch.norm(achieved - desired, dim=-1)
+    return -(d &gt; 0.05).float()             # 稀疏按新目标重算：SB3 会用它替换旧奖励</code></pre>
+    <p>解读：这份配置处理了 SB3 生态里一个具体的选择题。<b>选项一：让 HER 重写全部奖励（用 compute_reward_simple）</b>，干净、与第 031 章完全一致，但丢掉了距离塑形，早期学习完全依赖重标记密度；对推动任务，稀疏重标记通常足够（每一条轨迹都会达成"某个目标"）。<b>选项二：塑形奖励 + 重采样</b>，保留塑形梯度，但 HER 的奖励重算与差分塑形难以兼容（设计箱里讲过原因）。本章的推荐是<b>选项一 + 目标课程（第 032 章）</b>：目标距离从 0.1 m 起步，正样本密度被课程保证；距离拉大后 HER 的 future 重标记接管。这个组合（稀疏 + HER + 目标课程）在推块任务上是公开研究里验证最充分的标准配方；把塑形的活交给目标课程，是"课程学习替代塑形"的一个漂亮案例。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>进度奖励无接触门控</strong>：策略学会"悬停在物体旁等随机漂移"，或蹭一下就走。症状：接触保持率低但回报不低。修复：门控（稳定接触 + 力阈值双过滤）。</li>
+      <li><strong>接触保持奖励过大</strong>：0.1/步是甜点；设成 1.0/步时策略"贴住物体不动"净收益接近 1/步。症状：物体几乎不动、回合超时率高。修复：保持项 ≤ 进度项单步量级的 1/3。</li>
+      <li><strong>成功无速度条件</strong>：把物体"发射"过目标点即成功，任务退化成弹射。症状：成功率高但重测时物体位置散布大。修复：距离 + 速度双条件 + 5 步保持。</li>
+      <li><strong>摩擦不随机化</strong>：单一摩擦训练的策略换桌面后系统偏差（瞄准点错位）。症状：训练内 90% 成功率、随机化一变只剩 40%。修复：摩擦 0.2–0.6 宽范围随机化（本任务最重要的泛化轴）。</li>
+      <li><strong>工具推高过低/过高</strong>：接触点远离重心导致物体翻转或翘起。症状：翻倒率异常、物体朝向混乱。修复：奖励物面姿态（惩罚大角度俯仰）或把工具初始提高到重心高度。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>计算题：μ=0.3、物体松手速度 0.5 m/s。滑行距离约多少？如果成功容差是 5 cm，策略的"提前松手量"应约为多少？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>d = v²/(2μg) ≈ 0.25/(2×0.3×9.8) ≈ 4.2 cm，与 5 cm 容差同阶，"松手时机"是任务的核心技能之一。</div></details>
+      </li>
+      <li>消融实验：把接触门控去掉训练一次，观察"接触时长的分布"与"成功率"的联合变化，描述你看到的悬停行为。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>关注"物体静止但邻近"的状态占比；没有门控时这部分样本会获得正回报，策略停留时间拉长。</div></details>
+      </li>
+      <li>实验设计：对比"稀疏 + HER + 目标课程"与"塑形 + 无 HER"两套奖励，预测并验证"早期学习速度"与"最终泛化（对随机目标）"两个维度的差异。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>塑形版早期更快；HER 版泛化与最终质量往往更好（重标记让每条轨迹都有价值）。用"训练分布内/外"两组目标分别评估。</div></details>
+      </li>
+      <li>动力学实验：把工具接触高度从重心高度改成"顶部 1 cm 处"，记录物体翻转率与成功率的崩坏过程，并结合力矩解释。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>接触力作用线高于重心 → 力矩使物体前翻；观察翻转事件率与"物体朝向大于 30°"的样本占比。</div></details>
+      </li>
+      <li>思考题：为什么推动任务的成功容差（5 cm）比抓取的成功判据（抬升 5 cm）在"物理含义"上完全不同？请从"状态可控性"的角度比较两者对策略精度的要求。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>抓取的 5 cm 是"是否离桌"的二元高度，抓握稳定后易保持；推动的 5 cm 是平面精度，滑行与摩擦每一步都在漂移，可控性差得多，所以推动对"停止策略"的要求更高。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>非夹持操作：物体只能被推出、不能被带走；进度奖励必须接触门控（稳定接触 + 力阈值双过滤）。</li>
+      <li>滑动动力学三件事：推力高度（翻转）、偏心推力（旋转）、摩擦（滑行距离 d=v²/2μg，与容差同阶）。</li>
+      <li>奖励结构：门控进度 1.0 + 接触保持 0.1/步 + 时间 −0.01 + 成功 +10 + 出桌 −2；成功 = 距离 &lt; 5 cm 且速度 &lt; 2 cm/s 持续 5 步。</li>
+      <li>标准配方：稀疏奖励 + HER（future）+ 目标课程；塑形与 HER 的"奖励差分"组合是进阶坑，先绕开。</li>
+      <li>下一章引入铰接物体：开门任务，把"物体"从自由刚体换成带关节约束的机构，任务空间与观测都要升级。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch038.html">← 第 038 章：实现堆叠任务</a>
+    <a class="next" href="ch040.html">第 040 章：实现开门任务 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

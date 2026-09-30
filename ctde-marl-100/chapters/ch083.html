@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第083章 协同强化学习与仿真环境集成 | 多智能体强化学习课程 · CTDE 框架与协同算法</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第五篇 · 研究复现与系统集成</span>
+    <span class="sep">/</span>
+    <span>第 083 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第五篇 · 研究复现与系统集成</div>
+    <h1>第 083 章：协同强化学习与仿真环境集成</h1>
+    <p class="lead">算法只有接上环境才能训练：本章讲并行环境接口的字段契约、局部观测与全局状态的拆分原则、包装器栈的叠加顺序，以及向量化采样中情节缓冲的形状约定与隐藏状态管理。</p>
+    <ul class="meta">
+      <li>主题：环境接口工程 / 向量化采样</li>
+      <li>关键公式：情节缓冲形状 (T, B, N, ·)、终止（Termination）与截断（Truncation）的区分</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 082 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>掌握并行环境（Parallel Environment）的 reset/step 契约与各返回字段的语义，特别是终止与截断的区别。</li>
+      <li>理解局部观测与全局状态的拆分原则，能按"执行期可得性"设计观测与状态向量。</li>
+      <li>掌握包装器（Wrapper）栈的分层设计与叠加顺序，避免训练侧与评估侧的接口不对称。</li>
+      <li>理解向量化采样中情节缓冲（Episode Buffer）的形状约定，能正确处理变长智能体数与 RNN 隐藏状态。</li>
+      <li>能实现一个轻量多智能体环境，并用统一接口完成并行采样与轨迹收集。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>CTDE 算法代码的骨架都是三层：环境接口、采样循环、参数更新。单智能体环境只有一条数据流（观测、动作、奖励），多智能体环境却要在每个时间步上同时处理 N 组字段：N 份局部观测、N 份动作、N 份奖励，还有"哪个智能体活着、哪个智能体结束"这类掩码信息。<strong>接口层面的错误通常不报异常，只会让训练静默变差：奖励按错误维度求和、终止标志被当成截断、隐藏状态跨情节泄漏，这些问题的症状都表现为曲线难看，排查成本极高。</strong></p>
+    <p>采样吞吐是实验成本的主要部分：一次对比研究的总环境步可达千万量级，串行采样会把大部分时间花在 Python 解释器开销上，向量化采样是常规手段。本章先定义接口契约，再实现并行采样，为第 084 章的真机集成与第 092 至 094 章的论文复现打地基。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 并行环境接口契约</h3>
+    <p>参照 Gymnasium 与 PettingZoo 的并行接口（Parallel API）习惯，多智能体环境的契约可以用四个函数签名描述：reset 返回（观测字典, 信息字典）；step 接收动作字典，返回（观测字典, 奖励字典, 终止字典, 截断字典, 信息字典）。三个细节决定实现质量：</p>
+    <ul>
+      <li><strong>终止与截断必须分开</strong>：终止（Termination）表示任务状态真正到达终点，价值函数在终点处为零；截断（Truncation）表示时间上限触发，价值函数在截断处仍有残余价值。二者混用会让自举（Bootstrap）目标错位，这是第 093 章 GAE 实现错误的头号来源。</li>
+      <li><strong>字段以智能体为键</strong>：字典的键是智能体标识，值按智能体对齐；环境内部不要用列表下标隐式排序，避免智能体增删时索引错位。</li>
+      <li><strong>信息字典承载掩码</strong>：存活掩码、动作合法性掩码等由环境提供，采样器传递给损失函数，策略网络不自行推断。</li>
+    </ul>
+    <p>PettingZoo 还提供 AEC（Agent Environment Cycle）接口，把每个智能体的动作串行执行。并行接口更适合向量化与批量训练；若任务本身有严格的轮换语义（回合制游戏），AEC 更自然，可用适配层转换。</p>
+
+    <h3>2. 局部观测与全局状态的拆分</h3>
+    <p>CTDE 的结构性约束是：执行期每个智能体只能拿局部观测 o<sub>i</sub>，训练期 critic 才能访问全局状态 s。拆分原则只有一条，<strong>按"执行期可得性"画线：任何在执行期无法获得的信息都不得进入观测</strong>。常见拆分方案是观测包含自身的位姿、速度、传感器读数与邻居相对位置，状态包含全体智能体的绝对位姿与任务进度。把绝对坐标放进观测再声称"分布式执行"是典型违规，训练曲线会很好看，部署时直接失效。</p>
+    <div class="formula">
+      o<sub>i</sub> = f<sub>obs</sub>(局部传感器, 邻居相对量)，s = f<sub>state</sub>(全体位姿, 任务信息)
+      <span class="note">拆分检查：把 s 中的每一项逐条自问"执行期这台机器人真的拿得到吗"</span>
+    </div>
+
+    <h3>3. 包装器栈与叠加顺序</h3>
+    <p>环境功能以包装器（Wrapper）逐层叠加，顺序遵循"先语义、后数值"：转化包装器（字典与数组互转）在最内层，其上依次是时间限制、记录器、域随机化、观测归一化。数值类包装器放最外层的原因：归一化统计量应看到随机化后的分布，否则统计量与真实输入分布错位。此外，所有影响观测或奖励的包装器必须对称地施加于训练与评估；只在训练侧加噪声、评估侧干净，会造成训练评估分布不一致。</p>
+
+    <h3>4. 向量化采样与情节缓冲</h3>
+    <p>并行环境把采样并行度 B 与智能体数 N 组织成两条独立维度：B 个环境副本各自 reset、step，采样的张量统一为 (T, B, N, ·) 形状，T 为情节块长度。时间维放最外层有两个理由：按情节切片喂 RNN 方便；计算逆向扫描的回报与 GAE 时按时间轴反序遍历高效。RNN 隐藏状态按（副本, 智能体）二维存储，情节边界处清零，共享参数不共享记忆。</p>
+    <p>变量长度的智能体列表用零填充加掩码处理：随时可用的智能体掩码为 1，死亡或已结束的智能体掩码为 0，损失函数按掩码加权。缓冲区容量按转移条数计：经典的 5000 条回合级样本是 SMAC 系列算法的常用设置，回合级存储保证了 RNN 序列的完整性。</p>
+
+    <h3>5. 数据集成的验收清单</h3>
+    <p>环境集成完成后，用四项检查验收：同一随机种子重置两次得到完全相同的轨迹；终止与截断字段在时间上限处分别正确触发；掩码在智能体死亡后立即归零且不影响其余智能体梯度；并行副本的种子互不相同且可复现。<strong>四项检查全部通过后，才允许把环境接入正式训练循环。</strong></p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>集成流程分五步：</p>
+    <ol>
+      <li><strong>定义契约</strong>：实现 reset/step，字段按智能体为键，终止与截断分开返回。</li>
+      <li><strong>拆分观测状态</strong>：按执行期可得性分离 o<sub>i</sub> 与 s，写成文档并在代码断言中固化维度。</li>
+      <li><strong>叠加包装器</strong>：转化、时限、记录、随机化、归一化自内向外排列。</li>
+      <li><strong>向量化采样</strong>：B 个副本并行推进，输出 (T, B, N, ·) 形状的情节块与掩码。</li>
+      <li><strong>接入验收</strong>：跑种子一致性、终止截断、掩码传播、副本种子分配四项检查。</li>
+    </ol>
+    <p>与第 082 章的差异点：082 章处理训练外部的数据聚合，本章处理训练入口的数据生产；082 章的记录层从本章的评估循环中获取原始数据。</p>
+    <h3>采样参数起点</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>并行副本数 B</td><td>8</td><td>采样吞吐</td><td>与 CPU 核数和环境内存占用匹配</td></tr>
+      <tr><td>情节块长度 T</td><td>64</td><td>RNN 序列长度</td><td>长于任务的关键时间尺度，短于 BPTT 梯度消散临界</td></tr>
+      <tr><td>隐藏状态维度</td><td>64</td><td>记忆容量</td><td>SMAC 系列常用值，与观测维度同量级</td></tr>
+      <tr><td>缓冲区容量</td><td>5000 回合</td><td>off-policy 经验池</td><td>QMIX 系列默认值，兼顾相关性与内存</td></tr>
+      <tr><td>训练批量</td><td>32 回合</td><td>梯度估计</td><td>与隐藏维度 64 搭配时显存占用适中</td></tr>
+      <tr><td>评估间隔</td><td>25000 环境步</td><td>评估频率</td><td>与第 082 章分析管道一致</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：为什么在接口层就分开终止与截断？</span>
+      <p>若在环境内部把时间上限也记为终止，采样器就失去了"该处是否需要自举"的信息。补救只能在损失函数里猜，而猜测依据（步数阈值）与任务语义耦合，任务一换就失效。<strong>把语义完整地暴露在接口上，是让下游所有算法组件共享同一事实的来源。</strong></p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：轻量协作环境（并行接口）</strong></p>
+    <pre class="code"><code>import numpy as np
+
+class GridTeamEnv:
+    """双智能体网格协作：所有智能体到达各自目标格才获得团队奖励。"""
+    def __init__(self, n_agents=2, size=5, max_steps=50, seed=0):
+        self.n_agents, self.size, self.max_steps = n_agents, size, max_steps
+        self.rng = np.random.default_rng(seed)
+
+    def reset(self, seed=None):
+        if seed is not None:
+            self.rng = np.random.default_rng(seed)   # 每个并行副本用独立种子
+        self.pos = self.rng.integers(0, self.size, size=(self.n_agents, 2))
+        self.goal = self.rng.integers(0, self.size, size=(self.n_agents, 2))
+        self.t = 0
+        return self._obs(), {"step": self.t}
+
+    def step(self, actions):
+        # actions 为 {智能体: 动作} 字典；动作 0..4 对应四个方向与停留
+        move = np.array([[0, 1], [0, -1], [1, 0], [-1, 0], [0, 0]])
+        for i in range(self.n_agents):
+            self.pos[i] = np.clip(self.pos[i] + move[actions[i]], 0, self.size - 1)
+        self.t += 1
+        on_goal = np.all(self.pos == self.goal, axis=1)
+        reward = float(np.all(on_goal))          # 团队奖励：全部到位才记为 1
+        term = bool(np.all(on_goal))             # 终止：任务语义上的终点
+        trunc = self.t &gt;= self.max_steps          # 截断：时间上限，语义不同
+        obs = self._obs()
+        rewards = {i: reward for i in range(self.n_agents)}   # 共享奖励
+        terms = {i: term for i in range(self.n_agents)}
+        truncs = {i: trunc for i in range(self.n_agents)}
+        return obs, rewards, terms, truncs, {"step": self.t}
+
+    def _obs(self):
+        # 局部观测只含自身位置与目标（归一化）；全局状态由采样器另行拼接
+        flat = np.concatenate([self.pos, self.goal], axis=1) / (self.size - 1)
+        return {i: flat[i].astype(np.float32) for i in range(self.n_agents)}</code></pre>
+    <p>解读：<strong>（1）</strong>reset 接受可选种子并重建随机数生成器，保证并行副本互不相同又可独立复现；若所有副本共用同一个生成器，副本间相关性会让有效样本量打折。<strong>（2）</strong>term 由任务语义决定（全部到位），trunc 由时间上限决定，两者在接口层就分开，下游 GAE 在 trunc 处按残余价值自举、在 term 处按零自举。<strong>（3）</strong>团队奖励以字典广播到每个智能体，与值分解算法的输入约定一致；若后续要改成个体奖励，只需改这一处映射。</p>
+
+    <p><strong>片段 2：向量化情节块收集</strong></p>
+    <pre class="code"><code>import numpy as np
+
+def collect_chunk(envs, act_fn, steps=64):
+    """在 B 个并行副本上收集 T 步，张量形状约定为 (T, B, N, ·)。"""
+    b_count = len(envs)
+    obs_list = [e.reset() for e in envs]
+    n_agents = len(obs_list[0])
+    obs_dim = len(obs_list[0][0])
+    # 时间维放最外层：便于按情节切片段，也便于回报与 GAE 的逆序扫描
+    obs_buf = np.zeros((steps, b_count, n_agents, obs_dim), dtype=np.float32)
+    act_buf = np.zeros((steps, b_count, n_agents), dtype=np.int64)
+    rew_buf = np.zeros((steps, b_count, n_agents), dtype=np.float32)
+    mask = np.ones((steps, b_count, n_agents), dtype=np.float32)
+    hidden = np.zeros((b_count, n_agents, 64), dtype=np.float32)
+    for t in range(steps):
+        for b, env in enumerate(envs):
+            for i in range(n_agents):
+                obs_buf[t, b, i] = obs_list[b][i]
+                # 每个（副本, 智能体）维护独立隐藏状态：参数共享、记忆不共享
+                a, hidden[b, i] = act_fn(obs_list[b][i], hidden[b, i])
+                act_buf[t, b, i] = a
+        for b, env in enumerate(envs):
+            actions = {i: int(act_buf[t, b, i]) for i in range(n_agents)}
+            obs2, rew, term, trunc, _ = env.step(actions)
+            obs_list[b] = obs2
+            for i in range(n_agents):
+                rew_buf[t, b, i] = rew[i]
+            if all(term.values()) or all(trunc.values()):
+                obs_list[b] = env.reset()     # 副本自动重开，采样不中断
+                hidden[b] = 0.0               # 隐藏状态随情节边界清零
+                mask[t + 1:, b, :] = 0.0      # 结转之后的步在损失中被屏蔽
+    return dict(obs=obs_buf, act=act_buf, rew=rew_buf, mask=mask)</code></pre>
+    <p>解读：<strong>（1）</strong>act_fn 接口返回（动作, 新隐藏状态），把记忆管理放进策略接口，避免采样器触碰网络内部实现。<strong>（2）</strong>mask 在情节结束后清零，损失函数用它对无效步加权为零；若不屏蔽，结转后 reset 的观测会以错误奖励进入梯度。<strong>（3）</strong>每个（副本, 智能体）独立维护 hidden，参数共享只发生在网络权重层面；跨智能体共享隐藏状态会引入执行期不可得的全局信息，违反 CTDE 约束。<strong>（4）</strong>返回字典：新增字段（如动作合法性掩码）时调用方只需读取新键，接口向后兼容；返回多个位置数组则每次扩展都要改动全部调用点。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>终止与截断混用</strong>：把时间上限记为终止，价值函数在时限处按零自举，长回合任务的价值估计被系统性压低。修复：接口层分开返回，GAE 分别处理。</li>
+      <li><strong>包装器只加在训练侧</strong>：训练用归一化观测、评估用原始观测，评估曲线虚高或虚低。修复：包装器栈由训练与评估共享同一构造代码。</li>
+      <li><strong>全局状态泄露进观测</strong>：拆分时把绝对坐标或全体信息放进 o<sub>i</sub>，训练正常、部署失效。修复：用"执行期可得性"逐项审查，写成断言固化。</li>
+      <li><strong>并行副本种子重复</strong>：所有副本同一初始状态，采样多样性锐减。修复：每个副本用（基础种子 + 副本编号）派生独立种子并记录进配置文件。</li>
+      <li><strong>RNN 隐藏状态跨情节泄漏</strong>：reset 后未清零隐藏状态，上一情节的信息串入下一情节。修复：情节边界清零并检查掩码同步。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>给 GridTeamEnv 增加第三个智能体与"至少两人到达才得分"的规则，说明需要改动的接口字段与掩码逻辑。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>奖励改为按到达人数阈值判断；n_agents 与观测维度自动扩展。掩码逻辑不变，因为所有智能体共享情节边界。</div></details>
+      </li>
+      <li>把情节块长度 T 从 64 提高到 256，预测显存占用、BPTT 梯度质量与采样吞吐的变化。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>显存按 T 线性增长；梯度可能消散（长依赖未被覆盖时收益为零）；吞吐略降。验证：固定其他参数，对比 64 与 256 的 TD 损失收敛速度。</div></details>
+      </li>
+      <li>设计验收测试：用同一（基础种子, 副本编号）两次构造环境并采集 100 步，逐字段断言两次轨迹完全一致；再断言不同副本的初始状态互不相同。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>轨迹包括动作序列与奖励序列（动作由确定性函数给出，例如固定策略）。浮点比较用 np.array_equal，若用随机策略则两次采样的动作也须一致。</div></details>
+      </li>
+      <li>改造 collect_chunk：当 B 个副本中某个智能体比其余更早死亡时（个体淘汰任务），把掩码与奖励处理改为按智能体的独立情节边界。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>需要记录每个智能体的 done 标志与结转时刻，重开副本时只重置已淘汰个体。奖励应停在个体淘汰时刻，掩码从此为 0。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>并行接口契约的三个要点：终止与截断分开、字段以智能体为键、掩码由环境提供。</li>
+      <li>观测与状态按"执行期可得性"拆分；全局状态只进 critic，绝不进执行期策略输入。</li>
+      <li>包装器栈先语义后数值；影响观测奖励的包装器必须训练评估对称。</li>
+      <li>向量化采样采用 (T, B, N, ·) 形状，隐藏状态按（副本, 智能体）独立管理并在情节边界清零。</li>
+      <li>下一章走向实体系统：<strong>真机集成：从仿真到实体系统</strong>，讨论域随机化、延迟建模与安全层如何弥合仿真与现实的差距。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch082.html">← 第 082 章：训练可视化与实验分析方法</a>
+    <a class="next" href="ch084.html">第 084 章：真机集成：从仿真到实体系统 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

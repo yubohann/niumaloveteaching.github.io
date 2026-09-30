@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第008章 Ray资源管理与自动缩放 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · Ray 基础与分布式编程</span>
+    <span class="sep">/</span>
+    <span>第 008 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · Ray 基础与分布式编程</div>
+    <h1>第 008 章：Ray资源管理与自动缩放</h1>
+    <p class="lead">调度器的全部世界观就是一本资源账本：声明决定谁能被调度、策略决定落到哪里、自动缩放决定账本本身多大。读懂这三层，才能把训练集群的利用率调到可控区间。</p>
+    <ul class="meta">
+      <li>主题：Ray 核心 / 资源声明、调度策略与弹性伸缩</li>
+      <li>关键机制：逻辑资源、自定义资源、放置组（Placement Group）、自动缩放（Autoscaling）</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 007 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>建立逻辑资源（Logical Resource）模型：CPU、GPU 与自定义资源的统一账本语义，理解声明是一份调度合同。</li>
+      <li>掌握四种调度倾向：默认均衡、打散（SPREAD）、严格打散、紧凑（PACK）的适用条件与代价。</li>
+      <li>会用放置组为一组需要共存的 Actor 做原子预留，理解成组调度（Gang Scheduling）解决什么问题。</li>
+      <li>理解自动缩放（Autoscaling）的决策输入：待调度需求、资源利用率、空闲时钟；能编写最小自动缩放配置。</li>
+      <li>能诊断三类问题：未知自定义资源导致永久排队、放置组死锁、扩缩容振荡。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>上一章搭好了固定规模的集群，但训练负载是波动的：采样阶段需要大量轻量进程，训练阶段需要少量大显存进程；一次超参搜索可能同时占用几十个中等试验，也可能只跑一个巨型试验。<strong>固定规模的集群要么在高峰期排队，要么在低谷期闲置</strong>，弹性伸缩是提高利用率的直接手段。</p>
+    <p>弹性之前，先要有一套精确的需求语言。Ray 的资源模型把 CPU、GPU 与任意自定义资源统一成可声明、可记账的额度，任务与 Actor 逐条声明需求，调度器据此匹配供应。这套抽象最实用的地方在于自定义资源：不必写任何额外并发控制代码，声明一个命名的紧缺资源，就能精确限制某类任务的同时运行数。</p>
+    <p>本章按"账本 → 策略 → 弹性"三层展开，最后给出自动缩放配置的完整示例与调参依据。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 逻辑资源：从额度到合同</h3>
+    <p>Ray 的资源是调度器账本里的数值额度，与物理设备之间保持松耦合的映射关系。任务与 Actor 声明需求，运行时保证以下合同：</p>
+    <ul>
+      <li><strong>额度不超卖</strong>：一个节点上同时运行的任务声明之和不超过该节点额度。声明 1 核的任务，同时最多运行节点核数那么多个。</li>
+      <li><strong>额度可分数化</strong>：声明支持 <code>0.5</code>、<code>0.25</code> 这类分数，用于表达能力弱于整核的轻量任务，提高打包密度。</li>
+      <li><strong>未知资源视为无限稀缺</strong>：声明一个集群中不存在的自定义资源，任务永久排队而不报错，这是本章头号陷阱。</li>
+    </ul>
+    <div class="formula">
+      节点可承载任务数 ≤ 节点额度 ÷ 单任务声明
+      <span class="note">声明不足而实际占用更多（超卖）会导致同节点任务互相拖慢，吞吐低于账面预期</span>
+    </div>
+    <p>自定义资源的典型用法有两类。其一是<strong>并发上限</strong>：希望某类环境进程全局不超过 16 个，就定义 16 个单位的令牌资源，每个进程声明 1 个，调度器自动完成排队。其二是<strong>设备绑定</strong>：把异构设备（不同型号的推理加速器、不同显存档位的卡）注册为不同名称的资源，任务按型号声明，调度自然对齐。<strong>资源名就是调度器的语言，命名粒度决定了控制粒度</strong>。</p>
+
+    <h3>2. 调度倾向：均衡、打散与紧凑</h3>
+    <p>同样满足资源约束的多个节点里选哪个，由调度策略决定：</p>
+    <table>
+      <tr><th>策略</th><th>行为</th><th>适用场景</th><th>代价</th></tr>
+      <tr><td>默认（混合）</td><td>兼顾负载均衡与数据本地性</td><td>通用任务</td><td>行为不可完全预测</td></tr>
+      <tr><td>SPREAD</td><td>尽量分散到不同节点</td><td>容错要求高、单节点故障影响小</td><td>跨节点通信增多</td></tr>
+      <tr><td>紧凑 PACK</td><td>尽量塞满少量节点，空出整机</td><td>需要大块连续资源的后续任务、便于集中散热与停机</td><td>单节点故障影响面大</td></tr>
+    </table>
+    <p>选择标准由两个量决定：<strong>节点内通信与节点间通信的代价差，以及故障域的容忍度</strong>。需要频繁交换大对象的任务组倾向同节点紧凑放置；相互独立、要求高可用的任务组倾向打散。混合负载的集群可以把两类策略分别施加到对应的任务集合上。</p>
+
+    <h3>3. 放置组：一组资源的原子预留</h3>
+    <p>成组调度解决一类特定问题：一组进程必须同时启动才能工作（分布式训练的各个梯度副本彼此等待），若逐个申请资源，可能出现"一半进程拿到资源、另一半永远等不到"的部分占用僵局。放置组（Placement Group）把一组资源需求写成若干资源包（Bundle），调度器<strong>原子性地预留全部资源包后才启动组内成员</strong>。</p>
+    <ul>
+      <li><strong>PACK 策略</strong>：所有资源包落在尽量少的节点上，适合通信密集的训练组。</li>
+      <li><strong>STRICT_PACK</strong>：全部资源包必须在同一节点，适合单机多卡的训练组。</li>
+      <li><strong>STRICT_SPREAD</strong>：每个资源包落在不同节点，适合要求故障域隔离的服务组。</li>
+    </ul>
+    <p>放置组也是规模规划工具：为一个 4 副本训练组建组，每包声明例如 4 核 1 卡，调度器会自动寻找能容纳的节点组合，组内成员后续只会在预留区内被调度。</p>
+    <p>放置组还有一条生命周期规则要记住：<strong>撤销放置组会连带终止绑定其上的任务与 Actor</strong>，成员持有的状态随之丢失。撤销前应先把成员显式清理或迁移，把放置组当作"资源预留的生命周期边界"来管理。资源包尺寸的下限则要按最大节点验证：STRICT_PACK 要求每个资源包必须装进单个节点，包尺寸超过最大节点容量时预留永远不会完成，这类失败在提交时不报错，只在运行时表现为长时间等待。</p>
+
+    <h3>4. 自动缩放：账本自身的伸缩</h3>
+    <p>自动缩放器（Autoscaler）周期性观察集群状态，做出加节点或减节点决策，输入信号有三类：</p>
+    <ol>
+      <li><strong>待调度需求</strong>：存在因资源不足而排队的任务或 Actor 时，倾向扩容。</li>
+      <li><strong>空闲程度</strong>：节点利用率低于阈值且持续时间超过空闲时钟（Idle Timeout）时，倾向缩容。</li>
+      <li><strong>规模边界</strong>：最小与最大节点数构成硬约束，防止缩到不可用或扩到失控。</li>
+    </ol>
+    <p>缩容比扩容更需要谨慎：节点上可能挂着正在运行的 Actor，缩容流程会先迁走可迁移对象再下线节点；<strong>空闲时钟太短会造成"扩了又缩、缩了又扩"的振荡，太长则低谷期资源闲置</strong>。训练作业的采样循环本身有周期性波动，空闲时钟应覆盖一个完整周期的低谷，把周期波动当作噪声处理，避免每次探底都触发缩容。</p>
+
+    <h3>5. 数值算例：令牌限流与空闲时钟的账</h3>
+    <p>片段 1 的配置里藏着一笔可算的清账。16 个 env_slot 令牌、每任务声明 0.5 核时，任意时刻最多 16 个任务并发，占用 16 × 0.5 = 8 个核；若机器有 16 核，另外 8 核处于空闲。设单任务耗时 0.4 秒、共 32 个任务：</p>
+    <table>
+      <tr><th>配置</th><th>并发批数</th><th>总耗时</th><th>CPU 占用</th><th>说明</th></tr>
+      <tr><td>16 令牌 + 0.5 核</td><td>2</td><td>约 0.8 s</td><td>8 / 16 核</td><td>令牌先到顶，半数核闲置</td></tr>
+      <tr><td>8 令牌 + 0.5 核</td><td>4</td><td>约 1.6 s</td><td>4 / 16 核</td><td>限流更紧，耗时翻倍</td></tr>
+      <tr><td>16 令牌 + 1 核</td><td>2</td><td>约 0.8 s</td><td>16 / 16 核</td><td>声明匹配实际占用，核被用尽</td></tr>
+    </table>
+    <p>代入核对第一行：并发数由两侧的较小值决定，CPU 侧允许 16 ÷ 0.5 = 32 个并发，令牌侧只允许 16 个，因此并发取 16；32 个任务恰好两批，总耗时 2 × 0.4 = 0.8 秒。通用判定式为<strong>有效并发 = min(令牌上限, 核数 ÷ 单任务核声明)</strong>，取较小值的一侧必然先到顶，另一侧闲置。当令牌指标对应真实紧缺物（许可证、远端连接数）时，CPU 声明应按实际用量填写，让剩余算力承接其他任务；若把 CPU 声明虚报为 1 核，核会比令牌更早占满，吞吐反而受限。</p>
+    <p>空闲时钟的取值同样可以量化。设负载呈 5 分钟采样、5 分钟训练的周期，节点从请求到就绪约 3 分钟（容器拉起、注册、环境初始化）。空闲时钟取 2 分钟时，每个低谷期采样节点被回收，下个高峰期重新申请：峰值起点约 3 分钟内只有基载算力，按周期折算的峰值迟滞占比约 30%；每个周期还多出 6 个节点 × 3 分钟 × 2 次（回收与重建）约 36 节点分钟的开销。把时钟提到 10 分钟以上，节点跨过整个低谷保留，重建开销归零，代价是低谷期 6 个节点的闲置成本。两个方案落到一个比较式上：<strong>闲置成本 = 节点数 × 低谷时长；振荡成本 = 重建节点数 × 重建时长 × 2 + 峰值迟滞损失</strong>，两侧各算一遍即可给空闲时钟定值。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>为训练作业设计资源方案的步骤：</p>
+    <ol>
+      <li><strong>给角色分档</strong>：列出作业中的进程角色（采样、训练、评估、数据加载），逐个给出单实例的资源声明。</li>
+      <li><strong>估算并发</strong>：按目标吞吐反推每类角色的并发数，乘以单实例声明得到各角色总额度。</li>
+      <li><strong>确定缩放边界</strong>：最小节点数覆盖基载，最大节点数按峰值额度加一档余量。</li>
+      <li><strong>选择策略</strong>：训练组用紧凑或放置组，采样组用默认或打散，评估组要求稳定用打散。</li>
+      <li><strong>配置空闲容忍</strong>：依据采样与训练的交替周期设置空闲时钟，避免抖动。</li>
+      <li><strong>上线观测</strong>：记录需求队列长度与利用率曲线，用实测数据修正声明值。</li>
+    </ol>
+    <table>
+      <tr><th>参数</th><th>典型取值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>单采样进程声明</td><td>0.5–1 核</td><td>采样并发控制</td><td>按采样吞吐目标反推并发数</td></tr>
+      <tr><td>单训练进程声明</td><td>2–8 核 + 1 卡</td><td>梯度计算绑定</td><td>模型规模与批大小决定显存档位</td></tr>
+      <tr><td>min_workers / max_workers</td><td>基载 / 峰值</td><td>缩放硬边界</td><td>峰值额度加一档余量作为上限</td></tr>
+      <tr><td>空闲时钟</td><td>覆盖一个低谷周期</td><td>缩容灵敏度</td><td>采样训练交替周期的最长空档</td></tr>
+    </table>
+    <div class="box tip">
+      <span class="box-title">与上一章的差异点</span>
+      <p>第 007 章解决"节点怎么连起来"，本章解决"任务怎么分进去、集群怎么自己长大"。自动缩放的扩展基础是第 007 章的注册流程：新节点加入走同一条注册路径，对上层任务透明。</p>
+    </div>
+    <p>声明值的校准有一条固定流程：先按经验值上线，采集每个角色的实际占用（CPU 时间、常驻内存、显存峰值），把 P95 占用量向上取整到可声明的档位（0.25 的倍数）作为新声明。校准窗口放在作业稳定运行之后，避开启动阶段的瞬时峰值；跨异构节点时逐类节点分别校准，统一声明会向最慢节点妥协或对最快节点虚报。还有一条语义要记牢：<strong>声明是任务向调度器索取的额度上限</strong>，机器核数多于声明时富余部分供其他任务使用，声明超过单节点物理容量时多出的部分无人能提供，任务永久排队。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>以下片段采用 Ray 2.x 时期的通用写法；接口随版本演进，以对应版本官方文档为准。</p>
+    <p><strong>片段 1：用自定义资源做并发限流</strong></p>
+    <pre class="code"><code>import ray
+
+# 关键点：把"并发上限"注册成一种命名资源，用声明替代手工控制
+# 启动集群时通过参数注册，例如每节点 4 个 env_slot，4 节点合计 16 个令牌
+ray.init(num_cpus=16, resources={"env_slot": 16})
+
+@ray.remote(num_cpus=0.5, resources={"env_slot": 1})
+class Environment:
+    def step(self, n):
+        return n + 1                       # 占位：轻量环境推进一步
+
+envs = [Environment.remote() for _ in range(32)]   # 32 个请求，16 个令牌
+# 提交 32 个推进任务：同一时刻最多 16 个环境进程在跑，其余排队
+refs = [envs[i].step.remote(i) for i in range(32)]
+print(len(ray.get(refs)), "个任务完成，并发受 env_slot 约束")</code></pre>
+    <p>解读：这段代码演示"资源即策略"的思想。<code>env_slot</code> 是集群账本里的一种自定义额度，16 个令牌构成全局并发上限，调度器负责排队与唤醒，应用层不写任何计数或信号量逻辑。<strong>额度写在集群启动参数里，可以被多个作业共享协商</strong>，这是相比进程内限流工具的关键优势：限流范围与集群边界一致。注意 CPU 声明与自定义资源声明相互独立，<code>0.5</code> 核的声明用于打包密度，令牌用于并发语义，两者各管一段。</p>
+
+    <p><strong>片段 2：放置组为一组训练进程做原子预留</strong></p>
+    <pre class="code"><code>import ray
+from ray.util.placement_group import placement_group
+from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+
+ray.init(address="auto")
+
+# 4 个资源包，每包 4 核 1 卡：要么整体就绪，要么整体等待
+pg = placement_group([{"CPU": 4, "GPU": 1} for _ in range(4)], strategy="PACK")
+ray.get(pg.ready())                       # 阻塞直到全部资源包预留完成
+
+@ray.remote(num_cpus=4, num_gpus=1)
+class Trainer:
+    def train(self, round_id):
+        return round_id                    # 占位：一轮梯度更新
+
+# 组内成员用放置组策略绑定到各自的资源包（bundle_index 逐包分配）
+trainers = [
+    Trainer.options(
+        scheduling_strategy=PlacementGroupSchedulingStrategy(
+            placement_group=pg, placement_group_bundle_index=i)
+    ).remote() for i in range(4)
+]
+print(ray.get([t.train.remote(r) for r, t in enumerate(trainers)]))</code></pre>
+    <p>解读：放置组先于成员创建，<code>pg.ready()</code> 等到 4 个资源包全部到位，避免"先启动的进程空等后启动的进程"。<code>bundle_index</code> 把每个训练进程钉在指定资源包上，是分配设备序号的可靠方式；省略它则由调度器在组内自选，适合成员不多、对位置无要求的场景。<strong>PACK 策略让 4 个包尽量集中在少量节点上</strong>，梯度同步走节点内网络，这是通信密集训练组的常规选择。若作业要求故障域隔离，把策略改为 STRICT_SPREAD 即可，代价是跨节点通信增多。</p>
+
+    <p><strong>片段 3：自动缩放的集群配置与程序化请求</strong></p>
+    <pre class="code"><code># 集群配置文件（片段，供自动缩放器读取）
+cluster_name: rl-training
+max_workers: 8                 # 上限：峰值额度加一档余量，防止失控
+available_node_types:
+  worker:
+    min_workers: 2             # 基载：采样常驻负载的最小规模
+    max_workers: 8
+    idle_timeout_minutes: 10   # 空闲时钟：覆盖采样与训练的交替低谷
+    resources: {"CPU": 16, "GPU": 8}
+upscaling_speed: 2.0           # 每个周期最多新增的节点比例
+
+# 程序化扩缩：作业已知未来负载时，可直接向缩放器提出资源请求
+import ray
+from ray.autoscaler.sdk import request_resources
+
+ray.init(address="auto")
+request_resources(num_cpus=64)   # 声明"还需要 64 核"，缩放器据此决定加节点
+print(ray.cluster_resources()["CPU"], "核额度（随缩放变化）")</code></pre>
+    <p>解读：配置里每个数值都有对应信号来源。<code>min_workers</code> 与 <code>max_workers</code> 是硬边界，调度器不会越界；<code>idle_timeout_minutes</code> 为 10 分钟，含义是节点空闲持续十分钟才考虑下线，足以跨过常见的采样与评估交替低谷；<code>upscaling_speed</code> 限制单周期扩容速度，防止一次请求打满供应侧。<strong>程序化请求适用于作业能预判负载曲线的场景</strong>：比如已知即将进入大规模采样阶段，提前请求容量比被动等待排队更平滑。请求只是建议，最终决策仍由缩放器按边界与状态做出。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>声明了不存在的自定义资源</strong>：任务排队但没有任何报错，调度器视角里它永远缺一种额度。症状是任务长期处于待调度状态而节点看似空闲。修复：核对资源名拼写与注册位置，用集群资源视图逐个比对。</li>
+      <li><strong>资源声明不足造成超卖</strong>：进程实际占用 2 核但只声明 1 核，同节点塞进双倍任务，互相拖慢。症状是吞吐低于账面核数预期且耗时方差增大。修复：用实测占用校准声明，为峰值留出余量。</li>
+      <li><strong>放置组资源包超过单节点容量</strong>：要求 STRICT_PACK 但单包需求大于任何节点，预留永不完成。修复：调整包尺寸或改用 PACK；创建前先用资源视图验证可行性。</li>
+      <li><strong>扩缩容振荡</strong>：空闲时钟过短，节点在低谷被回收、下一周期又需要重建，循环往复。症状是节点数与需求曲线高频交替。修复：把空闲时钟拉长到覆盖完整低谷周期，并把缩容灵敏度与负载周期对齐。</li>
+      <li><strong>假设缩放立刻生效</strong>：发出请求后立即按新容量提交任务，新节点尚在注册途中，任务先经历一段排队。修复：把扩容视为异步过程，用节点视图确认到位后再提交重负载，或依赖调度器的自然排队吸收过渡期。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把片段 1 的 <code>env_slot</code> 从 16 降到 8，预测 32 个任务的完成时间变化，运行验证并解释排队行为的形态。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>并发减半后总时间约翻倍，任务分批进入执行；排队期间核数利用率下降是否明显，取决于单任务的计算占比。</div></details>
+      </li>
+      <li>预测题：片段 2 中把策略从 PACK 改为 STRICT_SPREAD，4 个资源包在 2 节点集群上的可行性与失败行为分别是什么？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>需要 4 个不同节点，2 节点集群无法满足，预留永不完成。教训：放置组策略与集群规模必须在设计时一起验证。</div></details>
+      </li>
+      <li>设计题：为一个"16 个采样进程加 2 个训练进程"的作业设计完整资源方案：自定义资源、放置组、缩放边界与空闲时钟，给出全部数值与依据。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>采样进程声明 0.5 核加 1 个自定义令牌限制总量；训练组用 2 包放置组；缩放边界按采样峰值定上限；空闲时钟覆盖采样训练交替周期。</div></details>
+      </li>
+      <li>分析：某集群配置空闲时钟 2 分钟，负载呈 5 分钟采样、5 分钟训练的周期。预测节点数曲线的形态，给出两种修复配置并比较取舍。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>低谷持续 5 分钟超过时钟，节点被回收；下一周期又要重建，形成锯齿。修复：把时钟提高到 6–10 分钟，或把最小节点数提高到覆盖低谷基载。</div></details>
+      </li>
+      <li>推导：设作业额度需求随时间波动为 R(t)，节点容量为 C，空闲时钟为 T。写出稳态下节点数的近似表达式，并讨论 T 趋近于零与趋近于无穷两种极端的利用率与稳定性表现。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>节点数近似为 R(t) 在滑窗 T 内的上包络除以 C。T 趋零则紧跟峰值但振荡频繁；T 趋无穷则节点数恒为历史峰值，利用率走低但零抖动。设计目标是让 T 略大于主要波动周期。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>资源是调度器的逻辑账本：声明即合同，不超卖、可分数、未知资源永久排队。</li>
+      <li>自定义资源把并发控制变成声明式配置；资源命名粒度即调度控制粒度。</li>
+      <li>调度倾向按"通信代价与故障域"选择：紧凑利于通信，打散利于隔离；放置组解决成组资源的原子预留与部分占用僵局。</li>
+      <li>自动缩放由待调度需求、利用率与空闲时钟共同驱动；<strong>空闲时钟要覆盖负载低谷周期，避免振荡</strong>。</li>
+      <li>下一章处理弹性系统的必修课：<strong>故障恢复与容错</strong>，看节点失效时任务、对象与 Actor 各自如何应对。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch007.html">← 第 007 章：Ray集群配置与启动</a>
+    <a class="next" href="ch009.html">第 009 章：Ray故障恢复与容错 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

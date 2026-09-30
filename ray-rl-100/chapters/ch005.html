@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第005章 Ray Actor池与并发控制 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · Ray 基础与分布式编程</span>
+    <span class="sep">/</span>
+    <span>第 005 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · Ray 基础与分布式编程</div>
+    <h1>第 005 章：Ray Actor池与并发控制</h1>
+    <p class="lead">单 Actor 的串行队列是吞吐天花板，Actor 池把有状态服务横向摊开，再用分发策略与在途窗口控制住并发水位，这正是 RLlib 采样器组（EnvRunner Group）的原型。</p>
+    <ul class="meta">
+      <li>主题：Ray 核心 / 有状态服务的并行化</li>
+      <li>关键机制：池化分片、按完成顺序取回、在途窗口、线程池并发</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 004 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解 Actor 池要解决的问题：单 Actor 队列的吞吐上限与方差放大，池化后如何横向扩展。</li>
+      <li>掌握两种分发策略：静态分片与动态派发各自的适用条件与代价。</li>
+      <li>会使用 ray.util.ActorPool 完成提交与按完成顺序取回，并解释它内部的"待取回队列"结构。</li>
+      <li>能为池配置合适的规模：池大小、每 Actor 资源声明、在途任务上限三者的关系。</li>
+      <li>理解 max_concurrency 大于 1 时的线程池语义，能判断哪些状态访问需要额外保护。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 002 章已经确认：需要累积状态的组件必须放进 Actor，而 Actor 的方法默认串行。一个环境副本推进一步的耗时为毫秒级，一个训练步需要成千上万步样本，单副本的吞吐与整体需求相差几个数量级。<strong>解决办法是把状态分片到多个同类 Actor，把原本的单队列负载摊成 N 条并行队列</strong>，这正是 Actor 池模式。</p>
+    <p>池化之后引入两个新问题：任务怎么分发，结果怎么回收。分发太偏会让个别 Actor 积压成瓶颈；回收无序则让调用方难以配对结果与任务。RLlib 的环境采样组、Tune 的并行试验执行、Serve 的多副本部署都使用同一套池化加分发的组合技，先把这套机制在本章讲透，后面看到相关架构就不会陌生。</p>
+    <p>本章依次处理三个层次：池的结构（有哪些 Actor）、分发策略（任务给谁）、并发水位（同时在途多少），最后落到线程池并发这一进阶选项。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 池化的收益与代价</h3>
+    <p>设单 Actor 处理一个任务的耗时为 T，池中有 N 个 Actor，理想情况下吞吐从 1/T 提升到 N/T。这个理想成立的前提有三条：</p>
+    <ul>
+      <li><strong>状态可分片</strong>：每个分片独立维护自己的状态，分片之间无需协商。环境副本、分片缓冲天然满足；全局计数器不满足。</li>
+      <li><strong>资源够用</strong>：N 个 Actor 的常驻资源声明之和不超过集群容量。Actor 创建即占资源，池规模受物理上限约束。</li>
+      <li><strong>负载足够均匀</strong>：若任务耗时方差大，固定分片的池会被慢分片拖住，没有空闲 Actor 接走积压。</li>
+    </ul>
+    <p>池化的代价是管理复杂度：创建、分发、回收、故障处理都需要显式逻辑。当任务是纯计算且无状态时，直接用远程函数配合调度器即可获得并行，无需池。<strong>池是"有状态服务并行化"的专门工具</strong>。</p>
+    <p>分片边界的判定可以借助一条检查：状态更新是否要求对全部分片可见。全局限量（如全局步数计数器）与依赖全体统计量的运算（如批次级优势标准化）不能按分片独立维护，处理方式是把它们从数据面抽离成一个协调 Actor：分片各自产出局部量，协调 Actor 串行合并全局量。协调 Actor 的队列压力远小于数据面，因为它只承载统计量，原始样本仍留在数据面，这与第 002 章聚合点的设计一脉相承。</p>
+
+    <h3>2. 分发策略：静态分片与动态派发</h3>
+    <table>
+      <tr><th>策略</th><th>规则</th><th>优点</th><th>代价</th></tr>
+      <tr><td>静态分片</td><td>任务 i 固定发给 Actor（i mod N）</td><td>无状态分发、可预测、结果与分片一一对应</td><td>分片耗时方差直接转化为等待</td></tr>
+      <tr><td>动态派发</td><td>谁空闲发给谁（按完成顺序再投喂）</td><td>自动吸收方差，尾延迟平滑</td><td>结果到达顺序不定，需要配对逻辑</td></tr>
+    </table>
+    <p><strong>选择标准是"任务是否要求归属同一状态"</strong>：采样推进必须回到同一个环境副本，天然适合静态分片或"按分片再投喂"的混合模式；无归属的推理请求、预处理任务适合动态派发。实践中常用折中：以分片为最小调度单位，分片内部再按完成顺序投喂下一批任务。</p>
+
+    <h3>3. 在途窗口：并发水位的显式控制</h3>
+    <p>池的提交接口本身不阻塞，程序可以在循环里瞬间投出成千上万个任务。若不加控制，将出现两类问题：对象存储中未消费的结果堆积，内存水位失控；调度队列积压导致最慢任务拖长整个批次的完成时间。控制的抓手是<strong>在途任务上限（In-flight Window）</strong>：</p>
+    <div class="formula">
+      在途任务数 ≤ 池大小 × 每 Actor 并发度
+      <span class="note">窗口太小则 CPU 出现空洞，窗口太大则队列积压与内存膨胀；稳态下窗口取池大小的 1–2 倍</span>
+    </div>
+    <p>典型的窗口循环是"提交一批、按完成顺序取回一个、立即补投一个"。取回使用完成顺序，保证谁先空出来谁先接活，提交顺序在此只作参考，这正是 ray.util.ActorPool 内部维护的待取回队列（含已完成与未完成引用）所做的事。</p>
+    <table>
+      <tr><th>在途窗口取值</th><th>每 Actor 平均在途任务</th><th>预期表现</th></tr>
+      <tr><td>小于池大小 N</td><td>不足 1</td><td>Actor 有空转，吞吐随窗口线性爬升</td></tr>
+      <tr><td>等于 N</td><td>1</td><td>无排队缓冲，一次取回的空档直接表现为短暂空转</td></tr>
+      <tr><td>1–2 倍 N</td><td>1–2</td><td>稳态推荐区间：覆盖补投空档，内存占用可预测</td></tr>
+      <tr><td>远大于 N</td><td>远超 2</td><td>队列积压，尾延迟与结果对象驻留量同步膨胀</td></tr>
+    </table>
+    <p>窗口等于 N 加一个缓冲量 Δ 时，Δ 的作用是覆盖"取回结果、补投下一任务"之间的时间缝隙；Δ 超过 N 之后，吸收方差的能力不再提升，队列长度却随 Δ 线性增长，存储占用约等于 Δ 乘以单结果对象尺寸。这段推理给出窗口调参的收敛路径：先把窗口设为 2N，若监控显示队列在途数长期贴近上限，说明下游消费慢于上游生产，此时应先解决消费端，继续放大窗口无助于吞吐。</p>
+
+    <h3>4. 线程池并发：max_concurrency 的两种形态</h3>
+    <p>Actor 的并发度可以调高，行为随方法类型分岔：</p>
+    <ul>
+      <li><strong>同步方法加线程池</strong>：声明 <code>max_concurrency=N</code> 后，普通同步方法在 N 个线程的池中执行，N 个调用可真正并行。代价是实例变量可能被并发访问，需要自行加锁保护。</li>
+      <li><strong>异步方法加事件循环</strong>：方法为异步函数时由事件循环调度，适合等待输入输出的场景（第 006 章展开）。</li>
+    </ul>
+    <p>线程池提升吞吐的前提是方法内部能真正并行：等待外部服务的调用会释放线程去做别的活；纯计算因全局解释器锁（Global Interpreter Lock, GIL）的存在收益有限，计算型负载更应通过增加池中 Actor 数量来扩展（多进程并行）。<strong>并发（Concurrency）解决"等待时的空闲"，并行（Parallelism）解决"计算量的摊分"，两者手段不同</strong>。</p>
+    <table>
+      <tr><th>扩容手段</th><th>生效场景</th><th>理论上限</th><th>状态安全</th><th>资源成本</th></tr>
+      <tr><td>增加 Actor 副本（分片）</td><td>计算密集型</td><td>受可用核数约束</td><td>分片内串行，天然免锁</td><td>每副本常驻核数与内存</td></tr>
+      <tr><td>max_concurrency 线程池</td><td>等待型（远端调用、文件输入输出）</td><td>并发度参数的取值</td><td>需显式加锁</td><td>单进程内多线程，内存开销小</td></tr>
+      <tr><td>异步事件循环</td><td>高并发等待</td><td>受事件循环吞吐约束</td><td>需协程安全设计</td><td>最低</td></tr>
+    </table>
+    <p>选择顺序可以固定：负载属于等待型时先试线程池或事件循环，用较小资源换取重叠；计算型直接加副本，让多进程真正平分算力；两类负载混合时，把等待部分与计算部分拆到不同组件，分别扩容。</p>
+
+    <h3>5. 数值算例：方差、批投喂与窗口化的效率差</h3>
+    <p>设 4 个 Actor 处理 32 个任务，其中 24 个快任务耗时 0.2 秒，8 个慢任务耗时 0.6 秒（慢任务占四分之一，模拟长回合环境）。总工作量为 24 × 0.2 + 8 × 0.6 = 9.6 秒，4 路理想均衡下最短完成时间为 9.6 ÷ 4 = 2.4 秒。不同调度方式的完成时间与效率如下：</p>
+    <table>
+      <tr><th>调度方式</th><th>完成时间</th><th>相对理想效率</th><th>说明</th></tr>
+      <tr><td>单 Actor 串行</td><td>9.6 s</td><td>25%</td><td>无并行能力，仅作基线</td></tr>
+      <tr><td>静态分片，每批恰含慢任务（最坏排布）</td><td>4.8 s</td><td>50%</td><td>8 批各 0.6 秒，快 Actor 空转等待慢 Actor</td></tr>
+      <tr><td>单批投喂（每批 4 个任务）</td><td>约 3.79 s</td><td>63%</td><td>每批时间取批内最大值，按慢任务出现概率求期望</td></tr>
+      <tr><td>窗口化动态派发（在途 8）</td><td>2.6–3.0 s</td><td>80–92%</td><td>慢 Actor 继续接任务，空闲 Actor 被快任务填满</td></tr>
+    </table>
+    <p>期望值算法：每批 4 个任务中不含慢任务的概率为 0.75<sup>4</sup> ≈ 0.3164，此时批耗时 0.2 秒；含至少一个慢任务时批耗时 0.6 秒，该情形概率为 0.6836。单批期望耗时为 0.2 × 0.3164 + 0.6 × 0.6836 ≈ 0.473 秒，8 批合计约 3.79 秒。窗口化派发的完成时间有理论上界：<strong>总工作量 ÷ Actor 数 + 最长单任务 = 9.6 ÷ 4 + 0.6 = 3.0 秒</strong>，这是列表调度的经典界；实测通常在 2.6 秒附近，因为慢 Actor 完成后会连续吸收更多快任务。这张表把池化的收益来源拆开了：并行度贡献了接近 4 倍的提升，动态派发再把方差造成的二十余个百分点捡回来，静态分片则把方差完整保留在等待里。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>从单 Actor 服务到 Actor 池的演进步骤：</p>
+    <ol>
+      <li><strong>确认状态可分片</strong>：检查状态中是否存在必须全局一致的部分。全局部分可抽成独立的协调 Actor，数据面则池化。</li>
+      <li><strong>定池大小</strong>：先按"目标吞吐 ÷ 单 Actor 吞吐"估算，再受集群核数上限约束；Actor 声明核数不要超过 1（除非单任务真的需要多核）。</li>
+      <li><strong>选分发策略</strong>：有归属要求选分片制，无归属选动态派发；混合场景按分片为调度单位加批内再投喂。</li>
+      <li><strong>接入取回循环</strong>：用完成顺序取回构建窗口，稳定在途任务数；对结果做配对与去重设计。</li>
+      <li><strong>处理故障与退出</strong>：为 Actor 配置重启策略（第 009 章），池管理逻辑要能跳过已失效的分片；退出前统一清理池资源。</li>
+    </ol>
+    <p>两笔容易被低估的成本要在定池大小之前算清。<strong>创建成本</strong>：每个 Actor 都要拉起独立工作进程、导入模块、初始化环境与模型，池越大启动阶段越长；工程做法是在训练循环开始前提前创建并预热（用一次轻量空跑调用触发所有副本完成初始化），并把初始化排除在计时口径之外。<strong>内存成本</strong>：每个副本持有独立的环境与模型副本，64 个各占 100 MB 的环境实例即 6.4 GB 常驻内存，池规模最先撞上的常常是内存墙，核数墙排在后面。</p>
+    <table>
+      <tr><th>参数</th><th>典型取值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>pool_size</td><td>4–64</td><td>池中 Actor 数量</td><td>目标吞吐除以单 Actor 吞吐，再核资源上限</td></tr>
+      <tr><td>在途窗口</td><td>1–2 × pool_size</td><td>并发水位</td><td>按结果对象尺寸与存储预算校准</td></tr>
+      <tr><td>max_concurrency</td><td>1 / 4–16</td><td>单 Actor 并发度</td><td>等待型负载调高，计算型保持 1 并加池</td></tr>
+    </table>
+    <div class="box tip">
+      <span class="box-title">与上一章的差异点</span>
+      <p>第 004 章的依赖图描述任务之间的关系，可完全由调度器管理；本章的池把调度权收回到应用层（分发策略由程序决定），换取对分片归属与并发水位的精确控制。两者的取舍是"交给调度器自动化"与"自己握住方向盘"。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>以下片段采用 Ray 2.x 时期的通用写法；接口随版本演进，以对应版本官方文档为准。</p>
+    <p><strong>片段 1：ray.util.ActorPool 的标准用法</strong></p>
+    <pre class="code"><code>import ray
+from ray.util import ActorPool
+
+ray.init(num_cpus=8)
+
+@ray.remote
+class EnvWorker:
+    def __init__(self, seed):
+        self.rng = seed
+
+    def rollout(self, n_steps):
+        self.rng = (self.rng * 1103515245 + 12345) % 2**31   # 分片内状态递推
+        return n_steps, self.rng
+
+workers = [EnvWorker.remote(seed=i) for i in range(4)]   # 4 个常驻环境副本
+pool = ActorPool(workers)                                # 池接管分发与回收
+
+tasks = [(i % 4, 2000) for i in range(24)]               # 模拟 24 个采样任务
+pool.map(lambda w, t: w.rollout.remote(t[1]), tasks)     # 内部做窗口化动态派发
+print("全部任务完成")                                     # map 阻塞直到全部返回</code></pre>
+    <p>解读：<code>ActorPool</code> 把"选一个空闲 Actor、提交、按完成顺序取回、补投"这套循环封装成 map 接口。<strong>它维护的待取回队列同时容纳已完成与未完成引用，因此总能挑选最早空闲的 Actor</strong>，天然吸收各副本耗时差异。注意池只管分发，不管语义：任务与分片的对应关系由调用方在任务参数里决定。生产代码中常用逐任务提交加 <code>get_next</code> 的形态替代一次性 map，以便在循环中插入进度记录与检查点逻辑。</p>
+    <p>接口清单值得完整过一遍：<code>submit</code> 投出一个任务；<code>get_next</code> 按完成顺序取回一个结果，池空时抛停止迭代信号；<code>map</code> 是"全部提交、逐个取回"的封装，返回顺序按完成先后；<code>map_unordered</code> 直接给出完成顺序的结果迭代器；<code>has_next</code> 判断是否还有在途任务。窗口循环的标准写法是 submit 与 get_next 配对：提交到上限后，每取回一个就补投一个。<code>map</code> 适合任务总数已知且结果顺序无关的场景；顺序敏感的场景要在任务返回值里携带序号，用标识配对；完成顺序不定时，按位置配对必然错位。</p>
+
+    <p><strong>片段 2：显式窗口，把并发水位握在手里</strong></p>
+    <pre class="code"><code>import ray
+import time
+
+ray.init(num_cpus=8)
+
+@ray.remote
+class Worker:
+    def process(self, job_id, cost):
+        time.sleep(cost)                 # 模拟耗时方差：0.05 至 0.35 秒
+        return job_id
+
+workers = [Worker.remote() for _ in range(4)]
+window_limit = 8                          # 在途上限 = 池大小 × 2
+windows = {}                              # 引用 -> 池行为记录
+
+def flush_one():
+    ready, _ = ray.wait(list(windows), num_returns=1)   # 谁先完成取谁
+    ref = ready[0]
+    result = ray.get(ref)
+    del windows[ref]
+    return result
+
+for job in range(32):
+    if len(windows) >= window_limit:      # 窗口满：先消费一个再继续提交
+        flush_one()
+    worker = workers[job % len(workers)]  # 混合策略：分片归属由参数决定
+    ref = worker.process.remote(job, 0.05 + 0.1 * (job % 4))
+    windows[ref] = job
+
+while windows:                            # 排空剩余任务
+    flush_one()
+print("窗口峰值受控，任务全部回收")</code></pre>
+    <p>解读：这份手写实现把 ActorPool 的内部逻辑展开展示。<strong>窗口判定放在提交之前，保证任意时刻在途对象数量有上界</strong>，内存水位与队列长度都可预测。<code>ray.wait</code> 按完成顺序返回，确保先空出的 Actor 在下一轮优先拿到新任务。任务参数中的 <code>job % len(workers)</code> 只是分发示意；若业务要求同一分片的状态连续性，应把该映射替换为按分片键取模确定槽位。排空阶段的循环同样重要，遗漏会让最后一批结果无人回收。</p>
+
+    <p><strong>片段 3：max_concurrency 的线程池语义与安全边界</strong></p>
+    <pre class="code"><code>import ray
+import time
+
+ray.init(num_cpus=8)
+
+@ray.remote(max_concurrency=4)            # 同步方法走 4 线程池：方法可真正并发
+class SlowService:
+    def __init__(self):
+        self.calls = 0
+        self.lock = __import__("threading").Lock()   # 共享计数需加锁保护
+
+    def query(self, q):
+        time.sleep(0.2)                   # 模拟等待型负载：线程在此让出
+        with self.lock:                   # 临界区最小化：只包住状态更新
+            self.calls += 1
+            n = self.calls
+        return q, n
+
+svc = SlowService.remote()
+t0 = time.perf_counter()
+ray.get([svc.query.remote(i) for i in range(8)])   # 8 次调用摊到 4 线程约两轮
+print("耗时 %.2f s" % (time.perf_counter() - t0))</code></pre>
+    <p>解读：默认 max_concurrency 为 1 时，8 次查询需要 1.6 秒；调高到 4 后大致降到两轮调用的量级。<strong>加速的来源是等待期间线程切换，不是计算变快</strong>，所以这套配置适合输入输出型服务，纯计算负载应改用 4 个独立 Actor 并行。<code>self.calls</code> 的写法展示了并发的风险面：方法一旦并发，实例变量就没有免费的互斥，哪怕只是一行自增也要进临界区。RLlib 中大量服务型组件默认串行，只有当分析确认瓶颈在等待时才会开启并发。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>池大小超过资源容量</strong>：8 核机器创建 16 个各声明 1 核的 Actor，一半 Actor 的构造会排队等待，池初始化阶段出现长时间停顿。修复：池大小乘以单 Actor 核数不超过可用核数。</li>
+      <li><strong>空闲 Actor 长期占用资源</strong>：训练进入评估阶段后采样池仍常驻，资源无法让给训练。修复：按阶段创建与销毁池，或使用资源声明更小的 Actor 形态。</li>
+      <li><strong>无窗口提交导致内存与队列双膨胀</strong>：循环里无脑提交数万任务，结果对象堆满对象存储。修复：引入在途上限，消费一个补投一个。</li>
+      <li><strong>max_concurrency 开启后忘记保护状态</strong>：方法内对共享变量做读改写，出现丢更新与竞态。症状是统计值偶发偏小。修复：临界区加锁，或将共享部分收敛到独立串行 Actor。</li>
+      <li><strong>按提交顺序配对结果</strong>：动态派发下完成顺序与提交顺序不一致，按序配对会张冠李戴。修复：让任务返回值携带身份标识（如分片键、任务编号），配对以标识为准。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把片段 1 的池大小从 4 改为 8、16，预测 24 个耗时 0.2 秒任务的完成时间变化，解释拐点出现的位置。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>8 核机器上池大小为 4 时仍有空闲核，扩到 8 收益线性；超过 8 后 Actor 创建排队，收益消失。拐点在核数处。</div></details>
+      </li>
+      <li>修改片段 2 的窗口上限为 1、8、32，记录吞吐变化，说明窗口与池大小的合理比例关系。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>窗口为 1 时退化为串行提交，并发度不足；窗口远大于池大小时队列积压但不提升吞吐。稳态最佳在池大小的一到两倍。</div></details>
+      </li>
+      <li>设计题：把"多个环境副本采样、单一回放缓冲聚合"的结构画成池加协调 Actor 的形态，给出池的分发策略、窗口上限与缓冲的写入批量化方案。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>环境副本池按分片归属静态分配，窗口取池大小两倍；回放缓冲作为协调 Actor 接收批量写入（每次方法承载一批样本），摊薄单样本的队列开销。</div></details>
+      </li>
+      <li>分析：某推理服务单次查询耗时 300 毫秒，其中 280 毫秒在等待远端模型服务器。分别给出"加 Actor 副本"与"提高 max_concurrency"两种方案的预期收益上限，并说明如何选择。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>等待占比极高时，两者理论收益都接近等待时长被重叠；线程方案省内存但与远端服务的连接数共享资源，副本方案隔离性更好。若远端连接是瓶颈，选副本。</div></details>
+      </li>
+      <li>推导：设池有 N 个 Actor，任务耗时服从均值 μ、标准差 σ 的分布，一次投喂 N 个任务形成一批。写出批完成时间的一阶近似，解释为什么"小批量多批投喂"比"大批量单批投喂"的到达率更平稳。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>批完成时间近似 μ + σ·c(N)，最大次序统计量随批量增大上移。小批量下每批的极端值更温和，多批叠加后整体到达曲线更平滑。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>Actor 池解决有状态服务的水平扩展：状态可分片、资源够用、负载方差可控是三个前提。</li>
+      <li>分发策略二选一：有归属要求用静态分片，无归属用动态派发；按完成顺序取回是平滑尾延迟的关键。</li>
+      <li><strong>在途窗口是在并发与内存之间的旋钮</strong>，稳态取值约为池大小的一到两倍。</li>
+      <li>max_concurrency 提升的是等待型负载的并发，纯计算负载应通过增加池中 Actor 数量获得多进程并行。</li>
+      <li>下一章进入等待的另一半故事：<strong>异步任务与 Future</strong>，把事件循环与对象引用结合起来消除阻塞。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch004.html">← 第 004 章：Ray任务依赖与DAG调度</a>
+    <a class="next" href="ch006.html">第 006 章：Ray异步任务与Future →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

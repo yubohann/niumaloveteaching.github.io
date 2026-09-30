@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第022章 共享内存与零拷贝传输 | 多机器人协同学习课程 · ROS2 通信与系统集成</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 数据分发与协同感知</span>
+    <span class="sep">/</span>
+    <span>第 022 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 数据分发与协同感知</div>
+    <h1>第 022 章：共享内存与零拷贝传输</h1>
+    <p class="lead">同一台主机上跑着相机、检测、SLAM 三个节点时，大消息为什么"绕了半个网络又回来"？本章讲清拷贝成本的来龙去脉，以及共享内存与进程内通信如何把同机数据流变成"只传指针"。</p>
+    <ul class="meta">
+      <li>主题：通信基础 / 零拷贝与传输优化</li>
+      <li>关键机制：DDS 共享内存、iceoryx、Data-Sharing、进程内通信</li>
+      <li>预计学时：50 分钟</li>
+      <li>前置章节：第 021 章（多机器人状态同步）</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解一次"发布"在中间件里要经历几次内存拷贝，以及为什么大消息时拷贝会成为 CPU 与内存带宽的瓶颈。</li>
+      <li>掌握共享内存（Shared Memory, SHM）零拷贝的机制：环形缓冲、内存段映射、以及同机/跨机的边界条件。</li>
+      <li>会切 RMW 与配置共享内存（CycloneDDS / Fast DDS），知道 rclpy 下零拷贝收益与 C++ 的差别。</li>
+      <li>能用正确的方法验证"真的走了共享内存"（延迟、CPU、<code>/dev/shm</code>）；只看日志会漏掉静默回退。</li>
+      <li>能对一组话题做取舍：哪些值得零拷贝、哪些该压缩、哪些该降频。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>多机器人系统的算力分布常常是"一个机箱里好几个进程"：机载计算机上同时跑着激光驱动、点云预处理、SLAM、避障，甚至还有一个视觉节点。这些进程之间传的往往是 1–20 MB 级的大消息。默认情况下，DDS 的数据就算在<strong>同一台机器内部</strong>传递，也要经过序列化、内核套接字、环回网卡这一整套"出门旅行"的流程，每一次都是实打实的内存拷贝。</p>
+    <p>把 2 MB 的点云以 10 Hz 在三个同机节点间转发，拷来拷去就是每秒上百 MB 的内存搬运量，CPU 被无声地吃掉一大块，延迟还会抖动。共享内存与零拷贝（Zero-Copy）解决的就是这个问题：<strong>让同一主机上的发布者和订阅者映射同一块物理内存，消息只传引用不传数据</strong>。它是第 021 章"状态同步"之后的自然下一步，先把链路修高效，再谈内容怎么组织。</p>
+    <p>注意边界：零拷贝只救得了同机数据流，跨机传播依然要压缩（第 023 章）。两章合起来是"大消息传输"的两层优化。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 一次发布要经历多少道拷贝</h3>
+    <p>假设你发布一条 2 MB 的点云，走默认的 DDS 网络路径（即使对端在同机）：</p>
+    <ol>
+      <li><strong>序列化拷贝</strong>：msg 对象的字段被写进中间件的发送缓冲区，第 1 次拷贝；</li>
+      <li><strong>系统调用拷贝</strong>：中间件把缓冲区交给内核 socket，内核再拷进自己的缓冲，第 2 次；</li>
+      <li><strong>环回/网卡拷贝</strong>：数据经过环回接口或网卡 DMA 到达接收侧，又被拷进接收进程的内存，第 3 次。</li>
+    </ol>
+    <p>每一次拷贝都消耗内存带宽和 CPU 时间。2 MB × 3 次 × 10 Hz，一条点云流就要搬运约 60 MB/s 的内存量；几十条这样的流叠加，机载计算机的 CPU 会有一两成"莫名其妙地花在了通信上"。更要命的是延迟抖动：内核调度、socket 缓冲都会引入不确定的排队时间，对 SLAM 与融合这类时间敏感的计算很不友好。</p>
+    <div class="formula">
+      拷贝开销 ≈ 消息大小 × 拷贝次数 × 发布频率 × 订阅者数量
+      <span class="note">2 MB × 3 × 10 Hz × 2 订阅者 ≈ 120 MB/s 的纯内存搬运，这就是零拷贝要省掉的部分</span>
+    </div>
+    <p>再补两个定量直觉。<strong>序列化不是纯内存拷贝</strong>：字段级写入的实际有效带宽常在 1–3 GB/s，2 MB 消息折算约 0.7–2 ms/帧，10 Hz 下相当于单核 0.7–2% 的占用；<strong>拷贝要按"读加写"两次访存计</strong>：4 MB × 3 次拷贝 × 2 × 20 Hz = <strong>480 MB/s</strong>，占 20 GB/s 内存带宽约 2.4%。单个数字都不大，但通信搬运与算法计算抢的是同一份内存带宽与同一个 CPU，流水线上多条大消息叠加后，收益更多体现在 p99 抖动下降与 CPU 被释放给算法；平均延迟的下降通常只有几毫秒。</p>
+
+    <h3>2. 共享内存的机制：把"邮局"变成"公告栏"</h3>
+    <p>共享内存传输的思路是：在物理内存中划出若干<strong>内存段</strong>（segment），发布者与订阅者把它映射到各自的地址空间。发布者把消息写进段里，然后把消息在段中的<strong>偏移量</strong>通过一条极小的通知消息传给订阅者，数据本身留在段内不动；订阅者按偏移量到同一段内存里读。数据一次都没有搬家，通知消息只有几十字节。</p>
+    <ul>
+      <li><strong>环形缓冲与分块管理</strong>：段内被切成固定大小的块（chunk），收发双方通过无锁队列交换块的所有权。<strong>块大小上限决定了哪些消息能走零拷贝</strong>，点云数据块太大时会被回退到网络路径。</li>
+      <li><strong>回退是静默的</strong>：SHM 不可用（对端不同机、段太小、两端配置不一致）时，中间件不报错，直接走 UDP/环回。<strong>所以"配了 SHM"和"走了 SHM"是两回事，必须实测验证。</strong></li>
+      <li><strong>同机限定</strong>：指针离开这台主机就失去意义，跨机只能走网络。这是物理边界，不是配置问题。</li>
+    </ul>
+    <p>主流实现里，CycloneDDS 与 Fast DDS 都可以接入 <strong>iceoryx</strong> 共享内存守护进程；Fast DDS 另有 <strong>Data-Sharing</strong> 机制，让同主机（同进程更佳）的 writer/reader 直接共享历史缓存。名字不同，本质都是"传偏移不传数据"。三者的适用面与注意点对照：</p>
+    <table>
+      <tr><th>机制</th><th>生效范围</th><th>优点</th><th>注意点</th></tr>
+      <tr><td>iceoryx 共享内存（CycloneDDS / Fast DDS 挂接）</td><td>同一主机跨进程</td><td>通用，与 RMW 解耦；图像点云均可受益</td><td>需要守护进程与内存池配置；两端要同时启用</td></tr>
+      <tr><td>Fast DDS Data-Sharing</td><td>同一主机匹配端点（同进程更佳）</td><td>不需要独立守护进程，配置面小</td><td>仅在 Fast DDS 栈内可用；跨机自动回退</td></tr>
+      <tr><td>进程内通信（intra-process）</td><td>同一进程内</td><td>路径最短，可以做到所有权移交</td><td>C++ 成熟、rclpy 收益弱；对象所有权模型要配合</td></tr>
+    </table>
+    <p>还要说清零拷贝"改不动什么"：<strong>端到端的最小搬运次数不可能为零</strong>，数据从内核接收缓冲（或传感器 DMA 缓冲）进入用户态的那一次搬运，在 rclpy 形态下依然存在；零拷贝优化掉的是"用户态到用户态"的重复搬运。同理，订阅端对点云的遍历与算法计算成本一分未减，如果瓶颈在算法本身（CPU 花在点云处理上，通信占比很小），SHM 的收益会非常有限。<strong>结论：它解决"搬运太贵"，不解决"内容太大"与"算法太慢"，后两者要找降频、降采样与算法优化。</strong></p>
+
+    <h3>3. 进程内通信：更短的路径</h3>
+    <p>如果发布和订阅在<strong>同一个进程</strong>内，还有更狠的一招：进程内通信（intra-process communication）让消息对象几乎不经手中间件。C++（rclcpp）里这是成熟选项：<code>NodeOptions().use_intra_process_comms(true)</code> 配合 <code>UniquePtr</code> 发布，可以做到"发布即移交所有权"；Python（rclpy）的进程内支持在较新发行版中才逐步引入，且受解释器对象模型限制，收益弱于 C++。<strong>实践建议：Python 侧重用 SHM 传输；对性能极限敏感的大点云链路，把关键节点做成 C++。</strong></p>
+
+    <h3>4. 什么值得零拷贝：判据与量级</h3>
+    <p>零拷贝不是免费的午餐：它要求两端 RMW 一致、配置一致，还会把内存段固定占用掉。判断标准可以浓缩成三条：</p>
+    <ul>
+      <li><strong>大</strong>：单条消息几十 KB 到几 MB（图像、点云、深度图）；小消息（几十字节的位姿）拷三遍也不值一提。</li>
+      <li><strong>频繁</strong>：10 Hz 以上持续流动。偶发的配置消息不值得为它建段。</li>
+      <li><strong>同机</strong>：生产者与消费者在同一个计算单元上。跨机链路请直接进入第 023 章的压缩路线。</li>
+    </ul>
+    <table>
+      <tr><th>数据流</th><th>大小/频率</th><th>优化手段</th><th>理由</th></tr>
+      <tr><td>激光点云 → SLAM</td><td>2 MB @ 10 Hz</td><td>SHM 零拷贝</td><td>大且频繁，同机；拷贝开销占比高</td></tr>
+      <tr><td>相机图 → 检测</td><td>2.7 MB @ 30 Hz</td><td>SHM 或进程内</td><td>更大更频繁；检测结果再跨机（023）</td></tr>
+      <tr><td>位姿/状态 → 可视化</td><td>100 B @ 50 Hz</td><td>无需优化</td><td>拷贝成本可忽略，优化是过度设计</td></tr>
+      <tr><td>地图块 → 各机器人</td><td>KB–MB 级/事件</td><td>增量传输 + 压缩</td><td>跨机为主，SHM 帮不上</td></tr>
+    </table>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>落地一套零拷贝链路，按以下五步走，每一步都有明确的验证点：</p>
+    <ol>
+      <li><strong>盘点同机大流量</strong>：把系统里"大小 × 频率 × 订阅数"排前几名的话题列出来。只有同机且量大的才进入清单。</li>
+      <li><strong>选 RMW 与机制</strong>：全系统统一到一个 RMW（如 <code>rmw_cyclonedds_cpp</code>）；需要 SHM 则启用 iceoryx（CycloneDDS/Fast DDS 皆可）；Fast DDS 环境也可评估 Data-Sharing。<strong>两端 RMW 不同则 SHM 必然不可用（可能仍能通过网络互通，但性能目标落空）。</strong></li>
+      <li><strong>配置内存段与块大小</strong>：按最大消息估算块大小（如 4 MB 块容纳 2 MB 点云），按并发在途消息数估算块数量（订阅者数 × QoS 深度 + 余量）。段太小 → 大消息静默回退网络路径，这是最常见的"配了没用"原因。</li>
+      <li><strong>用 launch 统一注入</strong>：环境变量（<code>RMW_IMPLEMENTATION</code>、<code>CYCLONEDDS_URI</code>）写进顶层 launch，保证整支车队行为一致；不要靠个人 shell 里 export，否则"你的终端能用、机器人上不能用"。</li>
+      <li><strong>验证与回退</strong>：用延迟与 CPU 占用量化收益；保留一份"无 SHM"的配置，一旦某个发行版/平台组合出问题可以整体回退。</li>
+    </ol>
+    <div class="box key">
+      <span class="box-title">设计决策：为什么先量化再切换？</span>
+      <p>零拷贝牵动环境变量、RMW 选型与内存占用，排障成本高于普通话题。先用 <code>ros2 topic bw</code>、<code>top</code>/<code>htop</code>、进程级延迟测量证明"拷贝确实是瓶颈"，再动基础设施。经验阈值：同机大消息链路上，如果通信进程 CPU 占比超过一个感知节点，就值得优化。</p>
+    </div>
+    <h3>参数选取速查</h3>
+    <table>
+      <tr><th>参数</th><th>示例值</th><th>依据</th></tr>
+      <tr><td>块大小（chunk size）</td><td>4 MB</td><td>覆盖最大单条消息（2 MB 点云 + 对齐余量）</td></tr>
+      <tr><td>块数量（chunk count）</td><td>16</td><td>订阅者数 × QoS 深度 + 在途余量</td></tr>
+      <tr><td>段大小（mem pool）</td><td>64 MB</td><td>块大小 × 块数量；被固定占用，别贪大</td></tr>
+      <tr><td>QoS 深度</td><td>1–2</td><td>大消息链路拒绝积压，KEEP_LAST 最适合</td></tr>
+    </table>
+    <h3>内存池的账（按池算，不按话题算）</h3>
+    <p>多个话题共享一个 SHM 池时，块需求是所有"在途消息"之和。一个常见配置：4 MB 块、3 条大话题共用、每条 2 个订阅者、QoS depth 1，则在途块 ≈ 3 ×（1 份发布缓冲 + 2 份订阅占用）+ 2 块余量 = <strong>11 块 ≈ 44 MB</strong>，取 48–64 MB 池是合理档位；若每条话题各自建池（各 64 MB），三话题就是 192 MB 常驻，嵌入式板卡上很快见底。<strong>池共享与容量估算要在部署前写清，SHM 占的内存属于"开机即扣"的固定成本</strong>，第 013 章的带宽预算表旁边应并列一张内存预算表。</p>
+    <p>部署形态里还有三个硬边界，桌面实验不会遇到、一上线就同时出现：<strong>（1）容器</strong>：容器默认的共享内存挂载点往往只有 64 MB，SHM 池一旦超过它就会分配失败并静默回退，需要显式加大共享内存大小并共享 IPC 命名空间；<strong>（2）用户与权限</strong>：段有属主概念，以不同用户身份启动的进程（系统服务与手动调试各一）可能互相看不见对方的段；<strong>（3）崩溃残留</strong>：进程异常退出可能留下段文件与锁，重启脚本要包含清理逻辑，否则会出现"第一次崩溃之后 SHM 再也不工作"的怪象。</p>
+    <p>验证协议再补两条硬规矩。<strong>（1）A/B 比较必须同负载、同窗口</strong>：开与关 SHM 的两次测试使用同一份录制数据回放或同一套合成负载，各跑 5 分钟以上，比较 p50/p99 与 CPU 均值；单次对比与短窗口没有统计意义。<strong>（2）证据链要三层齐全</strong>：段文件存在（系统层）、环回流量下降（链路层）、端到端 p99 改善（应用层），缺任何一层都可能是"配置生效了但没人用"或"收益被别处吃掉"。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：给 CycloneDDS 打开共享内存（配置文件示意）</strong></p>
+    <pre class="code"><code>&lt;!-- cyclonedds_shm.xml：同机大消息走共享内存，字段名以对应发行版配置文档为准 --&gt;
+&lt;CycloneDDS xmlns="https://cdds.io/config"&gt;
+  &lt;Domain id="any"&gt;
+    &lt;SharedMemory&gt;
+      &lt;Enable&gt;true&lt;/Enable&gt;      &lt;!-- 关键开关：允许中间件使用共享内存段传数据 --&gt;
+      &lt;LogLevel&gt;info&lt;/LogLevel&gt;   &lt;!-- info 级日志会报告初始化与回退事件，便于验证 --&gt;
+    &lt;/SharedMemory&gt;
+  &lt;/Domain&gt;
+&lt;/CycloneDDS&gt;</code></pre>
+    <p>解读：这个文件本身不做任何传输决策，它只是<strong>授予中间件使用共享内存的许可</strong>。真正决定"这条消息是否走 SHM"的是运行时条件：对端是否同机、块是否装得下、两端配置是否一致。把 <code>LogLevel</code> 提到 info 的目的很明确，回退是静默的，只有日志里才能抓到"failed to allocate"这类线索。配置文件路径由 <code>CYCLONEDDS_URI</code> 指向；若你要用 Fast DDS，对应的是 XML profile 与 Data-Sharing 开关，机制同源、字段不同，以该发行版文档为准。</p>
+
+    <p><strong>片段 2：大消息发布与延迟实测（rclpy）</strong></p>
+    <pre class="code"><code>import rclpy
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from sensor_msgs.msg import PointCloud2
+
+class CloudPublisher(Node):
+    """10 Hz 发布 2 MB 点云：SHM 生效时发布动作本身不搬运数据。"""
+    def __init__(self):
+        super().__init__("cloud_pub")
+        # 大消息链路的关键 QoS：KEEP_LAST(1) 永不留积压，订阅者只拿最新帧
+        qos = QoSProfile(depth=1)
+        qos.history = HistoryPolicy.KEEP_LAST
+        qos.reliability = ReliabilityPolicy.BEST_EFFORT  # 遥测语义：丢一帧无妨
+        self.pub = self.create_publisher(PointCloud2, "lidar/points", qos)
+        self.timer = self.create_timer(0.1, self.tick)   # 10 Hz
+
+    def tick(self):
+        msg = PointCloud2()
+        # 用"数据测量时刻"打戳：用发送时刻打戳会让延迟测量失去意义
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = "robot1/lidar"
+        msg.height = 1
+        msg.width = 32768            # 模拟 32K 点、每点 64 字节
+        msg.point_step = 64
+        msg.row_step = 64 * 32768
+        msg.is_dense = True
+        msg.data = bytes(32768 * 64) # 2 MB 负载：优化与不优化差在最明显的量级
+        self.pub.publish(msg)
+
+class CloudSubscriber(Node):
+    """收到消息立刻测"从测量到处理"的端到端延迟。"""
+    def __init__(self):
+        super().__init__("cloud_sub")
+        qos = QoSProfile(depth=1)
+        qos.history = HistoryPolicy.KEEP_LAST
+        qos.reliability = ReliabilityPolicy.BEST_EFFORT
+        self.n = 0
+        self.acc = 0.0
+        self.sub = self.create_subscription(PointCloud2, "lidar/points", self.cb, qos)
+
+    def cb(self, msg):
+        now_ns = self.get_clock().now().nanoseconds
+        stamp_ns = msg.header.stamp.sec * 10**9 + msg.header.stamp.nanosec
+        dt_ms = (now_ns - stamp_ns) / 1e6
+        self.n += 1
+        self.acc += dt_ms
+        # 每 100 帧打印一次平均延迟：SHM 与环回路径的差距通常肉眼可辨
+        if self.n % 100 == 0:
+            self.get_logger().info(
+                f"平均端到端延迟 {self.acc / 100:.2f} ms（{len(msg.data)/1e6:.1f} MB/帧）")
+            self.acc = 0.0</code></pre>
+    <p>解读：这段代码有三个值得拆开讲的点。<strong>（1）</strong>发布端用 <code>bytes()</code> 造了一块 2 MB 的不可变负载，在真实驱动里它往往来自网口 DMA 缓冲，而 <code>publish</code> 是否触发整块拷贝，取决于中间件走的是 SHM 还是网络路径，这段代码正是用来对比两种情况的基准。<strong>（2）</strong>延迟测量必须用"测量时刻"的时间戳，且依赖第 009 章的时间同步；如果两个进程时钟有偏差，测出来的延迟会出现负数或巨大值。<strong>（3）</strong>大消息链路的 QoS 原则是"宁要新鲜，不要积压"：<code>KEEP_LAST(1)</code> 加 Best-effort，任何一端慢一拍都自动跳帧，排队只会把延迟越拖越长。</p>
+
+    <p><strong>片段 3：用 launch 统一注入环境（团队协作的正确姿势）</strong></p>
+    <pre class="code"><code>from launch import LaunchDescription
+from launch.actions import SetEnvironmentVariable
+from launch_ros.actions import Node
+
+def generate_launch_description():
+    # 环境变量在这里统一声明：整支车队一份配置，避免"谁的终端配了谁生效"
+    env_rmw = SetEnvironmentVariable("RMW_IMPLEMENTATION", "rmw_cyclonedds_cpp")
+    env_cfg = SetEnvironmentVariable("CYCLONEDDS_URI",
+                                     "file:///etc/ros/cyclonedds_shm.xml")
+    # 同机三个节点全部由这份 launch 启动：两端 RMW 与 XML 必然一致
+    talker = Node(package="shm_demo", executable="cloud_pub", output="screen")
+    listener = Node(package="shm_demo", executable="cloud_sub", output="screen")
+    slam = Node(package="shm_demo", executable="slam_node", output="screen",
+                # 回退开关：环境变量设 0 即整体退回网络路径，便于 A/B 对比
+                parameters=[{"expect_shm": True}])
+    return LaunchDescription([env_rmw, env_cfg, talker, listener, slam])</code></pre>
+    <p>解读：把 RMW 选型与 SHM 配置放进 launch 的环境动作层，是<strong>可复现部署</strong>的关键。零拷贝问题十有八九出在"两端配置不一致"：一端由手工终端启动（继承了旧环境），另一端由 systemd 拉起（环境干净）。统一入口后，A/B 实验也只差一个文件路径。注意 launch 里的环境变量只影响由它启动的进程及其子进程，不会污染系统全局，这正是我们想要的边界。</p>
+
+    <p><strong>片段 4：验证清单（三条命令）</strong></p>
+    <pre class="code"><code># 1) 看共享内存段是否真的建立（iceoryx 系在 /dev/shm 下留段文件）
+ls /dev/shm | grep -i iox
+# 2) 对比开/关 SHM 时环回网卡流量：走 SHM 应接近 0，走网络则约等于消息速率
+ros2 topic bw /robot1/lidar/points
+# 3) 查端点 QoS/类型与话题连接情况：静默不通时从这里看第一个现场
+ros2 topic info /robot1/lidar/points --verbose</code></pre>
+    <p>解读：三条命令分别对应三个层面的证据，<strong>系统层</strong>（段存在）、<strong>流量层</strong>（数据没走网络）、<strong>中间件层</strong>（端点真的连上了）。如果 1 和 2 都过了但延迟没改善，常见原因是 Python 侧序列化仍在发生（收益被摊薄），或者延迟瓶颈根本不在拷贝上，回到"先量化再优化"的原则。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>只配了一端 RMW</strong>：SHM 是 RMW 内部机制，两端不同 RMW 时它必然失效（协议层可能仍能互通，性能目标却落空）。症状：延迟与 CPU 毫无改善。修复：用 launch 或镜像统一注入 <code>RMW_IMPLEMENTATION</code>。</li>
+      <li><strong>内存段/块太小，大消息静默回退</strong>：2 MB 点云遇上 512 KB 的块，中间件默默走网络路径，日志里只有一行不起眼的 allocate 失败。修复：按最大消息设定块大小，并在验证清单里核对实际流量走向。</li>
+      <li><strong>把零拷贝当跨机优化</strong>：给两台物理机器人之间"配置 SHM"，结果什么都没发生。跨机请用压缩（第 023 章）或分频策略，SHM 的边界是同一主机。</li>
+      <li><strong>用墙钟差测延迟</strong>：两端进程时钟没同步（第 009 章），测出的"延迟"呈负数或上百毫秒的假象，据此做优化决策必然跑偏。修复：先做时间同步，再测。</li>
+      <li><strong>SHM 段被固定占用还设得过大</strong>：64 台消息段 × 512 MB 会让内存吃紧、容器被 OOM 杀掉。修复：按"块大小 × 块数量 × 并发流数量"精确估算，留 30% 余量即可。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>同一话题分别以环回网络与 SHM 传输，预测发布进程的 CPU 占用会差几倍？用进程监控（如 <code>top -p</code>）做 A/B 验证，并解释差异来源。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>大点云场景差异通常在一个量级左右。差异来自三次拷贝与内核调度；若差异很小，先检查 SHM 是否真的生效（片段 4 清单），再检查瓶颈是否早已在序列化。</div></details>
+      </li>
+      <li>把点云块大小从 4 MB 改小到 256 KB，预测哪些话题会退回网络路径、哪些不受影响；设计一个实验把"回退率"量化出来。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>大于块的消息（2 MB 点云）必然回退，1 MB 以下的图像仍可走 SHM。量化方法：对比 <code>ros2 topic bw</code> 的环回流量与消息速率，或统计日志中的 allocate 失败计数。</div></details>
+      </li>
+      <li>推导：某链路 4 MB @ 20 Hz、2 个订阅者、同机。若每次发布产生 3 次拷贝，求每秒纯拷贝搬运的内存量；再估算在 20 GB/s 内存带宽的嵌入式板卡上占比多少。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>4 MB × 3 × 20 Hz ×（1 写 + 2 读）约 480 MB/s 量级（按读写各计一次的方式不同略有出入），占 20 GB/s 约 2.4%；比例看似不大，但叠加多条流后不可忽视。</div></details>
+      </li>
+      <li>设计题：给你的系统画一张"同机/跨机数据流表"，为每条流标注大小、频率、是否值得 SHM / 压缩 / 降频，并写出各自的验证方法。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>判据是三条：大、频繁、同机。跨机的大流交给第 023 章的压缩方案；小消息明确标注"不优化"，避免过度设计。</div></details>
+      </li>
+      <li>思考：rclpy 下进程内通信收益弱于 C++，为什么？如果你只能改一个节点的语言，应该改哪一端（发布端还是订阅端）才最划算？<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>Python 对象与序列化缓冲之间存在隐式转换，所有权移交语义弱。通常优先改"数据源头"的发布端，让大消息全程不进入 Python 对象系统。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>一次发布在默认路径上经历序列化、内核、环回三道关卡；消息越大越频繁，"拷贝税"越重。</li>
+      <li>共享内存把"邮局寄包裹"变成"公告栏留便签"：传偏移不传数据，边界是同一主机、同一 RMW、块装得下。</li>
+      <li>回退是静默的：配了不等于生效，必须用"段文件 + 环回流量 + 延迟"三重证据验证。</li>
+      <li>取舍三判据：大、频繁、同机。小消息别优化，跨机走压缩，同机才谈零拷贝；收益验收盯 p99 与 CPU，不看平均。</li>
+      <li>下一章处理跨机大消息的另一半问题：<strong>图像与点云的压缩</strong>，在带宽这根硬管子上，压缩比零拷贝更基础。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch021.html">← 第 021 章：多机器人状态同步</a>
+    <a class="next" href="ch023.html">第 023 章：大消息传输：图像与点云压缩 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

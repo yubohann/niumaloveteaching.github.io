@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第006章 使用世界模型生成想象轨迹 | 具身智能学习课程 · VLA 与世界模型联合训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · 基础框架与联合训练</span>
+    <span class="sep">/</span>
+    <span>第 006 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · 基础框架与联合训练</div>
+    <h1>第 006 章：使用世界模型生成想象轨迹</h1>
+    <p class="lead">本章打通想象 rollout（Imagination Rollout）的完整流程：从真实上下文出发，策略提出动作、世界模型推演观测、按视界截断并解码检查，重点处理多样性注入与误差控制两个生成期问题。</p>
+    <ul class="meta">
+      <li>主题：世界模型 / 想象轨迹生成</li>
+      <li>关键公式：τ̂ = (o<sub>≤t</sub>, â<sub>t:t+L-1</sub>, ô<sub>t+1:t+L</sub>)</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 005 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解想象轨迹（Imagination Trajectory）的组成与生成角色，明确它与 003 章单帧预测、011 章动作条件视频预测的分工。</li>
+      <li>掌握潜空间 rollout 的主循环：上下文编码、动作提议、观测推演、状态附加。</li>
+      <li>掌握多样性注入机制：策略采样温度、潜变量噪声、起始状态分支。</li>
+      <li>理解 rollout 长度、分支数、解码频率三个成本参数与生成质量的关系。</li>
+      <li>能设计误差控制方案：视界截断、不确定性门控与真实数据重锚定。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>003 章验证了单步预测，本章扩展成轨迹生成。<strong>想象轨迹是世界模型的核心产出：一段“如果这样行动，世界会怎样变化”的推演，为 008 章策略增强与 014 章规划提供原材料。</strong>相比单步预测，新增两个问题：动作由谁提供、误差如何不失控。</p>
+    <p>动作来源决定用途：真实动作推演用于检验预测质量，策略输出推演用于评估策略并生成拟训练数据。开环误差随步数加深，本章任务是把污染链控制在可接受范围。</p>
+    <p>与 011 章的分工提前说明：本章关注“生成流程怎么组织”（循环、采样、截断、解码），011 章关注“视频预测模型本身怎么设计”（时间注意力、动作条件注入、时序一致性损失）。两者组合即完整的想象系统。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 想象轨迹的定义与组成</h3>
+    <p>一条轨迹由三段构成：真实上下文、策略提议的动作序列、世界模型推演的观测序列。</p>
+    <div class="formula">
+      τ̂ = (o<sub>≤t</sub>, â<sub>t:t+L-1</sub>, ô<sub>t+1:t+L</sub>)
+      <span class="note">L 为 rollout 长度（取 5–15）；â 表示策略采样的动作，ô 表示模型生成的观测</span>
+    </div>
+    <p>上下文只用真实观测，这是误差控制的起点；动作序列来自策略或数据集，两种来源产生不同用途的轨迹；观测序列是推演产物，<strong>其可信度随步数递减，这是所有后续机制的共同前提</strong>。轨迹的每一步都保留“真实或生成”的来源标记，训练使用时据此施加不同权重（008 章）。</p>
+    <p>两种动作来源的用途区分要量化到监督链路：真实动作推演只检验世界模型的预测质量（与真实观测比对即得一致性指标），不产生策略监督；策略动作推演才为 008 章的增强提供样本。混用时若把真实动作轨迹也当作策略监督，等于用数据集动作重复监督策略，边际收益接近零且稀释批次构成。实现上以来源字段区分，采样器按用途配额分配。</p>
+
+    <h3>2. 潜空间 rollout 主循环</h3>
+    <p>为了控制成本，推演在潜空间进行：上下文经编码器得到 z<sub>t</sub>，策略产生动作块 â，世界模型动力学给出 z<sub>t+1</sub>，循环推进。过程形式化为：</p>
+    <div class="formula">
+      z<sub>k+1</sub> = g<sub>ϕ</sub>(z<sub>k</sub>, â<sub>k</sub>) ，ô<sub>k</sub> = d<sub>ϕ</sub>(z<sub>k</sub>)
+      <span class="note">g<sub>ϕ</sub> 为潜空间动力学，d<sub>ϕ</sub> 为观测解码器；解码只在对检查点按需执行</span>
+    </div>
+    <p><strong>解码频率是成本与可检查性的折中</strong>：每步都解码到像素会失去潜空间推演的速度优势，完全不解码则无法人工检查与可视化。常规做法是只在每 5 步与轨迹末尾解码关键帧，训练消费潜变量，像素留在检查环节。潜空间推演的单位成本远低于像素推演，使“多分支、多起点”的批量生成在算力上可行。循环本身只含两次小前向（策略头取动作、动力学推进一步），起点与分支合并进批量维后设备利用率较高，这是多分支批量生成在单卡上可负担的直接原因之一，也是该方案优于逐条串行推演的算力来源。</p>
+
+    <h3>3. 多样性注入</h3>
+    <p>确定性策略加确定性动力学生成的轨迹在相同起点下完全一致，多样性为零，对策略训练的覆盖价值极低。三个注入点各自控制不同层面的多样性：<strong>策略头按温度采样动作</strong>（动作层多样性）、<strong>潜状态叠加小方差噪声</strong>（状态层扰动）、<strong>从数据集采样多个起始上下文</strong>（场景层覆盖）。</p>
+    <div class="formula">
+      â = π<sub>θ</sub>(·) + ε<sub>a</sub> ，z<sub>k</sub> = g<sub>ϕ</sub>(z<sub>k-1</sub>, â) + ε<sub>z</sub>
+      <span class="note">ε<sub>a</sub> 为动作噪声（或采样温度）；ε<sub>z</sub> 为潜噪声，方差取小值以保持动力学合理性</span>
+    </div>
+    <p>噪声尺度遵循“动作可执行、状态不离流形”的约束：动作噪声超过数据分布范围会让世界模型进入未见区域，预测可信度骤降；潜噪声过大会把 z 推离编码器流形，解码器输出破碎画面。实践上先固定噪声尺度，用“动作是否超出数据量程、解码关键帧是否合理”两条检查校准。</p>
+
+    <h3>4. 误差控制：截断、门控与重锚定</h3>
+    <p>三种手段按强度递增。视界截断把 L 限制在误差可控区间（5–15 步），是默认手段；不确定性门控在每步比较预测的不确定性估计（031 章给出实现），超阈值即提前终止；真实重锚定在生成多段轨迹时从数据集重新取上下文，避免长链污染。<strong>工程组合通常是“短视界 + 分支重锚定”</strong>：单条轨迹保持短程可信，用大量的短轨迹覆盖状态空间，并避开少量长轨迹的远端误差累积。</p>
+    <p>三种手段叠加后的有效视界再算一次：门控逐级截断时，轨迹的期望可用长度为 (1-q<sup>L+1</sup>)/(1-q)。q=0.9、L=10 时约 6.9 步，q=0.95 时约 8.6 步，都明显短于名义视界。<strong>名义视界、门控通过率与实际可用长度是三回事</strong>，评估报告必须注明使用哪一个口径；008 章的时域折扣按实际步数计算，避免用名义步数高估远端监督量。</p>
+
+    <h3>5. 生成质量评估</h3>
+    <p>轨迹质量需要三项独立指标：一致性（推演观测与在真实环境中执行同一动作序列的结果偏差）、多样性（同起点多分支的动作分布熵）、合理性（关键帧解码后的人工或自动检查，含动作量程与画面完整性）。<strong>三项指标必须同时报告：一致性好而多样性差说明生成退化，多样性好而一致性差说明噪声过大。</strong></p>
+
+    <h3>6. 推导与算例：误差累积上界与解码成本</h3>
+    <p>误差上界由递推展开得到。设第 k 步的推演误差为 e<sub>k</sub>，动力学每步放大 ρ 倍并叠加新的单步误差 ε：e<sub>k+1</sub> ≤ ρ·e<sub>k</sub> + ε。从初始误差 e<sub>0</sub> 展开：</p>
+    <div class="formula">
+      e<sub>k</sub> ≤ ρ<sup>k</sup>·e<sub>0</sub> + ε·(ρ<sup>k</sup> - 1)/(ρ - 1) （ρ ≠ 1）
+      <span class="note">ρ 接近 1 时上界趋近 k·ε，线性增长；ρ 明显大于 1 时按指数放大；取下界语境时该式即 001 章的误差累积结论</span>
+    </div>
+    <p>代入具体数字：ε=0.02、ρ=1.05 时，L=5 的上界为 0.1105，L=10 为 0.2516，L=15 为 0.4316，每加五步大约翻倍。把可接受误差定在 0.2 时，该放大系数下的视界上限约 8 步；若把 ρ 压到 0.95，十步上界降到 0.16，同一误差预算下视界放宽到约 13 步。这正是“短视界加重锚定”组合的定量依据：压低单条轨迹的 L 比事后过滤更省成本。</p>
+    <table>
+      <tr><th>视界 L</th><th>累积上界（ρ=1.05）</th><th>关键帧解码次数（每 5 步）</th></tr>
+      <tr><td>5</td><td>0.1105</td><td>1</td></tr>
+      <tr><td>10</td><td>0.2516</td><td>2</td></tr>
+      <tr><td>15</td><td>0.4316</td><td>3</td></tr>
+    </table>
+    <p>存储与解码成本对齐比较。起点 256、分支 4 时单批轨迹 1024 条，L=10 的潜状态总量 10240 个。潜状态按 256 维、单精度存储约占 10.5 MB；同样数量的像素帧（224×224×3、单精度）需要约 6.2 GB，两者相差约 588 倍。<strong>这个比例解释了潜空间推演为何能承受多分支批量生成</strong>，也解释了解码频率为何要作为独立参数：每步解码把存储与解码代价按倍数放大，训练管线消费潜变量即可，关键帧解码只服务于检查。</p>
+
+    <h3>7. 多样性注入的量化</h3>
+    <p>温度对动作分布的影响可以精确计算。设某步动作头在三档离散动作上的 logits 为 [2, 1, 0]，温度 0.7 时采样概率为 [0.771, 0.185, 0.044]，分布熵 0.651 纳特；温度 1.2 时为 [0.616, 0.268, 0.116]，熵升到 0.902。<strong>温度从 0.7 提到 1.2 让次优模式概率提高约 1.5 倍</strong>，探索能力上升，同时动作进入数据未覆盖区域的概率同步增大，这正是第 3 节“动作可执行”约束的量化一面。</p>
+    <p>分支数的覆盖效应同样可算。设单分支命中某个远离主模式的替代模式的概率为 q，B 个独立分支至少命中一次的概率为 1-(1-q)<sup>B</sup>。q=0.1 时 4 分支命中概率 34.4%，8 分支升到 57.0%；q=0.3 时 4 分支已有 76.0%，8 分支达 94.2%。<strong>分支的边际收益随 B 递减</strong>，稀有模式需要更多分支才能覆盖，覆盖率评估应按目标模式分别报告，总数会掩盖稀有模式的缺口。</p>
+    <p>生成成本按相乘结构估算：总成本约等于 起点数 × 分支数 × L × 单步推演成本，再加 关键帧数 × 解码成本。起点 256、分支 4、L=10 时推演步数 10240；若单步解码成本是单步推演的 20 倍、解码按每 5 步执行一次，则解码部分为 2048×20 = 40960 个推演当量，占总成本 40960/(10240+40960) = 80%。<strong>解码是成本主体，这一比例直接支持“训练消费潜变量、检查按需解码”的取舍。</strong></p>
+    <p>门控阈值的产量效应一并算清。把每步联合通过门控的概率近似为 q（阈值取验证误差分布的 q 分位时两者近似相等），一条 L 步轨迹全部通过的概率约为 q<sup>L</sup>。q=0.9、L=10 时通过率 34.9%；阈值放松到 0.95 时通过率 59.9%；收紧到 0.8 时只剩 10.7%。<strong>阈值、视界与产量三者联动</strong>，缩短视界或放低阈值都能提产量，前者损失长程信息，后者引入更多低置信样本，需要按下游过滤能力联合设定，单独调阈值会把视界的影响排除在外。</p>
+
+    <h3>8. 边界与失效模式</h3>
+    <ul>
+      <li><strong>误差预算被任务精度倒逼</strong>：精细操作要求末端误差到毫米级时，归一化空间的可接受阈值更低，视界被迫缩短到 5 步以内，覆盖能力依赖分支与重锚定补齐。此时应优先提高世界模型单步精度，增加分支无法改变放大系数。</li>
+      <li><strong>潜噪声偏离流形</strong>：ε<sub>z</sub> 过大时潜状态落入编码器未覆盖区域，解码器输出破碎画面。判据是解码关键帧抽检与潜状态范数分布，范数分布右尾变厚即降低噪声方差。</li>
+      <li><strong>门控阈值与产量失衡</strong>：阈值过松时低置信轨迹进入下游，过紧时可用轨迹稀少，两者都表现为训练数据供给波动。校准方式是跟踪通过率曲线并锁定在目标区间（例如 50% 到 80%）。</li>
+      <li><strong>重锚定过密丢失连续性</strong>：每个分支都从新起点出发时，状态空间覆盖变广而轨迹内连续性下降，依赖连续性的监督会失效。修复：为连续性敏感的任务保留一部分长轨迹，与短轨迹按比例混用。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>系统四组件：上下文采样器、潜空间推演循环、噪声控制器、关键帧解码器。批量生成按“起点×分支”展开，起点数管场景覆盖，分支数管同场景多样性。</p>
+    <h3>关键参数起点</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>视界 L</td><td>10</td><td>单条轨迹长度</td><td>误差累积与信息密度的折中（5–15 区间）</td></tr>
+      <tr><td>分支数 B</td><td>4</td><td>同起点多样性</td><td>覆盖多模态动作且不与算力冲突</td></tr>
+      <tr><td>起始上下文数</td><td>256</td><td>场景覆盖广度</td><td>与批量大小同量级，便于批内并行</td></tr>
+      <tr><td>动作温度</td><td>0.7</td><td>动作层多样性</td><td>低于贪心解码的确定性，高于纯随机</td></tr>
+      <tr><td>潜噪声方差</td><td>0.01</td><td>状态层扰动</td><td>小到不破坏动力学合理性</td></tr>
+      <tr><td>解码频率</td><td>每 5 步</td><td>检查点密度</td><td>成本与可视化的折中</td></tr>
+      <tr><td>不确定性阈值</td><td>分位数 90%</td><td>提前终止标准</td><td>由验证集预测误差分布确定</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：以短轨迹工厂替代长轨迹推演</span>
+      <p>长轨迹远端收益低、误差高，成本却线性增长。把算力投向短视界与海量重锚定，用覆盖换深度，是公开工作中更常见的取舍；014 章的规划会筛选候选轨迹。</p>
+    </div>
+    <p>衔接与差异：003 章只做教师强制下的单步预测；本章第一次把预测用于开环推演，并引入动作源与噪声控制；007 章讨论生成与训练如何排班，008 章把生成结果接入策略训练损失。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>片段以 Dreamer 系列与相关潜空间推演实现的公开设计为参照，接口随版本演进。第 1 段给出潜空间 rollout 主循环。</p>
+
+    <p><strong>片段 1：潜空间 rollout 主循环</strong></p>
+    <pre class="code"><code>import torch
+
+@torch.no_grad()
+def rollout_latent(policy, world, context, horizon=10):
+    """从真实上下文出发，策略提议动作，世界模型推演潜状态序列。"""
+    # context 形状 (B, k, 3, 224, 224)：仅含真实观测，保证起点无误差污染
+    z = world.encode(context)                   # 编码上下文为初始潜状态
+    latents, actions = [z], []
+    for k in range(horizon):
+        # 策略每次给出一个动作块；取首步推演，块内其余步留作重叠参考
+        chunk = policy.decode_action(world.decoder_feat(z))
+        a = chunk[:, 0]                         # (B, action_dim)
+        actions.append(a)
+        # 动力学前推一旦发生，后续输入均为生成量：误差从这里开始累积
+        z = world.dynamics(z, a)
+        latents.append(z)
+    return torch.stack(latents, dim=1), torch.stack(actions, dim=1)</code></pre>
+    <p>解读：<strong>（1）</strong>整个循环置于 no_grad 之下：生成阶段不需要梯度，节省显存并使推演可以批量化。<strong>（2）</strong>策略通过共享特征接口取动作，说明生成系统复用联合训练的主干，无需独立模型。<strong>（3）</strong>循环内不调用解码器，潜状态序列单独返回；解码在需要检查时按频率单独执行，这是成本控制的关键取舍。</p>
+
+    <p><strong>片段 2：多样性注入与分支展开</strong></p>
+    <pre class="code"><code>@torch.no_grad()
+def branched_rollout(policy, world, contexts, branches=4,
+                     horizon=10, temp=0.7, noise_std=0.01):
+    """分支生成：同一上下文展开多条轨迹，注入动作与状态两层噪声。"""
+    B = contexts.shape[0]
+    # 起点重复 branches 次：批量维承载“起点×分支”的二维展开
+    ctx = contexts.repeat_interleave(branches, dim=0)
+    z = world.encode(ctx)
+    traj, acts = [], []
+    for k in range(horizon):
+        feat = world.decoder_feat(z)
+        # 温度采样：logits 除以温度后再采样，温度越低越接近贪心
+        a = policy.sample_action(feat, temperature=temp)
+        # 潜噪声模拟真实环境中未被观测建模的随机因素，尺度需保持小
+        z = world.dynamics(z, a) + noise_std * torch.randn_like(z)
+        traj.append(z)
+        acts.append(a)
+    # 恢复 (B, branches, ...) 维度，调用方按起点聚合统计多样性
+    shape = (B, branches, horizon, -1)
+    return torch.stack(traj, 1).reshape(shape), torch.stack(acts, 1).reshape(shape)</code></pre>
+    <p>解读：<strong>（1）</strong>repeat_interleave 使同一上下文的各分支在批量维相邻排列，后续融合与统计无需重排。<strong>（2）</strong>温度作用在采样分布上，动作值保持原始尺度，保证采样动作仍落在策略的合理输出范围。<strong>（3）</strong>暂未加入不确定性门控，保持主流程简洁；门控作为可选步骤在片段 3 接入。</p>
+
+    <p><strong>片段 3：不确定性门控的提前终止</strong></p>
+    <pre class="code"><code>@torch.no_grad()
+def gated_rollout(policy, world, context, horizon=15, q_thresh=None):
+    """带门控的推演：每步估计不确定性，超阈值提前终止该分支。"""
+    z = world.encode(context)
+    traj, alive = [z], torch.ones(z.shape[0], dtype=torch.bool)
+    for k in range(horizon):
+        a = policy.sample_action(world.decoder_feat(z), temperature=0.7)
+        z_next = world.dynamics(z, a)
+        # 用集成或单模型启发式给出每样本的不确定性分数（031 章展开）
+        unc = world.uncertainty(z_next, a)
+        # 阈值取验证集误差分布的 90% 分位：过松失去门控意义，过紧样本稀少
+        alive = alive & (unc &lt; q_thresh) if q_thresh is not None else alive
+        traj.append(z_next)
+        # 所有分支都被截断时提前退出循环，避免空转计算
+        if not bool(alive.any()):
+            break
+        z = z_next
+    return torch.stack(traj, dim=1), alive</code></pre>
+    <p>解读：<strong>（1）</strong>每步推演后计算不确定分数，超过分位数阈值即把该样本标记为失效，后续步不再信任其输出。<strong>（2）</strong>alive 掩码随轨迹一并返回，训练侧（008 章）按掩码过滤或加权，<strong>门控判断与数据使用在接口上解耦</strong>。<strong>（3）</strong>阈值取验证集误差分布的 90% 分位是数据驱动的定标方式，避免手工魔数；空分支提前退出保护批量生成的整体效率。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>上下文混入生成帧</strong>：推演中途把预测帧写回上下文窗口，误差被反复放大。修复：上下文窗口只读真实数据，生成量单独存放。</li>
+      <li><strong>动作超范围导致推演失真</strong>：采样噪声或温度过大使动作超出数据量程，世界模型进入未见区域。修复：对动作按数据统计量裁剪，并监控超范围比例。</li>
+      <li><strong>多样性坍缩</strong>：多分支输出近乎相同，策略训练反复见过同一模式。修复：提高温度或分支噪声，用分支间动作方差的统计量做告警。</li>
+      <li><strong>全程解码拖垮吞吐</strong>：每个推演步都解码到像素，生成速度下降一个量级。修复：改为按频率解码关键帧，训练管线只消费潜变量。</li>
+      <li><strong>长视界无终止条件</strong>：视界硬编码过大且无门控，远端步骤既慢又不可信。修复：视界与门控阈值联动配置，轨迹长度分布纳入监控。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>起点数 256、分支数 4、视界 10，计算单批生成的潜状态总量；若改为每步解码，粗算解码调用次数的增幅。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>潜状态约 1 万个；解码调用从每 5 步 1 次变为每步 1 次，增加 5 倍。</div></details>
+      </li>
+      <li>把动作温度从 0.7 提到 1.2，预测轨迹的多样性与可信度各会怎样变化，给出验证方法。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>多样性升但超范围动作增多、可信度降；用分支方差与一致性指标评估，并真实环境抽样复现。</div></details>
+      </li>
+      <li>推导：若单步预测误差被放大系数 ρ 作用于后续输入，写出一条 L 步轨迹的误差累积上界，并解释为什么它支持“短视界加重锚定”的组合。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>上界形如 Σ ρ<sup>L-k</sup>ε<sub>k</sub>，随 L 指数增长；把 L 压小并以大量起点覆盖状态空间，可在同算力下降低总误差。</div></details>
+      </li>
+      <li>设计轨迹质量的三项评估流程：一致性、多样性、合理性，各给出一个可自动化的指标与阈值设定方法。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>一致性用交互式执行对比；多样性用分支动作熵；合理性用动作量程统计与关键帧自动检查。阈值由验证集分布确定。</div></details>
+      </li>
+      <li>构造实验：固定起点，比较“单一长轨迹”与“短轨迹乘多分支”在相同算力下对状态空间的覆盖率，并给出度量。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>状态投影到低维网格统计访问格点比例；预期短轨迹组合覆盖更大，但局部连续性下降，需连续权重调和。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul>
+      <li>想象轨迹由真实上下文、策略动作、模型观测三段构成，可信度随推演步数递减。</li>
+      <li>潜空间 rollout 是成本可控的主循环，解码按频率执行，训练消费潜变量。</li>
+      <li>多样性从动作、状态、场景三个层面注入，噪声尺度受“动作可执行、状态不离流形”约束。</li>
+      <li>误差控制以视界截断为默认，叠加不确定性门控与真实重锚定，<strong>短轨迹工厂优于长轨迹推演</strong>。</li>
+      <li>轨迹质量用一致性、多样性、合理性三项指标联合评估。</li>
+      <li>下一章：VLA 与世界模型的交替训练策略。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch005.html">← 第 005 章：联合训练中的损失函数设计</a>
+    <a class="next" href="ch007.html">第 007 章：VLA与世界模型交替训练策略 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

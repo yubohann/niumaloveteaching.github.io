@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第087章 多机器人协同通信协议设计 | 多机器人协同学习课程 · ROS2 通信与系统集成</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第五篇 · 科研进阶与协同机制</span>
+    <span class="sep">/</span>
+    <span>第 087 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第五篇 · 科研进阶与协同机制</div>
+    <h1>第 087 章：多机器人协同通信协议设计</h1>
+    <p class="lead">DDS 只保证"管子通"，不保证"话说明白"：设计状态与事件双通道、消息信封与版本、增量编码、gossip 分发与协议状态机，让 20 台机器人用最少的字节说清协同所需的一切。</p>
+    <ul class="meta">
+      <li>主题：协同通信协议（应用层设计）</li>
+      <li>关键机制：状态/事件语义分离、消息信封与版本、增量编码、gossip 分发、协议状态机</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 086 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解"话题 ≠ 协议"：DDS 给你传输保证与会话发现，但应用层语义（说什么、说多少、丢了怎么办）必须自己设计。</li>
+      <li>掌握状态（latest-wins）与事件（at-least-once）两类语义的区别，能为每类协同信息选择正确的通道与 QoS。</li>
+      <li>会设计消息信封（schema 版本、类型、序列号、位图增量），使协议能在灰度升级、丢包、乱序下存活。</li>
+      <li>理解 gossip（传染病式）分发的收敛规律：fanout 与轮数的关系，以及去重为什么是防风暴的命门。</li>
+      <li>能写出一个完整协议状态机：加入 → 全量同步 → 增量稳态 → 降级 → 恢复。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>你已经有话题、服务、QoS 三件工具，为什么还要"设计协议"？因为它们各自只解决了通信的一个截面：话题是单向管道、服务是一次问答、QoS 是一次连接合同。而协同需要的是<strong>一条随时间展开的"会话"</strong>：新机器人加入时怎么追上当前全局状态？稳定运行时怎么只传变化量？消息丢了一拍怎么发现、怎么补齐？两台机器人相隔几十秒先后到达，状态怎么合并？这些"跨越时间的说话规则"就是通信协议。</p>
+    <p>没有协议的系统会退化成两种病：<strong>要么"话太多"</strong>，每台机器人 10 Hz 广播全量状态，20 台两两互发直接把 WiFi 带宽占满；<strong>要么"话不成句"</strong>，状态和事件混在一根话题上，后加入者把三天前的事件当成刚发生的，情绪稳定地做出错误决策。本章按第 086 章的四要素框架，把"通信规则"这一项做成可实现的协议：消息怎么设计、通道怎么划分、分发怎么扩散、会话怎么推进。</p>
+    <p>本章的协议跑在 DDS 之上（ROS2 话题承载），它不理解 DDS 的发现细节，只假设"消息可能丢、可能乱序、可能重复"。这个假设比理想网络苛刻，也让协议在任何底层中间件上都成立。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 状态与事件：两条通道，两种语义</h3>
+    <p>协同信息先分两类。<strong>状态（state）</strong>是"现在是什么样"：位置、电量、任务进度。它的正确语义是最新值优先（latest-wins），旧的没收到没关系，新的到了就覆盖；重复收到也没关系（幂等）。<strong>事件（event）</strong>是"发生了一件事"：到达目标点、发现故障、领取任务。它的正确语义是至少一次（at-least-once），丢一个事件可能让系统永远停在错误状态（比如"任务完成"事件丢了，任务池一直等）。两类语义对通道的要求完全相反：</p>
+    <table>
+      <tr><th>维度</th><th>状态通道</th><th>事件通道</th></tr>
+      <tr><td>触发方式</td><td>周期 + 变化触发（带死区）</td><td>仅在事件发生时</td></tr>
+      <tr><td>QoS 可靠性</td><td>Best-effort（丢一帧等下一帧）</td><td>Reliable（丢了必须重传）</td></tr>
+      <tr><td>持久性</td><td>Volatile 或 Transient-local</td><td>Volatile + 幂等键去重</td></tr>
+      <tr><td>乱序容忍</td><td>天然容忍（时间戳新者胜）</td><td>需要序列号区分新旧</td></tr>
+      <tr><td>典型大小</td><td>15–40 字节/机（增量后）</td><td>64–128 字节/条（稀疏）</td></tr>
+    </table>
+    <p><strong>最常见的协议错误是"把事件当状态发"或反过来</strong>：把"任务完成"做成周期广播的状态，丢一个周期后接收方下次又会收到（还行）；但把"障碍物消失"做成事件，丢一条就永远以为有障碍，反过来把"位置"做成事件，丢一条位置就永远停格。语义选错，后面所有机制都建在流沙上。</p>
+
+    <h3>2. 消息信封：版本、序号与幂等键</h3>
+    <p>每条消息共用一个固定头部（信封），它是协议进化的地基：</p>
+    <div class="formula">
+      envelope = (schema_ver, msg_type, robot_id, seq) + payload
+      <span class="note">schema_ver 让新旧节点共存（灰度升级）；seq 让接收端检测丢包与乱序；msg_type 决定 payload 的解析方式</span>
+    </div>
+    <p>为什么必须有 schema_ver？因为多机器人系统的升级不是原子的：你不可能 20 台同时重启。带版本后，新节点收到旧消息按旧 schema 解析，旧节点收到新消息至少能识别出"版本不认识"并安全忽略，避免崩溃或误解析。为什么必须有 seq？它是接收端唯一的"体检工具"：收到 seq=7 之后直接跳到 seq=9，说明 8 丢了，状态消息丢了无所谓，事件消息丢了就触发补拉或请求重发。<strong>没有序号的协议在丢包面前是盲人。</strong></p>
+
+    <h3>3. 增量编码：把"说了什么"压到最小</h3>
+    <p>状态消息随频率传播，是协议的常态负载，值得专项压缩。机器人状态字段量级：位置（x、y 各 int16 厘米 = 4 字节）、朝向（int8，约 1.4° 精度 = 1 字节）、电量（uint8 = 1 字节）、状态码（uint8 = 1 字节），全量约 16 字节含头部。而稳态运行时，很多字段根本不变化（电量几秒才动一格），用<strong>位图增量</strong>：1 字节位图标记哪些字段被包含，只打包变化的字段。实测稳态下平均每消息 3–5 字节 payload，比全量省 30–50%；状态字段越多（加点云索引、任务进度等），增量优势越大。</p>
+    <div class="formula">
+      全量周期广播（20 台、全连接）= 19 × 200 B × 5 Hz ≈ 19 KB/s/机 → 系统级 380 KB/s
+      增量 + 邻居 fanout=2 = 2 × (8 B 头 + 6 B 载荷) × 5 Hz ≈ 140 B/s/机 → 系统级约 2.8 KB/s
+      <span class="note">协议设计把"能不能用"变成"差两个数量级还多"</span>
+    </div>
+
+    <h3>4. gossip 分发：为什么"随机转两条"能扩散到全场</h3>
+    <p>全连接广播太快饱和，环状单播又传播太慢，工程里的甜点区是传染病式分发（gossip）：<strong>每个收到新消息的节点，随机选 fanout 个邻居转发</strong>。从 1 个节点播种，传播人数按每轮 ×(fanout+1) 增长，因为每轮被"感染"的人都会再去感染 fanout 个新人。到达全部 N 人所需轮数约 ⌈log<sub>(fanout+1)</sub> N⌉：</p>
+    <div class="formula">
+      fanout = 2、N = 20 → 轮数 ≈ ⌈log<sub>3</sub> 20⌉ = 3；若每轮 20 ms，全场收敛 &lt; 100 ms
+      <span class="note">每轮总消息数 = 已感染数 × fanout，总开销 O(N·fanout)，与 N 线性；扩散时间对数级</span>
+    </div>
+    <p>gossip 在丢包下也健壮：某条转发丢了，别的路径还在传；节点掉线后重新上线，下一波消息自然会扩散到它。代价是两点：<strong>（1）去重必须做</strong>（收到重复消息不再转发，否则同一消息被指数级复制；用 msg_id 集合去重）；<strong>（2）有概率尾巴</strong>（最后一两个人可能几轮没被抽到，需要"反熵"兜底：周期性发全量摘要对齐，也就是下面状态机里的 SYNC）。</p>
+
+    <h3>5. 协议状态机：会话有生命周期</h3>
+    <p>单条消息设计好之后，把它们组织成"会话"：</p>
+    <ul>
+      <li><strong>JOIN</strong>：新节点广播 ANNOUNCE（带自己的 id 与版本），老成员回复 HELLO。为什么先声明再对话：让双方在交换状态前确认协议版本兼容。</li>
+      <li><strong>SYNC</strong>：新节点从任一老成员拉取全量状态快照（用 Transient-local 的"最后一条"或显式请求应答）。为什么必须先全量同步：增量只描述"变化"，新加入者没有基准无从应用。</li>
+      <li><strong>STEADY</strong>：增量 + gossip 分发 + 心跳；事件走可靠通道。</li>
+      <li><strong>DEGRADED</strong>：连续 2 s 没有收到任何队友消息（全体静默；单台失联不算），说明网络或自身两端有问题，进入保守模式：降速、停接新任务、周期性重试 JOIN。</li>
+      <li><strong>RECOVER</strong>：重新 JOIN 后必须重新 SYNC，为什么不能接着增量：降级期间错过的变化无从补齐，重新拉全量最诚实。</li>
+    </ul>
+    <p>这套状态机与第 085 章的租约系统兼容：租约负责"任务归属"，本协议负责"状态传播"，心跳同时服务两者，<strong>协议层做通用，机制层做专务</strong>。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>把协议落到 ROS2：两个话题通道 + 两个服务 + 一张消息清单。</p>
+    <h3>消息清单（20 台车队参考配置）</h3>
+    <table>
+      <tr><th>消息</th><th>通道</th><th>触发/频率</th><th>大小</th><th>QoS</th></tr>
+      <tr><td>ANNOUNCE / HELLO</td><td><code>/fleet/events</code></td><td>加入时各 1 次</td><td>32 B</td><td>Reliable, Volatile</td></tr>
+      <tr><td>STATE（全量/增量）</td><td><code>/fleet/state</code></td><td>变化 + 5 Hz 保底</td><td>15–40 B</td><td>Best-effort, Volatile</td></tr>
+      <tr><td>EVENT（到达/故障等）</td><td><code>/fleet/events</code></td><td>事件驱动</td><td>64 B</td><td>Reliable, Volatile</td></tr>
+      <tr><td>HEARTBEAT</td><td><code>/fleet/heartbeat</code></td><td>2 Hz 周期</td><td>16 B</td><td>Best-effort, Volatile</td></tr>
+      <tr><td>SYNC 请求/应答</td><td>服务 <code>/fleet/sync</code></td><td>加入/恢复时</td><td>2–10 KB</td><td>Reliable</td></tr>
+    </table>
+    <p>三个设计决定逐条给理由：<strong>（1）状态话题采用变化触发加 5 Hz 保底</strong>：机器人静止时没有变化，但队友仍需要确认它活着且位置正确（收敛尾巴的兜底）；5 Hz 对 20 台只有 KB/s 级。<strong>（2）事件与状态共用 <code>/fleet/events</code> 还是分开？</strong>分开成两个话题：可靠性 QoS 不同（Reliable 与 Best-effort 不匹配会静默断路），且订阅者兴趣不同（任务监听者只关心事件）。<strong>（3）SYNC 用服务</strong>，请求-应答语义天然匹配，且只在会话建立时刻发生，不需要占用常驻带宽。</p>
+    <h3>版本演进规则（写进团队约定）</h3>
+    <ul>
+      <li>只增字段、不改语义：新字段必须有默认值，旧节点忽略未知字段（解析器按 schema_ver 分支）。</li>
+      <li>删除字段先弃用再删除：至少两个发布周期内保留解析支持。</li>
+      <li>语义破坏性修改（改单位、改坐标系）= 新消息类型 + 新话题，不硬塞进旧 schema。</li>
+      <li>灰度顺序：先升级接收端（老发送者、新接收者），再升级发送端，保证任一瞬间的新旧组合都有定义。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：信封 + 位图增量编码，稳态只发变化的字段</strong></p>
+    <pre class="code"><code>import struct
+
+def encode_state(robot_id, seq, state, mask):
+    """状态消息：8 字节信封 + 1 字节位图 + 变化字段。
+    state 固定五字段：x(米), y(米), theta_deg, battery, status。"""
+    # schema_ver=1, msg_type=2(STATE)，序号给接收端做丢包体检
+    head = struct.pack("&lt;BBHI", 1, 2, robot_id, seq)
+    body = struct.pack("&lt;B", mask)          # 位图：第 i 位=1 表示第 i 字段在后文
+    if mask &amp; 0x01:
+        body += struct.pack("&lt;h", int(state["x"] * 100))     # 厘米 int16
+    if mask &amp; 0x02:
+        body += struct.pack("&lt;h", int(state["y"] * 100))
+    if mask &amp; 0x04:
+        body += struct.pack("&lt;b", int(state["theta_deg"] / 4.0))  # 约 1.4°/LSB
+    if mask &amp; 0x08:
+        body += struct.pack("&lt;B", state["battery"])         # 电量 0-100
+    if mask &amp; 0x10:
+        body += struct.pack("&lt;B", state["status"])          # 状态码
+    return head + body
+
+def changed_mask(prev, cur, eps=0.05):
+    """死区 + 变化检测：位置变化超过 5 cm 才算"变了"。
+    死区防止机器人在原地微动时刷屏。"""
+    m = 0
+    if abs(cur["x"] - prev["x"]) &gt; eps or abs(cur["y"] - prev["y"]) &gt; eps:
+        m |= 0x03                       # x、y 一起发：分开容易产生撕裂的坐标对
+    if abs(cur["theta_deg"] - prev["theta_deg"]) &gt; 2.0:
+        m |= 0x04
+    if cur["battery"] != prev["battery"]:
+        m |= 0x08
+    if cur["status"] != prev["status"]:
+        m |= 0x10
+    return m
+</code></pre>
+    <p>解读：三个细节各有一层考量。<strong>（1）x 与 y 的位绑定在一起</strong>：位置是一个整体，如果只发 x 不发 y，接收端会短时间内看到"x 是新的、y 是旧的"的撕裂坐标，对决策副作用大于省下的 2 字节。<strong>（2）死区 5 cm</strong>：编码前先判断"算不算变化"，否则连续微动会以全速刷消息；5 cm 低于定位精度量级，对协同决策无损。<strong>（3）朝向量化到 4°</strong>：编队场景对朝向敏感度低于位置，1 字节换精度是划算的；如果应用需要更精（比如相机对准），把 theta 换成 int16（0.06° 精度）只需改一个格式符，这正是信封里 schema_ver 的价值：格式演进有据可查。</p>
+
+    <p><strong>片段 2：序列号体检，丢包与乱序的检测器</strong></p>
+    <pre class="code"><code>class SeqTracker:
+    """每发送者一个序列号跟踪器：正常、跳号、重传三种情况三分支。"""
+    def __init__(self):
+        self.seen = {}                     # robot_id -> 已连续收到的最大 seq
+
+    def on_message(self, rid, seq):
+        expect = self.seen.get(rid, seq - 1) + 1
+        if seq == expect:
+            self.seen[rid] = seq           # 严丝合缝：更新水位
+            return None
+        if seq &gt; expect:
+            self.seen[rid] = seq           # 跳号：中间至少丢了 (seq - expect) 条
+            return ("gap", rid, expect, seq - 1)
+        return "dup"                       # 旧序号：重复或乱序到达，直接丢弃
+</code></pre>
+    <p>解读：跳号之后直接接受新水位（丢了就丢了），<strong>因为状态消息本来就是 latest-wins 语义，补旧不如等新</strong>；返回的 gap 事件交给上层决定：状态丢包记一个指标即可，事件丢包则触发"向该机器人点对点补拉"（那是事件通道 Reliable 的职责，这里是最后防线）。"dup" 分支看起来无害，其实保护了 gossip 的一致性：重复消息不进入转发逻辑，漏洞在这里被堵住。另外注意 <code>seen.get(rid, seq-1)+1</code> 的巧妙：首次见到某发送者时不误报跳号（把当前 seq 当基准）。</p>
+
+    <p><strong>片段 3：gossip 转发，随机 fanout + msg_id 去重</strong></p>
+    <pre class="code"><code>import random
+
+class GossipNode:
+    """传染病式分发：每个新消息随机转发给 fanout 个邻居。"""
+    def __init__(self, neighbors, fanout=2, cache=512):
+        self.neighbors = neighbors         # 邻居列表（订阅到的活跃机器人）
+        self.fanout = fanout               # 2 是经典甜点：收敛快、冗余可接受
+        self.cache = cache
+        self.seen_ids = set()              # msg_id 去重集合：防指数复制
+        self.recent = []                   # 简易 FIFO：让去重集合有界
+
+    def on_receive(self, msg):
+        if msg.msg_id in self.seen_ids:
+            return []                      # 已见过：不转发（协议的第一条铁律）
+        self.seen_ids.add(msg.msg_id)
+        self.recent.append(msg.msg_id)
+        if len(self.recent) &gt; self.cache:
+            self.seen_ids.discard(self.recent.pop(0))   # 有界内存：丢最老的 id
+        k = min(self.fanout, len(self.neighbors))
+        peers = random.sample(self.neighbors, k)        # 随机挑选：抗丢包
+        return [peer for peer in peers]    # 交给上层逐邻居发送
+
+# 20 台、fanout=2：约 3 轮收敛；每轮消息数 ≤ 20×2=40，量级 O(N·fanout)
+</code></pre>
+    <p>解读：两个工程要点。<strong>（1）去重集合必须有界</strong>：msg_id 无限累积会吃光内存（长跑系统的经典泄漏）；用 FIFO 只保留最近 512 条，超期重复消息理论上可能二次转发，但 512 条窗口远超传播生命周期（秒级），实践中不会出问题。<strong>（2）用随机选择替代顺序轮转</strong>：如果每台机器人总是转发给固定两个邻居，某条链路持续丢包就会形成永久传播盲区；随机化让盲区变成瞬时低概率事件，gossip 的鲁棒性正来自"每轮受害者也不同"。fanout=2 是"收敛速度 vs 冗余流量"的典型折中：fanout=1 收敛慢且脆弱，fanout=3+ 收敛只快一点点但流量线性上升。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>事件当状态发，或反之</strong>：把"发现障碍"做成 5 Hz 周期状态（障碍消失后还在播），或把"位置"做成事件（丢一条位置永远停格）。修复：过一遍第 1 小节的判据，latest-wins 语义的走状态通道，occurrence 语义的走事件通道。</li>
+      <li><strong>无版本升级直接把 20 台机器人换新消息</strong>：升级期新旧节点混跑，旧节点把新消息解析成乱码指令。修复：信封带 schema_ver，先升级接收端、后升级发送端；破坏性改动走新话题。</li>
+      <li><strong>去重集合无限增长</strong>：长跑 48 小时后 gossip 节点内存缓慢上涨直到被 OOM 杀掉。修复：FIFO 有界去重窗口（512 条量级即可），并把内存占用纳入长跑监控。</li>
+      <li><strong>把 SYNC 做成增量</strong>：新机器人加入时只收到"谁谁的位置变了"，没有基准，界面上一片空白。修复：加入/恢复必走全量快照；稳态才用增量，状态机的相位决定语义。</li>
+      <li><strong>状态话题与事件话题混用同一 QoS</strong>：为省事全用 Reliable，状态流的重传挤占了事件与控制的带宽。修复：状态 Best-effort + 死区触发，事件 Reliable，<strong>语义对齐 QoS，不要图省事</strong>。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>算一算：N = 40 台、fanout = 2 时，一条消息传遍全队大约需要几轮？每轮单机转发多少条消息、全队总量是多少？（用轮数 ≈ ⌈log<sub>3</sub> N⌉ 估算，并对比 fanout = 3 的情形。）<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>log₃40 ≈ 3.4 → 4 轮；每轮每台最多转发 2 条，全队每轮 ≤ 80 条；fanout=3 时 log₄40 ≈ 2.7 → 3 轮，但每轮 ≤ 120 条。收敛快一轮，代价是 50% 流量，这就是 fanout 的权衡点。</div></details>
+      </li>
+      <li>改配置并预测结果：把状态话题从"5 Hz 保底 + 变化触发"改为"纯变化触发（无保底）"，预测以下三件事的变化：静止机器人的位置可信度、系统带宽、gossip 收敛的"最后一公里"。再用仿真验证。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>静止机器人不再发消息，新加入者或丢包者永远无法从它的沉默中区分"没变化"与"失联"；带宽下降但心跳仍在；gossip 尾巴失去兜底。结论：保底频率是廉价保险，别省。</div></details>
+      </li>
+      <li>设计：为"夜间巡逻 + 异常集结"场景写出完整消息清单表（消息名、通道、触发、大小、QoS、schema 字段），并标出哪三条消息必须走 Reliable 及理由。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>参考本章消息清单表；必须 Reliable 的通常是：异常事件（丢了就没人集结）、集结确认（双向承诺）、退出/失联通告。位置与巡逻进度走 Best-effort 状态流。</div></details>
+      </li>
+      <li>推导：证明"位图增量在字段独立变化"假设下比全量编码平均省 50% 以上（提示：以 5 字段为例，假设每个字段每步独立地以概率 p=0.2 变化，计算期望传输字节数与全量字节数之比），并讨论字段相关性（如 x、y 同变）对结论的影响。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>期望变化字段数 = 5×0.2 = 1，payload ≈ 1 字段均值 1.5 B + 位图 1 B ≈ 2.5 B，对比全量约 9 B payload，节省约 70%。x、y 绑定使有效 p 上升（0.2→0.36 量级），节省率下降，相关字段越多，增量的边际收益越低。</div></details>
+      </li>
+      <li>实验：用片段 3 的 GossipNode 在 20 个节点、5% 丢包、随机拓扑下模拟 1000 条消息的分发，统计每条的收敛轮数与未收敛比例；把 fanout 从 2 调到 4 再跑一遍，用一页报告比较两组的收敛分布与冗余倍数。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>预期：fanout=2 平均 3–4 轮收敛、少量尾巴需"反熵"兜底；fanout=4 平均 2 轮但消息量翻倍。报告里给出"收敛 P95 轮数 vs 冗余倍数"两条曲线，结论按场景选（实时性优先用 4，带宽优先用 2）。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>话题是管子，协议是说话规则：会话的成立条件（加入/同步）、展开方式（增量/事件）、失败出口（降级/恢复）都要显式设计。</li>
+      <li>状态（latest-wins，Best-effort + 死区触发）与事件（at-least-once，Reliable + 幂等键）分通道承载，语义与 QoS 对齐。</li>
+      <li>消息信封 = schema 版本 + 类型 + 发送者 + 序列号；版本支持灰度共存，序号让丢包与乱序可见。</li>
+      <li>位图增量 + 死区把稳态负载压一个数量级；x、y 等强相关字段要么绑定发送、要么接受撕裂风险。</li>
+      <li>gossip：fanout=2 时 20 台约 3 轮收敛，开销 O(N·fanout)；msg_id 有界去重是防风暴与防内存泄漏的双保险。</li>
+      <li>协议状态机：JOIN → SYNC（全量）→ STEADY（增量）→ DEGRADED（保守）→ RECOVER（重新全量），相位决定语义。</li>
+      <li>下一章从"怎么说话"转向"怎么看得更广"：<strong>协同感知机制</strong>，多机观测融合、一致性与跟踪级架构。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch086.html">← 第 086 章：多机器人协同机制设计方法论</a>
+    <a class="next" href="ch088.html">第 088 章：多机器人协同感知机制 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

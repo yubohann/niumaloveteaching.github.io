@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第030章 实现接触检测与奖励 | 机器人仿真学习课程 · Isaac Sim 强化学习训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · 仿真环境与训练框架</span>
+    <span class="sep">/</span>
+    <span>第 030 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · 仿真环境与训练框架</div>
+    <h1>第 030 章：实现接触检测与奖励</h1>
+    <p class="lead">把"碰到没碰到"变成可学习信号：接触事件的检测、去抖、一次性奖励与力窗口设计，动机是让奖励帮你精确表达"想要什么样的接触"。</p>
+    <ul class="meta">
+      <li>主题：奖励设计 / 接触事件</li>
+      <li>相关组件：Isaac Sim（接触报告 / 力）、Stable-Baselines3</li>
+      <li>预计学时：45 分钟</li>
+      <li>前置章节：第 029 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>掌握接触检测的三层实现：物理接触报告、净接触力阈值、几何距离代理，各自的精度与成本。</li>
+      <li>会做接触事件的"瞬间判定"与去抖：用前一时刻状态维护事件边沿，避免逐帧奖励抖振。</li>
+      <li>理解接触奖励的四类形态（触碰一次性奖励、力窗口塑形、超力惩罚、脱离惩罚）及其权重设计。</li>
+      <li>能识别并修复"接触奖励刷分"（reward hacking）：策略贴着物体反复触碰骗奖励的行为。</li>
+      <li>会把接触事件同时用于奖励与终止判断，形成接触丰富任务的奖励骨架。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>上一章你学会了把力信号"读出来"，本章要把它"用起来"。接触事件是操作任务里最基础的成功判据构件：抓到了没（夹爪与物体接触）、到达了没（工具与目标接触）、撞坏了没（接触力超限）。<strong>很多任务用"接触 + 条件"就能写出稀疏但正确的奖励，比调一堆塑形项可靠得多。</strong></p>
+    <p>接触奖励同时也是最容易出问题的地方：奖励写成一个逐帧电费表，策略就会用"贴着刷新"的方式薅羊毛；不做去抖，一秒里接触状态翻转几十次，奖励噪声比信号还大；把全机器人的接触力都算进来，地面接触也变成"触碰奖励"。本章逐个解决这些问题，你从第 036 章开始看到的每一个任务，奖励函数里都有本章方法的影子。</p>
+  </section>
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 接触检测的三条实现路线</h3>
+    <table>
+      <tr><th>路线</th><th>原理</th><th>优点</th><th>成本/局限</th></tr>
+      <tr><td>物理接触报告</td><td>PhysX 对指定刚体报告接触对与接触点，按力/穿透阈值过滤</td><td>精确、可直接拿到接触点与法向</td><td>开关式启用，报告量大时有开销；需给每个环境正确设置过滤</td></tr>
+      <tr><td>净接触力阈值</td><td>读取刚体净接触力，模长超过阈值即判定接触</td><td>接口最简单；与第 029 章复用</td><td>只能给"合力"，区分不出接触点；地面支撑力会混入</td></tr>
+      <tr><td>几何距离代理</td><td>用末端与目标表面距离，低于阈值视为"准接触"</td><td>零物理成本、对穿模鲁棒</td><td>阈值依赖几何先验；快速掠过时可能漏判</td></tr>
+    </table>
+    <p><strong>工程默认用"净接触力 + 阈值"，需要接触点信息（如判断是哪个手指先碰到）时再上物理接触报告。</strong>阈值取值要有物理依据：夹爪与物体的稳定接触力通常 2–10 N，取 1.0 N 做"是否接触"的判据，既排除数值噪声（仿真接触求解残差约 0.01–0.1 N），又不会漏掉轻触。</p>
+
+    <h3>2. 事件边沿：把"状态"变成"事件"</h3>
+    <p>接触是一个持续状态，而奖励通常想要一个<b>事件</b>，"刚刚碰到"的那一刻。用状态的上升沿表示事件：</p>
+    <div class="formula">
+      event<sub>t</sub> = contact<sub>t</sub> ∧ ¬contact<sub>t−1</sub>
+      <span class="note">需要为每个环境保存上一帧的接触布尔量；重置时必须把该状态清零，否则会把"上一回合的接触"误判成本回合的上升沿</span>
+    </div>
+    <p>为什么事件化很重要？因为逐帧状态奖励会引导"保持接触刷奖励"的行为，而上升沿事件奖励不可重复刷取（一次回合通常只有一个上升沿）。<strong>这是奖励设计里"事件 vs 状态"的通用原则：想让行为发生一次，奖励边沿；想让状态保持，惩罚偏差。</strong>进阶做法是加去抖（debounce）：要求接触连续维持 k 帧（如 3 帧 = 50 ms）才确认"真的碰上了"，否则该接触视为传感器噪声，这会把策略从"点一下就缩回"的投机路径赶回物理上可信的接触。</p>
+
+    <h3>3. 接触奖励的四种形态与权重</h3>
+    <p>围绕同一次接触，通常叠加四个分量，各司其职：</p>
+    <ul>
+      <li><b>触碰事件奖励</b>：首次接触 +1.0（一回合一次）。给出强稀疏信号，直接回答"任务的关键一步做了没"。</li>
+      <li><b>力窗口塑形</b>：r = −w<sub>f</sub>·|F − F<sub>target</sub>|/F<sub>target</sub>，让接触力保持在目标窗口（如 5 N）附近。w<sub>f</sub> 取 0.1 量级，塑形是"锦上添花"，不能盖过事件信号。</li>
+      <li><b>超力惩罚</b>：F &gt; F<sub>safe</sub>（如 30 N）时收到 −1.0 且可以触发终止。它表达的是"安全约束"，用未滤波的原始力判定（第 029 章的原则）。</li>
+      <li><b>脱离惩罚</b>：本该保持接触的阶段里接触丢失，给 −0.5。它把"抓着不放"和"碰一下就跑"区分开。</li>
+    </ul>
+    <p>权重设计的纪律：<strong>事件与安全是"主角"（±1 量级），塑形是"配角"（0.1 量级）</strong>。常见错误是把力窗口塑形的权重也给 1.0，结果策略为了维持"完美的 5 N"而完全无视任务推进，塑形项的目标是加速学习，不是定义任务。</p>
+
+    <h3>4. 奖励刷分与它的三种疫苗</h3>
+    <p>只要奖励里存在"可重复获取"的项，策略就会找到重复路径。接触奖励的经典作弊模式是"贴着目标反复碰"：接触→断开→再接触，每个上升沿都领钱。三种防御：</p>
+    <ol>
+      <li><b>事件一次性</b>：上升沿奖励加"每回合只发一次"的掩码（配合 3 帧去抖，把每回合的假事件数量压到接近 0）。</li>
+      <li><b>脱离惩罚配对</b>：想刷新接触就要先付"脱离"的成本，把刷分路径变成负收益。</li>
+      <li><b>以任务进度为主奖励</b>：接触奖励的权重不能大到让策略忘记目标（如抓取任务的最终奖励是"举起来"）；<strong>当塑形项收益超过任务项时，策略必然刷分</strong>。</li>
+    </ol>
+
+    <h3>5. 接触状态与终止：一对好搭档</h3>
+    <p>终止条件常和接触信号联动：物体掉落（脱离 + 高度低于阈值）、超力接触（安全性）、意外碰撞（如机械臂碰到非目标物体）。<b>判断终止用的是"原始力"和"未做去抖的瞬时状态"</b>：去抖会让终止晚 50 ms 生效，对安全性判断来说太晚；而奖励通道可以承受这一点延迟。<strong>奖励可以平滑，安全不能平滑，这个区分要在代码注释里写清楚。</strong></p>
+
+    <h3>6. 完整算例：阈值与去抖的信噪比核算</h3>
+    <p>阈值 1.0 N 与去抖 3 帧的组合可以用概率算清楚。设接触求解残差近似高斯、σ=0.1 N（区间 0.01–0.1 N 的上端），则"无接触时单帧噪声越过 1 N"发生在 10 个标准差之外，概率低于 1e-20，单帧误报可以忽略；这就是阈值取 1 N 的依据：0.2 N 只高出残差上端 2 个标准差（σ=0.1 N），会有百分之几的逐帧误报，<strong>1 N 同时避开了数值残差（0.01–0.1 N）与真实轻触（2 N 起）之间的空档</strong>。</p>
+    <p>去抖对付的是"接触维持期间的间歇性塌陷"，高斯噪声在阈值这一层就已经被隔离：物体若与手指反复微分离（刚性接触的解脱-再接触周期），某帧力跌回阈值以下的概率设为 q。连续 3 帧都塌陷才误判"未接触"，误判概率降到 q³：q=0.2 时约 0.8%，q=0.1 时约 0.1%。反向地，单帧毛刺（概率 1%）要连续三帧出现才会误报一次接触，概率降到 1e-6。两个方向的数字说明：<strong>3 帧去抖用 50 ms 的确认延迟换来两个数量级以上的净噪声压制，是划算的</strong>。</p>
+    <p>延迟的代价也要量化：确认延迟 3 帧 = 50 ms，若接触时刻的接近速度为 0.1 m/s，事件确认时末端已多走了约 5 mm。对插孔这类需要"轻触即退"的任务，这 5 mm 会转化成超力风险，处理办法是把"预接触减速"写进任务塑形（接近目标区域时限制速度）；把去抖帧数调回 1 只会把毛刺问题放回来。</p>
+
+    <h3>7. 奖励收支核算：刷分路径为什么是负收益</h3>
+    <p>把"正确行为"与"刷分行为"在一段 500 步（约 8.3 s）的回合里做账。假设刷分策略每秒触碰再脱离 10 次，整回合约 83 次：</p>
+    <table>
+      <tr><th>科目</th><th>正确行为（碰一次并保持推进）</th><th>刷分行为（全回合约 83 次触碰-脱离）</th></tr>
+      <tr><td>触碰事件奖励</td><td>+1.0（一次）</td><td>+1.0（一次性掩码只发首份）</td></tr>
+      <tr><td>脱离惩罚（−0.5/次，保持阶段内）</td><td>0</td><td>约 −41（82 次脱离结算）</td></tr>
+      <tr><td>力窗口塑形（−0.1 量级）</td><td>−0.05 至 −0.2（保持期小额）</td><td>接近 0（大部分时间不在接触）</td></tr>
+      <tr><td>任务推进奖励</td><td>+5 量级（0.01/步 × 500 步）</td><td>0（不推进）</td></tr>
+    </table>
+    <p>账目把防线说透了：一次性掩码把刷分者最强的那一路收入砍到与正确行为同额，脱离惩罚把它变成约 −40 的净亏，任务推进项再拉开正向差距。反过来若拆掉任意一环：掩码去掉则 83 次触碰给 +83（远超成功奖励），脱离惩罚去掉则刷分净收益为正。<strong>防刷分不靠"策略自觉"，靠每一项的收支都算过账</strong>，这张表就是模板：把你的奖励项逐条列成收入/支出，找找有没有净收益为正的捷径。</p>
+
+    <h3>8. 边界与失效模式</h3>
+    <ul>
+      <li><strong>轻快敲击被去抖吞掉</strong>：接触持续时间短于 3 帧（50 ms）的敲击根本到不了 confirmed 状态，事件奖励永远不发。判据：任务是否存在"轻点一下就算成功"的合法接触；若是，给这类接触单独开一条"原始上升沿 + 一次性掩码"的通路，去抖只管状态型用途。</li>
+      <li><strong>阈值与负载重量的错位</strong>：0.5 kg 物体的重力载荷约 4.9 N，若阈值设成 1 N 而判据又要求"净接触力超过阈值"，抓着物体静止时接触力包含自重，看起来一切正常；但一旦把阈值提高到 5 N（想过滤支撑力），静止持握的信号就会被误判为"未接触"。修复：夹持类任务的判据区分"抓取保持力"与"外部接触力"，或用指定刚体对过滤掉自重。</li>
+      <li><strong>力窗口目标没有算入自重</strong>：持握阶段传感器读到的 5 N 可能本就是物体的重量，窗口目标若再设 5 N，策略会把"额外夹紧"当成训练目标。修复：标定空载与带载两种状态的基线，窗口围绕"接触力 − 载荷基线"设。</li>
+      <li><strong>去抖计数与模仿跨帧状态漏重置</strong>：count 或 touch_awarded 漏进重置清单时，新回合要么"出生即接触"，要么"触碰奖励永远不再发"。修复：维护一张跨帧状态清单，重置时逐项清零，并用"每回合事件计数"日志核对。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p><strong>接触奖励的工程实现分五步：确定检测对象 → 取信号并阈值化 → 去抖 + 事件掩码 → 组装四个奖励分量 → 与终止逻辑对接。</strong>关键状态（上一帧接触、事件已发放掩码）都要进入重置清单。</p>
+    <ol>
+      <li><strong>检测对象</strong>：只对"末端执行器（夹爪指掌）与目标物体"这一对做接触判定，不对全场刚体开报告，这是性能与语义的双重要求。</li>
+      <li><strong>阈值与去抖</strong>：接触力模长 &gt; 1.0 N 记 contact=1；连续 3 帧为 1 才算确认接触。</li>
+      <li><strong>事件掩码</strong>：<code>first_touch = confirmed ∧ ¬prev_confirmed</code>；发放后置 <code>touch_awarded=True</code>，回合内不再发。</li>
+      <li><strong>奖励组装</strong>：touch + force-window + over-force penalty + lose-contact penalty；四项权重刻意差一个数量级。</li>
+      <li><strong>终止对接</strong>：超力（原始力）立即终止并给负奖励；目标物体落地失败终止；回合接近上限的阶段性判定。</li>
+    </ol>
+    <table>
+      <tr><th>参数</th><th>推荐值</th><th>理由</th></tr>
+      <tr><td>接触阈值</td><td>1.0 N</td><td>高于求解残差（0.01–0.1 N）、低于典型轻触（2 N）</td></tr>
+      <tr><td>去抖帧数</td><td>3 帧（50 ms）</td><td>滤掉单帧数值毛刺，又不拖慢真实接触的确认</td></tr>
+      <tr><td>触碰事件奖励</td><td>+1.0（一次性）</td><td>强稀疏信号、不可刷</td></tr>
+      <tr><td>力窗口</td><td>5 N，w=0.1</td><td>塑形配角；窗口来自任务物理需求</td></tr>
+      <tr><td>超力阈值</td><td>30 N，罚 −1.0 并终止</td><td>安全约束；用原始力判定</td></tr>
+      <tr><td>脱离惩罚</td><td>−0.5（仅"应保持"阶段）</td><td>与事件奖励配对，堵刷分路径</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计思维：接触奖励是"中间站"，不是"终点"</span>
+      <p>接触本身极少是任务目标，它只是通往目标的必经之路。<strong>奖励结构应该是"接触事件 → 保持接触/推进 → 最终成功"的梯子</strong>：触碰给 1.0，让策略知道方向；持续接触下的推进（如插入深度、抬升高度）给 0.5 量级的连续信号；最终成功再给 3–10 的大额奖励。梯子上每一级都要有合理高度差，否则策略学会了第一级就不想往上爬，这在第 037 章抓取与第 041 章插拔的奖励设计里会被反复引用。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：接触读取与去抖状态机</strong></p>
+    <pre class="code"><code>import torch
+
+class ContactTracker:
+    """接触状态跟踪：阈值 → 去抖 → 事件边沿，三个状态量都随回合重置"""
+    def __init__(self, num_envs, threshold=1.0, debounce_frames=3, device="cuda"):
+        self.threshold = threshold                        # 1 N：高于残差、低于轻触
+        self.debounce = debounce_frames                   # 连续 3 帧才算确认：抗单帧毛刺
+        self.device = device
+        self.count = torch.zeros(num_envs, dtype=torch.long, device=device)   # 连续接触计数
+        self.confirmed = torch.zeros(num_envs, dtype=torch.bool, device=device)  # 去抖后状态
+        self.raw = torch.zeros(num_envs, dtype=torch.bool, device=device)     # 未去抖：给终止用
+
+    def reset(self, env_ids):
+        self.count[env_ids] = 0                           # 不重置 = 上回合的接触渗进新回合
+        self.confirmed[env_ids] = False
+        self.raw[env_ids] = False
+
+    def update(self, force_norm):
+        """force_norm: (N,) 末端净接触力模长（原始值，未滤波）"""
+        self.raw = force_norm &gt; self.threshold            # 瞬时判定：安全逻辑用它
+        self.count = torch.where(self.raw, self.count + 1,
+                                 torch.zeros_like(self.count))   # 连续帧计数，断开即清零
+        prev_confirmed = self.confirmed.clone()
+        self.confirmed = self.count &gt;= self.debounce      # 去抖后的"确认接触"
+        event = self.confirmed &amp; (~prev_confirmed)        # 上升沿：本帧刚刚"确认碰上"
+        return event</code></pre>
+    <p>解读：这个状态机里有三个布尔量，每个都对应一个明确用途，<b>合在一起才是"正确的接触抽象"</b>。<code>raw</code> 是最快的信号（零延迟），终止与安全判断用它；<code>count/confirmed</code> 是去抖后的稳定状态，观测与状态奖励用它；<code>event</code> 是上升沿，一次性奖励用它。三者分开存储的代价是几十字节，收益是"同一物理事件在不同用途下各取所需"，避免"用去抖信号判终止导致晚 50 ms 反应"或"用瞬时信号发奖励导致一次接触发五份奖金"的两难。<b><code>torch.where</code> 那一行是去抖的精髓</b>：接触时计数加一、断开时直接清零，"中断即重新计"保证了只有"连续"接触才能累积到 3 帧。<b>重置清单</b>：三个状态全部清零；漏掉任何一个，新回合开头都会出现"幽灵事件"。</p>
+
+    <p><strong>片段 2：四分量接触奖励的组装</strong></p>
+    <pre class="code"><code>class ContactReward:
+    """接触奖励：事件 + 力窗口 + 超力惩罚 + 脱离惩罚；权重刻意差一个数量级"""
+    def __init__(self, num_envs, f_target=5.0, f_safe=30.0, device="cuda"):
+        self.f_target = f_target            # 期望接触力 5 N：来自任务物理分析
+        self.f_safe = f_safe                # 30 N 安全上限：超过即罚并终止
+        self.touch_awarded = torch.zeros(num_envs, dtype=torch.bool, device=device)
+        self.keep_phase = torch.zeros(num_envs, dtype=torch.bool, device=device)  # 应保持接触阶段
+
+    def reset(self, env_ids):
+        self.touch_awarded[env_ids] = False
+        self.keep_phase[env_ids] = False
+
+    def compute(self, tracker, force_mag, raw_force_mag):
+        rew = torch.zeros_like(force_mag)
+
+        first_touch = tracker.confirmed &amp; (~self.touch_awarded)
+        rew = rew + first_touch.float() * 1.0          # 事件奖励 +1：同回合只发一次，天然不可刷
+        self.touch_awarded |= tracker.confirmed        # 发放后打标记：之后不再重复
+
+        in_contact = tracker.confirmed
+        window_err = (force_mag - self.f_target).abs() / self.f_target
+        rew = rew - 0.1 * window_err * in_contact.float()   # 力窗口塑形：配角，权重 0.1
+
+        over = raw_force_mag &gt; self.f_safe             # 超力判定用原始力：滤波会洗白冲击
+        rew = rew - over.float() * 1.0                 # 安全惩罚：与事件奖励同级
+
+        lost = self.keep_phase &amp; (~in_contact)
+        rew = rew - lost.float() * 0.5                 # 应保持却脱离：堵"碰一下就跑"的作弊路径
+        return rew, over                               # over 同时交给终止逻辑使用</code></pre>
+    <p>解读：这段代码是"奖励权重纪律"的活教材。<b>四个分量的系数 1.0 / 0.1 / 1.0 / 0.5</b> 不是随手写的：事件与安全是任务级信号（+1/−1），力窗口是学习加速器（−0.1），脱离惩罚是对冲工具（−0.5），<strong>任何一个塑形项的累计收益都不该超过一次任务事件</strong>。假想刷分场景：策略每秒断开再接触 10 次，若无 <code>touch_awarded</code> 机制可薅 10 分/秒；现在第一份之外为零，且每次断开吃 −0.5，刷分路径变成负收益。另一个细节是 <code>over</code> 被同时返回给终止逻辑：<b>同一个判据服务两个用途（奖励 + 终止）时，要确保它们读的是同一个物理量</b>（这里都是原始力），如果终止用去抖、奖励用原始，会出现"被罚了但没终止"的不一致日志。</p>
+
+    <p><strong>片段 3：接进环境循环与终止对接</strong></p>
+    <pre class="code"><code>def step_contact_task(self, actions):
+    for _ in range(self.decimation):
+        self._world.step(render=False)               # 物理推进：接触在这里发生
+
+    raw = self._end_effector_net_force()             # (N, 3)：世界系净接触力（第 029 章）
+    raw_mag = raw.norm(dim=-1)                       # (N,)
+    force_mag = self.force_obs.f_filt.norm(dim=-1)   # 观测用的滤波值：奖励窗口参考它
+
+    event = self.tracker.update(raw_mag)             # 去抖状态机：取原始模长做判定
+    rew_contact, over = self.contact_reward.compute(self.tracker, force_mag, raw_mag)
+
+    # 终止：安全（超力）用原始力；任务失败用几何判据；超时用计数器
+    terminated = over | self._object_dropped() | (self.progress_buf &gt;= self.max_steps)
+    truncated = self.progress_buf &gt;= self.max_steps  # 超时截断：引导时与失败区分
+    rew_task = self._task_progress_reward()          # 任务主奖励：接触奖励之外的主体
+    rew = rew_contact + rew_task + self._regularizers()  # 总奖励 = 接触 + 任务 + 正则
+
+    self._autoreset(terminated | truncated)          # 只重置结束的环境
+    return self._build_obs(), rew, terminated, truncated</code></pre>
+    <p>解读：把本章所有构件在这十行里对上了号。<b>注意力的分配</b>：<code>raw_mag</code> 走判定与终止、<code>force_mag</code>（滤波）走塑形，两个变量名刻意不同，读代码的人一眼能看出"哪个信号服务哪个用途"。<b>奖励的层次</b>：<code>rew_contact</code> 只是骨架，真正驱动任务的是 <code>rew_task</code>（如插入深度、抬升高度），本章反复强调的"接触是中间站"在这里落地。<b>终止与截断的分工</b>：<code>terminated</code>（超力/掉落）在引导时按 0 截断，<code>truncated</code>（超时）保留价值估计；这和第 022 章讲的规范完全一致。最后一行 <code>_autoreset</code> 顺手把三个状态机（tracker、reward 掩码、第 029 章的滤波状态）交给环境的重置清单统一清零，<strong>凡是跨步状态，都属于重置清单，一个都不能漏。</strong></p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>接触奖励刷分</strong>：触碰奖励逐帧发放且无脱离罚，策略学会每秒碰十次。症状：成功率低但回合回报异常高。修复：事件一次性 + 脱离惩罚 + 任务奖励权重占主导。</li>
+      <li><strong>全场刚体都算接触</strong>：机器人脚垫、基座与地面的支撑力混进"接触判据"，所有环境开局即"接触"。症状：事件奖励永不触发（上升沿早就发生过了）。修复：只对指定刚体对做判定；接触力查询指定 body 索引。</li>
+      <li><strong>状态不随重置清零</strong>：上一回合的接触计数残留，新回合第一帧就"确认接触"或计数已经累计到去抖阈值。症状：奖励日志出现时空错位的奖励峰值。修复：把接触相关状态全部放进 reset 清单。</li>
+      <li><strong>去抖帧数过大</strong>：想滤噪声把去抖设成 10 帧（167 ms），快速接触（如敲击）根本来不及确认。症状：策略动作有效但奖励不变。修复：去抖 ≤ 3 帧；毛刺主要靠更合理的阈值和滤波在前面处理。</li>
+      <li><strong>用滤波力做安全判定</strong>：撞击被低通"洗白"，超力事件漏判。症状：评估日志中力的峰值远超安全阈值却不终止。修复：安全路径一律读原始力。</li>
+      <li><strong>短敲击被去抖吞掉</strong>：接触短于 3 帧（50 ms）的合法轻点永远到不了确认状态。症状：任务做对了但事件奖励从不发放。修复：为轻点单独开"原始上升沿 + 一次性掩码"通路，去抖只管状态型用途。</li>
+      <li><strong>阈值与自重错位</strong>：把阈值抬高到能过滤支撑力的量级（5 N）后，静止持握 0.5 kg 物体的信号（约 4.9 N）反而被误判为未接触。修复：按刚体对过滤，或用"接触力减载荷基线"的净信号做判定。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>实现"去抖帧数"消融：debounce 设为 1 / 3 / 10，训练同一个触碰任务，从"事件奖励发放次数"的日志解释三者的差异。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>debounce=1 时事件数与"接触翻转次数"挂钩，一次物理接触被算成多次；debounce=10 时真实事件反被漏掉。对照日志的每次接触平均时长（典型 100–300 ms）。</div></details>
+      </li>
+      <li>设计一个"刷分策略"的探测工具：在训练日志里同时跟踪"触碰事件次数/回合"与"任务成功率"。什么样的曲线组合标志策略正在刷分？<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>健康的信号是事件次数接近 1、成功率上升；刷分信号是事件次数远大于 1 且成功率平坦（甚至下降）。</div></details>
+      </li>
+      <li>把力窗口的目标从 5 N 改成 15 N，预测并验证策略接触力的分布变化。用直方图量化"实际接触力"与目标的偏差。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>窗口塑形权重只有 0.1，预期分布向 15 N 移动但不精确贴合；差多少反映塑形权重的强度，这也是检验权重是否合理的指标。</div></details>
+      </li>
+      <li>工程题：给第 029 章的力观测管线接入本章的驱动状态机，跑通"观测用滤波值、奖励用原始值、终止用原始瞬时值"三路信号，并写一段不超过 5 行的验证脚本证明三路确实不同。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>在撞击瞬间打印三个量：滤波值会明显低估峰值、raw 会尖峰、confirmed 会晚几帧翻转。把三者的曲线画在一起，差异一目了然。</div></details>
+      </li>
+      <li>思考题：为什么"事件奖励 + 保持惩罚"的组合比"逐帧状态奖励"更不容易被利用？从 MDP 的回报定义出发给出一段证明式论证。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>逐帧奖励的回报随"持续帧数"线性增长，策略可以直接优化"贴住时长"这个与任务无关的量；事件奖励的回报与时长无关，只表达"发生过"。保持惩罚则给"贴住"这个中间状态定价为负。</div></details>
+      </li>
+      <li>用 7 节的账目模板做一次压力测试：假设你的任务是"把插头插到底"（成功 +10），有人把力窗口权重从 0.1 改成 1.0、窗口误差典型 0.5，保持阶段 200 步。算出正确行为的窗口净支出与成功奖励的对比，判断这个权重是否越界。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>窗口支出 = 1.0 × 0.5 × 200 = 100，远超成功奖励 +10；即便误差只有 0.1，支出也有 20。结论是塑形权重要用"累计支出不得超过任务奖励"反推，先算账再定值。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>接触检测三条路：接触报告（精细）、净接触力阈值（默认）、几何距离（零成本代理）；阈值取 1 N 量级。</li>
+      <li>三个状态量分工：raw（终止/安全，零延迟）、confirmed（观测/状态奖励，去抖 3 帧）、event（一次性奖励，上升沿）。</li>
+      <li>四分量奖励权重纪律：事件 ±1、安全 ±1、力窗口 0.1、脱离 0.5；塑形累计收益不得超过任务事件。</li>
+      <li>防刷分三件套：事件一次性、脱离惩罚配对、任务主奖励占权重主导。</li>
+      <li>本章是本篇的收官：观测三模态（027–029）与接触奖励（030）构成完整拼图。下一章进入第二篇，目标条件强化学习，让奖励从"固定目标"升级为"任意目标"。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch029.html">← 第 029 章：实现基于力传感器的观察</a>
+    <a class="next" href="ch031.html">第 031 章：实现目标条件强化学习 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

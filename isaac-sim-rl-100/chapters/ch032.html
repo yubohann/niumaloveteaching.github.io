@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第032章 实现课程学习 | 机器人仿真学习课程 · Isaac Sim 强化学习训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 任务与技能实现</span>
+    <span class="sep">/</span>
+    <span>第 032 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 任务与技能实现</div>
+    <h1>第 032 章：实现课程学习</h1>
+    <p class="lead">让任务难度会"呼吸"：滑动窗口成功率驱动推动/降级状态机，从简单目标自动爬到困难目标，省去手调十份任务配置的工作量。</p>
+    <ul class="meta">
+      <li>主题：训练策略 / 课程与难度调度</li>
+      <li>相关组件：Isaac Sim、Stable-Baselines3 / RL-Games</li>
+      <li>预计学时：50 分钟</li>
+      <li>前置章节：第 031 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解课程学习要解决的三个问题：稀疏奖励下的探索死路、非平稳难度的训练稳定性、以及人工分级任务的工作量。</li>
+      <li>掌握自动课程的核心机制：用滑动窗口成功率做"晋升/降级"判据，构成难度自适应的闭环。</li>
+      <li>会选择课程变量：目标距离、随机化范围、障碍数量、力阈值，以及为什么随机化范围是最通用的那一个。</li>
+      <li>会实现两种调度器：离散等级状态机与 ADR 式连续范围扩张，并说清各自的适用任务。</li>
+      <li>能诊断课程学习的典型故障：震荡、退课、以及在简单等级上"躺平"。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 031 章的目标空间采样有一个隐含矛盾：从"最远 1 米"的目标开始训练，稀疏奖励下几乎无正样本；从"5 厘米内"的目标开始，策略很快学会，但对远处的泛化要很久才爬上去。<strong>课程学习（curriculum learning）把这个矛盾交给时间：先训简单版本，学好了再升难度。</strong></p>
+    <p>它同时解决了域随机化的"甜区"问题：第 021 章的随机化范围若一开始就开到最大（质量 ±20%、摩擦 0.2–1.0、延迟 0–30 ms），早期学习被噪声淹没；若全程不扩张，策略又养不成鲁棒性。<b>自动域随机化（ADR）把随机化范围本身变成课程变量，成功率达标就"拧大一圈"，本质是让难度跟着能力走。</b>本章覆盖两个主题：难度等级调度与随机化范围调度，它们用的是同一套反馈闭环。</p>
+  </section>
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 为什么需要"难度会动"：三个理论直觉</h3>
+    <ul>
+      <li><b>探索死路</b>：稀疏奖励 + 大目标空间时，随机探索命中目标的概率随难度指数下降（第 031 章算过：ε=5 cm 在 1 m³ 里约 0.5‰）。课程把早期目标收敛到"跳一下够得着"的距离，让正样本密度回到可学习区间。</li>
+      <li><b>非平稳性与平稳化</b>：难度固定时，任务分布是平稳的；难度上移时，分布平移，理论上违反平稳假设。工程上的做法是<b>让难度缓慢漂移（相对策略改进速度趋近准平稳）</b>：每次晋升都要求成功率持续超过阈值，避免了"刚会走就要求跑"的跳变。</li>
+      <li><b>信用分配的远近</b>：简单任务里"成功"离当前动作只有几步（信用分配距离短）；困难任务把成功推到几十步之外。课程让信用分配从近距离开始，逐步拉长，这与 GAE 的 λ 视野配合得很好。</li>
+    </ul>
+
+    <h3>2. 判据：滑动窗口成功率与它的估计误差</h3>
+    <p>自动课程的输入只有一个信号：<b>成功率</b>。逐回合统计会抖动（50 回合里成功 3 次还是 4 次是纯噪声），所以要滑动窗口。向量化训练里的高效实现是<b>指数滑动平均（EMA）</b>：</p>
+    <div class="formula">
+      s ← (1−β)·s + β·1[成功]，  β ≈ 0.005–0.01
+      <span class="note">β=0.01 时有效窗口 ≈ 1/β = 100 个回合；每环境各维护一份 s，判据按全环境均值或分位数取</span>
+    </div>
+    <p>为什么用指数平均、不用"最近 100 回合硬窗口"？滑动窗口实现要维护环形队列/T 队列，EMA 只需一个标量、天然支持并行环境，且"窗口"随时间自然滑动，是向量化训练的事实标准。两个使用纪律：<b>(1) β 与判据阈值要匹配</b>，β=0.05 时窗口只有 20 回合（等效样本量约 39），真实率 0.7 时成功率估计的 1 σ 噪声约 0.07，用阈值 0.7 判晋升会频繁误判；β=0.01 时噪声 σ≈0.033，阈值 0.7 才可靠（口径见第 6 节）。<b>(2) 判据用"均值 + 分位数"双保险</b>：均值达标但存在 20% 环境学不动时，晋升会让弱者彻底脱队，额外要求"25% 分位数的成功率 &gt; 阈值的一半"，让课程照顾尾部。</p>
+
+    <h3>3. 两种调度器：离散等级 vs 连续范围</h3>
+    <table>
+      <tr><th>调度器</th><th>课程变量</th><th>晋升/降级</th><th>适用</th></tr>
+      <tr><td>离散等级状态机</td><td>目标距离档位、障碍数量、地形难度</td><td>成功率 &gt; 0.7 晋一级；&lt; 0.3 降一级；级间不跃迁</td><td>目标/地形可明确分级的任务</td></tr>
+      <tr><td>连续范围扩张（ADR）</td><td>随机化参数范围（质量、摩擦、延迟）</td><td>成功率 &gt; 0.8 时范围各扩 20%（设上限）；&lt; 0.5 时收 20%</td><td>域随机化、鲁棒性训练</td></tr>
+      <tr><td>逐环境等级（混合）</td><td>每个并行环境各自的等级</td><td>各自晋升降级，互不同步</td><td>大规模并行（4096 环境=同时上很多课）</td></tr>
+    </table>
+    <p>最值得推荐的是<b>逐环境等级</b>：4096 个环境里，总有一部分在"简单课"、一部分在"困难课"，梯度信号同时包含两级分布，比全局同步晋升"同时上课"吞吐利用得更充分。代价是观测里要带等级（或至少奖励/终止按各自等级算对），实现稍复杂。</p>
+
+    <h3>4. 升降级的稳定性设计：滞回与冷却期</h3>
+    <p>直接从 0.7 晋、0.7 降会得到"晋升—掉到 0.69—降级—升到 0.7，"的高频振荡，策略在两个难度的分布间反复横跳。<strong>三个稳定器把它们钉住</strong>：</p>
+    <ul>
+      <li><b>滞回（hysteresis）</b>：晋升阈值 0.7，降级阈值 0.3，中间地带保持不动，形成"死区"。</li>
+      <li><b>冷却期（cooldown）</b>：每次等级变化后锁定 2000 个决策步不做判断，给策略适应新难度的时间。</li>
+      <li><b>单次不越级</b>：一次只动一级；连续两次达标的间隔至少一个冷却期。</li>
+    </ul>
+    <p>参数之间还有量纲关系：冷却期要显著大于策略的学习时间尺度（至少几千步），否则策略还没开始适应就被降回去，课程"原地踏步"。</p>
+
+    <h3>5. 课程终点的对齐：难度轴与评估轴</h3>
+    <p>课程训练的"最终难度"必须等于部署难度，这是最容易被忽略的一致性要求。例子：抓取课程从"目标距离 0.2 m"练到"0.6 m"，但评估按满工作区 0.9 m 测，成绩当然差。<strong>做法：把课程最高级设成略超部署条件（如 0.65 m），评估只在部署条件（≤0.6 m）上做；同时记录"训练峰值难度"作为覆盖率指标（多少比例的部署条件被训练见过）。</strong>覆盖率与成功率要一起报告：一个只覆盖了 70% 部署条件的策略，成功率再高也说明不了泛化。</p>
+
+    <h3>6. 完整算例：EMA 的等效样本量与误判概率</h3>
+    <p>把"β 取多少"从口径之争变成可以算的概率问题。EMA 在独立回合流上的稳态方差是 β/(2−β) 倍的回合方差，等效样本量 N<sub>eff</sub> = (2−β)/β：β=0.01 时约 199 个回合、β=0.02 时约 99、β=0.05 时约 39。注意这与"时间常数口径 1/β"不是一回事，1/β 描述记忆长度，N<sub>eff</sub> 描述统计噪声，判据可靠性以后者为准。</p>
+    <p>在真实成功率 0.7 时，成功率估计的标准差 σ = √(0.7×0.3/N<sub>eff</sub>)：β=0.01 时 0.033，β=0.02 时 0.046，β=0.05 时 0.073。再看"实际能力 0.65 却被判晋升"的误判概率（晋升阈值 0.7，需要 EMA 越过阈值）：</p>
+    <table>
+      <tr><th>β</th><th>N<sub>eff</sub></th><th>σ（真实率 0.7）</th><th>真实 0.65 的误判概率</th></tr>
+      <tr><td>0.01</td><td>199</td><td>0.033</td><td>约 6%</td></tr>
+      <tr><td>0.02</td><td>99</td><td>0.046</td><td>约 14%</td></tr>
+      <tr><td>0.05</td><td>39</td><td>0.073</td><td>约 25%</td></tr>
+    </table>
+    <p>读法：β=0.05 时每四次判定就有一次"能力不足却晋级"，晋级后成功率回落的概率随之升高；β=0.01 把误判压到 6%，代价是反应变慢（见下节）。这就是"阈值 0.7 要配合 β≤0.01 才可靠"的定量依据，也解释了 2 节里"β 与阈值必须匹配"的纪律。</p>
+
+    <h3>7. 晋升的响应时间：β、回合长度与冷却期的三角关系</h3>
+    <p>课程爬一级需要多久，可以用 EMA 轨迹直接算。等级变化后 EMA 被重置到 0.5，新难度下的真实成功率设为 p，EMA 的期望轨迹是 s(n) = p + (0.5 − p)(1−β)<sup>n</sup>（n 为回合数）。要越过 0.7 的晋升线，解得</p>
+    <div class="formula">
+      n = ln((p − 0.5)/(p − 0.7)) / β
+      <span class="note">β=0.01、p=0.8 时约 110 个回合；p=0.75 时约 161 个回合；p=0.9 时约 69 个回合</span>
+    </div>
+    <p>换算成决策步：回合长 100 步时，110 个回合约 11 000 步。把冷却期放回来看：2000 步的冷却期只相当于 20 个回合，远短于 EMA 越过阈值所需的 69–161 个回合。<strong>这意味着系统不会因为冷却期结束就误升，真正的爬级节奏由 EMA 与 β 决定；冷却期只负责防抖，起不到限速作用</strong>。若希望课程更快，正确旋钮是提高 β（代价是上表里的误判概率上升）或缩短回合（成功提前重置已经在做）；把冷却期改小几乎没有实际效果。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p><strong>课程系统的实现分五步：选课程变量 → 定等级表 → 每环境维护成功率 EMA → 晋升/降级状态机 → 把等级写回任务采样器（reset 生效）。</strong>关键是"难度在 reset 时生效、统计在 step 后更新"的时序。</p>
+    <ol>
+      <li><strong>选课程变量</strong>：目标距离（Reach/Push）、物体数量（堆叠）、随机化范围（ADR）各有场景。通用度排序：随机化范围 &gt; 目标距离 &gt; 结构化等级。</li>
+      <li><strong>定等级表</strong>：离散等级写成表格（L0–L5 与对应参数），连续范围写成"基值 × 扩张系数"。</li>
+      <li><strong>成功率 EMA</strong>：每环境一个标量 s；回合结束时更新（不是每步更新，成功率是回合级事件）。</li>
+      <li><strong>状态机</strong>：晋升（s &gt; 0.7 且冷却期结束）→ level+1；降级（s &lt; 0.3）→ level−1；clamp 在 [0, L-1]。</li>
+      <li><strong>写回采样器</strong>：新等级在下次 reset 时生效，不要中途改当前回合的难度，否则同一回合的奖励口径不一致。</li>
+    </ol>
+    <table>
+      <tr><th>参数</th><th>推荐值</th><th>理由</th></tr>
+      <tr><td>EMA 系数 β</td><td>0.01（窗口≈100 回合）</td><td>窗口太短判据噪声大；太长跟不上能力变化</td></tr>
+      <tr><td>晋升阈值</td><td>0.7</td><td>要求"稳定会做"；1.0 会让所有环境困在简单级</td></tr>
+      <tr><td>降级阈值</td><td>0.3</td><td>与晋升形成滞回死区，抑制震荡</td></tr>
+      <tr><td>冷却期</td><td>2000 决策步</td><td>远大于策略适应新难度的时间尺度</td></tr>
+      <tr><td>等级数</td><td>5–8 级</td><td>太细的等级收益递减；太粗则每级台阶过大</td></tr>
+      <tr><td>难度轴上限</td><td>部署条件 × 1.1</td><td>略超部署是有效的分布外余量</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计思维：等级也要进观测（有时）</span>
+      <p>策略是否需要知道"我在第几级课"？两种立场：<strong>不需要</strong>，策略的行为由观测与奖励决定，等级只改变采样的目标分布，这是大多数任务的答案；<strong>需要</strong>，当不同等级的动作精度要求差异巨大（如插拔 L0 粗放、L5 精细）时，把等级作为一维 one-hot 加进观测能让策略切换"行为模式"，加快高级课程的适应。判据：如果高级课程上线后成功率会出现"先掉再涨"的深坑，试试把等级进观测。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：逐环境等级的课程状态机</strong></p>
+    <pre class="code"><code>import torch
+
+class CurriculumScheduler:
+    """逐环境课程：EMA 成功率 → 晋升/降级；等级在 reset 时采样生效"""
+    def __init__(self, num_envs, levels=6, promote=0.7, demote=0.3,
+                 beta=0.01, cooldown=2000, device="cuda"):
+        self.promote, self.demote = promote, demote   # 双阈值：滞回死区抑制震荡
+        self.beta = beta                              # EMA 系数：窗口 ≈ 1/beta = 100 回合
+        self.cooldown = cooldown                      # 冷却期：等级变化后不判定的步数
+        self.level = torch.zeros(num_envs, dtype=torch.long, device=device)
+        self.success = torch.full((num_envs,), 0.5, device=device)   # 先验 0.5：中性起始
+        self.since_change = torch.full((num_envs,), cooldown, device=device)  # 开局即可判定
+
+    def update(self, done_mask, success_mask):
+        """回合结束时调用；只更新已结束环境的 EMA，未结束环境保持不动"""
+        new_ema = (1 - self.beta) * self.success + self.beta * success_mask.float()
+        self.success = torch.where(done_mask, new_ema, self.success)   # 逐环境生效
+        self.since_change += 1
+        can_judge = self.since_change &gt;= self.cooldown      # 冷却期未过不判定
+        up = can_judge &amp; (self.success &gt; self.promote) &amp; (self.level &lt; 5)
+        down = can_judge &amp; (self.success &lt; self.demote) &amp; (self.level &gt; 0)
+        # 一次只动一级：连续两次达标的间隔由冷却期保证，避免"连跳"
+        self.level = torch.where(up, self.level + 1,
+                                 torch.where(down, self.level - 1, self.level))
+        changed = up | down
+        self.since_change = torch.where(changed, torch.zeros_like(self.since_change),
+                                        self.since_change)
+        self.success = torch.where(changed, torch.full_like(self.success, 0.5),
+                                   self.success)
+        # 等级变化后成功率重置为 0.5：新难度下的旧统计不再可信
+
+    def sample_range(self, env_ids):
+        """当前等级对应的目标/随机化范围系数：0.2 到 1.0 之间按等级线性插值"""
+        frac = self.level[env_ids].float() / 5.0     # L0=0.2 起步：先近后远
+        return 0.2 + 0.8 * frac</code></pre>
+    <p>解读：状态机里藏着三个"防呆"设计，每个都对应一类真实故障。<b>成功率先验取 0.5、不取 0</b>：新环境/刚降级的环境没有历史，0.5 让它处于"死区"内部，需要几轮真实回合才能积累证据升或降，避免噪声推动的误动作。<b>等级变化后统计清零到 0.5</b>：旧的 EMA 是在另一个难度下测的，留着它会导致"升级后立刻又被降回来"的连锁反应。<b>冷却期与逐环境独立</b>：4096 个环境各有各的等级与冷却计时器，全 GPU 张量运算、无 Python 循环，这是第 022 章"消灭循环"原则在训练策略层的又一次应用。最后 <code>sample_range</code> 的设计：L0=0.2 到 L5=1.0 线性映射目标距离/工作区范围，含义是"目标从最近 20% 开始，逐级扩展到全工作区"。倍率的起点不要低于 0.15，目标太近会让机械臂"原地够"就能成功，学不到移动技能。</p>
+
+    <p><strong>片段 2：ADR 式随机化范围扩张</strong></p>
+    <pre class="code"><code>class ADRRange:
+    """自动域随机化：成功率达标就扩范围，掉下去就收范围；始终留 20% 采样余量"""
+    def __init__(self, base, lo_factor=1.0, hi_factor=3.0, step=1.2,
+                 promote=0.8, demote=0.5, delta_max=0.2, device="cuda"):
+        self.base = torch.tensor(base, device=device)     # 初始范围（半宽）如 [0.5, 0.05, 0.01]
+        self.factor = torch.ones_like(self.base)          # 扩张系数：从 1.0 开始
+        self.lo_factor, self.hi_factor = lo_factor, hi_factor   # 下限 1×、上限 3×（防无限扩张）
+        self.step = step                                  # 每次扩张 ×1.2
+        self.promote, self.demote = promote, demote       # ADR 阈值更严：0.8 / 0.5
+        self.delta_max = delta_max                        # 采样余量：实际范围 = 标称 × (1±0.2)
+
+    def expand(self, success_ema):
+        """按成功率调整范围：双向调参，保证分布始终围绕当前能力"""
+        up = success_ema &gt; self.promote
+        down = success_ema &lt; self.demote
+        self.factor = torch.where(up, (self.factor * self.step).clamp(max=self.hi_factor),
+                                  torch.where(down, (self.factor / self.step).clamp(min=self.lo_factor),
+                                              self.factor))
+        return self.factor
+
+    def sample(self, num_envs, generator):
+        """给 N 个环境采随机化参数：范围 = 基值 × 系数 × (1±delta_max)"""
+        hi = self.base * self.factor * (1 + self.delta_max)   # 上限留 20% 余量：
+        lo = self.base * self.factor * (1 - self.delta_max)   # 部署时可能遇到训练分布外的值
+        u = torch.rand(num_envs, self.base.numel(), device=self.base.device,
+                       generator=generator)
+        return lo + u * (hi - lo)      # 均匀采样：每环境独立，域随机化第 021 章的连续版</code></pre>
+    <p>解读：ADR 与离散课程的区别在"范围"是连续量，扩张粒度可以很小。<b>为什么扩张要有上限 3×？</b>离开标称值太远的随机化参数描述的是"另一个机器"，摩擦 0.05、质量翻五倍的系统里练出的策略对真实机器人没有意义；上限按"真实世界可能的极端"设定（如摩擦真实范围 0.2–1.0，标称 0.5 基值、最大半宽就到 0.3×1.2…，这里以任务实测为准）。<b>delta_max=0.2 的采样余量是 ADR 的精髓</b>：训练分布是"标称范围×系数×[0.8, 1.2]"，比计划范围永远多 20% 的缓冲。这样当真实系统参数落在标称范围之外（真机总有惊喜），策略也见过类似样本；同时避免"范围边界上的策略恰好只在边界内的数据上训练"的边界效应。样本生成用固定 <code>generator</code>（带种子的随机源）：ADR 改变采样分布时，随机流的对齐让两次训练的随机化序列只差一个系数，消融对比才干净。</p>
+
+    <p><strong>片段 3：接进训练循环，统计与调度各归其位</strong></p>
+    <pre class="code"><code>def step_curriculum_task(self, actions):
+    obs = self._build_obs()                      # 观测含"当前等级采样出的目标"
+    rew, terminated, truncated = self._simulate(actions, obs)
+
+    step_success = self._reached_goal()          # (N,) 本步是否达成目标
+    self.ep_success = self.ep_success | step_success   # 成功是"锁存"事件：
+    # 成功后任务常要求"稳定保持若干帧"才终止，用滞后信号统计会系统性低估成功率
+
+    done = terminated | truncated
+    self.scheduler.update(done, self.ep_success)         # 只对结束环境更新 EMA
+    self.scheduler.expand_ranges(self.scheduler.success.mean())  # ADR：双向调范围
+    self._autoreset(done | self.ep_success)              # 成功即可提前重置，加速采样
+
+    self.log_curriculum()                        # 三条曲线：等级均值/等级最小/成功率
+    return obs, rew, done</code></pre>
+    <p>解读：这段循环把"统计"与"调度"的时序固定下来。<b>(1) 成功要锁存</b>：很多任务的终止条件是"成功后保持 N 帧"，如果只在终止帧读瞬时成功标志，那些中途失败（不稳定）的回合会被算作失败，但它们确实达成过目标，课程该归为"能学会"。锁存语义把"达到过"与"保持住"分开统计。<b>(2) EMA 只对 done 环境更新</b>：回合结果是一个"完成事件"，没结束的环境没有结果可计入；用 <code>done_mask</code> 过滤后，每个环境的成功率曲线只在它自己的回合边界上采样，不受其他环境节奏影响。<b>(3) 成功即提前重置</b>：<code>done | ep_success</code> 让成功的环境立刻开新课，课程爬升速度直接翻倍，因为不再等满回合时限。<b>(4) 日志三分量</b>：等级均值看整体进度，等级最小值看"有没有人卡课"（若最小值为 0 且均值很高，说明少数环境在拖后腿，值得单独回放分析），成功率 EMA 看学习质量。三条曲线一起看，课程系统有没有在工作一目了然。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>用瞬时成功率判晋升</strong>：单回合成功就升级，噪声让等级在两级间震荡。症状：等级曲线锯齿状、成功率曲线上不去。修复：EMA 窗口 ≥100 回合 + 双阈值滞回 + 冷却期。</li>
+      <li><strong>EMA 对所有环境更新</strong>：把"未结束环境的 success=0"计入平均，成功率被系统性低估，课程永远不晋升。症状：等级均值长时间恒为 0。修复：只对 done 的环境更新，或用回合级统计。</li>
+      <li><strong>难度上限低于部署条件</strong>：课程练到 0.6 m 距离就封顶，部署要求 0.9 m。症状：评估掉点、泛化差。修复：上限设成部署条件略超（×1.1），并记录"峰值难度覆盖率"。</li>
+      <li><strong>冷却期太短</strong>：200 步就允许再判定，策略还没适应新难度就被降回来。症状：升级后立刻降级，等级原地打转。修复：冷却期 ≥ 2000 决策步，且大于一次策略更新的时间尺度。</li>
+      <li><strong>等级写回时机错误</strong>：在回合中途改采样难度，同一回合内奖励口径前后不一致。症状：日志里同一回合的奖励结构怪异。修复：等级只在 reset 时生效，回合内不可变。</li>
+      <li><strong>ADR 收回过激</strong>：降级阈值设太高（如 0.7）或收缩步长过大，范围在能力正常波动时反复收放，采样分布持续非平稳。症状：随机化范围曲线锯齿、训练回报方差大。修复：降阈值比升阈值低 0.2–0.3（0.8/0.5 的搭配），收缩步长比扩张步长更保守。</li>
+      <li><strong>EMA 只升不重置</strong>：升级后沿用旧难度的成功率，策略在新难度下表现下滑时 EMA 还很高，容易"连跳"到学不动的等级。修复：等级变化时把 EMA 重置到中性值 0.5，让新难度重新积累证据。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>计算题：EMA 系数 β=0.02，成功率真实值为 0.7。估计成功率估计量的标准差（回合级二项统计），并判断晋升阈值 0.7 是否可靠。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>按 6 节口径，等效样本量 (2−β)/β≈99，噪声约 sqrt(0.7×0.3/99)≈0.046，真实能力 0.65 时有约 14% 的误判率（见表）；β 减半可降噪声但响应变慢。</div></details>
+      </li>
+      <li>消融实验：关闭冷却期（设为 0）训练一次，观察等级曲线的震荡幅度；再打开冷却期做对照。给出你任务上冷却期的合理量级。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>没有冷却期时等级会在"刚晋升—成功率未建立—立刻降级"之间循环；冷却期长度可以从日志里"升级后成功率回到 0.5 以上所需步数"直接读出来。</div></details>
+      </li>
+      <li>实验设计题：把晋升阈值从 0.7 改成 0.9，预测对课程总时长（达到最高级所需步数）与最终策略质量的影响并验证。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>阈值高 = 每级练得更扎实但晋级慢；观察最终成功率是否更高，还是被"过度练习"浪费的时间拖垮。</div></details>
+      </li>
+      <li>设计一个"难度轴对齐"评估：训练课程上限 ×1.1、评估条件为部署规格，给出一张 4 列（训练峰值难度 / 覆盖率 / 部署条件成功率 / 分布外成功率）的评估表并说明每列的含义。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>覆盖率 = 部署条件中被训练数据覆盖的测度比例；分布外成功率是最诚实的泛化指标，不要只报平均值。</div></details>
+      </li>
+      <li>思考题：为什么"逐环境等级"比"全局同步等级"吞吐利用率更高？从"梯度信号的分布宽度"角度论证，并指出逐环境方案的两个额外代价。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>代价：每个环境要额外维护等级状态与判据（显存与实现复杂度）；若观测需包含等级，网络输入维度增加；日志聚合也更复杂。</div></details>
+      </li>
+      <li>用 7 节的公式算一次课程时长：β=0.01、回合 50 步、真实成功率 0.85，从 L0 爬到 L5 共需多少决策步（含每级冷却期 2000 步）？再算 β=0.02 的版本，并说明哪个配置更值得。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>每级回合数 n=ln(0.35/0.15)/β≈84.7（β=0.01），折 4235 步，加冷却期共约 6235 步/级，5 级约 3.1 万步；β=0.02 时约 2100+2000=4100 步/级，但误判概率翻倍，按误判导致的回退成本权衡。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>课程学习把"难度"变成训练过程的一等公民：稀疏奖励靠它重获正样本，域随机化靠它找到鲁棒性甜区。</li>
+      <li>核心闭环：回合级成功率 EMA（β≈0.01）→ 滞回双阈值（0.7/0.3）+ 冷却期（2000 步）→ 进/降一级 → reset 时生效。</li>
+      <li>两种调度器：离散等级状态机（目标距离/障碍数）与 ADR 连续范围扩张（随机化参数，带 20% 采样余量）。</li>
+      <li>三个必查日志：等级均值、等级最小值（尾部环境）、成功率 EMA；难度上限要略超部署条件并报告覆盖率。</li>
+      <li>下一章换一条完全不同的数据来源：不再靠探索与重标记，改为直接向人类专家借经验，模仿学习。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch031.html">← 第 031 章：实现目标条件强化学习</a>
+    <a class="next" href="ch033.html">第 033 章：实现模仿学习 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第096章 多智能体环境：自动驾驶 | 深度强化学习课程 · PPO、SAC 与多智能体系统</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第五篇 · 多智能体环境与实践</span>
+    <span class="sep">/</span>
+    <span>第 096 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第五篇 · 多智能体环境与实践</div>
+    <h1>第 096 章：多智能体环境：自动驾驶</h1>
+    <p class="lead">把 6 辆车放进周长归一化的双车道环形公路：每步同时决定加速/刹车与变道，奖励速度、惩罚跟车过近与碰撞，用共享网络的离散 PPO 训练，看车队能否在几乎零碰撞的前提下把平均速度从匀速基线的 0.08 拉到 0.12 以上。</p>
+    <ul class="meta">
+      <li>主题：环境设计 / 环形交通流与跟车-变道决策</li>
+      <li>关键公式：r<sub>i</sub> = 5v<sub>i</sub> − 2·𝟙[间距&lt;0.03] − 4·𝟙[间距&lt;0.015] − 0.1·𝟙[变道]</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 095 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>把自动驾驶抽象成"跟车 + 变道"的最小模型：环形公路、速度档位、车道选择、间距约束。</li>
+      <li>设计同时覆盖纵向与横向的离散动作（3×3=9 个），并处理"变道被拒"这种局部动作失效。</li>
+      <li>用共享网络的离散 PPO 训练 6 辆车，理解局部观测（前车/后车/邻道间距）如何支撑分布式决策。</li>
+      <li>把"速度"与"安全"写进同一份奖励并调平：跟车罚款、碰撞重罚、变道成本各自的作用。</li>
+      <li>用匀速基线给学习结果定标：不看速度提升百分比，就不知道训练到底有没有产生价值。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>自动驾驶是多智能体研究里"安全关键"的旗舰场景：每辆车都想快，但快的前提是不撞、不堵、不逼停别人。与前面章节的差别在于<strong>奖励冲突是逐车的局部冲突</strong>：前车留出空当，你能多拿速度分；跟车过近，随时可能付出 4 倍罚款。策略必须在每一刻权衡"再快一点"与"保守一点"。</p>
+    <p>环形公路（ring road）是交通流理论的标准实验台：没有红绿灯、没有交叉口，纯粹考察跟车与变道。把它离散成"每步 0.02 的速度档 + 三档变道"后，问题规模刚好能让 PPO 在几万步内学出看得见的行为：默认设置下是"全员加速到上限并保持零碰撞巡航"；在更拥挤（车数加到 10）或引入慢车（匝道练习）的变体里，才会出现择机超车、堵车降速这类更丰富的行为。本章也是第五篇里唯一同时包含"纵向控制 + 横向决策"的环境，动作空间是二维的，变道时机与安全约束的相互作用是本章最有意思的观察点。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 环形运动学</h3>
+    <p>周长归一化为 1，车 i 的位置 p<sub>i</sub> ∈ [0,1) 环形推进，速度每步最多改变 0.02：</p>
+    <div class="formula">
+      v<sub>t+1</sub> = clip(v<sub>t</sub> + 0.02·a<sub>t</sub>, 0.02, 0.2)，p<sub>t+1</sub> = (p<sub>t</sub> + v<sub>t+1</sub>) mod 1
+    </div>
+    <p>速度范围 [0.02, 0.2] 让"最慢"与"最快"相差 10 倍。注意每步速度变化只有 0.02（约一个档位），而位置推进量就是当前速度，<strong>速度即是位移</strong>，这个简化把"加速度积分"这一层拿掉了，保留了交通流的核心机制：间距与速度的相互约束。</p>
+
+    <h3>2. 横向动作与变道拒绝</h3>
+    <p>动作空间是纵向 {−1,0,+1} 与横向 {−1,0,+1} 的笛卡尔积（9 个）。变道不是无条件生效的：如果目标车道在当前位置 ±0.03 内已有车辆，变道被<strong>静默拒绝</strong>（车留在原车道）。这种"动作部分失效"是真实驾驶的写照，也迫使策略在观测里关注邻道间距，盲目变道只会浪费动作预算。注意"静默"两个字：被拒的动作仍会消耗一次决策，日志里看不出失败，只有变道次数统计能反映实际生效的次数。</p>
+
+    <h3>3. 奖励结构：速度与安全写在一张账单上</h3>
+    <div class="formula">
+      r<sub>i</sub> = 5v<sub>i</sub> − 2·𝟙[前车间距 &lt; 0.03] − 4·𝟙[前车间距 &lt; 0.015] − 0.1·𝟙[变道生效]
+    </div>
+    <p>速度项每步贡献 0.1～1.0，是唯一正收益；跟车罚款让"贴前车"变成负和游戏；碰撞重罚相当于两步满速收益；变道成本抑制"来回横跳"。注意罚款是<strong>每步重复计算</strong>的，持续贴车会持续扣分，因此最优策略是稳定保持安全间距，"偶尔贴一下"的占便宜思路会被持续扣分修正。两级阈值 0.03/0.015 形成"警告—事故"的双层结构：策略有 0.015 的缓冲带可以在不撞的前提下体验警告信号。</p>
+
+    <h3>4. 为什么局部观测就够了</h3>
+    <p>观测只含：本车道前车间距与前车速度、邻道前车间距与速度、本车道后车间距。环形结构的妙处在于：任何全局拥堵都会通过"前车慢 → 我跟车罚款"的链条传导到每辆车的局部观测里。参数共享的 6 辆车各自做局部最优反应，整体交通流就可能逼近高效均衡，这正是分布式交通控制的核心假设，也是本章想验证的事。</p>
+
+    <h3>5. 评价口径</h3>
+    <p>三个指标：<strong>平均速度</strong>（效率）、<strong>碰撞次数</strong>（安全）、<strong>变道次数</strong>（稳定性）。匀速基线（v=0.08、不变道）给出 0 碰撞的参考点；学习策略必须同时满足"速度明显提升"与"碰撞保持接近 0"，否则没有工程价值。安全指标不达标的策略不值得优化速度，这是全章的第一纪律。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+
+    <h3>模块划分</h3>
+    <table>
+      <tr><th>组件</th><th>职责</th><th>关键点</th></tr>
+      <tr><td><code>RingRoadEnv</code></td><td>双车道环线（纯 numpy）</td><td>环形间距、变道拒绝、奖励与统计</td></tr>
+      <tr><td><code>_gap_ahead</code> / <code>_gap_behind</code></td><td>环形前后间距计算</td><td>取模运算处理环线，不存在"队首队尾"</td></tr>
+      <tr><td><code>PPOActorCritic</code></td><td>离散动作策略 + 价值头</td><td>Categorical 策略，与第 090 章同族</td></tr>
+      <tr><td><code>evaluate</code></td><td>学习策略 / 匀速基线</td><td>同随机流下比速度与碰撞；基线动作=4（保持）</td></tr>
+    </table>
+
+    <h3>关键超参数</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用与取值理由</th></tr>
+      <tr><td><code>n_cars</code></td><td>6</td><td>密度适中：太挤必然堵、太空学不到跟车</td></tr>
+      <tr><td><code>v 范围</code></td><td>[0.02, 0.2]</td><td>速度比 10:1；上下限同时约束奖励尺度</td></tr>
+      <tr><td><code>safe_gap / crash_gap</code></td><td>0.03 / 0.015</td><td>两级阈值形成"警告—事故"双层惩罚</td></tr>
+      <tr><td><code>ent_coef</code></td><td>0.02</td><td>比默认略高：9 个动作需要更多探索</td></tr>
+      <tr><td><code>gamma</code></td><td>0.95</td><td>回合 150 步；跟车行为的回报视野约 20 步</td></tr>
+      <tr><td><code>max_steps</code></td><td>60000</td><td>交通任务收敛通常 3～6 万步</td></tr>
+    </table>
+
+    <h3>数据流</h3>
+    <p>每步：6 辆车读各自的 9 维局部观测 → 共享策略输出 9 选 1 的动作 → 环境先处理变道（含拒绝判定）、再更新速度与环形位置、最后结算奖励 → 2048 步后按 (T, N) 做 GAE、展平成 12288 个样本做 4 轮裁剪更新 → 每 1 万步评估（速度、碰撞、变道），并与匀速基线打印对照。</p>
+
+    <h3>与前一章的差异</h3>
+    <p>第 095 章是"资源-生态"耦合（采集影响存量、存量影响未来收益），本章是"车辆-交通流"耦合（自己的速度影响别人的间距、别人的间距反过来制约你）。两者的共同点是<strong>局部观测 + 全局耦合</strong>；差别是 095 的奖励是团队或个体的采集量，而本章奖励里写进了显式的安全约束，"不要撞"成为奖励设计的目标，环境规则不设硬约束。</p>
+
+    <div class="box key">
+      <span class="box-title">"稳态跟车"是本章要观察的第一行为</span>
+      <p>奖励里没有"保持车距"的正项，只有贴太近的罚款，但速度项只在前方有空间时才能兑现。策略的理性路径是：找到与前车的<strong>可持续间距</strong>，用不触发罚款的速度稳定巡航，遇到慢车才择机变道。这就是交通流理论里的"稳态跟车"（car-following equilibrium）。注意默认设置里所有车都能加速到上限、彼此不干扰，这个行为会淡化成平凡解；加车或引入慢车后它才会显出分量。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：环形间距，取模如何消灭"队首队尾"</strong></p>
+    <pre class="code"><code>def _gap_ahead(self, i, lane):
+    """返回 (环形前方最近车的间距, 该车速度)，没有车时返回 (1.0, 0)。"""
+    best_gap, best_v = 1.0, 0.0
+    for j in range(self.n_cars):
+        if j == i or self.lane[j] != lane:
+            continue                           # 只看同车道的其他车
+        gap = (self.pos[j] - self.pos[i]) % 1.0   # 取模：环形上"前方"的通用定义
+        if gap &lt; best_gap:
+            best_gap, best_v = gap, float(self.v[j])
+    return best_gap, best_v</code></pre>
+    <p>解读：十行函数，但取模那一行是环线环境的命门。<strong>（1）</strong><code>(pos[j] − pos[i]) % 1.0</code>：在圆环上，j 如果在 i 前方 0.1 处，差值可能为负（比如 j=0.05、i=0.95 时差 −0.9），取模后变成 0.1，"前方"在任何坐标位置都有正确定义。<strong>（2）</strong>初始值 <code>(1.0, 0.0)</code>：环上最长间距不超过 1，没有前车时返回"无限远、速度零"，观测与奖励都能安全消费这个哨兵值。<strong>（3）</strong>取最小 gap：跟车安全只由最近的障碍决定，这是"min 聚合"在交通场景里的自然复现（回忆第 087 章地标覆盖的 min）。<strong>（4）</strong>顺带返回前车速度：跟车不仅要看距离，还要看前车快慢，同样是 0.03 的间距，前车 0.2 与 0.05，策略的最优反应完全不同。<strong>（5）</strong>用不取模的差值，位置回绕时"刚超过我的车"会被误判成远处来车，这类 bug 只在高密度下偶发，很难查，所以每个环线间距都必须走这一个函数。</p>
+
+    <p><strong>片段 2：9 维局部观测的构造</strong></p>
+    <pre class="code"><code>def _obs(self) -&gt; np.ndarray:
+    obs = []
+    for i in range(self.n_cars):
+        other = 1 - self.lane[i]                       # 另一条车道
+        fg, fv = self._gap_ahead(i, self.lane[i])      # 本道前车：间距 + 速度
+        og, ov = self._gap_ahead(i, other)             # 邻道前车：判断能不能变过去
+        rg = self._gap_behind(i, self.lane[i])         # 本道后车：知道谁在贴我
+        lane_onehot = np.zeros(2, dtype=np.float32)
+        lane_onehot[self.lane[i]] = 1.0                # 自己在哪条道
+        o = np.concatenate([
+            [self.v[i] / self.v_max],
+            lane_onehot,
+            [min(fg, self.gap_cap) / self.gap_cap, fv / self.v_max],
+            [min(og, self.gap_cap) / self.gap_cap, ov / self.v_max],
+            [min(rg, self.gap_cap) / self.gap_cap],
+            [0.0],                                     # 预留位：留给后续实验扩展
+        ])
+        obs.append(o.astype(np.float32))
+    return np.stack(obs)</code></pre>
+    <p>解读：9 维观测是"够用就好"的典范。<strong>（1）</strong>前车信息分两条：本道前车（决定我能不能加速）与邻道前车（决定我值不值得变道），变道决策的全部依据就是后者，这也是"变道被拒"机制留给策略的线索。<strong>（2）</strong>后车间距进观测：被追尾的风险属于自己，策略需要知道"后面贴了多近"，否则永远学不会"被贴时别急刹"。<strong>（3）</strong>间距截断到 <code>gap_cap=0.3</code> 再归一化：环上距离超过 0.3 就算"很远"，截断避免远距离噪声稀释有效信息，也让输入尺度与速度项一致。<strong>（4）</strong>速度除以 <code>v_max=0.2</code>、间距除以 0.3，所有输入都在 [0,1] 附近，离散 PPO 的输入尺度纪律和前面章节一致。<strong>（5）</strong>最后预留的恒 0 维：保持观测维度为 9 是为了记忆方便，同时给"变道中标记"之类的扩展留了口子；真正起作用的是前 8 维，这份诚实比凑数维度更有价值。</p>
+
+    <p><strong>片段 3：变道判定，让"横向动作"有条件生效</strong></p>
+    <pre class="code"><code>accel_idx = actions // 3          # 0,1,2 -&gt; 对应 -1,0,+1 档加速度
+lane_pref = actions % 3 - 1       # -1,0,+1：向左/保持/向右
+self.steps += 1
+
+# 1) 变道：目标车道在当前位置附近（±0.03）有车则婉拒
+changed = np.zeros(self.n_cars, dtype=bool)
+for i in range(self.n_cars):
+    if lane_pref[i] == 0:
+        continue                                   # 不换道：跳过
+    target = int(np.clip(self.lane[i] + lane_pref[i], 0, 1))
+    if target == self.lane[i]:
+        continue                                   # 已在边界车道，向外变无效
+    blocked = False
+    for j in range(self.n_cars):
+        if j == i or self.lane[j] != target:
+            continue
+        d = min((self.pos[j] - self.pos[i]) % 1.0,
+                (self.pos[i] - self.pos[j]) % 1.0)  # 环形双向距离：前后都要查
+        if d &lt; 0.03:
+            blocked = True                         # 目标车道附近有车：拒绝变道
+            break
+    if not blocked:
+        self.lane[i] = target
+        changed[i] = True</code></pre>
+    <p>解读：动作解码与变道安全是两个必须分开理解的层次。<strong>（1）</strong>解码用整数除法与取模：<code>actions//3</code> 得纵向档、<code>actions%3−1</code> 得横向偏好，9 个动作与 (纵向,横向) 一一对应，不需要查表。<strong>（2）</strong>变道只检查"目标车道 ±0.03 内是否有车"，前后都要查（<code>min</code> 两个方向的环形距离）：真实驾驶里变道既要看盲区（后方）也要看前方。<strong>（3）</strong>被拒的变道<strong>不报错、不惩罚</strong>：车留在原车道，横向动作静默失效，策略只能通过观测（邻道间距）学会预测何时会被拒。<strong>（4）</strong>边界车道向外变道（<code>target == self.lane[i]</code>）直接跳过：动作合法但语义无效，不需要拒绝逻辑。<strong>（5）</strong>变道在纵向更新<strong>之前</strong>处理：判断用的是当前时刻的车辆位置，避免"同一帧内先变道的人改变间距、后变道的人按旧间距判断"的顺序歧义，多智能体环境的动作结算"要么同时、要么有明确顺序"，这里是后者。</p>
+
+    <p><strong>片段 4：纵向动力学与奖励结算</strong></p>
+    <pre class="code"><code># 2) 纵向动力学：速度在 [v_min, v_max] 内加减，位置环形推进
+dv = (accel_idx - 1).astype(np.float32) * self.dv     # 档位 -1/0/+1 → −0.02/0/+0.02
+self.v = np.clip(self.v + dv, self.v_min, self.v_max)
+self.pos = (self.pos + self.v) % 1.0                  # 位置即位移：速度直接累加
+
+# 3) 奖励：速度收益 + 安全罚款（逐车、逐项结算）
+rewards = 5.0 * self.v.copy()
+for i in range(self.n_cars):
+    fg, _ = self._gap_ahead(i, self.lane[i])
+    if fg &lt; self.safe_gap:                            # 跟车过近：警告圈
+        rewards[i] -= 2.0
+    if fg &lt; self.crash_gap:                           # 进入碰撞圈：重罚并计数
+        rewards[i] -= 4.0
+        self.collisions += 1
+    if changed[i]:                                    # 变道生效：摩擦成本
+        rewards[i] -= 0.1</code></pre>
+    <p>解读：这是"效率与安全"在同一步里被定价的地方。<strong>（1）</strong>纵向动力学两行：速度被限制在 [0.02, 0.2]，低于最低速也不行，现实里车不能停死（环线没有红灯）；位置推进 <code>(pos+v)%1</code> 里速度就是每步位移。<strong>（2）</strong>奖励先给所有人发速度分，再逐车扣安全账：<code>5.0·v</code> 的量级（0.1～1.0）明显大于变道成本（0.1），小于碰撞重罚（4.0），三档量级对应三种优先级。<strong>（3）</strong>两级阈值可以<strong>同时触发</strong>（间距 &lt; 0.015 时两项都扣）：越危险罚得越狠，形成连续的惩罚梯度。<strong>（4）</strong><code>collisions</code> 是累计计数器，不会 reset，用于统计"每局碰撞次数"；训练中段探索导致的零星碰撞是正常的，最终评估必须压到 0。<strong>（5）</strong>注意"撞了不终止"：环线没有自然终局，碰撞只是持续负奖励。如果一撞就 reset，策略会学到"反正重开"的短视投机，真实事故的代价必须大于换一局的便宜。</p>
+
+    <p>完整可运行脚本（附录）：<a href="../code/ch096.py" download>code/ch096.py</a></p>
+    <pre class="sh"><code>python code/ch096.py          # 完整训练：CPU 约 3–5 分钟
+python code/ch096.py --quick  # 快速跑通：约 30–60 秒</code></pre>
+    <p>日志先打印匀速基线，之后每 1 万步打印速度、碰撞与变道。<strong>预期（以实跑为准）：学习策略很快学会"全员加速到上限并巡航"：评估平均速度 0.198（上限 0.2）、提升约 150%、碰撞 0、变道次数迅速降到 0</strong>。这个结果暴露了默认场景的一个短板：没有慢车与瓶颈，稳态跟车与择机超车不会被逼出来，练习一（加车）、练习四（激进基线）、练习五（低速匝道车）才是制造这类压力的旋钮。若训练后碰撞长期为正，先加大碰撞罚款再重训。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>环形间距用不取模的差值</strong>：环上"前面的车"可能位于坐标另一端。不取模时位置回绕会让策略把"刚超过我的车"误判成远处来车，且只在高密度下偶发、极难排查。</li>
+      <li><strong>变道拒绝对动作空间形成"死区"</strong>：若观测缺邻道间距信号，策略无法学会"先等空位再变道"，会白占大量样本；本实现把 <code>og, ov</code> 放进观测就是为了堵这个洞。</li>
+      <li><strong>把碰撞当"回合结束"处理</strong>：环线没有自然终局，碰撞应只是持续负奖励；一撞就 reset 会让车学会"反正重开"，扭曲安全行为。</li>
+      <li><strong>只调速度奖励不调罚款</strong>：把速度系数从 5 提到 20，单步罚款相对变小，策略立刻"油门焊死"。奖励是一个整体尺度，改任何一项都要检查其余项的量级。</li>
+      <li><strong>变道判定用单向距离</strong>：目标车道只查前方不查后方（或反之），会让策略贴脸变道而系统不拒绝，随后碰撞，真实的变道安全检查必须双向。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把车数从 6 加到 10，先预测平均速度与变道次数的走向，再观察密度上升后策略变成什么风格。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>车多后"变道超车"的收益下降、风险上升，策略通常变保守。<code>n_cars</code> 传进构造参数即可，观测循环用 <code>self.n_cars</code> 自动适配。</div></details>
+      </li>
+      <li>把跟车罚款从 2.0 提到 5.0，先预测速度与碰撞的联合变化，再验证"过度保守"的代价。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>罚款过重时策略保持巨大车距，平均速度反而下降。观察"安全"与"效率"的跷跷板如何在数字上表现。</div></details>
+      </li>
+      <li>把碰撞罚款拆成"给后车 −4、给前车 −1"，先分析被追尾车的行为应如何改变，再观察它是否学会"向后看"。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>在 <code>step</code> 的 <code>fg &lt; crash_gap</code> 分支里给前车也加一份小罚款。后视信息已在观测里，这个实验检验"责任分担是否改变行为"。</div></details>
+      </li>
+      <li>把匀速基线换成"激进基线"（所有车恒速 0.2），先预测它的碰撞与速度，再讨论"什么才是合理的对照"。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>初始速度改 0.2、基线动作恒为纵向 +1。激进基线速度虽高但碰撞爆表，它让你直观看到"没有安全的效率"没有意义。</div></details>
+      </li>
+      <li>给环境加"上下匝道"：每隔 50 步插入一辆低速新车（0.06），先设计"如何在不改车辆数的前提下模拟进出流"，再观察策略的恢复能力。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>动态增删会改变 n_agents，最省事的做法是维持 6 辆、让某辆"离线"一段时间再以低速回归；统计回归后多少步速度恢复到旧水平。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>环形公路把自动驾驶简化成"跟车 + 变道"：环形间距（取模）、速度档位、两级安全阈值是该场景的最小要素。</li>
+      <li>9 元离散动作（纵向×横向）让 PPO 直接处理变道决策；"变道被拒"机制要求策略具备邻道感知。</li>
+      <li>奖励把速度收益与安全成本写在一起：稳定保持间距优于反复贴车，变道成本抑制抖动；碰撞不终止而持续罚。</li>
+      <li>评估三指标（速度、碰撞、变道次数）缺一不可；匀速基线把"提升多少"变成可计量的数字。</li>
+      <li>下一章进入算法世界：多个推荐智能体争夺用户注意力，用独立 Q 学习看市场集中度与内容多样性如何演化。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch095.html">← 第 095 章：多智能体环境：资源收集</a>
+    <a class="next" href="ch097.html">第 097 章：多智能体环境：推荐系统 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

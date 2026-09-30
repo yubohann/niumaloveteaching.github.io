@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第018章 多机器人日志聚合与监控 | 多机器人协同学习课程 · ROS2 通信与系统集成</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · 通信基础与系统搭建</span>
+    <span class="sep">/</span>
+    <span>第 018 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · 通信基础与系统搭建</div>
+    <h1>第 018 章：多机器人日志聚合与监控</h1>
+    <p class="lead">20 台机器人的日志如果各自躺在自己的硬盘上，故障复盘就是考古。本章搭一套"本地缓冲、限速汇聚、结构化可检索"的日志体系。</p>
+    <ul class="meta">
+      <li>主题：通信基础 / 可观测性工程</li>
+      <li>关键机制：结构化日志、日志限流、限速汇聚、断网缓冲</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 006 章、第 014 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>建立多机器人日志的三层需求：调试（本地）、审计（可检索）、复盘（跨机排序），理解它们对不同机制的要求。</li>
+      <li>掌握日志纪律：级别使用规范、限流（throttle）手段、避免日志洪水，能估算日志流量对带宽预算的影响。</li>
+      <li>会写结构化日志：关键字段（机器人、节点、事件、键值对）与机器可检索的格式。</li>
+      <li>会设计汇聚链路：本地环形缓冲 → 限速批量上传 → 中央存储；断网不丢关键日志。</li>
+      <li>能把日志与指标结合成值班界面：告警规则（阈值 + 连续判定）与"恢复通知"。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 006 章解决了"谁在线"（图层与应用层心跳），但"为什么出问题"要靠日志。多机器人系统里日志的麻烦有三重：<strong>分散</strong>（20 台设备的 20 份文件）、<strong>淹没</strong>（正常日志每秒几十条，关键那一条淹在里面）、<strong>失联即失忆</strong>（网络断开时，偏偏是故障时段的日志躺在那台连不上的机器人硬盘里）。</p>
+    <p>此外日志本身也是流量：一条 200 字节的日志以 20 Hz 从 20 台机器人涌来，就是 80 KB/s 的持续负载，一不注意，"日志把自己要诊断的拥塞变成了更大的拥塞"。本章把日志当一等公民做工程：<strong>先纪律（级别与限流）、再结构（可检索）、后链路（缓冲与限速）</strong>，与第 020 章阶段项目的验收指标（"故障后 5 分钟内能重建时间线"）直接挂钩。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 三层需求：调试、审计、复盘</h3>
+    <table>
+      <tr><th>需求</th><th>问题</th><th>机制要求</th></tr>
+      <tr><td>调试（本机）</td><td>"这个节点刚才怎么了"</td><td>终端输出 + 本地文件；实时性最重要</td></tr>
+      <tr><td>审计（跨机）</td><td>"谁改了参数/谁发的急停"</td><td>结构化字段 + 中央存储 + 检索；完整性最重要</td></tr>
+      <tr><td>复盘（故事线）</td><td>"14:03:07 到底发生了什么"</td><td>跨机时间排序 + 上下文关联；时间同步最重要</td></tr>
+    </table>
+    <p>三种需求对应三种设计取舍：调试要"快看到"（本地、低延迟），审计要"查得到"（中央、不可丢），复盘要"排得顺"（时间戳可信、字段齐全）。<strong>同时满足三者的关键是两条纪律（工具只影响实现效率）：日志带结构化字段、时间戳出自 ROS 时钟（第 009 章的跨机排序前提）。</strong>缺少任何一条，中央集齐了 20 份日志也拼不出事故时间线。</p>
+
+    <h3>2. 日志级别与限流：先别把系统淹了</h3>
+    <p>ROS2 日志分五级（DEBUG/INFO/WARN/ERROR/FATAL），级别纪律很简单：<strong>稳态运行输出 INFO 且克制；WARN 以上必须"每条有行动含义"；DEBUG 只在排查时开。</strong>真正的洪水来自循环：控制环每帧打一条 INFO，100 Hz 下每秒 100 条，20 台就是每秒 2000 条、约 400 KB/s 的日志流，还要全部经网络、全部落盘。</p>
+    <p>治理手段的优先级：<strong>（1）限流（throttle）</strong>，同一条消息 N 秒内只打一次，ROS2 日志接口原生支持（下一节演示）；<strong>（2）聚合</strong>，"连续 1000 条同类告警"合并成一条带计数的；<strong>（3）降级</strong>，高频路径的日志降到 DEBUG，默认不输出；<strong>（4）采样</strong>，每 N 次打一次。顺序不要反：先限流（零信息损失：重复信息本来就冗余），实在不行才采样。</p>
+    <p>聚合有一个胜过敏捷限流的变体值得采用：<strong>告警持续期间不逐条发，退出时补一条带"持续时长 + 累计次数"的总结</strong>（如"低电量持续 12 分钟、期间触发 720 次"）。它保留了"持续多久"这一维信息，而简单限流会把持续时长切碎成散点；实现上只需在状态机里记录首次触发时刻与计数，在状态恢复时汇总上报。</p>
+    <div class="formula">
+      日志带宽 ≈ 单条大小 × 频率 × 台数 ≈ 200 B × 20 Hz × 20 台 ≈ 80 KB/s
+      <span class="note">看起来不大，但它是"持续"负载：一天 6.9 GB；一旦某节点进入异常循环（每帧 ERROR），瞬间翻十倍，日志必须自带刹车</span>
+    </div>
+
+    <h3>3. 结构化日志：给每条日志装上"检索键"</h3>
+    <p>纯文本日志的宿命是"只有写它的人会查"。结构化日志把关键信息放进固定字段：<strong>机器人编号、节点名、事件类型、关键数值</strong>。ROS2 日志天然携带时间戳、节点名与级别，你只需要把"事件语义"补上，推荐统一格式：<code>[事件码] 键=值 键=值</code>（如 <code>[TASK_REJECT] task=7 reason=battery_low pct=0.12</code>）。</p>
+    <p>为什么值得多写这几个字段？因为告警与检索都靠它们：中央系统可以"按事件码聚合计次"、"按机器人过滤"、"找出所有 reason=battery_low"；复盘时一条命令从 20 份日志里拉出同一个任务的全链路。反过来，<code>"任务被拒绝了，因为电量太低"</code>这种自然语言日志，机器帮不了你，人工查的时候还要猜措辞。</p>
+    <p>结构化不是免费的：同一条日志加上字段与键名后，体积通常涨 20–50%（150 B 的文本变约 250 B 的 JSON 记录）。但只要用事件字典与限流把"条数"压住，总账仍然是两个数量级的下降：每秒 50 条的自由文本变成每秒 0.2 条的结构化记录，单台从 7.5 KB/s 降到约 50 B/s。反过来说，<strong>结构化格式要和限流配套使用，否则只是"每条日志多花了 100 字节"</strong>。检索侧同样要定纪律：字段名进字典、键值类型固定（pct 永远是 0–1 的小数），否则同一个含义出现三种写法，聚合查询立刻退化回正则猜谜。</p>
+    <table>
+      <tr><th>维度</th><th>纯文本日志</th><th>结构化日志</th></tr>
+      <tr><td>检索方式</td><td>正则猜措辞，容易漏</td><td>按字段精确匹配</td></tr>
+      <tr><td>聚合计数</td><td>人工逐条看</td><td>一行命令按字段分组</td></tr>
+      <tr><td>告警规则</td><td>关键词命中，误报偏高</td><td>事件码 + 字段条件，可精确表达</td></tr>
+      <tr><td>单条体积</td><td>基准</td><td>约 +20–50%</td></tr>
+      <tr><td>总体开销</td><td>条数失控时长尾很大</td><td>配合限流与字典后总量更小</td></tr>
+    </table>
+
+    <h3>4. 汇聚链路：缓冲、限速、批量</h3>
+    <p>汇聚链路的四段与责任：<strong>采集</strong>（每台机器人：本地日志文件的守夜人 + rosout 订阅）→ <strong>本地缓冲</strong>（环形队列 + 落盘：断网时写本地，恢复后续传）→ <strong>限速上传</strong>（批量 + 令牌桶，走后台流分类，第 014 章）→ <strong>中央存储与检索</strong>（按天滚动、按机器人分片、保留策略）。</p>
+    <ul>
+      <li><strong>本地缓冲是灵魂</strong>：网络断了，日志必须继续在本地落盘（环形缓冲限定容量，防止塞满磁盘）；恢复后按时间顺序续传。没有这段，断网故障的日志永远缺"案发时段"。</li>
+      <li><strong>限速上传是纪律</strong>：日志是后台流，批量（如 100 条/包）、限速（如每台 2 Mbps）、错峰（避免 20 台同时上传）；<strong>上传优先级永远排在控制与感知之后。</strong></li>
+      <li><strong>保留策略是成本</strong>：INFO 级 7–30 天、WARN 以上 90 天以上、审计类更长；上中央存储前先想清楚"谁在什么场景会查哪一段"，保留策略写不出与场景的对应，就是纯花钱。</li>
+    </ul>
+    <div class="formula">
+      环形缓冲容量 ≥ 日志产生速率 × 最长预期断网时长 × 安全系数（取 1.5–2）
+      <span class="note">例：0.024 MB/min × 断网 24 h（1440 min）≈ 34.6 MB，乘 1.5 约 52 MB。设计表里写 50 MB 时，它恰好覆盖约 35 小时断网；若"最长断网"假设超过一天，缓冲要同步上调；容量必须有输入参数，不能拍一个"感觉够了"的数</span>
+    </div>
+    <p><strong>两组数字把日志工程的总账说清楚。</strong>上传侧：单台日均 35 MB，按 2 Mbps 限速上传的净耗时约 140 秒，占一天后台窗口不到千分之二，前提是批量与错峰都到位。存储侧算例复核一遍：20 台合计 700 MB/天，INFO 保留 30 天约 21 GB 量级，一块中等容量的磁盘就能承载。<strong>可见日志体系的瓶颈在条数控制与检索质量</strong>：管不住条数，再大的盘也会被一个月填满；字段不统一，存下来也检索不动。</p>
+    <p>把"日志"与"指标"的分工说清，能省下大量存储与检索力气：<strong>离散事件、上下文与责任归属用日志；高频数值观测用指标</strong>（计数器、仪表盘、直方图：频率、利用率、延迟分位）。把 100 Hz 的实时频率数值写进日志是典型浪费，日志按条存储与索引，指标按时间序列压缩聚合，成本差着几个数量级；而"谁在 14:03 发了急停"这类离散事实必须进日志。<strong>判据：需要逐条保留原委的用日志，只需要趋势与阈值的用指标。</strong></p>
+    <p>跨机排序还有一条前提常被忽视：<strong>时间戳只在校验过同步质量之后才可用于定序</strong>。两机偏差 30 ms 时，间隔小于 30 ms 的两个事件谁先谁后没有定论；复盘跨机事故应结合因果标记（同一 task_id 的事件链、消息序号）消歧。<strong>把"时钟同步质量"作为日志报告的一部分交给复盘者</strong>，是对结论负责的做法。</p>
+
+    <h3>5. 从日志到告警：值班界面要什么</h3>
+    <p>日志聚合的最终消费方是"值班界面"：<strong>（1）时间线视图</strong>（按时间排序的跨机事件流，靠第 1 节的时间纪律）；<strong>（2）聚合计数</strong>（"过去 5 分钟 ERROR 按机器人分组"）；<strong>（3）告警规则</strong>（阈值 + 连续判定：连续 3 次心跳缺失、5 分钟内 ERROR 超过 10 条等）。规则设计与第 006 章一脉相承：<strong>每条告警必须携带"发生了什么 + 建议动作"，并配套恢复通知</strong>，只会喊"异常"不会说"怎么办"的告警，最终教会值班员无视它。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>为 20 台机器人车队设计日志体系（预算与边界同步给评审）：</p>
+    <ol>
+      <li><strong>定事件字典</strong>：先列出"值得留痕的事件"（任务生命周期、模式切换、安全动作、参数变更、连接事件），分配事件码；代码里只许用字典内的事件码，<strong>日志内容也要有接口，不能各写各的。</strong></li>
+      <li><strong>分级与限流基线</strong>：稳态 INFO ≤ 每台 2 条/秒；高频路径默认 DEBUG；所有周期日志加持 throttle（如 5 s）。</li>
+      <li><strong>本地链路</strong>：日志文件按天滚动 + 保留 7 天；环形缓冲 50 MB；断网落盘、恢复续传。</li>
+      <li><strong>上传链路</strong>：批量 100 条/包、每台限速 2 Mbps、错峰窗口（每台偏移随机 0–30 s）；上传流量计入"后台流"配额（第 013/014 章）。</li>
+      <li><strong>中央与告警</strong>：按"机器人 + 天"分片存储；告警规则三条起步（心跳、ERROR 率、安全事件），每条带动作与恢复通知。</li>
+    </ol>
+
+    <h3>日志预算表（单台机器人）</h3>
+    <table>
+      <tr><th>类别</th><th>频率</th><th>日均量</th><th>上传策略</th></tr>
+      <tr><td>稳态 INFO</td><td>≤ 2 条/s</td><td>~35 MB</td><td>批量 + 限速 + 错峰</td></tr>
+      <tr><td>WARN/ERROR</td><td>偶发</td><td>忽略不计</td><td>即时上传（高优先）</td></tr>
+      <tr><td>DEBUG（排查期）</td><td>临时开启</td><td>可控</td><td>默认不上传，仅本地</td></tr>
+      <tr><td>安全事件</td><td>稀有</td><td>极小</td><td>即时 + 持久保留 + 告警</td></tr>
+    </table>
+
+    <div class="box key">
+      <span class="box-title">设计决策：为什么"错误日志即时上传"而"稳态日志批量错峰"？</span>
+      <p>因为两类日志的价值时间尺度不同。错误与安全事件<strong>必须尽快出现在值班界面</strong>，晚五分钟可能意味着下一台机器人踩上同一个坑；它们的总量极小（稀有事件），即时上传不构成流量压力。稳态 INFO 则相反：量大、单条价值低、但集体价值高（复盘要用），批量、限速、错峰把成本压到后台流的零头。<strong>分类处理同一个数据源的不同子集，是流量工程的一般手法</strong>（第 014 章"关键/后台"分类的一个实例）：关键在于分清"哪部分日志值得即时特权"；笼统地问"日志要不要限速"没有意义。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：结构化 + 限流，日志纪律的代码形态</strong></p>
+    <pre class="code"><code>class TaskExecutor(Node):
+    """任务执行节点：演示日志级别纪律、限流与结构化字段。"""
+    def __init__(self, robot_id):
+        super().__init__("task_exec", namespace=f"robot{robot_id}")
+        self.robot_id = robot_id
+        self.create_timer(0.1, self.tick)      # 10 Hz 循环：最容易诞生日志洪水的地方
+
+    def tick(self):
+        # 周期状态只打 DEBUG：稳态 INFO 要克制，高频路径绝不上 INFO
+        self.get_logger().debug(f"tick r={self.robot_id}")
+        # 偶发信息用结构化格式：[事件码] 键=值，机器可检索、可聚合、可告警
+        if self.battery_low():
+            # 关键一步：throttle 限流。同一条消息 10 秒内只出现一次，
+            # 避免"持续低电量"以 10 Hz 刷屏（ROS2 日志接口原生支持该参数）
+            self.get_logger().warn(
+                "[BATTERY_LOW] pct=0.12 robot={} action=return_home".format(self.robot_id),
+                throttle_duration_sec=10.0)
+        # 安全事件：不打折、不节流，附带结构化上下文（审计与告警都要用）
+        if self.estop_triggered():
+            self.get_logger().error(
+                f"[ESTOP] robot={self.robot_id} source=watchdog ts=now action=stop")
+
+    def battery_low(self):
+        return False                            # 简化示例：真实实现读电量缓存</code></pre>
+    <p>解读：<strong>（1）</strong>三个级别三种纪律同框展示：周期状态 debug（默认静默）、持续告警 warn + throttle（10 s 一条）、安全事件 error（永不节流），<strong>"日志级别"是运维策略分级，和情绪无关</strong>。<strong>（2）</strong><code>throttle_duration_sec</code> 是 ROS2 日志接口的现成能力：它按"消息内容 + 时长"限制重复，比自己写去重逻辑简单、可靠。注意最后一行 <code>action=stop</code>：结构化字段里包含"该做什么"，让告警系统与值班手册可以直接引用。<strong>（3）</strong>格式上混用了 f-string 与 <code>.format()</code> 两种写法，工程中择一统一即可；关键是字段名的统一（robot/pct/action），它们就是未来检索的第一批关键词。</p>
+
+    <p><strong>片段 2：汇聚节点的本地缓冲，断网不失忆</strong></p>
+    <pre class="code"><code>from collections import deque
+import json
+
+class LogCollector(Node):
+    """本机日志守夜人：收集自己的日志流，写入环形缓冲，限速上传。"""
+    def __init__(self, robot_id, upload_fn, buffer_mb=50):
+        super().__init__("log_collector", namespace=f"robot{robot_id}")
+        self.robot_id = robot_id
+        self.upload = upload_fn                 # 上传实现：批量 + 令牌桶（第 014 章）
+        self.buf = deque(maxlen=buffer_mb * 1024 * 1024 // 256)  # 按条数近似的环形缓冲
+        # 订阅日志话题：按本节点命名空间过滤或使用重映射拆分（以发行版实际话题为准）
+        self.create_subscription(Log, "/rosout", self.on_log, QoSProfile(depth=100))
+        self.create_timer(5.0, self.flush)      # 5 s 一批：批量上传比逐条省得多
+
+    def on_log(self, msg):
+        if not msg.name.startswith(f"/robot{self.robot_id}/"):
+            return                              # 只收本机的：日志不该跨机广播
+        rec = {"t": msg.stamp.sec + msg.stamp.nanosec / 1e9,
+               "level": msg.level, "node": msg.name, "text": msg.msg}
+        self.buf.append(json.dumps(rec, ensure_ascii=False))  # 结构化：一行一条
+        # WARN/ERROR 走即时通道（片段 1 的设计决策：关键子集有上传特权）
+        if msg.level &gt;= Log.WARN:
+            self.upload([self.buf.pop()], urgent=True)
+
+    def flush(self):
+        batch = [self.buf.popleft() for _ in range(min(len(self.buf), 100))]
+        if batch:
+            self.upload(batch, urgent=False)    # 稳态日志：批量、限速、错峰（见设计表）</code></pre>
+    <p>解读：<strong>（1）</strong><code>deque(maxlen=...)</code> 就是环形缓冲：满员自动淘汰最老，<strong>"限定容量"是断网缓冲的关键设计</strong>（不设上限的缓冲会在长断网时吃光磁盘），代价是最老的日志可能被覆盖，这是容量与完整性的显式取舍，应写进设计表。<strong>（2）</strong>过滤逻辑只保留本机命名空间的日志：日志话题是公共的，但"采集边界"必须清晰，否则 20 台各采全量、中央存储 ×20 倍。<strong>（3）</strong>两级上传通道与设计决策完全对应：urgent（阈值以上，即时小批量）与批量（稳态，5 s 一批），<strong>把"分类"落实成两个函数调用，是这段代码最值得抄走的骨架。</strong></p>
+
+    <p><strong>片段 3：查询与告警，值班视角的常用动作</strong></p>
+    <pre class="code"><code># 复盘开场三件事：跨机拉同一时间窗、按事件码过滤、按机器人分组计数
+ros2 topic echo /rosout --once              # 快速验证日志流还在（本机视角）
+journalctl -u robot_agent --since "14:00" --until "14:10" | grep ESTOP
+grep -h "\[TASK_REJECT\]" /var/log/fleet/robot*/today.log | sort | uniq -c
+# 告警规则示例（中央监控侧）：
+#  R1: 5 分钟内同一 robot 的 ERROR ≥ 10 条 -&gt; CRITICAL（可能进入异常循环）
+#  R2: 任意 [ESTOP] 事件 -&gt; CRITICAL + 立即拉取该机前后 60 s 全量日志
+# R3: 某机 30 分钟无日志上报 -&gt; WARN（采集/网络问题，需与业务问题区分）
+# 每条告警都必须有对应"恢复通知"与建议动作，否则值班员会脱敏（第 006 章）</code></pre>
+    <p>解读：<code>grep + sort + uniq -c</code> 看起来朴素，却是"结构化日志"承诺的兑现：事件码让聚合计数一行命令完成。<strong>告警规则 R3 值得特别注意</strong>，"无日志上报"本身是告警（说明采集链路断了），它把第 006 章"监控自己也要被监控"原则应用到了日志体系：没有 R3，日志系统自己死亡时，值班界面会安静得像一切正常。最后一行是告警设计的通用底线：<strong>没有恢复通知与动作建议的告警是不完整的。</strong></p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>循环里打 INFO</strong>：控制环每帧一条，每秒数百条 × 20 台，磁盘与上传双爆。修复：高频路径降 DEBUG；周期信息一律 throttle；上线前用"日志预算表"核对频率。</li>
+      <li><strong>纯文本自由格式</strong>：复盘时要靠"猜措辞"来 grep（"是'任务拒绝'还是'拒绝任务'？"）。修复：事件字典 + <code>[事件码] 键=值</code> 格式，评审时检查格式合规。</li>
+      <li><strong>日志时间戳用系统时间</strong>：仿真里时间轴错位（第 009 章）、跨机排序错乱。修复：日志一律走 ROS 时钟；跨机排序前先验收时间同步。</li>
+      <li><strong>上传不限速不错峰</strong>：20 台在凌晨同一分钟上传昨日日志，把后台窗口打成主负载。修复：批量 + 令牌桶 + 每台随机错峰（第 014 章的后台流纪律）。</li>
+      <li><strong>断网日志不留本地</strong>：上传失败即丢弃，恰好故障时段的日志全灭。修复：环形缓冲 + 落盘 + 恢复续传；缓冲容量写进设计表。</li>
+      <li><strong>告警只报不修</strong>：满屏 WARN 无动作建议，值班员开始忽略。修复：每条告警配动作与恢复通知；定期清理"从来不会触发动作"的规则。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>计算题：某节点以 50 Hz 运行且每次循环打一条 150 B 的 INFO。单台每秒产生多少 KB？20 台一天多少 GB？限流到 5 s 一条后呢？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>150 B×50=7.5 KB/s；20 台一天 ≈ 13 GB；限流后降到 ~0.03 KB/s/台，一天 20 台 &lt; 100 MB。两个数量级的差别就是这么来的。</div></details>
+      </li>
+      <li>格式题：把"robot2 在 14:03 因为电量低拒绝了任务 7"改写成结构化格式（含事件码与至少 3 个键值对），并写出对应的告警规则与动作建议。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>[TASK_REJECT] robot=2 task=7 reason=battery_low pct=0.12 action=requeue；告警规则：同机器人 5 分钟内 TASK_REJECT ≥ 3 → WARN + 检查电量策略。</div></details>
+      </li>
+      <li>设计题：给"安全事件审计"设计保留与不可抵赖方案：安全事件的存储位置、保留时长、防篡改手段（退一步讲：最低成本的"防误删"方案）。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>安全事件双写（本地 + 中央）、中央侧 append-only 存储、按天校验计数；防篡改可用只写账号 + 逐条校验码串联（进阶）。核心：安全事件不与稳态日志同池淘汰。</div></details>
+      </li>
+      <li>推导题：断网 30 分钟，单台机器人稳态日志 35 MB/天。环形缓冲需要多大才能不丢？如果缓冲只有 10 MB 会发生什么？给出容量建议与设计表条目写法。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>35 MB/天 ≈ 0.024 MB/min；30 分钟 ≈ 0.73 MB，10 MB 缓冲足够撑 6+ 小时断网。想清楚"最长断网时长"这个输入参数，容量就有依据了。</div></details>
+      </li>
+      <li>论证题：有人主张"所有日志都传中央，本地不留"，理由是"集中才叫聚合"。列出至少三条反对意见，并给一个断网 2 小时后复盘的具体失败场景。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>反对：断网即失忆（恰是故障时段）、上传带宽无锚（全量即洪水）、本地故障时中央缺案发现场日志。失败场景：断网期间发生碰撞，恢复后只剩"碰撞后"的日志。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>日志三层需求：调试（本地实时）、审计（中央完整）、复盘（跨机可排序）；两条纪律是结构化字段与 ROS 时钟时间戳。</li>
+      <li>级别是策略不是情绪：稳态克制、周期限流（throttle）、安全事件不打折；先限流再聚合，最后才采样。</li>
+      <li>结构化格式统一为 [事件码] 键=值：检索、聚合、告警全部因此变得一行命令可得。</li>
+      <li>汇聚链路四段：采集 → 本地环形缓冲（断网不失忆）→ 限速批量上传（后台流）→ 中央存储与保留策略。</li>
+      <li>告警三要素：阈值 + 连续判定 + 恢复通知；每条告警携带动作；监控日志系统自己是否活着（R3 类规则）。</li>
+      <li>下一章收官系统编排：<strong>生命周期节点</strong>，让 20 台机器人的启动顺序像乐队进场一样可控。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch017.html">← 第 017 章：多机器人仿真环境搭建</a>
+    <a class="next" href="ch019.html">第 019 章：生命周期节点与系统启动编排 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

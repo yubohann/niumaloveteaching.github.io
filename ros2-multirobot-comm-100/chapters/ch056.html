@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第056章 多机器人协同搬运 | 多机器人协同学习课程 · ROS2 通信与系统集成</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第三篇 · 协同控制与任务协同</span>
+    <span class="sep">/</span>
+    <span>第 056 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第三篇 · 协同控制与任务协同</div>
+    <h1>第 056 章：多机器人协同搬运</h1>
+    <p class="lead">多台机器人抬同一个物体：用对象坐标系统一所有人的动作，用抓持矩阵把"期望运动"与"夹持内力"分开控制，用速度共识避免互相打架，这是 057、058、059 三章共同的地基。</p>
+    <ul class="meta">
+      <li>主题：任务协同 / 物理耦合搬运</li>
+      <li>关键机制：对象坐标系、抓持矩阵与伪逆分解、内力抵消、速度共识</li>
+      <li>预计学时：65 分钟</li>
+      <li>前置章节：第 055 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解三类物理耦合（推、抓、吸）的区别，以及"统一在对象坐标系控制"为什么能简化协同。</li>
+      <li>掌握刚体速度约束 v<sub>i</sub> = v<sub>o</sub> + ω<sub>o</sub> × r<sub>i</sub> 与抓持矩阵 G 的构造，会做伪逆分解（外力 + 零空间内力）。</li>
+      <li>能解释"内力打架"的成因与危害，并设计内力抑制与夹持力上下限。</li>
+      <li>会实现两种对象状态获取方式：leader 广播对象速度、或由多机位姿最小二乘反解对象位姿。</li>
+      <li>能设计通信中断时的降级行为（停止并保持抓持），并写出搬运任务的验收指标。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>到此为止的协同都是"动作层面"的：保持队形、避让、围住目标，机器人之间没有力传递。协同搬运第一次引入<strong>物理耦合</strong>：多台机器人通过同一物体连成一体，任何一台的错误动作都会以力的形式传给其他机器人，轻则互相顶着推不动，重则把物体扭变形、把夹爪拉坏。这也是为什么协同搬运被公认为多机器人里"协同质量"的试金石。</p>
+    <p>本章建立通用框架：对象坐标系、抓持矩阵、内力分解、速度反解与标定流程。057 章专攻"重物推动"（无力抓持、摩擦锥与导纳控制），058 章专攻"长物体"（姿态约束与过弯），059 章专攻"抓取动作"（抓点选择与同步抬起）。先把 056 的抽象层吃透，后面三章只是把它在不同物理形态下的特化。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 统一到对象坐标系</h3>
+    <p>如果每台机器人在自己的世界坐标系里闭环控制"我要到哪"，搬运必然打架：A 要去世界系的 (3, 2)，B 也去 (3, 2)，而它们抬着的是同一个物体，目标点应该由<strong>物体要移动到的位置</strong>推出来。正确做法是：所有运动指令先转换到对象的机体坐标系（原点在物体几何中心、x 轴沿物体长轴），对象的目标速度与角速度是唯一的协同变量，每台机器人只负责"让我的接触点按刚体约束跟随"：</p>
+    <div class="formula">
+      v<sub>i</sub> = v<sub>o</sub> + ω<sub>o</sub> × r<sub>i</sub>
+      <span class="note">v<sub>o</sub>、ω<sub>o</sub> 为对象速度/角速度；r<sub>i</sub> 为接触点在对象系的坐标，刚性耦合下所有接触点共享同一对 (v<sub>o</sub>, ω<sub>o</sub>)</span>
+    </div>
+    <p>这条约束是所有协同搬运算法的主轴：它既是"命令下发的正向通道"（对象速度 → 各接触点速度），也是"状态反馈的逆向通道"（各接触点实测速度 → 估计对象速度）。推翻它（比如各自闭环）就等于主动引入矛盾。</p>
+
+    <h3>2. 抓持矩阵：把"运动"与"夹持"拆开</h3>
+    <p>力层面的关系用一个矩阵表达：m 个接触点的力（每个 2 维，平面情形）合成为作用在物体上的合力旋量（2 个力 + 1 个力矩）：</p>
+    <div class="formula">
+      f<sub>o</sub> = G·f<sub>c</sub>，&nbsp; G = [G<sub>1</sub> … G<sub>m</sub>]，G<sub>i</sub> = [[1, 0], [0, 1], [−r<sub>iy</sub>, r<sub>ix</sub>]]
+      <span class="note">f<sub>c</sub> 为 2m 维接触力向量；G 形状 3 × 2m；G 的行是"每个接触点对对象三个自由度的贡献"</span>
+    </div>
+    <p>抓持矩阵的妙处在于<strong>零空间</strong>：满足 G·f = 0 的接触力组合不产生任何净运动，是纯"内力"（互相对挤或对拉）。通用做法是把期望力分解为两个正交分量：</p>
+    <div class="formula">
+      f<sub>c</sub> = G<sup>+</sup>·f<sub>des</sub> + (I − G<sup>+</sup>G)·f<sub>int</sub>
+      <span class="note">第一项产生期望运动（最小范数），第二项投影到零空间只调夹持；G<sup>+</sup> = G<sup>T</sup>(GG<sup>T</sup>)<sup>−1</sup></span>
+    </div>
+    <p>这个分解解释了协同搬运最常见的故障，"<strong>打架</strong>"：两台机器人沿相反方向用力，接触力包含巨大的零空间分量，物体纹丝不动（G·f = 0 没有净运动），但电机持续发热、结构承受挤压。合理系统必须显式管理内力：给零空间分量设目标值（需要夹稳时给一点挤压力）与上限（防损坏），不允许它自由生长。</p>
+
+    <h3>3. 对象状态的获取：两条路</h3>
+    <table>
+      <tr><th>维度</th><th>leader 广播</th><th>多机位姿反解</th></tr>
+      <tr><td>通信依赖</td><td>强，断连即失效</td><td>弱，可各自计算</td></tr>
+      <tr><td>消息量</td><td>Twist 几十字节 @20 Hz</td><td>各方位姿 @20 Hz</td></tr>
+      <tr><td>精度来源</td><td>规划值，稳定</td><td>依赖标定，姿态误差 5.7° 量级</td></tr>
+      <tr><td>典型角色</td><td>主通道</td><td>监控与降级</td></tr>
+    </table>
+    <p>算法需要对象的位姿与速度，来源有两类：<strong>(a) leader 广播</strong>，某台机器人（或虚拟 leader）负责规划对象轨迹，以 20–30 Hz 广播 (v<sub>o</sub>, ω<sub>o</sub>)，其余机器人按刚体约束求自己接触点的目标速度。简单、带宽小（Twist 消息几十字节），但依赖通信连续性，且 leader 本身可能失位。<strong>(b) 由多机位姿反解</strong>，每台机器人报告自己的接触点位姿，任一台（或各自）用最小二乘拟合刚体变换，得到对象位姿与速度。无需 leader、断连容忍度高，但要求<strong>接触点标定准确</strong>：r<sub>i</sub> 的误差（对象系下）、机器人定位误差、物体形变都会灌进拟合结果，在对象较小（r 小）时拟合病态、姿态估计抖。</p>
+    <p>工程组合方案：对象较大、通信良好时用 (a) 为主、(b) 做监控（比较两者偏差，超过 0.1 m 说明标定或通信出问题）；断连时切换到 (b) 自治。</p>
+
+    <h3>4. 标定：启动前的必修课</h3>
+    <p>协同搬运系统 60% 以上的故障源于启动前没标定或标定不准。需要标定三样东西：<strong>接触点在对象系的坐标 r<sub>i</sub></strong>（最常用"对点法"：各自把夹爪/接触面贴到物体上的标记点，把本地位姿转成对象系坐标，重复 5 次取均值，误差控制在 2 cm 以内）；<strong>接触点在本机系的安装位置</strong>（夹爪偏置，用尺量 + 一次触碰验证）；<strong>摩擦与力限值</strong>（夹持力从零缓升，观察物体是否滑动，记录临界值）。标定结果写入参数文件并带版本，搬运任务启动时校验版本一致，两台用不同版本参数的机器人抬起同一个物体，等于两台各自以为对方是别的构型。</p>
+
+    <h3>5. 通信中断与降级</h3>
+    <p>搬运过程中的断连比探索场景更危险：不知道队友意图时继续移动，会拉扯物体甚至掀翻。降级原则是"<strong>停住但保持抓持</strong>"：速度指令置零、夹持力保持当前值（松手会让物体掉落，加力可能损坏），并周期重播自己的状态与意图。恢复重新同步后，先做一次"对象状态共识"（所有人对对象位姿的估计差收敛到 0.1 m 内）再恢复移动。这套降级逻辑需要与 044 章的本地安全层组合：速度为零的机器人仍在 ORCA 体系中，防止其他执行任务的机器人撞上这个"静止的搬运组"。</p>
+
+    <h3>6. 数值算例：一次抬升的力分解</h3>
+    <p>用两个接触点 r<sub>1</sub> = (0.5, 0)、r<sub>2</sub> = (−0.5, 0)（对象系，单位 m）构造 3 × 4 抓持矩阵：</p>
+    <div class="formula">
+      G = [[1, 0, 1, 0], [0, 1, 0, 1], [0, 0.5, 0, −0.5]]
+      <span class="note">前三列对应 r<sub>1</sub> 处的 (f<sub>x</sub>, f<sub>y</sub>)，后三列对应 r<sub>2</sub> 处；第三行是力矩贡献 r<sub>x</sub>·f<sub>y</sub> − r<sub>y</sub>·f<sub>x</sub></span>
+    </div>
+    <p><strong>纯平移分解</strong>：期望对象受到 +x 方向 10 N 的合力、零力矩，即 f<sub>des</sub> = (10, 0, 0)。最小范数解（伪逆）给出两组接触力 (5, 0, 5, 0)：两台机器人各推 5 N，力矩项 0.5×0 − (−0.5)×0 = 0，干净利落，与"正中间纯推力按各出一半分摊最省力"的直觉一致。</p>
+    <p><strong>纯力矩分解</strong>：若改为期望 0.5 N·m 的纯扭矩（f<sub>des</sub> = (0, 0, 0.5)），解是 (0, 0.5, 0, −0.5)：第一台沿 +y 推 0.5 N、第二台沿 −y 推 0.5 N，合力为零、扭矩为 0.5×0.5 + 0.5×0.5 = 0.5 N·m。两人的推力方向相反，正是"差动"产生的力矩：<strong>转动物体靠的是两端推力的差，不是更强的单点推力</strong>，所以让物体缓慢转动只需 0.5 N 量级的差动力。</p>
+    <p><strong>内力演示</strong>：取 f = (1, 0, −1, 0)，即两台沿 x 互相顶：G·f = (1 − 1, 0 + 0, 0.5×0 + 0.5×0) = (0, 0, 0)，对象受到的合力旋量为零，纹丝不动，但两台的电机持续出力。<strong>内力就是"在零空间里自由生长"的那部分接触力</strong>；把内力目标设为 10 N、上限设为 30 N，就是给这部分力装上"目标值 + 保险丝"。</p>
+    <p>纯摩擦夹持的边界核算：若把 5 kg 平台的重量完全交给两侧接触面的摩擦（纯侧向夹持），每侧需要的法向力为 mg/(2μ) = 49/(2×0.6) = 40.8 N，超过内力上限 30 N；反过来，10 N 的内力目标在 μ = 0.6 下只能承载约 1.22 kg。这说明<strong>10 N 的目标值只适用于"托举面承重、夹持力防滑移"的构型</strong>；若接触构型就是纯侧向夹持，内力目标必须提到 40 N 以上，并同步复核结构强度，或重新设计成托底搬运。</p>
+    <p>标定误差的影响也可以估：r<sub>i</sub> 误差 2 cm、接触力 50 N 时，臂上的寄生力矩约为 50 × 0.02 = 1 N·m，相当于给对象额外施加一个可见的转向力矩；两侧误差方向相反时力矩翻倍。这就是把 r<sub>i</sub> 标定精度卡在 2 cm、并运行中用最小二乘残差在线监控的原因。</p>
+    <p>反解通道的数字感：最小二乘残差的 RMS 正常情况下在 2–3 cm（标定与定位误差的量级），跳到 10 cm 说明有机器人位姿跳变、标定失效或物体滑移。两点接触（4 个方程、3 个未知量）的姿态精度有限：1 m 基线上 1 cm 的相对测量误差对应 arctan(0.01/1) ≈ 0.57° 的姿态误差，而两台机器人各 5 cm 的定位误差合起来是 10 cm 量级，对应约 5.7° 的姿态偏差。这是有意取舍：姿态以 leader 广播为主，反解用于监控与降级；5.7° 的监控精度对"发现异常"够用，对"闭环控制"不够，两个通道各司其职。上线前把两条通道分开测：静置 10 分钟查标定残差（应稳定在 3 cm 内），急动测试查位姿跳变（残差峰值不应超过 10 cm），结果记入搬运系统的准入清单。两份记录各跑一轮就能覆盖主要退化路径，测试频次建议每 20 次搬运任务复测一轮，复测发现残差上限抬升就提前重新标定，成本远低于一次现场事故的处置代价。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <ol>
+      <li><strong>角色与架构</strong>：leader（本示例 robot1）运行对象轨迹规划（输入键盘/任务目标，输出对象 Twist）；所有成员运行"接触点速度解算 + 本机执行"。</li>
+      <li><strong>坐标系</strong>：对象坐标系随标定定义；接触点速度在对象系算完后转换到各机世界系再下发。</li>
+      <li><strong>消息</strong>：<code>/fleet/object_cmd</code>（Twist：v<sub>o</sub>, ω<sub>o</sub>）20 Hz，Reliable；<code>/fleet/object_state</code>（位姿 + 速度 + 来源标记）30 Hz，Best-effort；<code>/fleet/grasp_force</code>（各接触点实测/目标力）10 Hz。</li>
+      <li><strong>参数校验</strong>：启动时校验标定版本与力限值一致性，不一致拒绝进入搬运模式。</li>
+      <li><strong>降级</strong>：0.3 s 无 <code>object_cmd</code> → 速度归零、保持夹持；1.5 s 仍无 → 全员广播 HOLD 状态；恢复后重同步再动。</li>
+      <li><strong>验收</strong>：2 台机器人抬 5 kg 桌面平台沿走廊 15 m（含一次 90° 转弯）：到位误差小于 0.15 m；过程中对象姿态偏差小于 5°；内力估计始终低于 30 N；断电通信 2 s 测试无掉落、无异常位移（小于 3 cm）。</li>
+    </ol>
+    <h3>参数表</h3>
+    <table>
+      <tr><th>参数</th><th>取值</th><th>依据</th></tr>
+      <tr><td>搬运速度 / 加速度</td><td>0.3 m/s / 0.2 m/s²</td><td>有载系统的常规保守值，兼顾乘客（物体）稳定</td></tr>
+      <tr><td>夹持内力目标</td><td>10 N</td><td>用于托举面承重构型的横向防滑（0.2 m/s² 加减速下 5 kg 惯性力约 1 N，4 N/点已含安全系数）；纯侧向承重需 41 N/点，见正文</td></tr>
+      <tr><td>内力上限</td><td>30 N</td><td>结构承受与电机发热的保守线</td></tr>
+      <tr><td>对象指令频率</td><td>20 Hz</td><td>与底盘控制 50 Hz 匹配；再低会有指令间隙</td></tr>
+      <tr><td>标定精度要求</td><td>r<sub>i</sub> 误差 ≤ 2 cm</td><td>拟合病态与内力增长的直接来源</td></tr>
+      <tr><td>中断降级</td><td>0.3 s 冻结 / 1.5 s HOLD</td><td>与 042 章失联门限同族</td></tr>
+    </table>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：抓持矩阵与伪逆分解</strong></p>
+    <pre class="code"><code>import numpy as np
+
+def grasp_matrix(r_list):
+    """平面抓持矩阵：m 个接触力 -&gt; 物体合力旋量 (fx, fy, tau)。"""
+    cols = []
+    for (rx, ry) in r_list:                  # 接触点在对象系坐标
+        cols.append(np.array([[1.0, 0.0],
+                              [0.0, 1.0],
+                              [-ry, rx]]))   # 第三行：力矩 r x f
+    return np.hstack(cols)                   # 形状 3 x 2m
+
+def distribute_wrench(G, f_des, f_int=10.0, f_max=30.0):
+    """伪逆分解：外力分量 + 零空间挤压分量，并限幅。"""
+    G_pinv = G.T @ np.linalg.inv(G @ G.T)    # 最小范数伪逆
+    f_ext = G_pinv @ f_des                   # 产生期望运动的分量
+    # 成对反向的挤压向量，再投影到零空间（G @ f_null = 0）
+    m = G.shape[1] // 2
+    f_null = np.array([(-1.0) ** i for i in range(2 * m)])
+    f_null = f_null - G_pinv @ (G @ f_null)  # 去掉非零空间成分
+    f = f_ext + f_int * f_null / max(np.linalg.norm(f_null), 1e-6)
+    return np.clip(f, -f_max, f_max), f_ext</code></pre>
+    <p>解读：三处设计逐一说。<strong>(1) G 的第三行 [−r<sub>y</sub>, r<sub>x</sub>]</strong> 是力矩贡献，注意符号（正号版本对应 r × f 的方向约定），标定完先做一个单元测试：在 r = (1, 0) 处施加 (0, 1) 的力，物体应获得 +1 的逆时针力矩。<strong>(2) 伪逆用最小范数形式</strong> G<sup>T</sup>(GG<sup>T</sup>)<sup>−1</sup>：它给出"完成期望运动所需的最省力接触力"，避免某台机器人承担全部载荷。<strong>(3) 零空间投影</strong>是防打架的关键：<code>f_null</code> 先取成对反号（一个挤一个撑），再减去非零空间成分，剩下的无论怎么施加都不产生净运动，正是"夹紧"这个动作的数学表达。若省略投影直接加进控制量，反号向量可能含有净运动成分，物体就会被"偷偷推走"。</p>
+
+    <p><strong>片段 2：由多机位姿反解对象位姿</strong></p>
+    <pre class="code"><code>import math
+import numpy as np
+
+def object_pose_from_contacts(contact_world, r_list):
+    """由各接触点的世界系位置与对象系坐标，最小二乘拟合对象位姿。"""
+    r_list = np.asarray(r_list, dtype=float)
+    contact_world = np.asarray(contact_world, dtype=float)
+
+    def residuals(params):
+        ox, oy, oth = params
+        c, s = math.cos(oth), math.sin(oth)
+        pred = np.empty_like(contact_world)
+        pred[:, 0] = ox + c * r_list[:, 0] - s * r_list[:, 1]
+        pred[:, 1] = oy + s * r_list[:, 0] + c * r_list[:, 1]
+        return (pred - contact_world).ravel()   # 位置残差
+
+    from scipy.optimize import least_squares
+    sol = least_squares(residuals, x0=[0.0, 0.0, 0.0])
+    return sol.x, float(np.sqrt(np.mean(sol.fun ** 2)))  # 位姿 + RMS 残差</code></pre>
+    <p>解读：这是"逆向通道"的实现：两台机器人各自的接触点世界坐标（由本机里程计 + 夹爪偏置换算）加上预标定的 r<sub>i</sub>，拟合出一个刚体变换。返回的 <strong>RMS 残差是健康指标</strong>：正常情况下应在 2–3 cm（标定 + 定位误差的量级）；残差跳到 10 cm 意味着有机器人位姿跳变、标定失效、或物体真的在滑移，三种情况都需要停下来检查。两点工程注意：优化初值用上一帧解（增量式）避免陷入局部解；两台机器人时 3 个未知量与 4 个残差方程勉强可解，但姿态对噪声敏感，所以对象状态仍以 leader 广播为主、拟合用于监控与降级，这与设计里的组合方案一致。</p>
+
+    <p><strong>片段 3：接触点速度解到差速轮速</strong></p>
+    <pre class="code"><code>import math
+
+def contact_vel_to_wheels(v_contact_world, me_yaw, wheel_base=0.3,
+                          v_max=0.3, w_max=1.0):
+    """把对象系算出的接触点世界速度转为本机 (v, omega)。"""
+    c, s = math.cos(-me_yaw), math.sin(-me_yaw)
+    vx = c * v_contact_world[0] - s * v_contact_world[1]
+    vy = s * v_contact_world[0] + c * v_contact_world[1]
+    v = vx                                  # 差速车沿车头方向前进分量
+    w = 2.0 * vy / wheel_base               # 侧向分量用旋转近似实现
+    v = max(-v_max, min(v_max, v))          # 双限幅：与避让层输出同量级
+    w = max(-w_max, min(w_max, w))
+    return v, w
+
+def rigid_contact_velocity(v_obj, w_obj, r_i):
+    """刚体约束：由对象速度求某接触点的世界系目标速度。"""
+    vx = v_obj[0] - w_obj * r_i[1]
+    vy = v_obj[1] + w_obj * r_i[0]
+    return vx, vy</code></pre>
+    <p>解读：这段代码把抽象分解落到了执行器。<code>rigid_contact_velocity</code> 是约束的正向使用：对象速度 (v<sub>o</sub>, ω<sub>o</sub>) 加上该点因转动产生的切向速度（ω × r，平面展开为 (−ω r<sub>y</sub>, ω r<sub>x</sub>)）得到接触点速度，两台机器人算出的接触点速度必然满足"刚体不拉伸"的一致性，从命令源头消灭矛盾。<code>contact_vel_to_wheels</code> 是简化执行模型：差速车无法横移，侧向分量用旋转近似实现，只有当接触点距车心近、承载面允许微小滑移时成立；若是"全向底盘"或"带机械臂的抓取"，这里替换为各自的逆运动学即可，上层的对象级分解不受影响。限幅值 0.3 m/s 与设计表一致：搬运速度必须远低于空载，把"稳"放在"快"前面。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>没标定直接启动</strong>：r<sub>i</sub> 误差 10 cm，伪逆解出的接触力从第一拍就含大内力，表现为物体抖动、电流飙升。修复：强制标定流程 + 启动时版本校验；运行中监控内力估计。</li>
+      <li><strong>通信中断各推各的</strong>：leader 指令断流后成员继续按最后的指令走，或者干脆各自导航，把物体撕裂。修复：0.3 s 冻结 + 1.5 s HOLD 的确定性降级；恢复前做状态共识。</li>
+      <li><strong>各自在世界系闭环</strong>：两台机器人分别追踪各自的世界系目标点，目标是"自己算的"，逐渐产生矛盾。修复：运动指令必须从对象状态推出；世界系目标只允许出现在对象轨迹规划一层。</li>
+      <li><strong>内力无上限</strong>：为"夹得牢"把夹持力调得很大，长期挤压导致物体变形或夹爪过载。修复：内力目标与上限分离（10 N 目标 / 30 N 上限），并且上限由结构强度标定，取值要有依据。</li>
+      <li><strong>对象状态估计互相污染</strong>：多台机器人各自估计对象位姿、又互相转发对方的估计，协方差虚假收缩（同 054 章的问题）。修复：对象状态带来源标记，估计融合只在"独立观测"之间做；转发只作参考。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>两台机器人分别位于对象 r<sub>1</sub> = (0.5, 0) 与 r<sub>2</sub> = (−0.5, 0)（对象系，单位 m）。写出 3 × 4 抓持矩阵；验证 f<sub>c</sub> = (1, 0, −1, 0) 是否为零空间向量（不产生净运动），说明它的物理含义。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>G = [[1,0,1,0],[0,1,0,1],[0,0.5,0,0.5]]；G·(1,0,−1,0) = (0,0,0)，一台推、一台反推，纯内力对拉，物体不动但结构受力。</div></details>
+      </li>
+      <li>把夹持内力从 10 N 加到 40 N，预测：防滑裕度、电机电流、物体变形风险、抓取成功率分别如何变化？给出用"临界滑动实验"标定内力目标的方法。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>防滑裕度上升但边际递减（摩擦锥饱和）；电流与变形风险线性上升。标定：固定外力扰动下逐步降低夹持力至开始滑动，取临界值的 1.5–2 倍。</div></details>
+      </li>
+      <li>设计断连降级的完整时序：0.1 s / 0.3 s / 1.5 s / 恢复 5 s 各阶段的动作与广播内容；说明为什么"保持夹持"比"松开"更安全，以及何时应该反过来（物体可能损坏、需要释放）。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>保持夹持：摩擦防滑有保证；释放仅在物体有跌落缓冲（地面低、软着陆）或夹持力本身超标时才考虑。恢复阶段先"共识对象位姿"再动。</div></details>
+      </li>
+      <li>用最小二乘反解对象位姿时，把 r<sub>i</sub> 注入 5 cm 误差，观察残差与位姿估计的偏移；解释为什么残差能成为"标定健康"的指标。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>对称误差部分被吸收进位姿偏移、部分留在残差；越多的接触点（≥3）越能区分"标定误差"与"位姿误差"，这也是多点接触的价值之一。</div></details>
+      </li>
+      <li>为你的协同搬运写测试大纲：静置（夹持保持 10 min）、直线、转弯、断连、单机失效（3 台中的 1 台停机）五个场景，各给出判据与记录字段。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>记录字段：对象姿态偏差、内力估计、残差 RMS、指令-实测速度差、事件时间线。单机失效场景判据：物体位移 &lt; 5 cm、其余机器人保持 HOLD。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>协同搬运的一切矛盾都源于"各自闭环"；统一到对象坐标系，用刚体约束 v<sub>i</sub> = v<sub>o</sub> + ω<sub>o</sub> × r<sub>i</sub> 下发命令、反解状态。</li>
+      <li>抓持矩阵 G 把接触力映射为对象合力旋量；伪逆分解 = 外力分量 + 零空间内力。"打架"就是零空间力失控。</li>
+      <li>对象状态两条路：leader 广播（主用）与多机最小二乘拟合（监控与降级）；拟合残差是标定健康指标。</li>
+      <li>标定（r<sub>i</sub>、夹爪偏置、力限值）与降级（冻结 → HOLD → 共识恢复）是工程落地的两条生命线。</li>
+      <li>下一章特化：<strong>协同搬运重物</strong>，无力抓持、推的方式、摩擦锥与导纳控制下的力分配。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch055.html">← 第 055 章：多机器人围捕任务</a>
+    <a class="next" href="ch057.html">第 057 章：协同搬运重物 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

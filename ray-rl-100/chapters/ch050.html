@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第050章 RLlib策略蒸馏与部署衔接 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第三篇 · RLlib 算法实现</span>
+    <span class="sep">/</span>
+    <span>第 050 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第三篇 · RLlib 算法实现</div>
+    <h1>第 050 章：RLlib策略蒸馏与部署衔接</h1>
+    <p class="lead">训练成果如何落地成推理工件：策略蒸馏（Policy Distillation）用教师策略的软动作分布监督小型学生网络，状态分布漂移如何用在线采样抵消，导出（Export）与部署衔接需要核对输入处理、模型裁剪与延迟预算三件事。</p>
+    <ul class="meta">
+      <li>主题：RLlib 训练（蒸馏与导出）</li>
+      <li>关键机制：KL 蒸馏损失、温度损失景观、推理工件导出</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 049 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解策略蒸馏的目标函数结构：教师软分布、温度缩放与 KL 散度三者如何组合。</li>
+      <li>掌握状态分布漂移（Distribution Shift）问题及三种数据来源方案的取舍。</li>
+      <li>会在 RLlib 中实现"教师前向加 KL 项"的蒸馏损失，并与任务损失加权组合。</li>
+      <li>能执行导出流程：裁剪推理不需要的组件、经脚本化（Scripting）固化图结构、测量推理延迟。</li>
+      <li>能设计蒸馏验收标准：动作一致率（Action Agreement Rate）与回报保持率的双指标口径。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>训练出来的策略往往比部署环境允许的更大：多环境平行训练产生的网络宽、推理慢，集成策略体积成倍。蒸馏把大模型（教师）的行为压缩到小模型（学生）：训练数据从环境交互换成教师对状态的响应，监督信号比稀疏回报稠密得多，小模型因此能在远少于强化学习的交互中逼近教师。</p>
+    <p>训练与部署之间还隔着工程衔接：推理只保留前向路径、输入处理必须与训练一致、动作选择需要确定性、延迟要满足控制周期的预算。本章把蒸馏与导出放在同一条链路上讲，避免出现"训练指标达标、上线行为不对"的断层。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p>本节按"损失结构、数据来源、导出工件"三个层面展开。</p>
+
+    <h3>1. 蒸馏损失：软分布、温度与 KL</h3>
+    <p>教师在状态 s 下输出动作分布 π<sub>T</sub>(·|s)，学生在同一状态输出 π<sub>S</sub>(·|s)。蒸馏的核心监督信号是两个分布的差异，用 KL 散度度量并作为损失：</p>
+    <div class="formula">
+      L<sub>distill</sub> = KL( π<sub>T</sub>(·|s) ‖ π<sub>S</sub>(·|s) ) = Σ<sub>a</sub> π<sub>T</sub>(a|s) · log( π<sub>T</sub>(a|s) / π<sub>S</sub>(a|s) )
+      <span class="note">教师分布常用温度 τ 软化：π<sub>T</sub> ∝ exp(z<sub>T</sub>/τ)；τ 越大分布越平坦，类别间相对大小的信息越完整</span>
+    </div>
+    <p>软分布携带的信息比"最优动作的独热标签"更多：次优动作的相对高低反映了教师对状态的置信结构，学生因此学到动作之间的相似关系。这是蒸馏相对直接模仿（Behavior Cloning）的主要优势。</p>
+    <p>温度对梯度有两层影响。一方面软化后的分布更平坦，KL 项对所有动作都有非零梯度；另一方面，分类输出经 softmax 后做温度缩放，其梯度量级与 1/τ² 同阶。<strong>调整 τ 时损失的有效尺度随之改变，必须同步调整蒸馏项的权重 λ，否则会与任务损失的平衡发生意外偏移。</strong></p>
+
+    <h3>2. 强化学习特有的问题：状态分布漂移</h3>
+    <p>监督学习里输入分布固定，强化学习里学生自己的行为决定它遇到什么状态。纯离线的做法（用教师轨迹蒸馏）会留下分布缝：学生从未见过的状态上监督缺失，误差在长时程中累积放大。三种数据来源按代价递增：</p>
+    <ul>
+      <li><strong>教师轨迹</strong>：采集成本由教师环境交互决定，分布只覆盖教师的常用路径，实现最简单。</li>
+      <li><strong>学生在线采样、教师标注</strong>：学生按当前策略探索，教师对相同状态给出分布，监督分布随学生改善而移动，缓解漂移；教师前向的计算开销成为训练侧新增成本。</li>
+      <li><strong>迭代式数据集聚合</strong>：周期性用学生采集数据、教师标注并扩增数据集，重复数轮，接近模仿学习里的数据集聚合（Dataset Aggregation）方法，工程复杂度最高。</li>
+    </ul>
+    <p>与任务损失的组合方式决定蒸馏后的水平：纯蒸馏学生的上限是教师；蒸馏加任务损失（在环境回报上继续学习）允许学生超过教师，但需要防止两个损失相互拉扯。常见起点是 KL 权重 1.0 与任务损失的组合，再按一致率与回报两个指标双向观察。</p>
+
+    <h3>3. 部署衔接：从检查点到推理工件</h3>
+    <p>训练检查点包含优化器状态、探索组件、序列状态管理工具与完整的模型定义；推理工件只保留前向计算。导出流程做三件事：<strong>裁剪</strong>（去除优化器、教师分支与探索模块）、<strong>固化</strong>（经脚本化或追踪生成独立于训练框架的静态计算图）、<strong>校验</strong>（同一批状态上比较导出前后动作输出的最大偏差）。</p>
+    <p>延迟预算的核算是衔接阶段最容易遗漏的算术题：控制周期 20 毫秒意味着从观测到动作的总耗时要控制在预算内，其中包含输入预处理、网络前向与动作后处理（离散动作的选择、连续动作的裁剪）。<strong>测量要以端到端管道为准，单独测量网络前向会低估总延迟。</strong></p>
+    <p>输入一致性是第二类衔接风险：训练时观测经过归一化、帧堆叠、通道重排，推理时任何一步缺失或顺序错误，都会让行为在"数值上接近、语义上错位"的输入上退化。<strong>把训练侧的输入处理链路与推理侧并排核对，逐项确认形状、范围与顺序。</strong></p>
+
+    <h3>4. 数值算例：温度对损失与梯度尺度的作用</h3>
+    <p>取一组三点 logits 验证 1/τ² 的缩放结论：教师 [0.30, 0.15, 0.05]、学生 [0.20, 0.10, 0.08]，最大差值 0.25，远小于所取温度的尺度，落在可线性化的区间。用数值微分计算 KL 与其对全部 student logits 的梯度范数：</p>
+    <table>
+      <tr><th>温度 τ</th><th>KL 值</th><th>相邻比</th><th>梯度范数</th><th>相邻比</th><th>KL·τ²</th></tr>
+      <tr><td>1</td><td>1.417×10<sup>−3</sup></td><td>基准</td><td>3.07×10<sup>−2</sup></td><td>基准</td><td>1.42×10<sup>−3</sup></td></tr>
+      <tr><td>2</td><td>3.57×10<sup>−4</sup></td><td>0.252</td><td>7.71×10<sup>−3</sup></td><td>0.251</td><td>1.43×10<sup>−3</sup></td></tr>
+      <tr><td>4</td><td>8.9×10<sup>−5</sup></td><td>0.249</td><td>1.93×10<sup>−3</sup></td><td>0.250</td><td>1.42×10<sup>−3</sup></td></tr>
+    </table>
+    <p>读表：温度每翻一倍，KL 与梯度范数都缩到约四分之一，乘回 τ² 后三行的量级恒定在 1.4×10<sup>−3</sup>，证明该区间内损失与温度确实解耦。<strong>注意适用条件：logits 差值接近或超过 τ 时线性化失效，缩放指数从 2 退化到约 1，此时的 τ² 修正偏大，λ 需要按实际梯度读数重新标定；照搬小差值区间的经验值会失准。</strong></p>
+
+    <h3>5. 一致率与回报的量化关系</h3>
+    <p>动作一致率是逐步统计的指标，它与整局行为一致的关系按指数衰减：单步一致率 95% 时，连续 100 步全部一致的概率为 0.95<sup>100</sup> ≈ 0.59%；放宽到 98% 时概率也只有约 13.3%。这组数字说明两点：其一，用整局一致率做验收门槛会把标准抬到不可能的高度，验收口径必须按步统计；其二，单步一致率每提高一个百分点，长时程行为的一致性改善是乘性的，蒸馏的学生网络在关键决策点上的少量分歧会被长时程放大，验收时要结合回报保持率一起看。</p>
+    <p>一致率还有一个统计口径问题：离线教师轨迹上的一致率与闭环回放中的一致率含义不同，前者覆盖教师的状态分布，后者覆盖学生的状态分布。报告里两条口径要分别记录，验收采用闭环口径。</p>
+
+    <h3>6. 验收标准的双指标数值口径</h3>
+    <p>动作一致率按闭环、逐动作统计：10 个离散动作下随机水平的期望一致率是 10%，验收线 90% 意味着基本复现教师的贪心选择，动作数增多时验收线可按 1−1/(动作数) 的随机水平等比例放宽；连续动作没有"一致"的天然定义，改用动作分布的平均 KL 或输出差的标准差。回报保持率按学生回报除以教师回报计，落在 0.9 至 1.05 视为保持；低于 0.9 说明学生欠拟合，高于 1.05 通常是学生继续优化任务损失的结果，需要先核对评估协议再下结论。两项指标冲突时以回报保持率为先，一致率降级为行为层面的解释变量。</p>
+
+    <h3>7. 推理延迟的分解核算</h3>
+    <p>端到端延迟分解为三段：输入预处理、网络前向与动作后处理。设实测前向 6 毫秒，其中固定开销（内存拷贝、算子调度）约 1.5 毫秒，计算部分约 4.5 毫秒。学生宽度减半时，方阵乘法的计算量按宽度平方降到四分之一，延迟估计为 1.5+4.5×0.25 ≈ 2.6 毫秒，只降到原来的约 44%，固定开销占剩余延迟的份额反而升到约 57%。<strong>这解释了"模型砍半、延迟未必砍半"的常见现象：压缩到一定程度后，收益被固定开销封顶，进一步压缩要靠算子融合、量化与去掉多余拷贝。</strong></p>
+    <p>把三段代回预算：预处理 3 毫秒、前向 2.6 毫秒、后处理 1 毫秒，合计 6.6 毫秒，相对 20 毫秒的控制周期留出约 67% 的余量，足以吸收调度抖动；若学生只裁到 80% 宽度，前向约 1.5+4.5×0.64 = 4.4 毫秒，合计 8.4 毫秒，余量降到 58%。预算表按三段时间分开记录，任何一段超标都能被立即定位，压缩工作也有明确的靶点。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>蒸馏到部署按六步推进。</p>
+    <ol>
+      <li><strong>确定学生规模</strong>：按延迟预算倒推参数与层数，学生宽度取教师的 1/4 至 1/2 起步。</li>
+      <li><strong>准备教师</strong>：从最优检查点加载并冻结权重，置为评估模式。</li>
+      <li><strong>选择数据来源</strong>：以"学生在线采样加教师标注"为默认，离线教师轨迹作为冷启动。</li>
+      <li><strong>组合损失</strong>：KL 项与任务项加权，记录两项的量级比例。</li>
+      <li><strong>验收</strong>：动作一致率与回报保持率双指标，连续评估若干窗口。</li>
+      <li><strong>导出与测速</strong>：裁剪、固化、数值校验、端到端延迟测量。</li>
+    </ol>
+    <h3>参数表</h3>
+    <table>
+      <tr><th>参数</th><th>典型值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>学生宽度比</td><td>教师的 1/4–1/2</td><td>容量与延迟的折中</td><td>延迟预算倒推，兼顾一致率</td></tr>
+      <tr><td>温度 τ</td><td>1–4</td><td>软化教师分布</td><td>类别间差异小时取大值</td></tr>
+      <tr><td>KL 权重 λ</td><td>0.1–1.0</td><td>蒸馏项相对任务项</td><td>与 τ 联动校准；验收不达标时上调</td></tr>
+      <tr><td>采样比例</td><td>学生采样 50%–100%</td><td>数据来源构成</td><td>漂移风险高时全用学生采样</td></tr>
+      <tr><td>一致率目标</td><td>90%–95%</td><td>行为吻合度（离散动作）</td><td>动作数多时阈值相应放宽</td></tr>
+      <tr><td>导出偏差上限</td><td>1e-4 量级</td><td>数值校验</td><td>按动作输出尺度折算</td></tr>
+    </table>
+    <h3>教师前向的额外计算占比</h3>
+    <p>"学生在线采样、教师标注"的数据来源会给训练侧加一笔计算账：教师宽度为学生 ρ 倍时，单次前向计算量按 ρ² 增长（方阵乘法按宽度平方计），按一个学生训练步约等于三份前向量的经验折算（前向一份、反向两份），教师前向与学生训练步之比约为 ρ²/3。ρ=1.5 时约 0.75，与学生训练计算量同量级；ρ=2 时约 1.33，训练侧计算翻倍以上。教师宽度比的选择因此有两层约束：一致率要求教师容量足够，算力预算要求 ρ²/3 控制在可承受范围，位于两层约束交集内的取值通常落在 1.5 至 2 之间。</p>
+    <p>与上一章的差异：049 章优化训练吞吐，本章优化推理路径；训练侧的大批次与并行度参数不再出现，取而代之的是延迟预算、参数量与一致率，两者的优化目标在数值上相互独立。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：带温度的 KL 蒸馏损失</strong></p>
+    <pre class="code"><code>import torch
+import torch.nn.functional as F
+
+def distillation_kl(student_logits, teacher_logits, temperature=2.0):
+    """KL(教师 ‖ 学生)，按温度缩放 logits。
+    返回的损失已乘 τ²：抵消 softmax 梯度随 1/τ² 的缩放，
+    让损失权重 λ 在不同温度下保持可比。"""
+    s = student_logits / temperature
+    t = teacher_logits / temperature
+    log_p_student = F.log_softmax(s, dim=-1)      # KL 需要学生侧的对数概率
+    log_p_teacher = F.log_softmax(t, dim=-1)
+    p_teacher = log_p_teacher.exp()
+    kl = (p_teacher * (log_p_teacher - log_p_student)).sum(dim=-1).mean()
+    return kl * (temperature ** 2)
+
+# 教师前向加入同一损失：总损失 = 任务损失 + λ · 蒸馏损失
+def combined_loss(task_loss, student_logits, teacher_logits, lam=1.0):
+    kl = distillation_kl(student_logits, teacher_logits, temperature=2.0)
+    total = task_loss + lam * kl
+    # 返回两项便于监控：蒸馏项占比过高会把学生拉离任务目标
+    return total, {"task": float(task_loss.detach()), "kl": float(kl.detach())}</code></pre>
+    <p>解读：三个设计点。<strong>（1）</strong>最终乘 τ² 是标准技巧：温度缩放会让 softmax 梯度变小，乘回 τ² 使蒸馏损失的尺度与温度解耦，λ 的调参经验可以跨温度复用。<strong>（2）</strong>用 <code>log_softmax</code> 计算 KL 比先 <code>softmax</code> 再取对数数值更稳定，低概率类别的对数值不会溢出。<strong>（3）</strong>返回两项数值供监控：蒸馏项相对任务项过大时，学生会背离环境回报向教师的行为分布收缩，这正是需要重新平衡 λ 的信号。</p>
+
+    <p><strong>片段 2：蒸馏损失的接入位置</strong></p>
+    <pre class="code"><code>class DistilledPolicy(TorchPolicy):
+    """学生策略：训练时额外前向一个冻结教师，产生蒸馏监督。"""
+    def __init__(self, observation_space, action_space, config):
+        super().__init__(observation_space, action_space, config)
+        # 教师与学生使用各自的模型配置；教师参数从检查点加载后冻结
+        self.teacher_network = build_model_for(config["teacher_model"])
+        self.teacher_network.eval()          # 关闭 dropout 与批归一化的训练行为
+        for p in self.teacher_network.parameters():
+            p.requires_grad_(False)          # 教师只提供目标，不接收梯度
+
+    def extra_forward(self, obs_batch):
+        # 教师前向不建图（no_grad）：省显存且避免梯度误入教师分支
+        with torch.no_grad():
+            self._teacher_out = self.teacher_network(obs_batch)
+
+    def loss(self, model_out, actions, advantages, **kwargs):
+        task_loss = super().loss(model_out, actions, advantages, **kwargs)
+        # 蒸馏监督使用学生采样到的同一批状态：分布随学生改善而移动
+        total, parts = combined_loss(
+            task_loss, model_out["action_logits"], self._teacher_out, lam=0.5)
+        if self.global_timestep % 1000 == 0:   # 低频打印，避免污染日志
+            print("损失分解：", parts)
+        return total
+
+# 接口形态随版本演进：新版在 Learner 的 compute_loss 或 RLModule 中
+# 组织双模型前向与损失组合，请以对应版本官方文档为准</code></pre>
+    <p>解读：逐块说明。<strong>（1）</strong>教师网络置为评估模式并冻结梯度是两条独立要求：前者影响数值行为（dropout 采样），后者影响显存与优化；漏掉任何一条都会得到不一致或含糊的蒸馏目标。<strong>（2）</strong>教师前向放在 <code>no_grad</code> 上下文中，显存占用与批次大小解耦于教师参数量。<strong>（3）</strong>蒸馏使用学生采样批次的同一批状态，天然实现"学生在线采样、教师标注"，无需维护独立的数据管道。</p>
+
+    <p><strong>片段 3：导出为推理工件并测速</strong></p>
+    <pre class="code"><code>import time
+import torch
+
+def export_and_verify(policy, example_obs):
+    """裁剪、固化、校验、测速四步导出流程。"""
+    policy.eval()
+    # 1) 固化：追踪前向生成静态图；示例输入形状必须与部署一致
+    traced = torch.jit.trace(policy.model, example_obs)
+    traced = torch.jit.freeze(traced) if hasattr(torch.jit, "freeze") else traced
+
+    # 2) 校验：同一批状态上导出前后的动作输出做最大偏差比较
+    with torch.no_grad():
+        before = policy.model(example_obs)
+        after = traced(example_obs)
+        diff = (before - after).abs().max().item()
+    assert diff &lt; 1e-4, f"导出偏差过大: {diff}"
+
+    # 3) 测速：端到端延迟按批大小 1 测量，贴近控制回路真实形态
+    with torch.no_grad():
+        t0 = time.perf_counter()
+        for _ in range(200):
+            traced(example_obs[:1])
+        latency_ms = (time.perf_counter() - t0) / 200 * 1000
+    print(f"导出偏差={diff:.2e} 单样本前向延迟={latency_ms:.2f} ms")
+    # 4) 保存工件：记录输入规格与训练检查点编号，便于版本追溯
+    torch.jit.save(traced, "policy_inference.pt")
+    return traced, latency_ms</code></pre>
+    <p>解读：这段代码把四步导出流程固化为函数。<strong>（1）</strong>示例输入必须与部署形状一致，追踪会记录实际计算路径，形状不同会得到错误的静态图。<strong>（2）</strong>数值校验是安全阀：先比较导出前后输出再上线，偏差超限说明存在未被支持的算子或不合适的追踪路径。<strong>（3）</strong>测速按单样本进行：控制回路逐帧决策，批大小为 1 的延迟才是有意义的数字；批量吞吐数字会系统性低估单步延迟。保存时附带输入规格与检查点编号，为版本追溯留线索。</p>
+    <p>偏差阈值 1e-4 的量级依据：离散动作的 logits 输出通常在 −10 到 10 之间，1e-4 的相对偏差不足以改变任何决策边界上的 argmax，除非两个动作的 logit 差本身就小于 1e-4，这类平局情形下动作选择已经无实质差别；连续动作输出经 tanh 或裁剪后对 1e-4 的扰动同样不敏感。阈值放宽到 1e-2 会在接近平局的决策点上产生行为分叉，收紧到 1e-6 以下则容易被浮点累计误差触发误报，1e-4 是两份风险之间的平衡点。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>忽略状态分布漂移</strong>：只用教师轨迹离线蒸馏，学生上线后在陌生状态上行为退化。症状是离线一致率很高、闭环回报明显落后。修复：改用学生在线采样加教师标注，或用迭代聚合补数据。</li>
+      <li><strong>温度与损失权重不联动</strong>：调高 τ 后蒸馏项梯度变小，λ 未同步调整，蒸馏名存实亡。修复：使用乘 τ² 的损失形式并重新标定 λ。</li>
+      <li><strong>教师残留训练行为</strong>：忘记 <code>eval()</code> 或漏加 <code>no_grad</code>，目标的分布含噪、显存翻倍。修复：两条要求写进加载函数的固定流程。</li>
+      <li><strong>端到端延迟只算网络</strong>：忽略输入预处理与动作后处理，实测延迟超出预算。修复：以完整管道计时，把预处理与后处理纳入预算表。</li>
+      <li><strong>输入处理链不一致</strong>：训练用归一化加帧堆叠、推理只做形状变换，模型收到语义错位的输入。修复：把预处理实现为共享函数，训练与导出调用同一份代码。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>计算：控制周期 20 毫秒，网络前向 6 毫秒、输入预处理 3 毫秒、动作后处理 1 毫秒，剩余预算多少？若学生网络再小一半，延迟按参数量线性估计是多少？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>当前合计 10 毫秒，剩余 10 毫秒；线性估计不是好模型，实际延迟还与内存带宽和固定开销相关，需实测修正。</div></details>
+      </li>
+      <li>推导：softmax 输出对 logits 的梯度含因子 p·(1−p)，温度缩放把 p 推向均匀。证明 τ 增大时该因子整体下降、梯度量级约按 1/τ² 收缩，并解释乘 τ² 的修正作用。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>p 趋近 1/K 时 p(1−p)≈(1/K)(1−1/K)，与 τ 无关的数量级来自 logits 差的 1/τ 缩放；综合效应即 1/τ²，乘回后尺度与 τ 解耦。</div></details>
+      </li>
+      <li>设计验收实验：教师、学生各跑 200 局评估，给出动作一致率与回报保持率的计算口径与验收线，并说明两者冲突时的处置顺序。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>一致率按同状态贪心动作相同比例统计；回报保持率按学生回报除以教师回报。冲突时以回报保持率优先，一致率作为行为解释。</div></details>
+      </li>
+      <li>设计"迭代聚合"蒸馏流程：给出轮数、每轮采样量、教师标注方式与停止条件，并估算教师前向的额外计算占比。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>每轮学生采 10<sup>5</sup> 步量级、教师标注同批状态，3 至 5 轮；停止条件取一致率连续两轮不再提升。教师前向约为学生训练计算量的 1/2 至 1 倍。</div></details>
+      </li>
+      <li>解释为什么"导出偏差校验"必须用训练侧同一批状态；随机噪声落在训练分布之外，会把算子差异掩盖或误报。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>随机噪声落在训练分布之外，算子差异可能被掩盖或误报；用真实状态分布中的样本比较，才能发现影响行为的偏差。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>蒸馏用教师的软动作分布监督学生，KL 散度是标准度量，温度缩放控制分布的平坦程度。</li>
+      <li>温度改变梯度量级，损失乘 τ² 使其与温度解耦，λ 的取值因此可以跨温度复用。</li>
+      <li>状态分布漂移是强化学习蒸馏的特有风险，默认采用学生在线采样加教师标注的数据来源。</li>
+      <li>导出流程四步：裁剪训练组件、固化静态图、同分布样本数值校验、端到端延迟测量。</li>
+      <li>输入处理链路必须训练与推理共用一份实现，延迟预算以完整管道为准。</li>
+      <li>下一章从"如何做得更好"转向"如何做得更稳"：训练稳定性诊断的指标体系与处置流程。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch049.html">← 第 049 章：RLlib训练吞吐与并行度调优</a>
+    <a class="next" href="ch051.html">第 051 章：RLlib训练稳定性诊断 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

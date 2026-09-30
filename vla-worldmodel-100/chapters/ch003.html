@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第003章 世界模型预测下一帧图像 | 具身智能学习课程 · VLA 与世界模型联合训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · 基础框架与联合训练</span>
+    <span class="sep">/</span>
+    <span>第 003 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · 基础框架与联合训练</div>
+    <h1>第 003 章：世界模型预测下一帧图像</h1>
+    <p class="lead">本章把世界模型收敛到最小的具体目标：给定观测历史预测下一帧图像。讲清像素级预测的网络结构、重建损失与感知损失的组合、教师强制与开环推演的混合训练，以及均值模糊与捷径学习两类典型失效。</p>
+    <ul class="meta">
+      <li>主题：世界模型 / 下一帧预测</li>
+      <li>关键公式：L<sub>frame</sub> = L<sub>1</sub>(ô<sub>t+1</sub>, o<sub>t+1</sub>) + β·L<sub>perc</sub>(ô<sub>t+1</sub>, o<sub>t+1</sub>)</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 002 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解下一帧预测（Next-Frame Prediction）的任务定义与条件结构，明确它与动作生成、动作条件视频预测的边界。</li>
+      <li>掌握编码器、潜空间预测器、解码器三段式结构，理解潜空间前推相对端到端像素回归的取舍。</li>
+      <li>掌握重建损失与感知损失（Perceptual Loss）的组合动因，能够解释纯像素损失导致均值模糊的机理。</li>
+      <li>理解教师强制（Teacher Forcing）与开环推演的分布差异，会实现调度采样（Scheduled Sampling）式的混合训练。</li>
+      <li>能诊断捷径学习、多步漂移、感知损失权重失当三类训练问题并给出修复方案。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>世界模型的一切能力从“预演下一步”开始：给定到 t 时刻为止的观测历史，t+1 时刻的画面是什么样。<strong>下一帧预测是后续能力的最小闭环：先会预测单帧，才可能预测动作条件下的视频序列（011 章），才可能用预测轨迹增强策略训练（008 章）。</strong></p>
+    <p>选择像素空间起步的理由在工程侧：像素目标是稠密且可直接可视化的监督信号，收敛与否肉眼可查；潜空间目标需要配套编码解码设计（017 章展开），调试链路更长。<strong>本章在像素空间走通预测任务的全部要素，所得经验可直接迁移到潜空间版本。</strong></p>
+    <p>设计参照视频预测公开工作：确定性重建、感知度量、随机生成三类路线。本章以确定性路线为主，随机路线在理论末节给出必要性。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 任务定义与条件结构</h3>
+    <p>条件端是观测历史，目标端是下一帧像素；动作字段在本章仅随窗口提供，其建模作用在 011 章展开。</p>
+    <div class="formula">
+      ô<sub>t+1</sub> = f<sub>φ</sub>(o<sub>t-k+1:t</sub>)
+      <span class="note">f<sub>φ</sub> 为预测网络；输入 k 帧历史图像（k 取 2–4），输出一帧预测图像，分辨率 224×224</span>
+    </div>
+    <p>与另两个目标划清边界：动作生成（004 章）的输出是低维动作向量；动作条件视频预测（011 章）输出以动作为条件的多帧序列。本章只预测单帧、只消化历史观测，<strong>先把“画面如何变化”学准，再讨论“动作如何改变画面”</strong>。</p>
+
+    <h3>2. 三段式结构：编码、前推、解码</h3>
+    <p>编码器把每帧压成空间分块（Patch）潜表示，预测器在潜空间完成时间前推，解码器还原像素。<strong>三段式的核心价值是解耦“预测什么”与“如何呈现”</strong>：预测头只处理低维潜变量，容量集中用于动力学；解码器专注细节重建，不参与时序推理。</p>
+    <p>以 224×224 输入、16×16 分块为例，每帧得到 14×14=196 个 token。历史帧连同帧号与位置嵌入拼接后过时空注意力，同一空间槽位跨帧聚合出运动趋势，预测头为每个槽位回归下一帧潜表示。该设计假设画面变化在空间上局部，需要大范围交互时由全连接注意力补偿。</p>
+
+    <h3>3. 损失组合与均值模糊</h3>
+    <p>帧预测本质是条件分布的期望回归：未来存在多种合理走向时，最小化逐像素误差的最优解是各走向的均值，视觉表现为边缘与纹理被抹平。</p>
+    <div class="formula">
+      L<sub>frame</sub> = λ<sub>1</sub>·L<sub>1</sub>(ô<sub>t+1</sub>, o<sub>t+1</sub>) + β·L<sub>perc</sub>(ô<sub>t+1</sub>, o<sub>t+1</sub>)
+      <span class="note">λ<sub>1</sub> 取 1.0、β 取 0.1 起步；感知损失在预训练特征空间比较，惩罚“数值接近但纹理糊”的预测</span>
+    </div>
+    <p>感知损失在预训练特征空间比较预测与目标，对纹理与结构敏感，能压低模糊解。两点工程注意：<strong>特征网络在训练期保持冻结；β 过大时模型用伪纹理换取特征相似，需与重建指标联合评估</strong>。</p>
+
+    <h3>4. 教师强制与开环推演的差异</h3>
+    <p>用真实历史帧作输入称教师强制（Teacher Forcing），用自身生成历史作输入称开环推演。两者输入分布不同，只在教师强制下训练的网络进入推演后误差迅速放大，即曝光偏差（Exposure Bias）。</p>
+    <p>缓解手段是混合训练：以概率 p 用自生成帧替换历史末帧，让网络在训练期见到带误差输入。p 从 0.2–0.3 起步缓慢上调，实现从教师强制到开环的平滑过渡，即调度采样（Scheduled Sampling）思路。以 6 万步把 p 从 0.2 升到 0.5 时，每万步增量约 0.05；评估周期取 5 千步时每次提升约 0.025，提升幅度小于单步误差的波动量级，调度不会在评估曲线上留下台阶。<strong>替换帧必须切断梯度，让网络学习纠正输入误差；梯度若经替换帧回流，网络会走迎合自身输出的捷径。</strong></p>
+
+    <h3>5. 随机性的必要性</h3>
+    <p>遮挡变化、接触瞬间、并发操作等情形下，给定历史后下一帧并不唯一。确定性回归收敛到模糊均值，这是表达能力的边界，训练再充分也无法消除。<strong>处理方式是升级为分布建模：潜变量采样（017 章）或条件生成（扩散与流匹配）。</strong>评估时应按动态类型分区报告误差，遮挡与接触邻近段单独统计。</p>
+
+    <h3>6. 推导与算例：均值模糊的定量形态</h3>
+    <p>先补一段不跳步的推导。给定历史后，真实下一帧的分布记为 p(x)，逐像素平方误差损失的期望对预测值 y 求导：dE‖y - x‖<sup>2</sup>/dy = 2(y - E[x])，令导数为零得最优预测等于条件均值。</p>
+    <div class="formula">
+      y* = argmin<sub>y</sub> E<sub>x</sub>‖y - x‖<sup>2</sup> = E[x] ；L1 的最优解为条件中位数
+      <span class="note">两式都只依赖分布的一阶统计量；分布含多个模式时，最优解落在模式之间，不会落进任何单一模式内部</span>
+    </div>
+    <p>数值上看得更清楚：未来有两种等概率走向，某区域像素取值分别为 0 与 10。条件均值 5 使 L2 损失为 0.5×5<sup>2</sup> + 0.5×5<sup>2</sup> = 25；预测任一真实走向时损失为 50。均值解在损失意义下更优，但像素值 5 不对应任何真实画面，模糊由此产生。同一例中 L1 损失在区间 [0, 10] 内恒等于 5，中位数不唯一，L1 同样无法恢复多模态。空间频率视角给出一致解释：均值化压制高频成分，边缘两侧亮度向中间靠拢、梯度幅度下降，视觉上表现为轮廓发虚与纹理消失。</p>
+    <p>三条路线的取舍可整理成下表，选择依据是场景欠定程度与推理预算：</p>
+    <table>
+      <tr><th>路线</th><th>输出形态</th><th>多模态</th><th>推理成本</th><th>适用场景</th></tr>
+      <tr><td>确定性回归</td><td>单帧条件均值</td><td>弱，均值模糊</td><td>一次前向</td><td>动态接近单一模式的场景</td></tr>
+      <tr><td>潜变量分布建模</td><td>条件分布采样</td><td>中，受潜维数限制</td><td>一次前向加采样</td><td>中等欠定，017 章展开</td></tr>
+      <tr><td>条件扩散或流匹配</td><td>迭代去噪生成</td><td>强</td><td>多步迭代采样</td><td>接触与遮挡频繁的强欠定场景</td></tr>
+    </table>
+
+    <h3>7. 复制捷径的自动检测</h3>
+    <p>复制上一帧的捷径可以用一个统计量自动检测。定义帧间变化比：预测帧差的平均幅度与真实帧差平均幅度之比。静止画面占比较高时，网络用复制策略即可压低总体误差，但该比值接近零。数字示例：真实帧差平均幅度 5.0、预测帧差平均幅度 0.8 时比值为 0.16，触发告警；健康模型的比值通常落在 0.7 到 1.3 之间，低于 0.2 可判定复制倾向，高于 1.5 说明预测的运动幅度超过数据实际变化。修复按数据侧与损失侧分工：提高高运动窗口的采样权重，或对帧差小的区域降低重建权重。告警连续三个评估周期出现再介入处理，避免单周期波动造成误判。</p>
+    <p>感知损失的边界同样要交代：特征网络通常在自然图像上预训练，机器人视角的图像与预训练分布存在域差。校准方法是构造两组输入做对照：一组为真实帧与均值帧，另一组为真实帧与另一真实帧。<strong>感知项对第一组的响应应显著大于第二组</strong>，否则说明特征网络对模糊不敏感，需要换用域内特征网络或提高权重后再评估。</p>
+
+    <h3>8. 数值算例：感知权重的临界值与解码器几何</h3>
+    <p>感知权重不是越大越好，用两组假设解可以算出临界值。设模糊解的重建 L1 为 0.02、感知距离为 0.5；锐利解的重建 L1 为 0.03、感知距离为 0.2。β=0.1 时两解总损失分别为 0.02+0.1×0.5=0.07 与 0.03+0.1×0.2=0.05，优化器选择锐利解；β=0.01 时分别为 0.025 与 0.032，模糊解反而占优。令两式相等，临界值 β* = (0.03-0.02)/(0.5-0.2) ≈ 0.033。<strong>低于临界值时感知项无力改变优化方向，高于临界值后锐利程度随 β 提高，伪纹理风险同步上升。</strong>默认 0.1 约为临界值的三倍，属于偏保真的起步选择。</p>
+    <p>解码器几何再核对一遍。分块 16、输入 224 时每帧 14×14 = 196 个 token；历史 3 帧共 588 个 token，位置嵌入参数量约 588×384 ≈ 22.6 万。解码器四级转置卷积把边长逐级放大两倍：14 → 28 → 56 → 112 → 224，四级恰好覆盖 224/14 = 16 的倍数。放大倍数满足 2<sup>4</sup> = 16 = 输入边长除以潜图边长，改动分块尺寸时必须同步调整解码器级数与卷积核配置，否则输出尺寸与目标帧不一致，损失在形状层面对齐失败。</p>
+
+    <h3>9. 边界与失效模式</h3>
+    <ul>
+      <li><strong>域外视觉输入</strong>：更换相机、光照或背景后，历史帧统计分布改变，预测误差突增而训练损失看不出异常。修复：建立域外检测指标，输入统计与训练集的偏移量超阈值时降低该段预测损失的权重。</li>
+      <li><strong>多模态歧义区</strong>：遮挡与接触瞬间的欠定性属于表达边界，确定性模型的误差在该区域无法通过加深网络消除。修复：按动态类型分区报告误差，欠定区改用分布建模路线。</li>
+      <li><strong>混合训练调度过快</strong>：替换概率 p 提升过猛时，网络在低质量自生成帧上训练，收敛速度下降。修复：p 从 0.2 起步，每个评估周期提升不超过 0.05，并观察单步误差曲线是否出现抖动。</li>
+      <li><strong>长序列显存</strong>：帧数、分块与主干层数同时上调时激活显存按乘积增长。修复顺序为先减帧数或加大分块，梯度检查点作为最后手段（016 章）。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>管线四步：历史帧共享分块嵌入；帧号与空间位置嵌入叠加后过时空注意力；空间槽位跨帧聚合得下一帧潜表示；解码器逐级上采样回 224×224。<strong>转置卷积堆叠令分辨率逐级翻倍，输出端 sigmoid 归一化到像素区间。</strong></p>
+    <h3>关键参数起点</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>历史帧数 k</td><td>3</td><td>提供运动信息</td><td>两帧差可表达速度，三帧处理加减速</td></tr>
+      <tr><td>分块尺寸</td><td>16×16</td><td>token 化粒度</td><td>224 整除，得到 14×14 网格</td></tr>
+      <tr><td>d<sub>model</sub></td><td>384</td><td>潜表示宽度</td><td>是像素空间预测的常用折中规模</td></tr>
+      <tr><td>主干层数</td><td>6</td><td>时空融合深度</td><td>单帧任务无需过深，配合训练步数调节</td></tr>
+      <tr><td>重建权重 λ<sub>1</sub></td><td>1.0</td><td>数值对齐强度</td><td>基准项，量纲参考</td></tr>
+      <tr><td>感知权重 β</td><td>0.1</td><td>细节清晰度</td><td>过大引入伪纹理，0.05–0.2 区间微调</td></tr>
+      <tr><td>替换概率 p</td><td>0.2 起步</td><td>混合训练强度</td><td>从教师强制平滑过渡到开环</td></tr>
+      <tr><td>批量大小</td><td>64</td><td>梯度估计方差</td><td>像素目标的显存占用高于动作任务</td></tr>
+      <tr><td>学习率</td><td>1e-4</td><td>更新步长</td><td>Transformer 主干常规下限</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：预测器输出下一帧潜图，解码器负责还原像素</span>
+      <p>让注意力直接回归整帧像素，参数量与显存集中在输出端，时序推理容量不足。把目标设为 14×14 潜图、解码器负责上采样，等价于解耦“动力学”与“渲染”，同等参数量下精度与稳定性更优。该解耦在 017 章成为主设计。</p>
+    </div>
+    <p>衔接：002 章的 future 字段在本章首次消费，其首元素即训练目标。<strong>差异：本章不考虑动作输入影响，也不约束时序一致性；011 章加入动作条件并扩展到多帧序列。</strong></p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>片段以视频预测与生成模型的公开设计为参照（含空间分块编码与转置卷积解码的通行做法），接口随版本演进。第 1 段给出三段式预测网络。</p>
+
+    <p><strong>片段 1：下一帧预测网络</strong></p>
+    <pre class="code"><code>import torch
+import torch.nn as nn
+
+class NextFramePredictor(nn.Module):
+    """下一帧预测器：历史帧分块编码，潜空间槽位聚合，卷积解码回像素。"""
+    def __init__(self, d_model=384, depth=6, nhead=6, frames=3, grid=14):
+        super().__init__()
+        self.frames, self.grid = frames, grid
+        # 分块嵌入：16x16 卷积核与步长把 224x224 帧压成 14x14 个 token
+        self.embed = nn.Conv2d(3, d_model, kernel_size=16, stride=16)
+        # 帧号与空间位置联合嵌入：让注意力同时区分“第几帧”与“画面哪个位置”
+        self.pos = nn.Parameter(torch.zeros(1, frames * grid * grid, d_model))
+        layer = nn.TransformerEncoderLayer(d_model, nhead, 4 * d_model,
+                                           batch_first=True, norm_first=True)
+        self.fuse = nn.TransformerEncoder(layer, num_layers=depth)
+        # 预测头：逐槽位回归下一帧潜表示；目标维度与输入潜表示一致
+        self.predict = nn.Sequential(nn.Linear(d_model, d_model), nn.GELU(),
+                                     nn.Linear(d_model, d_model))
+        # 解码器：四级转置卷积逐级放大 14 到 224，末级输出三通道 RGB
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(d_model, 256, 4, 2, 1), nn.GELU(),
+            nn.ConvTranspose2d(256, 128, 4, 2, 1), nn.GELU(),
+            nn.ConvTranspose2d(128, 64, 4, 2, 1), nn.GELU(),
+            nn.ConvTranspose2d(64, 3, 4, 2, 1),
+        )
+
+    def forward(self, hist):
+        # hist 形状 (B, frames, 3, 224, 224)；批次与帧维展平后共享同一套分块参数
+        B, F = hist.shape[:2]
+        tok = self.embed(hist.flatten(0, 1)).flatten(2).transpose(1, 2)
+        # 加位置嵌入后恢复帧维：token 顺序为“帧号优先”，与 pos 的排布一致
+        tok = tok.view(B, F * self.grid * self.grid, -1) + self.pos
+        mem = self.fuse(tok).view(B, F, self.grid * self.grid, -1)
+        # 同一空间槽位跨帧求均值：用最简聚合先打通链路，后续可换注意力池化
+        slot = mem.mean(dim=1)                      # (B, grid^2, d_model)
+        z = self.predict(slot)                      # 下一帧各槽位潜表示
+        # 潜图还原为特征图后交给解码器；输出 sigmoid 对齐到像素区间 [0,1]
+        x = z.transpose(1, 2).reshape(B, -1, self.grid, self.grid)
+        return torch.sigmoid(self.decoder(x))</code></pre>
+    <p>解读：<strong>（1）</strong>历史帧先展平批次与时间维再过嵌入卷积，等价于所有帧共享同一个编码函数，参数量与帧数解耦。<strong>（2）</strong>位置嵌入联合编码帧号与空间槽位，通道数与 token 数严格对应；排布写错会表现为固定方向的错位伪影。<strong>（3）</strong>槽位聚合用均值实现，作为最简基线；换注意力池化属工程优化，不影响接口。<strong>（4）</strong>解码器四级放大与分块尺寸 16 对应，14×2<sup>4</sup>=224，尺寸对齐是转置卷积最容易出错的超参数。</p>
+
+    <p><strong>片段 2：重建与感知的联合损失</strong></p>
+    <pre class="code"><code>def frame_loss(pred, target, feat_net, lam1=1.0, beta=0.1):
+    """帧预测损失：数值重建项与特征感知项加权，兼顾对齐与清晰度。"""
+    # L1 对亮度主导的平移与曝光变化更稳，且梯度幅值有界，训练早期不易爆
+    l1 = nn.functional.l1_loss(pred, target)
+    # 感知项在冻结特征空间比较：均值模糊的预测与目标特征差异被显著放大
+    f_pred = feat_net(pred * 2.0 - 1.0)         # 输入映射到 [-1,1] 以匹配特征网
+    f_tgt = feat_net(target * 2.0 - 1.0)
+    perc = nn.functional.l1_loss(f_pred, f_tgt)
+    # beta 过大时模型会用伪纹理换取特征相似，需与重建指标联合评估
+    total = lam1 * l1 + beta * perc
+    return total, {"l1": float(l1), "perc": float(perc)}</code></pre>
+    <p>解读：<strong>（1）</strong>两项损失分开计算并返回分量，便于在训练曲线上区分“数值对齐”和“结构相似”的进展。<strong>（2）</strong>特征网络输入归一化须与主干一致，一侧写错会让感知项失去区分度。<strong>（3）</strong>取多层特征做加权的变体（LPIPS 风格）通常比单层更稳，此处用单层示意；关键是特征网络保持冻结。</p>
+
+    <p><strong>片段 3：教师强制与滑入开环的混合训练</strong></p>
+    <pre class="code"><code>def mixed_train_step(model, opt, batch, feat_net, p_rollout=0.2, clip=1.0):
+    """混合训练：以概率 p 用自生成帧替换历史末帧，模拟推理期误差输入。"""
+    hist = batch["hist"].clone()                # (B, frames, 3, 224, 224)
+    target = batch["target"]                    # 真实下一帧，形状 (B, 3, 224, 224)
+    if torch.rand(1).item() &lt; p_rollout:
+        with torch.no_grad():
+            # 用当前模型为“前 frames-1 帧”生成的预测替换末帧输入
+            fake = model(hist[:, :-1])
+            hist[:, -1] = fake                  # 注入自身误差，训练纠错能力
+    pred = model(hist)
+    loss, parts = frame_loss(pred, target, feat_net)
+    opt.zero_grad(set_to_none=True)
+    loss.backward()
+    # 感知项经冻结特征网反传，梯度尺度可能偏大，裁剪保证更新稳定
+    torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
+    opt.step()
+    return parts</code></pre>
+    <p>解读：<strong>（1）</strong>替换在 no_grad 下进行，<strong>自生成帧不携带梯度是本实现的要点</strong>：网络只能通过改进预测器降低损失，无法改写生成帧。<strong>（2）</strong>p_rollout 从 0.2 起步缓慢上调，本学期内的经验范围是 0.2–0.5，过大比例会让早期训练在噪声输入上浪费容量。<strong>（3）</strong>随机数用全局种子，复现时混合节奏一致；长训练可用固定比例替代随机采样。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>均值模糊与纹理丢失</strong>：边缘发虚、纹理消失，重建指标尚可但视觉质量差。修复：加入感知损失并校准权重，或改用随机生成路线。</li>
+      <li><strong>复制上一帧的捷径</strong>：静止场景占比高时网络学会抄上一帧，指标不差但动力学为零。修复：对高运动片段加权，监控“与上一帧差异”指标。</li>
+      <li><strong>多步推演误差漂移</strong>：单步指标正常，连续推演五步后画面明显偏离。修复：训练期提高 p_rollout 或加入短展开损失，推演步数按误差曲线确定上限。</li>
+      <li><strong>感知损失权重失当</strong>：β 偏大出现无关的伪造纹理，偏小则模糊依旧。修复：在验证集上画 β 与两项指标曲线，取折中。</li>
+      <li><strong>归一化口径不一致</strong>：输入侧均值方差归一化、输出侧按 [0,1] 监督，口径错位使预测偏暗或偏亮。修复：统一在像素区间定义损失。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>图像 224×224、分块 16、历史 k=3，计算进入时空注意力的 token 数与位置嵌入参数量。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>每帧 196 token，共 588；位置嵌入参数量为 588×d<sub>model</sub>，d<sub>model</sub>=384 时约 22.6 万。</div></details>
+      </li>
+      <li>把感知权重 β 从 0.1 改为 1.0，重建误差与视觉效果各怎样变化，给出判断依据。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>感知项主导后重建 L1 上升，纹理更锐利但可能出现伪纹理；以重建与感知两条曲线同时评估，单独看一条会误判。</div></details>
+      </li>
+      <li>推导：设未来有两个等概率走向，逐像素 L2 的最优预测是两者均值。说明该结论在多模态处的视觉含义，并给出回避模糊的两种建模路线。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>两组像素值的中点使平方误差最小，但中点不对应任何真实画面。回避路线：潜变量分布建模、条件扩散或流匹配生成。</div></details>
+      </li>
+      <li>设计实验：固定模型与数据，把 p_rollout 取 0、0.3、0.6 三档，报告单步误差与五步开环误差，解释两档指标随 p 的变化方向。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>p 增大时单步误差略升、开环误差下降，因为训练输入分布更接近推理分布；p 过大时两者都变差，存在最优区间。</div></details>
+      </li>
+      <li>设计一个识别“复制上一帧”捷径的自动化检测：给出统计量与阈值选取方法，并说明在数据侧的处理。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>比较预测与上一帧的差异图均值同真实帧间差；接近零且显著低于目标差说明存在捷径。数据侧提高高运动窗口权重。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>下一帧预测是世界模型的最小闭环：条件是观测历史，目标是单帧像素。</li>
+      <li>三段式结构解耦动力学与渲染，预测器输出潜图，解码器负责还原整帧像素。</li>
+      <li>纯像素损失的最优解是多模态处的均值，感知损失用于抑制模糊，权重需与重建指标联合评估。</li>
+      <li>教师强制与开环推演存在输入分布差异，混合训练让网络提前见到带误差输入，替换帧必须切断梯度。</li>
+      <li>遮挡与接触事件附近的欠定性属于表达边界，需用分布建模路线处理。</li>
+      <li>下一章转向策略侧：VLA 策略网络如何生成动作指令。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch002.html">← 第 002 章：基于视觉语言动作数据集的预处理流程</a>
+    <a class="next" href="ch004.html">第 004 章：VLA策略网络生成动作指令 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

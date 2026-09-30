@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第063章 多机器人协同巡逻 | 多机器人协同学习课程 · ROS2 通信与系统集成</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第三篇 · 协同控制与任务协同</span>
+    <span class="sep">/</span>
+    <span>第 063 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第三篇 · 协同控制与任务协同</div>
+    <h1>第 063 章：多机器人协同巡逻</h1>
+    <p class="lead">巡逻不是"绕圈走"：用图论模型定义巡查路线，用等时切分让每台机器人负责一段闭环，再让突发事件按优先级抢占巡逻，一个在园区、仓库、机房都通用的协同框架。</p>
+    <ul class="meta">
+      <li>主题：任务协同 / 周期巡查</li>
+      <li>关键机制：拓扑图建模、等时切分、空置时间（idleness）、告警抢占与恢复</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 062 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解巡逻问题的图论建模：航点图、回路、空置时间（idleness）与发现延迟的定义与计算。</li>
+      <li>掌握多机器人巡逻的核心策略：回路等时切分、分区并行与加权巡查频率。</li>
+      <li>会设计"巡逻—告警抢占—断点恢复"的状态机，并解释为什么要限制抢占的并发机器人数。</li>
+      <li>会用 ROS2 节点实现巡逻调度、告警派发与状态上报的三个最小角色。</li>
+      <li>能为项目写出巡逻验收指标：最大空置时间、日均巡检次数、告警响应时延。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>园区安防、仓库巡检、机房值守、变电站巡查，这些任务的共同点是"<strong>周期性把关注点看一遍</strong>"。它和上一章的覆盖不同：覆盖要求空间上扫满，巡逻要求时间上不漏，某条路线隔多久被看一次才是关键指标。</p>
+    <p>单机器人巡逻是简单循环，多机器人巡逻则引出三个新问题：<strong>路线怎么切</strong>（每台各管一段还是共同跑一圈）、<strong>事件来了谁去</strong>（全去支援会导致其他区域真空）、<strong>支援完怎么回</strong>（从哪里接着巡）。本章给出这三个问题的工程解法，并把它实现为可复用的巡逻、告警、派发三个节点，为 064 章的行为树决策与 074 章故障恢复做机制铺垫。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 巡逻的图模型与评价指标</h3>
+    <p>把环境中需要查看的位置抽象为顶点 V = {v<sub>1</sub>, v<sub>2</sub>, …, v<sub>m</sub>}（门、房间、设备点），把可通行的路径抽象为带权边 E，权重是行驶时间。巡逻任务就是在这张图上游走，使每个顶点被"最近一次访问"的时间尽量新。</p>
+    <p>最核心的指标是<strong>空置时间（idleness）</strong>：从某顶点被访问后到下下次被访问之间的间隔。单机器人沿一条回路以速度 v 循环时，所有顶点的空置时间都等于回路总行驶时间。n 台机器人均匀切分后：</p>
+    <div class="formula">
+      idleness ≈ (Σ<sub>e∈回路</sub> t<sub>e</sub>) / n
+      <span class="note">回路总时长 20 min、4 台机器人 → 平均每点每 5 min 被查看一次；这是巡逻验收的第一指标</span>
+    </div>
+    <p>与 idleness 并列的是<strong>发现延迟</strong>：某点发生事件到被机器人观测到的期望时间。对均匀巡逻，发现延迟的期望大约是 idleness 的一半。这两个指标决定验收标准，例如"机房最大空置时间 ≤ 6 min、发现延迟 ≤ 3 min"。</p>
+
+    <h3>2. 多机巡逻的三种路线切分</h3>
+    <table>
+      <tr><th>策略</th><th>做法</th><th>优点</th><th>代价</th></tr>
+      <tr><td>回路等时切分</td><td>先构一条经过所有点的回路，按预估行驶时间切成 n 段连续子路径，各自循环</td><td>简单、负载均衡可按时间校准、各段首尾相接</td><td>路段长度不同时图边界要迭代调整</td></tr>
+      <tr><td>分区并行</td><td>按楼层/防区把图切成 n 个子图，每台在自己子图内做单机巡逻回路</td><td>天然与世界结构对齐，掉线影响局部</td><td>子图间不共享，某区机器人故障时该区空置</td></tr>
+      <tr><td>加权频率</td><td>重要点（配电柜、服务器）分配更高的访问频率，路线设计成不同周期混合</td><td>资源投向关键点，符合安防实务</td><td>路线更复杂，排程与验证成本高</td></tr>
+    </table>
+    <p><strong>默认组合是"分区并行 + 区内部等时切分"</strong>：先按防区做一次粗分（与运维组织结构一致），再在每区内把回路按时间切细。纯等时切分适合单层开放区域；加权频率只在对少数点位有硬性要求时启用。</p>
+    <p>切分的目标是"<strong>通行时间相等</strong>"，不追求"边长相等"：一段 20 m 的走廊若含闸机等待，可能比 60 m 直道更慢。切分算法用行驶时间权重，切完后做一次"最大段/均值"校验，超过 1.15 就把最长段的首个航点让给相邻段，迭代两轮即可。</p>
+
+    <h3>3. 告警抢占与恢复</h3>
+    <p>巡逻的常态会被突发事件打断。设计抢占时要回答三个问题：</p>
+    <ul>
+      <li><strong>谁去</strong>：由告警派发节点选"距离最近且未被占用"的一台，其余保持巡逻，<strong>绝不能全员扑向同一告警</strong>，那样其余防区会出现长空置，等于帮入侵者清场。</li>
+      <li><strong>怎么打断</strong>：巡逻节点收到高优先级告警后，取消当前导航目标，记录"断点航点索引"，转入响应状态；告警清除后从断点续巡；从回路起点重来会让被频繁打扰的路段永远巡不到。</li>
+      <li><strong>抢占的迟滞</strong>：响应结束后给一个冷却窗（例如 30 s）才接受同区域的新告警，防止抖动告警让机器人在响应与巡逻间反复横跳。</li>
+    </ul>
+    <p>状态机只有四个状态就够：<strong>PATROL（按段巡逻）→ RESPOND（前往告警点）→ HOLD（驻留确认）→ RESUME（回断点）</strong>。所有状态迁移都产生一条状态广播，让调度与监控可见。</p>
+
+    <h3>4. 巡逻的通信特征</h3>
+    <p>巡逻是典型"低频小数据"业务：状态上报 1 Hz、位置几十字节、告警事件驱动。一条 50 字节的状态消息、1 Hz、20 台机器人，总带宽不到 1 KB/s，<strong>巡逻的通信压力不在带宽而在覆盖</strong>：路线常经过电梯井、地下室等 WiFi 盲区，状态心跳一断，监控就误判离线。对策是监控端把超时阈值设得比消息周期大 3 倍以上（例如 1 Hz 心跳配 5 s 超时），并在盲区入口预先记录"预期失联窗口"。</p>
+    <table>
+      <tr><th>话题</th><th>频率</th><th>QoS</th><th>理由</th></tr>
+      <tr><td><code>/fleet/patrol_status</code></td><td>1 Hz</td><td>Best-effort</td><td>丢一两条不影响大局，宁要新值</td></tr>
+      <tr><td><code>/fleet/alarm</code></td><td>事件驱动</td><td>Reliable + Transient-local</td><td>告警不能丢；晚加入的派发节点也要看到未处理告警</td></tr>
+      <tr><td><code>/fleet/guard_command</code></td><td>事件驱动</td><td>Reliable</td><td>派发指令是命令类消息，必须到达</td></tr>
+    </table>
+
+    <h3>5. 数值算例：idleness 与机器人数的线性账</h3>
+    <p>用一组具体参数把公式算穿。机房巡逻回路共 12 个航点，纯行驶时间 24 min，每点驻留 5 s，驻留合计 60 s = 1 min，回路总负载 25 min。按等时切分给 n 台机器人，每台负担 25/n min，所有点的空置时间都约等于这个数：n = 3 时 8.33 min；n = 4 时 6.25 min；要满足"最大空置 ≤ 6 min"就得加到 5 台（5.0 min）。idleness 与台数是反比例关系，"加一台降多少"可以精确算：从 3 台加到 4 台，空置减少 2.08 min（25%）；从 4 台加到 5 台，再减少 1.25 min（20%），边际收益随台数增加而衰减，而每台都是实打实的成本，扩容决策就建立在这条曲线上。</p>
+    <p>发现延迟的期望值约等于 idleness 的一半：3 台机器人时约 4.2 min，5 台时约 2.5 min。验收时常用的写法是"发现延迟 ≤ 3 min"，对应需要 5 台（或把回路本身缩短：删减非关键航点、提高段内速度，效果与加机器人等价）。特别提醒：以上都是理论值，实测 idleness 通常比理论高 10%–20%，来源是段边界衔接、导航误差修正与避让绕行；工程做法是先用理论值做方案比较，再用实测值校准，把两者都写进验收报告，防止用理论线蒙混过关。</p>
+
+    <h3>6. 数值算例：加权巡查的负荷账</h3>
+    <p>继续用 25 min 主回路做加权巡查的预算。3 个配电柜要求每 10 min 内必访，把它们串成快循环：行驶 6 min + 3 点驻留 15 s = 6.25 min，满足 10 min 约束。两种执行方式的账完全不同。<strong>方式一</strong>：由主回路上的机器人 A 顺带执行，A 的周期变成 8.33 + 6.25 = 14.6 min，比同伴长 75%，整队均衡被破坏，而它的普通航点空置同步恶化到大 14.6 min；<strong>方式二</strong>：设一台专职机器人执行快循环，关键点空置 6.25 min，主回路三台维持 8.33 min，代价是人力从 3 台变 4 台、总工作量增加 6.25/25 = 25%。结论很直接：加权巡查在小规模下用"顺带"最省成本，但要接受空置时间的不均匀；一旦关键点数量增加或时间窗收紧，专职化是唯一能同时守住两条 idleness 线的方案。</p>
+    <p>告警占用也要计入同一条预算。假设告警到达率 2 次/小时、单次响应占用 3 min（行驶 + 驻留确认），响应机器人的巡逻时间被挤占约 6 min/小时 = 10%，其分段 idleness 从 8.33 min 恶化到约 9.3 min。这就是"限制并发响应机器人数"的量化理由：如果 2 次告警落在同一台身上，占用率翻倍到 20%，该防区的空置会逼近验收线；把响应分散到不同机器人、并让派发节点记住最近占用情况，是维持 idleness 策略稳定最便宜的手段。</p>
+    <p>盲区处置还可以进一步定量。电梯行程 P95 约 45 s，机器人进电梯前发一条"预期失联至 T + 60 s"的公告，监控把该机临时移出超时判离线名单；没有这条公告时，按 5 s 超时会在 45 s 内连续触发约 9 次判离线事件，每次都试图重派任务，全部被它出电梯后的心跳撤销，日志被噪声淹没，还可能触发一次错误的换人。公告机制把这 9 次无效动作压缩成 1 次约定，实现只多一条消息类型，这是"与物理结构对齐的例外表"优于统一阈值的典型案例。</p>
+    <p>机器人速度不一致时，切分要按速度比例分配，按长度均分会失衡。回路长 900 m，两台机器人速度 0.5 与 1.0 m/s，等时切分的解是快机骑 600 m、慢机骑 300 m，两段循环时间都是 600 s = 10 min；若按长度均分（各 450 m），慢机需要 900 s、快机 450 s，慢段的航点空置被拉到 15 min，快机一半时间闲置。规则由此明确：段长按速度比例分配，idleness 才能拉平；这与 061 章覆盖任务"按能力给面积"是同一原则，巡逻场景的对应物就是"按速度给里程"。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>从地图到可运行的巡逻系统分四步：</p>
+    <ol>
+      <li><strong>建图</strong>：从共享地图上标注航点（POI）与连接边，落成一份 YAML（航点表 + 边表 + 每条边的预估行驶时间）。预估时间先由"距离/速度"计算，上线后用实测数据校准。</li>
+      <li><strong>切分</strong>：按防区粗分后，对每区回路做等时切分，输出"机器人 → 航点序列"的巡逻段，随任务下发给各巡逻节点。</li>
+      <li><strong>巡逻执行</strong>：巡逻节点依次导航到段内航点，到达后驻留 T<sub>dwell</sub>（安防取 3–10 s 足够拍照记录），循环执行；状态以 1 Hz 上报。</li>
+      <li><strong>告警闭环</strong>：检测节点（视觉/红外/人工）发布告警；派发节点选一台响应；响应完成后释放占用并广播，巡逻恢复。</li>
+    </ol>
+    <h3>参数起点表</h3>
+    <table>
+      <tr><th>参数</th><th>建议值</th><th>理由</th></tr>
+      <tr><td>驻留时间 T<sub>dwell</sub></td><td>3–10 s</td><td>短了没时间取证/记录，长了直接抬高 idleness</td></tr>
+      <tr><td>状态心跳</td><td>1 Hz</td><td>与告警检测节拍匹配；盲区超时用 5 s</td></tr>
+      <tr><td>告警响应人数</td><td>1（最多 2）</td><td>防区真空是比单个告警更严重的风险</td></tr>
+      <tr><td>冷却窗</td><td>30 s</td><td>抑制抖动告警；比典型干涉时长小一个量级</td></tr>
+      <tr><td>均衡度上限</td><td>1.15</td><td>段间最长时间差超过 15% 就重新切分</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：为什么切分要生成"连续子路径"？</span>
+      <p>任意选点（每台机器人按序号各挑差不多的航点）看似均衡，但会产生大量路网空驶，机器人需要频繁横穿别人的区段。连续子路径让每台机器人只在自己熟悉的一小片区域往返，路径最短、相遇机会少、掉线影响范围明确。<strong>代价是段边界处的两点相距较远时首尾衔接变慢</strong>，所以切分后要检查段首尾的连通性，必要时把边界点挪到路口。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：按行驶时间把巡逻回路切成 N 段</strong></p>
+    <pre class="code"><code>def split_tour(tour, leg_time, n, dwell=5.0):
+    """tour: 航点索引回路；leg_time[i]: tour[i]-&gt;tour[i+1] 的行驶秒数。
+    返回 n 段连续子路径，每段是航点索引列表（含闭合点）。"""
+    legs = leg_time + [leg_time[0]]          # 回路闭合：最后一段回到起点
+    segs, cur, acc = [], [tour[0]], 0.0
+    for i, dt in enumerate(legs):
+        nxt = tour[(i + 1) % len(tour)]
+        cur.append(nxt)
+        acc += dt + dwell                    # 驻留时间计入段负载，不能漏
+        if acc &gt;= sum(legs) / n and len(segs) &lt; n - 1:
+            segs.append(cur)                 # 当前段到此收口
+            cur, acc = [nxt], 0.0            # 下一段从同一个航点出发（无缝衔接）
+    segs.append(cur)                         # 尾段接收全部剩余航点
+    return segs</code></pre>
+    <p>解读：切分函数有两个容易被忽略的细节。<strong>（1）驻留时间计入负载</strong>：20 个航点每点驻留 5 s 就是 100 s，在 5 分钟的巡逻周期里占三分之一，只按行驶距离切分必然失衡。<strong>（2）段与段共享边界航点</strong>：前段结束于 v<sub>k</sub>，下段从 v<sub>k</sub> 开始，整个回路在空间上首尾相扣，任一时刻的"覆盖缺口"最小。<code>len(segs) &lt; n - 1</code> 保证不会切出超过 n 段（否则最后几台无段可巡），尾段无条件接收剩余，小规模回路（航点数少于机器人数）时会产生空段，调用方要按实际段数下发任务。</p>
+
+    <p><strong>片段 2：巡逻节点的抢占与断点恢复</strong></p>
+    <pre class="code"><code>class PatrolNode(Node):
+    """单机巡逻执行器：正常巡段、被高优先级告警抢占、响应后回断点。"""
+    def __init__(self):
+        super().__init__("patrol", namespace="robot2")
+        self.segment = self.load_segment()        # 本机负责的航点序列
+        self.index = 0                            # 当前目标航点索引
+        self.resume_index = None                  # 抢占时记录断点
+        self.state = "PATROL"
+        self.alarm_sub = self.create_subscription(
+            Alarm, "/fleet/alarm", self.on_alarm, reliable_qos())
+        self.status_pub = self.create_publisher(PatrolStatus,
+            "/fleet/patrol_status", best_effort_qos())
+        self.create_timer(1.0, self.publish_status)
+
+    def on_alarm(self, msg):
+        # 只响应派发给本机的告警：派发节点已做过"距离最近且空闲"的筛选
+        if msg.target_robot != self.robot_id or self.state != "PATROL":
+            return
+        self.resume_index = self.index            # 记录断点，恢复时从被打断处继续
+        self.state = "RESPOND"
+        self.nav.cancel_current_goal()            # 打断当前巡逻目标
+        self.nav.send_goal(msg.position)          # 前往告警点
+
+    def on_arrived(self):
+        if self.state == "RESPOND":
+            self.state = "HOLD"                   # 驻留确认（拍照/复核）
+            self.create_timer(8.0, self.finish_hold)
+
+    def finish_hold(self):
+        self.state = "PATROL"
+        self.index = self.resume_index or self.index
+        self.nav.send_goal(self.segment[self.index])</code></pre>
+    <p>解读：这段代码的精髓在 <code>resume_index</code>。<strong>如果响应结束就从段首重巡</strong>，位于段尾的关键点将被无限推迟，打扰越频繁的区域越黑。记录断点后从被打断的航点继续，保证每个航点的最大空置时间有上界。另外两个保护：只有 <code>target_robot</code> 指向本机才响应（去中心化的派发决策避免六台机器人同时涌入同一条走廊）；只有处于 PATROL 状态才接受抢占（RESPOND 中的机器人不接新单，防止任务中途被抽走）。<code>HOLD</code> 状态用 8 秒驻留做现场确认；很多告警需要第二视角复核，到达即返回会漏掉这一步。</p>
+
+    <p><strong>片段 3：告警派发，只派一台</strong></p>
+    <pre class="code"><code>class AlarmDispatcher(Node):
+    """告警派发：从空闲机器人中选距离最近的一台响应。"""
+    def __init__(self):
+        super().__init__("alarm_dispatcher")
+        self.pose = {}          # robot_id -&gt; 最新位置（来自 1 Hz 状态）
+        self.busy_until = {}    # robot_id -&gt; 占用截止时间戳
+        self.create_subscription(RobotStatus, "/fleet/patrol_status",
+                                 self.on_status, best_effort_qos())
+        self.create_subscription(Alarm, "/fleet/alarm", self.on_alarm, reliable_qos())
+        self.cmd_pub = self.create_publisher(GuardCommand, "/fleet/guard_command", 10)
+
+    def on_status(self, msg):
+        self.pose[msg.robot_id] = msg.pose
+
+    def on_alarm(self, msg):
+        now = self.get_clock().now().nanoseconds / 1e9
+        # 候选 = 位置已知 且 非占用中；距离用欧氏距离近似（同层平面假设）
+        free = [(self.dist(self.pose[r], msg.position), r)
+                for r in self.pose if self.busy_until.get(r, 0.0) &lt; now]
+        if not free:
+            self.get_logger().warn("无空闲机器人，告警挂起等待重试")
+            return
+        _, chosen = min(free)                     # 最近者得单
+        self.busy_until[chosen] = now + 120.0     # 占用窗 120 s，超时自动释放
+        cmd = GuardCommand()
+        cmd.target_robot = chosen                 # 明确指定接受者
+        cmd.position = msg.position
+        self.cmd_pub.publish(cmd)</code></pre>
+    <p>解读：派发节点的两个关键设计。<strong>（1）占用窗带自动过期</strong>：<code>busy_until</code> 采用带期限的"租约"语义：若被派发的机器人半路失联，120 秒后租约自动失效，后续告警可以再派人，不会出现"资源被死锁"（这与第 069 章资源竞争管理的租约思想一致）。<strong>（2）距离用欧氏近似</strong>：对单层平面够了；多层建筑要换成"路网测地距离"，否则会派一台"直线近但要绕两层楼"的机器人。进阶做法是在告警消息里带楼层信息，派发只在本层选人，这个权衡（精度 vs 复杂度）要在项目文档里写明选择理由。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>全队响应同一告警</strong>：视觉检测误报一次，四台机器人一起离岗，防区空置十分钟。修复：派发节点全局去重（同一告警 ID 只派一次）+ 并发上限（最多 2 台）。</li>
+      <li><strong>抢占后从段首重巡</strong>：高告警频发时段，某段尾部永远巡不到，验收时表现为"该点 idleness 超标而全局平均正常"。修复：断点索引 + 恢复续巡，验收脚本要单点统计 idleness，全局均值会掩盖问题。</li>
+      <li><strong>驻留时间未计入切分负载</strong>：按行驶距离切分看起来均衡，实际驻留点多的那一段（例如岗亭）会慢 40%。修复：切分负载 = Σ(行驶 + 驻留)。</li>
+      <li><strong>把 1 Hz 心跳的超时设成一秒级</strong>：机器人经过电梯或钢结构厂房时短暂丢几包，监控立刻判离线并触发换人，等它出来时任务已被抢。修复：超时阈值 ≥ 3 倍心跳周期，且判离线前先做服务探测确认。</li>
+      <li><strong>告警消息用 Best-effort</strong>：巡检系统最关键的消息类型反而选了最弱的可靠性，偶发丢包导致漏警，且没有任何日志。修复：告警用 Reliable + Transient-local，并让检测端做"未确认重发"。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>机房巡逻回路总行驶时间 24 min（12 个航点），每点驻留 5 s，3 台机器人参与。按等时切分算出每段的目标负载与理论 idleness，并解释为什么实际 idleness 通常比理论值大 10–20%。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>总负载 = 24×60 + 12×5 = 1500 s，每段 500 s ≈ 8.3 min，理论 idleness ≈ 8.3 min。实际还包括段边界衔接、导航误差修正、避障绕行；经验上再加 15% 余量再对照验收线。</div></details>
+      </li>
+      <li>把 <code>busy_until</code> 的租约从 120 s 改成 600 s，再构造"被派发机器人 5 分钟后才失联"的场景，预测系统行为并与 120 s 版本对比。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>600 s 租约下，机器人失联后 10 分钟内该告警无法被二次派发（资源被"死锁"），其余告警响应能力下降；120 s 下 2 分钟后即可重派。租约时长应在"任务典型时长"与"失效恢复速度"之间折中。</div></details>
+      </li>
+      <li>设计加权巡逻：配电柜（3 个）要求 10 min 内必访，普通点位 30 min 内即可。给出你的频率分配方案（哪些点子集挂在快循环、哪些挂慢循环），并估计巡检总负荷增加了多少。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>把 3 个关键点组成小回路（≤10 min）与主回路解耦，机器人执行"快循环每轮插一次"。负荷增加 ≈ 关键回路周长 / 主周期；若由同一台执行需重做等时切分，最好交给专职机器人。</div></details>
+      </li>
+      <li>写一个仿真脚本：2 个告警在 10 s 内先后到达，验证派发节点不会把两台机器人都派给同一位置；再模拟派发后 3 s 该机器人失联（停止上报状态），验证 120 s 后新告警能另派他人。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>用 ros2 bag 或节点内的 FakeClock 驱动时间；关键断言：同一告警位置的并发占用 ≤ 1、租约过期后 free 列表重新包含失联者之外的新候选、派发日志含"挂起等待重试"。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>巡逻的本质是时间问题：用空置时间 idleness 与发现延迟验收，"走过了"不算数。</li>
+      <li>路线切分默认"分区并行 + 区内部等时切分"；负载必须包含驻留时间，段间共享边界航点保证无缝衔接。</li>
+      <li>告警抢占三原则：只派一台（防防区真空）、记录断点（防反复打扰饿死某段）、租约过期（防资源死锁）。</li>
+      <li>巡逻通信量极小，真正的风险是盲区丢心跳与告警误配 QoS，超时阈值取心跳周期的 3 倍以上，告警用 Reliable + Transient-local。</li>
+      <li>下一章给这类"多状态切换"的协同行为换一种更易扩展的表达方式：<strong>基于行为树的协同决策</strong>。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch062.html">← 第 062 章：协同覆盖路径规划</a>
+    <a class="next" href="ch064.html">第 064 章：基于行为树的协同决策 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

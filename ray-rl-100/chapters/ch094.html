@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第094章 端到端实践：多智能体任务训练流水线 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第五篇 · 训练工程与系统进阶</span>
+    <span class="sep">/</span>
+    <span>第 094 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第五篇 · 训练工程与系统进阶</div>
+    <h1>第 094 章：端到端实践：多智能体任务训练流水线</h1>
+    <p class="lead">一句话：本章组装多智能体任务的完整流水线：环境接口约定、策略映射（Policy Mapping）、参数共享与集中式评论家、以及按智能体分列的评估口径。</p>
+    <ul class="meta">
+      <li>主题：端到端实践 / 多智能体强化学习（Multi-Agent RL, MARL）</li>
+      <li>关键机制：字典观测接口、策略映射、共享策略、集中式训练分散执行</li>
+      <li>预计学时：65 分钟</li>
+      <li>前置章节：第 093 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>掌握多智能体环境接口的约定：字典化的观测与奖励、终止标志的全量键、以及同时决策与轮转决策的差异。</li>
+      <li>会编写策略映射函数，理解"智能体到策略"的指派如何决定参数共享的粒度。</li>
+      <li>理解集中式训练分散执行（Centralized Training with Decentralized Execution, CTDE）中全局状态的设计与使用边界。</li>
+      <li>掌握多智能体评估的口径：按智能体分列回报、团队聚合指标、协作成功率的定义。</li>
+      <li>会配置多智能体采样与批处理，并识别非平稳性带来的训练不稳定信号。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>多智能体任务把训练对象从一个策略变成一组相互影响的策略：每个智能体的环境转移依赖其他智能体的动作，奖励可能共享也可能独立。<strong>这种耦合带来三个新问题：接口从单值观测变成字典结构；策略数量与共享关系成为需要设计的变量；评估从单一回报曲线变成需要按个体与团队分列的指标组。</strong>前两章的流水线默认单策略单回报，本章把这两处拓展补齐。</p>
+    <p>多智能体训练的不稳定性高于单智能体：对手或队友的策略在学习中持续变化，每个智能体面对的环境是非平稳的（Non-stationary），值估计的收敛性论证减弱。<strong>工程上的应对是把"稳定性来源"显式化：参数共享减小策略间漂移，集中式评论家缓解局部信息不足，固定评估场景控制比较噪声。</strong>本章的配置组织围绕这三点展开。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p><strong>多智能体流水线的核心是把"多个智能体"翻译成"若干策略加一张指派表"，再用集中式信息与共享结构控制非平稳带来的方差。</strong>本节按接口、映射、共享、集中式设计与评估依次展开。</p>
+
+    <h3>1. 环境接口约定</h3>
+    <p>多智能体环境的观测、奖励与终止标志都以智能体标识为键的字典组织：观测字典的每个值对应各智能体的局部视图，奖励字典给出每个智能体的当期回报，终止字典至少包含一个全集键（约定为 <code>"__all__"</code>）表示整个回合结束。<strong>接口约定里最容易出错的是键集合的一致性：智能体死亡或加入时键集合变化，采样端按当前活跃集合组装数据，历史轨迹中的键需要保留到回合结束，否则信用分配断链。</strong>同时决策（所有智能体同步出一组动作）与轮转决策（按序逐个决策）在实现上不同：前者的策略前向可批量执行，后者需要回合内多轮交互，采样效率与实现复杂度都不同。</p>
+
+    <h3>2. 策略映射与共享粒度</h3>
+    <p>策略映射是一个函数：输入智能体标识（与可选的回合信息），输出策略标识。映射决定共享结构：全部智能体映射到同一策略标识时，参数完全共享，样本汇总到一个网络；不同类别映射到不同标识时，按类别共享；全部独立时回到"一智能体一策略"。三种选择的依据：</p>
+    <ul>
+      <li><strong>同构且对称</strong>（同类机器人、同类单位）：完全共享。样本量按智能体数放大，探索行为一致，训练最稳定。</li>
+      <li><strong>同构但角色不对称</strong>（进攻与防守同类单位）：按角色共享，让不同角色的数据各自集中。</li>
+      <li><strong>异构</strong>（观测与动作空间不同的智能体）：必须独立策略，空间不匹配无法共享网络。</li>
+    </ul>
+    <p>共享策略的样本量优势需要正确的批统计支撑：<strong>批次按"所有智能体的转移总和"计量，训练步数口径与单智能体任务不同，跨任务比较时要显式换算。</strong></p>
+
+    <h3>3. 集中式评论家与全局状态</h3>
+    <p>集中式训练分散执行的核心思想是：执行时每个智能体只用局部观测，训练时评论家可以使用全局信息（所有智能体的观测或环境全局状态）。全局状态的构造是一个设计决策：<strong>拼接所有智能体观测是最简单的形式，缺点是维数随智能体数增长、排列敏感（智能体顺序变化会改变状态表示）；用固定顺序的标识排序或加入标识嵌入可缓解排列敏感性。</strong>集中式信息只进入评论家，若误入策略输入，执行阶段（拿不到全局信息时）行为与训练不符，这是实现层最常见的错误之一。</p>
+
+    <h3>4. 非平稳性的工程应对</h3>
+    <p>非平稳性无法消除，但可以抑制其方差：共享策略使同类智能体的更新同步化，减少策略间的相互追逐；集中式评论家给出更稳定的价值估计；更新轮数压低、批增大可以平滑单个智能体数据到来的波动；评估时冻结所有策略并固定场景。<strong>监控上应关注按智能体分列的回报方差：个别智能体方差显著高于其他，往往指向共享结构不适合该异构程度。</strong></p>
+
+    <h3>5. 评估口径</h3>
+    <p>多智能体评估的输出是一组指标：每个智能体的回合回报分布、团队聚合（各智能体回报之和或环境定义的总回报）、协作成功率（成功回合占比，需要环境定义成功判据）、以及与基线策略的成对比较（对称任务中交换双方策略评估均衡性）。协议仍沿用固定初始状态集、固定回合数与冻结探索。<strong>团队聚合指标可能掩盖个别智能体的退化：合作任务中某一方偷懒仍可维持总和，报告必须同时保留个体分列视角。</strong></p>
+
+    <h3>6. 采样与批处理</h3>
+    <p>采样结构与单智能体一致：进程数、每进程环境数、片段长度与整除链；差异在于每个环境实例每个时间步产生多个转移（按智能体计数），<strong>批大小配置通常按"回合内转移数"计量，配置前确认框架的计数口径，避免把智能体数量重复计入两次。</strong>回合长度在对抗任务中可能很长，片段截断模式与完整回合模式的取舍沿用第 083 章的结论。</p>
+
+    <h3>7. 样本计量与共享收益的数值示例</h3>
+    <p>以 4 个同构智能体为例：单智能体等效批取 4000 个转移时，按转移总数计量的批为 16000；完全共享时四个智能体的转移汇总到同一策略，每轮参数更新看到 16000 个样本；完全独立时每个策略只看到各自的约 4000 个。共享把每策略的有效样本量提高约 4 倍，这是共享结构在样本效率上的主要收益。</p>
+    <div class="formula">
+      每策略有效样本量 ≈ 批转移总数 / 策略数
+      <span class="note">4 智能体、批 16000 时：共享结构每策略 16000，独立结构每策略 4000；收益倍数等于策略数，角色不对称时负迁移会抵消部分收益</span>
+    </div>
+    <p>跨任务换算示例：共享配置把批设为 8000 时，折算到每个智能体约 2000 个转移，与单智能体基线 4000 相比属于正常水平；把两个任务的批数字直接并列比较会得出错误结论。复用轮数同样按转移总数口径核对，非平稳数据下压低 1 至 2 档的结论在此口径下依然成立。</p>
+
+    <h3>8. 共享结构的定量对照</h3>
+    <table>
+      <tr><th>结构</th><th>每策略有效样本</th><th>方差主要来源</th><th>适用情形</th><th>主要风险</th></tr>
+      <tr><td>完全共享</td><td>全部转移总和</td><td>策略内部</td><td>同构且对称</td><td>角色不对称时负迁移</td></tr>
+      <tr><td>按角色共享</td><td>该角色的转移总和</td><td>角色内部</td><td>同构但角色不同</td><td>角色划分错误时两侧都弱</td></tr>
+      <tr><td>完全独立</td><td>各自转移</td><td>策略间漂移</td><td>异构空间</td><td>样本效率最低，非平稳最强</td></tr>
+    </table>
+    <p>选择依据：先从完全共享起步验证接口与学习能力，只在出现明确的负迁移证据时拆分角色策略；拆分后按角色重新分配批与复用轮数，两侧样本量都要重新核算。</p>
+
+    <h3>9. 全局状态的维数与排列敏感</h3>
+    <p>全局状态按拼接构造时，维数等于智能体数与单智能体观测维数之积：5 个智能体、每个 8 维观测时全局状态为 40 维。排列敏感的根源在于拼接顺序写入网络输入的位置结构：交换两个智能体的顺序会改变状态向量，评论家学到的函数与序位相关，对集合排列缺乏不变性。缓解构造包括固定排序约定（按标识字典序）与标识嵌入加集合池化；前者实现简单，后者在智能体数可变时更稳健。<strong>集中式信息只进入评论家，任何进入策略输入的路径都要在启动自检中拦截。</strong></p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>流水线组装按六步推进，映射与共享结构是本流水线的核心决策点。</p>
+    <ol>
+      <li><strong>接口对齐</strong>：按字典约定实现环境或接口适配，确认键集合与终止键的完整性。</li>
+      <li><strong>映射设计</strong>：按同构与对称性分析确定共享粒度，写出映射函数并在配置中声明策略清单。</li>
+      <li><strong>集中式结构</strong>：确定评论家的全局信息来源与拼接方式，检查策略输入不含全局信息。</li>
+      <li><strong>采样配置</strong>：进程、环境数、片段长度与批的整除链；确认批的计量口径。</li>
+      <li><strong>评估协议</strong>：固定场景、按智能体分列回报、团队指标与成功率定义。</li>
+      <li><strong>搜索接入</strong>：多智能体任务先稳住结构（共享与集中式），再搜索学习率与复用参数。</li>
+    </ol>
+    <h3>配置起点表</h3>
+    <table>
+      <tr><th>项</th><th>起点</th><th>依据</th></tr>
+      <tr><td>策略数</td><td>按类别 1 至 3 个</td><td>同构共享，异构独立</td></tr>
+      <tr><td>映射</td><td>恒等映射起步，按角色细分</td><td>先验证接口，再谈共享优化</td></tr>
+      <tr><td>评论家输入</td><td>全局状态拼接，固定顺序</td><td>缓解排列敏感，检查执行边界</td></tr>
+      <tr><td>批大小</td><td>单智能体基线的 2 至 4 倍</td><td>按智能体数放大样本量</td></tr>
+      <tr><td>评估回合</td><td>5 至 10 回合，按智能体分列</td><td>非平稳与多主体方差更大</td></tr>
+      <tr><td>复用轮数</td><td>较单智能体压低 1 至 2 档</td><td>非平稳数据有效期更短</td></tr>
+    </table>
+    <div class="box warn">
+      <span class="box-title">与上一章的差异</span>
+      <p>第 093 章的动作边界与归一化在单策略内闭环；本章增加"策略之间的边界"：映射函数决定数据流向哪个网络，共享结构决定方差来源。数值治理之外增加了结构治理，这是多智能体流水线的独有层次。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>以下片段基于 Ray 2.x 时期的通用写法，接口随版本演进，以对应版本的官方文档为准。</p>
+
+    <p><strong>片段 1：多智能体环境的最小实现</strong></p>
+    <pre class="code"><code>import gymnasium as gym
+import numpy as np
+
+class SimpleMultiAgentEnv:
+    """多智能体环境约定：观测、奖励、终止均为以标识为键的字典。
+    "__all__" 键表示整局结束，是所有键中最迟置位的。"""
+    def __init__(self, n_agents=2):
+        self.agents = [f"agent_{i}" for i in range(n_agents)]
+        # 每个智能体的局部观测空间：接口约定要求字典键与智能体集合一致
+        self.observation_space = {
+            a: gym.spaces.Box(-1.0, 1.0, shape=(4,), dtype=np.float32)
+            for a in self.agents
+        }
+        self.action_space = {
+            a: gym.spaces.Box(-1.0, 1.0, shape=(2,), dtype=np.float32)
+            for a in self.agents
+        }
+
+    def reset(self, seed=None, options=None):
+        rng = np.random.default_rng(seed)
+        self.state = rng.normal(size=(4,))
+        obs = {a: self.state + rng.normal(scale=0.01, size=4).astype(np.float32)
+               for a in self.agents}
+        return obs, {a: {} for a in self.agents}
+
+    def step(self, actions):
+        # 动作字典的键为当前活跃智能体；缺失键按策略异常处理并报错
+        delta = sum(actions.values()) / len(actions)
+        self.state = np.clip(self.state + delta * 0.1, -1.0, 1.0)
+        obs = {a: self.state.astype(np.float32) for a in self.agents}
+        rewards = {a: float(-np.linalg.norm(self.state)) for a in self.agents}
+        terminated = {a: False for a in self.agents}
+        terminated["__all__"] = bool(np.linalg.norm(self.state) &lt; 0.05)
+        truncated = {"__all__": False}
+        return obs, rewards, terminated, truncated, {a: {} for a in self.agents}</code></pre>
+    <p>解读：这个骨架演示了接口约定的全部要点。<strong>（1）</strong>观测与动作空间按智能体给出字典：框架据此为不同策略校验输入输出维度，空间不匹配会在启动时暴露。<strong>（2）</strong>终止字典含 <code>"__all__"</code> 全集键，整局结束由它表达；个体结束可以置位个体键而全集键保持 False，用于智能体陆续退场的任务。<strong>（3）</strong>奖励按智能体分列：共享奖励剧情中所有值相同，独立奖励剧情中各异，接口层不区分，由任务定义决定。</p>
+
+    <p><strong>片段 2：策略映射与共享结构配置</strong></p>
+    <pre class="code"><code>from ray.rllib.algorithms.ppo import PPOConfig
+
+def policy_mapping_fn(agent_id, episode=None, worker=None, **kwargs):
+    """映射函数：按标识前缀把智能体指派到策略。
+    同构智能体共享同一策略标识；异构类别拆分独立标识。"""
+    if agent_id.startswith("agent_"):
+        return "shared_policy"            # 同类智能体完全共享参数
+    return "observer_policy"              # 观测结构不同的类别独立成策略
+
+config = (
+    PPOConfig()
+    .environment(SimpleMultiAgentEnv)
+    .multi_agent(
+        # 策略清单：标识、空间类型与网络配置在启动时静态声明
+        policies={
+            "shared_policy": (None, None, None),
+            "observer_policy": (None, None, None),
+        },
+        policy_mapping_fn=policy_mapping_fn,
+        policies_to_train=["shared_policy", "observer_policy"],
+    )
+    # 批大小按所有智能体的转移总和计量：与单智能体任务的口径不同，
+    # 跨任务比较吞吐与复用参数前需要显式换算
+    .training(train_batch_size=8000, sgd_minibatch_size=512, num_sgd_iter=4)
+)</code></pre>
+    <p>解读：映射函数与策略清单构成结构层配置。<strong>（1）</strong>映射按标识前缀分类：这一写法让新增同类智能体自动归入共享策略，无需改动映射逻辑，同构扩展零成本。<strong>（2）</strong>策略清单在启动时声明全部策略标识，映射函数只做指派；未声明的标识会在运行时报错，把配置错误拦截在启动阶段。<strong>（3）</strong>批大小 8000 是"智能体数 × 单智能体等效批"的量级，注释强调计量口径：多智能体的样本计数按转移总数，直接与单智能体任务的数字并列会得出错误结论。</p>
+
+    <p><strong>片段 3：按智能体分列的评估</strong></p>
+    <pre class="code"><code>def evaluate_marl(algo, env, episodes=5, base_seed=5000):
+    """多智能体评估：固定场景，冻结探索，按智能体分列回报。
+    团队总和与个体分列同时保留：总和可能掩盖个体退化。"""
+    per_agent, team_totals, successes = {}, [], []
+    for i in range(episodes):
+        obs, _ = env.reset(seed=base_seed + i)
+        done, team = False, 0.0
+        agent_sum = {a: 0.0 for a in env.agents}
+        while not done:
+            # 同时决策：为全部活跃智能体一次性求动作，批量前向更高效
+            actions = {
+                a: algo.compute_single_action(obs[a], policy_id="shared_policy",
+                                              explore=False)
+                for a in env.agents
+            }
+            obs, rewards, terminated, truncated, _ = env.step(actions)
+            for a in env.agents:
+                agent_sum[a] += float(rewards[a])
+            team += float(sum(rewards.values()))
+            done = terminated["__all__"] or truncated["__all__"]
+        # 成功率按环境定义的判据统计：此处以团队回报阈值示意
+        successes.append(1.0 if team &gt; 0.0 else 0.0)
+        for a, v in agent_sum.items():
+            per_agent.setdefault(a, []).append(v)
+        team_totals.append(team)
+    return {
+        "team_mean": sum(team_totals) / len(team_totals),
+        "success_rate": sum(successes) / len(successes),
+        "agent_means": {a: sum(v) / len(v) for a, v in per_agent.items()},
+    }</code></pre>
+    <p>解读：评估函数输出三层指标。<strong>（1）</strong>动作按活跃智能体批量求取，共享策略下一次前向可服务多个智能体，评估成本低于逐策略调用。<strong>（2）</strong>团队总和与个体均值同时返回：合作任务里个体偷懒可以维持总和，个体分列让退化可见。<strong>（3）</strong>成功率把"是否达标"与"达标程度"分开：阈值判据由环境定义，报告口径固定后不同配置的成功率才可比较。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>终止字典缺少全集键</strong>：回合终止判定失效，轨迹长度异常增长。修复：接口层强制包含 <code>"__all__"</code> 键，键集合完整性在环境测试中校验。</li>
+      <li><strong>映射函数返回未声明的策略标识</strong>：运行时才报错，浪费启动开销。修复：策略清单静态声明，映射函数与清单的一致性用启动自检覆盖。</li>
+      <li><strong>异构智能体强行共享策略</strong>：空间不匹配直接失败，或空间同形但语义不同导致负迁移。修复：共享前核对空间语义，异构类别独立成策略。</li>
+      <li><strong>全局信息进入策略输入</strong>：执行阶段拿不到全局信息，训练与执行行为不一致。修复：全局状态只接评论家；用"策略接口不含全局键"的自检拦截。</li>
+      <li><strong>只报告团队总和</strong>：个体退化被平均掩盖，部署时个别智能体行为异常。修复：团队与个体分列上报；个体方差持续高企时复核共享结构。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>设计题：为"4 个同构机器人协作搬运"任务设计策略映射与共享方案：策略数、映射函数形式、批大小口径，并说明与"2 个同构机器人加 1 个异构观察者"场景的差异。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>四机器人全共享一个策略；加入观察者后为异构类别建独立策略；批按转移总数计量，共享场景样本量翻数倍。</div></details>
+      </li>
+      <li>预测题：把复用轮数从 6 提到 20，其余不变。预测按智能体分列回报的方差与团队曲线的走向。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>非平稳数据有效期短，高复用使旧对手数据失真，个体方差上升、团队曲线出现更明显的震荡。</div></details>
+      </li>
+      <li>分析题：解释全局状态拼接为什么对智能体排列敏感，并给出两种缓解构造。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>拼接顺序决定输入位置，交换顺序改变网络输入；缓解方式为固定排序约定，或加入标识嵌入与集合池化结构。</div></details>
+      </li>
+      <li>验证题：为多智能体流水线写一份启动自检清单：键集合、空间匹配、映射一致性与执行边界各一条断言，并说明每条断言拦截的故障类型。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>键集合拦截终止失效；空间匹配拦截启动失败；映射一致性拦截运行时指派错误；执行边界拦截全局信息泄漏。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>多智能体接口以字典组织观测、奖励与终止；全集键与键集合完整性是回合语义的基础。</li>
+      <li>策略映射决定共享粒度：同构对称全共享、角色不对称按角色共享、异构独立。</li>
+      <li>集中式评论家使用全局信息，策略输入必须保持局部；全局状态构造要处理排列敏感。</li>
+      <li>评估按团队与个体分列，成功率与回报程度分开报告；固定场景控制比较噪声。</li>
+      <li>三条端到端流水线完成；下一章把这些流水线装进可编排、可隔离的训练平台。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch093.html">← 第 093 章：端到端实践：连续控制任务训练流水线</a>
+    <a class="next" href="ch095.html">第 095 章：训练平台化：作业编排与资源隔离 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

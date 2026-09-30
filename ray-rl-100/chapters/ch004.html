@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第004章 Ray任务依赖与DAG调度 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · Ray 基础与分布式编程</span>
+    <span class="sep">/</span>
+    <span>第 004 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · Ray 基础与分布式编程</div>
+    <h1>第 004 章：Ray任务依赖与DAG调度</h1>
+    <p class="lead">对象引用不只是取结果的凭据，还是任务之间的依赖边。读懂有向无环图（DAG）的自动调度机制，才能真正把流水线写对：什么时候流水、什么时候设栅栏。</p>
+    <ul class="meta">
+      <li>主题：Ray 核心 / 依赖解析与任务图调度</li>
+      <li>关键机制：引用即依赖、就绪队列、血缘（Lineage）重建、动态任务图</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 003 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解"对象引用即依赖边"：把引用直接作为参数传入远程调用即可建立依赖，无需手工同步。</li>
+      <li>掌握依赖驱动的调度流程：就绪队列、依赖计数递减、任务触发与执行位置的本地性偏好。</li>
+      <li>能区分流水线（Pipeline）与栅栏（Barrier）两种拓扑，并说明中间插入 ray.get 的代价。</li>
+      <li>理解血缘（Lineage）如何支撑对象重建，以及它与第 009 章容错策略的关系。</li>
+      <li>会写动态任务图：任务内部按数据规模派生新任务，实现自适应的并行展开。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>任何真实的数据处理都不是一步完成的：采样产生原始轨迹，轨迹经过优势估计得到训练批次，多个批次聚合成一轮更新。这些阶段之间存在数据依赖，写成串行代码很容易，写成并行代码却容易掉进两个极端：要么到处插入等待，把并行结构压扁成串行的若干段；要么放任任务乱跑，结果错配。<strong>Ray 用对象引用把依赖关系显式化，让调度器自动完成"依赖就绪即执行"的工作</strong>。</p>
+    <p>在强化学习训练里，这个机制直接对应采样与训练的重叠：一批样本完成梯度更新前，下一批样本的采集可以已经开始。RLlib 的迭代器（Iterator）风格训练循环、Tune 的试验间数据共享都靠 DAG 调度获得重叠收益。写不出正确的依赖图，训练吞吐会被阶段间的等待吃掉。</p>
+    <p>本章先讲清依赖驱动的调度原理，再用三段代码展示常见错误写法与正确写法，最后给出动态展开任务的工程模式。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 引用即依赖：依赖图的自动构建</h3>
+    <p>当远程调用 <code>g.remote(f.remote(x))</code> 时，<code>g</code> 收到的参数是 <code>f</code> 的结果引用，数值要待 <code>f</code> 完成后才能取回。调度器据此建立一条依赖边：<strong>g 必须在 f 完成后才能执行</strong>。在提交端，这一行代码同时完成了三件事：</p>
+    <ul>
+      <li>登记 f 任务并立即返回其引用，不阻塞；</li>
+      <li>登记 g 任务，并把 g 标记为"未就绪"；</li>
+      <li>在依赖计数器上为 g 记录一条待满足条件。</li>
+    </ul>
+    <p>当 f 完成、结果封存后，调度器递减 g 的依赖计数；计数归零，g 进入就绪队列等待资源。整个过程无需提交端参与，也不产生任何显式同步原语。<strong>依赖关系是数据结构，调度行为是它的自然推论</strong>。</p>
+    <div class="formula">
+      就绪条件：任务的所有输入引用均已封存且资源可得
+      <span class="note">依赖以引用为单位计数；含 k 个输入引用的任务需要 k 次就绪信号才进入调度队列</span>
+    </div>
+
+    <h3>2. 流水线与栅栏：两种拓扑的性能分野</h3>
+    <p>考虑两级链路：第一级 N 个分片任务，第二级对分片结果做聚合。两种写法会产生完全不同的执行剖面：</p>
+    <table>
+      <tr><th>拓扑</th><th>写法</th><th>执行剖面</th><th>适用场景</th></tr>
+      <tr><td>流水线</td><td>聚合任务直接引用一级输出，或逐分片消费</td><td>分片完成一个、聚合推进一个，阶段间重叠</td><td>可分片聚合、在线统计、流式训练</td></tr>
+      <tr><td>栅栏</td><td>先 ray.get 全部分片，再做聚合</td><td>等待最慢分片，阶段完全串行</td><td>全局归约、必须全量对齐的算法</td></tr>
+    </table>
+    <p><strong>栅栏的代价等于最长分片与平均分片之差乘以阶段数</strong>。当分片数量大、尾部分片偏慢时（环境交互耗时的方差天然较大），这个差值会持续侵蚀吞吐。流水线写法把聚合拆成"逐分片合并"，用可交换、可结合的聚合函数（求和、计数、极值）把等待局部化。只有全局归一化、排序这类要求全量输入的操作才必须设置栅栏。</p>
+    <p>选择拓扑前先检查聚合算子是否满足结合律与交换律，结果决定等待能被摊薄到什么程度：</p>
+    <table>
+      <tr><th>聚合操作</th><th>算子性质</th><th>推荐拓扑</th><th>实现要点</th></tr>
+      <tr><td>求和、计数、最大值</td><td>满足结合律与交换律</td><td>流水线逐片合并</td><td>结果与合并顺序无关，任意归并树都正确</td></tr>
+      <tr><td>均值、方差</td><td>需配套充分统计量</td><td>流水线（传 sum 与 count）</td><td>先合并充分统计量，除法留到最后一步</td></tr>
+      <tr><td>优势标准化</td><td>依赖全局均值与标准差</td><td>两遍式：先流水线求统计量，再并行归一化</td><td>只对统计量设栅栏，数据本身仍可并行处理</td></tr>
+      <tr><td>排序、精确 top-k</td><td>需要全量可见</td><td>栅栏</td><td>或改用近似算法换取流水线能力</td></tr>
+    </table>
+    <p>这张表把"要不要设栅栏"从直觉判断变成算子性质检查：能在第一阶段被充分统计量替换的全局量，都不需要数据级栅栏。两遍式设计是强化学习批归一化的常用手法，第一遍并行收集均值与方差，第二遍并行归一化，两遍之间只同步两个标量。</p>
+
+    <h3>3. 血缘与重建：依赖图的第二重身份</h3>
+    <p>依赖图还有第二个用途：容错。每个对象都记录了它的产生方式（哪个函数、哪些输入引用），这份记录称为血缘（Lineage）。当对象因节点故障丢失且没有任何副本时，系统可以沿血缘反向追溯，把产生它的任务重新执行一遍以获得等价对象。<strong>血缘使"可重算"替代"多副本"成为默认容错手段</strong>，代价是重算需要消耗与原任务相当的资源，且要求任务无副作用（幂等）。</p>
+    <p>血缘链越长，重建的级联成本越高。这给出一条设计约束：流水线级数不宜过深，中间结果在合适位置物化（例如写入检查点），可以截断重建路径。这个权衡在第 009 章展开。</p>
+    <p>血缘重建还有一条常被忽略的边界条件：<strong>重建的正确性要求任务可安全重放</strong>。无副作用的纯计算天然满足；带外部副作用的任务（写文件、发网络请求、推进真实环境）在重建时会把副作用执行第二次，产生重复数据或不可逆状态。两类做法可以把有副作用的任务纳入血缘体系：一是让副作用幂等（以对象编号为键覆盖写入），二是把随机性来源（随机种子、外部输入快照）作为任务输入显式携带，使重放结果与原执行逐位一致。RLlib 采集任务正是靠第二种方式保证重放一致性，第 098 章的随机种子管理会给出完整做法。</p>
+
+    <h3>4. 动态任务图：任务内部继续派生任务</h3>
+    <p>静态提交的任务数量由驱动进程决定；动态任务图允许工作进程在执行中根据数据规模派生新任务。典型模式是"规划任务 + 执行任务"：一个任务先探查输入规模，再决定拆成多少个子任务并提交，最后返回子任务结果的引用集合。提交端只需等待最终引用，中间展开过程对上层透明。</p>
+    <p>动态展开的价值是<strong>并行度由数据决定</strong>：数据大就多拆，数据小就少拆，避免"固定并行度"在数据缩水时的资源浪费。代价是调度视野被推迟，无法提前做全局规划，滥用会退化成碎片化的小任务海。工程上常加一层约束：单任务工作量低于阈值时不再下拆。</p>
+
+    <h3>5. 数值算例：流水线重叠的吞吐收益与血缘重建代价</h3>
+    <p>用一个两阶段训练循环核算重叠收益。设每轮流程为"采样 1.0 秒 + 训练 0.6 秒"，两个阶段使用各自独立的资源池（采样 worker 与训练进程互不争抢），共 20 轮。栅栏写法要求每轮采样全部完成后才开始训练：单轮耗时 1.6 秒，总计 32 秒。流水线写法让第 k 轮训练与第 k+1 轮采样重叠：总计 20 × 1.0 + 0.6 = 20.6 秒，加速比为 32 ÷ 20.6 ≈ 1.55。</p>
+    <div class="formula">
+      稳态吞吐 = 1 ÷ max(t<sub>采样</sub>, t<sub>训练</sub>)；栅栏吞吐 = 1 ÷ (t<sub>采样</sub> + t<sub>训练</sub>)
+      <span class="note">重叠的收益上限来自瓶颈阶段：空闲比例 = 1 − min(t₁, t₂) ÷ max(t₁, t₂)</span>
+    </div>
+    <p>代入核对：流水线稳态吞吐为 1 ÷ 1.0 = 1.0 轮/秒，栅栏为 1 ÷ 1.6 = 0.625 轮/秒，比值恰为 1.6。运行 20 轮期间采样资源忙碌 20 秒，利用率约 97%，训练资源忙碌 12 秒，利用率约 58%，空闲部分就是重叠留下的气泡。这组数字给出三条工程判据：<strong>第一，两阶段耗时越接近，重叠收益越大，1:1 时理论收益为 2 倍；第二，阶段完全不平衡时收益退化，例如 1.0 秒对 0.1 秒只剩约一成；第三，任何一轮中的个别慢分片会直接拉长流水线节拍</strong>，把一个 1.0 秒的采样拖成 2.0 秒，总时长即升至 21.6 秒，尾延迟在流水线中同样按轮次累积。</p>
+    <p>血缘重建的代价可以用同一套算术估算。设依赖链共 6 级、每级重算 0.8 秒，末端对象丢失时需要级联重放全部 6 级，恢复耗时 4.8 秒；若在第 3 级后写入检查点，恢复只需重放 3 级即 2.4 秒，代价是每次物化检查点多出一次写盘。按单级重建成功率 p = 0.99 计算，无检查点时联合成功率为 0.99<sup>6</sup> ≈ 0.9415，插入一个检查点把有效链长折半后升至 0.99<sup>3</sup> ≈ 0.9703。<strong>检查点密度与重建成本之间存在明确的最优点：把期望恢复时间写为"检查点写入开销 × 数量 + 折半链长的重放时间"，对数量求最小值即可</strong>，这正是练习 5 要推导的权衡，也是第 009 章容错设计的量化基础。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>把一条多阶段处理链路翻译成 DAG 的步骤：</p>
+    <ol>
+      <li><strong>画出数据流</strong>：标出每个阶段的输入、输出与基数（一变多还是一对一），基数变化处就是并行展开点。</li>
+      <li><strong>识别最小依赖集</strong>：找出每个阶段真正需要哪些输入。最小化依赖能让任务尽早就绪，也缩小血缘重建范围。</li>
+      <li><strong>选择拓扑</strong>：可用可结合聚合函数的阶段一律流水线化；必须全量对齐的聚合点设栅栏，并接受一次同步。</li>
+      <li><strong>确定物化点</strong>：在阶段边界决定哪些中间结果直接传引用继续流动，哪些落检查点截断血缘。</li>
+      <li><strong>控制派发总量</strong>：全流程同时在途任务数设上限，用窗口化提交防止任务海淹没调度器。</li>
+    </ol>
+    <table>
+      <tr><th>参数</th><th>典型取值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>分片数</td><td>并发核数的 2–4 倍</td><td>流水线并行粒度</td><td>留出冗余以吸收分片耗时方差</td></tr>
+      <tr><td>在途任务上限</td><td>64–256</td><td>防止派发风暴</td><td>按对象平均尺寸与存储预算反推</td></tr>
+      <tr><td>动态展开阈值</td><td>单任务 0.1 s 以上</td><td>控制最细粒度</td><td>低于阈值时调度开销占比过大</td></tr>
+    </table>
+    <div class="box tip">
+      <span class="box-title">与上一章的差异点</span>
+      <p>第 003 章解决了"同一对象如何被多个消费者安全共享"，本章解决"多个对象之间的先后关系由谁保证"。前者管空间，后者管时序；两者组合成完整的数据流控制面。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>以下片段采用 Ray 2.x 时期的通用写法；接口随版本演进，以对应版本官方文档为准。</p>
+    <p><strong>片段 1：中间 ray.get 如何压扁流水线</strong></p>
+    <pre class="code"><code>import ray
+
+ray.init(num_cpus=8)
+
+@ray.remote(num_cpus=1)
+def fetch_shard(shard_id):
+    return [shard_id] * 1000            # 模拟从存储读取一个分片
+
+@ray.remote(num_cpus=1)
+def merge(stats_a, stats_b):
+    return stats_a + stats_b            # 可结合的聚合：支持逐片合并
+
+# 写法 A（错误示范）：中途 ray.get，阶段间形成栅栏
+refs = [fetch_shard.remote(i) for i in range(8)]
+shards = ray.get(refs)                  # 等待全部 8 片：流水线在此折断
+total = len(shards[0]) * len(shards)
+print("栅栏写法总量:", total)
+
+# 写法 B：聚合任务直接引用分片结果，依赖图上形成"八岔归一路"的流水线
+pair_refs = [merge.remote(fetch_shard.remote(i), fetch_shard.remote(i + 1))
+             for i in range(0, 8, 2)]   # 提交时建立依赖边，不等待
+total_ref = pair_refs[0]
+for ref in pair_refs[1:]:               # 逐级归并，聚合对象数减半递进
+    total_ref = merge.remote(total_ref, ref)
+print("流水线写法总量:", len(ray.get(total_ref)))</code></pre>
+    <p>解读：两种写法的输出规模刻意保持一致，便于观察结构差异。写法 A 的 <code>ray.get</code> 是显式栅栏：在 8 个分片全部完成前，任何后续计算都无法开始，尾部延迟直接计入总耗时。写法 B 中只有提交端在构建引用表达式，调度器看到的是完整的依赖图：每个 <code>merge</code> 任务在它的两个输入就绪时立刻执行，聚合与获取自然重叠。<strong>表达式越"引用化"，调度器可用的并行信息越多</strong>，这是本章最重要的书写原则。</p>
+
+    <p><strong>片段 2：依赖驱动的启动时机观测</strong></p>
+    <pre class="code"><code>import ray
+import time
+
+ray.init(num_cpus=8)
+
+@ray.remote(num_cpus=1)
+def load(id_, delay):
+    time.sleep(delay)                   # 模拟 0.2 至 0.6 秒不等的读取耗时
+    return (id_, time.strftime("%H:%M:%S"))
+
+@ray.remote(num_cpus=1)
+def transform(payload):
+    return payload                        # 依赖载荷，仅作时序观测
+
+t0 = time.strftime("%H:%M:%S")
+# 分片耗时故意递增：观察下游任务是否"完成一片、启动一片"
+raw = [load.remote(i, 0.2 * (i + 1)) for i in range(4)]
+stage2 = [transform.remote(r) for r in raw]   # 每个 transform 绑定一个分片引用
+print("提交完成于", t0)
+print(ray.get(stage2))</code></pre>
+    <p>解读：运行这段脚本会发现 <code>transform</code> 任务逐片激活：耗时 0.2 秒的分片完成后，对应下游立即执行，不需要等待全部 4 个 <code>load</code> 完成。<strong>依赖是逐引用满足的，不存在"整批就绪"的隐含栅栏</strong>。耗时递增的构造方式便于在回显时间中读出重叠轨迹；把时间戳替换为单调时钟差值，还能测出每个任务的排队时延，用于识别调度器侧的拥塞。</p>
+
+    <p><strong>片段 3：动态任务图，按数据规模自适应展开</strong></p>
+    <pre class="code"><code>import ray
+
+ray.init(num_cpus=16)
+
+@ray.remote(num_cpus=1)
+def process_range(start, end):
+    return end - start                    # 占位计算：返回处理量
+
+@ray.remote(num_cpus=1)
+def plan(total, chunk=1000):
+    """规划任务：按数据规模决定拆成多少子任务，返回子任务引用列表。"""
+    n_chunks = max(1, (total + chunk - 1) // chunk)   # 向上取整，杜绝零任务
+    refs = [process_range.remote(i * chunk, min((i + 1) * chunk, total))
+            for i in range(n_chunks)]    # 在执行中派生任务，展开动态 DAG
+    return refs                           # 关键：返回引用列表，数值留待下游取回
+
+# 外层 get 拿到的仍是引用列表：需要二次取回才能得到子任务结果
+nested = ray.get(plan.remote(5000))       # 此时 total 5000 → 5 个子任务
+sizes = ray.get(nested)                   # 对子任务引用再取回
+print("子任务处理量:", sizes)</code></pre>
+    <p>解读：<code>plan</code> 的返回值是"引用的列表"，外层 <code>ray.get</code> 解析出的仍是引用，需要第二次 <code>ray.get</code> 才能穿透到数值。这个双层结构是动态任务图的标志：<strong>任务数量由运行时数据决定，提交端只负责发起与收敛</strong>。实践中常把它封装成"返回最终聚合引用"的形态，避免嵌套引用泄漏到调用层。注意 <code>plan</code> 声明了 1 个 CPU，但它在等待子任务时不占用计算资源；把规划类任务与计算类任务分开声明资源，能避免长等待任务占用核数。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>习惯性在每阶段之间 ray.get</strong>：把 Python 同步思维带入分布式代码，逐阶段等待，DAG 退化为串行流水账。症状是阶段间出现明显空档、GPU 利用率偏低。修复：让引用直接流入下游调用，只在最终需要数值时取回。</li>
+      <li><strong>误以为任务按提交顺序执行</strong>：无依赖任务可任意重排，依赖任务的启动时机由就绪事件决定。依赖顺序假设会导致对日志、外部副作用时序的误判。修复：把顺序要求显式建模为数据依赖或 Actor 队列。</li>
+      <li><strong>引用循环导致死锁</strong>：手工构造出互相等待的引用关系（例如任务 A 的参数引用了 B 的输出，B 又引用 A 的输出），双方永远无法就绪。修复：依赖图必须是有向无环的；出现环时应引入中间对象切断。</li>
+      <li><strong>无节制提交造成任务海</strong>：单次提交数万个任务，调度队列与元数据膨胀，反而拖慢整体。修复：窗口化提交，保持在途任务上限；结合动态展开阈值控制粒度。</li>
+      <li><strong>把血缘当免费午餐</strong>：级联重建会重放整条依赖链，上游任务耗时长时恢复代价极高。修复：在阶段边界写入检查点截断血缘，关键中间结果保留副本。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把片段 1 的写法 B 改为"每片单独统计再汇总"的结构，预测提交后调度器看到的任务图形态，并说明逐级归并相比一次归并节省了什么。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>逐级归并把单点聚合的负载摊到对数级层数上，任一层内部可并行；一次归并则让所有输入汇聚到单任务，形成长依赖等待。</div></details>
+      </li>
+      <li>预测题：在片段 2 中把 4 个分片的耗时改为全部相同（各 0.2 秒），下游启动时间与总完成时间会怎么变化？与递增耗时的情形对比，解释尾延迟的影响。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>耗时一致时下游同样逐片激活，但总完成时间接近单分片耗时加一轮流水，方差越小越接近理想重叠；递增耗时时最慢分片决定尾声。</div></details>
+      </li>
+      <li>设计题：为一个"采样 → 优势估计 → 批合并"的三级链路设计 DAG：标明哪些阶段可流水线化、哪些必须设栅栏，并给出在途对象数上限的估算方法。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>采样到优势估计可分片流水；批合并若做全局归一化（如优势标准化）需要全量统计量，属栅栏点。上限按并发任务数乘以单对象尺寸对存储预算取余。</div></details>
+      </li>
+      <li>分析：某流水线每级耗时 0.5 秒，共 4 级，分片耗时标准差扩大到均值的 50%。分别估算流水线与栅栏两种拓扑的端到端耗时量级，并解释差异来源。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>栅栏代价含最大分片偏置；流水线把偏置局部化到每级内。级数越多、方差越大，差距越明显，这解释了长链路训练管线偏爱流式设计的原因。</div></details>
+      </li>
+      <li>推导：血缘链长度 L、单级重建成功率 p。写出对象经一次故障后成功重建的概率表达式，并讨论检查点密度与重建成本之间的权衡。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>逐级重算的联合成功率约为 p^L；链越长越脆弱。把检查点插在中间使有效链长缩短，但检查点本身有写入成本，最优密度使两者之和最小。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>对象引用即依赖边：把引用直接传入远程调用即可建立依赖，调度器负责"就绪即执行"。</li>
+      <li>流水线与栅栏是两种基本拓扑；<strong>中间 ray.get 是显式栅栏，会把重叠收益全部吃掉</strong>，只在必须全量对齐处设置。</li>
+      <li>血缘让对象可沿依赖链重建，是第 009 章容错机制的基石；长链路需用检查点截断重建范围。</li>
+      <li>动态任务图把并行度决策推迟到运行时，由数据规模驱动展开；需配阈值防止任务海。</li>
+      <li>下一章把 DAG 中的一类特殊节点规模化：<strong>Actor 池与并发控制</strong>，解决单 Actor 队列吞吐不足的问题。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch003.html">← 第 003 章：Ray对象存储与共享内存</a>
+    <a class="next" href="ch005.html">第 005 章：Ray Actor池与并发控制 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

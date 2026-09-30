@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第011章 MATD3双Critic实现 | 多智能体强化学习课程 · CTDE 框架与协同算法</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · CTDE 基础与核心算法</span>
+    <span class="sep">/</span>
+    <span>第 011 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · CTDE 基础与核心算法</div>
+    <h1>第 011 章：MATD3双Critic实现</h1>
+    <p class="lead">连续控制路线的稳定性修补：双评论家取最小压制高估、延迟策略更新先校正评论家、目标策略平滑压低误差尖峰。MATD3（Multi-Agent Twin Delayed Deep Deterministic Policy Gradient）在 MADDPG 骨架上增加三件套，本章逐项推导机理、实现并给出消融协议。</p>
+    <ul class="meta">
+      <li>主题：连续控制 / 高估抑制</li>
+      <li>关键公式：y = r + γ (1 − done) · min<sub>j∈{1,2}</sub> Q′<sub>j</sub>(s′, a′ + clip(ε, −c, c))</li>
+      <li>预计学时：50 分钟</li>
+      <li>前置章节：第 010 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解连续控制评论家高估的成因：逼近误差被确定性目标与自举反复利用并放大。</li>
+      <li>掌握双评论家取最小、延迟策略更新、目标策略平滑三项机制各自抑制的环节。</li>
+      <li>会实现 MATD3 的评论家目标、更新时序与联合动作平滑噪声，并保持与第 010 章的接口一致性。</li>
+      <li>会设计高估测量实验（蒙特卡洛对照）与三件套逐一消融协议。</li>
+      <li>能说明取最小带来的悲观偏差与延迟更新的样本效率代价，理解两者与任务容错度的匹配关系。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 010 章的 MADDPG 在连续控制问题上结构清晰，但训练中普遍出现一类故障：评论家的价值估计系统性高于真实回报，策略梯度沿着虚高的方向改进，最终陷入"评估漂亮、执行平庸"的状态。单智能体文献把这类现象称为高估偏置（overestimation bias），其放大机制有两步：函数逼近误差使某些动作的价值被高估；自举目标反复采用"下一时刻的贪心动作价值"，贪心选择优先落在正误差上，误差经时序差分回流并累积。</p>
+    <p>多智能体设定放大了这两个环节：评论家输入是高维联合动作，逼近误差更大；目标侧动作由确定性目标演员生成，没有随机策略的动作分布来平均掉误差。MATD3（Multi-Agent Twin Delayed Deep Deterministic Policy Gradient）把单智能体 TD3 的三项修补搬到多智能体：<strong>双评论家取最小直接惩罚正误差的传播路径，延迟策略更新降低"策略利用误差"的频率，目标策略平滑把目标动作置于一个小邻域的平均位置以避开误差尖峰。</strong>三项机制各有代价，本章的消融协议用于逐项量化收益与代价。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p>本节先交代高估的自举放大机制，再拆解三件套各自的数学作用与代价，最后给出多智能体适配细节。</p>
+
+    <h3>1. 高估的自举放大</h3>
+    <p>记评论家 Q<sub>j</sub>(s, a; φ) = Q<sup>π</sup>(s, a) + ε<sub>φ</sub>(s, a)，其中 ε<sub>φ</sub> 为逼近误差，可正可负。时序差分目标取下一动作的价值后回归：</p>
+    <div class="formula">
+      y = r + γ Q<sub>φ</sub>(s′, μ′(o′))， 更新后 Q 在 (s, a) 处趋向 y
+      <span class="note">当误差函数 ε<sub>φ</sub> 在 argmax 附近为正时，目标值被抬高；更新让 Q(s, a) 追随被抬高的目标，下一轮误差又在新的贪心点附近被采样，正误差沿轨迹逐步累积。若误差零均值且各点独立，期望意义下仍出现系统性偏高，因为"取所估计的贪心动作的价值"优先利用了正误差</span>
+    </div>
+    <p>多智能体版本中每个评论家面对 (s, a<sub>1</sub>, …, a<sub>N</sub>) 的高维输入，误差上界随维度上升；确定性目标动作没有分布平均效应。<strong>高估的后果在协作任务中表现为"策略相信某些联合配合一定能获得高回报"，而真实环境中该配合的收益低于估计，探索会被系统性误导。</strong></p>
+
+    <h3>2. 三件套的作用机理</h3>
+    <p><strong>（1）双评论家取最小。</strong>评论家 j ∈ {1, 2} 独立初始化、独立更新，目标取二者较小值：</p>
+    <div class="formula">
+      y = r + γ (1 − done) · min<sub>j∈{1,2}</sub> Q′<sub>j</sub>( s′, a′<sub>1</sub>, …, a′<sub>N</sub> )
+      <span class="note">两个独立误差同时为正的概率低于单一误差为正；取最小近似"悲观下包络"，正误差峰被惩罚。代价：误差同号向下时转变为低估，策略趋于保守</span>
+    </div>
+    <p><strong>（2）延迟策略更新。</strong>评论家每环境步更新，演员每 d = 2 步更新一次，目标网络随演员更新一起软更新：</p>
+    <div class="formula">
+      每步更新评论家； 每 d 步更新演员，随后一次 Polyak 软更新全部目标参数
+      <span class="note">机理：策略改进依赖评论家梯度，评论家误差要先被数据校正；延迟把"用未校正的评论家改策略"的频次减半。代价：策略改进速度下降，达到同等回报所需环境步数上升</span>
+    </div>
+    <p><strong>（3）目标策略平滑。</strong>目标动作叠加截断噪声，相当于对目标策略做局部期望：</p>
+    <div class="formula">
+      ã′<sub>i</sub> = μ′<sub>i</sub>(o′<sub>i</sub>) + clip( ε<sub>i</sub>, −c, c )， ε<sub>i</sub> ~ 𝒩(0, σ²)， 每个智能体独立采样
+      <span class="note">机理：若某动作点恰好是误差尖峰，邻域平均把目标值拉回平缓区域；独立噪声保证联合动作邻域被各方向覆盖。代价：目标值方差上升，平滑过强会让价值面失去细节</span>
+    </div>
+
+    <h3>3. 多智能体适配细节</h3>
+    <p>三件套在拓扑上的落点与单智能体不同：每个智能体持有自己的评论家对（Q<sub>i,1</sub>, Q<sub>i,2</sub>），目标值取该智能体自己两个评论家的最小；平滑噪声施加在"全体智能体的目标动作"拼接向量上，每个分量独立采样；演员损失仍只对自身动作求导。更新次序固定为评论家、演员（条件触发）、目标更新（紧随演员）三段。<strong>次序是算法定义的组成部分：若把目标更新提前到演员更新之前，目标动作与目标价值来自不同版本的策略，平滑与取最小的联合效果会被稀释，消融实验将显示稳定性差异。</strong></p>
+
+    <h3>4. 与第 010 章的差异清单</h3>
+    <table>
+      <tr><th>维度</th><th>MADDPG（第 010 章）</th><th>MATD3（本章）</th></tr>
+      <tr><td>评论家数量</td><td>每智能体 1 个</td><td>每智能体 2 个，目标取最小</td></tr>
+      <tr><td>演员更新频率</td><td>每环境步</td><td>每 2 步（延迟）</td></tr>
+      <tr><td>目标动作</td><td>目标演员直接输出</td><td>目标演员输出加截断噪声</td></tr>
+      <tr><td>目标更新时机</td><td>每步软更新</td><td>随演员更新触发</td></tr>
+      <tr><td>主要代价</td><td>高估、误差利用</td><td>悲观偏差、样本效率下降</td></tr>
+    </table>
+    <p><strong>实践判据：任务回报尺度大且容错低（过激行为代价高）时取最小带来的保守化是净收益；任务奖励稠密且探索困难时，延迟更新与平滑的代价可能压过收益，需要通过消融确认。</strong></p>
+
+    <h3>5. 数值算例：取最小的悲观幅度与平滑的削峰比例</h3>
+    <p>先量化取最小的偏差方向与幅度。设两个独立评论家在同一个函数点上各带一个等概率取值 {−1, +1} 的误差（单位误差、对称分布、均值为零），四种误差组合等概率出现，聚合方式的期望偏差为：取平均 0（无偏），取最大 +0.5（乐观），取最小 −0.5（悲观），数值经程序核对。<strong>结论有两层：其一，取最小与"双估计器取最大"的偏差幅度相同、符号相反，MATD3 用悲观替换乐观，把高估故障换成经过标定的低估；其二，偏差幅度与误差分布宽度成正比，误差尺度为 δ 时期望偏差约为 0.5δ，任务回报尺度远大于 δ 时该偏差可忽略，回报尺度与 δ 同阶时必须把悲观偏差计入策略评估结论。</strong></p>
+    <p>再量化目标平滑的削峰力度。设某动作维上误差呈窄峰，峰宽 w = 0.05（按高斯形状衡量），峰值幅度 1；平滑噪声标准差 σ = 0.2、截断 c = 0.5。叠加噪声后目标值的期望为峰形与噪声分布的卷积，峰值贡献从 1 衰减为 w / √(w² + σ²) = 0.05 / √(0.0025 + 0.04) = 0.2425，约 76% 被削掉；把峰宽放大到 w = 0.1 后衰减系数升到 0.4472，削峰减弱到约 55%。<strong>读数方法：平滑对"窄尖峰"压制强、对"宽缓起伏"几乎不动（峰宽远大于 σ 时系数趋近 1）。误差尖峰通常来自单点过拟合、尺度较窄，真实价值面上的宽结构需要被保留；σ 的选择因此等价于声明"多宽的起伏按噪声处理"，σ = 0.2 在动作幅度为 1 的设定下抑制尺度约为 0.2 以下的起伏。</strong></p>
+    <p>延迟系数还可以精确换算：演员更新次数约为环境步数的 1/d。在固定环境步预算下要恢复 MADDPG 同量的演员更新，需要把环境步数乘以 d，或把批大小与演员学习率提到等效带宽；前者增加采样成本，后者改变优化动力学，两条路径都说明延迟的收益以样本效率为代价。<strong>工程折中：先按 d = 2 跑基线，若回报曲线的快速改进段明显偏后（前期平台期拉长），再把 d 降到 1 做对照，或将演员学习率提高一档观察。若任务允许在更长的交互预算内收敛，延迟几乎没有副作用；交互预算紧张时它是最先被削减的组件。</strong></p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>本节给出 MATD3 的组件与配置，沿用第 010 章的环境与数据接口，增量集中在评论家数量、目标构造与更新时序。</p>
+    <table>
+      <tr><th>设计项</th><th>取值（基线）</th><th>作用与依据</th></tr>
+      <tr><td>双评论家初始化</td><td>两个随机种子独立初始化</td><td>误差独立性是取最小有效的前提；同种子初始化会退化</td></tr>
+      <tr><td>演员学习率</td><td>5e-4</td><td>与第 010 章一致</td></tr>
+      <tr><td>评论家学习率</td><td>1e-3</td><td>与第 010 章一致</td></tr>
+      <tr><td>延迟系数 d</td><td>2</td><td>标准基线；d = 1 退化为 MADDPG 时序，d 增大进一步保守</td></tr>
+      <tr><td>平滑噪声 σ</td><td>0.2</td><td>与动作幅度同尺度；过小无效，过大目标失真</td></tr>
+      <tr><td>噪声截断 c</td><td>0.5</td><td>限制单步目标偏移；c / σ ≈ 2.5 为常用档位</td></tr>
+      <tr><td>软更新系数</td><td>τ = 0.01，随演员更新触发</td><td>目标版本与演员版本的同步节奏</td></tr>
+      <tr><td>探索噪声</td><td>0.3 线性降至 0.05</td><td>与第 010 章一致；探索噪声与平滑噪声职责分离</td></tr>
+      <tr><td>回放与批</td><td>10<sup>6</sup> 条，批 128</td><td>与第 010 章一致，保证对照单变量</td></tr>
+    </table>
+    <p>实现层面需维护一个更新计数器 <code>step_t</code>，三种事件挂在计数器 mod d 的余数上。第 010 章的评论家类继续复用，加一层"评论家对"包装。<strong>数据接口唯一的增量是目标平滑的噪声配置字段：噪声尺度与截断为全局常量，不随状态变化，保证目标构造确定可复现（固定种子情况下）。</strong></p>
+    <div class="box key">
+      <span class="box-title">设计决策：取最小作用于评论家对的理由</span>
+      <p>更精细的方案是显式估计并减去误差（例如双评论家的差作为方差代理），实现复杂度高且引入新的超参。取最小的优点是零额外超参、计算开销为一个前向的价值读取，且与"独立误差同时为正概率低"的直觉直接对应。<strong>c 与 σ 是本章仅有的两个新增连续超参，窄搜索即可：σ 取动作幅度的一半量级，c 取 2σ 附近，先固定后各自微调。</strong></p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：评论家对与目标取最小</strong></p>
+    <pre class="code"><code>def twin_critic_target(q1_t, q2_t, target_actors, ns, nobs_next, done, rew,
+                       gamma=0.95, sigma=0.2, c=0.5):
+    """目标值 = r + gamma * min(Q1', Q2'), 目标动作加截断平滑噪声。"""
+    with torch.no_grad():
+        # 联合目标动作: 每个智能体独立采样噪声, 保证邻域各方向被覆盖
+        a_next = []
+        for i, ta in enumerate(target_actors):
+            a_hat = ta(nobs_next[:, i])
+            eps = torch.randn_like(a_hat) * sigma
+            a_next.append(a_hat + eps.clamp(-c, c))    # 截断限制单步偏移
+        a_next = torch.cat(a_next, dim=-1)
+        q1 = q1_t(ns, a_next)
+        q2 = q2_t(ns, a_next)
+        y = rew[:, 0] + gamma * (1.0 - done[:, 0]) * torch.minimum(q1, q2)
+    return y</code></pre>
+    <p>解读：这段函数是本章理论的核心实现。<strong>（1）</strong>噪声在每个智能体的动作上独立采样，<code>torch.randn_like</code> 的形状与动作一致；若全部智能体共享同一噪声向量，联合目标的偏移方向单一，平滑退化为沿对角线的移动。<strong>（2）</strong><code>clamp(-c, c)</code> 把采样值截断在对称区间，截断位置的梯度为零（在 no_grad 内无影响，语义上表示"极端偏移不被允许"）。<strong>（3）</strong><code>torch.minimum(q1, q2)</code> 逐元素取小，与逐智能体的评论家对一一对应；两个评论家在同一批次、同一目标动作上求值，保证比较的是同一函数点的两个估计。</p>
+
+    <p><strong>片段 2：更新时序</strong></p>
+    <pre class="code"><code>def matd3_step(agents, batch, step_t, d=2, tau=0.01):
+    """一次完整更新: 评论家每步, 演员与目标按延迟系数 d 触发。"""
+    s, acts, rew, ns, nobs, done = batch
+    for ag in agents:
+        # 评论家对: 两个网络分别对同一个 min 目标回归
+        y = twin_critic_target(ag.q1_t, ag.q2_t, [a.target_actor for a in agents],
+                               ns, nobs, done, rew)
+        for q, opt in ((ag.q1, ag.opt_q1), (ag.q2, ag.opt_q2)):
+            loss_q = ((q(s, acts) - y) ** 2).mean()   # 双网络共享目标, 独立参数
+            opt.zero_grad(); loss_q.backward(); opt.step()
+    # 延迟触发: 演员与目标只在 step_t % d == 0 时更新
+    if step_t % d == 0:
+        for ag in agents:
+            # 演员损失: 只用 Q_i 对自己动作的梯度, 其他动作为常数
+            a_i = ag.actor(ag.obs_i(batch))
+            others = ag.others_acts(batch).detach()
+            q_val = ag.q1(s, torch.cat([others, a_i / ag.act_scale], dim=-1))
+            loss_a = -q_val.mean()
+            ag.opt_a.zero_grad(); loss_a.backward(); ag.opt_a.step()
+        for ag in agents:
+            # 目标参数一次 Polyak 滑动: 演员与双评论家成对更新
+            for online, target in ag.online_target_pairs():
+                for p_o, p_t in zip(online.parameters(), target.parameters()):
+                    p_t.mul_(1.0 - tau).add_(p_o, alpha=tau)
+    return step_t + 1</code></pre>
+    <p>解读：时序函数把"频率"落实为显式分支。<strong>（1）</strong>评论家更新在每个环境步都发生，演员与目标更新挂在 <code>step_t % d</code> 条件内；三者共享同一批次，评论家与演员看到的数据快照一致。<strong>（2）</strong>演员损失复用第 010 章的写法：只对自身动作求导、其他动作 detach；延迟策略下同一批次被评论家多学一轮，策略改进更干净。<strong>（3）</strong>目标滑动紧随演员更新，保证"目标策略版本"与"目标价值版本"在同一节奏上前进；<code>online_target_pairs()</code> 把需要成对维护的网络集中声明，避免遗漏评论家对中的某一个。</p>
+
+    <p><strong>片段 3：高估测量</strong></p>
+    <pre class="code"><code>def overestimation_report(agents, eval_states, env, n_episodes=20):
+    """在同一评估状态集上比较 Q 估计与蒙特卡洛回报的平均差距。"""
+    import numpy as np
+    est = []
+    for s in eval_states:
+        # 估计侧: 双评论家取小后的价值作为"经过悲观化的估计"
+        with torch.no_grad():
+            q_min = float(torch.minimum(agents[0].q1(s), agents[0].q2(s)).mean())
+        est.append(q_min)
+    mc = []
+    for _ in range(n_episodes):
+        obs, _ = env.reset()
+        done, ret = False, 0.0
+        while not done:                            # 评估策略滚动: 不加探索噪声
+            acts = [ag.actor.act_greedy(obs[i]) for i, ag in enumerate(agents)]
+            obs, _, r, done = env.step(acts)
+            ret = ret * 0.95 + r                     # 折扣回报, 与 gamma 对齐
+        mc.append(ret)
+    # 差距显著为正提示高估残留; 由正转负提示取最小带来低估
+    return float(np.mean(est) - np.mean(mc))</code></pre>
+    <p>解读：测量函数把"高估"从定性描述变为可随着训练周期记录的数值。<strong>（1）</strong>估计侧使用双评论家取小的结果，测量的是"经过悲观化后"的价值估计；这个量接近蒙特卡洛回报说明三件套工作正常，显著为正说明高估残留，显著为负说明保守过度。<strong>（2）</strong>蒙特卡洛回报用与训练一致的折扣因子累加，评估策略不带探索噪声，回报分布才与 Q 的定义对齐。<strong>（3）</strong>函数只读参数、不触发更新，可以作为训练回调按固定步数间隔调用；把该曲线与回报曲线并列观察，能在回报下降时第一时间区分"高估被纠正"与"策略退化"两种不同原因。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>双评论家初始化相关。</strong>症状：取最小与单评论家效果几乎无差别，高估曲线与 MADDPG 重合。原因：两个评论家从相同种子或相同数据顺序起步，误差高度相关。修复：独立初始化并验证两个评论家在早期批次上的输出相关系数明显低于 1。</li>
+      <li><strong>把平滑噪声加到行为探索上。</strong>症状：探索不足且目标值噪声增大。原因：平滑噪声与行为噪声共用同一配置。修复：两者拆成独立参数，平滑噪声只出现在目标构造内部、位于 <code>no_grad</code> 段。</li>
+      <li><strong>目标更新与演员更新不同步。</strong>症状：训练出现周期性抖动，价值曲线与目标值差距反复张开。原因：目标网络每步更新但演员延迟，目标动作与目标价值版本错位。修复：把目标更新放进延迟分支，并与演员更新顺序相邻。</li>
+      <li><strong>延迟系数与学习率联调失误。</strong>症状：策略改进极慢或出现停滞。原因：d 过大同时又降低学习率，改策略的"带宽"过低。修复：先固定 d = 2 与第 010 章学习率，确认改进速度后再单独调整 d。</li>
+      <li><strong>用单评论家输出做评估。</strong>症状：测量脚本显示低估而实际执行偏保守。原因：评估时只读 q1，未包含 <code>min</code>。修复：所有面向外部的价值报告统一经过 min 聚合函数，避免"训练用 min、报告用单个"的口径不一致。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>给定同一状态动作点上两个评论家估计 Q<sub>1</sub> = 5、Q<sub>2</sub> = 2，真实回报为 3。分别计算"取最小"与"取平均"作为目标时，下一轮回归对价值估计的推动方向，并说明哪种更抑制正误差。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>取最小目标值 2，向下拉动估计，惩罚 5 的正误差；取平均目标 3.5，仍高于真实回报，偏乐观的估计被保留。取最小对正误差的惩罚更直接。</div></details>
+      </li>
+      <li>把延迟系数从 2 改为 1（退化为每步更新演员），预测高估曲线与回报曲线的变化，并说明此时算法与第 010 章的差异还剩哪些。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>d = 1 后平滑与取最小仍在，但策略更新频率恢复；预期高估略升、收敛更快，与第 010 章的差异退化为"双评论家 + 平滑"两项，正好作为消融对照组。</div></details>
+      </li>
+      <li>论证：两个零均值独立误差中"同时取正"的概率低于单个误差取正的概率，并说明该论据对"低估风险"的对称含义。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>独立同分布下 P(两者皆正) = P(正)²，小于 P(正)；同理两者皆负的概率同为 P(负)²，取最小在负侧同样激进，低估风险与高估抑制同一机制的两种表现。</div></details>
+      </li>
+      <li>设计消融：三件套（双评论家、延迟更新、目标平滑）各去掉一项，共四个配置。给出每组的高估测量曲线、回报曲线与所需环境步数，说明如何从结果判定某项对该任务是否必要。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>判定标准：去掉某组件后高估测量显著恶化且回报下降，说明必要；若高估测量不变且回报相当，说明该任务结构中该项贡献小。四组共享随机种子与超参，唯一变量为组件开关。</div></details>
+      </li>
+      <li>设计题：目标平滑的噪声幅度若改为状态相关的（例如依动作范围或价值坡度自适应），给出一种可实现的方案设想、可能收益与引入的新风险。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>方案例：σ(s) 正比于该状态下两评论家估计差值（不确定度代理），差大处多平滑。收益是平滑强度对齐不确定区域；风险是噪声尺度随估计反馈形成闭环，估值噪声被自我放大，需要限幅与滑动平均。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>高估偏置由逼近误差与自举放大两个环节构成；多智能体的高维联合动作输入与确定性目标放大这两个环节。</li>
+      <li>双评论家取最小压制正误差传播；延迟策略更新降低"策略利用误差"的频率；目标平滑把目标动作置于邻域平均位置。</li>
+      <li>多智能体适配：逐智能体评论家对、独立平滑噪声、目标更新随演员触发；次序是算法定义的一部分。</li>
+      <li>代价是悲观偏差与样本效率下降；高估测量（估计对蒙特卡洛）与三件套消融是必要的实验环节。</li>
+      <li>下一章转向同策略方向的明星算法：<strong>MAPPO 近端策略优化</strong>，用裁剪代理目标与集中式价值函数处理协作任务。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch010.html">← 第 010 章：MADDPG多智能体连续控制</a>
+    <a class="next" href="ch012.html">第 012 章：MAPPO近端策略优化 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

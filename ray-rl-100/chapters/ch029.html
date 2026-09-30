@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第029章 RLlib多GPU分布式训练 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · RLlib 核心接口与训练</span>
+    <span class="sep">/</span>
+    <span>第 029 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · RLlib 核心接口与训练</div>
+    <h1>第 029 章：RLlib多GPU分布式训练</h1>
+    <p class="lead">多卡训练通过数据并行把大批次拆分到多张加速器上，用梯度同步换取学习阶段的吞吐。本章讲清同步数据并行的通信结构、通信量模型、扩展效率的判据，以及在 RLlib 中落地多卡学习器的工程要点。</p>
+    <ul class="meta">
+      <li>主题：RLlib 训练 / 多卡并行</li>
+      <li>关键机制：数据并行、梯度同步、通信量模型、学习率缩放、扩展效率</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 028 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解同步数据并行的执行结构与梯度同步的语义。</li>
+      <li>掌握梯度通信量模型：参数规模、卡数与单步通信字节数的关系。</li>
+      <li>理解批量与学习率随卡数缩放的规则，能预判配置失衡时的后果。</li>
+      <li>会用通信与计算之比判断扩展效率，识别小模型多卡的无效区间。</li>
+      <li>了解多卡学习器的接入方式与版本约束，能规划单机与多机方案。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>学习阶段的单卡吞吐被模型规模与批次规模共同限制。当训练批次需要放大到数万样本以上、或模型参数量达到数百万到数亿区间时，单卡的计算时间成为迭代周期的主导项，扩展学习侧算力成为缩短迭代时间的主要手段。</p>
+    <p>多卡扩展的常见误解是卡数增加速度线性提升。梯度同步要求各卡把本地梯度聚合成全局梯度，通信量与参数量成正比；卡数越多、单卡计算量越小，通信占比越高，扩展效率衰减越快。<strong>理解通信与计算的相对关系，才能判断多卡是否为有效手段。</strong>上一章讨论单卡资源分工，本章扩展到多卡同步。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p>多卡训练的核心矛盾是计算并行度与梯度同步开销之间的平衡。</p>
+
+    <h3>1. 同步数据并行的执行结构</h3>
+    <p>数据并行为每张加速器放置完整模型副本：全局批次均分为子批，各卡在本地子批上前向与反向，得到本地梯度；集合通信（Collective Communication）把梯度求和取平均，各卡用同一份全局梯度更新，保证副本一致。同步语义有两个推论：迭代时间由最慢的卡决定；全局批次不能小于卡数乘单卡有效批量。</p>
+
+    <h3>2. 通信量模型</h3>
+    <p>参数同步常用环形全归约（Ring AllReduce）：每卡收发各为 (N−1)/N 乘参数字节数，N 为卡数。总通信量与参数量相关、与卡数近似无关，这是环形结构的优势；但单卡通信时间不随卡数下降，计算被拆小后通信占比上升。设参数字节数为 P：</p>
+    <div class="formula">
+      单卡通信量 ≈ 2 × (N − 1) / N × P 字节，N 较大时趋近 2P
+      <span class="note">通信时间 ≈ 通信量 / 有效带宽；单机内互联带宽高一个数量级，跨机训练时带宽回落，扩展效率对拓扑更敏感</span>
+    </div>
+
+    <h3>3. 批量与学习率的缩放</h3>
+    <p>保持每卡计算量的做法是全局批次随卡数线性放大，否则子批变小、利用率下降。批次放大改变梯度噪声尺度，学习率随之调整：线性缩放规则在小批次区间近似成立，批次很大时配合平方根规则或暖启动（Warmup）过渡。<strong>不做缩放直接多卡，既损失利用率又改变优化轨迹。</strong>各卡数据划分还需均衡，随机种子卡间独立、整体可控。</p>
+
+    <h3>4. 扩展效率与无效区间</h3>
+    <p>扩展效率定义为实际加速比除以卡数。通信与计算之比越高，效率越低：小模型小批次中通信占主导，效率迅速跌落；大模型大批次中计算占主导，效率保持在可用区间。判断顺序是先估算通信时间，再与单卡计算时间对照。<strong>梯度分桶（Gradient Bucketing）与通信计算重叠（Overlap）能把部分通信隐藏进反向传播，是提高效率的常规手段。</strong></p>
+
+    <h3>5. 扩展效率的数值演算</h3>
+    <p>取参数字节 P = 200 MB、全局批次的单卡计算总量 T₁ = 160 毫秒，N 张卡时每卡计算 T₁/N，通信时间按 t<sub>comm</sub>(N) ≈ 2P(N−1)/(N·BW) 计算。三种互联带宽下的扩展效率对比如下：</p>
+    <table>
+      <tr><th>卡数 N</th><th>300 GB/s 效率</th><th>32 GB/s 效率</th><th>10 GB/s 效率</th></tr>
+      <tr><td>4</td><td>0.98</td><td>0.81</td><td>0.57</td></tr>
+      <tr><td>8</td><td>0.95</td><td>0.65</td><td>0.36</td></tr>
+      <tr><td>16</td><td>0.89</td><td>0.46</td><td>0.21</td></tr>
+    </table>
+    <p>读表可得带宽档位决定可用卡数上限：高带宽互联下 16 卡仍保持约 0.89 的效率；带宽降一个数量级后，16 卡效率跌破一半；再降一档，8 卡已经不足 0.4。<strong>扩展效率由通信与计算之比控制，卡数增加时通信时间趋于常数而单卡计算被拆小，比值必然上升。</strong>效率的解析形式为：</p>
+    <div class="formula">
+      E(N) ≈ 1 / (1 + 2PN / (BW · T₁))
+      <span class="note">P = 200 MB、BW = 300 GB/s、T₁ = 160 毫秒时，16 卡理论效率约 1/(1 + 0.133) ≈ 0.88，与表内数值一致；P 越大或 T₁ 越小，效率衰减越快</span>
+    </div>
+
+    <h3>6. 学习率缩放的对照</h3>
+    <p>全局批次随卡数放大后，梯度噪声尺度改变，学习率按规则同步调整。以单卡基线批次 8000、学习率 3e-4 为例：</p>
+    <table>
+      <tr><th>全局批次</th><th>相对基线倍数</th><th>线性规则学习率</th><th>平方根规则学习率</th></tr>
+      <tr><td>8000</td><td>1×</td><td>3e-4</td><td>3e-4</td></tr>
+      <tr><td>32000</td><td>4×</td><td>1.2e-3</td><td>6e-4</td></tr>
+      <tr><td>128000</td><td>16×</td><td>4.8e-3</td><td>1.2e-3</td></tr>
+    </table>
+    <p>选择依据：中小批次区间线性规则近似成立；批次非常大时线性规则容易失稳，改用平方根规则并以暖启动过渡，让初期步长逐步抬升。<strong>多卡配置中批次与学习率是一对参数，缺少任何一侧的调整都会同时改变利用率和优化轨迹。</strong></p>
+
+    <h3>6.1 同步等待的数值示例</h3>
+    <p>四张卡在同一轮的计算耗时分别为 38、40、42、60 毫秒，其中一张卡因负载不均明显滞后。同步语义下整轮耗时由 60 毫秒决定，理想均衡时只需 40 毫秒；相对单卡总计算量 160 毫秒，理论加速比从 4 被稀释到约 2.7。<strong>卡间耗时不均是扩展效率的隐性损耗源，梯度分桶重叠只能隐藏通信，无法弥补计算侧的倾斜。</strong>缓解手段包括均匀切分子批、剔除慢卡与平衡各卡的数据预处理开销。</p>
+    <p>与异步更新对照：异步参数服务器让各卡独立读写全局参数，去掉整轮同步等待，代价是梯度版本陈旧，收敛表现依赖算法对陈旧梯度的容忍度。同步方案在可复现性与收敛稳定性上占优，属于默认选择；异步方案只在卡数很多且同步墙钟成本不可接受时评估。</p>
+
+    <h3>6.2 跨机分层归约</h3>
+    <p>跨机场景常用分层归约（Hierarchical AllReduce）：机内先做一次全归约，每机选出一个代表参与跨机全归约，再把结果传回机内广播。按此结构，跨机链路上的流量从每卡 2P 降到每机约 2P，压力集中在机内互联；两机各四卡的配置下，跨机通信量与单机四卡同量级，而机间链路带宽通常只有机内的十分之一，瓶颈因此落在机间。通信后端库会选择拓扑，环境变量可以强制指定网卡与拓扑策略；网络抖动大的环境下应固定拓扑以稳定性能。</p>
+
+    <h3>7. 通信比与加速上限</h3>
+    <p>记 r 为每轮通信时间与单卡计算时间之比，忽略重叠时加速比上限近似为 S(N) = N / (1 + r(N−1))。数值：r = 0.4 时 4 卡上限约 1.82；r = 0.1 时约 3.08；r = 0.05 时约 3.48。<strong>r 每翻一倍，可用的有效卡数近似减半。</strong>降低 r 的两条路径：增大单卡计算密度（放大每卡批次）与提高互联带宽（拓扑选择与分层归约）。叠加梯度分桶重叠后，实际加速比落在估算上限与理想线性之间，偏离程度由重叠覆盖率决定。</p>
+
+    <h3>8. 跨机同步的时间构成与分层归约</h3>
+    <p>环形全归约的时间分两项：数据搬运项 2(N−1)/N × P / BW 与延迟项 2(N−1) × 单跳延迟。机内互联带宽高、延迟低，两项都不显眼：4 卡、200 MB 参数、300 GB/s 互联时数据项约 1.0 毫秒。跨机链路带宽通常只有机内的十分之一量级，同一配置下数据项升到 30 毫秒；单跳延迟按 0.2 毫秒计、延迟项 1.2 毫秒，合计约 31.2 毫秒。整轮耗时从理想的 40 毫秒变为 71.2 毫秒，加速比从 4 倍掉到约 2.25，效率约 0.56，与效率表中最差一档吻合。</p>
+    <div class="formula">
+      同步时间 ≈ 2(N − 1)/N × P / BW + 2(N − 1) × 单跳延迟
+      <span class="note">4 卡、200 MB：机内 300 GB/s 时约 1.0 毫秒；跨机 10 GB/s 时约 30 + 1.2 = 31.2 毫秒。参数越小数据项越小，延迟项占比越高：20 MB 参数时数据项约 3 毫秒，延迟项占近三成</span>
+    </div>
+    <p><strong>分层归约把跨机链路的参与者从"每卡"降为"每机一个代表"：</strong>机内先完成全归约，代表携带聚合结果参与跨机全归约，结果再回机内广播。两机各四卡的配置里，跨机流量从按卡计的约 16P（每卡约 2P）降到按机计的约 2P，相差约八倍；机内链路负载不变，瓶颈按设计落在跨机段。通信后端用环境变量固定拓扑与网卡绑定，网络抖动大的环境固定拓扑可让性能可复现。</p>
+    <p>三条边界的组合顺序：参数规模大、机间带宽低、卡数多，三者同时出现时跨机多卡几乎必然低于单机多卡；参数在 200 MB 以上时先看带宽档位，参数在几十 MB 量级时先看延迟项，小模型跨机的组合应直接排除。<strong>估算与实测的偏差主要来自重叠覆盖率：估算用于卡数上限的初筛，实测用于最终配置确认。</strong></p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>多卡方案的设计顺序：确认瓶颈在学习侧，估算通信占比，规划批次与学习率，再接入运行环境。</p>
+    <table>
+      <tr><th>参数</th><th>示例值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>卡数 N</td><td>4</td><td>学习副本数</td><td>单机优先；跨机需重新评估带宽</td></tr>
+      <tr><td><code>train_batch_size</code></td><td>32000</td><td>全局批次</td><td>单卡 8000 量级乘卡数，维持每卡计算量</td></tr>
+      <tr><td><code>sgd_minibatch_size</code></td><td>2048</td><td>学习内部小批</td><td>保证每卡子批不因切分而过小</td></tr>
+      <tr><td>学习率</td><td>6e-4</td><td>全局学习率</td><td>相对单卡基线按批量比例放大并配合暖启动</td></tr>
+      <tr><td>同步策略</td><td>梯度全归约</td><td>副本一致性</td><td>同步语义简单可复现，异步方案属于后续章节</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：为什么多卡扩展投向学习器？</span>
+      <p>采样侧的并行手段是进程与副本，可在 CPU 上扩展；学习侧的瓶颈是单卡算力与显存，只能用多卡接力，并避免策略副本膨胀带来的参数广播成本。<strong>采样供给远高于学习消耗时，扩展采样没有意义；学习吞吐不足时，多卡才是对症手段。</strong></p>
+    </div>
+    <p>实测校准流程：先单卡测出 T₁；再跑两卡，用总耗时减去计算耗时分摊出通信增量；把实测通信时间与带宽模型对照，偏差过大时检查拓扑与通信后端配置；最后按模型外推目标卡数。估算模型用于设计搜索区间，最终配置以实测曲线为准；通信后端与拓扑选择在训练启动时固定，跨机实验记录链路型号与带宽，作为事后效率分析的背景信息。多卡还涉及每张卡完整副本的显存占用，参数量大的模型先核对单卡容量，再讨论卡数规划。<strong>核对算式：单卡常驻占用约为参数字节的四倍（参数、梯度与优化器状态各计一份）。</strong>5000 万参数按 float32 计约 200 MB，常驻约 800 MB；单卡 16 GB 时留给激活与批次的余量约 15 GB，批量上限由激活项决定；超出容量时先缩内部小批或模型宽度，再讨论增加卡数。梯度压缩与低精度通信是跨机场景的备用手段：把梯度做量化或稀疏化传输，通信量可降数倍，代价是收敛质量需要单独验证，压缩与分层归约可以叠加使用。通信与计算重叠的覆盖率由分桶策略决定，覆盖率低时即使带宽充足也会出现同步等待，覆盖率应作为调优指标记录。</p>
+    <p>与上一章差异：第 028 章讨论单卡内部资源分工；本章在学习阶段内部再做多卡切分，引入通信维度。接入方式随版本演进（早期多卡学习器对后端有约束，新 API 栈把分布式学习放到学习器层），以官方文档为准。下一章转入 Ray Tune 集成。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：多卡学习配置</strong></p>
+    <pre class="code"><code>from ray.rllib.algorithms.ppo import PPOConfig
+
+# 多卡作用于学习器：采样进程仍以 CPU 为主，避免参数广播与显存竞争
+config = (
+    PPOConfig()
+    .resources(num_gpus=4)                   # 学习器可见 4 张卡，数据并行
+    .env_runners(num_env_runners=12,         # 采样侧保持 CPU 并行，供给放大的批次
+                 num_envs_per_env_runner=2)
+    .training(
+        train_batch_size=32000,              # 全局批次 = 单卡基线 × 卡数
+        sgd_minibatch_size=2048,             # 单卡子批保持足够规模
+        lr=6e-4,                             # 学习率随批次放大，配合暖启动
+        num_epochs=10,
+    )
+)
+algo = config.build_algo()
+result = algo.train()
+print(result["info"]["timers"]["learn_time_ms"])  # 对照单卡基线的学习耗时</code></pre>
+    <p>解读：配置围绕一个守恒关系展开：全局批次等于单卡子批乘并行度，学习率随之调整。采样侧同步放大到十二个进程，样本供给与批次匹配，任何一侧留短都会让另一侧等待。学习率放大后的稳定性依赖暖启动与梯度裁剪。键名与后端支持随版本演进，迁移前核对官方文档的多卡章节。</p>
+
+    <p><strong>片段 2：通信量估算</strong></p>
+    <pre class="code"><code>def allreduce_bytes_per_gpu(param_bytes, n_gpus):
+    """环形全归约：每张卡收发各 (N-1)/N 份参数字节。"""
+    per_direction = param_bytes * (n_gpus - 1) / n_gpus
+    return 2 * per_direction              # 接收与发送之和
+
+
+def comm_over_compute(param_bytes, n_gpus, bandwidth_gbps,
+                      compute_s_per_gpu):
+    """通信时间与单卡计算时间之比：判断多卡是否处在有效区间。"""
+    comm_s = allreduce_bytes_per_gpu(param_bytes, n_gpus) / (bandwidth_gbps * 1e9)
+    return comm_s / compute_s_per_gpu
+
+
+# 5000 万参数（约 200 MB），4 卡，单机互联 300 GB/s：
+# 通信时间约 1.3 ms；若单卡计算 40 ms，比值约 0.03，扩展效率可观
+print(comm_over_compute(200e6, 4, 300, 0.040))</code></pre>
+    <p>解读：估算模型把"多卡值不值"化成比值。比值低于零点一时通信可被有效隐藏；高于零点五时同步开销主导，应缩小卡数或增大单卡批次。<strong>带宽按拓扑取值：单机互联与跨机网络相差一个数量级，跨机后比值抬升十倍，必须重新估算。</strong>实测时分别记录反向传播与同步等待时间，与估算对照校准。</p>
+
+    <p><strong>片段 3：梯度分桶与重叠的结构示意</strong></p>
+    <pre class="code"><code>def train_step_with_overlap(model, batch, sync):
+    """示意反向传播与梯度同步重叠：按桶触发全归约。"""
+    model.zero_grad()
+    buckets = []
+    for layer in reversed(model.layers):        # 自输出层向输入层反向
+        loss = layer.backward(batch)            # 常规反向计算
+        buckets.append(layer.grad)
+        if len(buckets) >= 4:                   # 攒满一个桶立刻发起同步
+            # 高层梯度先就绪，同步与低层的反向计算自然重叠；
+            # 桶越大通信效率越高，桶越小重叠机会越多
+            sync.allreduce_async(buckets)
+            buckets = []
+    sync.wait_all()                             # 收齐后统一更新参数
+    model.update_parameters()</code></pre>
+    <p>解读：代码展示重叠的两个参数：桶大小与触发时机。桶越大，固定开销摊得越薄；桶越小，越多的同步能提前与后续计算重叠；从层边界自然分桶起步，再按实测调整。同步必须全部完成才能更新参数，等待点放在反向结束处，是同步数据并行的标准结构。伪代码中的同步原语在具体框架中以集合通信库调用呈现。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>小模型直接上多卡</strong>：通信占比高，实测加速比远低于卡数。症状是卡数翻倍而学习耗时几乎不变。修复：先用通信量模型估算，必要时退回单卡并放大批次。</li>
+      <li><strong>批次不随卡数缩放</strong>：每卡子批变小，利用率下降且优化轨迹改变。症状是学习耗时下降但收敛质量变差。修复：全局批次随卡数放大，学习率同步调整。</li>
+      <li><strong>跨机沿用单机判断</strong>：互联带宽回落一个数量级，通信时间显著上升。症状是单机四卡有效、跨机四卡无效。修复：跨机前重新跑通信量估算，必要时降低卡数或增大计算密度。</li>
+      <li><strong>学习率未配合缩放</strong>：批次放大而学习率不变，单位样本的有效步长变小。症状是收敛变慢、评估曲线爬升乏力。修复：按线性或平方根规则调整学习率，并加暖启动稳定初期。</li>
+      <li><strong>数据划分不均衡</strong>：各卡子批的样本分布差异大。症状是同步梯度方向抖动、损失曲线震荡。修复：按卡均匀切分全局批次，打乱在批组装层完成。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>参数量 2000 万（约 80 MB），估算 8 卡环形全归约的单卡通信字节数，并与 2 卡对比说明总量趋势。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>单卡通信量约为 2×(N−1)/N×80 MB，8 卡约 140 MB，2 卡约 80 MB；总量趋近于两倍参数字节，不随卡数线性增长。</div></details>
+      </li>
+      <li>单卡学习耗时 30 毫秒，通信与计算之比估值为 0.4。预测四卡的理论加速比上限，并说明为什么实际值更低。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>理想 4 倍被通信稀释，粗略上限约为 4/(1+0.4×3) 量级；实际还叠加同步等待长尾与批次组装的额外开销。</div></details>
+      </li>
+      <li>推导：说明环形全归约为何让每卡通信量与卡数弱相关，以及这一性质对扩展规划的意义。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>数据分环流转，每卡收发量正比于 (N−1)/N 乘参数量；卡数增加时单卡通信量趋于常数，但单卡计算量被拆小，因此比值仍会上升。</div></details>
+      </li>
+      <li>设计实验：固定模型与全局批次，比较 1、2、4 卡的学习耗时与评估回报，标出扩展效率跌破一半的卡数。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>记录每档的学习耗时与回报曲线；效率按加速比除以卡数计算，回报下滑提示批次与学习率需要重新校准。</div></details>
+      </li>
+      <li>为跨机训练设计通信规划：两机各四卡，估算梯度同步的额外延迟来源，并给出两条缓解措施。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>困难源是跨机链路的低带宽与高延迟；缓解包括梯度压缩与分层归约（机内先归约再跨机），以及增大每卡计算密度隐藏通信。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>同步数据并行让每卡持有完整副本，子批梯度经全归约后统一更新，迭代时间由最慢的卡决定。</li>
+      <li>单卡通信量约为两倍参数字节乘 (N−1)/N，与参数量强相关、与卡数弱相关；通信占比决定扩展效率。</li>
+      <li>全局批次随卡数缩放、学习率按比例调整并配合暖启动，是多卡配置的基本守恒关系。</li>
+      <li>小模型小批次与跨机低带宽是扩展效率的主要杀手，通信量估算应先于任何多卡实验。</li>
+      <li>梯度分桶与通信计算重叠把同步隐藏进反向传播，是提升效率的常规工程手段。</li>
+      <li>下一章进入 Ray Tune 集成：把训练放进超参搜索与调度框架。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch028.html">← 第 028 章：RLlib使用GPU训练</a>
+    <a class="next" href="ch030.html">第 030 章：RLlib与Ray Tune集成 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第022章 PPO的探索策略：动作空间噪声 | 深度强化学习课程 · PPO、SAC 与多智能体系统</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · 策略梯度与 PPO</span>
+    <span class="sep">/</span>
+    <span>第 022 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · 策略梯度与 PPO</div>
+    <h1>第 022 章：PPO的探索策略：动作空间噪声</h1>
+    <p class="lead">把随机性加在"选动作"这一步：ε-贪心覆盖与 logits 高斯噪声两种动作层探索，和 PPO 默认的 softmax 采样同种子、同预算对比，并用"偏离率"与"状态覆盖"两把尺子量化探索行为。</p>
+    <ul class="meta">
+      <li>主题：探索机制 / 行为策略与重要性比率</li>
+      <li>关键公式：logits′ = logits + σ·ξ，ξ ~ N(0, I)；a ~ softmax(logits′)</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 021 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解动作空间噪声的两种形式（ε-贪心、logits 噪声），以及它们与第 021 章参数空间噪声的本质区别。</li>
+      <li>能把"行为策略 μ"与"目标策略 π<sub>θ</sub>"的角色分清：噪声改的是数据从哪来，不改优化目标。</li>
+      <li>掌握 PPO 实现铁律，<code>logp_old</code> 永远是<strong>干净策略</strong>对所选动作的对数概率，并用实验验证写错的后果。</li>
+      <li>学会用偏离率与状态覆盖桶两个诊断量横向比较不同探索方案。</li>
+      <li>在 <code>CartPole-v1</code> 上完成三臂对比（默认采样 / ε-贪心 / logits 噪声），读懂噪声退火对收敛的影响。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 005 章用熵正则化在"目标函数层面"鼓励探索，第 021 章在"参数层面"加噪声让行为成片变化。本章处理第三种、也是最直觉的一种：<strong>直接在动作上做手脚</strong>，随机换动作（ε-贪心）或者抖动动作偏好（logits 噪声）。它的优点是实现极简、不碰网络内部、对离散与连续动作都适用，很多工程代码库默认就带一个 ε 退火；缺点同样明显：噪声与策略"各干各的"，行为连贯性差，还会让价值函数看到策略本来不会选的动作。</p>
+    <p>本章把两种动作噪声放进同一份 PPO 代码里做对照实验，并引入两个能量化"探索行为"的指标。本章的落点在于方法论本身：<strong>探索强度要能调度、能度量，探索与利用的切换必须显式管理</strong>，第 023 章将在此基础上叠加熵正则化做系统对比。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 目标策略、行为策略与重要性比率</h3>
+    <p>PPO 默认的动作来自目标策略 π<sub>θ</sub> 自身：</p>
+    <div class="formula">
+      a<sub>t</sub> ~ π<sub>θ</sub>(·|s<sub>t</sub>) = softmax(logits<sub>θ</sub>(s<sub>t</sub>))
+    </div>
+    <p>动作噪声则引入一个<strong>行为策略（behavior policy）</strong> μ：数据由 μ 产生，但优化目标仍是 π<sub>θ</sub>。二者不一致时，正确的梯度要带重要性权重：</p>
+    <div class="formula">
+      ∇<sub>θ</sub>J = 𝔼<sub>a~μ</sub>[ (π<sub>θ</sub>(a|s) / μ(a|s)) · ∇<sub>θ</sub>log π<sub>θ</sub>(a|s) · Â(s,a) ]
+      <span class="note">PPO 的比率只用 π<sub>θ_old</sub> 当分母，相当于假设 μ = π<sub>θ_old</sub>；μ 偏离越远，偏差越大</span>
+    </div>
+    <p>这就是动作噪声必须<strong>退火（annealing）</strong>的原因：训练早期允许 μ 偏离来拓宽覆盖面，训练后期把噪声降回 0，让 μ 重新与 π<sub>θ</sub> 重合，PPO 恢复成无偏的 on-policy 更新。反过来，如果噪声一直不衰减，数据分布永远带着"策略之外的偏差"，价值函数学的是带噪行为的回报，评估（干净策略）与训练就对不上了。</p>
+    <p>还有一条被否决的路线要说清：既然数据来自 μ，理论上也可以保留 μ 的 logp、把重要性权重 π/μ 乘进损失做严格纠正。工程上很少有人这么做：权重的方差大、需要额外的裁剪与归一化，而 PPO 的比率与裁剪本来就在处理分布差异，两层纠正叠在一起容易互相打架。通行路线是"噪声退火 + 干净 logp"：让 μ 随退火逐步回归 π，权重纠正用得很少。</p>
+
+    <h3>2. 两种离散动作噪声</h3>
+    <p><strong>ε-贪心覆盖：</strong>以概率 ε<sub>t</sub> 把动作换成均匀随机动作，否则按策略采样：</p>
+    <div class="formula">
+      a<sub>t</sub> = 均匀随机动作（概率 ε<sub>t</sub>）；&nbsp; a<sub>t</sub> ~ π<sub>θ</sub>(·|s<sub>t</sub>)（概率 1−ε<sub>t</sub>）
+    </div>
+    <p><strong>logits 噪声：</strong>先给动作偏好加高斯抖动，再按抖动后的分布采样：</p>
+    <div class="formula">
+      logits′ = logits<sub>θ</sub>(s<sub>t</sub>) + σ<sub>t</sub> · ξ，&nbsp; ξ ~ N(0, I)，&nbsp; a<sub>t</sub> ~ softmax(logits′)
+      <span class="note">σ<sub>t</sub> 很大时分布趋近均匀；σ<sub>t</sub> = 0 时退化为标准采样</span>
+    </div>
+    <p>两者的差别值得细品：ε-贪心会<strong>完全丢弃策略信息</strong>，随机出来的动作可能恰恰是当前状态下最差的动作；而 logits 噪声只是把偏好"拍平"，被抽中的动作仍与策略相关（原本 logits 高的动作即使被抖动也更容易胜出），因此噪声的破坏性更温和。两者都采用线性退火：在前 <code>anneal_frac</code> 比例的训练预算内从初值降到终值。线性退火公式为：</p>
+    <div class="formula">
+      level(t) = start + (end − start) · min(1, t / (anneal_frac · T))
+      <span class="note">t 为已用环境步数，T 为总预算；前 60% 预算退火，后 40% 留给干净策略收敛</span>
+    </div>
+    <p>把本章默认值代入，退火段是前 0.6×80000 = 48000 步，斜率 (0.02−0.3)/48000 ≈ −5.83×10⁻⁶ 每步；每次更新 2048 步，ε 每轮下降约 0.012。抽查各更新点的 ε：第 0 轮 0.300、第 5 轮 0.240、第 10 轮 0.181、第 15 轮 0.121、第 20 轮 0.061、第 23 轮 0.025，约第 24 轮（47104 步之后）退火结束并停在 0.020。<strong>前 1 万步里 ε 仍在 0.24 以上，探索量最大的窗口恰好覆盖"策略最不成熟"的阶段</strong>；若把 <code>--anneal-frac</code> 调大到 0.8，末期只剩 1.6 万步的干净收敛期，往往不够用，这是 0.6 这个默认值的由来。</p>
+    <p>两种噪声的"破坏力"还有一个可计算的差别。设当前策略在两个动作上的 logits 差为 d、logits 噪声尺度为 σ，噪声把较差动作顶上来的概率是 Φ(−d/(σ√2))：翻盘条件等价于噪声差超过确定性的差距，而噪声差服从 N(0, 2)。取 σ=1：策略尖锐（d=3）时翻盘概率约 1.7%，策略平坦（d=0.2）时约 44%。<strong>logits 噪声的破坏性会随策略变尖自动衰减；ε-贪心的完全随机注入只看 ε，策略再尖也恒定存在（n=2 时随机分支就贡献 ε/2 的翻盘概率）</strong>，这就是"退火终点"对后者更关键的原因。</p>
+
+    <h3>3. 关键约定：logp_old 属于谁</h3>
+    <p>无论动作是怎么选出来的，存进 rollout 的 <code>logp_old</code> 必须是<strong>干净策略 π<sub>θ</sub> 对该动作的对数概率</strong>；噪声后分布的 log 概率不能充当这个基准。原因回到比率的定义：</p>
+    <div class="formula">
+      r<sub>t</sub>(θ) = π<sub>θ</sub>(a<sub>t</sub>|s<sub>t</sub>) / π<sub>θ_old</sub>(a<sub>t</sub>|s<sub>t</sub>)
+    </div>
+    <p>分母 π<sub>θ_old</sub> 是"更新前策略的概率"。采样那一刻 θ 还没变，所以干净策略对该动作的 logp 恰好就是 π<sub>θ_old</sub> 的 logp，用它做分母，r<sub>t</sub> 的起点才是 1。如果误用噪声分布 μ 的 logp 当分母，r<sub>t</sub> 在第一步就不等于 1，更新会被系统性削弱或放大，KL 统计也跟着失真。这是动作噪声实现里最容易犯的错，本章代码把它固定成一条"铁律"。</p>
+    <div class="box key">
+      <span class="box-title">数值例子：分母写错后比率偏离 1 多少</span>
+      <p>取两动作、干净策略 π=(0.9, 0.1)、ε=0.3 的 ε-贪心臂，行为分布 μ = 0.7π + 0.3×(0.5,0.5) = (0.78, 0.22)。两步算清后果：</p>
+      <p><strong>第一步，比率的起点。</strong>用干净 logp 当分母时，更新起点处每个样本的 r=1（分子分母同分布），方差为零。若误存 μ 的 logp，r 的取值变成 π(a)/μ(a)：抽中动作 1 时 r=0.9/0.78≈1.154，抽中动作 2 时 r=0.1/0.22≈0.455。<strong>均值仍是 1（因为 Σμ·(π/μ)=1），但每个样本都偏离 1，标准差约 0.29。</strong>裁剪区间 [0.8, 1.2] 会立刻削掉动作 2 的那部分样本（0.455 被夹到 0.8），而对动作 1 的样本不动作，信任域从第一步就左右不对称。</p>
+      <p><strong>第二步，更新方向的偏置。</strong>PPO 的比率本应衡量"新策略相对更新起点"的变化，写错分母后衡量的是"策略相对行为分布"的差距，梯度里混入了重要性纠正的成分。训练仍会动，但裁剪比例与 KL 读数全部失真，任何"看起来正常"的日志都不能证明实现是对的。这也是练习 3 能用一个指标（近似 KL 系统性偏大或偏小）抓出这个 bug 的原因。</p>
+    </div>
+
+    <h3>4. 度量：偏离率与状态覆盖</h3>
+    <p>把 argmax<sub>a</sub>π<sub>θ</sub>(a|s) 当作"策略当前最想做的动作"，<strong>偏离率</strong>定义为执行动作不等于它的比例：</p>
+    <div class="formula">
+      偏离率 = count(a<sub>t</sub> ≠ argmax<sub>a</sub>π<sub>θ</sub>(a|s<sub>t</sub>)) / 总步数
+    </div>
+    <p>它对三臂都可比：默认采样也会有偏离（熵高时接近 50%），ε-贪心和 logits 噪声则把偏离率显著推高。另一个量是<strong>状态覆盖</strong>：把 4 维观测按常用范围离散成 6<sup>4</sup>=1296 个桶，统计训练中累计访问过的桶数，衡量探索"走过多少地方"。两个指标合起来看：偏离率描述"行为有多野"，覆盖桶描述"野出了多少新地盘"。在 CartPole 上两者会一起读：偏离率高而覆盖桶不增，说明在重复踩同一片区域；覆盖桶持续增长时，偏离率往往也同步抬高。</p>
+    <p>三臂的偏离率各有解析形状，写下来便于解释日志。两动作情形下，默认臂的期望偏离率等于 1 − p<sub>max</sub>，就是"策略对自己选的动作为何自信"的直接读数：logits 差 d 时约等于 1 − σ(d)，d=1 时约 0.27、d=3 时约 0.047。ε-贪心臂的期望偏离率是 ε(1−1/n) + (1−ε)(1−p<sub>max</sub>)：n=2 时随机分支贡献 ε/2，再加上策略分支的残余；p=0.9、ε=0.3 时约 0.22，ε 降到 0.02 后约 0.11，仍高于默认臂的 0.10，因为那 2% 的纯随机永远在贡献偏离。logits 噪声没有闭式，退火段可用翻转概率 Φ(−d/(σ√2)) 近似：σ=1 时 d=0.5 约 36%、d=1 约 24%、d=2 约 8%，与"策略越尖、噪声破坏越小"的判断一致。三条式子合起来读日志：默认臂看策略置信度、ε-贪心臂看 ε 叠加置信度、噪声臂看两者随 σ 的混合。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+
+    <h3>模块划分</h3>
+    <table>
+      <tr><th>组件</th><th>职责</th><th>与第 021 章的关系</th></tr>
+      <tr><td><code>sample_action</code></td><td>按探索臂选动作；返回动作、干净策略 logp、价值、argmax 动作</td><td><strong>新增</strong>：动作层的三种行为分布</td></tr>
+      <tr><td><code>anneal_level</code></td><td>按训练进度对 ε / σ 做线性退火</td><td><strong>新增</strong>：显式探索调度</td></tr>
+      <tr><td><code>obs_to_bins</code></td><td>6<sup>4</sup> 状态桶统计累计覆盖</td><td>沿用 021 的覆盖思路</td></tr>
+      <tr><td><code>collect_rollout</code></td><td>采样并统计偏离率、覆盖桶</td><td><strong>改动</strong>：不再扰动/恢复参数</td></tr>
+      <tr><td><code>ppo_update</code></td><td>裁剪损失 + 多轮小批量更新</td><td>与 001/021 完全一致</td></tr>
+      <tr><td><code>run_arm</code></td><td>单臂训练 → 评估 → 保存模型与统计</td><td><strong>新增</strong>：三臂复用的实验壳</td></tr>
+    </table>
+
+    <h3>关键超参数</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用与取值理由</th></tr>
+      <tr><td><code>--arms</code></td><td>stochastic,egreedy,logitnoise</td><td>要对比的探索臂；可只跑其中一两个</td></tr>
+      <tr><td><code>--eps-start</code> / <code>--eps-end</code></td><td>0.3 / 0.02</td><td>ε-贪心退火区间：早期三成动作随机，后期基本靠策略（留 0.02 防死锁）</td></tr>
+      <tr><td><code>--sigma-start</code> / <code>--sigma-end</code></td><td>1.0 / 0.0</td><td>logits 噪声退火区间：σ=1 时分布接近均匀，末期完全回归干净策略</td></tr>
+      <tr><td><code>--anneal-frac</code></td><td>0.6</td><td>前 60% 预算内线性退火，后 40% 留给干净策略收敛</td></tr>
+      <tr><td><code>--max-steps</code></td><td>80000（每臂）</td><td>每臂预算按环境步数对齐，三臂公平</td></tr>
+      <tr><td><code>steps_per_update</code> / <code>epochs</code></td><td>2048 / 10</td><td>与第 021 章相同，保证差异只来自探索方式</td></tr>
+    </table>
+
+    <h3>数据流</h3>
+    <p>每个更新周期：<strong>按当前进度算噪声水平</strong>（ε 或 σ）→ <strong>采样 2048 步</strong>，动作由行为分布决定、logp 由干净策略记录 → 统计本轮的偏离率、累计覆盖桶 → <strong>GAE 估计优势</strong> → <strong>标准 PPO 更新</strong>（10 epochs × 32 minibatch）→ 打印日志 → 近 100 回合滑窗 ≥ 475 则早停。一条臂跑完做 10 回合贪婪评估并保存模型，三条臂跑完打印汇总表。</p>
+
+    <h3>与第 021 章的差异点</h3>
+    <ul>
+      <li><strong>噪声位置</strong>：021 扰动网络参数、采样后恢复；本章完全不碰权重，只在动作选择处注入噪声，因此没有"恢复参数 / 重算 logp"的步骤。</li>
+      <li><strong>行为分布的形态</strong>：参数噪声是整批共享一个扰动（行为成片变化）；动作噪声是每步独立注入（行为跳变、连贯性差）。</li>
+      <li><strong>探索调度</strong>：021 用 KL 自适应调 σ；本章用训练进度线性退火 ε 与 σ，节奏可预测。</li>
+      <li><strong>对照指标</strong>：新增偏离率 + 累计覆盖桶，用于横向比较三臂的探索行为，成为回报曲线之外的第二把尺子。</li>
+    </ul>
+
+    <div class="box key">
+      <span class="box-title">三臂共用同一条学习管道</span>
+      <p>网络、GAE、裁剪损失、评估协议全部原样复用，唯一的变量是 <code>sample_action</code> 里选动作的方式。实验对照的公平性来自两点：每臂开头都调用 <code>set_seed(--seed)</code> 重置初始条件；每臂的预算都是 <code>--max-steps</code> 步。随机动作也统一用 <code>np.random.randint</code> 抽取，不用 <code>env.action_space.sample()</code>，因为它走环境内部的独立随机源，不受 <code>set_seed</code> 控制，实验会变得不可复现。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：三种行为分布的唯一入口</strong></p>
+    <pre class="code"><code>@torch.no_grad()
+def sample_action(net, obs_t, arm, level, n_actions):
+    """按指定探索臂选动作；返回 (action, logp, value, greedy)。"""
+    logits, value = net(obs_t)                          # 一次干净前向：策略偏好 + 价值
+    greedy = int(torch.argmax(logits, dim=-1).item())   # 干净策略的最优动作（统计偏离率用）
+
+    if arm == "logitnoise" and level &gt; 0.0:
+        # logits 加高斯噪声：σ 越大分布越接近均匀；σ=0 时退化为标准采样
+        noisy_logits = logits + level * torch.randn_like(logits)
+        action = Categorical(logits=noisy_logits).sample()
+    elif arm == "egreedy" and random.random() &lt; level:
+        # 以概率 ε 直接换成均匀随机动作，绕开策略分布（探索最"硬"的方式）
+        action = torch.tensor([np.random.randint(n_actions)], device=logits.device)
+    else:
+        # 默认：按策略自身的 softmax 分布采样
+        action = Categorical(logits=logits).sample()
+
+    # 关键行：logp 永远用"干净 logits"计算，它是 PPO 比率的基准。
+    # 若改用噪声分布的 logp，r_t 的起点不再是 1，更新被系统性扭曲。
+    logp = Categorical(logits=logits).log_prob(action)
+    return int(action.item()), logp.item(), value.item(), greedy</code></pre>
+    <p>解读：函数先做一次干净前向拿到 <code>logits</code> 与 <code>greedy</code>（argmax），随后按臂分派采样方式，这就是"行为策略 μ"的三种形态。<strong>（1）</strong><code>logitnoise</code> 直接给 logits 加 <code>level * torch.randn_like(logits)</code>，σ 控制"拍平"程度，实现只有两行；<strong>（2）</strong><code>egreedy</code> 用 <code>np.random.randint</code> 抽均匀动作，随机源受 <code>set_seed</code> 控制，可复现；<strong>（3）</strong>最后一行是整章的灵魂：<code>logp</code> 统一从干净 <code>logits</code> 计算。注意 <code>level=0</code> 时 <code>logitnoise</code> 分支不触发，直接走标准采样，退火到 0 后行为完全等价于默认臂，这个细节让"退火到底"在实现上无缝。</p>
+
+    <p><strong>片段 2：线性退火与状态覆盖桶</strong></p>
+    <pre class="code"><code>def anneal_level(progress, start, end, anneal_frac):
+    """线性退火：前 anneal_frac 段预算内从 start 降到 end，之后保持 end。"""
+    if anneal_frac &lt;= 0.0:
+        return end                                     # 关闭退火：直接用终值
+    p = min(1.0, max(0.0, progress / anneal_frac))     # 进度归一化并截断到 [0,1]
+    return start + (end - start) * p
+
+def obs_to_bins(obs, n_bins=6):
+    """把一批观测映射到 n_bins^4 个桶，返回访问过的桶集合（状态覆盖统计）。"""
+    x = np.clip((obs - COVER_LOW) / (COVER_HIGH - COVER_LOW), 0.0, 0.9999)
+    idx = (x * n_bins).astype(np.int64)                # 每维取 0..n_bins-1 的桶号
+    return {tuple(int(v) for v in row) for row in idx} # 集合去重：只关心访问过没有</code></pre>
+    <p>解读：<code>anneal_level</code> 把"已用预算比例"映射成噪声强度，<strong>前 60% 退火、后 40% 恒为终值</strong>。进度用预算比例、不用绝对步数，好处是 <code>--quick</code> 快速模式下退火节奏与完整模式一致，日志曲线可直接对比。<code>max(0.0, …)</code> 防负进度、<code>min(1.0, …)</code> 防超界，两个截断让函数在任意输入下都返回 [end, start] 区间内的值。<code>obs_to_bins</code> 里 <code>clip</code> 到 0.9999 是关键：保证桶号最大恰好是 <code>n_bins-1</code>，边界观测不会溢出成第 7 个桶；返回的是<strong>集合</strong>，覆盖统计只关心"到没到过"，去重后跨步求并集即可。</p>
+
+    <p><strong>片段 3：采样循环里的"行为特征"</strong></p>
+    <pre class="code"><code>    for _ in range(steps):
+        a, logp, v, greedy = sample_action(net, obs_t, arm, level, n_actions)
+        if a != greedy:                          # 偏离率：执行动作 ≠ 干净策略 argmax
+            n_deviate += 1
+        next_obs, r, terminated, truncated, _ = env.step(a)
+
+        obs_buf.append(obs_t.squeeze(0).cpu().numpy())
+        act_buf.append(a)                        # 执行过的动作（可以是噪声动作）
+        logp_buf.append(logp)                    # 采样时刻快照，充当比率的分母
+        rew_buf.append(r)
+        val_buf.append(v)
+        # 只有真终止才切断价值；时间截断（truncated）仍用 bootstrap
+        term_buf.append(float(terminated))
+
+        ep_ret += r
+        obs_t = to_tensor(next_obs, device)
+        obs_after = obs_t                        # 循环结束用于 bootstrap 的最后观测
+
+        if terminated or truncated:              # 回合结束：记账并重置环境
+            ep_returns.append(ep_ret)
+            ep_ret = 0.0
+            reset_obs, _ = env.reset()
+            obs_t = to_tensor(reset_obs, device)</code></pre>
+    <p>解读：这段循环比 001 章多了两个东西。<strong>（1）</strong>逐行比较 <code>a != greedy</code> 累计偏离计数，注意它对三条臂都有意义：默认臂在熵高时也会大量偏离，所以三臂数字直接可比。<strong>（2）</strong><code>term_buf</code> 只记 <code>terminated</code>，截断不置零，CartPole 的 500 步上限是时间限制，必须继续 bootstrap，这个处理与 001 章一致。<strong>（3）</strong><code>logp_buf</code> 存的仍是干净策略 logp（片段 1 决定的），即使动作来自 ε-贪心或噪声分布，缓冲区的语义没变，PPO 更新逻辑就完全不用改。</p>
+
+    <p><strong>片段 4：单臂训练循环，从进度到早停</strong></p>
+    <pre class="code"><code>    while total_steps &lt; args.max_steps and solved_at is None:
+        # 1) 按训练进度把探索强度换算成当前 level（默认臂恒为 0）
+        progress = total_steps / max(1, args.max_steps)
+        if arm == "egreedy":
+            level = anneal_level(progress, args.eps_start, args.eps_end, args.anneal_frac)
+        elif arm == "logitnoise":
+            level = anneal_level(progress, args.sigma_start, args.sigma_end, args.anneal_frac)
+        else:
+            level = 0.0
+
+        # 2) 采样一批经验；deviate_rate / cover_bins 是本臂的"行为特征"
+        batch, ep_returns, obs_t, deviate_rate, cover_bins = collect_rollout(
+            env, net, arm, level, args.steps_per_update, obs_t, device,
+            args.gamma, args.lam, n_actions)
+        total_steps += args.steps_per_update
+        all_returns.extend(ep_returns)
+        dev_iter.append(deviate_rate)
+        cover_all |= cover_bins                  # 覆盖桶按并集累计，只增不减
+
+        # 3) PPO 更新（与默认 PPO 完全一致：噪声只改数据来源，不改算法）
+        stats = ppo_update(net, optimizer, batch, args)
+        update_idx += 1
+
+        # 4) 近 100 回合滑窗达标即早停，三臂同一标准，预算公平
+        if solved_at is None and len(all_returns) &gt;= 100 and \
+                np.mean(all_returns[-100:]) &gt;= args.target_reward:
+            solved_at = total_steps</code></pre>
+    <p>解读：循环体就是本章的实验骨架，四步节奏值得记住。<strong>（1）</strong>进度用 <code>total_steps / max_steps</code>（不按"第几次更新"）：更新次数会随 <code>--steps-per-update</code> 变化，步数才是不随配置漂移的公平标尺。<strong>（2）</strong><code>collect_rollout</code> 返回值里的 <code>deviate_rate</code> 与 <code>cover_bins</code> 只用于统计与日志，不影响更新，它们和回报一起构成对探索行为的完整描述。<strong>（3）</strong><code>cover_all |= cover_bins</code> 是集合并集，天然单调不减，斜率变平即探索饱和。<strong>（4）</strong>早停条件是"近 100 回合滑窗 ≥ 475"，未达标的臂老老实实跑完 8 万步；每个臂开头都 <code>set_seed</code>，保证网络初始化、环境 reset、噪声随机数三条流都从同一起点出发。</p>
+
+    <p>完整可运行脚本（附录）：<a href="../code/ch022.py" download>code/ch022.py</a></p>
+    <pre class="sh"><code>python code/ch022.py            # 三臂各 8 万步：CPU 约 2–5 分钟
+python code/ch022.py --quick    # 快速跑通：30–60 秒，只验证流程
+python code/ch022.py --arms stochastic,egreedy   # 只对比两臂</code></pre>
+    <p>以实跑为准：<strong>三臂通常都能在 2.5 万～7 万步内越过 475 的滑窗门槛，最终评估在 470～500 之间</strong>。稳定的差异在行为列，logits 噪声臂平均偏离率最高（典型 0.15～0.30），ε-贪心次之，默认采样最低（随策略变尖衰减到 0.05～0.15）；覆盖桶数通常是 logitnoise ≥ egreedy ≥ stochastic（典型相差 10%～35%）。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>logp_old 写成噪声分布的 log 概率</strong>：比率的分子分母必须同属目标策略。行为分布 μ 的 logp 只能用于重要性纠正，不能当 PPO 的基准；症状是 KL 系统性偏大/偏小、裁剪比例异常，更新幅度被扭曲。<strong>修复</strong>：统一从干净 logits 重算 <code>log_prob</code>。</li>
+      <li><strong>噪声不退火</strong>：持续高 ε / 高 σ 让行为分布永远偏离策略，价值网络长期拟合带噪回报，贪婪评估与训练成绩脱节，滑窗均值震荡不收敛。<strong>修复</strong>：把 <code>--anneal-frac</code> 控制在 0.5～0.7，并检查末期偏离率是否降下来。</li>
+      <li><strong>随机动作的随机源不受控</strong>：用 <code>env.action_space.sample()</code> 抽随机动作时，随机数来自环境内部独立 RNG，与 <code>set_seed</code> 不一致，实验不可复现。<strong>修复</strong>：统一用 <code>np.random.randint(n_actions)</code>。</li>
+      <li><strong>评估时忘了关噪声</strong>：评估必须用干净策略的 argmax、不注入任何噪声。带噪评估分数偏低且方差大，容易误判某臂"更差"。<strong>修复</strong>：<code>evaluate()</code> 里只用 <code>argmax</code>，与噪声代码完全隔离。</li>
+      <li><strong>只跑一个种子就下结论</strong>：CartPole 太简单，单次运行的臂间差异大多落在随机波动里。<strong>修复</strong>：固定同一份代码多跑 <code>--seed 0/1/2</code>，只在"偏离率与覆盖桶"这类稳定行为差异上做判断。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把 <code>--eps-end</code> 从 0.02 改成 0.3 各跑一次，观察末期偏离率与近 100 回合均值的变化，解释"为什么不退火会拖累收敛"。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>不用改代码。重点看日志末尾的偏离率是否仍高、KL 是否虚高，以及早停是否迟迟不触发。</div></details>
+      </li>
+      <li>把 <code>--sigma-start</code> 分别设为 0.5 与 2.0 跑 logitnoise 臂，对比早期覆盖桶数与首达目标步数，找出"探索过多"的迹象。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>σ=2 时早期动作接近均匀，覆盖涨得快但近 20 回合均值长期在低位；σ=0.5 时偏离率上升幅度有限。对比两条日志前 10 次更新。</div></details>
+      </li>
+      <li>故意把 <code>sample_action</code> 返回的 logp 改成"噪声分布 μ 的 logp"（对 <code>noisy_logits</code> 求 <code>log_prob</code>），跑到 2 万步左右观察 KL 与裁剪比例的异常，解释为什么比率的基准不能是行为分布。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>改动集中在 <code>logp = Categorical(logits=logits).log_prob(action)</code> 一行。你会看到近似 KL 系统性偏大或偏小，因为 r<sub>t</sub> 的起点不再是 1。</div></details>
+      </li>
+      <li>实现"偏离率闭环"探索：不按步数退火，改为每 5 次更新根据实测偏离率调整 σ（高于目标就减小、低于目标就增大），把平均偏离率稳定在 0.2 附近。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>仿照第 021 章的 σ 自适应结构：在 <code>run_arm</code> 里保存最近几次的偏离率，按 1.1 倍步长调整 σ，并给 σ 设上下界 [0, 3]。观察回报曲线是否比线性退火更平滑。</div></details>
+      </li>
+      <li>把同一套动作噪声思路迁移到连续动作：在 Pendulum-v1 上给动作加高斯噪声 a = clip(μ(s) + σ<sub>t</sub>·ξ)，logp_old 记录高斯策略对该动作的对数密度，比较与离散 logits 噪声的行为差异。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>需要先有一个高斯策略的 PPO 实现（可参考第 011 / 030 章的骨架）。注意动作加噪后仍要 clip 到环境动作边界，logp 用未裁剪的采样值计算。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>动作空间噪声 = 显式修改行为分布 μ：ε-贪心完全丢弃策略信息，logits 噪声只拍平动作偏好，两者都需要线性退火回到 on-policy。</li>
+      <li>实现铁律：<code>logp_old</code> 永远记录干净策略 π<sub>θ</sub> 对所选动作的 log 概率，噪声只影响"动作怎么选"，不影响比率的基准。</li>
+      <li>偏离率量化"行为有多野"，覆盖桶量化"探索走了多远"；两把尺子让探索方案对比不再只靠回报曲线。</li>
+      <li>CartPole 上三臂都能达标；动作噪声把覆盖推高 10%～35%，但没有换来更快的收敛，探索是有代价的。</li>
+      <li>下一章把动作噪声与熵正则化叠成 2×3 网格系统对比：外加强制的探索与目标函数内的熵奖励，谁更划算、什么时候必须同时用。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch021.html">← 第 021 章：PPO的探索策略：参数空间噪声</a>
+    <a class="next" href="ch023.html">第 023 章：PPO的探索策略：熵正则化与噪声结合 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

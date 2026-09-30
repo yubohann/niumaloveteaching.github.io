@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第034章 自建主题路由与数据分发中间件 | 多机器人协同学习课程 · ROS2 通信与系统集成</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 数据分发与协同感知</span>
+    <span class="sep">/</span>
+    <span>第 034 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 数据分发与协同感知</div>
+    <h1>第 034 章：自建主题路由与数据分发中间件</h1>
+    <p class="lead">当 DDS 端点从几十涨到几百，发现变慢、拓扑纠缠，你可以在应用层建一条"路由总线"：用表格驱动的转发节点把 N×M 的连接网变成 N+M 的星形。</p>
+    <ul class="meta">
+      <li>主题：数据分发 / 应用层路由</li>
+      <li>关键机制：路由表配置、动态类型加载、限流与合并、环路防护、跨域桥接</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 033 章（分布式环境表示与全局栅格）</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解应用层路由器要解决的问题：端点规模、发现开销、异构命名与受限网络。</li>
+      <li>掌握路由表设计：规则结构、通配符匹配、QoS 与限速字段，以及配置驱动的好处。</li>
+      <li>会写通用路由节点：动态消息类型加载、成对建立订阅/发布、转发回调与环路防护。</li>
+      <li>掌握限流与合并两种流量整形手段，知道它们各自的语义代价。</li>
+      <li>能判断"何时该建路由器、何时不该"，不做过度工程。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 001 章算过一笔账：DDS 的发现规模随端点数平方增长。20 台机器人、每台 20 个端点就是 400 个端点、约 8 万对潜在匹配；如果每台机器人还要订阅其他 19 台的检测、状态、地图更新，端点数再翻几倍，发现流量与连接管理开销会明显拖慢系统。<strong>更常见的现实约束是网络</strong>：跨网段、跨防火墙、跨运营商时，DDS 的多播/单播发现可能根本打不通（第 010 章），但应用层的 WebSocket/单向隧道可以。</p>
+    <p>应用层路由器（topic router）用最朴素的方式解决这两类问题：<strong>它作为普通节点订阅一批话题、再发布到另一批话题</strong>，对 DDS 来说连接数是"N 入 + M 出"，把 N×M 的对等网格收敛成星形；对网络来说它是可部署在任何可达位置的一段普通程序。它还能顺手完成限流、过滤、改名、聚合等数据处理。代价也真实：多一跳延迟、单点风险、QoS 不再端到端。本章把路由器的设计、实现与边界讲清楚，它是分布式系统工具箱里"该出手时才出手"的重型工具。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 拓扑账本：N×M 网格 vs N+M 星形</h3>
+    <p>假设 20 台机器人，每台把自己的状态（1 个话题）发给其他所有机器人。对等网格方案：每台 1 个发布端点 + 19 个订阅端点 = 每台 20 端点，全系统 400 端点，发现匹配对 ≈ 400²/2 = 8 万。星形路由器方案：每台机器人只与路由器相连（1 发布 + 1 订阅），路由器一侧 40 个端点，<strong>总端点从 400 降到约 80；按"任意两端点都可能相关"的发现上限口径，潜在匹配对从约 8 万降到约 3 千（实际主题匹配组合仅约 40 对）。</strong></p>
+    <div class="formula">
+      对等网格端点 ≈ N × M；星形路由端点 ≈ N + M
+      <span class="note">20 台全互联：400 vs 约 80，再加一层车队级话题，差距随 N 持续放大</span>
+    </div>
+    <p>除了规模，路由器还带来三个"顺手"能力：<strong>（1）命名搬运</strong>，把 <code>/robotN/…</code> 的风格统一成车队视角的 <code>/fleet/…</code>；<strong>（2）流量治理</strong>，在任何一条边上限速、过滤、合并；<strong>（3）网络桥接</strong>，把 DDS 世界与另一种中间件（Zenoh 网关、Web 面板、云端队列）连起来，路由器就是协议转换点。</p>
+
+    <h3>2. 代价清单：路由器不是白拿的</h3>
+    <table>
+      <tr><th>代价</th><th>量化</th><th>缓解</th></tr>
+      <tr><td>额外一跳延迟</td><td>同机约 0.5–2 ms；跨机再加网络延迟</td><td>路由器尽量靠近数据源部署；控制流不走路由器</td></tr>
+      <tr><td>单点故障</td><td>路由器挂 → 全部转发中断</td><td>双实例热备；或按机器人分组多实例（第 039 章监控）</td></tr>
+      <tr><td>QoS 断裂</td><td>两侧 QoS 各自独立，不再是端到端合同</td><td>按"入口 QoS 决定出口 QoS"的规则显式映射</td></tr>
+      <tr><td>调度风险</td><td>单线程回调里处理大消息会阻塞所有规则</td><td>多执行器/回调组；大消息流单独实例</td></tr>
+    </table>
+    <p>判断标准：<strong>端点规模大、发现慢、需要跨网段或需要集中治理流量 → 值得建路由器；同域内十几台机器人、直连 DDS 很健康 → 不建</strong>。中间态可以先做"路由器只处理跨机话题，机内话题保持 DDS 直连"的混合拓扑。把混合拓扑的账算一遍：每台机器人有 3 个跨机话题（状态、扫描、检测）、若干机内话题。纯网格方案为跨机话题建 3 × 19 = 57 个订阅，全系统 1200 个端点、约 1140 对匹配；混合方案里机器人侧 3 发 3 收共 120 个端点，路由器侧再 120 个，合计 240 个端点、约 120 对匹配，规模各降约 5 倍与 9 倍，而机内高频话题仍然走零拷贝直连，一点没被拖慢。</p>
+
+    <h3>3. 路由表：把转发逻辑变成配置</h3>
+    <p>路由器的转发逻辑应该做成数据（配置）驱动：改一条转发规则不需要改程序、不需要重编译，评审也能一眼看清"什么流向哪里"。一条规则的典型字段：</p>
+    <ul>
+      <li><code>from</code> / <code>to</code>：源话题模式与目标话题（支持通配符捕获，如 <code>/robot*/status</code> → <code>/fleet/{1}/status</code>）；</li>
+      <li><code>type</code>：消息类型全名（决定动态加载哪个类型）；</li>
+      <li><code>qos</code>：入口/出口 QoS 档位（如 reliable/be、depth）；</li>
+      <li><code>rate</code>：出口最大频率（限流）；</li>
+      <li><code>filter</code>：简单的内容条件（可选，如"只转发 battery &lt; 30%"的告警流）。</li>
+    </ul>
+    <p>两个协议级细节：<strong>（1）环路防护</strong>，路由器发布的 <code>to</code> 话题如果又被自己的 <code>from</code> 匹配（通配符写宽了），转发会无限循环。加载配置时必须做可达性检查（拓扑无环），运行时要靠"源话题 != 目标话题"与消息元数据防自环。<strong>（2）类型一致性</strong>，转发是"类型保真"的：路由器不做消息转换（转换是桥接器的职责），类型拼写错误在加载期就应报错，运行时静默不匹配是必须避免的形态。</p>
+
+    <h3>4. 流量整形：限流与合并</h3>
+    <p>路由器是天然的流量整形点，两种手段语义不同，别混用：</p>
+    <ul>
+      <li><strong>限流（rate limit）</strong>：超过设定频率的消息直接丢弃（保频率上限，牺牲完整性）。适合"状态类"数据（谁在乎 3 秒前的状态？）；<strong>不适合指令流</strong>（丢一条速度指令可能是物理事故）。</li>
+      <li><strong>合并（coalescing）</strong>：攒一个窗口，用窗口内"最后一条"或"聚合结果"代替一整批（保完整性语义，牺牲中间态）。适合状态更新、地图块（第 027 章的整流同源）；对事件流（如"检测到一个目标"）不适用，中间态本身携带信息。</li>
+    </ul>
+    <p>还有一个常被忽略的<strong>回压（backpressure）</strong>问题：入口订阅队列满时，DDS 按 QoS 丢旧/丢新；路由器出口如果被限速，队列会持续积压，必须显式设计"积压时怎么办"（丢弃最旧、丢弃新到、断开重连），否则路由器变成延迟黑洞。</p>
+    <p>整形的效果同样可以定量：某状态流入口 50 Hz，可视化只需要 4 Hz。合并窗口取 0.25 s，输出固定 4 Hz，流量降 12.5 倍，最坏新鲜度损失 250 ms；全队 20 台的消息量从 1000 条/秒降到 80 条/秒，路由器与订阅端的 CPU 都跟着降一个量级。这个交换在状态数据上几乎无感，在事件数据上则完全不成立。</p>
+
+    <h3>5. 数值算例：拓扑规模、延迟与吞吐的完整账</h3>
+    <p>把第 1 小节的账算细。20 台机器人互发状态：对等网格下每台 1 个发布端点加 19 个订阅端点，全系统 400 个端点，真正参与主题匹配的组合是 20 × 19 = 380 对；按"任意两端点都可能相关"的发现上限估计则是 400 × 399 ÷ 2 ≈ 8 万对。星形方案：机器人侧共 40 个端点，路由器侧 40 个，总计 80 个端点，实际主题匹配组合约 40 对（按端点对上限口径约 3 千），<strong>端点数降到五分之一、匹配对数降一个数量级，发现流量与连接管理随之同比缩小</strong>。</p>
+    <p>再看路由器要扛的流量与延迟。状态流：每台 200 B × 10 Hz = 2 KB/s，20 台共 40 KB/s；二维扫描：每帧 720 束 × 8 B ≈ 5.8 KB，按 5 Hz 降频后每台 29 KB/s，20 台共 576 KB/s。合计不到 1 MB/s，对单实例路由器的网卡与内存都是小负载；CPU 侧按每条消息 50 µs 的序列化与回调成本估算，500 条/秒的消息量只占单核的 2.5%。<strong>结论：路由器的瓶颈很少是带宽，通常是回调调度（大消息阻塞小消息）与部署位置带来的延迟</strong>。</p>
+    <p>延迟预算：同机部署一跳约 0.5–2 ms，可以接受；网关机跨网部署则要加上 5–20 ms 的网络延迟。对照 50 Hz 控制环 20 ms 的周期，路由器的延迟与抖动会挤占大半个周期，因此控制流不走路由器是硬规则；感知与状态流允许几十毫秒延迟，路由器在这里是净收益。</p>
+
+    <h3>6. 失效模式与边界条件</h3>
+    <ul>
+      <li><strong>自环爆炸</strong>：通配符写宽导致消息绕环，入口 100 Hz、环路延迟 1 ms 时，消息数每绕一圈翻倍，约 10 ms 就从 100 条/秒膨胀到 10 万条/秒，单核瞬间打满。边界动作：加载期做话题有向图的可达性检查，运行期对转发消息加跳数上限并统计异常。</li>
+      <li><strong>重启后的数据空窗</strong>：单实例路由器重启到重新发现、重新匹配完成通常需要秒级，期间的流数据丢失。边界动作：状态型话题出口用 transient-local 弥补（重连即拿最新），事件流则靠双实例热备缩短空窗。</li>
+      <li><strong>QoS 静默降级</strong>：入口 Reliable、出口 Best-effort，可靠性在路由器处消失，而上下游都以为链路可靠。边界动作：路由表两侧 QoS 显式书写，加载期打印"映射摘要"供评审核对。</li>
+      <li><strong>队列无界的延迟黑洞</strong>：出口限速但入口不限，积压队列持续增长，数据从"实时"退化成"重放"。边界动作：队列深度硬上限、丢最旧、丢弃计数告警，三步缺一不可。</li>
+      <li><strong>双重写者竞争</strong>：两条规则把不同来源转发到同一目标话题，接收端看到交替的冲突值。边界动作：加载期校验"每个目标话题只有一个规则写入"，把它列为路由表评审的第一条检查。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <ol>
+      <li><strong>清点流向</strong>：列出所有需要转发的数据流（源、目标、类型、频率、QoS），区分"必须实时"与"允许整形"。</li>
+      <li><strong>写路由表</strong>：YAML 配置驱动；每条规则显式写出 type/qos/rate；通配符规则尽量窄。</li>
+      <li><strong>加载期校验</strong>：类型可加载、目标话题不构成环、同一目标话题只有一个写者（防竞争）。</li>
+      <li><strong>部署拓扑</strong>：路由器部署在数据汇聚最便宜的位置（网关机/车队主控）；大消息流单独实例，避免阻塞小消息。</li>
+      <li><strong>监控验收</strong>：转发吞吐、各规则丢弃率（限流丢弃 + 队列丢弃）、端到端延迟增量、重启恢复时间。</li>
+    </ol>
+    <table>
+      <tr><th>参数</th><th>起点值</th><th>依据</th></tr>
+      <tr><td>队列深度</td><td>10（小消息）/ 5（大消息）</td><td>限制积压上界，延迟可预测</td></tr>
+      <tr><td>限流频率</td><td>按消费方需求（如 5 Hz 可视化）</td><td>下游用不到更高频率就不转发</td></tr>
+      <tr><td>合并窗口</td><td>0.2–0.5 s</td><td>状态类数据的"新鲜度-流量"折中</td></tr>
+      <tr><td>执行器</td><td>多线程 or 多回调组</td><td>防一条大消息流阻塞小消息流</td></tr>
+    </table>
+    <p>监控清单要覆盖四类信号：按规则统计的转发吞吐、分开计数的丢弃（限流丢弃与队列丢弃语义不同）、端到端延迟增量（用带时间戳的探针消息测量）、实例存活与配置版本。四类信号里，延迟增量是发现"路由器变成瓶颈"最早的一盏灯，前两类在正常范围内时它就会先亮。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：路由表（YAML，配置驱动）</strong></p>
+    <pre class="code"><code># router_rules.yaml：一行一条转发规则；评审看这张表就能理解系统数据流
+rules:
+  - from: "/robot*/status"          # 通配符匹配 20 台机器人的状态
+    to:   "/fleet/status/{1}"       # {1} 捕获第一段通配符，保留机器人编号
+    type: "my_fleet/msg/RobotStatus"
+    qos:  {reliability: best_effort, depth: 5}
+    rate: 10.0                      # 出口限流 10 Hz：可视化/聚合够用
+  - from: "/robot*/scan"
+    to:   "/fleet/scans/{1}"
+    type: "sensor_msgs/msg/LaserScan"
+    qos:  {reliability: best_effort, depth: 3}
+    rate: 5.0                       # 扫描降频到 5 Hz：聚合页面的最低需求
+  - from: "/fleet/cmd/dock"         # 车队级指令：只做搬运，不做整形
+    to:   "/robot*/cmd/dock/{1}"
+    type: "my_fleet/msg/DockCommand"
+    qos:  {reliability: reliable, depth: 10}
+    rate: 0.0                       # 0 = 不限流：指令语义绝不能丢中间态</code></pre>
+    <p>解读：这张表把第 013/014 章的流量设计原则直接落成了配置。<strong>（1）</strong>通配符与捕获组让规则数量与机器人数量解耦：加一台机器人不用改路由表，这是"实例化复用"（第 001 章）在分发层的体现。<strong>（2）</strong>限流字段按数据语义区分：状态与扫描是"状态类"（限流安全），指令是"事件类"（rate 0 表示不整形）。<strong>（3）</strong>显式写 type 与 qos：路由器两侧的 QoS 不继承，必须在这里把意图写清楚，缺省值永远是最危险的配置。</p>
+
+    <p><strong>片段 2：通用路由节点，动态类型加载与转发</strong></p>
+    <pre class="code"><code>import re
+import yaml
+import rclpy
+from rclpy.node import Node
+from rosidl_runtime_py.utilities import get_message
+from rclpy.qos import QoSProfile
+
+class TopicRouter(Node):
+    """按 YAML 路由表建立 订阅->发布 对：一个节点服务任意多条转发规则。"""
+    def __init__(self, rules_path):
+        super().__init__("topic_router")
+        with open(rules_path, encoding="utf-8") as f:
+            self.rules = yaml.safe_load(f)["rules"]
+        self._validate_no_cycle()            # 加载期防环：比运行时救火便宜
+        for rule in self.rules:
+            self._setup_rule(rule)
+
+    def _setup_rule(self, rule):
+        # 动态加载消息类型：路由器的"通用"就靠这一行
+        msg_type = get_message(rule["type"])
+        pattern = re.compile("^" + rule["from"].replace("*", "(.*)") + "$")
+        self.out_topics = [rule["to"]]       # 简化：单目的话题匹配 + 替换
+        qos = QoSProfile(depth=rule["qos"].get("depth", 10))
+        pub = self.create_publisher(msg_type, rule["to"], qos)
+        # 通配符订阅：用正则重新构造匹配逻辑（示意版按已知机器人列举）
+        for topic in self.discover_topics(pattern):
+            self.create_subscription(
+                msg_type, topic, self._make_cb(pub, rule), qos)
+
+    def _make_cb(self, pub, rule):
+        last = {"t": 0.0}
+        min_gap = 0.0 if rule.get("rate", 0.0) == 0 else 1.0 / rule["rate"]
+        def cb(msg):
+            now = self.get_clock().now().nanoseconds * 1e-9
+            if min_gap &gt; 0 and (now - last["t"]) &lt; min_gap:
+                return                       # 限流：状态类数据丢中间帧是安全的
+            last["t"] = now
+            pub.publish(msg)                 # 类型保真转发：不做消息转换
+        return cb
+
+    def _validate_no_cycle(self):
+        # 简化版：目标话题不得再被任何 from 规则匹配（防转发自环）
+        for rule in self.rules:
+            outs = {r["to"] for r in self.rules}
+            assert rule["from"].replace("*", "") not in outs, rule</code></pre>
+    <p>解读：这段代码把"配置驱动"落成了具体机制。<strong>（1）</strong><code>get_message</code> 动态加载消息类型，是路由器"不需要为每种消息编译一份代码"的关键；类型名拼错会在加载期直接抛异常（fail fast），杜绝运行时静默收不到消息。<strong>（2）</strong>闭包 <code>_make_cb</code> 里绑定各自规则的发布者与限流状态：每条规则独立限流、互不干扰，如果所有规则共用一个时间戳，任何一条消息都会把其他规则的限流"充值"，行为完全错乱。<strong>（3）</strong>限流的实现是"看时间戳丢帧"：这与第 022 章大消息 QoS 的思路一致。<strong>队列会把延迟越拖越长，丢弃则把"系统时间"拉回现在。</strong><strong>（4）</strong><code>_validate_no_cycle</code> 是示意版的自环检查（真实实现应对话题图做可达性分析）：环路的后果是消息在两条规则间无限转圈，带宽与 CPU 被瞬间吃光。注意 SPEC 提醒：通配符订阅在 rclpy 中通常需按已知话题逐一创建（或用更底层的 graph 接口动态增删），代码里的 <code>discover_topics</code> 就是这一步骤的占位接口，实际取其发行版的发现 API 实现。</p>
+
+    <p><strong>片段 3：合并窗口与回压防护</strong></p>
+    <pre class="code"><code>from collections import deque
+
+class Coalescer:
+    """合并窗口：把高频状态更新压成低频发布，保留"最新值"语义。"""
+    def __init__(self, pub, period=0.25):
+        self.pub = pub
+        self.period = period
+        self.pending = None                  # 只留最后一条：中间态无价值
+        self.dropped = 0
+
+    def on_msg(self, msg):
+        self.pending = msg                   # 覆盖式：天然抗突发
+        if self.dropped == 0:
+            pass
+        # 入口积压检测：如果队列反复满，说明出口速率设置过低
+        # （真实实现用订阅 QoS 的丢弃统计或队列长度观测）
+
+    def tick(self):
+        if self.pending is not None:
+            self.pub.publish(self.pending)   # 固定节奏出口：流量可预测
+            self.pending = None
+
+def make_room(queue, cap):
+    """回压策略：队列超上限时丢最旧的，系统时间里没有过期数据"""
+    while len(queue) &gt; cap:
+        queue.popleft()
+        # 生产实现应在此计数并告警：持续触发说明带宽或频率规划有误
+    return queue</code></pre>
+    <p>解读：合并与回压是路由器"长期稳定运行"的两个保险。<strong>（1）</strong>Coalescer 用"覆盖式 pending"代替队列：无论入口多快，出口永远是最新一条、固定节奏发布，流量从"随入口波动"变成"随出口设定"，这正是第 027 章整流思想的复用。<strong>（2）</strong>回压策略选了"丢最旧"：对状态类数据，最新值才是唯一有意义的；丢最新等于让消费方永远滞后。<strong>（3）</strong>两个位置都必须有计数与告警，丢弃本身不可怕，可怕的是丢弃在无声发生。把这些计数接进第 039 章的健康监测，路由器的每个"皱眉"都会变成可观测指标。（4）最后提醒一条纪律：<strong>路由器上的整形规则必须与其下游消费者的需求一致</strong>，给可视化降频到的 5 Hz 数据，不要再被别的模块当作高频输入去用；数据流的"等级"在路由表里是显式的。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>通配符写太宽导致自环</strong>：<code>/robot*</code> 的 <code>from</code> 匹配到了规则自身的 <code>to</code>，消息无限转圈。修复：加载期做话题图可达性检查；运行期防护"源=目标"。</li>
+      <li><strong>类型拼写错误静默失败</strong>：<code>get_message</code> 抛异常被 catch 后忽略，规则形同虚设。修复：加载期 fail fast，任何规则建立失败就退出并报告。</li>
+      <li><strong>单线程回调被大消息阻塞</strong>：点云转发规则占满执行器，小状态消息延迟飙升。修复：多回调组/独立实例隔离大消息流。</li>
+      <li><strong>限流用在指令流上</strong>：为了省带宽给指令加 rate，关键时刻丢指令。修复：按语义分类（状态可限、事件不可限），路由表里显式标注。</li>
+      <li><strong>把 QoS 期望带过路由器</strong>：以为入口 reliable 就端到端可靠；出口若配 best_effort，可靠性在路由器处消失。修复：路由表两侧 QoS 显式声明并在评审中复核。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>算规模账：30 台机器人互发状态话题。对等全互联方案与"路由器聚合再分发"方案的端点总数、匹配对数量各是多少？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>对等：每台 1 发布 + 29 订阅 = 900 端点，匹配对 30×29 = 870；星形：每台 1 发 1 收 = 60 端点 + 路由器两侧约 60 端点，匹配对约 60。端点数差几倍、匹配对数差一个数量级，发现负载随匹配对数走。</div></details>
+      </li>
+      <li>给路由表加一条"只转发电量低于 30% 的告警"的过滤规则，预测实现需要哪些字段与逻辑；说明过滤在入口侧做还是出口侧做的区别。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>入口过滤省带宽、出口过滤省发布开销；字段需要 filter 表达式与消息字段路径解析。过滤器引入的计算应在加载期校验表达式合法性。</div></details>
+      </li>
+      <li>设计一个验证实验：故意在路由表里制造一条环路，观察 CPU/带宽的爬升速度，然后写出你的"环检测"规则。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>环路通常几秒内让单核打满。检测规则：构建"话题有向图"，检查是否存在从任意 to 经 from 回到自身的路径；也可运行时用消息 hop 计数兜底。</div></details>
+      </li>
+      <li>设计题：为 20 台机器人的车队设计路由器部署方案：几个实例、各自负责哪些流、故障切换策略、监控指标清单。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>可按"大消息流/小消息流"分两个实例（故障域与负载隔离），或用双实例热备；监控至少覆盖吞吐、丢弃、延迟增量、实例存活。</div></details>
+      </li>
+      <li>思考：路由器把拓扑从网格改成星形，为什么说它"降低了 DDS 的发现负担，却提高了应用的耦合度"？列出你的缓解手段。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>所有流量经过同一点，路由器成为系统级依赖；缓解：实例隔离、无状态化（可随时重启）、配置版本化与灰度。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul>
+      <li>应用层路由器用 N+M 的星形替代 N×M 网格，解决端点爆炸与跨网段分发，同时提供治理能力。</li>
+      <li>代价清单：一跳延迟、单点风险、QoS 断裂、调度阻塞，每一项都要有对应的工程缓解。</li>
+      <li>路由表配置驱动：通配符、类型、QoS、限流显式化；加载期校验（类型、环、单写者）fail fast。</li>
+      <li>整形分清语义：状态类可限流/合并，事件与指令类绝不整形；回压策略必须是显式设计。</li>
+      <li>下一章处理不可靠网络本身：<strong>通信丢包与重传策略</strong>，什么时候让 DDS 重传，什么时候自己定义重传，什么时候干脆放弃。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch033.html">← 第 033 章：分布式环境表示与全局栅格</a>
+    <a class="next" href="ch035.html">第 035 章：通信丢包与重传策略 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

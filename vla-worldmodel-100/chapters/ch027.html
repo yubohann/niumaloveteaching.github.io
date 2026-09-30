@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第027章 世界模型中的动作空间离散化 | 具身智能学习课程 · VLA 与世界模型联合训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 联合训练进阶与策略能力</span>
+    <span class="sep">/</span>
+    <span>第 027 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 联合训练进阶与策略能力</div>
+    <h1>第 027 章：世界模型中的动作空间离散化</h1>
+    <p class="lead">自回归世界模型以 token 为输入输出，连续动作必须先经过分箱或量化才能进入语言式的建模框架；本章讲清量化误差界、非均匀分箱的动机与执行端的平滑衔接。</p>
+    <ul class="meta">
+      <li>主题：动作量化（action quantization） / 分箱（binning）</li>
+      <li>关键公式：a<sub>q</sub> = round((a − a<sub>min</sub>) / Δ)，Δ = (a<sub>max</sub> − a<sub>min</sub>) / (K − 1)；量化误差 ≤ Δ/2</li>
+      <li>预计学时：45 分钟</li>
+      <li>前置章节：第 026 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解动作空间离散化（action space discretization）在世界模型与策略中的双重动机：统一 token 接口与表达多峰动作分布。</li>
+      <li>掌握均匀分箱的误差界分析，能按精度要求反推分箱数 K。</li>
+      <li>掌握非均匀分箱（分位数分箱、μ 律压缩）的适用场景，理解动作分布形状对分箱策略的影响。</li>
+      <li>会设计"分箱 → 交叉熵训练 → 反量化 → 平滑执行"的完整链路，并处理块内的平滑约束。</li>
+      <li>能诊断分箱精度不足、边缘抖动与词表长尾稀疏三类问题。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>自回归世界模型（autoregressive world model）与语言模型共享同一套机制：输入输出都是离散 token。连续动作（关节角、末端位移）无法直接进入该框架，需要先离散化为 token；策略侧同样受益，分类式动作头天然表达多峰分布，抓取动作"从左绕或从右绕"不会像均方误差那样被平均成一个中间值。</p>
+    <p>离散化的代价是精度损失与执行抖动。分箱粒度 Δ 决定动作分辨率，粒度太粗会引入控制误差，太细则词表膨胀、长尾 token 训练不足。工程上需要在控制精度、训练效率与词表大小之间取平衡，并把反量化后的平滑处理纳入执行链路。</p>
+    <p>本章与第 026 章的衔接：可视化诊断出的失败模式（例如动作在目标附近来回振荡）有一部分源自分箱边缘效应；理解离散化链路是定位这类问题的前提。后续第 034 章的语言条件世界模型直接消费本章产生的动作 token。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 均匀分箱与误差界</h3>
+    <p>把归一化后的动作区间 [a<sub>min</sub>, a<sub>max</sub>] 均匀划分为 K 个箱，箱宽 Δ 与量化误差满足：</p>
+    <div class="formula">
+      Δ = (a<sub>max</sub> − a<sub>min</sub>) / (K − 1) ，q(a) = round( (a − a<sub>min</sub>) / Δ ) ，|a − a<sub>q</sub>| ≤ Δ / 2
+      <span class="note">q 为箱索引；K = 256 时每个动作维用 1 个字节表示，7 维动作恰为 7 个 token</span>
+    </div>
+    <p>注意误差界的作用范围：Δ/2 是"每个动作维"的绝对误差，通过运动学映射到末端位置后误差会被雅可比矩阵放大或缩小。对精密插孔类任务，末端位置精度要求可能到毫米级，需要先做运动学敏感性分析再选 K，不能只看关节角的数值精度。</p>
+    <p>把整条误差链用数字走一遍：归一化区间 [−1, 1] 下，K=256 时箱宽 0.00784、误差界 0.00392；K=64 时箱宽与误差界放大到 4 倍（0.03175 与 0.01587）；K=1024 时缩到四分之一。物理量程下关节差异立刻显现：基座关节行程 340° 时 K=256 的误差界 0.667°、K=64 时 2.698°；腕关节行程 60° 时 K=256 的误差界 0.118°。再经运动学折算到末端：0.5 米臂长下，0.667° 约对应 5.8 毫米，0.118° 约 1.0 毫米；精密插孔要求毫米级精度时，基座关节配 K=256 就不够，要么把 K 提到 1024（0.167°，约 1.5 毫米），要么对该关节单独加密分箱。这条链说明 K 的选择依据是任务精度除以雅可比放大量，统一经验值会掩盖各关节的差异。</p>
+    <p>解码时把箱索引映射回箱中心可以最小化期望平方误差；直接取箱边界（例如左边界）会系统性地引入半个箱宽的偏置。<strong>编码取最近箱、解码取箱中心是误差最小化的标准组合。</strong>软期望解码的误差形态与箱中心不同：单峰集中分布下期望值接近箱中心，均方误差与 Δ<sup>2</sup>/12 同量级；双峰对称分布下期望落在两峰之间的中点，物理上对应“在两个可行方向之间犹豫”的位置，连续但未必是任何一峰的动作。对控制任务而言，连续性与置信度信号的收益通常大于“期望位置不精确”的代价，精密任务则改用箱中心解码并把多峰处理交给上层规划。</p>
+
+    <h3>2. 非均匀分箱的动机与形式</h3>
+    <p>真实动作分布并不均匀：接近阶段动作集中在慢速微调区域，转移阶段动作幅度大。均匀分箱在这些区域浪费分辨率。两种非均匀方案：</p>
+    <ul>
+      <li><strong>分位数分箱</strong>：按训练数据的分位数确定箱边界，每个箱覆盖相同的样本量，稀有区域获得更多分辨率。</li>
+      <li><strong>μ 律压缩</strong>：用非线性变换 y = sign(a)·log(1 + μ|a|) / log(1 + μ) 压缩动态范围，小幅度动作分辨率高，大幅度动作分辨率低，借鉴语音编码的思路。</li>
+    </ul>
+    <p>实现上两者都把"分箱"变成"查表"：先定义边界数组，编码用二分搜索找到所属箱，解码取箱中心。查表结构的额外收益是边界可以按任务定制（例如夹爪开度只在 0 与 1 附近密集设箱）。代价是编码解码不再是简单乘除，需在数据管线中做向量化实现。</p>
+    <p>非均匀分箱的收益用三箱算例量化：区间 [0, 1] 上按分位数取边界 [0, 0.5, 0.9, 1]，箱宽为 0.5、0.4、0.1；在箱内近似均匀的假设下，各箱均方误差为 Δ<sup>2</sup>/12，取三等分数据质量后总 MSE 约 0.0117。对照均匀三箱（宽 0.5、MSE 0.0208），分位数分箱把整体误差压低约 44%，且收益集中在样本最密的中间箱。选择判据随之明确：动作分布相对均匀时两种方案差距小，分布明显偏斜（微调段样本占比过半）时分位数分箱的收益随偏斜度增长；μ 律压缩适合“已知要小幅度高精度”的控制任务，不需要统计训练数据即可给出边界。</p>
+
+    <h3>3. 动作块与 token 布局</h3>
+    <p>动作分块（action chunking）下，一次预测 H<sub>c</sub> 步、每步 D 维动作。token 化的布局有两种：</p>
+    <div class="formula">
+      时间优先布局：t<sub>1</sub>d<sub>1</sub>, t<sub>1</sub>d<sub>2</sub>, 依次到 t<sub>1</sub>d<sub>D</sub>, 然后进入 t<sub>2</sub>d<sub>1</sub>，共 H<sub>c</sub> × D 个 token
+      <span class="note">t 为块内时间步，d 为动作维度；维度优先布局把所有时间步的同维动作排在一起</span>
+    </div>
+    <p>时间优先布局让自回归模型按时间顺序生成，因果掩码自然对齐；维度优先布局便于按维度统计与约束。世界模型的动作条件通道需要与之一致，否则动作 token 的时序语义错位。H<sub>c</sub> = 8、D = 7 时每块 56 个 token，是常见量级。</p>
+    <p>token 预算要合并核算：单块动作 56 个 token，与 012 章语言上限 48 个、010 章视觉 392 个同处一个序列预算表内。动作 token 占比约 11%，词表 K=256 时动作头输出 56×256 ≈ 1.4×10<sup>4</sup> 个 logits，与语言词表动辄数万的输出层同量级，这也是自回归世界模型能把动作并入统一词表的容量依据。若把 H<sub>c</sub> 提到 16，动作 token 翻倍到 112，序列与输出层同步膨胀，预算核算需重做。</p>
+    <p>同一时刻的维度展开还引入人为顺序：时间优先布局下 d<sub>1</sub> 到 d<sub>7</sub> 按固定次序生成，模型学习的是该次序下的联合分布。维度间存在强相关时（位置与姿态、双臂协同），固定次序会让靠后的维度只能看到靠前维度的采样结果，表达略有受限；缓解方式是按相关性分组排列，或允许同一时刻的维度组内互相可见。这一细节在自回归生成中容易被忽略，但对动作平滑度有可测影响，验证方法是比较两种排序下块内动作差分的分布。</p>
+
+    <h3>4. 反量化与执行端平滑</h3>
+    <p>分箱输出在箱之间跳变，相邻控制周期的反量化动作会出现阶梯状抖动。三种平滑衔接：一阶低通滤波（指数平滑）；在块内做线性插值（利用分块预测的完整轨迹）；把分箱中心与相邻箱中心做软混合（按 softmax 概率加权，得到连续值）。软混合在高频控制回路里最自然：分类头输出的是概率分布，期望值 Σ p<sub>k</sub> c<sub>k</sub> 本身就是连续动作，且保留了多峰信息供执行端判断置信度。</p>
+    <p><strong>平滑不能替代精度：</strong>滤波会把分箱误差在时间上平均，但无法消除系统性偏移。选箱策略错误（例如量程映射错位）带来的偏置会在平滑后原样保留。</p>
+    <p>指数平滑的响应与滞后可以量化：新值权重 α=0.3 时，阶跃输入后第 1、2、3、5、10 个控制周期的响应分别为 0.300、0.510、0.657、0.832、0.972，全部到位需要十余个周期；跟踪滞后的近似值为 (1 − α)/α ≈ 2.3 个周期。α 的选择因此是抖幅与跟踪误差的直接交换：α 取 0.5 时滞后降到约 1 个周期，但对分箱阶梯的抑制减弱；取 0.1 时曲线平滑，滞后升到 9 个周期，快速任务会感到“追不上”。标定方法是分别记录阶跃响应的到位周期与稳态抖幅，在两条曲线的交叉点附近取值。</p>
+    <p>分箱表是策略与世界模型共享的接口资产，版本管理不能省：两端使用不同的边界表时，同一动作 token 在策略侧解码为一种物理量、在世界模型条件通道解释为另一种，联合训练出现“对不上”的隐性错位。规范做法是把边界表与量程表随模型权重一同保存、校验版本标识，训练、评估、部署三处加载同一版本；分位数分箱的表来自训练集统计，数据集版本更新时必须重新生成并触发一次一致性回归。</p>
+    <p>低置信保持也要设上限：置信度连续低于阈值时动作被反复替换为上一周期值，若不加限制会演变为“动作冻结”，机器人停在原地而日志上没有报错。防护规则是保持状态最多延续 3 个控制周期，超限后改用箱中心解码的保守动作并上报异常；冻结时长的监控进入运行指标，与 026 章的低熵告警联动排查。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>离散化链路由编码器、动作头、解码与平滑执行四段组成。与第 026 章的差异：026 是诊断工具，本章是动作接口设计，直接决定世界模型与策略共享的动作语义。</p>
+    <ol>
+      <li><strong>归一化约定</strong>：按维度记录量程（min/max），线性映射到 [−1, 1]；夹爪等二值量单独处理。</li>
+      <li><strong>分箱表生成</strong>：默认均匀分箱 K = 256；动作分布偏斜明显时切换分位数分箱，边界表随数据集统计生成并在训练集冻结。</li>
+      <li><strong>动作头训练</strong>：分类头输出 [H<sub>c</sub> × D, K] 的 logits，交叉熵逐 token 计算；掩码处理块尾无效步。</li>
+      <li><strong>解码与执行</strong>：取期望值或箱中心，按控制周期做指数平滑后下发；置信度低的 token 触发热替换（用上一周期动作）。</li>
+    </ol>
+    <h3>超参数起点表</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>分箱数 K</td><td>256</td><td>分辨率与词表大小的平衡</td><td>运动学敏感性分析结果</td></tr>
+      <tr><td>动作块长 H<sub>c</sub></td><td>8</td><td>块内时间覆盖</td><td>演示数据的时间平滑尺度</td></tr>
+      <tr><td>token 布局</td><td>时间优先</td><td>与因果掩码对齐</td><td>与世界模型条件通道一致</td></tr>
+      <tr><td>解码方式</td><td>软期望 Σ p<sub>k</sub> c<sub>k</sub></td><td>连续化并保留置信度</td><td>控制频率与抖动水平</td></tr>
+      <tr><td>平滑系数</td><td>0.3（新值权重）</td><td>抑制阶梯抖动</td><td>跟踪误差与抖动的平衡</td></tr>
+      <tr><td>低置信阈值</td><td>最大类概率低于 0.5</td><td>触发动作保持</td><td>验证集误判统计</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：为什么解码用期望值代替最大概率箱？</span>
+      <p>取最大概率箱对应"最可能的动作"，在多峰分布下会在两峰之间跳跃；取期望值得到连续输出，且附带一个有用的副产品：期望与最大箱的距离可以作为动作不确定度的粗略信号，用于触发平滑或保持。二者取值的差别在高频控制任务中直接表现为抖动幅度差异。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>以下片段参照公开的离散动作 token 化实现设计，版本中立；PyTorch 风格，接口随版本演进。</p>
+
+    <p><strong>片段 1：分箱编解码器</strong></p>
+    <pre class="code"><code>import torch
+
+class ActionBinner:
+    """按维度量程归一化后做均匀分箱；解码取箱中心，不取边界。"""
+    def __init__(self, low, high, n_bins=256):
+        # low/high：每个动作维的物理量程，形状 [D]
+        self.low = torch.as_tensor(low, dtype=torch.float32)
+        self.high = torch.as_tensor(high, dtype=torch.float32)
+        self.n_bins = n_bins
+
+    def encode(self, action):
+        # 归一化到 [0, 1]：量程按维度对齐，防止大行程关节主导分箱
+        scale = (self.high - self.low).clamp(min=1e-6)
+        norm = (action - self.low) / scale
+        bins = torch.round(norm * (self.n_bins - 1))
+        return bins.clamp(0, self.n_bins - 1).long()
+
+    def decode(self, bins):
+        # 取箱中心：解码误差期望为零；取左边界会引入半箱宽的系统偏置
+        centers = (torch.arange(self.n_bins, dtype=torch.float32) + 0.5) / self.n_bins
+        return centers[bins] * (self.high - self.low) + self.low
+</code></pre>
+    <p>解读：<strong>（1）</strong>量程按维度存储，编码前先归一化，这是"不同关节行程差异"的标准处理；<strong>（2）</strong>clamp 兜住越界动作（演示数据常含少量越界样本），避免索引溢出；<strong>（3）</strong>解码用箱中心公式 (k + 0.5) / K，与均匀分箱的边界定义配套；<strong>（4）</strong>整数索引与浮点中心一一对应，训练与部署两侧共用同一张表，是"单一事实来源"式设计。</p>
+
+    <p><strong>片段 2：分类式动作头与交叉熵训练</strong></p>
+    <pre class="code"><code>import torch
+import torch.nn.functional as F
+
+def chunked_action_loss(logits, target_bins, pad_mask, n_bins=256):
+    """动作头输出每步每维的箱分布，逐 token 交叉熵。"""
+    # logits 形状 [B, H_c * D, K]；target_bins 形状 [B, H_c * D]
+    loss = F.cross_entropy(
+        logits.reshape(-1, n_bins),          # 展平 token 维度便于统一计算
+        target_bins.reshape(-1),
+        reduction="none")
+    # 块尾不足 H_c 步的 token 由掩码剔除，防止用填充值训练
+    mask = pad_mask.reshape(-1).float()
+    return (loss * mask).sum() / mask.sum().clamp(min=1.0)
+
+def decode_expectation(logits, binner):
+    """解码取分布的软期望：连续输出并可读出置信度。"""
+    probs = torch.softmax(logits, dim=-1)
+    centers = (torch.arange(binner.n_bins, dtype=torch.float32) + 0.5) / binner.n_bins
+    # 期望落在归一化空间，再映射回物理量程
+    norm = (probs * centers).sum(dim=-1)
+    return norm * (binner.high - binner.low) + binner.low
+</code></pre>
+    <p>解读：<strong>（1）</strong>交叉熵按 token 展开计算，与语言模型完全同构，方便与世界模型共享训练基础设施；<strong>（2）</strong>掩码按有效 token 数归一，块长变化时损失尺度不变；<strong>（3）</strong>软期望解码让输出连续，多峰时输出两峰之间仍有意义的插值位置，实际下发配合平滑使用；<strong>（4）</strong>概率分布同时保留，最大概率与期望的差异可作为低置信信号。</p>
+
+    <p><strong>片段 3：执行端平滑与低置信保持</strong></p>
+    <pre class="code"><code>class ActionSmoother:
+    """执行端整形：指数平滑抑制阶梯抖动，低置信时保持上一周期动作。"""
+    def __init__(self, alpha=0.3, conf_thresh=0.5):
+        self.alpha = alpha                  # 新值权重：越小越平滑
+        self.conf_thresh = conf_thresh
+        self.last = None
+
+    def step(self, action, max_prob):
+        if max_prob &lt; self.conf_thresh and self.last is not None:
+            # 置信度不足时保持：避免抖动的分箱跳变直接进入控制回路
+            action = self.last
+        if self.last is None:
+            self.last = action
+        else:
+            action = self.alpha * action + (1 - self.alpha) * self.last
+            self.last = action
+        return action
+</code></pre>
+    <p>解读：<strong>（1）</strong>平滑与置信控制放在执行端，训练侧保持"干净"的监督信号，职责分离；<strong>（2）</strong>保持策略只在置信度低时触发，避免长期保持造成的响应迟滞；<strong>（3）</strong>alpha 越小动作越平滑，但跟踪误差上升，需按控制频率标定：高频回路可用更小的 alpha；<strong>（4）</strong>last 状态随执行器生命周期维护，重置时机（例如换任务）需要与上层调度约定。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>量程不归一直接均匀分箱</strong>：不同关节的物理行程差异巨大（例如基座关节 ±170 度、腕关节 ±30 度），统一量程让小行程关节的有效分辨率严重不足。修复：按维度量程归一化后再分箱，量程表在数据统计阶段生成。</li>
+      <li><strong>分箱边缘抖动</strong>：动作在箱边界附近时，两次前向的量化结果在相邻箱间跳变，执行端出现高频抖动。修复：解码取软期望或箱中心，配合指数平滑；在训练中加入对边界样本的权重调整。</li>
+      <li><strong>词表过大导致长尾稀疏</strong>：K 提到 1024 以上后，极端箱的样本极少，分类头对长尾 token 的估计不稳定。修复：K 控制在 256 量级，改用非均匀分箱把分辨率分配给高频动作区间。</li>
+      <li><strong>反量化后直接下发无平滑</strong>：分箱阶梯直接进入控制回路，关节速度指令出现锯齿。修复：执行端加入平滑与速率限制，速率上限按执行器的额定速度设定。</li>
+      <li><strong>二值量按连续量处理</strong>：夹爪开合只有两个有效状态，均匀分箱把中间箱的样本量堆成噪声。修复：二值维度用专门的分类维度处理，或在编码前做阈值化，训练时给予单独权重。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把 K 从 256 降到 64。预测关节角量化误差、末端位置误差与执行抖动三项指标的变化，并说明哪一项最先恶化。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>箱宽变为 4 倍，关节角误差界从 Δ/2 直接放大 4 倍，末端误差经雅可比放大后最先在精密任务上恶化；抖动因箱间距离增大反而更明显。最先可测的是末端位置的静态精度。</div></details>
+      </li>
+      <li>推导：均匀分箱下解码取箱中心时期望量化误差为零，解码取左边界时误差期望为 −Δ/2。给出两类解码的均方误差表达式。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>动作在箱内均匀假设下，取中心的均方误差为 Δ²/12，取左边界为 Δ²/3；中心解码同时消除偏置与三倍方差，是标准选择。</div></details>
+      </li>
+      <li>设计非均匀分箱实验：对同一数据集分别用均匀与分位数分箱（K 相同），预测两者在"慢速微调阶段"与"快速转移阶段"的量化误差分布差异，并说明评估所需的统计量。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>分位数分箱在慢速微调段误差显著更小，快速段略大；统计量按阶段分组报告误差均值与 95 分位，避免全样本平均掩盖分段差异。</div></details>
+      </li>
+      <li>把解码从软期望改成"最大概率箱中心"，预测执行轨迹的抖动幅度与跟踪误差的变化，并说明为什么会发生这种变化。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>多峰分布下最大箱在相邻周期可能切换，抖幅上升；跟踪误差在单峰区域几乎不变。变化源于 argmax 的不连续性，期望解码则是连续映射。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>动作离散化让连续控制进入 token 建模框架，同时为策略提供表达多峰分布的能力。</li>
+      <li>均匀分箱的误差界为 Δ/2，解码取箱中心可消除偏置；运动学敏感性决定 K 的取值。</li>
+      <li>非均匀分箱（分位数、μ 律压缩）把分辨率分配给高频动作区域，适合分布偏斜明显的任务。</li>
+      <li>动作块的 token 布局需要与世界模型的条件通道保持一致，时间优先布局与因果掩码天然匹配。</li>
+      <li>执行端平滑与低置信保持是离散化链路的标准收尾，平滑无法修复系统性的量程偏置。</li>
+      <li>下一章进入联合训练中的随机化：在环境参数分布上训练稳健策略，覆盖仿真与真实的差距。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch026.html">← 第 026 章：VLA策略的注意力可视化</a>
+    <a class="next" href="ch028.html">第 028 章：联合训练中的随机化 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

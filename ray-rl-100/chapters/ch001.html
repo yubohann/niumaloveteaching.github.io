@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第001章 Ray环境搭建与第一个分布式任务 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · Ray 基础与分布式编程</span>
+    <span class="sep">/</span>
+    <span>第 001 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · Ray 基础与分布式编程</div>
+    <h1>第 001 章：Ray环境搭建与第一个分布式任务</h1>
+    <p class="lead">先看懂 Ray 的分层架构与一次远程任务的完整生命周期，再在本机完成初始化并跑通第一个分布式任务，为后续的采样并行与训练分布打底。</p>
+    <ul class="meta">
+      <li>主题：Ray 核心 / 运行环境与执行模型入门</li>
+      <li>关键机制：全局控制服务（GCS）、调度单元（Raylet）、对象引用（ObjectRef）、本地集群初始化</li>
+      <li>预计学时：50 分钟</li>
+      <li>前置章节：无（本课程从这里开始）</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>建立 Ray 运行时的分层心智模型：驱动进程（Driver）、工作进程（Worker）、调度单元（Raylet）、全局控制服务（Global Control Service, GCS）与对象存储（Object Store）各司其职。</li>
+      <li>理解一次远程调用从提交、调度、执行到取回结果的完整生命周期，明确对象引用（ObjectRef）在其中扮演的凭据角色。</li>
+      <li>掌握本机环境的安装与初始化：版本对齐、资源声明、对象存储上限的设置依据。</li>
+      <li>能写第一个分布式任务，并用吞吐（步/秒）对比串行与并行的差异，解释加速比与性能上限。</li>
+      <li>会诊断三类入门级故障：任务永久待调度、对象存储溢出、重复初始化。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>强化学习训练的算力需求天然是并行的：多个环境副本同时采样、多个策略副本同时求梯度、多组超参数同时搜索。用 Python 原生多进程去拼这套体系，很快会撞上三堵墙：进程间大数据传输要反复序列化、任务调度与容错要自己写、资源分配靠人工约定。<strong>Ray 的价值在于把这三件事变成运行时内置能力</strong>，让编写分布式程序接近编写单机函数。</p>
+    <p>Ray 的做法可以概括为：用一个统一的资源调度层管理整个集群的 CPU、GPU 与自定义资源；用对象存储与共享内存把大对象在进程间零拷贝传递；用装饰器把普通 Python 函数与类变成可远程执行的实体。RLlib、Ray Tune、Ray Data、Ray Serve 都建在这层之上，所以先理解 Ray Core 的架构，后面所有上层的并行度、资源与故障行为才有处可依。</p>
+    <p>本章先在本机跑通第一个分布式任务，核心收获是建立"提交即返回凭据、结果延迟取回"的思维习惯，API 语法只占其中很小一部分；这个习惯将贯穿整个课程。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 运行时分层：谁在管理谁</h3>
+    <p>启动 Ray 后，本机（或集群）内会出现一组协作的常驻进程，它们的职责如下表。理解这张表是排障的地图：任务卡住、对象丢失、资源对不上，症状不同，责任进程也不同。</p>
+    <table>
+      <tr><th>组件</th><th>职责</th><th>故障时的典型症状</th></tr>
+      <tr><td>驱动进程（Driver）</td><td>运行主程序，提交任务与 Actor，调用 ray.get 取结果</td><td>脚本退出导致结果丢失、阻塞等待</td></tr>
+      <tr><td>工作进程（Worker）</td><td>实际执行远程函数与 Actor 方法</td><td>异常被封装进对象引用，取回时才抛出</td></tr>
+      <tr><td>调度单元（Raylet）</td><td>每个节点一个，负责本地资源账本与任务分派</td><td>资源不足时任务停留在待调度状态</td></tr>
+      <tr><td>全局控制服务（GCS）</td><td>维护全集群的节点、资源与 Actor 注册信息</td><td>信息过期、节点视图不一致</td></tr>
+      <tr><td>对象存储（Object Store）</td><td>存放跨进程共享的不可变对象，大对象经共享内存零拷贝访问</td><td>内存占用攀升、对象被逐出后触发重算</td></tr>
+    </table>
+    <p><strong>调度决策遵循"资源账本加就近原则"</strong>：每个 Raylet 维护本节点的可用资源，任务优先落在数据所在节点，减少跨节点传输。这套机制在单机模式下同样成立，因此本机开发的代码可以直接扩展到集群，环境的差异主要体现在节点数量与资源总量上。</p>
+
+    <h3>2. 一次远程任务的完整生命周期</h3>
+    <p>把 <code>@ray.remote</code> 装饰的函数想成一个"招工启事"：调用方提交的是一份任务描述，由调度器寻找执行者。完整流程分五步：</p>
+    <ol>
+      <li><strong>提交</strong>：驱动进程调用 <code>f.remote(args)</code>，参数被序列化，任务描述进入 GCS 与本地 Raylet 的视野。</li>
+      <li><strong>调度</strong>：调度器按资源需求（CPU、GPU、自定义资源）挑选节点与工作进程。若无空闲资源，任务进入待调度队列，直到有资源释放。</li>
+      <li><strong>执行</strong>：工作进程反序列化参数，执行函数体，把返回值写入对象存储。</li>
+      <li><strong>封存</strong>：返回值成为不可变对象，附带唯一编号；调用方拿到的对象引用（ObjectRef）相当于取件凭证。</li>
+      <li><strong>取回</strong>：<code>ray.get(ref)</code> 按凭证取结果；若尚未完成则阻塞等待。对象直接以共享内存映射方式访问，不产生第二次拷贝。</li>
+    </ol>
+    <div class="box key">
+      <span class="box-title">设计决策：为什么 remote 调用立即返回</span>
+      <p>立即返回是并行化的前提。若 <code>f.remote()</code> 阻塞到结果就绪，循环提交 N 个任务就退化成串行执行。返回对象引用使"提交"与"取回"解耦，程序可以在等待期间继续提交新任务或做本地计算，调度器则把所有任务铺满可用资源。后续章节的流水线、异步接口、采样循环都建立在这个延迟取回语义之上。</p>
+    </div>
+
+    <h3>3. 资源声明与并行度</h3>
+    <p>Ray 默认按机器可探测的 CPU 数分配资源，也可以显式声明。任务与 Actor 在提交时声明需求，例如 <code>@ray.remote(num_cpus=2)</code> 表示一个任务独占 2 个逻辑核；16 核机器上最多同时运行 8 个这类任务。资源声明与实际占用的一致性是调度正确性的前提，声明过大导致任务长期排队，声明过小导致物理核超卖、性能反而下降。</p>
+    <div class="formula">
+      并行任务数 ≈ 节点 CPU 总数 ÷ 单任务声明核数
+      <span class="note">16 核机器、每任务声明 1 核 → 最多 16 个任务并行；若每任务实际占用 2 核，则发生超卖，吞吐低于预期</span>
+    </div>
+    <p><strong>加速比与核数不成正比</strong>：任务启动、参数序列化、结果传输、调度开销构成固定成本。任务越小，固定成本占比越高，并行收益越容易被吞掉。经验区间是：单任务计算时长从数十毫秒提升到数百毫秒以上，调度开销才可忽略。</p>
+
+    <h3>4. 数值算例：固定开销如何吞掉并行收益</h3>
+    <p>用一个可逐步演算的模型把"粒度太细吃掉收益"定量化。设单任务纯计算时长为 t<sub>c</sub>，每任务的固定开销（参数序列化、调度分派、结果回传）合计 t<sub>o</sub> = 12 ms，机器为 16 核，每个逻辑核由一个 worker 处理等长任务队列。理想情形（开销为零）的并行时间为 N × t<sub>c</sub> ÷ 16；实际情形下每个核串行处理 N ÷ 16 个任务，每个任务占用 t<sub>c</sub> + t<sub>o</sub>。实际时间与理想时间的比值就是并行效率：</p>
+    <div class="formula">
+      η = t<sub>c</sub> ÷ (t<sub>c</sub> + t<sub>o</sub>)，每秒每核有效任务数 ≈ 1 ÷ (t<sub>c</sub> + t<sub>o</sub>)
+      <span class="note">取 t<sub>o</sub> = 12 ms 逐档代入：t<sub>c</sub> = 5 ms 得 η = 29.4%；50 ms 得 80.6%；500 ms 得 97.7%</span>
+    </div>
+    <table>
+      <tr><th>单任务计算时长 t<sub>c</sub></th><th>并行效率 η</th><th>每核吞吐（任务/秒）</th><th>被开销吞掉的比例</th></tr>
+      <tr><td>5 ms</td><td>29.4%</td><td>58.8</td><td>70.6%</td></tr>
+      <tr><td>50 ms</td><td>80.6%</td><td>16.1</td><td>19.4%</td></tr>
+      <tr><td>500 ms</td><td>97.7%</td><td>2.0</td><td>2.3%</td></tr>
+    </table>
+    <p>代入过程以 5 ms 一档为例：5 ÷ 17 = 0.294，即 16 核整机每秒完成 16 × 58.8 ≈ 941 个任务，而零开销理想值为 16 × 200 = 3200 个，差值全部流向调度与序列化。50 ms 一档的损耗降到两成以内，500 ms 一档基本可以忽略。<strong>计算时长达到固定开销的约 40 倍时效率才越过 97%</strong>；达到 10 倍时约 91%，仍然每 11 份算力有 1 份被开销消耗。</p>
+    <p>该模型还有两个修正方向。其一，结果对象较小时，回传可以与同一 worker 的下一任务计算重叠，实际效率略高于表中数值，量级关系不变。其二，t<sub>o</sub> 随任务规模增长：任务数量与引用图越复杂，驱动进程侧的提交与解引用开销越大。因此增大粒度的两种手段（worker 内部循环批处理、单步计算向量化）在后续章节反复出现：第 022 章的环境向量化把多次小步进合并为一次批处理，第 083 章则要在并行环境数与单环境步进量之间重新分配同一笔预算。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>搭建本机 Ray 环境的标准步骤：</p>
+    <ol>
+      <li><strong>版本对齐</strong>：Python 与 Ray 版本之间、Ray 与 RLlib/Tune 之间必须配套。安装时优先选择官方发布的成套版本组合，避免单独升级子包导致接口错位。</li>
+      <li><strong>安装</strong>：核心功能用 <code>pip install ray</code>；需要 RLlib、Tune、Data、Serve 等上层库时使用带扩展标记的安装（如 <code>ray[rllib,tune]</code>），把依赖一次性装全。</li>
+      <li><strong>初始化</strong>：<code>ray.init()</code> 启动本机集群。显式给出 <code>num_cpus</code>、<code>num_gpus</code>、<code>object_store_memory</code>，让资源账本与物理机器一致。</li>
+      <li><strong>先单机后集群</strong>：本机模式下所有调度、序列化、对象存储行为与集群一致，调试效率最高；确认逻辑正确后再迁移到集群（第 007 章）。</li>
+      <li><strong>度量</strong>：用固定任务量测吞吐（步/秒），调整 worker 数量观察曲线，找到本机的最优并行度。</li>
+    </ol>
+    <table>
+      <tr><th>参数</th><th>典型取值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>num_cpus</td><td>物理逻辑核数</td><td>声明本节点可被调度的核数</td><td>与硬件一致，留 1–2 核给系统与驱动</td></tr>
+      <tr><td>object_store_memory</td><td>2–8 GiB</td><td>对象存储内存上限</td><td>不超过物理内存的 30%，预留解释器开销</td></tr>
+      <tr><td>_temp_dir</td><td>专用数据盘目录</td><td>套接字与溢写临时目录</td><td>路径不含空格与非 ASCII 字符</td></tr>
+    </table>
+
+    <h3>安装与版本对齐</h3>
+    <p>安装环节最常见的隐性故障来自版本错位，需要对齐的关系共有四层：Python 解释器版本、Ray 版本（<code>ray.__version__</code>）、上层库版本（RLlib 与 Tune 随 Ray 一同发行）、深度学习框架版本（PyTorch 与 CUDA 驱动）。核对顺序固定为三条命令：<code>python -V</code> 确认解释器，<code>python -c "import ray; print(ray.__version__)"</code> 确认运行时，<code>pip check</code> 检查整个环境的依赖冲突。当 RLlib 报出策略类缺失或配置键无法识别时，第一嫌疑是 Ray 与框架版本错位，代码本身的错误概率排在后面。另有一条容易踩中的安装陷阱：不要单独执行 <code>pip install rllib</code>，RLlib 自 Ray 1.x 起随主包发行，PyPI 上的同名独立包年代久远，会把依赖树拆散。</p>
+
+    <h3>与相邻方案的定量对照</h3>
+    <p>理解 Ray 的定位，需要与两种常见的并行方案对照：进程池（multiprocessing）与消息传递接口（Message Passing Interface, MPI）。</p>
+    <table>
+      <tr><th>维度</th><th>Python multiprocessing</th><th>MPI（mpi4py）</th><th>Ray</th></tr>
+      <tr><td>进程模型</td><td>固定进程池，启动后规模不变</td><td>作业启动即固定通信域</td><td>动态 worker 池，按资源账本伸缩</td></tr>
+      <tr><td>数据传递</td><td>参数与返回值均经 pickle 拷贝</td><td>显式消息传递，单边通信可近零拷贝</td><td>对象存储一次写入多次读取，同节点共享内存映射</td></tr>
+      <tr><td>调度方式</td><td>静态切分，无中央调度器</td><td>无中心调度，拓扑由程序决定</td><td>资源声明驱动，支持负载均衡与抢占</td></tr>
+      <tr><td>容错</td><td>需自行重试</td><td>默认整作业退出</td><td>任务重试与 Actor 重建内置</td></tr>
+      <tr><td>适用边界</td><td>单机、任务间无大量数据共享</td><td>超算、固定拓扑、通信密集</td><td>单机与集群同一 API，任务图可动态生成</td></tr>
+    </table>
+    <p>三者的定量差异集中在"同节点大对象被多次消费"的场景。假设一个 256 MB 的数组需要被 8 个下游任务读取：multiprocessing 在传递时逐个 pickle，最坏产生 8 次全量复制，合计约 2 GB 内存流量；Ray 侧先 <code>ray.put</code> 写入对象存储一次，再把同一个对象引用交给 8 个任务，同节点读取走共享内存映射，复制次数为 0。反过来，任务之间几乎不共享数据的场景里，对象存储与调度的固定成本属于纯开销，进程池的简单结构开销更小。第 003 章会把"一次写入、多次读取"这条性质展开为对象存储的完整规则。</p>
+    <div class="box tip">
+      <span class="box-title">与后续章节的差异点</span>
+      <p>本章只使用无状态任务（Task）；第 002 章引入有状态 Actor 后，方法的执行位置、并发语义与生命周期管理都会出现新的约束。本章先建立"任务即一次性计算"的基线，作为后续对照。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>以下片段采用 Ray 2.x 时期的通用写法；接口随版本演进，以对应版本官方文档为准。</p>
+    <p><strong>片段 1：初始化本机集群并核对资源账本</strong></p>
+    <pre class="code"><code>import ray
+
+ray.init(
+    num_cpus=16,                      # 显式声明可调度的逻辑核数，与物理核保持一致
+    num_gpus=0,                       # 本机无 GPU 时保持 0，声明过大将导致任务永久排队
+    object_store_memory=4 * 1024**3,  # 对象存储上限 4 GiB，按物理内存的 30% 以内取值
+    _temp_dir="D:/ray_tmp",           # 指定无空格路径，规避平台相关的套接字路径问题
+)
+
+print(ray.cluster_resources())        # 集群资源总量：调度器的"总预算"
+print(ray.available_resources())      # 当前空闲资源：随任务提交与完成动态变化
+
+ray.shutdown()                        # 显式关闭，保证下次 init 从干净状态开始</code></pre>
+    <p>解读：三个参数对应三类风险。<code>num_cpus</code> 是调度器的唯一依据，本地机器比它大多少核都不影响调度结果；<code>num_gpus</code> 声明错误是新手最常见的"任务排队"原因。<code>object_store_memory</code> 控制对象存储预算，它与 Python 解释器内存叠加占用物理内存，取值过大在加载大模型或大回放数据时会触发系统级内存压力。查询 <code>cluster_resources</code> 与 <code>available_resources</code> 的差值，可以判断当前有多少资源被占用，这是所有资源问题的第一步诊断。</p>
+
+    <p><strong>片段 2：第一个分布式任务，提交即返回</strong></p>
+    <pre class="code"><code>import ray
+import time
+
+ray.init(num_cpus=16)
+
+@ray.remote(num_cpus=1)            # 每个任务声明占用 1 个逻辑核，由调度器记账
+def simulate_rollout(worker_id, steps=50000):
+    """模拟一个环境副本推进若干步的计算量，返回统计结果。"""
+    import random
+    rng = random.Random(worker_id)  # 按 worker_id 播种，保证结果可复现
+    state = 0.0
+    for _ in range(steps):
+        state = 0.999 * state + rng.random()  # 轻量递推，模拟采样循环的开销
+    return worker_id, state
+
+t0 = time.perf_counter()
+refs = [simulate_rollout.remote(i) for i in range(16)]   # 立即返回对象引用，不阻塞
+print("已提交任务数:", len(refs))                          # 提交阶段几乎瞬时完成
+results = ray.get(refs)          # 统一等待所有任务完成；调度器把它们铺满 16 个核
+dt = time.perf_counter() - t0
+print("总步数:", 16 * 50000, "耗时: %.2f s" % dt,
+      "吞吐: %.0f 步/秒" % (16 * 50000 / dt))</code></pre>
+    <p>解读：注意两次计时点的位置。<code>remote</code> 调用阶段只做参数序列化与任务登记，耗时可以忽略；真正的等待发生在 <code>ray.get</code>。这种"先全部提交、再统一取回"的写法让 16 个任务同时进入调度队列，先完成的核立刻接下一个任务，整体吞吐接近线性扩展。若改成"提交一个、取回一个"的循环，任何时刻只有一个任务在跑，并行度退化为 1。返回值里携带 worker_id 便于核对结果与任务的一一对应关系，这是排查"结果错位"类问题的基本手段。</p>
+
+    <p><strong>片段 3：并行度扫描，寻找本机吞吐拐点</strong></p>
+    <pre class="code"><code>import ray
+import time
+
+ray.init(num_cpus=16)
+
+@ray.remote(num_cpus=1)
+def step_sim(seed, steps=50000):
+    import random
+    rng = random.Random(seed)
+    state = 0.0
+    for _ in range(steps):
+        state = 0.999 * state + rng.random()
+    return state
+
+def measure(n_workers):
+    t0 = time.perf_counter()
+    ray.get([step_sim.remote(i, steps=50000) for i in range(n_workers)])
+    dt = time.perf_counter() - t0
+    total = n_workers * 50000
+    print(f"workers={n_workers:2d}  总步数={total:7d}  "
+          f"耗时={dt:5.2f}s  吞吐={total / dt:10,.0f} 步/秒")
+
+for n in (1, 2, 4, 8, 16, 32):   # 扫描并行度，观察吞吐何时停止增长
+    measure(n)</code></pre>
+    <p>解读：最后一个数据点（32 workers）故意超过 16 核容量，用于观察两种现象：任务分批执行导致的耗时台阶，以及单核超卖后的吞吐回落。曲线通常在核数处出现拐点：核数之前吞吐随 worker 数近似线性上升，之后趋平甚至下降。这段脚本把"并行度该设多少"从猜测变成测量，后来的 RLlib 环境副本数、Tune 并发试验数都沿用同一套标定方法。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>忘记 ray.get 导致结果丢失</strong>：提交任务后直接退出程序，驱动进程结束后对象存储被回收，任务结果一并消失。症状是偶尔打印出无意义的值或没有任何输出。修复：所有需要结果的引用都要显式 <code>ray.get</code>，或使用 <code>ray.wait</code> 循环消费。</li>
+      <li><strong>资源声明超出物理容量</strong>：在 8 核机器上声明 <code>num_cpus=32</code>，16 个任务会有 8 个长期处于待调度状态，程序看起来"卡住"。修复：资源声明与硬件容量一致；用 <code>ray.available_resources()</code> 核对剩余资源。</li>
+      <li><strong>重复初始化与残留进程</strong>：在 Jupyter 中反复运行初始化单元，或上一次的 Ray 进程未退出，会看到地址占用的错误。修复：初始化前用 <code>ray.is_initialized()</code> 判断并复用现有集群，必要时 <code>ray.shutdown()</code> 后重新启动。</li>
+      <li><strong>对象存储默认预算与解释器内存叠加</strong>：对象存储上限过大时，大对象集合会同时挤压 Python 堆内存，表现为系统级内存交换或进程被终止。修复：把对象存储控制在物理内存的 30% 以内，大对象及时释放引用。</li>
+      <li><strong>任务粒度过细</strong>：把单次耗时不足 10 毫秒的计算拆成远程任务，调度与序列化开销超过计算本身，吞吐不升反降。修复：合并小任务，让单任务计算时长达到数百毫秒量级再并行。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>在本机 8 核环境运行片段 3 的扫描脚本，分别取 workers = 1、4、8、16。预测 16 workers 的吞吐相对 1 worker 的加速比，运行后与预测对照，解释偏差来源。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>8 核机器上 8→16 的区间已经进入分批执行，吞吐趋于饱和。偏差主要来自调度开销、内存带宽争用与 Python 全局解释器锁之外的系统噪声。加速比必然低于核数，把实测曲线画出来比记结论更有价值。</div></details>
+      </li>
+      <li>把 <code>object_store_memory</code> 分别设为 512 MiB 与 4 GiB，观察 <code>ray.cluster_resources()</code> 输出中对象存储数值的变化，并说明该参数为什么影响大对象任务的稳定性。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>对象存储是跨进程共享对象的落脚点；预算耗尽时对象会被溢写到磁盘或触发重算，吞吐出现台阶式下降。该参数与解释器内存之和不应超过物理内存。</div></details>
+      </li>
+      <li>设计实验测量任务粒度与吞吐的关系：固定 worker 数为 8，把 <code>steps</code> 取 500、5000、50000 三档，记录吞吐并解释拐点。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>steps=500 时单任务计算时间进入毫秒级，调度开销占比显著；steps 越大固定开销占比越低。结论是"任务粒度要与调度开销拉开两个数量级"。</div></details>
+      </li>
+      <li>推导：设任务总工作量中可并行部分占比为 p，单机需要串行部分占比为 1-p。用阿姆达尔定律估算 16 workers 的理论加速上限，并解释为什么实测值更低。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>加速比上限 = 1 / ((1-p) + p/16)。实测更低的原因包括调度与序列化开销、结果汇总的串行段、内存带宽瓶颈。</div></details>
+      </li>
+      <li>设计一个两级分布式任务：第一级 16 个任务各自生成一批数据并返回统计量，第二级 4 个任务对统计量做分组合并。画出对象引用之间的依赖关系图，说明为什么所有第一级任务应"先提交、后统一取回"。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>依赖图中两级任务通过对象引用连成有向无环图（DAG）；先提交后取回让第一级任务全部进入调度队列获得满负载。第二级任务的参数直接引用第一级的返回对象，调度器会自动等待依赖就绪，这正是第 004 章的主题。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>Ray 运行时由驱动进程、工作进程、Raylet、GCS 与对象存储协作构成；调度依赖每个节点的资源账本。</li>
+      <li>一次远程调用经历提交、调度、执行、封存、取回五步；对象引用是延迟取回结果的凭据。</li>
+      <li>设计决策的核心是<strong>提交与取回解耦</strong>：先批量提交、后统一取回，任务才能铺满资源。</li>
+      <li>资源声明必须与硬件一致；并行度用吞吐测量标定，串行部分决定加速上限。</li>
+      <li>下一章进入 Ray 的两大执行原语：<strong>远程函数与 Actor</strong>，重点讲清无状态任务与有状态进程的语义区别与选用标准。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="../index.html">← 返回课程目录</a>
+    <a class="next" href="ch002.html">第 002 章：Ray远程函数与Actor基础 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

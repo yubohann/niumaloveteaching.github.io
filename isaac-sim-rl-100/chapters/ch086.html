@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第086章 实现末端执行器定向控制 | 机器人仿真学习课程 · Isaac Sim 强化学习训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第四篇 · 控制与优化</span>
+    <span class="sep">/</span>
+    <span>第 086 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第四篇 · 控制与优化</div>
+    <h1>第 086 章：实现末端执行器定向控制</h1>
+    <p class="lead">位置到了还不够，姿态也得对：焊接要垂直、倒水要倾角、装配要对孔。本章讲清三种姿态表示的取舍，用四元数误差构造稳定的观测与奖励，避开万向锁与双覆盖两个经典陷阱。</p>
+    <ul class="meta">
+      <li>主题：控制与优化 / 姿态表示与定向控制</li>
+      <li>相关组件：Isaac Sim / Isaac Lab / Stable-Baselines3</li>
+      <li>预计学时：50 分钟</li>
+      <li>前置章节：第 085 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解三种姿态表示（欧拉角、旋转矩阵、四元数）的数学本质与工程取舍。</li>
+      <li>说清万向锁的产生机制，以及它为何是学习型控制器必须处理的问题。</li>
+      <li>掌握四元数误差的稳定计算：双覆盖处理、旋转误差向量（轴角）的计算与用法。</li>
+      <li>会设计"位置 + 姿态"的联合观测与奖励，并用"等效位移"给两个权重定量。</li>
+      <li>能诊断姿态奖励记账错误、欧拉角观测跳变、单一姿态过拟合等问题。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>很多任务的成功判据里，姿态往往比位置更关键：USB 插孔差 1 mm 还能导引，角度差 5° 就永远插不进去；倒水时杯口倾角直接决定流量。机械臂的末端姿态是 3 个自由度（围绕三个轴的转动），把它们准确、无歧义、无奇异地送进神经网络，比位置复杂一个量级。</p>
+    <p>姿态表示的坑很隐蔽：同一个物理姿态有多种数值表示（欧拉角的多解、四元数的正负号），如果观测或奖励里用错表示，<strong>网络看到的"状态"会突然跳变，而奖励却忽略了真实的物理等价性</strong>，训练要么不收敛，要么收敛到一个"看着对、其实全靠碰巧"的策略。本章把姿态这件事从数学讲到代码。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 姿态的三种表示</h3>
+    <table>
+      <tr><th>表示</th><th>参数数</th><th>优势</th><th>致命弱点</th></tr>
+      <tr><td>欧拉角 (roll, pitch, yaw)</td><td>3</td><td>直观、可读</td><td>万向锁、多解（同一姿态多组角）、插值无意义</td></tr>
+      <tr><td>旋转矩阵 R</td><td>9（6 约束）</td><td>无奇异、可直接乘</td><td>冗余且必须保持正交；网络输出难以约束在流形上</td></tr>
+      <tr><td>四元数 (w, x, y, z)</td><td>4（1 约束）</td><td>无万向锁、插值平滑、计算省</td><td>双覆盖（q 与 −q 同姿态）、需归一化</td></tr>
+    </table>
+    <p>结论先行：<strong>传动与存储用四元数，观测与奖励用"旋转误差向量"，不要把原始欧拉角喂给网络</strong>。理由如下。</p>
+
+    <h3>2. 万向锁：为什么欧拉角不适合做控制</h3>
+    <p>欧拉角描述的是"依次绕三个轴转"，三个角的速度与真实角速度 ω 之间有线性映射 ω = E(θ)·θ̇。当中间角（pitch）达到 ±90° 时，第一轴与第三轴重合，E 降秩，<strong>roll 与 yaw 的变化产生完全相同的效果，两个自由度坍缩成一个</strong>。这就是万向锁（gimbal lock）。它的实际后果：<strong>要么为产生所需 ω 需要无穷大的角速度，要么某个方向的转动彻底不可达</strong>。四元数与旋转矩阵没有这个内禀奇异（只在一个测度为零的点上病态）。</p>
+
+    <h3>3. 旋转误差：一个 3 维的"姿态距离"</h3>
+    <p>给定当前姿态 R 与目标姿态 R<sub>d</sub>，相对旋转为：</p>
+    <div class="formula">
+      R<sub>err</sub> = R<sub>d</sub> · R<sup>T</sup>
+      <span class="note">顺序：先"撤掉当前姿态"再"转到目标"；反过来写会得到不同坐标系下的误差</span>
+    </div>
+    <p>由 Rodrigues 公式，任何相对旋转等价于绕某个单位轴 n 转角度 θ。把误差压成 3 维向量：</p>
+    <div class="formula">
+      e<sub>o</sub> = θ · n，&nbsp; θ = arccos((tr(R<sub>err</sub>) − 1) / 2) ∈ [0, π]
+      <span class="note">e_o 是"旋转向量"(axis-angle vector)：方向=往哪转，长度=转多少弧度</span>
+    </div>
+    <p>为什么它好用：e<sub>o</sub> 与角速度同量纲（rad），可与位置误差（m）一起进观测和奖励；θ=0 处光滑；长度天然有界（≤π）。<strong>这就是机器人学习中 "orientation error as axis-angle" 标准做法的来历。</strong></p>
+
+    <h3>4. 四元数的双覆盖：p 与 −p 是同一姿态</h3>
+    <p>四元数 p = (w, x, y, z) 与 −p 表示完全相同的旋转。这带来两类事故：比较两个四元数时数值上相差很远（点积为 −1，与 +1 数值上差别最大），但物理上姿态一致；插值时走"远路"绕 360°。处理办法是<strong>先对齐符号再做运算</strong>：</p>
+    <div class="formula">
+      若 p<sub>cur</sub>·p<sub>des</sub> &lt; 0，令 p<sub>des</sub> ← −p<sub>des</sub>&nbsp;&nbsp;（或统一在误差计算中取 |w|）
+      <span class="note">误差四元数 q<sub>e</sub> = p<sub>cur</sub><sup>−1</sup> ⊗ p<sub>des</sub> 后，再取 θ = 2·atan2(‖q<sub>e,vec</sub>‖, |q<sub>e,w</sub>|)</span>
+    </div>
+    <p>工程上更偏好 <code>atan2(‖v‖, |w|)</code>：arccos 版本在 θ→0 处导数无穷、浮点误差被放大；atan2 全程稳定，<strong>而小误差区域恰恰是定向任务最常用的工作区</strong>。</p>
+
+    <h3>5. 位置与姿态的语言不通：用"等效位移"翻译</h3>
+    <p>位置误差单位是米、姿态误差单位是弧度，直接相加需要权重。定量方法是给一个"等效位移尺度"：把姿态误差换算成"若是纯位置误差，相当于多走了多少米"。经验换算：<strong>末端到腕部旋转中心约 0.2 m，3°（0.052 rad）的姿态误差在腕部约合 0.01 m 的弧长偏差</strong>，据此可把两组权重调成物理可比，省去反复试错。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <ol>
+      <li><strong>先定坐标系约定</strong>：所有姿态误差在同一个坐标系里算（推荐世界系或基座系）；明确"目标姿态"是末端期望朝向还是工具轴期望方向，少一个约定，后面全乱。</li>
+      <li><strong>观测：喂误差向量，绝对值不进观测</strong>。位置误差 + 旋转误差 e<sub>o</sub>（3 维）+ 末端角速度共 9 维任务相关量，再叠关节位置/速度；四元数只作中间计算，不进观测。</li>
+      <li><strong>奖励写成指数核</strong>：r = w<sub>p</sub>·exp(−k<sub>p</sub>‖e<sub>p</sub>‖) + w<sub>o</sub>·exp(−k<sub>o</sub>θ)。指数核在误差大时梯度小（允许"先干别的"）、接近目标时梯度密（精细收敛），比线性 −‖e‖ 更符合"先粗后精"的行为模式。</li>
+      <li><strong>权重用等效位移对齐</strong>：取 k<sub>o</sub> = k<sub>p</sub>·0.2（0.2 m 是典型腕部半径），w<sub>o</sub> = w<sub>p</sub>。若任务对姿态更敏感（插孔），再看情况加大 w<sub>o</sub>。</li>
+      <li><strong>成功判据分开设阈值</strong>：位置 &lt; 5 mm（再放宽到"轴线对准"口径），姿态 &lt; 3°；两项都满足才算成功，只用位置判据会放过"歪着进去"的假成功。</li>
+      <li><strong>姿态目标随机化</strong>：训练时目标姿态在球面上随机采样（或至少 ±30° 扰动），否则策略会记住"手腕固定朝下"这一条捷径，换任务就崩。</li>
+      <li><strong>评估</strong>：位置误差与姿态误差的分位数（P50/P90）分别统计；另记录绕工具轴的"自旋"误差，绕对称轴的旋转常常不影响任务，浪费网络容量，可加权弱化。</li>
+    </ol>
+    <div class="box key">
+      <span class="box-title">设计思维：旋转误差向量相对目标四元数的优势</span>
+      <p>把目标四元数直接喂给网络，等于要求网络自己学会"四元数乘法/范数"这些非线性运算，还要处理双覆盖；而"我离目标还差多少角度、往哪个方向转"（e<sub>o</sub>）是<strong>对策略友好的充分统计量</strong>，把状态投影到任务需要的低维坐标系里，学习难度会显著下降。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：旋转误差向量（axis-angle）的稳定计算</strong></p>
+    <pre class="code"><code>import torch
+
+def quat_mul(a, b):
+    """四元数乘法（w 在前）：a ⊗ b。批量形状 (B, 4)。"""
+    aw, ax, ay, az = a.unbind(-1)
+    bw, bx, by, bz = b.unbind(-1)
+    return torch.stack([
+        aw * bw - ax * bx - ay * by - az * bz,
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+    ], dim=-1)
+
+def quat_inverse(q):
+    """单位四元数的逆 = 共轭（实部不变，虚部取反）。要求 q 已归一化。"""
+    return torch.stack([q[..., 0], -q[..., 1], -q[..., 2], -q[..., 3]], dim=-1)
+
+def orientation_error_vector(q_cur, q_des):
+    """相对姿态的旋转误差向量 e_o = θ·n（3 维，rad），数值稳定版本。
+    q_cur/q_des: (B, 4) 单位四元数。返回 (B, 3)。"""
+    q_cur = q_cur / q_cur.norm(dim=-1, keepdim=True)   # 防御性归一化
+    q_des = q_des / q_des.norm(dim=-1, keepdim=True)
+    # 双覆盖处理：点积为负时翻转目标，保证走"短弧"
+    dot = (q_cur * q_des).sum(dim=-1, keepdim=True)
+    q_des = torch.where(dot &lt; 0, -q_des, q_des)
+    q_err = quat_mul(quat_inverse(q_cur), q_des)       # 误差四元数
+    vec = q_err[..., 1:]                                # 虚部 = n·sin(θ/2)
+    w = q_err[..., 0:1].abs()                           # 取 |w| 稳稳落在短弧
+    v_norm = vec.norm(dim=-1, keepdim=True)
+    # θ = 2·atan2(|v|, |w|)：远离 0 与 π 都稳定，避免 arccos 的导数爆炸
+    theta = 2.0 * torch.atan2(v_norm, w)
+    return vec / v_norm.clamp(min=1e-8) * theta          # 轴向单位化再乘角度
+</code></pre>
+    <p>解读：这段是全章的数学心脏，三个细节决定成败。（1）<code>q_err = q_cur^{-1} ⊗ q_des</code> 的顺序不能反：它表示"在当前的坐标系里看目标"，换个顺序得到的是另一套坐标下的误差，数值可能差一个符号，奖励曲线会因此震荡；（2）双覆盖用<strong>点积判负翻转</strong>处理：当 q<sub>cur</sub>·q<sub>des</sub> &lt; 0 时翻转目标，保证误差四元数对应"短弧"，这是奖励连续性的前提；（3）<code>atan2(v_norm, w)</code> 代替 arccos：在姿态几乎对准（θ≈0.001 rad）时 arccos 的浮点误差会到 0.1 rad 量级，而 atan2 全程稳定。<code>clamp(min=1e-8)</code> 处理 v_norm=0（θ=0）时的除零，方向矢量取任意但角度为 0，不影响结果。</p>
+
+    <p><strong>片段 2：姿态感知的观测与奖励构造</strong></p>
+    <pre class="code"><code>class OrientationAlignEnv:
+    """把"末端对准目标姿态"接进观测与奖励。位置与姿态分别核化。"""
+
+    def __init__(self, kp=15.0, k_orient=0.2, pos_tol=0.005,
+                 rot_tol=3.14159 / 60.0):   # 3° ≈ 0.052 rad
+        self.kp = kp                        # 位置指数核的锐度：k=15 时 1 cm 误差衰减 e^-0.15
+        self.k_orient = k_orient            # 姿态核锐度换算：kp × 腕部半径 0.2 m
+        self.pos_tol = pos_tol              # 成功判据的位置阈值 5 mm
+        self.rot_tol = rot_tol              # 成功判据的姿态阈值 3°
+
+    def compute_obs(self, q_cur, target_pos, ee_pos, ee_angvel, joints):
+        e_p = target_pos - ee_pos                            # 位置误差（世界系）
+        e_o = orientation_error_vector(q_cur, self.q_des)    # 旋转误差向量 rad
+        # 关键：观测给"误差"（决策所需的充分统计量）
+        return torch.cat([joints, e_p, e_o, ee_angvel], dim=-1)
+
+    def compute_reward(self, e_p, e_o):
+        # 指数核：大误差时梯度平缓（容许先调整大方向），近目标时梯度密集
+        r_pos = torch.exp(-self.kp * e_p.norm(dim=-1))
+        r_ori = torch.exp(-self.kp * self.k_orient * e_o.norm(dim=-1))
+        return 0.5 * r_pos + 0.5 * r_ori                     # 两项都归一化到 (0,1]
+
+    def check_success(self, e_p, e_o):
+        # 两项判据同时满足：只判位置会放过"歪着到位"的假成功
+        return (e_p.norm(dim=-1) &lt; self.pos_tol) &amp; (e_o.norm(dim=-1) &lt; self.rot_tol)
+</code></pre>
+    <p>解读：（1）观测里的 <code>e_o</code> 是片段 1 的产物，3 维、有界（≤π）、无跳变，与位置误差量纲可比（rad vs m，通过核函数再统一）；（2）奖励把两个误差各自过指数核再加权：<code>k_orient = kp × 0.2</code> 就是"等效位移"换算的代码化，3° 的姿态误差在腕部约合 1 cm 弧长，与 1 cm 位置误差衰减同样的 e 指数；（3）<code>0.5/0.5</code> 的权重让两项各自在 (0,1] 区间，相加后奖励上限为 1，与"每步时间税"等其它项的量纲关系清晰。<strong>不要用 −‖e_p‖−0.2‖e_o‖ 的线性形式</strong>：线性核在误差 1 rad 时给出 −0.2 的常数斜率，大误差区域梯度不衰减，策略会在"姿态差得远"时过度牺牲位置，指数核天然处理"先解决主要的差距"。</p>
+
+    <p><strong>片段 3：训练统计，分开记录位置与姿态误差</strong></p>
+    <pre class="code"><code>log = {"pos_err": [], "rot_err_deg": [], "spin_deg": [], "success": []}
+for it in range(3000):
+    obs = env.observe()
+    tau = policy(obs)
+    obs, reward, done, info = env.step(tau)
+    e_o = info["orientation_error"]                 # (B, 3) 旋转向量
+    rot_deg = torch.rad2deg(e_o.norm(dim=-1))       # 总转角度数
+    # "自旋"分量：绕工具轴的分量，很多任务不需要精确控制它
+    spin = torch.rad2deg(e_o[..., 2].abs())         # 假设第 3 分量对应工具轴
+    log["pos_err"].append(info["pos_error"].norm(dim=-1).mean().item())
+    log["rot_err_deg"].append(rot_deg.mean().item())
+    log["spin_deg"].append(spin.mean().item())
+    log["success"].append(info["success"].float().mean().item())
+    if it % 200 == 0:
+        print(f"iter {it}: 位置 {log['pos_err'][-1]*1000:.1f} mm  "
+              f"姿态 {log['rot_err_deg'][-1]:.1f}°  自旋 {log['spin_deg'][-1]:.1f}°")
+</code></pre>
+    <p>解读：分开统计是必要的诊断手段，合并成单一"误差范数"会让人无法判断问题出在哪个子空间。判读经验：姿态总误差在训练后期常常卡在 1°–2°（受关节分辨率与伺服刚度限制），这不是算法失败；如果 <code>spin</code> 长期很大而总误差不大，说明该把工具轴分量降权或从奖励里去掉了。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>四元数双覆盖记账错误</strong>：目标四元数未做符号对齐，网络看到"同一姿态"的输入时而 +q 时而 −q，训练曲线剧烈震荡。修复：所有比较/误差计算前先做点积判负翻转（片段 1）。</li>
+      <li><strong>把欧拉角喂给网络</strong>：roll 从 +179° 跳到 −179° 时网络认为状态剧变，行为抖动。修复：用旋转误差向量或 6D 旋转表示（旋转矩阵前两列）。</li>
+      <li><strong>误差计算顺序反了</strong>：写成 R<sub>cur</sub>·R<sub>d</sub><sup>T</sup> 或 q<sub>des</sub><sup>−1</sup>⊗q<sub>cur</sub>，得到的是"目标系下看当前"，方向符号相反。症状是策略朝反方向对齐。修复：固定约定并写单测：q<sub>cur</sub>=q<sub>des</sub> 时误差必须精确为 0。</li>
+      <li><strong>arccos 直接求角度</strong>：θ→0 时数值误差大，奖励在"已对准"附近反而出现噪声平台。修复：atan2 版本（片段 1）。</li>
+      <li><strong>单一目标姿态过拟合</strong>：训练集里姿态永远朝下，策略实际在"背角度"，没有真正"对齐"。修复：姿态目标球面随机采样或 ±30° 扰动。</li>
+      <li><strong>姿态权重未经换算</strong>：w<sub>o</sub> 拍脑袋给 1.0，策略发现"转姿态"比"走位置"更划算，在空中反复转圈。修复：等效位移法对齐权重。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>构造 pitch=89.9° 附近的欧拉角序列，画出对应四元数分量，指出哪个分量在"万向锁"附近变化剧烈。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>固定 roll 与 yaw、让它们同时 +1° 与 −1°，观察末端的实际姿态是否相同，这就是"两个角产生同一效果"的坍缩。</div></details>
+      </li>
+      <li>把目标四元数人为取反（q → −q）后运行片段 1，验证 e<sub>o</sub> 不变；去掉双覆盖处理再对比。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>没有双覆盖时，误差四元数会走"长弧"，θ 从 0.1 rad 跳到约 2π−0.1，奖励立刻崩塌。</div></details>
+      </li>
+      <li>在 θ = 0.001 rad 与 θ = π−0.001 rad 处，对比 arccos 与 atan2 两种角度计算的浮点误差。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>构造对应的轴角并转成四元数，用它验证公式；arccos 在两端都有精度损失，atan2 全程稳定。</div></details>
+      </li>
+      <li>实验设计：训练时把姿态目标固定为"朝下"，评估时改为球面随机姿态，对比成功率落差，解释过拟合机制。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>固定姿态下策略可能根本不依赖 e_o 输入（输入消融实验：把 e_o 置零看性能损失多少）。</div></details>
+      </li>
+      <li>把姿态核锐度 k<sub>o</sub> 从等效位移换算法（0.2 m 半径）改为拍脑袋的 5 倍与 0.2 倍，观察位置误差与姿态误差的此消彼长。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>画出（位置误差 P50，姿态误差 P50）的散点图，你会看到一条新的帕累托曲线，权重只是在这条曲线上选点。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>姿态三种表示：欧拉角直观但有万向锁与多解；旋转矩阵无奇异但冗余；四元数紧凑平滑但有双覆盖。计算用四元数，观测用旋转误差向量。</li>
+      <li>万向锁是欧拉角速度映射降秩的后果（中间角 ±90° 两个自由度坍缩），学习型控制器应避免以欧拉角为输入或输出。</li>
+      <li>旋转误差向量 e<sub>o</sub> = θ·n：3 维、有界、θ=0 处光滑，用 atan2 稳定计算，配合双覆盖处理保证短弧。</li>
+      <li>位置/姿态奖励用指数核并做"等效位移"权重换算（腕部半径 0.2 m，3° ≈ 1 cm 弧长）；成功判据两项独立设阈值。</li>
+      <li>下一章从"纯运动"跨到"接触"：当末端与环境的接触力成为任务的一部分，位置控制让位给力位混合控制，见第 087 章。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch085.html">← 第 085 章：实现关节限位约束</a>
+    <a class="next" href="ch087.html">第 087 章：实现力位混合控制 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

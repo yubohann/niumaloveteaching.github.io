@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第090章 多智能体环境：交通仿真 | 深度强化学习课程 · PPO、SAC 与多智能体系统</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第五篇 · 多智能体环境与实践</span>
+    <span class="sep">/</span>
+    <span>第 090 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第五篇 · 多智能体环境与实践</div>
+    <h1>第 090 章：多智能体环境：交通仿真</h1>
+    <p class="lead">把 4 个十字路口的信号灯交给 4 个共享策略的智能体：车辆按概率到达、绿灯按通行能力放行、下游拥堵会回溢堵死上游，看学习策略能否比"每 4 步轮换"的固定配时少排 15% 以上的队，同时不像贪心基线那样疯狂换相。</p>
+    <ul class="meta">
+      <li>主题：环境设计 / 交通信号协同与车流耦合</li>
+      <li>关键公式：r<sub>i</sub> = −Σq<sub>本口</sub> − 0.25·Σq<sub>下游</sub> − 0.5·𝟙[换相]</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 089 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>把交通信号控制抽象成多智能体 MDP：状态（各车道排队 + 当前相位 + 相位时长）、动作（南北/东西放行）、奖励（排队 + 换相惩罚）。</li>
+      <li>掌握路网级的车辆流动实现：外部到达、绿灯放行、下游容量约束与<strong>回溢（spillback）</strong>，这是路口之间真正耦合的机制。</li>
+      <li>用离散动作的独立 PPO（参数共享）训练 4 个信号灯，理解观测里"下游排队"与"相位时长"的设计动机。</li>
+      <li>构建两个有说服力的规则基线：固定配时与逐秒贪心，并解释贪心为什么换相频繁。</li>
+      <li>用"平均排队 / 通行量 / 换相频率"三个指标综合评价策略，理解多目标之间的权衡。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>交通信号控制是合作型多智能体 RL 最成功的落地场景之一：每个路口只管自己的灯，但车辆在路口之间流动，一处乱配时会把车队推到邻居家门口。这种"局部动作、全局耦合"的结构与前面章节都不同，粒子和足球里智能体靠距离相互作用，而这里靠<strong>车流这个离散资源</strong>相互作用：下游堵了，上游放行的收益就会打折。</p>
+    <p>它也是少数"规则基线很强"的任务：固定配时（定时轮换）在均匀流量下几乎是最优的，逐秒贪心在高峰时容易来回切换、把通行时间浪费在切换本身。学习策略必须在"响应车流"与"保持稳定"之间找到平衡点，这正是训练奖励里要写进换相惩罚的原因，也是本章与物理类环境的根本区别：<strong>奖励要显式编码控制目标</strong>。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 状态与动作空间</h3>
+    <p>把每个路口建模成一个智能体。动作只有两个：放行南北（NS）或放行东西（EW）。每个路口 11 维观测为：</p>
+    <div class="formula">
+      o<sub>i</sub> = [ q<sub>N</sub>, q<sub>E</sub>, q<sub>S</sub>, q<sub>W</sub> ] / 10 ⊕ onehot(phase) ⊕ [ min(t<sub>switch</sub>, 10)/10 ] ⊕ [ q<sup>down</sup><sub>N,E,S,W</sub> ]
+    </div>
+    <p>符号：q 是本路口四个车道（从北/东/南/西来）的排队数，除以 10 做粗归一化；onehot(phase) 两维让策略知道"现在放行谁"；t<sub>switch</sub> 是当前相位已持续的步数（截到 10 再归一化）；最后四维是<strong>下游排队</strong>，前瞻信息：下游已堵时，继续放行只会让车堵在自己路口。</p>
+
+    <h3>2. 车辆流动与回溢</h3>
+    <p>每个控制步执行"换相 → 绿灯放行 → 外部到达 → 统计奖励"。放行规则：</p>
+    <div class="formula">
+      release = min( q<sub>lane</sub>, C )，C = 2（每绿灯车道每步通行能力）<br>
+      下游剩余容量 space = max_queue − 下游当前；实际进入 = min(release, space)，其余<strong>滞留原车道</strong>
+    </div>
+    <p>滞留就是回溢：上游排队长会压缩下游的放行收益，迫使两个路口的策略协调。没有这个机制，"4 个独立路口"就退化成 4 个互不相干的单智能体任务，<strong>耦合是任务难的来源，也是多智能体方法的价值所在</strong>。注意 <code>max_queue=20</code> 决定了回溢何时发生：排队越接近容量，链条传导越快。</p>
+
+    <h3>3. 奖励：本地排队 + 下游耦合 + 换相惩罚</h3>
+    <div class="formula">
+      r<sub>i,t</sub> = −Σ<sub>lane</sub> q<sub>i,lane</sub> − 0.25·Σ<sub>lane</sub> q<sub>down(lane)</sub> − 0.5·𝟙[本步换相]
+    </div>
+    <p>第一项是核心：路口越堵惩罚越大；第二项把"给邻居留空间"写进梯度，权重 0.25 说明"下游堵 4 辆 ≈ 自己堵 1 辆"；第三项抑制抖动。0.5 的量级介于"堵 1 辆车（−1）"与"两辆车（−2）"之间，换一次相相当于多堵半辆车，鼓励策略只在划算时切换。</p>
+
+    <h3>4. 为什么贪心基线需要被超越</h3>
+    <p>逐秒贪心只看"当前哪个相位排队多"，两个方向排队接近时会在两相位间反复横跳：实测换相约 3.0 次/步（四口合计口径，固定配时约 1.0），每次切换都要付 0.5 的固定成本，而这条成本完全不在它的决策里。学习策略能看到 <code>since_switch</code>，训练奖励里也含换相惩罚，自然学会"再等一等"，在通行量相近的同时把切换频率压下来。</p>
+
+    <h3>5. 参数共享的前提</h3>
+    <p>4 个路口在 2×2 网格中角色不同（角上有 2 条外部进口，边上更多），但观测格式统一（没有下游的车道用 −1 填坑），共享网络仍然能工作，网络从观测里读出"这是哪个位置的路口"。共享的价值在样本效率：4 个路口每步产生 4 条经验，一个网络同时吸收。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+
+    <h3>模块划分</h3>
+    <table>
+      <tr><th>组件</th><th>职责</th><th>关键点</th></tr>
+      <tr><td><code>TrafficGridEnv</code></td><td>2×2 路网（纯 numpy）</td><td>车道索引 [N,E,S,W]；回溢与外部到达；每口独立奖励</td></tr>
+      <tr><td><code>_downstream</code></td><td>车道到下游车道的映射</td><td>出口车道返回 None，供观测与放行共用</td></tr>
+      <tr><td><code>PPOActorCritic</code></td><td>Categorical 策略 + 价值头</td><td>离散动作 PPO，与连续版只差分布类型</td></tr>
+      <tr><td><code>compute_gae</code></td><td>每智能体独立奖励的 GAE</td><td>奖励矩阵 (T, N)，比共享奖励版多一维</td></tr>
+      <tr><td><code>run_policy</code></td><td>策略/基线统一评测</td><td>learned / fixed / greedy 三种模式同一套代码</td></tr>
+    </table>
+
+    <h3>关键超参数</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用与取值理由</th></tr>
+      <tr><td><code>arrival_p</code></td><td>0.5/进口/步</td><td>流量强度；0.3 低峰、0.7 接近饱和，改善幅度随流量变化</td></tr>
+      <tr><td><code>capacity</code></td><td>2</td><td>每绿灯车道每步放行车辆数；配时效果的关键参数</td></tr>
+      <tr><td><code>max_queue</code></td><td>20</td><td>车道容量；决定回溢何时发生</td></tr>
+      <tr><td><code>switch_penalty</code></td><td>0.5</td><td>换相成本，抑制抖动；练习会让你调大到 2.0 验证"懒死"</td></tr>
+      <tr><td><code>max_steps</code></td><td>40000</td><td>交通任务通常 2～4 万步接近收敛</td></tr>
+      <tr><td><code>epochs / batch_size</code></td><td>4 / 256</td><td>PPO 更新预算；2048×4 步展开成 8192 样本</td></tr>
+    </table>
+
+    <h3>数据流</h3>
+    <p>每步：4 个路口各自观测（本口排队 + 相位 + 相位时长 + 下游排队）→ 策略输出 4 个二值动作 → 环境执行"换相 → 放行 → 到达 → 奖励" → 采样 2048 步后按 (T, N)=(T, 4) 做 GAE 与优势标准化 → 展平 8192 个样本做 4 轮裁剪更新。评测时 <code>run_policy</code> 同时支持三种模式（学习/固定/贪心），保证三组数字在同一环境、同一随机流下量出。</p>
+
+    <h3>与前一章的差异</h3>
+    <p>第 089 章是连续物理 + 共享物体（球）+ 事件稀疏奖励；本章换成<strong>离散决策 + 资源流动 + 稠密惩罚</strong>：没有空间连续动力学，没有碰撞，所有交互都通过"车流进入下游的容量"发生。算法侧从连续 PPO 切到 Categorical PPO，只需三处改动（见代码节）。另一个不同点是本章内建了两条规则基线，让改善幅度有可信的参照系。</p>
+
+    <div class="box key">
+      <span class="box-title">为什么奖励按"每口一份"发放，不做全队共享</span>
+      <p>四个路口天然是"各自负责一段路"的分工结构：全队共享总排队会让任意一个路口"搭便车"（自己不作为、等邻居分流）。独立奖励保留本地责任；而下游项 0.25 的权重又把协调压力柔性注入。这个"本地主项 + 弱耦合项"的配方，是分布式控制类多智能体任务里最常用的奖励模板。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：车道到下游的唯一映射</strong></p>
+    <pre class="code"><code>def _downstream(self, r: int, c: int, lane: int):
+    """返回 (下一路口行, 列, 车道)；出口车道返回 None。"""
+    if lane == 0:      # 北来车 → 向南行驶（行号 +1）
+        nr, nc = r + 1, c
+    elif lane == 2:    # 南来车 → 向北行驶（行号 −1）
+        nr, nc = r - 1, c
+    elif lane == 3:    # 西来车 → 向东行驶（列号 +1）
+        nr, nc = r, c + 1
+    else:              # 东来车 → 向西行驶（列号 −1）
+        nr, nc = r, c - 1
+    if 0 &lt;= nr &lt; 2 and 0 &lt;= nc &lt; 2:
+        return nr, nc, lane       # 仍在路网内：流向下一路口的同名车道
+    return None                   # 驶出路网：调用方据此区分"出口"</code></pre>
+    <p>解读：整个路网的空间语义都压缩在这十几行里。<strong>（1）</strong>车道索引的含义是"车从哪一侧来"：北来车向南走、西来车向东走，行/列的增减方向与来向相反，这个映射写错一格，车流就会在路网里"倒流"。<strong>（2）</strong>"流向下一路口的同名车道"：北来车进入下游路口的北车道，车道的语义跨路口保持一致，于是只需一个函数即可表达全部拓扑。<strong>（3）</strong>越界返回 <code>None</code>：它是"出口"的统一标记，观测构造、放行逻辑、奖励计算三处都以 <code>None</code> 为分支条件，<strong>一份映射、三处复用</strong>，是这类网格环境保持一致性最省心的写法。<strong>（4）</strong>注意这是无转向路网（直行only）：简化换来的是教学聚焦，真实路网加上左右转只是多几个分支。</p>
+
+    <p><strong>片段 2：观测里的下游前瞻与 −1 占位</strong></p>
+    <pre class="code"><code>def _obs(self) -&gt; np.ndarray:
+    obs = []
+    for r in range(2):
+        for c in range(2):
+            i = r * 2 + c
+            q = self.queue[r, c] / 10.0              # 本口四车道排队（粗归一化）
+            phase_onehot = (np.array([1.0, 0.0]) if self.phase[i] == 0
+                            else np.array([0.0, 1.0]))     # 当前放行相位
+            since = min(self.since_switch[i], 10) / 10.0   # 相位已持续步数，截断归一
+            down = []
+            for lane in range(4):
+                nxt = self._downstream(r, c, lane)
+                # 有下游就报它的排队；没有下游（出口）用 −1 占位，杜绝幽灵索引
+                down.append(self.queue[nxt] / 10.0 if nxt else -1.0)
+            o = np.concatenate([q, phase_onehot, [since], np.asarray(down)])
+            obs.append(o.astype(np.float32))
+    return np.stack(obs)</code></pre>
+    <p>解读：观测里每一个分量都有明确用途，没有凑数的维度。<strong>（1）</strong>四个排队是主体状态；除以 10 的归一化让输入落在 0～2 的量级，与网络初始化匹配（最大 20 恰好对应 2.0）。<strong>（2）</strong>相位独热：策略必须知道"现在放行谁"才能决策"要不要换"，如果只有排队没有相位，同一观测下最优动作会自相矛盾。<strong>（3）</strong><code>since_switch</code> 截断到 10：排队已经到 20 上限，但相位时长可能上百步，截断防止这一维主导观测尺度；<strong>它是策略学会"再等一等"的关键输入</strong>（贪心基线没有这个信息，所以抖动）。<strong>（4）</strong>没有下游的车道用 −1 占位：−1 与任何真实排队（≥0）都不同，网络能识别"这里是出口"；若图省事写 <code>queue[nxt]</code> 而 <code>nxt=None</code>，numpy 的负索引会静默取到最后一行，观测里出现"幽灵下游"，bug 不报错但策略永远学不好。</p>
+
+    <p><strong>片段 3：绿灯放行与回溢，耦合的机制</strong></p>
+    <pre class="code"><code>new_queue = self.queue.copy()
+for r in range(2):
+    for c in range(2):
+        i = r * 2 + c
+        lanes = (0, 2) if self.phase[i] == 0 else (1, 3)   # NS 放 0/2，EW 放 1/3
+        for lane in lanes:
+            movable = min(int(self.queue[r, c, lane]), self.capacity)
+            if movable == 0:
+                continue
+            nxt = self._downstream(r, c, lane)
+            new_queue[r, c, lane] -= movable
+            if nxt is None:
+                self.exited += movable                  # 驶出路网：计通行量
+            else:
+                nr, nc, nl = nxt
+                # 先算下游剩余容量，再决定进多少，顺序反了会突破 max_queue
+                space = self.max_queue - new_queue[nr, nc, nl]
+                enter = min(movable, max(space, 0))
+                new_queue[nr, nc, nl] += enter
+                new_queue[r, c, lane] += movable - enter  # 回溢：进不去就原地滞留</code></pre>
+    <p>解读：这是实验里"多智能体"的真正来源。<strong>（1）</strong>放行在<strong>影子队列</strong> <code>new_queue</code> 上做、遍历结束后一次性写回：避免同一辆车在同一步里被"从上游放进下游、又被下游放走"的连锁瞬移，也让回溢的计算不受遍历顺序影响。<strong>（2）</strong>容量判断先于写入：<code>space</code> 用下游当前值算，<code>enter = min(movable, space)</code>，进不去的部分通过 <code>movable − enter</code> 加回原车道，这就是回溢的精确语义：<strong>车没有被"消灭"，只是被邻居的拥堵挡住了</strong>。<strong>（3）</strong>驶出路网的车计入 <code>exited</code>（通行量指标），这是全部奖励之外唯一的"生产性"出口，保证系统不会无限淤积。<strong>（4）</strong>相位与车道集合的对应 <code>(0,2) / (1,3)</code> 与观测的车道顺序一致；改动路网结构时，这里和 <code>_downstream</code> 是最需要同步检查的两处。</p>
+
+    <p><strong>片段 4：奖励组装与外部到达</strong></p>
+    <pre class="code"><code># 3) 外部到达：只有边界"进口"车道按概率来车（每边两条，共 8 条）
+for r in range(2):
+    for c in range(2):
+        for lane in range(4):
+            is_entry = ((lane == 0 and r == 0) or (lane == 2 and r == 1)
+                        or (lane == 3 and c == 0) or (lane == 1 and c == 1))
+            if is_entry and rng.random() &lt; self.arrival_p:
+                if self.queue[r, c, lane] &lt; self.max_queue:
+                    self.queue[r, c, lane] += 1
+# 4) 奖励：本地排队 + 下游排队（耦合项，权重 0.25）
+for r in range(2):
+    for c in range(2):
+        i = r * 2 + c
+        down_sum = 0
+        for lane in range(4):
+            nxt = self._downstream(r, c, lane)
+            if nxt:
+                down_sum += self.queue[nxt]
+        rewards[i] += -float(self.queue[r, c].sum()) - 0.25 * down_sum</code></pre>
+    <p>解读：到达与奖励两件"每步收尾"的工作放在一起看很有信息量。<strong>（1）</strong>到达只发生在边界进口：<code>is_entry</code> 的四个条件是"北边第一行的北车道、南边第二行的南车道、西边第一列的西车道、东边第二列的东车道"，几何上一一对应，写错一个方向车流来源就少一块。<strong>（2）</strong>到达有容量上限保护（满了就不加）：否则队列会超过 <code>max_queue</code>，回溢的 <code>space</code> 计算与观测的归一化全部失真。<strong>（3）</strong>奖励右侧的耦合项把四邻下游排队求和乘 0.25：注意它<strong>不区分方向</strong>（四个下游等权），也<strong>不包含上游</strong>，上游堵不堵是上游的账，本地只需对未来负责。这种"只看前、不看后"的局部性让每个路口的最佳响应定义清晰。<strong>（4）</strong>奖励在每步放行、到达都完成之后计算，反映的是本步结束时的拥堵状态，观测、奖励、下一状态三者时间戳一致，这是所有环境都不该打破的约定。</p>
+
+    <p>完整可运行脚本（附录）：<a href="../code/ch090.py" download>code/ch090.py</a></p>
+    <pre class="sh"><code>python code/ch090.py          # 完整训练：CPU 约 3–5 分钟
+python code/ch090.py --quick  # 快速跑通：约 30–60 秒</code></pre>
+    <p>日志先打印固定配时与贪心两条基线，之后每 8000 步打印学习策略评估。<strong>预期（以实跑为准）：学习策略平均排队比固定配时低 15%～40%，通行量略高，换相/步（四口合计）明显低于贪心的 3 左右</strong>。奖励稠密，通常 1 万步内就见改善。低流量（arrival_p=0.3）时优势会缩小，比较改善幅度时务必注明流量条件。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>先给下游加车再检查容量</strong>：顺序反了会突破 <code>max_queue</code>，回溢逻辑失效、观测归一化失真。必须先算 <code>space = max_queue − 下游当前</code>，再决定进入量与回溢量。</li>
+      <li><strong>观测里下游用了越界索引</strong>：边界车道没有下游，必须用 −1 占位：若写成 <code>queue[2, ...]</code>，numpy 负索引会静默取到最后一行，观测里出现"幽灵下游"却不报错。</li>
+      <li><strong>把训练奖励当评测指标</strong>：评测只报排队与通行量，不要把含 −0.5 换相惩罚的训练奖励混进报告，否则永远无法与固定配时公平比较。</li>
+      <li><strong>把"每步"当"每秒"</strong>：本环境的一步是"信号决策间隔"，不是秒。与真实交通论文对照前先统一时间粒度，再谈排队与延误的数值。</li>
+      <li><strong>在影子队列上漏了写回</strong>：放行读 <code>self.queue</code>、写 <code>new_queue</code>，忘记最后的 <code>self.queue = new_queue</code> 会让放行"放了个寂寞"，车数永远不减，日志表现为排队只涨不落。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把 <code>arrival_p</code> 调到 0.3 与 0.7 各跑一次，先预测改善幅度随流量怎么变，再画"流量强度—改善幅度"的趋势验证。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>改 <code>TrafficGridEnv</code> 构造参数或加命令行开关。低峰时固定配时几乎最优、学习领先缩小；饱和流量下改善最大但波动也最大。评估回合要跑久一点才稳定。</div></details>
+      </li>
+      <li>把换相惩罚从 0.5 改成 0 和 2.0，先预测换相频率与排队各自往哪边走，再验证"稳定性"目标是怎么被调出来的。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>惩罚为 0 时策略可能高频抖动（像贪心）；惩罚 2.0 时可能"懒死"在某个相位不动。找两者之间的甜点。</div></details>
+      </li>
+      <li>给观测加一维"上一周期的通行量"，先分析它会给策略带来什么新信息，再看学习曲线与最终排队的变化。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>在 env 里记录每路口上一步放出的车辆数，加入 <code>_obs</code> 拼接；<code>obs_dim</code> 从 11 改成 12，网络自适应。</div></details>
+      </li>
+      <li>把 2×2 路网扩成 3×3（9 个智能体），先论证"局部观测是否还够用"，再观察训练成本与协同难度的变化。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>把行列数从 2 改成 3，检查 <code>_downstream</code> 与外部到达的边界条件；<code>n_agents=9</code>，其余基本不用改。回溢链条变长后，远处拥堵无法从一步下游观测里看到，这正是 CTDE 类方法要解决的。</div></details>
+      </li>
+      <li>实现"压力驱动"强基线：按排队比例分配固定周期内的绿灯步数（简化 Webster 思路），与学习策略对比。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>把连续几步打包成一个周期，周期长度 T=6：NS 绿灯步数 = round(6×q_NS/(q_NS+q_EW))，其余给 EW；两侧都空时各分 3 步。它比逐秒贪心稳定，是评价学习策略合理性的新锚点。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>交通信号控制 = 局部动作 + 车流耦合：回溢机制是让多路口必须协同的设计核心。</li>
+      <li>奖励三件套（本地排队、下游前瞻、换相惩罚）对应控制里的三个目标：疏通、协同、稳定。</li>
+      <li>离散 PPO 与连续 PPO 只差分布类型（Categorical vs Normal+atanh）；参数共享让 4 个路口共享经验。</li>
+      <li>规则基线（固定配时、贪心）是这类任务的必要参照：它们揭示了"改善 30%"是否可信。</li>
+      <li>下一章把视角抬到三维空间：无人机用速度指令保持队形，学习跟踪与避碰，进入连续多智能体的又一经典场景。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch089.html">← 第 089 章：多智能体环境：足球</a>
+    <a class="next" href="ch091.html">第 091 章：多智能体环境：无人机编队 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

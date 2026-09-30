@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第044章 多机器人避障协同 | 多机器人协同学习课程 · ROS2 通信与系统集成</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第三篇 · 协同控制与任务协同</span>
+    <span class="sep">/</span>
+    <span>第 044 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第三篇 · 协同控制与任务协同</div>
+    <h1>第 044 章：多机器人避障协同</h1>
+    <p class="lead">把队友当成"会动的障碍"：用速度障碍（VO）描述未来碰撞，用 ORCA 半平面约束在速度空间求解，双方各承担一半避让责任，并处理对称死锁这个天然陷阱。</p>
+    <ul class="meta">
+      <li>主题：协同控制 / 反应式安全</li>
+      <li>关键机制：速度障碍、ORCA 半平面、倒数责任分配、邻居状态广播、死锁扰动</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 043 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解速度障碍（Velocity Obstacle, VO）的几何定义，会判断"当前相对速度是否指向未来碰撞"。</li>
+      <li>掌握 ORCA 半平面约束的构造思路：最小修正向量 u 与"双方各担一半"的倒数避让机制。</li>
+      <li>会用 2D 线性规划（半平面求交 + 候选点枚举）求"最接近偏好速度的安全速度"。</li>
+      <li>能设计邻居状态消息与过期剔除、时延外推逻辑，说清 0.4 s 超时等参数的依据。</li>
+      <li>能识别正面对撞与环形死锁两类对称陷阱，并用侧偏好、微扰动或优先级打破。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 042、043 章解决"到哪去"，但没解决"路上撞不撞"。多机器人共享空间时，任何规划都没法穷举所有动态交互：队友即障碍，而且这个障碍自己也在做决策。需要一层快速、局部、可证明安全性的反应式避让，它每 50 ms 左右重算一次，只依据邻居的当前位置与速度，输出一条安全的速度指令。</p>
+    <p>本章讲机器人之间的避让（谁让谁、各让多少）；下一章把环境障碍与编队保持叠加进来。ORCA（Optimal Reciprocal Collision Avoidance）是这一层的事实标准：几何直观、无需全局通信、在速度空间直接产出可执行指令。把这层做对，编队、搜索、围捕、搬运等所有任务才敢放心跑起来。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 为什么不用势场：力叠加的振荡</h3>
+    <p>最朴素的思路是人工势场：给每对机器人加一个斥力、合力进速度指令。问题是多机环境下斥力会互相叠加、彼此补偿：A 推 B、B 推 C，力场在动态中不断翻转，产生往复振荡；而且势场法只看"当前距离"，无法表达"以当前速度两秒后才会撞"这种未来信息。ORCA 换到<strong>速度空间</strong>：不看力，看"哪些速度会通向碰撞"，从几何上一次性给出安全速度集合。</p>
+
+    <h3>2. 速度障碍：把未来碰撞翻译成几何禁区</h3>
+    <p>设机器人 A、B 的位置差 p = p<sub>B</sub> − p<sub>A</sub>，半径之和 R = r<sub>A</sub> + r<sub>B</sub>（含安全余量），相对速度 w = v<sub>A</sub> − v<sub>B</sub>。若射线 p + t·w（t ≥ 0）与半径 R 的圆相交，说明按此相对速度未来必然碰撞。所有这样的 w 构成一个锥形区域，即速度障碍 VO<sub>AB</sub>。工程上再做两处修正：</p>
+    <ul>
+      <li><strong>时间截断 τ</strong>：只看未来 τ 秒（典型 2 s）。τ 太小会"贴身才发现"，τ 太大会把几十秒后的相遇也算进来，机器人过度保守。</li>
+      <li><strong>倒数责任</strong>：A 不独占整个锥，只需逃离锥边界的一半，另一半由 B 承担。这是 ORCA 名字里"Optimal Reciprocal"的来源，双方各修正二分之一，避免"双让"（都让到无法前进）与"双不让"（对撞）。</li>
+    </ul>
+    <div class="formula">
+      约束形式：n<sub>j</sub> · (v − (v<sub>pref</sub> + ½u<sub>j</sub>)) ≥ 0，对每个邻居 j
+      <span class="note">u<sub>j</sub> 是把相对速度拉出 VO 所需的最小修正；半平面通过 v<sub>pref</sub> + ½u<sub>j</sub>、法向 n<sub>j</sub></span>
+    </div>
+
+    <h3>3. 速度空间线性规划：min ‖v − v<sub>pref</sub>‖²</h3>
+    <p>把所有邻居的半平面约束求交，得到可行速度集合（凸多边形），在其中找离偏好速度最近的解：</p>
+    <div class="formula">
+      v* = arg min<sub>v</sub> ‖v − v<sub>pref</sub>‖² &nbsp;s.t.&nbsp; n<sub>j</sub> · v ≥ b<sub>j</sub>（∀j）
+      <span class="note">2D 下可行域最多是凸多边形；枚举候选点（原点到各线的最近点、两两交点）+ 可行性筛选即可精确求解</span>
+    </div>
+    <p>二维情形下这个"线性规划"无需数值优化器：凸多边形的最近点必然出现在边界顶点上，直接枚举 O(n²) 条候选再筛选，N ≤ 10 个邻居时计算量微秒级。求解结果 v* 就是本周期发布到底盘的速度指令，偏好速度 v<sub>pref</sub> 由上层（编队、导航）给出，这正是"<strong>安全滤波器</strong>"架构：上层管目的，ORCA 管安全，职责清晰。</p>
+
+    <h3>4. 对称陷阱与打破</h3>
+    <p>ORCA 有一个天生盲区：<strong>对称场景存在多个等价最优解</strong>。两台正面对撞时，"各自向左让"与"各自向右让"代价完全相同；如果两台的决策噪声让他们同时选择绕行方向还一致（都向右），会成功错开；但如果一侧依赖的邻居信息稍有不同，可能一台向左一台向右，再次对头。更糟的是环形死锁：四台机器人围成一圈互相让，有序的等待循环使全员静止。破解手段按工程优先级：</p>
+    <ul>
+      <li><strong>一致侧偏好</strong>：全队约定"避让时统一往右侧"（类似交通规则），把对称解变成唯一解。</li>
+      <li><strong>优先级 + 微小不对称</strong>：给低优先级机器人加 1–2% 的偏好速度偏移或 0.1 rad 的航向抖动，使对称被打破且不影响正常行驶。</li>
+      <li><strong>死锁探测</strong>：监测"速度持续接近零且 1 m 内有静止邻居"，触发一次限幅的一次性侧向脉冲。</li>
+    </ul>
+
+    <h3>5. 通信需求与时效</h3>
+    <p>每个邻居需要：位置（2 维）、速度（2 维）、半径、时间戳，约 50 字节。15 Hz 广播、10 台机器人规模下总带宽不到 10 kB/s，这是多机器人系统里最"便宜"的协同之一，普通 WiFi 轻松承载。真正的挑战是时效：位置差 100 ms 就会让避让边界错位 10 cm（1 m/s 时）。所以邻居状态必须带时间戳，控制层取用时按速度外推补齐延迟，并对超过 0.4 s 的旧数据直接剔除，宁可不避让（退化为保守减速），也不能拿着一秒前的位置做"错误精准"的避让。</p>
+
+    <h3>6. 数值算例：一次斜向相交的 VO 判定</h3>
+    <p>设 A 在原点、速度 (0.5, 0)；B 在 (1.5, 1.0)、速度 (0, −0.5)；半径和 R = 0.4 m。取 B 相对 A 的位置 p = (1.5, 1.0)、相对速度 w = v<sub>B</sub> − v<sub>A</sub> = (−0.5, −0.5)，代入射线与圆的几何关系可以算清三件事：</p>
+    <ul>
+      <li><strong>最近接近距离</strong>：最近点出现在 t* = −(p·w)/|w|² = 2.5 s，此时两机距离 0.354 m，小于 R = 0.4 m，若双方都不让必然剐蹭；</li>
+      <li><strong>进入冲突圆的时刻</strong>：解 |p + t·w| = R 得最早交点 t ≈ 2.24 s；</li>
+      <li><strong>τ 的裁决</strong>：τ = 2.0 s 时这次相遇被判为"暂不接管"（2.24 &gt; 2），本拍 ORCA 不介入；τ = 3.0 s 时冲突被提前 0.76 s 捕捉，约束立即生效。</li>
+    </ul>
+    <p>这个算例把 τ 的口径讲清楚了：<strong>τ 是"预警时钟"，不是物理碰撞时间</strong>。τ = 2 s 的含义是"两秒内会撞才管"，两秒外的相遇交给下一拍重新判定；系统 20 Hz 重算，危险窗口从 2.24 s 滑进 2.0 s 内时会被抓住，不会漏。τ 取 3 s 或更大则把更远的相遇也算进来，机器人提前绕开，代价是密集场景里"处处都是潜在冲突"，通过率下降、停滞增多。</p>
+    <p>再看正面对撞的退化情形：R = 0.5 m、τ = 2 s 时最小修正量 |u| = R/τ = 0.25 m/s，按倒数责任两台各修正一半（各 0.125 m/s）。方向选择在几何上完全对称，必须由协议补上侧偏好；约定全队向右避让，否则两台独立选择时存在选到相反方向的概率，两个修正互相抵消，对撞照旧发生。这是第 4 节对称陷阱的定量版本。</p>
+    <p>边界条件速查：<strong>(1)</strong> 已经重叠（中心距小于 R）时，最小修正是沿连线的分离方向、大小与重叠深度 (R − d) 成正比，先分开再谈预测；<strong>(2)</strong> 相对速度为零（两机同速同向）时不产生修正，这是正确行为，因为距离不缩小就不算接近；<strong>(3)</strong> 邻居多且全部处在锥内时，半平面交集可能为空集，求解器应回退到"减速到零"的保守解并上报事件，宁可停滞一拍也不能输出危险速度。</p>
+    <h3>7. 与相邻方法对照：什么场景选 ORCA</h3>
+    <table>
+      <tr><th>方法</th><th>依据信息</th><th>死锁风险</th><th>安全保证</th><th>适用场景</th></tr>
+      <tr><td>人工势场</td><td>当前距离</td><td>高（振荡、局部极小）</td><td>无形式化保证</td><td>稀疏、慢速</td></tr>
+      <tr><td>VO（单边责任）</td><td>位置 + 速度</td><td>低</td><td>本机让满，条件安全</td><td>对抗、非合作避让</td></tr>
+      <tr><td>ORCA（倒数责任）</td><td>位置 + 速度</td><td>中（对称需协议打破）</td><td>可行半平面内无碰撞</td><td>十台级编队、协作群体</td></tr>
+      <tr><td>学习型避让策略</td><td>训练分布内的交互经验</td><td>依训练而定</td><td>分布外无保证</td><td>有大量数据与算力时</td></tr>
+    </table>
+    <p>选型判据一句话：<strong>合作、十台规模、需要可解释的安全边界时用 ORCA；面对不配合的目标（行人、有人遥控的设备）时把该邻居的责任分配从一半提到全额，退化到 VO 的单边让行；学习型策略可以作为偏好速度的生成器，但底层仍应保留本节这套几何安全层兜底</strong>。表中"安全保证"一列是选型的硬指标：安全攸关的场地不要接受一列空白的方法。</p>
+    <p>最后补上安全余量 0.15 m 的账：两队机器人的定位误差各约 5 cm（相对即 10 cm 量级），速度估计误差 0.05 m/s 在 0.5 s 的避让窗口内又贡献约 2.5 cm，两项合计 12.5 cm，0.15 m 的余量覆盖之后还剩 20% 的裕度。若你的定位系统精度更差（例如纯里程计漂移到 30 cm），余量必须同步放大，否则 ORCA 算出的"安全"只是纸面上的安全。</p>
+    <p>与第 049 章的分工可以用一句话记住：<strong>ORCA 管"这一拍选什么速度"，预测轨迹交换管"未来两秒的路线是否安全"，两者用同一批邻居数据、不同的时间尺度</strong>。ORCA 每 50 ms 重算、只看瞬时几何，反应快但视野短；049 章的预测比较能提前一两个周期发现反复交汇路口的冲突。只装一层就上场时，前者适合稀疏流，后者适合结构化路口；密度升高后两层缺一不可。调参顺序也是分层的：先固定 τ 与安全余量把 ORCA 调到"不撞不抖"，再上调 049 章的预测窗口处理路口，反过来调会把两层的责任搅在一起，出了问题无法定位。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>把 ORCA 做成每台机器人本地的"速度安全滤波器"，五步落地：</p>
+    <ol>
+      <li><strong>邻居状态广播</strong>：每台 15 Hz 发布 <code>/fleet/neighbor_state</code>（自定义消息：<code>robot_id</code>、<code>pos</code>、<code>vel</code>、<code>radius</code>、<code>stamp</code>），Best-effort、Volatile。位置与速度来自各机自身里程计，无需全局坐标对齐之外的额外处理。</li>
+      <li><strong>邻居表维护</strong>：收到即更新（按时间戳拒绝乱序），0.4 s 未更新剔除；取用时外推 <code>pos + vel × age</code>（外推上限 0.3 s，防止噪声放大）。</li>
+      <li><strong>约束构造</strong>：对每个有效邻居计算半平面 (n, b)；机器人半径 0.25 m + 安全余量 0.15 m，τ = 2 s。</li>
+      <li><strong>LP 求解</strong>：偏好速度来自上层（例如 042 的编队控制器输出），ORCA 输出安全速度；控制环 20 Hz、广播 15 Hz 匹配。</li>
+      <li><strong>死锁监管</strong>：检测条件"自身速度小于 0.05 m/s、1 m 内存在邻居、持续 3 s"，触发右偏脉冲或临时降低本轮偏好速度的横向权重。</li>
+    </ol>
+    <h3>关键参数表</h3>
+    <table>
+      <tr><th>参数</th><th>取值</th><th>依据</th></tr>
+      <tr><td>机器人半径 r</td><td>0.25 m</td><td>底盘外接圆半径上取整，再留传感器盲区余量</td></tr>
+      <tr><td>安全余量</td><td>0.15 m</td><td>覆盖定位误差（±5 cm 量级）与执行误差</td></tr>
+      <tr><td>时间截断 τ</td><td>2.0 s</td><td>1 m/s 速度下对应 2 m 预警距离；更小则贴身才动作</td></tr>
+      <tr><td>广播频率</td><td>15 Hz</td><td>与 20 Hz 控制环匹配；10 Hz 开始出现明显相位滞后</td></tr>
+      <tr><td>邻居超时</td><td>0.4 s</td><td>约 6 个广播周期未更新，判定链路失效</td></tr>
+      <tr><td>速度上限</td><td>1.0 m/s</td><td>室内多机密度下的稳妥上限，密集区自动降为 0.6</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：为什么把 ORCA 放在"速度级"，它与"路径级"如何分工？</span>
+      <p>路径级重规划（046–049 章）周期在秒级，解决的是"走哪条路"；ORCA 周期在 50 ms 级，解决的是"这一拍走多快、朝哪偏"。两者分层后各司其职：上层冲突消解减少结构性冲突，下层保证任何时刻的瞬时安全。反过来把 ORCA 塞进路径规划器，会因为频繁重规划引入抖动，并让规划器承担它不擅长的高频安全职责。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：邻居表，过期剔除与时延外推</strong></p>
+    <pre class="code"><code>import numpy as np
+
+class NeighborTracker:
+    """维护邻居状态：按时间戳去重、超时剔除、取用时外推。"""
+    def __init__(self, timeout=0.4, max_extrap=0.3):
+        self.timeout, self.max_extrap = timeout, max_extrap
+        self.data = {}                    # robot_id -&gt; (stamp, pos, vel, radius)
+
+    def update(self, msg):
+        old = self.data.get(msg.robot_id)
+        # 只接受更新的时间戳：WiFi 抖动会让旧消息后到，直接丢弃
+        if old is None or msg.stamp &gt; old[0]:
+            self.data[msg.robot_id] = (msg.stamp, np.array(msg.pos),
+                                       np.array(msg.vel), msg.radius)
+
+    def active(self, now):
+        alive = []
+        for rid, (stamp, pos, vel, r) in list(self.data.items()):
+            age = now - stamp
+            if age &gt; self.timeout:        # 过期数据必须删，不能用旧位置做避让
+                del self.data[rid]
+                continue
+            # 外推补偿通信时延；钳制在 0.3 s 内，避免把速度噪声放大成位置跳变
+            alive.append((rid, pos + vel * min(age, self.max_extrap), vel, r))
+        return alive</code></pre>
+    <p>解读：这段代码处理的是"<strong>信息永远不新鲜</strong>"这一现实。三处设计都有名字：按时间戳去重（拒绝乱序旧包）、超时剔除（宁缺毋滥）、钳制外推（速度×时间，时间上限换噪声上限）。把 <code>max_extrap</code> 从 0.3 s 放大到 1.0 s 就能复现一个经典故障：邻居速度估计里 5% 的噪声被放大成米级的位置跳变，ORCA 约束忽左忽右，机器人发抖。</p>
+
+    <p><strong>片段 2：ORCA 半平面构造</strong></p>
+    <pre class="code"><code>import math
+
+def orca_constraint(me_pos, me_vel, me_r, nb_pos, nb_vel, nb_r, tau=2.0):
+    """构造一条半平面约束 (n, b)：要求新速度满足 n·v &gt;= b。
+    取自 RVO2 的标准构造：把相对速度投影到 VO 边界（截断圆或两条腿）。"""
+    p = nb_pos - me_pos                    # 邻居相对位置
+    R = me_r + nb_r                        # 膨胀半径（含安全余量）
+    dist = math.hypot(p[0], p[1])
+    if dist &lt; R:                           # 已经重叠：就地分离是最小修正
+        u = (R - dist) * p / max(dist, 1e-6)
+    else:
+        w = me_vel - nb_vel - p / tau      # 以 tau 截断的接近速度
+        w2 = float(np.dot(w, w))
+        dot1 = float(np.dot(w, p))
+        if dot1 &lt; 0 and dot1 * dot1 &gt; R * R * w2:
+            # 正对接近：投影到截断圆上
+            wl = math.sqrt(w2)
+            if wl &lt; 1e-6:
+                u = (R / tau) * p / dist
+            else:
+                u = (R / tau - wl) * (w / wl)
+        else:
+            # 斜向接近：投影到左侧或右侧的"腿"（切线）
+            leg = math.sqrt(dist * dist - R * R)
+            if p[0] * w[1] - p[1] * w[0] &gt; 0:
+                d = np.array([p[0] * leg - p[1] * R,
+                              p[0] * R + p[1] * leg]) / (dist * dist)
+            else:
+                d = np.array([-(p[0] * leg + p[1] * R),
+                              p[0] * R - p[1] * leg]) / (dist * dist)
+            u = float(np.dot(me_vel - nb_vel, d)) * d - (me_vel - nb_vel)
+    # 只要求修正一半：另一半责任在邻居自己（倒数避让的核心）
+    point = me_vel + 0.5 * u
+    n = p / max(dist, 1e-6)                # 法向：从邻居指向我，即远离方向
+    return n, float(np.dot(n, point))</code></pre>
+    <p>解读：这段是 ORCA 的心脏，逐块看：<strong>(1)</strong> "投影到截断圆"对应正对接近，最小修正是沿相对速度方向把 |w| 拉长到 R/τ；<strong>(2)</strong> "投影到腿部切线"对应斜向接近，沿 p 的垂线方向逃离，左右腿靠二维叉积（<code>p[0]*w[1] − p[1]*w[0]</code>）的符号选择；<strong>(3)</strong> 最关键的一行是 <code>point = me_vel + 0.5*u</code>：半平面边界只把我"修正量的一半"算进去，剩下的由对方承担，于是两台机器人相向而行时各自偏一点、合计恰好错开。<strong>(4)</strong> 法向取"从邻居指向我"的方向，约束 <code>n·v ≥ n·point</code> 的几何含义是：新速度必须落在远离邻居的那一侧。把 <code>0.5</code> 改成 <code>1.0</code> 就退化为"我全让"，单机看更安全，多机群里会造成拥挤和集体低速，这正是倒数责任存在的意义。</p>
+
+    <p><strong>片段 3：2D 线性规划求解与死锁脉冲</strong></p>
+    <pre class="code"><code>def solve_lp(v_pref, lines):
+    """在约束 n·v &gt;= b 的交集中，找离 v_pref 最近的速度（2D 精确枚举）。"""
+    cand = []
+    for n, b in lines:
+        cand.append((b / max(np.dot(n, n), 1e-9)) * n)   # 各线到原点的最近点
+    for i in range(len(lines)):
+        for j in range(i + 1, len(lines)):
+            n1, b1 = lines[i]
+            n2, b2 = lines[j]
+            det = n1[0] * n2[1] - n1[1] * n2[0]
+            if abs(det) &lt; 1e-9:
+                continue                                 # 平行线无交点
+            cand.append(np.array([(b1 * n2[1] - b2 * n1[1]) / det,
+                                  (n1[0] * b2 - n2[0] * b1) / det]))
+    best = None
+    for c in cand:
+        if all(np.dot(n, c) &gt;= b - 1e-6 for n, b in lines):
+            if best is None or (np.linalg.norm(c - v_pref)
+                                &lt; np.linalg.norm(best - v_pref)):
+                best = c
+    if best is None:                                     # 不可行：保守减速
+        return np.zeros(2)
+    return best
+
+def deadlock_nudge(v, stuck_time, neighbors_near):
+    """死锁检测：低速滞留且附近有邻居时，给一个一次性侧向脉冲。"""
+    if stuck_time &gt; 3.0 and neighbors_near &gt; 0:          # 3 s 阈值以下不打扰
+        return v + np.array([-v[1], v[0]]) * 0.15        # 垂直方向 0.15 m/s 脉冲
+    return v</code></pre>
+    <p>解读：<code>solve_lp</code> 的枚举策略利用了 2D 的性质，可行域是凸多边形，最优解必在顶点：候选 = 每条边界线离原点最近的点 + 所有两两交点，逐一检验可行性再比距离。O(n²) 对 10 个邻居足够快；不可行时返回零速度是"保守降级"：与其输出一个可能危险的解，不如停下，让上层看到速度为零再做处置。<code>deadlock_nudge</code> 里的垂直脉冲很小（0.15 m/s）且只在 3 s 低速滞留后触发一次，避免把正常低速工况变成抖动源；脉冲方向取速度的垂线，引导机器人朝绕开的方向偏离，不会迎头顶上。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>过期邻居不清除</strong>：一台机器人断电后仍留在邻居表里，ORCA 持续为一个"幽灵"让路，队伍在某处莫名绕行。修复：0.4 s 超时剔除是所有参数里最不能省的一个。</li>
+      <li><strong>时间戳来自不同步的时钟</strong>：各机墙上时钟差几百毫秒，"消息年龄"全部算错，外推要么过度要么失效。修复：先做时间同步（第 009 章），或退而用接收端本地间隔计时。</li>
+      <li><strong>对称死锁被当成偶发 bug</strong>：两台机器人在走廊里僵持不动，手动重启后"有时又好"。这是结构性对称，不是偶发。修复：统一右侧偏好 + 死锁脉冲双保险，并把"低速滞留 3 s"做成遥测指标长期观察。</li>
+      <li><strong>把全向速度直接发给差速底盘</strong>：ORCA 解出的 v* 含侧向分量，差速车执行不了，实际轨迹偏离安全集合。修复：把 v* 投影到可行速度集（只用其前向分量，转向由角速度控制器实现），或使用直接输出 (v, ω) 的非完整版本。</li>
+      <li><strong>假设所有邻居都执行 ORCA</strong>：遇到不配合的机器人（手动遥控、故障中）时，按"各让一半"设计的边界会被突破。修复：对"非 ORCA 成员"按全额责任计算约束（把 ½ 改成 1），保险费只是更保守一点，换来确定安全。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>两台机器人 A(0,0)、B(2,0) 都以 0.5 m/s 相向而行，R = 0.4 m，τ = 2 s。画出相对速度空间中的 VO 锥，标出 u 向量，并说明各担一半后各自的速度指令变化方向。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>先算 w = v<sub>A</sub> − v<sub>B</sub> = (1.0, 0)，p = (2, 0)；锥顶点在 p/τ = (1, 0)。两侧对称，任选一侧计算 u，注意 ½u 不是 ½|u|。</div></details>
+      </li>
+      <li>把 τ 从 2.0 s 改成 0.5 s，预测行为变化：预警距离、最小间距、通过交叉路口的机器人交会效率分别如何变化？给出一个可测量的验证指标。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>预警距离从 2 m 降到 0.5 m；通过率提升但最小间距下降、抖动增加。用"交叉路口 20 次通过的最近距离分布"验证。</div></details>
+      </li>
+      <li>设计一个 4 台机器人环形死锁场景（互相让行），写出触发条件与至少两种打破策略，并预测每种策略的恢复时间量级。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>无人主动让出时用"等待最久者优先+其余人让"的优先级翻转；或用随机微扰动（0.05 m/s 量级）让对称自然破裂，恢复时间约 1–3 s。</div></details>
+      </li>
+      <li>把 ORCA 约束里的"各让一半"改为"低优先级让 80%、高优先级让 20%"，推导：哪种方式通过更稳？在 6 台机器人密集场景中双向流量下仿真对比停滞时间占比。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>85/15 或 80/20 的情景减少"两边同时犹豫"，但低优先级一侧的绕行距离变长。用停滞时间占比与总行驶里程两个指标一起评估。</div></details>
+      </li>
+      <li>为你的系统设计 ORCA 与上层规划的分工：上层输出偏好速度，下层保证安全。写出参数表（r、R、τ、广播频率、超时、速度上限）与三类验收指标（碰撞率、最小间距、停滞时间占比）。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>碰撞率取自仿真与真机各 50 次运行；最小间距用日志逐帧计算；停滞时间占比 = 速度小于 0.05 m/s 的时长比。三指标同时达标才算合格。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>VO 把"未来会撞"翻译成速度空间里的几何禁区；τ 截断决定保守程度，是第一个要调的参数。</li>
+      <li>ORCA 用半平面近似 VO 边界，以"最多修正 ½·u"实现倒数避让；2D 下用顶点枚举精确求解，无需通用优化器。</li>
+      <li>邻居状态 50 字节 @15 Hz 非常廉价，真正决定安全的是时效处理：时间戳去重、0.4 s 剔除、≤0.3 s 外推。</li>
+      <li>对称死锁是结构问题：统一侧偏好 + 低速滞留检测 + 一次性脉冲，三层配合解决。</li>
+      <li>下一章把环境障碍与队形保持叠加到这套安全层之上，处理"编队过窄门"这类<strong>协同编队避障</strong>问题。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch043.html">← 第 043 章：多机器人编队变换</a>
+    <a class="next" href="ch045.html">第 045 章：多机器人协同编队避障 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第071章 实验筛选、排序与统计 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第四篇 · Ray Tune 超参搜索</span>
+    <span class="sep">/</span>
+    <span>第 071 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第四篇 · Ray Tune 超参搜索</div>
+    <h1>第 071 章：实验筛选、排序与统计</h1>
+    <p class="lead">从数十个试验中挑出结论，筛选口径与排序口径共同决定结论的可信度。本章讲清过滤的三个维度、尾段均值排序的稳健性、选择偏差（Winner's Curse）的量级估计，以及配对复验与自助区间的判读方法。</p>
+    <ul class="meta">
+      <li>主题：Ray Tune 调优 / 统计判读</li>
+      <li>关键机制：过滤口径、尾段均值、选择偏差、配对比较、自助区间</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 070 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>掌握筛选的三个维度（状态、预算、配置），会写明过滤口径与样本量变化。</li>
+      <li>理解排序口径的差异：末端值、尾段均值、全程最大值各自回答什么、偏差来自哪里。</li>
+      <li>会用极值统计估计选择偏差量级，解释“试验数越多、top-1 越乐观”的机制。</li>
+      <li>会用 top-K 均值替代单点最优作稳健汇报，并选择合理的 K。</li>
+      <li>会设计配对复验：同种子比较两配置，用自助区间判断差异是否超过噪声。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>搜索产出的是一组带噪声的测量值：同一配置换一个种子，末端指标可以浮动一个可观区间。<strong>从这样的数据里挑“最好”，挑选动作本身就是统计操作：值与不确定性绑定，报告口径决定结论的可信度。</strong>最朴素的做法（按末端值排序、取第一名汇报）有两个系统性缺陷：末端单点噪声大，且从大量候选中取最大值必然偏乐观。</p>
+    <p>上一章解决了多实验数据的拼装，本章解决拼装之后如何做结论。三件事按顺序发生：<strong>先过滤（哪些试验有资格参与比较），再排序（用什么统计量排序），后复验（差异是否真实）</strong>。每一步的口径都要写入报告，否则结论无法被复核。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 筛选的三个维度</h3>
+    <p><strong>状态过滤</strong>剔除异常与未完成试验；<strong>预算过滤</strong>只保留达到最低预算的试验，避免拿半程成绩与全程成绩比较；<strong>配置过滤</strong>按参数条件筛选子集（例如只看批量等于 4096 的试验）。三个维度可以叠加，但每叠加一层都要记录剩余样本量：<strong>过滤后的样本量是结论强度的前提，样本量过小的子集只能作为线索，不能作为结论。</strong>数值列里的空值（NaN）是筛选的常见事故源：NaN 与任何数值比较都为假，链式条件会把整批试验静默过滤掉，过滤后先断言样本量下限。</p>
+
+    <h3>2. 排序口径与截尾偏差</h3>
+    <p>三种常用口径各有偏差结构：<strong>末端值</strong>（最后一条记录）对评估噪声毫无抵抗，且预算不同的试验不可比；<strong>尾段均值</strong>（最后 K 条记录的平均）降低单点噪声，K 取 10 上下；<strong>全程最大值</strong>把训练过程中的幸运波动当成性能，选择偏差最大，仅用于诊断。</p>
+    <p>早停调度器带来的截尾让口径问题更尖锐：被淘汰试验的最后记录停在低预算处，若与其他试验的完整训练直接比较，截尾试验系统性吃亏。<strong>处理方式是分层：排序在“达到同一预算”的试验集合内进行；未达预算的试验单独统计其淘汰位置，用于描述性分析。</strong></p>
+
+    <h3>3. 选择偏差的极值估计</h3>
+    <p>从 n 个真实水平相同、测量标准差为 σ 的候选中取最大值，期望高估量约为 σ·E[max Z<sub>n</sub>]，其中 E[max Z<sub>n</sub>] 是标准正态最大值的期望，近似为 (2 ln n)<sup>1/2</sup>。</p>
+    <div class="formula">
+      偏差 ≈ σ × (2 ln n)<sup>1/2</sup>
+      <span class="note">n=60 时约 2.86σ；n=200 时约 3.26σ。σ=15 的回报噪声下，60 个试验的 top-1 平均高估约 43 点</span>
+    </div>
+    <p>这个近似的实践含义：<strong>top-1 的数值是“搜索规模”的函数，规模越大越乐观，因此它不能作为方法性能的无偏汇报。</strong>稳健汇报用 top-K 均值（K 取 5 至 10）：K 个高分者的均值仍带有少量选择偏差，但量级显著低于 top-1，且随 K 增大趋近于真实的高分区水平。K 过大时会把弱配置混入，均值失去“最优区域”含义，5 至 10 是本课程试验规模下的平衡区间。</p>
+
+    <h3>4. 复验与配对比较</h3>
+    <p>搜索阶段一个配置通常只有一个种子，配置之间的差异里混着种子噪声。复验阶段给少数候选配多种子（3 至 5 个），得到每配置的均值与标准误。<strong>比较两个配置时使用配对设计：同一组种子下各跑一次，比较逐种子的差值，种子带来的环境差异在两配置间相互抵消，差值序列的方差远低于独立比较。</strong>差值的置信区间用自助法（Bootstrap）构造：重采样差值序列，取 5% 与 95% 分位作为区间；区间不含 0 才认为差异可靠。样本量小时（3 至 5 个种子）区间会很宽，这是诚实的结果，如实报告比假装精确更有价值。</p>
+
+    <h3>5. 分位数与稳健统计</h3>
+    <p>回合回报的分布常带左尾：少数种子会训练失败，均值被拖低。<strong>报告指标建议同时给中位数与四分位区间，它们是顺序统计量，对尾部异常值不敏感；均值用于与文献口径对齐，两者并排展示，读者可以判断尾部的厚度。</strong>第 068 章的分布视图与本章的统计口径使用同一批数据，结论必须一致，不一致时回到数据检查筛选条件。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>结论产出按四步执行：<strong>过滤、排序、复验、定稿</strong>。与上一章的差异在于，第 070 章组合数据，本章从数据中提取可辩护的结论。</p>
+    <ol>
+      <li><strong>过滤</strong>：状态、预算、配置三维度依次应用，每步记录剩余样本量并设下限断言。</li>
+      <li><strong>排序</strong>：达预算集合内按尾段均值排序，输出 top-K 与全体分位参考线。</li>
+      <li><strong>复验</strong>：top-K 中取 2 至 3 个候选，配 3 至 5 个种子配对运行，计算差值区间。</li>
+      <li><strong>定稿</strong>：报告写明四项：口径（过滤条件与排序统计量）、样本量、区间、复验结论。</li>
+    </ol>
+    <table>
+      <tr><th>排序口径</th><th>抗噪性</th><th>主要偏差</th><th>适用位置</th></tr>
+      <tr><td>末端单点</td><td>低</td><td>评估噪声、截尾</td><td>仅快速检视</td></tr>
+      <tr><td>尾段均值</td><td>中高</td><td>轻微选择偏差</td><td>正式排序</td></tr>
+      <tr><td>全程最大值</td><td>低</td><td>幸运波动被高估</td><td>诊断性分析</td></tr>
+      <tr><td>top-K 均值</td><td>高</td><td>小且可控</td><td>对外汇报</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：为什么复验种子要与搜索种子分离？</span>
+      <p>搜索阶段用过的种子已经参与了“挑选”过程，配置在该种子上的表现带着选择效应。复验换用一组未参与搜索的种子，测到的才是配置在新环境下的期望水平。两组种子的角色不同：搜索种子决定“谁入围”，复验种子决定“入围者真实水平”，混用会让复验退化为对旧数据的重复确认。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：过滤与尾段均值排序</strong></p>
+    <pre class="code"><code>def rank_configs(df, metric="episode_return_mean",
+                 min_epoch=50, tail_k=10, top_k=5):
+    """排序流水线：预算过滤、尾段均值、top-K 统计与样本量断言。"""
+    # 预算过滤：未达最低预算的试验不参与比较，避免截尾不公平
+    ok = df[df["epoch"] &gt;= min_epoch].copy()
+    if len(ok) == 0:
+        raise RuntimeError("过滤后无试验，检查条件与 NaN")
+    # 尾段均值：每试验最后 tail_k 条记录的均值，抵抗末端单点噪声
+    tails = (ok.sort_values("epoch").groupby("trial_id")
+               .tail(tail_k).groupby("trial_id")[metric].mean())
+    ranked = tails.sort_values(ascending=False)
+    top = ranked.head(top_k)
+    se = top.std() / max(len(top), 1) ** 0.5   # top-K 均值的标准误
+    print(f"合格 {len(ranked)} 个；top{top_k} 均值 {top.mean():.1f} ± {se:.1f}")
+    # 过滤口径随结果返回：报告引用时一并写出
+    return ranked, top, {"min_epoch": min_epoch, "tail_k": tail_k,
+                         "n_kept": len(ranked)}
+</code></pre>
+    <p>解读：排序函数的四处设计都有明确的偏差针对。<strong>（1）</strong>预算过滤前置，让所有比较发生在“完成度相当”的集合内；断言防止空集继续计算产生误导性输出。<strong>（2）</strong>尾段均值把排序统计量从单点换成区间平均，评估噪声被平均稀释；<code>tail_k=10</code> 对应本课程常见的评估频率与预算。<strong>（3）</strong>top-K 均值的标准误是对“选拔区”稳定性的度量：标准误大说明高分者水平接近、名次不可靠，报告时应降低语气强度。<strong>（4）</strong>返回过滤参数字典，让报告自动携带口径说明，避免人工转述误差。</p>
+
+    <p><strong>片段 2：选择偏差的量级估计</strong></p>
+    <pre class="code"><code>import math
+
+def winners_curse(trial_std, n_trials):
+    """估计 top-1 的选择偏差：n 个同水平候选中最大值的期望高估。"""
+    # 极值统计近似：标准正态最大值期望约 sqrt(2 ln n)
+    e_max = math.sqrt(2.0 * math.log(n_trials))
+    bias = trial_std * e_max
+    print(f"n={n_trials}, sigma={trial_std}: top-1 高估约 {bias:.1f}"
+          f"（{e_max:.2f} sigma）")
+    return bias
+
+# 同一批试验数据的两种汇报口径对照
+winners_curse(trial_std=15.0, n_trials=60)     # 约 43 点
+winners_curse(trial_std=15.0, n_trials=200)    # 约 49 点
+
+def robust_topk(ranked, k=5):
+    """稳健汇报：用 top-K 均值近似高分区真实水平。"""
+    est = ranked.head(k).mean()
+    print(f"top-{k} 均值估计 {est:.1f}（选择偏差量级低于 top-1）")
+    return est
+</code></pre>
+    <p>解读：偏差估计函数的参数就是它的两个敏感性来源。<strong>（1）</strong>对于固定的 n，偏差与噪声 σ 成正比：σ 来自种子噪声与评估噪声的合成，估计 σ 时可先用复验种子的离散度作代理。<strong>（2）</strong>对固定的 σ，偏差随 ln n 缓慢增长：试验数从 60 增到 200，偏差从 2.86σ 升到 3.26σ，增量有限；这说明“多搜”本身带来的乐观偏移不会爆炸，真正危险的是把 top-1 当作无偏汇报。<strong>（3）</strong><code>robust_topk</code> 给出替代口径：K 取 5 至 10，均值对高分区水平的估计更接近复验结论，K 的具体值应在报告中写明。</p>
+
+    <p><strong>片段 3：配对复验与自助区间</strong></p>
+    <pre class="code"><code>import numpy as np
+
+def mean_last(df, key, seed, metric, tail=10):
+    """辅助函数：取指定配置与种子下，最后 tail 条记录的均值。"""
+    sub = df[(df["config_key"] == key) & (df["seed"] == seed)]
+    return sub.sort_values("epoch").tail(tail)[metric].mean()
+
+def paired_summary(df, key_a, key_b, metric, seeds):
+    """配对比较：同种子下两配置的差值均值与自助 90% 区间。"""
+    diffs = np.array([mean_last(df, key_a, s, metric)
+                      - mean_last(df, key_b, s, metric) for s in seeds])
+    rng = np.random.default_rng(0)
+    boot = [rng.choice(diffs, size=len(diffs), replace=True).mean()
+            for _ in range(2000)]
+    lo, hi = np.percentile(boot, [5, 95])
+    verdict = "差异可靠" if lo &gt; 0 or hi &lt; 0 else "差异未超过噪声"
+    print(f"配对差值 {diffs.mean():.1f}，90% 区间 [{lo:.1f}, {hi:.1f}]：{verdict}")
+    return diffs.mean(), (lo, hi)
+
+paired_summary(reverify_df, "cand_a", "cand_b",
+               "episode_return_mean", seeds=[11, 12, 13, 14, 15])
+</code></pre>
+    <p>解读：配对流程的三个要点。<strong>（1）</strong>差值在“同种子”内计算：环境初始化、评估布局等种子相关因素在差值中抵消，区间宽度显著小于独立两组比较。<strong>（2）</strong>自助重采样对分布形状不做正态假设，5 个样本也能给出区间；代价是区间本身有抖动，样本数少于 3 时建议只报告差值方向、不报区间。<strong>（3）</strong>判据用区间是否跨越 0；跨越 0 时输出“未超过噪声”，把“无差异”留给样本量充足的场合；措辞保持统计准确。区间落在正侧时，差值均值才是可以写进结论的效应量。本章示例中的分析接口与结果字段随版本演进，以对应版本的官方文档为准。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>用全程最大值为排序口径</strong>：训练过程的幸运波动被当作性能，排序结果在复验时大面积重排。修复：正式排序只用尾段均值，最大值口径仅作诊断。</li>
+      <li><strong>未达预算的试验混入排序</strong>：截尾试验的最后记录停在低预算处，排序系统性压低其名次。修复：按预算过滤后再排序，截尾试验单独统计。</li>
+      <li><strong>NaN 静默过滤</strong>：链式过滤条件遇 NaN 全部为假，合格样本被清空却继续计算。修复：过滤后断言样本量下限，采样问题回到数据源排查。</li>
+      <li><strong>直接把 top-1 写进结论</strong>：选择偏差随搜索规模增长，top-1 数值偏乐观，复验常无法重现。修复：汇报用 top-K 均值，并附偏差量级说明。</li>
+      <li><strong>单种子比较两个配置</strong>：种子噪声被当作配置差异，结论在换种子后反转。修复：复验采用配对多种子设计，区间跨 0 时不下结论。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>算一算：σ=20、n=100 时，top-1 的选择偏差约是多少？若改用 top-5 均值，偏差量级为何会显著下降？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>(2 ln 100)<sup>1/2</sup>≈3.03，偏差约 61 点。top-5 均值中每个成员仍带选择效应，但均值对极端高估的敏感性下降，量级约为 top-1 的几分之一，且随 K 继续增大趋近高分区真实水平。</div></details>
+      </li>
+      <li>预测题：把排序口径从尾段 10 条均值改为末端单点，top-K 名单会发生什么变化？复验时哪个口径的复现率更高？<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>末端单点让高评估噪声的试验冲进名单，名单稳定性下降；尾段均值的名单复现率更高，因为它测的是“区间平均表现”，与复验口径同构。</div></details>
+      </li>
+      <li>设计题：为一次 60 试验的搜索设计结论产出流程：过滤条件、排序统计量、复验候选数与种子数、报告字段，并给出每一步的验证点。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>过滤用状态加最低预算；排序用尾段 10 条均值；复验取 top-3 各 5 个种子配对；报告字段含口径、样本量、区间、复验判决。验证点是各步样本量与非空断言。</div></details>
+      </li>
+      <li>推导题：解释为什么配对设计的差值方差等于 σ<sub>d</sub><sup>2</sup>=σ<sub>a</sub><sup>2</sup>+σ<sub>b</sub><sup>2</sup>−2ρσ<sub>a</sub>σ<sub>b</sub>，并说明种子噪声相关性 ρ 对区间宽度的影响。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>同种子下两配置共享环境初始化与评估布局，ρ 较高；ρ 越大差值方差越小，区间越窄。这就是“同一批种子配对跑”比“各跑一批种子”更灵敏的原因。</div></details>
+      </li>
+      <li>实践题：对一次已完成搜索，分别用尾段均值与全程最大值生成两份 top-10 名单，统计两份名单的交集比例，并解释差异来源。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>交集比例低说明过程波动大；把两份名单对应的曲线各画三条，观察“全程最大值高”的试验是否在末端回落，即可定位差异来源是过程幸运波动。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>过滤按状态、预算、配置三维度进行，每步记录样本量并设下限断言，防 NaN 静默清空。</li>
+      <li>正式排序用达预算集合内的尾段均值；全程最大值仅作诊断，截尾试验分层处理。</li>
+      <li>选择偏差约等于 σ·(2 ln n)<sup>1/2</sup>，随搜索规模增长；top-1 不是无偏汇报。</li>
+      <li>稳健汇报用 top-K 均值（K 取 5 至 10），并写明口径与样本量。</li>
+      <li>复验用未参与搜索的种子配对比较，自助区间跨 0 时不下结论；区间与效应量共同入报告。</li>
+      <li>下一章扩展到两套方法的对比设计：对照口径、对齐轴与检验流程。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch070.html">← 第 070 章：实验导入、克隆与合并</a>
+    <a class="next" href="ch072.html">第 072 章：实验对比方法 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

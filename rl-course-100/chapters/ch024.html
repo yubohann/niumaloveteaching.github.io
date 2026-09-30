@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第024章 PPO的分布式实现 | 深度强化学习课程 · PPO、SAC 与多智能体系统</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · 策略梯度与 PPO</span>
+    <span class="sep">/</span>
+    <span>第 024 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · 策略梯度与 PPO</div>
+    <h1>第 024 章：PPO的分布式实现</h1>
+    <p class="lead">用"单进程多环境"复现分布式 PPO 的数据流：N 个环境同步采样、批量前向选动作、按环境分段算 GAE，最后量一量 8 环境比单环境快多少、快在哪里。</p>
+    <ul class="meta">
+      <li>主题：数据并行 / 向量化采样</li>
+      <li>关键公式：batch = ⋃<sub>i=1..N</sub> rollout(env<sub>i</sub>, π<sub>θ_old</sub>)；cost(N) ≈ unit + fixed / N</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 023 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解 PPO 为什么需要"分布式"：on-policy 数据不能复用，吞吐只能靠采样效率。</li>
+      <li>实现单进程多环境的同步采样器 <code>VecRunner</code> 与向量化 rollout。</li>
+      <li>掌握"按环境分段计算 GAE"的正确做法，理解跨环境拼接为什么会破坏优势估计。</li>
+      <li>对比 workers=1 与 workers=8 的墙钟吞吐与学习曲线，量化批量前向带来的收益。</li>
+      <li>认识同步屏障的局限（慢环境拖累整体、片段变短影响视野），为下一章异步更新做铺垫。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>PPO 是 on-policy 算法：一批数据做完十几个 epoch 的更新就必须丢弃。这意味着它的学习速度几乎线性依赖"每秒能采多少步"。单个环境的采样速度被物理仿真限制（CartPole 每步都在做同一份小规模计算），单纯优化更新代码很快会撞到天花板。</p>
+    <p>分布式实现换了个思路：<strong>把采样并行化</strong>，同时开 N 个环境各走一步，观测拼成矩阵做一次网络前向，一次采到 N 份数据。工程上它把"网络调用的固定开销"摊薄到 N 份样本上，还能顺带获得更丰富的状态分布。本章用单进程多环境做<strong>教学简化</strong>：环境步进在 Python 层仍是串行的，但数据流、GAE 分段、同步屏障这些核心工程问题与真实分布式系统完全一致，下一章再去掉屏障，做异步版本。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 分布式 PPO 的两种形态</h3>
+    <p>分布式 PPO 通常分两类。本章实现<strong>同步数据并行</strong>：N 个 actor 各自采样一段，凑齐一批数据后，learner 做一次完整更新，然后所有人从新参数重新出发。数学上等价于把 <code>steps_per_update</code> 拆成 N 份分配给不同环境，更新规则一字不改：</p>
+    <div class="formula">
+      batch = ⋃<sub>i=1..N</sub> rollout(env<sub>i</sub>, π<sub>θ_old</sub>, steps_per_env)，&nbsp; steps_per_update = N × steps_per_env
+    </div>
+    <p>另一类是<strong>异步更新</strong>（下一章预告）：actor 采完即提交，learner 不等所有人，吞吐更高，但数据可能来自旧策略版本，需要容忍梯度陈旧（staleness）。同步版本简单、无偏，是理解分布式 PPO 的必经起点。</p>
+    <table>
+      <tr><th>维度</th><th>同步数据并行（本章）</th><th>异步更新（下一章）</th></tr>
+      <tr><td>数据新鲜度</td><td>同一策略版本，无陈旧</td><td>可能混入旧版本策略的数据</td></tr>
+      <tr><td>吞吐</td><td>受最慢环境限制</td><td>actor 采完即走，吞吐更高</td></tr>
+      <tr><td>更新规则</td><td>与单环境完全一致</td><td>需要容忍梯度陈旧</td></tr>
+      <tr><td>实现复杂度</td><td>低：一个批处理循环</td><td>高：队列、版本号、锁</td></tr>
+    </table>
+
+    <h3>2. 为什么必须"按环境分段"算 GAE</h3>
+    <p>GAE 是沿时间轴的后向递推：δ<sub>t</sub> = r<sub>t</sub> + γV(s<sub>t+1</sub>) − V(s<sub>t</sub>)，它默认 s<sub>t+1</sub> 是 s<sub>t</sub> 的下一个状态。如果把 N 条互不相关的片段拼成一条长序列递推，那么在<strong>每个环境交界处</strong>，Â 会把"另一个世界的奖励与价值"累加进来：</p>
+    <div class="formula">
+      Â<sub>t</sub> = Σ<sub>l≥0</sub> (γλ)<sup>l</sup> δ<sub>t+l</sub> &nbsp; 仅当 t, t+1, t+2 … 属于同一条轨迹时才成立
+      <span class="note">正确做法：对每个环境的片段单独调用 compute_gae，再把结果拼接</span>
+    </div>
+    <p>这是本章最容易写错、也最难从回报曲线立刻看出来的 bug：训练仍然会动，但优势估计被系统性污染，KL 与价值损失都偏高。它值得单独占一个"实现红线"的位置。</p>
+    <p>污染的规模可以估出来：拼接版在交界处会继续向后读另一段序列的 δ，权重是 (γλ)<sup>l</sup>。这些 δ 独立且均值近零，其加权和的方差按 σ<sub>δ</sub><sup>2</sup>·Σ<sub>l≥1</sub>(γλ)<sup>2l</sup> = σ<sub>δ</sub><sup>2</sup>×7.66 放大，误差标准差约为单个 δ 的 2.8 倍，且影响向后拖约 1/(1−γλ)≈17 步。也就是说每个环境交界处，前后十几个样本的优势读数里混进了强度可与真实信号相比的伪信号，而它们在批次里的占比是 N−1 个交界除以总步数。</p>
+    <p>顺手澄清一个容易混淆的点：<strong>GAE 必须按段计算，但更新前的打乱不受影响</strong>。PPO 的比率、损失都是逐样本的，样本之间没有时序依赖，所以批内可以随便打乱；唯一要求时序的地方是 GAE 递推本身。把这两件事分开，代码结构就清晰了：分段递推在采集侧完成，打乱只发生在更新侧。</p>
+
+    <h3>3. 收益从哪来</h3>
+    <p>单个环境每步都要做一次网络前向（选动作）。前向耗时由"调用固定开销 + 批量计算"构成，小网络里固定开销占大头，批量 8 与批量 1 的耗时往往只差百分之几十。于是 N 环境方案的单位样本网络开销近似为：</p>
+    <div class="formula">
+      cost(N) ≈ (fixed + N · unit) / N = unit + fixed / N
+    </div>
+    <p>N 越大，fixed/N 越小，这就是吞吐提升的来源。另一部分收益来自更新频率：每次更新收集样本的时间缩短了，单位墙钟时间内的梯度更新次数变多。本章实验会直接量出这两者合成后的加速比。</p>
+
+    <div class="box key">
+      <span class="box-title">数值算例：吞吐模型与加速比的天花板</span>
+      <p>给四个量一组示意值：网络前向固定开销 0.3 ms、每样本边际 0.04 ms、环境步 0.05 ms、每批 PPO 更新 0.5 s，批大小 2048。单环境时前向要做 2048 次：2048×0.34 ms ≈ 0.70 s，加环境步 0.10 s 与更新 0.50 s，每批约 1.30 s、吞吐约 1577 步/秒。N=8 时前向只做 256 次：256×0.62 ms ≈ 0.16 s，采集合计 0.26 s，每批约 0.76 s、吞吐 2691 步/秒，加速 1.71 倍。逐档算出：</p>
+      <table>
+        <tr><th>N</th><th>前向总耗时（s）</th><th>采集耗时（s）</th><th>每批总耗时（s）</th><th>吞吐（步/秒）</th><th>加速比</th></tr>
+        <tr><td>1</td><td>0.696</td><td>0.799</td><td>1.299</td><td>1577</td><td>1.00</td></tr>
+        <tr><td>2</td><td>0.389</td><td>0.492</td><td>0.992</td><td>2066</td><td>1.31</td></tr>
+        <tr><td>4</td><td>0.236</td><td>0.338</td><td>0.838</td><td>2444</td><td>1.55</td></tr>
+        <tr><td>8</td><td>0.159</td><td>0.261</td><td>0.761</td><td>2691</td><td>1.71</td></tr>
+        <tr><td>16</td><td>0.120</td><td>0.223</td><td>0.723</td><td>2834</td><td>1.80</td></tr>
+      </table>
+      <p>两个读数值得记住：加速比随 N 迅速饱和，因为环境步进（0.10 s）与更新（0.50 s）不随 N 缩小，模型里的吞吐上限是 2048/0.602 ≈ 3402 步/秒，N=16 已经吃到约 83%；再想往上走，要么压低更新耗时（更小的网络、更快的批处理），要么让环境步进真并行（多进程或原生向量环境）。这也解释了实测"1.5～3 倍"的区间：参数不同不影响结构，拐点总落在 N=4～16 之间。</p>
+      <p>把模型再往外推两档看得更清楚：N=64 时前向总耗时降到 0.092 s、每批约 0.69 s、吞吐约 2950 步/秒，相对 N=16 只多约 4%，说明继续堆环境基本是白工。用 Amdahl 视角看更直接：更新 0.5 s 是固定成本，把采样耗时压到 0 的极限加速是 1.299/0.5 ≈ 2.6 倍，所以"分布式"在同步架构里的天花板由更新侧决定；要突破它，得改更新方式（更大批更少步）或换异步架构。</p>
+    </div>
+
+    <h3>4. 代价与权衡</h3>
+    <p>每次更新的样本量固定为 <code>steps_per_update</code> 时，workers 越多，<strong>每个环境贡献的片段越短</strong>（比如 2048 步由 8 个环境均分，每段只有 256 步）。片段太短有两个后果：GAE 的有效视野被截短（γλ 的衰减还没走完就 bootstrap），价值学习更依赖每段末尾的 V 估计。对 CartPole 影响不大，对长时程任务（如稀疏奖励）需要相应加大 <code>steps_per_update</code>。此外同步屏障意味着<strong>最慢的环境决定整体节奏</strong>，章节末尾会讨论如何用异步绕开它。</p>
+    <p>片段长度的影响可以精确到衰减数字：GAE 的有效回看由 γλ=0.9405 决定，256 步后 (γλ)<sup>256</sup>≈1.5×10<sup>−7</sup>，折扣质量几乎全部保留；64 步时 (γλ)<sup>64</sup>≈2.0%，截断开始可见；32 步时约 14%，优势估计明显更依赖每段末尾的价值精度。于是"每段至少几十步"是一条可操作的经验线：本章 8 环境 × 256 步远在安全区，练习 3 把每段压到 64 步才会摸到边界；长时程或 λ 接近 1 的任务，先按 (γλ)<sup>L</sup> 重新算一遍再定 steps_per_update。</p>
+    <p>同步屏障的代价同样可算：一次迭代的耗时等于最慢环境的时间。某个环境因为随机性慢了 1.5 倍，整体效率就降到约 2/3；慢 2 倍时只剩一半。N 越大，"集合里至少有一个慢环境"的概率越高，这条损失会持续放大。缓解手段按成本排序：给环境设回合步数上限（防止个别回合拖长）、把慢环境分到独立池子、以及下一章的异步更新。</p>
+    <p>顺带记住一条可复现性要求：每个 worker 固定用 base_seed+i 播种、评估环境单独播种，否则吞吐对比里会混进随机性带来的轨迹差异，两臂的"快慢"就不再干净。汇总表里把吞吐与用时都落盘，下次换机器或换实现时才有基线可比。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+
+    <h3>模块划分</h3>
+    <table>
+      <tr><th>组件</th><th>职责</th><th>与第 023 章的关系</th></tr>
+      <tr><td><code>VecRunner</code></td><td>持有 N 个环境与各自当前观测；<code>step_all</code> 全体走一步并处理独立重置</td><td><strong>新增</strong>：多环境容器</td></tr>
+      <tr><td><code>collect_vec_rollout</code></td><td>批量前向选动作、按环境记录六元组、分段 GAE、拼接 batch</td><td><strong>重写</strong>：从单环境循环改为向量化</td></tr>
+      <tr><td><code>compute_gae</code></td><td>单条序列的 GAE 递推（按环境调用 N 次）</td><td>沿用 001 的实现，<strong>调用方式</strong>变了</td></tr>
+      <tr><td><code>ppo_update</code></td><td>裁剪损失 + 多轮小批量更新</td><td>完全一致</td></tr>
+      <tr><td><code>run_arm</code></td><td>单 workers 配置训练 → 评估 → 记录吞吐</td><td><strong>新增</strong>：计时与吞吐统计</td></tr>
+    </table>
+
+    <h3>关键超参数</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用与取值理由</th></tr>
+      <tr><td><code>--workers-list</code></td><td>1,8</td><td>对比"单环境"与"8 环境同步"两臂；可传 1,4,8 画吞吐曲线</td></tr>
+      <tr><td><code>--steps-per-update</code></td><td>2048</td><td>每次更新的总样本数；8 环境时每段 256 步</td></tr>
+      <tr><td><code>--max-steps</code></td><td>120000（每臂）</td><td>两臂总预算一致，吞吐差异才可比</td></tr>
+      <tr><td>环境种子</td><td>seed + i</td><td>每个 worker 用不同种子，保证数据多样性且可复现</td></tr>
+      <tr><td><code>epochs</code> / <code>batch_size</code></td><td>10 / 64</td><td>与前三章一致，差异只来自采样方式</td></tr>
+    </table>
+
+    <h3>数据流</h3>
+    <p>每个更新周期：<strong>同步采样</strong>，N 个环境各走 <code>steps_per_env</code> 步，每步先做一次批量前向（(N, obs_dim) 进、(N, act_dim) 出）再全体步进 → <strong>分段 GAE</strong>，每条环境序列单独递推，末尾用各自观测批量估值做 bootstrap → <strong>按同一种展平顺序拼接</strong>成 N×steps_per_env 的 batch → <strong>标准 PPO 更新</strong> → 记录采样耗时与更新耗时。workers 列表跑完后汇总吞吐与加速比。</p>
+
+    <div class="box key">
+      <span class="box-title">同步屏障看清楚</span>
+      <p><code>collect_vec_rollout</code> 的内层循环必须让 N 个环境都走满 <code>steps_per_env</code> 步才返回。这个"所有环境到齐"的约束就是同步屏障，它让 batch 的样本数永远精确等于 N × steps_per_env，代价是所有环境互相等最慢的那一个。另一个容易忽略的语义：回合结束是<strong>逐环境独立重置</strong>，谁结束谁 reset，不影响其他环境。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：VecRunner，N 个环境的"班组"</strong></p>
+    <pre class="code"><code>class VecRunner:
+    """单进程多环境：N 个 gym 环境 + 每个环境的当前观测与累计回报。"""
+
+    def __init__(self, env_id, n_envs, base_seed):
+        self.n_envs = n_envs
+        self.envs = [gym.make(env_id) for _ in range(n_envs)]
+        self.obs = []
+        for i, env in enumerate(self.envs):
+            o, _ = env.reset(seed=base_seed + i)   # 每环境不同种子：数据多样且可复现
+            self.obs.append(o)
+        self.ep_ret = np.zeros(n_envs, dtype=np.float64)
+
+    def step_all(self, actions):
+        """让所有环境各走一步；返回奖励/终止/截断数组与完成的回合回报。"""
+        rewards = np.zeros(self.n_envs, dtype=np.float32)
+        terminated = np.zeros(self.n_envs, dtype=bool)
+        truncated = np.zeros(self.n_envs, dtype=bool)
+        finished = []
+        for i, env in enumerate(self.envs):
+            o, r, term, trunc, _ = env.step(int(actions[i]))
+            rewards[i] = r
+            self.ep_ret[i] += r
+            if term or trunc:                      # 该环境回合结束……
+                finished.append(float(self.ep_ret[i]))
+                self.ep_ret[i] = 0.0
+                o, _ = env.reset()                 # ……单独重置，不打扰其他环境
+            self.obs[i] = o
+            terminated[i] = term
+            truncated[i] = trunc
+        return rewards, terminated, truncated, finished</code></pre>
+    <p>解读：<code>VecRunner</code> 把"一组状态互不相同的环境"封装成统一的步进接口。<strong>（1）</strong>构造函数为每个环境用 <code>base_seed + i</code> 单独播种，保证数据多样性的同时完全可复现。<strong>（2）</strong><code>step_all</code> 返回三个<strong>数组</strong>：<code>terminated</code> 与 <code>truncated</code> 分开记录，后面 GAE 要用 <code>terminated</code> 决定是否切断 bootstrap，二者的语义差别在这里第一次以"向量"的形态出现。<strong>（3）</strong>回合结束时的 <code>env.reset()</code> 只发生在本地变量 <code>o</code> 上，写回 <code>self.obs[i]</code>，哪个环境结束就重置哪个，其他环境的轨迹不受任何影响，这正是向量化采样里最容易写错的一步。</p>
+
+    <p><strong>片段 2：批量前向，一次网络调用产出 N 个动作</strong></p>
+    <pre class="code"><code>    for _ in range(steps_per_env):
+        # 1) 批量前向：N 个环境的观测一次前向，摊薄网络调用开销
+        obs_batch = torch.as_tensor(np.stack(runner.obs), dtype=torch.float32, device=device)
+        logits, values = net(obs_batch)
+        dist = Categorical(logits=logits)
+        acts = dist.sample()                    # 一次采样出 N 个动作
+        logps = dist.log_prob(acts)             # 一次算好 N 个 logp（比率基准）
+
+        # 2) 记录"步进前"的状态与动作信息（按环境分桶，保持时序完整）
+        for i in range(n):
+            obs_seg[i].append(runner.obs[i])
+            act_seg[i].append(int(acts[i].item()))
+            logp_seg[i].append(float(logps[i].item()))
+            val_seg[i].append(float(values[i].item()))
+
+        # 3) 所有环境各走一步
+        actions = acts.cpu().numpy()
+        rewards, terminated, truncated, finished = runner.step_all(actions)
+        for i in range(n):
+            rew_seg[i].append(float(rewards[i]))
+            # 只有真实终止才切断 bootstrap；时间截断仍用 V(s)
+            term_seg[i].append(float(terminated[i]))
+        ep_returns.extend(finished)</code></pre>
+    <p>解读：这段是整个向量化采样的心脏，三步节奏缺一不可。<strong>（1）</strong><code>np.stack(runner.obs)</code> 把 N 个环境的观测堆成 (N, obs_dim)，一次前向同时服务所有环境，这就是吞吐提升的第一来源；<code>dist.sample()</code> 一次产生 N 个动作，与单环境写法的逐条采样完全等价。<strong>（2）</strong>记录的是<strong>步进前</strong>的观测与动作：观测、动作、logp、价值、奖励必须按时间严格对齐，错一位整个优势估计就废了。<strong>（3）</strong>注意 <code>logps</code> 与 <code>values</code> 都来自同一批干净前向，<code>logp_old</code> 的语义与单环境版完全相同，变化的只是"一次算一批"。</p>
+    <p>实现细节上还有一处值得说明：<code>np.stack</code> 每步都做一次 O(N) 的拷贝，N 不大时开销可以忽略；若把环境数推到几百个，应改成预分配 <code>(N, obs_dim)</code> 的缓冲数组原地写入，避免每步的堆叠开销。同理，第 2、3 步里按环境分桶的 <code>append</code> 是 Python 层逐条循环，环境数与每段步数之积就是这层的循环次数（8×256=2048 次），单进程下它的开销也进了 <code>t_collect</code>；真分布式系统会把这段下推到各 actor 进程，主进程只收张量。</p>
+    <p>向量化还带来一个次要但实在的收益：<strong>数据多样性</strong>。每个环境独立播种、独立重置，同一批数据里天然混着不同初始状态与不同轨迹阶段的状态，价值网络每轮看到的状态分布更宽，梯度估计的方差更低。这也解释了为什么多环境训练时曲线往往更平滑，即使吞吐不变，这个效应也存在。</p>
+
+    <p><strong>片段 3：分段 GAE 与拼接，本章的实现红线</strong></p>
+    <pre class="code"><code>    # 4) 每个环境的序列末端各做一次 bootstrap 估值（批量前向）
+    obs_last = torch.as_tensor(np.stack(runner.obs), dtype=torch.float32, device=device)
+    _, last_values = net(obs_last)
+    last_values = last_values.cpu().numpy()
+
+    # 5) 按环境分段做 GAE，再按"环境优先"的顺序拼接成一个大 batch
+    adv_parts, ret_parts = [], []
+    for i in range(n):
+        adv_i, ret_i = compute_gae(rew_seg[i], val_seg[i], term_seg[i],
+                                   float(last_values[i]), gamma, lam)   # 每段独立递推
+        adv_parts.append(adv_i)
+        ret_parts.append(ret_i)
+    advantages = np.concatenate(adv_parts, axis=0)
+    returns = np.concatenate(ret_parts, axis=0)</code></pre>
+    <p>解读：<strong>第 5 步是本章唯一允许出错的地方，也是最容易写错的地方。</strong><code>compute_gae</code> 每次只吃一条环境的时间序列（<code>rew_seg[i]</code> 等六个列表），递推在段内从后向前走；<code>last_values[i]</code> 是该环境当前观测（最后一次步进/重置之后）的 bootstrap 值。如果图省事拼成一条长序列只调用一次 GAE，每个环境交界处都会发生一次"跨世界的价值串联"：前一段的尾部把后一段的奖励当成自己的未来收益累进优势里，优势估计被系统性污染，症状是训练仍推进但 KL 与价值损失偏高。<strong>拼接顺序（环境优先、时间其次）本身不影响正确性</strong>，更新前会打乱，但 <code>obs/act/logp_old/adv/ret</code> 五种数据必须用同一种展平顺序，否则就是"张量错位"级别的灾难。</p>
+
+    <p><strong>片段 4：把吞吐量出来，采样与更新分开计时</strong></p>
+    <pre class="code"><code>    while total_steps &lt; args.max_steps and solved_at is None:
+        # 1) 同步采样：所有环境各走 steps_per_env 步（同步屏障的简化体现）
+        t0 = time.time()
+        batch, ep_returns = collect_vec_rollout(
+            runner, net, steps_per_env, device, args.gamma, args.lam)
+        t_collect += time.time() - t0            # 采样耗时单独累计
+
+        # 2) 中心化更新（所有环境到齐后才允许更新）
+        t0 = time.time()
+        stats = ppo_update(net, optimizer, batch, args)
+        t_update += time.time() - t0             # 更新耗时单独累计
+
+        if solved_at is None and len(all_returns) &gt;= 100 and \
+                np.mean(all_returns[-100:]) &gt;= args.target_reward:
+            solved_at = total_steps</code></pre>
+    <p>解读：计时的目的是回答"加速加在哪里"，日志好看只是顺带。<strong>（1）</strong><code>t_collect</code> 与 <code>t_update</code> 分开累计后会发现：workers=8 时采样耗时明显下降，而 <strong>PPO 更新耗时几乎不动</strong>，因为更新本来就不是逐环境做的事，它是整批张量运算。<strong>（2）</strong><code>steps_per_env = max(1, steps_per_update // workers)</code> 是每次更新均分给各环境的步数；参数不整除时向下取整，实际每批样本数以日志为准。<strong>（3）</strong>吞吐用 <code>total_steps / elapsed</code> 计算，两臂 max-steps 相同才有可比性。</p>
+
+    <p>完整可运行脚本（附录）：<a href="../code/ch024.py" download>code/ch024.py</a></p>
+    <pre class="sh"><code>python code/ch024.py            # workers=1 vs 8：各 12 万步，CPU 约 3–6 分钟
+python code/ch024.py --quick    # 快速跑通：30–60 秒
+python code/ch024.py --workers-list 1,2,4,8   # 画吞吐曲线</code></pre>
+    <p>以实跑为准：<strong>8 环境吞吐通常是单环境的 1.5～3 倍</strong>（批量前向摊薄固定开销是主因）；两臂样本预算相同，学习曲线量级接近，首达目标典型在 3 万～7 万步。workers=8 时 <code>t_collect</code> 明显下降，而更新耗时不变甚至占比更大，这提示你下一步优化该往哪里走。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>GAE 跨环境边界递推</strong>：把 N 条片段拼成一条序列做一次 GAE 是最隐蔽的错误。症状是训练照常推进但 KL 偏高、价值损失下不去。<strong>修复</strong>：每个环境各调用一次 <code>compute_gae</code> 再拼接。</li>
+      <li><strong>回合结束后忘了单独重置那个环境</strong>：向量化采样里每个环境独立开回合。忘记 reset 会让已终止的环境继续收步进结果，数据与回报统计全部错位。</li>
+      <li><strong>bootstrap 用错观测</strong>：每个环境的 <code>last_value</code> 必须取自该环境"最后一次步进/重置之后"的观测；若用了步进前的观测，价值目标会晚一步。</li>
+      <li><strong>把单进程多环境当成真并行</strong>：Python 层的 <code>env.step</code> 仍是一个个串行执行。加速来自批量前向的摊薄与更短的采样窗口；要真并行得用多进程或 C 级向量化环境，并付通信成本。</li>
+      <li><strong>各数据流拼接顺序不一致</strong>：<code>obs</code> 环境优先而 <code>adv</code> 时间优先（或反之），训练不会报错但样本对不上标签。<strong>修复</strong>：五种数据统一用同一段展平代码生成。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>运行 <code>--workers-list 1,2,4,8</code>，把四个吞吐值画成折线，找出边际收益开始变缓的拐点，并用 <code>unit + fixed/N</code> 的解释说明原因。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>吞吐不是随 N 线性增长：环境步进与更新耗时不随 N 缩小。把汇总表"用时"拆成 collect 与 update 两部分看更清楚。</div></details>
+      </li>
+      <li>把 <code>collect_vec_rollout</code> 里"按环境分段算 GAE"改成把整批当一条序列只调用一次 <code>compute_gae</code>（先用 8 个环境跑 2 万步），对比 KL、价值损失与滑窗回报的变化，解释污染从哪来。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>改动只在第 5 步：把所有环境的 rew/val/term 直接串起来递给一次 compute_gae。观察每个"环境交界处"的时序差分残差被错误累加后，平均 KL 会明显偏高。</div></details>
+      </li>
+      <li>固定 workers=8，把 <code>--steps-per-update</code> 从 2048 降到 512（每段 64 步），再升到 8192（每段 1024 步）：记录 KL 波动与首达步数，讨论"片段长度—方差"的权衡。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>512 时更新更频繁、KL 抖动更大；8192 时每段视野更长但更新更少。对比三档的裁剪比例与近 100 回合均值。</div></details>
+      </li>
+      <li>给 <code>VecRunner</code> 增加"环境多样性"参数：让一半环境用观测加噪声的变体（或不同的初始状态分布），观察状态覆盖与评估成绩是否变化。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>最简单的做法：在 <code>step_all</code> 返回前给部分环境的 obs 加一点 N(0, 0.01) 噪声（仅训练用）。思考这对策略泛化的影响。</div></details>
+      </li>
+      <li>实现"双缓冲半异步"：用后台线程提前采集下一批数据，主线程同时做当前批的 PPO 更新，用 <code>threading.Lock</code> 保护参数快照。测量墙钟时间变化与数据新鲜度（采完到消费的间隔）。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>采集线程需要网络参数的快照（<code>state_dict()</code> 深拷贝到独立网络），否则会与更新竞争。这个练习就是下一章异步更新的雏形。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>PPO 的吞吐瓶颈在采样；同步数据并行 = 把 <code>steps_per_update</code> 拆给 N 个环境，更新规则不变。</li>
+      <li>批量前向把网络调用的固定开销摊薄到 N 份样本上，是吞吐提升的主要来源；更新本身不并行。</li>
+      <li>GAE 必须按环境分段计算再拼接，跨环境递推会污染优势估计，这是本章最重要的实现红线。</li>
+      <li>workers 越多，每段轨迹越短、GAE 视野越窄；长时程任务要同步加大每次更新的总步数。</li>
+      <li>同步屏障让所有环境互相等待。下一章去掉屏障：actor 采完即提交、learner 持续消费，用"陈旧度"换吞吐。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch023.html">← 第 023 章：PPO的探索策略：熵正则化与噪声结合</a>
+    <a class="next" href="ch025.html">第 025 章：PPO的异步优势更新 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

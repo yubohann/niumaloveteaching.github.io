@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第023章 使用RL-Games训练机器人 | 机器人仿真学习课程 · Isaac Sim 强化学习训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · 仿真环境与训练框架</span>
+    <span class="sep">/</span>
+    <span>第 023 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · 仿真环境与训练框架</div>
+    <h1>第 023 章：使用RL-Games训练机器人</h1>
+    <p class="lead">换成 NVIDIA 官方高吞吐训练库：一份 YAML 描述网络与 PPO 全部超参，训练脚本一行命令拉起，机器人策略从配置到收敛全程可复现。</p>
+    <ul class="meta">
+      <li>主题：训练框架 / 配置驱动训练</li>
+      <li>相关组件：RL-Games、Isaac Sim、OmniIsaacGymEnvs（作为宿主）</li>
+      <li>预计学时：50 分钟</li>
+      <li>前置章节：第 022 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>定位 RL-Games 在 Isaac 生态中的角色：它是训练器（trainer），环境由宿主项目提供，理解"训练器与环境的接口契约"。</li>
+      <li>读懂一份 RL-Games 训练配置：horizon、minibatch、mini-epochs、clip、学习率等参数之间的关系与推荐量级。</li>
+      <li>掌握观测归一化、价值归一化这类"隐式预处理"为什么内建在 RL-Games 里，以及它们对机器人任务的影响。</li>
+      <li>会把第 022 章的批量环境接到 RL-Games 的接口上，并用一行命令启动训练与恢复（resume）。</li>
+      <li>说清 RL-Games 与 Isaac Lab 内置的 rsl_rl 的差异，知道什么场景选哪个。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 022 章解决了"环境怎么并行"，但学习器那一侧你还在手写 PPO。<strong>自己写的 PPO 通常卡在两件事上：超参没调对、训练不可复现。</strong>RL-Games 是 NVIDIA 机器人团队维护的高吞吐强化学习库，最初为 Isaac Gym 生态打造，如今仍作为 OmniIsaacGymEnvs 的默认训练后端。它的三个特点正好对上机器人训练的痛点：</p>
+    <ul>
+      <li><strong>配置驱动</strong>：网络结构、PPO 超参、训练轮数全部写在 YAML 里，实验即文件，换参数不用改代码，天然可复现、可对比。</li>
+      <li><strong>吞吐优先</strong>：所有数据通路按张量批处理设计，与第 022 章的 (N, dim) 观测天然匹配，4096 环境 × 16 步的采样在秒级完成。</li>
+      <li><strong>内建实用技巧</strong>：观测归一化、优势归一化、KL 自适应学习率、值函数裁剪都是默认项，这些恰是机器人任务里最容易踩坑的部分。</li>
+    </ul>
+    <p>本章不深挖 PPO 数学（第 017–020 章已铺垫），重点是<strong>学会用这套工具、读懂它的配置文件、理解每个默认值背后的理由</strong>。这些配置思想在后续所有训练章节里反复出现。</p>
+  </section>
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 训练器与环境的契约：谁负责什么</h3>
+    <p>RL-Games 的架构可以概括为一句话：<strong>环境负责"物理与数据"，训练器负责"学习与调度"</strong>。环境要向训练器暴露的最小接口包括：观测与动作的维度声明、<code>step</code>（批量）、<code>reset</code>（批量）、以及训练/评估模式切换（训练时随机化，评估时固定）。</p>
+    <p>在 Isaac 生态里这个契约具体表现为：OmniIsaacGymEnvs 里的 <code>VecTask</code> 子类实现这些方法，RL-Games 的 runner 按配置调用它们。所以"用 RL-Games 训练"实际是三件事：<b>写一个满足契约的环境、写一份配置文件、把两者在启动脚本里接起来</b>。理解这一点，换任何训练器（rsl_rl、skrl）时你只需要重新核对接口，算法本身不必重推。</p>
+
+    <h3>2. 采样结构：horizon 与 minibatch 的几何关系</h3>
+    <p>RL-Games 的 PPO 每轮收集的数据量是：</p>
+    <div class="formula">
+      batch = num_envs × horizon_length
+      <span class="note">例：4096 环境 × 16 步 = 65536 条 transition；minibatch_size=16384 时恰好整除，每轮 4 个 minibatch</span>
+    </div>
+    <p>horizon 控制"一次采集多长再更新"，<b>它同时决定优势估计（GAE）的时间视野</b>。机器人控制任务里 horizon 常取 8–32：太小，时序差分信号传不远（值函数学不动）；太大，样本变"陈旧"，策略已经变了但数据还是旧策略采的，PPO 的重要性权重比值漂移，训练不稳。</p>
+    <p>为什么要把 batch 拆成 minibatch 并多次遍历（mini_epochs）？这是 PPO 的精髓：同一批数据可以安全地做几次梯度更新，<strong>更新次数的实际上限由策略偏离程度（KL 散度）决定，固定 epoch 数只是名义值</strong>。RL-Games 默认打开自适应 KL 学习率：KL 偏大就降学习率，偏小就升，把训练稳定性和速度同时压出来。</p>
+
+    <h3>3. 内建归一化：为什么机器人任务离不开它</h3>
+    <p>机器人观测是"量纲大杂烩"：关节角 ±3.14 rad、速度 ±5 rad/s、目标距离 ±1 m、接触力 0–50 N。直接喂给 MLP，梯度会被大数值维度主导。RL-Games 的解法是<b>运行时归一化（running normalization）</b>：对每个观测维度维护在线均值与方差，更新公式是</p>
+    <div class="formula">
+      x̂ = (x − μ) / (σ + ε)，  μ ← (1−α)μ + αx，  σ² ← (1−α)σ² + α(x−μ)²
+      <span class="note">α 为滑动系数；训练前 1 万步用数据把统计量"喂稳"，之后再评估策略</span>
+    </div>
+    <p>与离线归一化（先跑一批数据算好均值方差）相比，运行时归一化自动适应课程学习与域随机化带来的分布漂移，这正是机器人训练最需要的。<b>但有一个副作用必须知道：归一化统计量随训练变化，策略的前端输入是非平稳的</b>。所以评估时必须冻结统计量，否则同一个策略在不同时刻测出的成功率会漂移。</p>
+
+    <h3>4. 与 rsl_rl 的关系：同源不同代</h3>
+    <p>Isaac Lab 的默认训练后端是 rsl_rl（苏黎世联邦理工 Robotic Systems Lab 出品），思路与 RL-Games 一脉相承：PPO + 张量环境 + YAML 配置。差异主要在工程细节：rsl_rl 更强调按 rollout 分块存储、与 Isaac Lab 的 manager-based 环境耦合更紧；RL-Games 历史更长、配置项更多、在 OmniIsaacGymEnvs 里开箱即用。<strong>选型原则：新项目用 Isaac Lab + rsl_rl；维护旧 Isaac Gym 风格工程或需要复用社区配置时用 RL-Games。</strong>两者的调参直觉完全互通。</p>
+
+    <h3>5. 完整算例：一轮 PPO 更新的时间账</h3>
+    <p>把 022 章的单步预算与本章的更新结构拼起来算一轮完整更新。采样量 = 4096 × 16 = 65536 条 transition。时间分三段：</p>
+    <table>
+      <tr><th>阶段</th><th>计算</th><th>耗时（ms）</th></tr>
+      <tr><td>采样</td><td>16 个控制步 × 20.5 ms/步</td><td>328</td></tr>
+      <tr><td>梯度更新（上限）</td><td>4 个 minibatch × 5 个 mini-epoch，单次前向+反传约 6 ms</td><td>120</td></tr>
+      <tr><td>评估与日志（摊销）</td><td>定期评估、TensorBoard、checkpoint 轮转</td><td>30</td></tr>
+      <tr><td>合计</td><td>65536 条 / 478 ms</td><td>478</td></tr>
+    </table>
+    <p>折算吞吐约 13.7 万条/秒，这是乐观上限；评估回合与渲染一旦计入，实测常落到 5–10 万条/秒区间。另有两点结构信息。<strong>第一，采样占 69% 的时间</strong>，更新的 20 次梯度步只占 25%，所以"提高吞吐"的主战场仍在环境侧（022 章的结论在这里得到延续）；把 mini_epochs 从 5 降到 3 省下的是小头，且可能降低样本效率。<strong>第二，按这个吞吐，1 亿条 transition 的墙钟时间在 12–33 分钟量级</strong>（5 万条/秒对应 33 分钟），与第 022 章的端到端口径互相印证：训练时长的数量级由吞吐决定，而吞吐要按含更新的口径报告。</p>
+
+    <h3>6. 网络容量的参数量核算</h3>
+    <p>观测 24 维、动作 7 维时，三种常用 MLP 的参数量（actor 与 critic 共享主干，各自外接头层）：</p>
+    <table>
+      <tr><th>units</th><th>主干参数</th><th>总参数（含两个头）</th><th>fp32 大小</th></tr>
+      <tr><td>[256, 128]</td><td>39 296</td><td>40 328</td><td>0.16 MB</td></tr>
+      <tr><td>[512, 256, 128]</td><td>177 024</td><td>178 056</td><td>0.71 MB</td></tr>
+      <tr><td>[1024, 512, 256]</td><td>681 728</td><td>683 784</td><td>2.74 MB</td></tr>
+    </table>
+    <p>读数：即使最大的配置 68 万参数，fp32 也只有 2.74 MB，加上梯度与 Adam 两个动量约 11 MB，显存上完全不是约束。<strong>网络宽度影响的是每步推理与反传的时间（进 5 节的时间账），不是显存</strong>。容量选择因此只按任务复杂度来：24 维观测、7 维动作的姿态控制任务，[512, 256, 128] 已远超需求；回报学不动时先查奖励与 horizon，再怀疑容量。另一个结构细节：[512, 256, 128] 的主干里，512×256 的中间层占 131 328 个参数、约 74%，加宽网络的代价主要砸在中间层，极端窄-宽-窄的层型并不划算。</p>
+
+    <h3>7. 对比：RL-Games、手写 PPO 与 rsl_rl 的工程账</h3>
+    <table>
+      <tr><th>维度</th><th>RL-Games</th><th>SB3 手写 PPO</th><th>rsl_rl</th></tr>
+      <tr><td>配置方式</td><td>YAML 全覆盖，实验即文件</td><td>Python 参数 + 回调</td><td>YAML + 少量代码</td></tr>
+      <tr><td>观测归一化</td><td>内建，随 checkpoint 保存</td><td>需配 VecNormalize，且要单独保存统计量</td><td>内建</td></tr>
+      <tr><td>KL 自适应学习率</td><td>内建</td><td>需自行实现</td><td>内建（desired_kl）</td></tr>
+      <tr><td>恢复训练</td><td>一条命令连统计量一起恢复</td><td>网络与归一化统计分两处手动管理</td><td>一条命令</td></tr>
+      <tr><td>环境耦合</td><td>宿主项目（OmniIsaacGymEnvs）提供张量环境</td><td>通用 gym 接口，逐环境包装有开销</td><td>与 Isaac Lab 管理器式环境深度耦合</td></tr>
+      <tr><td>适用场景</td><td>复用旧 Isaac Gym 风格工程与社区配置</td><td>快速原型、算法试验</td><td>新 Isaac Lab 项目</td></tr>
+    </table>
+    <p>三者的核心超参直觉互通：clip 0.2、gamma 0.99、lambda 0.95 可以照抄。真正的差异在"隐形工程"：归一化统计量的生命周期、恢复的完整性、评估模式的切换。手写 PPO 能跑通训练循环之后，这些才是把实验做扎实的部分，也正是本章把框架用起来的理由。</p>
+
+    <h3>8. 失效模式：KL 自适应与归一化的边界</h3>
+    <ul>
+      <li><strong>KL 自适应的上下探振荡</strong>：典型序列是 lr 3e-4 时 KL 冲到 0.035，超过阈值两倍（0.032），lr 降到 2e-4；随后 KL 回落到 0.006，低于阈值一半（0.008），lr 又升回 3e-4。若 lr 在两点间反复横跳，KL 曲线呈锯齿、回报平台化。修复：把 kl_threshold 适当收紧，或给 lr 设上下限截断振荡。</li>
+      <li><strong>归一化统计量的非平稳性</strong>：训练前一万步里统计量自身在漂移，策略前端输入分布随之变化，等价于"目标函数在动"。这是正常代价，换来的收益是自动适应课程学习与域随机化；边界在于评估：冻结统计量后同一策略可复测，但如果任务分布随后改变，旧统计量会让成绩缓慢劣化，需要重新校准。</li>
+      <li><strong>minibatch 尺寸的两端</strong>：minibatch 太小（如 4096 以下）时内核启动与同步开销占比升高，GPU 利用率掉；大于 batch 时逻辑上无意义。合理区间是 batch 的 1/8 到 1/2。</li>
+      <li><strong>稀疏奖励下的优势归一化</strong>：优势除以 batch 标准差会同时放大信号与噪声；奖励稀疏时分子近乎全零、分母很小，归一化输出几乎全是噪声。修复：先在奖励侧缩放（抬升 5 cm 给 1.0 这类 O(1) 设计），再进归一化。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p><strong>接入 RL-Games 的完整链路是"选宿主 → 注册环境 → 写配置 → 启动训练 → 恢复与评估"。</strong>逐段说明：</p>
+    <ol>
+      <li><strong>选宿主项目</strong>：优先在 OmniIsaacGymEnvs 框架内加任务（下一章会展开它），因为注册表、启动脚本、日志目录都已建好。若要独立工程，则自行初始化环境并调用 RL-Games 的 runner。</li>
+      <li><strong>环境满足契约</strong>：声明 <code>num_envs</code>、<code>obs_dim</code>、<code>act_dim</code>；<code>step</code> 返回的四个量都是 batch 维打头的张量；提供 <code>set_train()/set_eval()</code> 切换随机化。</li>
+      <li><strong>写训练配置</strong>：网络（MLP 层数与宽度）、PPO（horizon、minibatch、mini_epochs、clip、lr）、归一化开关、奖励尺度缩放。</li>
+      <li><strong>启动</strong>：训练脚本读取 YAML，构造环境与 runner，主循环采样-更新交替；日志与 checkpoint 落盘。</li>
+      <li><strong>恢复与评估</strong>：checkpoint 里保存网络、优化器、归一化统计量三者；评估时载入全部三样，冻结随机化。</li>
+    </ol>
+    <table>
+      <tr><th>参数</th><th>推荐起点</th><th>理由</th></tr>
+      <tr><td>horizon_length</td><td>16</td><td>短期任务 8 够用；涉及长时序（开门）可加到 32</td></tr>
+      <tr><td>minibatch_size</td><td>batch / 4</td><td>4 个 minibatch 是吞吐与稳定性的常见平衡点</td></tr>
+      <tr><td>mini_epochs</td><td>5</td><td>配合自适应 KL，属于"上限"，实际由 KL 提前终止</td></tr>
+      <tr><td>learning_rate</td><td>3e-4 → 1e-3（自适应）</td><td>4096 环境大 batch 下 3e-4 偏保守，KL 自适应会自动上探</td></tr>
+      <tr><td>clip</td><td>0.2</td><td>PPO 标准值；机器人任务不建议比 0.1 更小</td></tr>
+      <tr><td>gamma / lambda</td><td>0.99 / 0.95</td><td>控制周期 60 Hz 时有效视野约 1.7 s，适合操作任务</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计思维：奖励尺度也要"归一化"</span>
+      <p>RL-Games 配置里通常有一个 <code>reward_shaping</code> 或奖励缩放项。原因：PPO 对奖励的绝对尺度不像 Q-learning 那样敏感，但优势归一化是按 batch 统计的，如果大部分步奖励≈0（稀疏任务），归一化会把少量非零奖励放大成噪声。常见做法是把每步奖励缩放至 O(1) 量级（如抬升 5 cm 奖励 1.0、每步时间惩罚 0.01），<strong>让信号密度与数值尺度同时可控</strong>。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：一份可用的训练 YAML（节选自典型配置）</strong></p>
+    <pre class="code"><code>params:
+  config:                       # 全局训练参数：采样结构与优化器都在这里
+    name: franka_reach_ppo       # 实验名，决定日志与 checkpoint 目录
+    env_name: rlgpu              # 宿主环境的注册名（OmniIsaacGymEnvs 约定）
+    horizon_length: 16           # 每次采集 16 个控制步再更新：兼顾视野与新鲜度
+    minibatch_size: 16384        # 4096 环境 × 16 步 / 4，恰好整除便于 GPU 满负荷
+    mini_epochs: 5               # 同一批数据最多回炉 5 次，KL 过大时提前停
+    learning_rate: 3e-4          # 起始学习率；KL 自适应会在此基础上浮动
+    clip: 0.2                    # PPO 概率比裁剪，抑制单次更新的策略漂移
+    gamma: 0.99                  # 折扣因子：60 Hz 下有效视野约 1.7 秒
+    lam: 0.95                    # GAE 平滑系数，控制偏差-方差折中
+    kl_threshold: 0.016          # KL 超过它就降 lr：这是"稳"的关键闸门
+    normalize_input: True        # 观测在线归一化：机器人多量纲观测的刚需
+    normalize_value: True        # 价值在线归一化：回报尺度未知时防止值网络震荡
+    bounds_loss_coef: 0.001      # 轻推关节靠近限位中位的正则，避免贴边抖动
+  network:                       # 网络结构：actor 与 critic 默认共享主干
+    name: actor_critic
+    separate: False              # True 则 actor/critic 各一套 MLP（显存换个性化）
+    units: [512, 256, 128]       # 三层 MLP：机器人任务足够，过深反而难训
+    activation: elu              # ELU 负区间光滑，比 ReLU 更适合连续控制</code></pre>
+    <p>解读：<b>先看几何关系</b>，minibatch_size 取 16384，是因为 batch=65536 要能被整除；改 N 或 horizon 时这里必须同步改，否则会浪费尾部数据。<b>再看两个归一化开关</b>：<code>normalize_input</code> 处理观测量纲，<code>normalize_value</code> 处理回报尺度，机器人任务里建议都开；关闭它们只在你已有明确外部预处理时才有意义。<b>最后看 kl_threshold</b>：它是自适应学习率的判据，每个 mini-epoch 后统计新旧策略的 KL，超过 0.016 降 lr、低于一半升 lr。这个 0.016 不是魔法数字，它来自实践：超过 0.02 时策略行为变化过大，PPO 理论上的"保守更新"假设就失效了。注意关掉 <code>schedule</code> 里的固定学习率衰减、改用 KL 自适应，是 RL-Games 相比手写 PPO 最省心的部分之一。</p>
+
+    <p><strong>片段 2：环境侧接口，提供训练器需要的一切</strong></p>
+    <pre class="code"><code>class FrankaReachTask(VecTask):          # 宿主基类：自带 num_envs、设备、张量工具
+    def __init__(self, cfg):
+        super().__init__(cfg, ...)       # 版本差异：4.x 前是 cfg 字典，之后为任务配置对象
+        self._num_envs = cfg["env"]["numEnvs"]        # 4096：与训练 YAML 的 N 保持一致
+        self._obs_dim = 3 + 7 + 7 * 2                 # 目标(3) + 关节(7) + 关节速度(7)+夹爪(7)
+        self._act_dim = 7                             # 7 自由度位置增量：连续动作
+        # 训练器约定：观测与动作空间必须是 batch 维打头的张量
+        self.obs_space = gym.spaces.Box(low=-np.inf, high=np.inf,
+                                        shape=(self._num_envs, self._obs_dim))
+        self.act_space = gym.spaces.Box(low=-1.0, high=1.0,
+                                        shape=(self._num_envs, self._act_dim))
+
+    def set_train(self):
+        self.randomize = True            # 训练模式打开域随机化：物体位置、质量、摩擦
+    def set_eval(self):
+        self.randomize = False           # 评估模式冻结随机化与观测噪声，成绩才可比
+
+    def step(self, actions):
+        self._apply_actions(actions * self.action_scale)   # 训练器输出 [-1,1]，这里放大到关节增量
+        for _ in range(self.decimation):
+            self._world.step(render=False)
+        obs = self._build_obs()                            # (N, obs_dim)
+        rew = self._reward()                               # (N,)
+        done = self._fail_and_timeout()                    # (N,)
+        info = {"successes": self._check_success()}        # 评估指标随 step 返回
+        return obs, rew, done, info</code></pre>
+    <p>解读：这段代码的每个字段都在回答训练器的一个需求。<b>为什么动作空间写 [-1,1]、不用真实关节量纲？</b>因为策略网络输出经 tanh 落在 [-1,1]，环境侧再做 <code>actions × action_scale</code> 的仿射映射，把量纲转换集中在环境里；这样策略无需学习"动作的绝对刻度"，缩放超参也可以在 YAML 里被 sweep。<b>为什么 <code>set_train/set_eval</code> 单独成对？</b>域随机化、观测噪声、动作延迟如果评估时还开着，两次测得的成功率没有可比性；训练器会在切换阶段自动调用它们。<b>为什么 info 里带 successes？</b>RL-Games 的日志系统会把它聚合成成功率曲线，这是比回报更可靠的进度指标，尤其奖励被塑形过时。</p>
+
+    <p><strong>片段 3：启动、恢复与评估入口</strong></p>
+    <pre class="code"><code># 训练：脚本内部会读 YAML、构造环境、把 runner 跑起来
+# python train.py --task FrankaReach --num_envs 4096 --config franka_reach_ppo.yaml
+from rl_games.torch_runner import Runner
+
+def launch(config_path: str, checkpoint: str = None):
+    runner = Runner()                        # 训练器实例：什么都不做，直到喂它配置
+    runner.load(config_path)                 # 解析 YAML：网络/PPO/归一化全部就位
+    runner.reset()                           # 构造网络与优化器；此刻才会分配显存
+    if checkpoint:                           # 断点恢复：三样东西都要从盘上回来
+        runner.restore(checkpoint)           # 网络权重 + 优化器状态 + 归一化统计量
+        # 少恢复归一化统计量，相当于把观测分布"重置"，初期回报会明显跳水
+    runner.run({                             # 采样本、更新、定期评估与存档的主循环
+        "train": True,                       # False 则只评估：加载策略跑固定回合数
+        "play": False,
+        "checkpoint": "runs/franka_reach_ppo",   # 日志与权重的落盘目录
+    })</code></pre>
+    <p>解读：注意 <code>load → reset → restore → run</code> 这个顺序，它与常见框架的"构造即分配"不同：<b>RL-Games 把"读配置"和"建模型"显式分开</b>，好处是同一份配置可以在 CPU 上先做校验、再决定设备与精度。恢复训练时特别强调第三样东西，归一化统计量。它在 checkpoint 里与网络权重同存，如果只载入权重忽略统计量，策略面对的是一个"没校准的输入标尺"，表现为恢复后成功率骤降再缓慢回升。这种问题在日志上像个"训练不稳定"，实战里 90% 的偶发性恢复退化都出在这里。最后一行的目录建议用任务名 + 时间戳，RL-Games 默认在其下建 <code>nn/</code> 与 <code>summaries/</code> 子目录，便于多组实验对比。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>batch 不整除</strong>：改了 <code>num_envs</code> 或 <code>horizon_length</code> 却忘了同步 <code>minibatch_size</code>，训练器会对尾部数据做 padding，浪费 10–30% 的样本。症状：吞吐低于理论值、不同实验之间方差变大。修复：三者保持整倍关系。</li>
+      <li><strong>恢复训练只加载权重</strong>：忘记恢复观测归一化与优化器状态，回报曲线在恢复点跳水。修复：用 runner 的 restore 一条龙恢复，别手工 <code>load_state_dict</code> 只拿网络。</li>
+      <li><strong>评估时忘记冻结随机化</strong>：<code>set_eval()</code> 没生效或评估脚本自建环境时没调它，两次评估成功率差 20 个点很常见。修复：评估统一走"载入 checkpoint + 固定种子"。</li>
+      <li><strong>观测归一化在早期影响探索</strong>：前几千步统计量不准，归一化后的观测"忽大忽小"，早期回报噪声大。症状：训练开头 2000 步奖励剧烈抖动后转好。修复：属于正常现象，别急着回滚；可以预热几千步再开梯度更新。</li>
+      <li><strong>版本路径差异</strong>：Isaac Sim 4.x/5.x 里工具链目录与包路径与 2022.x 不同（如 <code>omni.isaac.*</code> 大量迁移到 <code>isaacsim.*</code>），RL-Games 独立安装与随宿主打包的版本 API 也略有出入。症状：<code>import rl_games</code> 失败或 runner 参数不匹配。修复：跟着宿主版本提供的示例配置走，不要混用旧教程的导入路径。</li>
+      <li><strong>两处 num_envs 不一致</strong>：环境配置里的 <code>numEnvs</code> 与训练 YAML 的并行度各写一份，改了其中一处就报 shape 不匹配或静默错位。症状：启动即报维度错误，或日志里步数对不上。修复：以启动脚本注入为单一来源，或启动时显式校验两个值相等。</li>
+      <li><strong>稀疏奖励直接开优势归一化</strong>：不做奖励缩放就上 <code>normalize_value</code>，优势被"零除以零"式的统计放大成噪声，表现为回报方差大而成功率不动。修复：先把每步奖励设计到 O(1) 量级，再启用归一化；用成功率和回报两条曲线是否同向作为体检。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把 <code>minibatch_size</code> 从 16384 改成 12000（不再整除 65536），训练 200 个 update，观察吞吐与回报曲线的变化，解释你看到的差异。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>关注每秒步数日志与每个 epoch 实际用到的样本数；Padding 或丢弃都会让"同样的墙钟时间"训得更少。</div></details>
+      </li>
+      <li>关闭 <code>normalize_input</code> 训练同一个任务，对比收敛步数。预测哪些观测维度会主导梯度。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>看看你的观测各维度量纲：关节速度 ±5、接触力 0–50，与归一化后的差距。关闭后通常需要显著调低 lr 才能稳住。</div></details>
+      </li>
+      <li>设计一个实验验证"恢复归一化统计量"的重要性：保存 checkpoint 后，手工只恢复网络权重 vs 完整恢复，对比恢复后前 100 个 update 的平均回报。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>两次实验用同一个 checkpoint 与同一随机种子，差异只能归因于统计量；差异的恢复时间也值得记录。</div></details>
+      </li>
+      <li>把 <code>horizon_length</code> 从 16 加到 64，分析两件事：每 update 样本量翻四倍后 lr 该如何调整（线性缩放假设）；以及"陈旧数据"效应对开门这类长时序任务是否反而有利，用实验说话。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>大 batch 常配合更大 lr（或用 KL 自适应自动接管）；陈旧数据的利弊要看任务信用分配距离，结论以成功率作准，回报曲线只作参考。</div></details>
+      </li>
+      <li>比较题：为你的任务写一份 rsl_rl 风格的配置（rollout 长度、num_mini_batches、learning_epochs），与本章 RL-Games 配置逐项对应。哪些概念一一对应，哪些是各自独有的？<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>horizon↔rollout、minibatch↔num_mini_batches、mini_epochs↔learning_epochs；RL-Games 独有的观测/价值归一化在 rsl_rl 里通常要自己写，反之 rsl_rl 的对称 actor-critic 更常出现在其默认配置中。</div></details>
+      </li>
+      <li>按 5 节的时间账复算：若把 horizon 从 16 改到 32，采样与更新各占多少毫秒（更新按 8 个 minibatch × 5 epoch 估）、每轮样本量与吞吐如何变化？<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>采样 32×20.5 = 656 ms；更新上限 40×6 = 240 ms；加 30 ms 摊销后每轮约 926 ms、131072 条，吞吐约 14.2 万条/s，与 horizon=16 的 13.7 万接近，说明吞吐对 horizon 不敏感而视野翻倍。</div></details>
+      </li>
+      <li>用 6 节的方法手算 [256, 256, 256] 主干在 obs=48、act=12 时的参数量，并与 [512, 256, 128] 对比，说明"加宽"与"加深"哪个涨参数更快。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>逐层 w×h+h 相加；比较相邻层宽度变化对参数总量的贡献，每加宽一层会让前后两层同时变大，而层数增加只叠加中间层。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>RL-Games 是"训练器"，只管学习和调度；环境负责物理与数据，二者用张量契约对接（batch 维打头、set_train/set_eval、step 返回四元组）。</li>
+      <li>采样几何：batch = num_envs × horizon，minibatch 必须整除 batch；horizon 同时决定 GAE 的视野上限。</li>
+      <li>观测/价值归一化是机器人训练的刚需，且 checkpoint 恢复时要连统计量一起恢复。</li>
+      <li>KL 自适应学习率让 mini_epochs 只作上限（KL 达标即提前停），配置文件里常用量级：lr 3e-4、clip 0.2、gamma 0.99、lambda 0.95、KL 阈值约 0.016。</li>
+      <li>下一章把它们组装起来：用 OmniIsaacGymEnvs 把任务注册进框架，一行命令完成"环境 + 训练器"的联合启动。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch022.html">← 第 022 章：实现多环境并行训练</a>
+    <a class="next" href="ch024.html">第 024 章：使用OmniIsaacGymEnvs训练 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

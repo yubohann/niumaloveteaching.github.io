@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第082章 超参搜索实战：采样效率相关参数 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第五篇 · 训练工程与系统进阶</span>
+    <span class="sep">/</span>
+    <span>第 082 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第五篇 · 训练工程与系统进阶</div>
+    <h1>第 082 章：超参搜索实战：采样效率相关参数</h1>
+    <p class="lead">一句话：本章把"每采集一批数据做多少次梯度更新"这笔账算清楚，并给出批大小、更新轮数、回放缓冲与开始学习步数这组参数的搜索方法。</p>
+    <ul class="meta">
+      <li>主题：超参搜索 / 采样效率（Sample Efficiency）</li>
+      <li>关键机制：复用预算、批与小批的整除约束、缓冲容量与陈旧度控制</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 081 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解采样效率（Sample Efficiency）的计量口径：达到目标回报所需的环境交互步数（Environment Steps）。</li>
+      <li>掌握复用预算（Reuse Budget）的计算方法：一批数据被几遍梯度更新消费，以及每步环境交互对应的更新次数。</li>
+      <li>理解复用次数的上界从何而来：策略梯度对旧数据的有效期受策略变化幅度约束。</li>
+      <li>会配置并在搜索中区分两类参数：批结构参数（批大小、小批大小、更新轮数）与回放参数（容量、开始学习步数、目标网络更新间隔）。</li>
+      <li>能以"达到回报阈值的环境步数"为指标组织搜索，并处理其噪声大的问题。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>训练成本有两种计价方式：按墙钟时间（Wall-clock Time）计价与按环境交互采样量（Environment Interactions）计价。前者决定实验多久能出结果，后者决定结果需要多少数据才能取得。仿真器快、算力充足时两者近似等价；当环境单步代价高（物理仿真、真机采样、复杂游戏模拟）时，<strong>采样量成为硬约束</strong>：超过预算的数据采集不可接受，只能通过提高"每样本学习量"来提升效果。这正是采样效率相关参数的存在意义。</p>
+    <p>这类参数直接改变学习与采集的比例关系：PPO 的更新轮数决定同一批数据被过几遍；DQN 的缓冲容量与开始学习步数决定旧数据的覆盖范围与新鲜度；目标网络更新间隔决定价值目标的稳定程度。它们共同刻画的量是<strong>"每消耗一个环境步，算法得到多少有效学习"</strong>。搜索这组参数的目标，是在样本预算固定的前提下把回报推到更高，或在回报目标固定时把样本消耗压到更低。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p><strong>采样效率参数的实质是复用预算的分配问题：数据复用越多，单样本学习量越大，但复用超过有效性上界后学习信号失真。</strong>本节先做账、再定界、后谈搜索。</p>
+
+    <h3>1. 复用预算的账</h3>
+    <p>以 PPO 为例：每轮迭代采集 <code>train_batch_size</code> 步数据，将其切成大小为 <code>sgd_minibatch_size</code> 的小批，共过 <code>num_sgd_iter</code> 轮（后续版本称作 <code>num_epochs</code>）。每轮迭代的梯度更新次数为：</p>
+    <div class="formula">
+      U = E × B / m
+      <span class="note">E 为更新轮数，B 为采样批大小，m 为小批大小；每样本平均被复用 E 次（所有更新轮的样本复用次数之和除以 B）</span>
+    </div>
+    <p>代入一组典型值：B = 4096，m = 256，E = 6，则 U = 96 次更新，平均每 42.7 个环境步做一次梯度更新。若把 E 提到 20，U = 320 次，平均每 12.8 步一次更新，<strong>同样的样本量产生三倍以上的学习信号</strong>。反之，E 降到 2 时更新数只有 32 次，样本被大量浪费在采集环节。这组账是搜索时预设范围的第一依据：先把 E 的下界与上界换成"每步更新密度"再判断是否合理。</p>
+
+    <h3>2. 复用次数的有效性上界</h3>
+    <p>策略梯度定理要求更新使用的数据来自当前策略。数据被复用时策略参数已经变化，旧数据的梯度方向不再精确指向新策略的改进方向。策略变化幅度由单次更新的步长决定，累计变化由 KL 散度约束限定。可以给出一个直观的上界：<strong>若策略在完成 E 轮复用后与采集时的策略之间的 KL 散度超过约束阈值，继续复用这批数据的收益会迅速衰减</strong>，表现为裁剪比例（Clip Fraction）居高不下、近似 KL 超限、回报停止上升甚至回落。因此 E 的有效上界与学习率、小批大小联动：学习率越大、单步策略变化越大，可接受的 E 越小。这一联动关系解释了为什么"增大 E 与减小学习率"经常作为组合出现，也解释了为什么 E 的搜索空间通常取 2 到 20 这样的范围，过高区间留给特殊场景验证。</p>
+
+    <h3>3. 离策略复用：缓冲的容量与新鲜度</h3>
+    <p>DQN 一类离策略（Off-policy）方法把数据存入回放缓冲（Replay Buffer）后长期复用，复用次数不受策略变化直接限制，但引入两种误差来源：样本陈旧度（Staleness）与分布偏移（Distribution Shift）。三个参数控制这组权衡：</p>
+    <ul>
+      <li><strong>容量（Capacity）</strong>：决定数据覆盖的时间窗口。容量太小，缓冲内样本高度相关，相当于在小窗口上反复记忆；容量太大，早期低质量策略的数据长期残留，稀释当前策略的数据占比。</li>
+      <li><strong>开始学习步数（Learning Starts）</strong>：在收集到足够样本前不更新，避免用小样本估计的梯度方向污染网络。设置过小，早期相关性极高的数据主导训练；设置过大，样本预算被采集阶段大量消耗。</li>
+      <li><strong>目标网络更新间隔（Target Update Interval）</strong>：间隔短则价值目标跟随快、偏差小但震荡；间隔长则目标稳定但陈旧，学习信号落后于当前价值函数。</li>
+    </ul>
+    <p>离策略的复用比常写成"每个环境步做多少次更新"：每次采样一步即更新一次的写法相当于复用比 1，经验上多数任务在 1 到 4 之间调整，比例越高对缓冲质量与纠偏机制的要求越高。</p>
+
+    <h3>4. 与信用分配参数的联动</h3>
+    <p>n 步自举（n-step Bootstrapping）与 GAE 参数（已在第 077 章展开）改变单条样本携带的学习信号量：自举步数越长，单样本的信用分配路径越完整，等效采样效率越高，但优势估计的方差越大。本章参数与它们的分工是：<strong>自举参数决定"每条样本值多少"，复用参数决定"每条样本用几次"</strong>。搜索时若两者同时开放，需警惕二者对样本效率的贡献重叠，建议先固定 GAE 参数再搜索复用参数。</p>
+
+    <h3>5. 指标口径与搜索设计</h3>
+    <p>采样效率的评测指标应直接使用"达到回报阈值所需的环境步数"（Steps-to-Threshold），阈值取基线最终回报的 60% 至 80%。该指标比最终回报更能反映学习速度，但噪声更大，处理办法：评估回报用多回合平均、阈值判定要求连续两次评估都达标、用 ASHA 以保底步数预算提前终止无效试验。搜索空间设计建议：更新轮数 E 取整数或小范围对数（2 到 20），小批大小取 {128, 256, 512, 1024} 的离散集合并保持整除约束，回放容量与开始学习步数在对数尺度上取 3 到 5 个候选点。<strong>每次搜索开放 2 到 3 个维度，其余参数固定在上一章的胜出配置上。</strong></p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>采样效率参数搜索的流程围绕"预算"二字展开，共五步。</p>
+    <ol>
+      <li><strong>确定样本预算</strong>：根据环境的单步代价与总时间约束，给出每次试验允许消耗的环境步数上限。这是所有比较的公共标尺。</li>
+      <li><strong>计算基线复用账</strong>：用上一节的公式算出基线配置的更新密度，确认它处在合理区间（通常每 10 到 100 个环境步一次更新）。</li>
+      <li><strong>检查整除与对齐约束</strong>：批大小需被小批大小整除；在并行采样下，批大小还应等于采样并行度与每 worker 步数的乘积（第 083 章展开）。约束不满足时框架会静默调整，实验记录与实际配置不符。</li>
+      <li><strong>开放搜索维度</strong>：PPO 开放更新轮数与小批大小；DQN 开放缓冲容量与开始学习步数。每维 3 到 5 个候选值，组合成 20 到 40 次试验接入 ASHA。</li>
+      <li><strong>复核收敛性与稳定性</strong>：胜出配置用三个种子复跑，检查"步数到阈值"的中位数改善是否超过种子间波动。</li>
+    </ol>
+    <h3>参数取值起点表</h3>
+    <table>
+      <tr><th>参数</th><th>常用起点</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>train_batch_size</td><td>4000 至 16000 步</td><td>每次迭代的采样量</td><td>多为 4k 的倍数，与并行度对齐</td></tr>
+      <tr><td>sgd_minibatch_size</td><td>128 至 512</td><td>单次梯度估计的样本量</td><td>整除批大小；太小则梯度噪声大</td></tr>
+      <tr><td>num_sgd_iter / num_epochs</td><td>4 至 10</td><td>数据复用轮数</td><td>兼顾更新密度与旧数据有效性</td></tr>
+      <tr><td>replay capacity</td><td>10<sup>5</sup> 至 10<sup>6</sup> 条</td><td>离策略数据窗口</td><td>按观测维度估算内存后取上界</td></tr>
+      <tr><td>learning_starts</td><td>10<sup>4</sup> 至 2×10<sup>4</sup> 步</td><td>开始更新前的采集量</td><td>不少于一个回报周期的长度</td></tr>
+      <tr><td>target_update_freq</td><td>200 至 1000 步</td><td>目标网络同步间隔</td><td>与更新密度联动，密度高则可缩短</td></tr>
+    </table>
+    <div class="box warn">
+      <span class="box-title">与上一章的差异</span>
+      <p>第 081 章调整损失系数，改变的是"梯度如何构成"；本章调整数据复用方式，改变的是"梯度从多少数据里获得、重复获得几次"。前者作用在损失结构，后者作用在数据流水线，因此本章参数与并行采样配置（下一章）存在硬性整除耦合。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>以下片段基于 Ray 2.x 时期的通用写法，接口随版本演进，以对应版本的官方文档为准。</p>
+
+    <p><strong>片段 1：复用预算计算器</strong></p>
+    <pre class="code"><code>def reuse_budget(batch_size, minibatch_size, epochs):
+    """把采样与更新的比例关系换算成可比较的账目。
+    输出两个口径：每轮迭代的更新次数、平均多少个环境步换一次更新。"""
+    assert batch_size % minibatch_size == 0, "批大小需被小批整除"
+    # 每轮的更新次数：轮数 x (批 / 小批)
+    updates_per_iter = epochs * (batch_size // minibatch_size)
+    # 更新密度：数值越小，说明每个环境步摊到的学习越密集
+    steps_per_update = batch_size / updates_per_iter
+    # 每样本复用次数等于 epochs：每轮遍历全体样本一次
+    print(f"更新 {updates_per_iter} 次/轮，每 {steps_per_update:.1f} 步一更新，"
+          f"样本复用 {epochs} 次")
+    return updates_per_iter, steps_per_update
+
+# 基线：4096 步采样、小批 256、过 6 轮，平均每 42.7 步一次更新
+reuse_budget(4096, 256, 6)
+# 提高复用：同样采样量下更新密度提高三倍以上，需复核学习率是否同步调小
+reuse_budget(4096, 256, 20)</code></pre>
+    <p>解读：这段代码把配置参数翻译成训练动力学指标。<strong>（1）</strong>断言整除约束：若批大小不能被小批整除，部分框架会在内部向下取整，实际更新次数与预期不符，实验记录的参数失去意义。<strong>（2）</strong>两个输出口径对应两种查看方式："更新次数"用于比较不同小批大小下的计算量，"每步一更新"用于直觉判断学习密度。<strong>（3）</strong>复用次数直接打印为轮数，提醒使用者：无论批大小如何变化，每样本被使用的次数等于轮数，它才是旧数据有效性的真正变量。</p>
+
+    <p><strong>片段 2：离策略回放参数配置</strong></p>
+    <pre class="code"><code>from ray.rllib.algorithms.dqn import DQNConfig
+
+config = (
+    DQNConfig()
+    .environment("CartPole-v1")
+    .training(
+        # 回放容量：决定数据覆盖的时间窗口，容量过小会让样本高度相关
+        replay_buffer_config={
+            "type": "PrioritizedReplayBuffer",   # 优先级采样，详见第 087 章
+            "capacity": 200000,
+        },
+        # 开始学习步数：先采集一个回报周期量级的数据，避免早期噪声主导
+        learning_starts=10000,
+        # 每次更新的采样批：离策略方法用它估计价值目标，规模远小于同策略
+        train_batch_size=32,
+        # 目标网络同步间隔：间隔与更新密度联动，过短则目标震荡
+        target_network_update_freq=500,
+    )
+    # 每条环境样本驱动的更新次数由 train_batch_size 与采样策略共同决定，
+    # 修改任意一项后都应重新核对"每步更新比"是否仍在 1 至 4 的常见区间
+)</code></pre>
+    <p>解读：这段配置中的每个数字都对应一个权衡。<strong>（1）</strong>容量 20 万条在低维观测下按内存量级是安全值，图像观测需按第 084 章的方法重新估算。<strong>（2）</strong><code>learning_starts</code> 取值以"覆盖一个回报周期"为准：回合长度越长的任务，该值越大，目的是让缓冲里出现完整的成功与失败样本后再开始学习。<strong>（3）</strong>目标更新间隔与更新密度是乘性关系：若把每步更新次数翻倍，目标网络的"陈旧步数"也会翻倍，此时应同步缩短间隔，保持目标与当前价值函数的距离不变。这类联动是离策略参数搜索中最容易被忽略的部分。</p>
+
+    <p><strong>片段 3：以"步数到阈值"为指标的搜索</strong></p>
+    <pre class="code"><code>from ray import tune
+
+# 采样效率的评测指标用"达到回报阈值所需的环境步数"：
+# 它比最终回报更能分辨学习速度，代价是噪声更大，需要稳健的判定
+space = {
+    "num_sgd_iter": tune.choice([2, 4, 6, 10, 14, 20]),       # 更新轮数
+    "sgd_minibatch_size": tune.choice([128, 256, 512]),        # 小批大小
+}
+
+def steps_to_threshold(episode_returns, threshold, window=3):
+    """找到首次连续 window 次评估都达到阈值的位置，返回对应步数。"""
+    streak = 0
+    for ret, steps in episode_returns:
+        # 连续达标计数：单点达标可能是噪声，连续达标才判为真实提升
+        streak = streak + 1 if ret >= threshold else 0
+        if streak >= window:
+            return steps
+    # 预算内未达标则返回一个大于任何真实值的哨兵，排序时排到最后
+    return float("inf")</code></pre>
+    <p>解读：这段代码的两个设计点都服务于"抗噪声"。<strong>（1）</strong>用 <code>tune.choice</code> 给出离散候选：更新轮数取整数值，避免对"6 轮与 6.3 轮"这种无差异区间浪费试验；小批大小取 2 的幂，与硬件对齐且保持整除性。<strong>（2）</strong>连续达标判定把单次偶然高回报排除，返回的步数单位统一为环境步，跨任务可比；未达标返回无穷大哨兵，调度器可以据此优先终止。<strong>（3）</strong>实际接入时把该指标与回报一同上报，前者用于排序，后者用于诊断该配置是"学得快"还是仅仅"评估时运气好"。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>共用样本预算却不共用评估口径</strong>：两次试验用不同的评估间隔，导致"步数到阈值"无法比较。修复：评估间隔、评估回合数、阈值定义全部写入实验配置，作为固定量随试验传递。</li>
+      <li><strong>只看最终回报，忽略样本效率</strong>：两组配置最终回报接近，但一组多消耗数倍样本，在生产采样昂贵时前者可能更优。修复：同时报告"步数到阈值"与总样本消耗，按场景选择排序指标。</li>
+      <li><strong>更新轮数提高后没有复核学习率</strong>：复用次数上升会放大累计策略变化，KL 超标、裁剪比例飙升。修复：提高轮数时同步下调学习率或上调 KL 目标，并把两者作为组合记录。</li>
+      <li><strong>整除约束被静默破坏</strong>：批大小与小批不整除，框架内部取整后实验记录与实际不符。修复：在配置校验环节加断言，或在启动日志中核对实际生效值。</li>
+      <li><strong>离策略参数按同策略直觉设置</strong>：把 <code>learning_starts</code> 设为几千步就启动更新，早期高相关数据主导网络；或把容量设为数千条，缓冲不断自我覆盖。修复：容量与开始学习步数都按"一个回报周期"标定，低维观测下先给到 10<sup>4</sup> 量级再评估。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>计算题：B = 8192、m = 512、E = 4。求每轮更新次数、平均多少环境步一次更新、每样本复用次数。若 E 改为 16，复用次数与学习密度如何变化？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>更新次数 = 4×16 = 64，每 128 步一更新，复用 4 次；E=16 时更新 256 次，每 32 步一更新，复用 16 次。</div></details>
+      </li>
+      <li>预测题：保持批大小与小批不变，把更新轮数从 6 提高到 20，学习率不动。预测裁剪比例、近似 KL、回报曲线的变化方向，并说明哪个指标最先报警。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>裁剪比例与近似 KL 都会上升，裁剪比例通常先变化，因为它按小批比例即时统计；回报曲线可能先升后跌。</div></details>
+      </li>
+      <li>设计题：为采样成本极高的任务（单步需要昂贵仿真）设计一套复用策略：更新轮数、学习率、小批大小、回放设置如何组合，使样本预算内的学习量最大化，并说明验证方案。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>高复用（E 取上限）、中低学习率、适中批大小；离策略方法配大容量缓冲；验证时以"相同步数预算下的回报"排序，并监控裁剪比例确认复用未越界。</div></details>
+      </li>
+      <li>分析题：解释为什么"样本复用次数等于更新轮数"在同策略方法里成立，而在带优先级的离策略缓冲里不再成立，后者如何计量复用？<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>同策略每轮遍历全体样本一次；优先级采样按优先级分布重复抽取，部分样本被反复使用，复用次数分布不均，需按采样概率的期望计量。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>采样效率用"达到回报阈值所需的环境步数"计量；复用预算 = 更新轮数 × 批大小 ÷ 小批大小。</li>
+      <li>每样本复用次数等于更新轮数，其上界受策略累计变化幅度约束，与学习率联动调整。</li>
+      <li>离策略方法用容量、开始学习步数与目标更新间隔控制陈旧度；目标间隔须与更新密度联动。</li>
+      <li>搜索开放 2 到 3 维，用离散候选维持整除约束，以连续达标判定抑制指标噪声。</li>
+      <li>下一章把账的另一半补上：并行环境数决定同样的采样量需要多长时间采集完成。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch081.html">← 第 081 章：超参搜索实战：损失函数组合</a>
+    <a class="next" href="ch083.html">第 083 章：超参搜索实战：并行环境数 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

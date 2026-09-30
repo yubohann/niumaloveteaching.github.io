@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第015章 通信延迟测量与实时性预算 | 多机器人协同学习课程 · ROS2 通信与系统集成</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · 通信基础与系统搭建</span>
+    <span class="sep">/</span>
+    <span>第 015 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · 通信基础与系统搭建</div>
+    <h1>第 015 章：通信延迟测量与实时性预算</h1>
+    <p class="lead">把"快不快"拆成毫秒级的账：单程还是往返、平均还是 p99、网络还是回调排队，测量方法决定你能看到什么。</p>
+    <ul class="meta">
+      <li>主题：通信基础 / 实时性度量</li>
+      <li>关键机制：延迟分解、单程/往返测量、延迟直方图、控制环预算表</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 009 章、第 014 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>掌握端到端延迟的完整分解：采集、序列化、发送排队、网络、接收处理、应用消费，知道每一段归谁管。</li>
+      <li>分清三类测量：往返（RTT，免时钟同步）、单程（需时钟同步，受偏差影响）、接收间隔（免同步，只测抖动）。</li>
+      <li>会给控制环做实时性预算：总预算 → 分段分配 → 测点布置 → 30% 余量，并知道每段超支时的处置顺序。</li>
+      <li>建立"盯 p99 不盯平均"的工程习惯，会用滑动窗口直方图输出 p50/p95/p99。</li>
+      <li>识别测量的三类偏差源：时钟偏差、回调排队（测量点错位）、探针本身的污染。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 013、014 章解决了"带宽够不够、谁先用"；对多机器人协同来说，还有一个同等重要的量：<strong>延迟，以及它的尾巴</strong>。遥操作要求端到端延迟 ≤ 100 ms 才好用，编队控制要求跨机状态延迟稳定在几毫秒内，这些数字不能靠感觉，必须能测、能拆、能对账。</p>
+    <p>延迟测量有三个著名陷阱，坑过每一个工程师团队：<strong>（1）时钟没同步就测单程</strong>，得到物理上荒谬的负延迟；<strong>（2）测量点选错</strong>，测到"消息到达网卡"就欢呼，而实际拖慢系统的是执行器里排队的回调（应用层看到的是几倍于网络延迟的数字）；<strong>（3）看平均值</strong>，平均 5 ms、p99 90 ms 的系统，在控制环里表现为"偶尔一帧迟到就抖"。本章把测量方法与预算方法一起给你，并用一个监控探头把两类死法都避免掉。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 延迟分解：一段一段的账</h3>
+    <p>一条消息从"产生"到"被使用"，经过的每一段都有归属：</p>
+    <table>
+      <tr><th>段</th><th>典型量级（同一车间）</th><th>归谁管</th></tr>
+      <tr><td>采集与封装（序列化）</td><td>0.1–1 ms（小消息）</td><td>节点实现、消息大小</td></tr>
+      <tr><td>发送侧排队</td><td>0–队列深度 × 周期</td><td>QoS depth、发布频率（第 002/011 章）</td></tr>
+      <tr><td>网络传输（LAN 有线）</td><td>0.2–2 ms</td><td>交换机、链路负载（第 013 章）</td></tr>
+      <tr><td>网络传输（WiFi）</td><td>2–20 ms（重传时更长）</td><td>空口竞争、重传</td></tr>
+      <tr><td>接收侧排队（执行器）</td><td>0–数十 ms（被重活拖累时）</td><td>回调纪律、执行器模型（第 002 章）</td></tr>
+      <tr><td>应用消费到生效</td><td>1–5 ms（控制计算）</td><td>算法本身</td></tr>
+    </table>
+    <p>分解的价值在排障顺序：<strong>数字大到离谱时，先怀疑"排队段"</strong>：网络丢包会重传（有线 1–5 ms），回调排队却动辄几十毫秒；"网络慢"是最常被冤枉的背锅侠。</p>
+    <table>
+      <tr><th>传输路径</th><th>单程延迟典型档位</th><th>波动特征</th></tr>
+      <tr><td>同机共享内存 / 回环</td><td>0.05–0.3 ms</td><td>几乎无抖动</td></tr>
+      <tr><td>千兆以太网（同交换机）</td><td>0.2–2 ms</td><td>低，随负载缓升</td></tr>
+      <tr><td>WiFi 同 AP</td><td>2–10 ms</td><td>中高，随并发与信道质量变化</td></tr>
+      <tr><td>WiFi 跨 AP / 漫游瞬间</td><td>10–50 ms，漫游可到 100 ms 以上</td><td>高，偶发尖峰</td></tr>
+      <tr><td>5G 公网</td><td>20–50 ms</td><td>中高，受基站调度影响</td></tr>
+    </table>
+    <p>用这张表可以快速"定责"：如果实测的通信段延迟落在 WiFi 同 AP 的档位内，网络与硬件大概率没问题，优化要往队列与调度走；如果实测比档位高出一个量级，才值得对链路动手。这些档位随环境浮动，属于估算起点，不是承诺值。</p>
+
+    <h3>2. 三类测量方法：各有各的前提</h3>
+    <ul>
+      <li><strong>往返测量（RTT）</strong>：A 发探测、B 立即回、A 测总时间。<strong>不需要时钟同步</strong>（同一只钟测），代价是只得到"去+回"，且回程那半段不是你的数据真正走的方向（可以近似对半）。适合：链路基线、快速排障。</li>
+      <li><strong>单程测量</strong>：消息带发送端时间戳 t<sub>s</sub>，接收端用 t<sub>r</sub> − t<sub>s</sub> 得延迟，<strong>前提是两台机器的时间同步（第 009 章的落点）</strong>。时钟偏差会整体平移结果：偏差 300 ms 未校正，测出的"延迟"要么是负的要么看似巨大。校正法：先测出 offset，再从结果中扣除；或只观察相对变化（抖动）。</li>
+      <li><strong>接收间隔法</strong>：假设发布周期稳定（如 50 Hz 即 20 ms 间隔），接收端测相邻两帧到达间隔的波动，<strong>免同步，测的是抖动，给不出绝对延迟</strong>。适合"网络是否被挤得忽快忽慢"这类诊断。</li>
+    </ul>
+    <div class="formula">
+      单程延迟 L = t<sub>r</sub> − t<sub>s</sub> − offset；RTT ≈ L<sub>去</sub> + L<sub>回</sub>（对称假设）
+      <span class="note">offset 来自时钟同步（第 009 章）；未校正时用"相对分布/抖动"作结论，别报绝对值</span>
+    </div>
+    <p>RTT 的"对半分"只在路径对称时成立，把它用在业务延迟上要懂偏差方向：去程 4 ms、回程 16 ms 时，RTT = 20 ms、单程估计 10 ms，而真实去程只有 4 ms，误差 6 ms 恰好等于不对称量的一半。机器人场景里上行（图像、状态）通常比下行（指令）拥挤，所以 <strong>"RTT÷2 当作上行单程延迟"倾向系统性偏乐观</strong>，这也是为什么要保留单程探针做交叉验证。</p>
+
+    <h3>3. 为什么盯 p99：尾巴的定义与坏处</h3>
+    <p>延迟是波动量，单看均值会骗人：<strong>平均 5 ms + p99 90 ms 的系统，对 100 Hz（10 ms 周期）的控制环意味着每 100 个周期就有一帧迟到跨周期</strong>。工程约定：对延迟分布报告 p50 / p95 / p99，对控制链路的验收看 p99 甚至 p99.9。直觉换算：某任务 100 Hz、要求每帧都在周期内到达，若 p99=15 ms，则平均每一秒有 1 帧超期；p99.9=30 ms 意味着每 10 秒有 1 帧迟到两个周期。<strong>这些尾巴是控制器实际体验到的"卡顿"，必须按控制频率来解读；磁盘上好看的平均数会掩盖这一切。</strong></p>
+    <p>同一条尾巴在不同控制频率下的伤害不同：p99 超期约对应 1% 的帧迟到，100 Hz 控制环是每秒 1 帧，500 Hz 控制环就是每秒 5 帧；所以"高控制频率 + 高 p99"组合最先出事。另一个统计纪律：<strong>分位数的可信度取决于样本量</strong>。1000 个样本能稳定读出 p99（平均 10 个尾部观测），但 p99.9 要 10000 个样本才有约 10 个尾部观测，100 Hz 的流上需要积累 100 秒数据；用一分钟窗口报 p99.9 基本是数字游戏。</p>
+
+    <h3>4. 实时性预算：先分账，后测量</h3>
+    <p>预算方法（以遥操作端到端 50 ms 为例）：给每一段分配上限，测量后"对账"：</p>
+    <table>
+      <tr><th>段</th><th>预算</th><th>测点</th><th>超支处置</th></tr>
+      <tr><td>遥控台采集+封装</td><td>2 ms</td><td>发布前打点</td><td>降序列化成本、缩小消息</td></tr>
+      <tr><td>网络（WiFi）</td><td>15 ms</td><td>单程探针（第 009 章同步基础上）</td><td>信道规划、分流（第 013/014 章）</td></tr>
+      <tr><td>底盘接收排队</td><td>5 ms</td><td>回调入口打点</td><td>回调瘦身、执行器调整</td></tr>
+      <tr><td>控制计算+执行</td><td>18 ms</td><td>控制环内打点</td><td>算法优化（这之后是控制问题）</td></tr>
+      <tr><td>余量</td><td>10 ms</td><td>，</td><td>预留 20–30%，不许挪用</td></tr>
+    </table>
+    <p>三条预算纪律：<strong>（1）余量不许花</strong>，它的作用是吸收 p99 抖动与偶发事件；<strong>（2）每段有独立测点</strong>，否则对不上账（"总延迟超了"无法定位）；<strong>（3）预算按 p99 分配</strong>；按均值分账是自欺欺人。此外记住发布周期的量化下限：周期采集的数据自带最多一个周期的"龄"，50 Hz 状态在预算表里就要先记 20 ms 的采样粒度（第 002 章的"半个周期"直觉）。</p>
+    <p>预算数字从哪来？从物理容忍度倒推，行业惯例只作参考。协同抓取允许 2 mm 的相对错位、双方相对速度 0.5 m/s 时，时间预算只有 2 ÷ 500 = 4 ms，这解释了紧耦合任务为什么肯为 PTP 与有线网络付成本；反过来，慢速巡检（0.3 m/s、允许 3 cm 错位）的时间预算是 100 ms，局域网 NTP 就绰绰有余。<strong>先把"错位容忍度"翻译成"时间预算"，再翻回第 009 章的方案选择表，两章在同一张账上对账。</strong></p>
+    <p>单程测量里的 offset 校正有个容易忘的时间维度：<strong>校正值本身会过期</strong>。两机时钟的相对漂移按 ppm 累积，20 ppm 的相对漂移意味着每小时新增 72 ms 的表差（第 009 章的 40 ppm 口径则是 144 ms/h）；反过来推算校准节奏：若要求残余偏差不超过 1 ms，40 ppm 相对漂移下 offset 至少每 25 秒更新一次。所以"开机测一次 offset"只适用于短实验；连续监测系统要么做周期性重估（复用第 009 章的往返探测），要么依靠操作系统层的持续校时把漂移压住，再按分钟级刷新校正值。</p>
+
+    <h3>5. 测量工具与它们测的是什么</h3>
+    <table>
+      <tr><th>工具</th><th>测什么</th><th>前提与局限</th></tr>
+      <tr><td><code>ros2 topic hz</code> 的波动</td><td>到达间隔抖动</td><td>免同步；不给你绝对延迟</td></tr>
+      <tr><td><code>ros2 topic delay</code></td><td>单程延迟（响应头时间戳）</td><td>需要 header 与时钟同步，否则数值不可信</td></tr>
+      <tr><td>自研探针（本章片段）</td><td>端到端真实路径 + 分布</td><td>要设计好测量点与统计窗口</td></tr>
+      <tr><td>抓包时间戳</td><td>最接近物理真值</td><td>复杂；适合疑难杂症的定点复核</td></tr>
+    </table>
+    <p>工具选择原则：<strong>先用 hz/自研探针看分布，用 RTT 探针分链路与主机，最后必要时抓包。</strong>抓包放在最后，因为它把"应用语义"全部丢掉，你能看到的只是字节的来去，而你要回答的问题往往涉及回调与执行器。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>为"遥控台→底盘"设计一套延迟测量与验收流程：</p>
+    <ol>
+      <li><strong>定义验收对象</strong>：端到端 p99 ≤ 50 ms（WiFi 场景），覆盖 100 Hz 指令流；同时报告 p50 与抖动标准差。</li>
+      <li><strong>布测点</strong>：遥控台发布前打 t1；底盘回调入口记 t2；控制计算完成记 t3。t1→t2 是"通信段"，t2→t3 是"计算段"。</li>
+      <li><strong>选择测量法</strong>：t1→t2 用单程（依赖时间同步，第 009 章验收基线）；同时跑 RTT 探针做交叉验证（免同步）。</li>
+      <li><strong>统计与输出</strong>：每 5 秒输出窗口统计（count/p50/p95/p99/最坏值），并推送到监控（第 018 章）。</li>
+      <li><strong>压力场景</strong>：在"图像全速 + 日志上传 + 一台机器人漫游切 AP"三个负载下重复测量，延迟验收必须在负载下做。</li>
+    </ol>
+    <p>压力场景不是笼统的"加点负载"，要可复现、有量化定义：<strong>（1）空载基线</strong>，只跑控制与状态流；<strong>（2）带宽满载</strong>，让图像流按第 013 章预算冲到每 AP 84 Mbps 稳态；<strong>（3）移动工况</strong>，让一台机器人以固定路线在 AP 间漫游，每 30 秒切换一次；<strong>（4）突发叠加</strong>，在测量窗口内刻意触发一次地图上传，复现"最坏一秒"。每组持续 5 分钟，记录 p50/p95/p99/max 四件套。这样得到的报告能回答评审最常问的一句话："最坏情况测过没有？"</p>
+
+    <h3>验收表（双机遥操作）</h3>
+    <table>
+      <tr><th>指标</th><th>目标</th><th>测量法</th><th>失败时的动作顺序</th></tr>
+      <tr><td>通信段 p99</td><td>≤ 15 ms</td><td>单程探针（同步校正）</td><td>①信道/干扰 ②分流整形 ③RMW 调参</td></tr>
+      <tr><td>端到端 p99</td><td>≤ 50 ms</td><td>单程探针</td><td>先查通信段，再查回调排队</td></tr>
+      <tr><td>到达间隔抖动</td><td>标准差 ≤ 5 ms</td><td>接收间隔法（免同步）</td><td>排查负载与 AP 漫游</td></tr>
+      <tr><td>RTT 基线</td><td>≤ 20 ms</td><td>RTT 探针</td><td>与单程交叉验证时钟质量</td></tr>
+    </table>
+
+    <div class="box key">
+      <span class="box-title">设计决策：为什么"回调入口"是最佳打点位置，等处理完再打点不行吗？</span>
+      <p>因为这两个时刻回答不同的问题。回调入口的 t2 与发布端 t1 之差，回答"<strong>通信系统（含接收侧排队）快不快</strong>"；回调处理完成的时间还混入了"你自己的代码耗时"。排障时先区分这两类账：如果 t1→t2 超标，是通信与调度的问题（改 QoS、分流、回调瘦身）；如果 t2 之后慢，是业务代码的问题（优化算法、挪走阻塞操作）。<strong>把"通信的责任"与"应用的责任"在时间轴上切一刀，是延迟优化的第一性原则</strong>，不切这一刀，团队就会在"网络慢还是代码慢"上吵一个月。同理，发布端也应在"其实该发的时刻"打点；publish 返回之后打点得到的数字，已经被序列化与发送排队污染了。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：端到端延迟探针，测量、校正与分布统计</strong></p>
+    <pre class="code"><code>class LatencyProbe(Node):
+    """接收侧探针：测单程延迟（时间同步基础上），输出窗口分布。"""
+    def __init__(self, clock_offset_sec=0.0):
+        super().__init__("latency_probe", namespace="robot2")
+        self.offset = clock_offset_sec       # 与发送端的时钟偏差（第 009 章测得）
+        self.window = []                     # 滑动窗口：只保留最近 1000 个样本
+        self.create_subscription(StampedCmd, "cmd_vel_stamped", self.on_cmd,
+                                 QoSProfile(depth=200))
+        self.create_timer(5.0, self.report)
+
+    def on_cmd(self, msg):
+        # 用消息自带的接收时刻打点：这是"回调入口"（executor 已把它送进来）
+        t_r = self.get_clock().now().nanoseconds / 1e9 - self.offset  # 校正到发送端时基
+        t_s = msg.stamp.sec + msg.stamp.nanosec / 1e9
+        lat = (t_r - t_s) * 1000.0           # 毫秒
+        if 0.0 &lt;= lat &lt;= 500.0:              # 物理合理区间外判为异常样本
+            self.window.append(lat)          # 负值/超大值先不丢：见解读
+        if len(self.window) &gt; 1000:
+            self.window.pop(0)
+
+    def report(self):
+        if len(self.window) &lt; 50:
+            return                            # 样本太少：统计无意义（启动期）
+        s = sorted(self.window)
+        n = len(s)
+        p = lambda q: s[min(n - 1, int(q * n))]
+        self.get_logger().info(
+            f"p50={p(0.50):.1f}ms p95={p(0.95):.1f}ms p99={p(0.99):.1f}ms "
+            f"max={s[-1]:.1f}ms n={n}")
+        # 生产环境把这三个数推送监控；max 单列：尖峰常被均值完全抹掉</code></pre>
+    <p>解读：<strong>（1）</strong>核心是两个校正与一个纪律：校正 t<sub>r</sub> 到发送端时基（减去 offset）后相减；把结果裁剪在物理合理区间。<strong>为什么采用"裁剪"处理，直接丢弃会怎样？</strong>超出区间的样本往往就是你要找的故障（时钟跳变、系统挂起），直接丢会让 p99 过好；正确做法是把它们单独计数、告警，这里为演示简洁先不入窗口，但注释里点明。<strong>（2）</strong><code>sorted</code> 算分位数是 O(n log n)，窗口 1000 样本每 5 秒一次完全可接受；不要过早优化成直方图近似，<strong>延迟工具的准确性优先于开销</strong>。<strong>（3）</strong><code>p99 = s[int(0.99*n)]</code> 是简化版分位数（真实实现要处理索引插值），教学窗口足够了；<code>max</code> 与 p99 并列输出是有意的：均值可以掩盖一切，最大值不能。</p>
+
+    <p><strong>片段 2：RTT 交叉验证，不依赖时钟同步的第二个视角</strong></p>
+    <pre class="code"><code>class RttProbe(Node):
+    """主动 RTT 探针：免同步测量链路往返，与单程结果交叉验证。"""
+    def __init__(self, peer_id):
+        super().__init__("rtt_probe")
+        self.cli = self.create_client(Echo, f"/robot{peer_id}/echo")
+        self.rtts = []
+        self.create_timer(0.2, self.ping)      # 5 Hz 探测：频率与业务相当
+
+    def ping(self):
+        # 探测频率要与真实业务一致：高频探测测的是"探测的世界"，不是业务的世界
+        req = Echo.Request()
+        t0 = self.get_clock().now().nanoseconds / 1e9
+        fut = self.cli.call_async(req)
+        fut.add_done_callback(lambda f, t0=t0: self.on_pong(f, t0))
+
+    def on_pong(self, fut, t0):
+        t1 = self.get_clock().now().nanoseconds / 1e9   # 同一只钟：无需同步
+        rtt = (t1 - t0) * 1000.0
+        self.rtts.append(rtt)
+        if len(self.rtts) &gt;= 50:                        # 50 样本做一次小结
+            s = sorted(self.rtts)
+            self.get_logger().info(
+                f"RTT p50={s[25]:.1f}ms p99={s[49]:.1f}ms → 单程估计≈{s[25]/2:.1f}ms")
+            self.rtts = []                      # 清窗：报告下一个 50 样本的分布</code></pre>
+    <p>解读：<strong>（1）</strong>RTT 的妙处是"一只钟测两段"，完全不碰时钟同步，因为 t0 与 t1 都来自本机。<strong>它的适用边界也在注释里：回程方向可能与业务方向不同</strong>（上行拥塞不影响下行），所以 RTT 与单程是"交叉验证"关系，不是互相替代。<strong>（2）</strong><code>lambda f, t0=t0: ...</code> 再次用到闭包冻结技巧（第 002 章的坑重演）：不冻结 t0，所有回调会拿循环里最后的那个值，不过这里 t0 是局部变量生成的单个闭包，每 ping 一次新建，其实天然安全；写默认参数是习惯性防御。<strong>（3）</strong>每 0.2 s 探测（5 Hz）与业务量级相仿：探测频率过高会把探测自己变成负载，测出"探测世界的延迟"；报告里"单程估计≈p50/2"要标注"对称假设"，与单程探针的数字对比时，差值就是不对称与时钟残余偏差的合计。</p>
+
+    <p><strong>片段 3：CLI 与快速核算</strong></p>
+    <pre class="code"><code>ros2 topic hz /robot1/odom          # 看 std dev 行：到达间隔的抖动（免同步）
+ros2 topic delay /robot1/odom       # 单程延迟（依赖 header 时间戳与时钟同步）
+# 注意：delay 显示负值或巨大值，先查时间同步（第 009 章），再查网络
+# 抓包定点复核（时间戳最接近物理真值）：
+sudo tcpdump -i any -tt udp portrange 7400-7500 -c 100
+# 预算对账小抄（把实测填进去，逐段核对）：
+#  采集2ms + 网络15ms(实测?) + 接收排队5ms + 控制18ms + 余量10ms = 50ms
+# 输出报告时：p50/p95/p99 三行 + 测试负载说明（空载数字没有意义）</code></pre>
+    <p>解读：用 <code>hz</code> 的 std dev 建立"抖动直觉"，用 <code>delay</code> 看单程（并再次交叉验证时钟），用抓包兜底，这正好是本章第 5 节工具表的执行顺序。<strong>最后两行是最容易被省略、却最重要的部分：预算对账与"负载说明"。</strong>没有负载说明的延迟数字（"我们测了是 3 ms"）在评审里没有价值，因为逼近真实使用场景的负载才是验收条件；把"空载/图像全速/切 AP"三组数字一起交付，才是一份可信的延迟报告。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>未同步时钟测单程</strong>：<code>ros2 topic delay</code> 显示负 250 ms 或巨大值，第一反应"网络坏了"。修复：先确认时间同步质量（第 009 章），或改用 RTT/间隔法凑合；任何时候先怀疑"表"再怀疑"路"。</li>
+      <li><strong>测量点错位</strong>：只测了"消息到达订阅集合"（DDS 层）就报"延迟 2 ms"，而应用实际使用时已经是 40 ms 后（执行器排队 + 回调慢）。修复：在回调入口打点，把"接收侧排队"计入账。</li>
+      <li><strong>只看平均</strong>：交付报告写"平均延迟 5 ms"，控制端却周期性抖动。修复：p50/p95/p99 + max 四件套，按控制周期解读；把"每秒迟到帧数"也换算出来。</li>
+      <li><strong>探针污染被测系统</strong>：100 Hz 探测 + 每次打印日志，测出来的延迟里有探针自己的份额。修复：探测频率贴业务、统计异步（5 秒汇报一次）、日志降噪。</li>
+      <li><strong>空载验收</strong>：演示环境测 3 ms，上线后 80 ms，因为图像与日志一起跑。修复：验收脚本固定三个负载档位，报告必须附负载说明。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>判断测量方法（并说明前提）：(a) 两台机器人时钟未同步，测链路快慢；(b) 已知时钟偏差 0.5 ms，要报端到端绝对值；(c) 排查"网络被图像挤得忽快忽慢"；(d) 精确定位 30 ms 的偶发延迟尖峰。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>(a) RTT 或接收间隔法；(b) 单程 + 偏差校正；(c) 接收间隔法看抖动；(d) 抓包 + 多点打点，定位到具体段与时刻。</div></details>
+      </li>
+      <li>换算题：100 Hz 控制环、延迟 p99=15 ms、p99.9=30 ms。分别换算"平均每秒迟到帧数"与"每 10 秒跨两周期帧数"，并解释控制器为什么会对 p99.9 敏感。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>p99=15 ms：每秒约 1 帧超 10 ms 周期；p99.9=30 ms：每 10 秒 1 帧迟到 2 个周期，若控制器无插值/无追赶逻辑，这帧直接引起可感知抖动。</div></details>
+      </li>
+      <li>对账题：端到端 p99 实测 62 ms，分段实测为：发布前 1 ms、网络单程（校正后）13 ms、接收回调入口到计算完成 41 ms、执行 3 ms。指出超支段与最可能的原因，给出修正动作清单排序。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>"回调入口→计算完成" 41 ms 远超预算：回调里可能做了重活/等多个锁/调用同步服务。先查回调链路（第 002 章纪律），网络段 13 ms 反而正常。</div></details>
+      </li>
+      <li>设计题：给"编队保持"设计跨机延迟验收：给出可容忍延迟的推导（间距误差与速度的关系）、测量法、验收阈值与压力场景（至少三个）。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>若编队速度 1 m/s、允许间距抖动 5 cm，则状态延迟预算 ≈50 ms（p99）；用单程探针 + 间隔法；压力场景：全员满速、单机切 AP、图像全速。</div></details>
+      </li>
+      <li>论证题：有人提议"用 ros2 topic hz 的标准差当延迟指标"，请说明它能回答与不能回答的问题，并给一个它会导致误判的小场景。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>能答"到达节律稳不稳"；不能答"绝对延迟多大"，一条延迟恒定 200 ms 的链路，间隔法看完全健康（稳定 20 ms 间隔），但对遥操作是灾难。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>延迟分段：采集/封装、发送排队、网络、接收排队、应用，排障先怀疑排队段，别默认"网络慢"。</li>
+      <li>三类测量：RTT（免同步）、单程（需同步、受偏差影响）、接收间隔（免同步、只测抖动）；交叉使用互相验证。</li>
+      <li>盯 p99 与 max，按控制周期解读"每秒迟到帧数"；空载数字没有说服力，报告必须带负载说明。</li>
+      <li>预算表：总预算分段分配、每段独立测点、余量 20–30% 不许挪用；在"回调入口"切出通信责任与应用责任的分界。</li>
+      <li>验收纪律：三种压力场景、四件套统计、失败处置有顺序（信道 → 分流 → 调度 → 代码）。</li>
+      <li>下一章换把工具箱：<strong>通信中间件对比</strong>，DDS、Zenoh 与共享内存各自主打的战场。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch014.html">← 第 014 章：网络带宽管理与流量整形</a>
+    <a class="next" href="ch016.html">第 016 章：通信中间件对比：DDS、Zenoh与共享内存 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

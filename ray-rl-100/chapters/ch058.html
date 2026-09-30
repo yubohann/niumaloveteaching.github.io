@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第058章 贝叶斯优化搜索 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第四篇 · Ray Tune 超参搜索</span>
+    <span class="sep">/</span>
+    <span>第 058 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第四篇 · Ray Tune 超参搜索</div>
+    <h1>第 058 章：贝叶斯优化搜索</h1>
+    <p class="lead">用历史信息决定下一个评估点：高斯过程（Gaussian Process, GP）代理模型给出预测均值与不确定性，采集函数（Acquisition Function）把两者合成一个可最大化的分数，探索与利用的平衡从随机抽签升级为有依据的决策。</p>
+    <ul class="meta">
+      <li>主题：Ray Tune 调优（模型引导搜索）</li>
+      <li>关键机制：代理模型、采集函数、批量并行</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 057 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解贝叶斯优化的两段结构：代理模型拟合已评估点，采集函数在预测均值与不确定性间权衡。</li>
+      <li>掌握高斯过程后验均值与方差的构成，能解释核函数长度尺度对预测的影响。</li>
+      <li>掌握期望改进（Expected Improvement, EI）与置信上界（Upper Confidence Bound, UCB）的定义与直觉。</li>
+      <li>会配置 Tune 的贝叶斯搜索器，设置初始设计点、采集函数与并行度约束。</li>
+      <li>能判断任务是否适合贝叶斯优化：评估代价、维度、噪声水平与并行需求四要素。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>网格与随机搜索把每次评估视为独立事件，不利用已经积累的信息。当单次评估代价很高（每轮训练占用大量采样预算）时，把历史评估结果用于选择下一个点能显著减少总评估数。贝叶斯优化的思路是把目标函数当作随机过程建模：已评估点提供证据，未评估点保持不确定性，下一次评估选在"可能好且不确定"的位置。</p>
+    <p>这套方法在调参界被广泛验证，但对强化学习任务需要额外的适配考量：评估噪声大、并行需求高。本章先讲清数学骨架，再落到 Tune 的封装接口与使用边界上。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p>本节按"代理模型、采集函数、批量并行、适用边界"四步展开。</p>
+
+    <h3>1. 代理模型：高斯过程的后验</h3>
+    <p>高斯过程假设任意有限点上的函数值服从联合正态分布，由均值函数与核函数完全确定。给定已评估点集 D = {(x<sub>i</sub>, y<sub>i</sub>)}，任意新点 x 的后验预测为：</p>
+    <div class="formula">
+      μ(x) = k(x, X) · [ K(X, X) + σ<sub>n</sub>²I ]<sup>−1</sup> · y ， σ²(x) = k(x, x) − k(x, X) · [ K + σ<sub>n</sub>²I ]<sup>−1</sup> · k(X, x)
+      <span class="note">核函数常取平方指数（RBF）：k(x, x′) = exp( −‖x − x′‖² / (2ℓ²) )；ℓ 为长度尺度，σ<sub>n</sub> 为观测噪声</span>
+    </div>
+    <p>三个结构性质需要理解。<strong>（1）</strong>后验均值是已观测值的核加权组合，离观测点越近预测越接近实测。<strong>（2）</strong>后验方差在观测点附近趋近噪声水平，远离观测点时回升到先验方差，这正是"不确定性驱动探索"的来源。<strong>（3）</strong>长度尺度 ℓ 控制相关性的衰减速度：ℓ 大则函数被认为更平滑，预测外推更远；ℓ 小则模型更灵活，也更容易被噪声误导。核超参通常按边缘似然最大化自动拟合。</p>
+
+    <h3>2. 采集函数：把均值与方差合成决策</h3>
+    <p>采集函数在每轮选择最大化它的点。两种最常用的形式：</p>
+    <div class="formula">
+      EI(x) = E[ max( f<sub>best</sub> − f(x), 0 ) ] = ( f<sub>best</sub> − μ )·Φ(z) + σ·φ(z) ， z = ( f<sub>best</sub> − μ ) / σ
+      <span class="note">UCB(x) = μ(x) + κ·σ(x)；Φ、φ 分别为标准正态的分布函数与密度函数</span>
+    </div>
+    <p>EI 的表达式体现了自动权衡：<strong>当 μ 远低于当前最优（f<sub>best</sub> − μ 为正且大）时，第一项主导，采集函数偏好"预测更好"的点；当 σ 大时，第二项把分数抬高，偏好"不确定性大"的点。</strong>UCB 用系数 κ 显式控制权重，κ 越大越偏探索，实践中常随评估次数衰减以增加后期利用。两类函数在小样本下表现接近，选择更多取决于实现与调参习惯。</p>
+
+    <h3>3. 批量与并行：顺序假设的挑战</h3>
+    <p>贝叶斯优化的经典流程是顺序的：评估一个点、更新模型、再选下一个。Tune 在集群上并行运行多个试验，顺序假设被打破：<strong>并行采样的多个点都基于同一份旧后验，彼此之间不满足"互斥的信息增益"，重复探索同一区域的风险上升。</strong>三种缓解方式按代价递增：其一，把并发试验数压到 1 至 4，接受并行度下降；其二，使用批量采集函数（对候选批量做联合优化或对已选点做虚拟观测后再选下一点）；其三，混合策略，用随机搜索跑前段、贝叶斯只接管后段。</p>
+    <p>强化学习任务的评估噪声还要求代理模型显式建模观测噪声 σ<sub>n</sub>：忽略噪声会让模型把单次波动当作函数结构，连续追逐"噪声高峰"。<strong>噪声水平可从重复实验估计，或对候选配置重复评估并把均值与标准误一并交给搜索器。</strong></p>
+
+    <h3>3.1 数值算例：EI 的逐步计算</h3>
+    <p>设当前最优 f<sub>best</sub>=100，两个候选点：A 为 μ=90、σ=15，B 为 μ=98、σ=2。对 A：z=(100−90)/15≈0.667，标准正态分布函数与密度函数取值 Φ(0.667)≈0.748、φ(0.667)≈0.319，EI=(100−90)×0.748+15×0.319≈7.48+4.79=12.27。对 B：z=1，Φ(1)≈0.841、φ(1)≈0.242，EI=2×0.841+2×0.242≈2.17。<strong>预测均值更差的 A 因不确定性拿到近六倍于 B的分数，探索项的作用被这两个数字直接量化。</strong></p>
+    <p>两个极限情形便于检查实现是否正确：σ 趋近 0 时第二项消失，EI 退化为 max(f<sub>best</sub>−μ, 0)，采集函数等价于纯利用；σ 很大而 μ 与 f<sub>best</sub> 接近时，第二项约等于 0.4σ 并主导分数，选点由不确定性排序。上线前用这两个极限做自检，比反复看曲线快得多。</p>
+
+    <h3>3.2 数值算例：一维高斯过程后验</h3>
+    <p>取两个观测点 X=[0,1]、y=[0,1]，观测噪声 1e-3，比较两个长度尺度。ℓ=0.3 时核值 k(0.5,0)=k(0.5,1)≈0.25，观测点相距 1 远超相关长度，新点与两观测近乎独立，后验在 x*=0.5 处只给出 μ≈0.25、σ≈0.94；x*=3 处核值全部趋零，μ 回到先验均值 0、σ 升到 1.0。ℓ=1.0 时相关性拉长，x*=0.5 处 μ≈0.55、σ≈0.18，模型对插值区间自信。<strong>两组读数把长度尺度的作用说清楚了：ℓ 小于点间距时模型近乎逐点记忆，预测回落到先验且不确定性居高；ℓ 大于点间距时才有平滑插值。</strong>这也解释了搜索器在归一化输入上默认长度尺度接近 1 的取值逻辑。</p>
+    <p>计算成本的量级同样要交代：后验拟合要求 n×n 核矩阵的逆，复杂度 O(n³)，预测 m 个候选点为 O(n²m)。n=100 时单轮决策在毫秒级；n 超过 10<sup>3</sup> 后单轮成本进入秒级，代理模型自身的开销开始挤压搜索预算，此时改用稀疏近似或密度估计类方法更合适。</p>
+
+    <h3>3.3 批量并行的信息重复</h3>
+    <p>顺序贝叶斯优化的价值来自"每次选点都基于最新后验"，并行 q 个点同时选时，q 个提案基于同一份旧后验，容易扎堆在同一探索区域，信息增益被重复计算。量化口径：若 q 个提案落在同一局部区域，实际等价于 1 个新观测加 q−1 次无信息重复；q 控制在 1 至 4 时重复概率低，并行节省的墙钟足以补偿；q 升到 16 时热点区域的重复选点成为常态，效率可能低于同预算的随机搜索。<strong>批量采集函数（对已选点做虚拟观测后再选下一点）能缓解扎堆，代价是实现复杂度与单点决策耗时上升，属于"并发度换算法复杂度"的交换。</strong></p>
+
+    <h3>3.4 采集函数的对照与选择</h3>
+    <table>
+      <tr><th>对照项</th><th>EI</th><th>UCB</th></tr>
+      <tr><td>探索控制</td><td>自动，方差项内嵌</td><td>系数 κ 显式控制</td></tr>
+      <tr><td>需要调参</td><td>基本不需要</td><td>κ 起点与衰减策略</td></tr>
+      <tr><td>决策含义</td><td>对当前最优的期望改进量</td><td>均值加放大后的不确定性</td></tr>
+      <tr><td>典型场景</td><td>默认选择</td><td>需要控制探索强度、强调可复现</td></tr>
+    </table>
+    <p>并行交互还有两种组织方式：队列式把 q 个提案一次性发出、收齐后统一更新模型，实现简单；中断式允许把表现差的试验先挂起、腾出资源给新提案，依赖试验的暂停与恢复能力（062 章）。低并发场景用队列式即可，试错成本最低。</p>
+
+    <h3>4. 适用边界</h3>
+    <table>
+      <tr><th>条件</th><th>适合贝叶斯优化</th><th>不适合</th></tr>
+      <tr><td>单次评估代价</td><td>高（分钟级以上）</td><td>低（秒级，随机搜索更省事）</td></tr>
+      <tr><td>维度</td><td>1–20 维</td><td>30 维以上（代理模型拟合成本与样本需求都上升）</td></tr>
+      <tr><td>噪声</td><td>中等且可估计</td><td>极大噪声且无法重复（排序信息不足）</td></tr>
+      <tr><td>并行需求</td><td>低并发（1–4）</td><td>必须高并发（顺序假设破坏）</td></tr>
+      <tr><td>总预算</td><td>30–200 次评估</td><td>预算只有个位数（初始设计点都不够）</td></tr>
+    </table>
+    <p>强化学习场景下的折中结论：<strong>训练评估天然带噪声，贝叶斯优化适合"评估贵、维度中低、可以接受低并发"的精细调优阶段；若追求吞吐型的大规模搜索，先停调度器（060 章）加随机搜索往往是更划算的组合。</strong></p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>贝叶斯搜索的接入按五步执行。</p>
+    <ol>
+      <li><strong>预处理参数</strong>：学习率等跨数量级参数取对数后进入模型；类别参数用独立维度或分组处理。</li>
+      <li><strong>设置初始设计点</strong>：用随机或低差异采样铺 5 至 10 个点，给代理模型起步数据。</li>
+      <li><strong>选择采集函数</strong>：默认 EI；需要更激进的探索时用 UCB 并给 κ 设衰减。</li>
+      <li><strong>约束并发</strong>：并发试验数压到 1 至 4；其余试验由调度器排队。</li>
+      <li><strong>估计噪声</strong>：对头部候选做 2 至 3 次重复，向搜索器提供噪声水平。</li>
+    </ol>
+    <h3>参数表</h3>
+    <table>
+      <tr><th>参数</th><th>典型值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>初始设计点数</td><td>5–10</td><td>代理模型起步数据</td><td>约为总预算的 10%</td></tr>
+      <tr><td>总评估数</td><td>30–100</td><td>搜索预算</td><td>评估代价与精度需求的折中</td></tr>
+      <tr><td>采集函数</td><td>EI / UCB</td><td>探索利用权衡</td><td>默认 EI；UCB 需配 κ</td></tr>
+      <tr><td>UCB 系数 κ</td><td>2–3，随轮次衰减</td><td>探索强度</td><td>前期大、后期小</td></tr>
+      <tr><td>并发试验数</td><td>1–4</td><td>并行度</td><td>顺序假设的容忍度</td></tr>
+      <tr><td>重复次数</td><td>2–3（头部）</td><td>噪声估计</td><td>按种子波动水平决定</td></tr>
+    </table>
+    <p>初始设计点与暖机轮数的定量口径：代理模型在 d 维空间里需要约 2d+1 个观测才有一个像样的一阶近似，五个维度对应至少 11 个点；把暖机与显式初始点合计控制在总预算的 10% 至 20%，既够起步又不挤占后期的模型引导阶段。预算 60 次时初始阶段 6 至 12 个点，与表中 5 至 10 的典型值一致。</p>
+    <p>噪声估计的工程做法：正式搜索前用固定配置跑 3 至 5 粒种子，记录同一评估点的回报标准差，把它作为 σ<sub>n</sub> 的量级输入搜索器；搜索中头部候选再各重复 2 次，用组内方差在线校准。噪声被低估时模型把波动当结构，表现为连续几轮选点都落在同一"假峰值"邻域；被高估时模型过度平滑，选点退化为大范围乱走，两种情况都可以从选点日志的集中度看出来。</p>
+    <p>预算分配的阶段划分建议：前 20% 评估用于铺点与噪声摸底，中间 50% 交给模型引导，最后 30% 用于候选精修（局部加密或重复验证）。阶段切换的依据是选点日志：连续多轮由探索项主导，说明尚未收敛到局部，继续全局搜索；由利用项主导则进入精修，可收窄空间或对头部重复评估。阶段划分写进实验记录，跨轮对比时口径保持一致；改动搜索空间后阶段比例要重新核对，避免新旧两轮口径混用。</p>
+    <p>与上一章的差异：057 章的选择规则是"空间结构与先验"，本章增加两个输入：评估代价（决定是否值得建代理模型）与并行约束（决定顺序假设是否成立）。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：高斯过程后验的教学实现</strong></p>
+    <pre class="code"><code>import numpy as np
+
+def gp_posterior(X_obs, y_obs, x_star, length=0.3, noise=1e-3):
+    """一维高斯过程后验：返回新点的预测均值与标准差。
+    X_obs 为已评估点，x_star 为待预测点（均为二维数组，列数为维度）。"""
+    def rbf(a, b):
+        # 平方指数核：距离按长度尺度归一后取指数
+        d2 = ((a[:, None, :] - b[None, :, :]) ** 2).sum(-1)
+        return np.exp(-d2 / (2 * length ** 2))
+
+    K = rbf(X_obs, X_obs) + noise ** 2 * np.eye(len(X_obs))
+    k_star = rbf(X_obs, x_star)              # 观测点到新点的核向量
+    K_inv = np.linalg.inv(K)
+    mu = k_star.T @ K_inv @ y_obs            # 后验均值：核加权组合
+    var = 1.0 - np.diag(k_star.T @ K_inv @ k_star)
+    return mu.ravel(), np.sqrt(np.maximum(var, 1e-12))</code></pre>
+    <p>解读：三个要点。<strong>（1）</strong>后验均值的计算是核加权组合：新点与哪些观测点核值大，预测就更靠近哪些观测值，这是"局部平滑外推"的实现。<strong>（2）</strong>后验方差由先验方差减去信息增益得到：观测点附近方差趋近噪声水平，远离时回升，代码中把方差下界截到 1e-12 防止数值问题。<strong>（3）</strong>长度尺度 0.3 是按输入尺度归一化后的取值：输入尺度不同时先做标准化，否则核参数的含义随维度漂移。教学实现省略了核超参拟合与数值稳定化，生产实现由搜索库提供。</p>
+
+    <p><strong>片段 2：期望改进的计算与选点</strong></p>
+    <pre class="code"><code>from scipy.stats import norm
+import numpy as np
+
+def expected_improvement(mu, sigma, f_best):
+    """EI：对当前最优的期望改进量，自动权衡均值与不确定性。"""
+    z = (f_best - mu) / sigma
+    ei = (f_best - mu) * norm.cdf(z) + sigma * norm.pdf(z)
+    return np.maximum(ei, 0.0)
+
+def pick_next(X_obs, y_obs, candidates, f_best, kappa_decay=1.0):
+    """在候选集上选择 EI 最大的点作为下一次评估。"""
+    mu, sigma = gp_posterior(X_obs, y_obs, candidates)
+    ei = expected_improvement(mu, sigma, f_best)
+    idx = int(np.argmax(ei))
+    # 记录分解量：均值项与方差项的占比解释了本次选择的动机
+    return candidates[idx], {"mu": float(mu[idx]), "sigma": float(sigma[idx]),
+                             "ei": float(ei[idx])}
+
+# 候选集可以比观测点密得多：选点在"便宜网格"上完成，
+# 真实评估只发生在选中的点上，这是标准的两段式实现结构</code></pre>
+    <p>解读：逐块说明。<strong>（1）</strong>EI 的两项分别对应"利用"（预测低于最优的改进量）与"探索"（不确定性的奖励），σ 很大时第二项抬分，这正是采集函数自动平衡的数学体现。<strong>（2）</strong>选点在候选网格上完成：GP 后验是廉价计算，真实训练评估昂贵，两段式结构把计算花在筛选环节，真实评估只发生在选中的点上。<strong>（3）</strong>返回分解量供日志分析：若连续多轮选择都由方差项主导，说明探索尚未收敛；由均值项主导则进入精修阶段。</p>
+
+    <p><strong>片段 3：Tune 贝叶斯搜索器配置</strong></p>
+    <pre class="code"><code>from ray import tune
+from ray.tune.search.bayesopt import BayesOptSearch
+
+search_alg = BayesOptSearch(
+    metric="evaluation/episode_reward_mean",     # 与报表键逐字一致
+    mode="max",
+    utility_kind="ucb",                          # 采集函数：EI / UCB / PI
+    utility_kappa=2.0,                           # UCB 探索系数
+    # 初始设计点：给代理模型起步数据，避免前几轮盲选
+    points_to_evaluate=[
+        {"lr": 3e-4, "gamma": 0.99},
+        {"lr": 1e-4, "gamma": 0.97},
+        {"lr": 1e-3, "gamma": 0.995},
+    ],
+    random_search_steps=8,                       # 前 8 轮用随机搜索暖机
+)
+
+analysis = tune.run(
+    "PPO",
+    search_alg=search_alg,
+    config={
+        "env": "LunarLander-v2",
+        "lr": tune.loguniform(1e-5, 1e-2),       # 对数域进入模型
+        "gamma": tune.uniform(0.95, 0.999),
+        "train_batch_size": 8192,
+        "evaluation_interval": 5,
+    },
+    num_samples=60,                              # 贝叶斯适合的评估量级
+    max_concurrent_trials=2,                     # 低并发：保护顺序假设
+    stop={"training_iteration": 80},
+)
+# 依赖第三方搜索库时按官方安装说明补齐；接口随版本演进</code></pre>
+    <p>解读：这段配置把理论边界逐项落地。<strong>（1）</strong>初始设计点与随机暖机轮数合计提供约 10 个起步观测，代理模型在第一轮决策前已有数据。<strong>（2）</strong>并发压到 2：并行度越高，同一后验上的重复选点越严重，这是对顺序假设的直接让步。<strong>（3）</strong>学习率以对数均匀进入模型，搜索器在内部对其取对数坐标，避免数量级跨度扭曲核距离；评估指标作为优化目标与 056 章的指标选择原则一致。</p>
+    <p>搜索器的 metric 必须与报表键逐字一致，嵌套键名（例如评估统计前缀）写错时搜索器收不到任何观测，表现为全程近似随机选点且没有报错，属于典型静默故障；提交前用一次干运行打印报表键核对。依赖第三方优化库时，安装说明与版本兼容以官方文档为准，依赖缺失会在构建搜索器阶段直接报错，不会静默降级，报错信息里通常包含缺失包的名称与版本要求，排查时可以直接对症。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>高并发跑贝叶斯</strong>：并发试验数开到 16 以上，同一后验上重复选点，探索效率反而低于随机搜索。修复：并发压到 1 至 4，或改用批量采集函数实现。</li>
+      <li><strong>忽略评估噪声</strong>：代理模型把单次波动当结构，反复追逐噪声峰值。修复：向模型提供噪声估计，头部候选重复评估后取均值。</li>
+      <li><strong>学习率不做对数处理</strong>：1e-5 与 1e-2 在欧氏距离上相距极远，核函数把数量级信息当作间距信息，采样分布失衡。修复：搜索空间用对数均匀，或显式传入对数变换。</li>
+      <li><strong>初始点过少</strong>：只给一两个初始点，代理模型几乎无信息，前若干轮等价于随机搜索却付了拟合开销。修复：初始设计点与暖机合计不少于总预算的 10%。</li>
+      <li><strong>维度失控仍用贝叶斯</strong>：30 维以上的空间配 40 次评估，代理模型的拟合与样本需求都无法满足。修复：先降维（敏感性扫描），高维空间改用随机搜索加早停。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>计算：f<sub>best</sub>=100，某候选点 μ=90、σ=15，另一候选 μ=98、σ=2，分别算出 EI 的数值并判断哪个会被选中。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>第一点 z≈0.67，EI≈10×0.75+15×0.32≈12.3；第二点 z=1，EI≈2×0.84+2×0.24≈2.2；高不确定性的第一点胜出，直观展示了探索项的作用。</div></details>
+      </li>
+      <li>推导：当 σ→0 时 EI 退化为 max(f<sub>best</sub>−μ, 0)，说明此时采集函数等价于纯粹的利用；当 σ 很大时说明探索项如何主导。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>σ→0 时 Φ(z)→1（若 μ&lt;f_best），第二项消失；σ 大且 z 接近零时 Φ≈0.5、φ≈0.4，第二项约 0.4σ 主导分数。</div></details>
+      </li>
+      <li>设计一个对照实验：同一任务、同一预算 60 次评估，比较随机搜索、贝叶斯（并发 2）与贝叶斯（并发 8）三组的"最优指标随评估次数的曲线"，给出预期与解释。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>预期贝叶斯（并发 2）前段与随机持平、后段反超；并发 8 的贝叶斯因重复选点优势缩小甚至接近随机。解释落在顺序假设与信息增益的重复计算。</div></details>
+      </li>
+      <li>解释长度尺度 ℓ 过大与过小各自的表现：结合"外推距离"与"噪声敏感度"两个角度，说明为什么核超参需要按数据拟合。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>ℓ 过大把远点也当作高相关，外推自信但忽略局部结构；ℓ 过小预测方差迅速饱和，模型被单点噪声牵动。边缘似然在两者间自动折中。</div></details>
+      </li>
+      <li>结合 057 章的覆盖概率界，说明为什么"预算只有 10 次评估"时贝叶斯优化优势有限，给出替代方案。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>10 次评估中初始设计点占去大半，代理模型刚起步预算即耗尽；替代方案是先做单变量扫描固定参数，把预算集中在最敏感的一两个维度上。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>贝叶斯优化用代理模型拟合已评估点，用采集函数在预测均值与不确定性间权衡选点。</li>
+      <li>高斯过程后验均值是核加权组合，方差在观测点附近收缩、远处回升，天然提供探索信号。</li>
+      <li>EI 与 UCB 是两种标准采集函数，前者自动平衡、后者用系数 κ 显式控制探索强度。</li>
+      <li>并行会破坏顺序假设，并发试验数应压到 1 至 4，或使用批量采集函数。</li>
+      <li>适用边界：评估昂贵、维度 1 至 20、噪声可估计、预算 30 至 200 次评估；其余场景随机搜索加早停更划算。</li>
+      <li>下一章进入利用"训练过程本身"的搜索方法：种群训练在训练中途交换参数与超参，把搜索与训练合并为一条时间线。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch057.html">← 第 057 章：网格搜索与随机搜索</a>
+    <a class="next" href="ch059.html">第 059 章：种群训练PBT →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

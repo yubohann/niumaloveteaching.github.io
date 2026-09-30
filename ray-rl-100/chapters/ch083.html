@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第083章 超参搜索实战：并行环境数 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第五篇 · 训练工程与系统进阶</span>
+    <span class="sep">/</span>
+    <span>第 083 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第五篇 · 训练工程与系统进阶</div>
+    <h1>第 083 章：超参搜索实战：并行环境数</h1>
+    <p class="lead">一句话：本章讲并行采样规模（Parallel Sampling Scale）的搜索方法：进程级与进程内两种并行粒度的开销差异、吞吐随规模的缩放规律、以及批结构的整除约束。</p>
+    <ul class="meta">
+      <li>主题：超参搜索 / 并行环境配置</li>
+      <li>关键机制：缩放曲线、进程级与向量化并行、批次整除约束</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 082 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解并行环境数改变的是采样吞吐，算法语义与更新规则不受其影响，并掌握"每 worker 环境数"与"采样 worker 数"两种并行粒度的开销模型。</li>
+      <li>会推导批次整除约束：采样批大小与并行度、片段长度的乘法关系，并解释破坏约束的后果。</li>
+      <li>掌握吞吐缩放曲线（Scaling Curve）的三个区间：线性区、饱和区、衰退区，以及各自的物理成因。</li>
+      <li>会用采样吞吐（Samples Per Second, SPS）与并行效率（Parallel Efficiency）两个指标评估配置，墙钟时间只作参考。</li>
+      <li>会为并行环境参数设计搜索空间，并在固定批大小的前提下同步调整片段长度。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>上一章算清了"一批数据做多少次更新"这笔账，本章解决账的另一半：<strong>同量的数据需要多长时间采集完成</strong>。在仿真环境中，采集一个环境步的计算量可能很小（一次算术密集的状态转移），也可能很大（物理引擎、渲染、外部进程调用）。并行环境的用途是把多个环境实例分散到多个 CPU 核上同时推进，把单核串行的采样时间压缩到接近核数分之一的量级。</p>
+    <p>并行规模的选择同时影响三件事：吞吐（每秒环境步数）、批次结构（一批数据由哪些轨迹组成）、以及系统开销（进程间通信、策略权重广播、调度抖动）。搜索并行环境数的目标，是在给定硬件上找到吞吐接近饱和、开销仍可接受的工作点；超过工作点后继续加环境只会增加开销而不增加产出，甚至拖慢训练。这个工作点由每步环境代价与固定开销之比决定，随任务与硬件而变，因此必须实测，经验值只能作起点。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p><strong>并行环境数的收益来自核利用率，代价来自规模增长后的固定开销，搜索的目标是找到两者相抵前的工作点。</strong>本节先建立两种并行粒度的开销模型，再推导缩放曲线与整除约束，最后给出测量与搜索方法。</p>
+
+    <h3>1. 两种并行粒度与开销模型</h3>
+    <p>RLlib 提供两个相乘的配置项：<code>num_env_runners</code>（采样 worker 进程数，旧称 <code>num_workers</code>）与 <code>num_envs_per_worker</code>（每个 worker 内并行推进的环境实例数，即环境向量化（Environment Vectorization））。两者的计算特征不同：</p>
+    <ul>
+      <li><strong>进程级并行</strong>：每个 worker 是独立进程，拥有自己的环境副本与策略副本。它真正增加 CPU 并行度，但每个 worker 带来固定开销：进程启动、策略权重广播（每轮迭代把最新权重序列化下发）、采样结果的序列化与传输。</li>
+      <li><strong>进程内向量化</strong>：一个 worker 内顺序推进多个环境实例，环境步在同一个进程内执行，没有序列化与进程调度开销。它摊薄了每步的固定成本，但若环境步是纯 Python 计算，受全局解释器锁（Global Interpreter Lock, GIL）限制，多个实例并不能真正并行占用多核。</li>
+    </ul>
+    <p>由此得到经验法则：<strong>昂贵的环境步（C 扩展、外部引擎、可释放 GIL 的实现）适合用向量化提高单核利用率；纯 Python 环境步必须靠进程级并行获得多核吞吐。</strong>两类开销的量级不同，搜索时应优先固定其中一类，再调另一类，避免两个维度同时变化造成归因困难。</p>
+
+    <h3>2. 吞吐缩放曲线</h3>
+    <p>设单个环境实例每秒可推进 r 步，采样规模为 N（两者相乘的总实例数），则系统采样吞吐可建模为：</p>
+    <div class="formula">
+      SPS(N) ≈ N · r / (1 + β · N)
+      <span class="note">β 为每实例摊到的固定开销系数；β·N 远小于 1 时为线性区，接近 1 时进入饱和区</span>
+    </div>
+    <p>三个区间各有明确成因。<strong>线性区</strong>：实例数不超过物理核数，并行度真实转化为吞吐，SPS 与 N 成正比。<strong>饱和区</strong>：核数用尽后，新增实例与既有实例竞争时间片，同时权重广播与结果传输的绝对量随 N 线性增长，吞吐增量趋近于零。<strong>衰退区</strong>：调度抖动、内存带宽与对象存储传输成为主导，吞吐不升反降，迭代时间的方差同时上升。并行效率定义为实测 SPS 与"N × 单实例 SPS"之比，它是判断工作点的主要指标：效率高于 0.8 说明还有余量，低于 0.5 说明规模已经过头。</p>
+    <p>另一条必须同时观察的量是<strong>同步屏障下的迭代时间</strong>。同策略方法每轮迭代等待全部 worker 完成片段采集，迭代时间约为全体 worker 采集时间的最大值加上聚合开销。环境实例越多，单个片段越短，"最慢 worker"与"平均 worker"的相对差距越大，尾延迟（Tail Latency）开始侵蚀吞吐收益。这一现象在第 086 章的同步异步对比中会继续展开。</p>
+
+    <h3>3. 批次整除约束</h3>
+    <p>在片段截断模式（<code>batch_mode="truncate_episodes"</code>）下，每轮迭代采集的样本量等于三者的乘积：</p>
+    <div class="formula">
+      train_batch_size = num_env_runners × num_envs_per_worker × rollout_fragment_length
+      <span class="note">片段长度（Rollout Fragment Length）为每个环境实例贡献的步数；三者不匹配时框架会调整实际采集量并给出提示</span>
+    </div>
+    <p>约束的意义在于让每个 worker 恰好采集整数个片段、每轮迭代恰好凑满批大小。若乘积大于批大小，框架只能截断样本，实际学习的批小于配置值；若小于批大小，则需等待额外的片段轮次，采样时间的会计口径被打乱。<strong>搜索并行度时，批大小应作为不变量固定，让片段长度随并行度反比调整</strong>，这保证不同配置之间比较的是同一份学习信号。另一模式 <code>complete_episodes</code> 要求 worker 采完整回合才返回，批大小因回合长度波动而不再固定，适合回合短且长度均匀的任务。</p>
+
+    <h3>4. 批内相关性与样本质量</h3>
+    <p>增大并行度还改变了批内数据的构成：更多环境实例意味着同一批样本来自更多条独立轨迹与更多初始状态，批内相关性下降，梯度估计的方差随之降低。对同策略方法这是额外收益：方差小的批让裁剪机制更少触发，等效于放宽了对复用次数的限制。但每实例采样步数随并行度上升而下降，单个片段覆盖的轨迹片段变短，长期信用分配的信息量减少。<strong>因此并行度搜索不能只以吞吐为指标，必须同时评估同一预算下的回报</strong>，两者共同决定工作点。</p>
+
+    <h3>5. 测量与搜索设计</h3>
+    <p>缩放曲线的实测方法：固定批大小与全部算法参数，让 N 取 {2, 4, 8, 16, 32}（对应总实例数受核数约束的等比序列），每个 N 运行固定迭代数，记录 <code>sample_time</code> 与采样步数，计算 SPS 与并行效率，绘制曲线并拟合 β。搜索空间设计：worker 数取 {2, 4, 8, 16}，每 worker 环境数取 {1, 2, 4}，片段长度由批大小除以并行度推导，试验数控制在 12 到 24 之间；排序指标用"达到回报阈值的样本量"，因为采样量固定后它同时反映学习质量，吞吐结论则由测量脚本单独报告。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>并行环境数的工作点确定分五步，测量与搜索交替进行。</p>
+    <ol>
+      <li><strong>核预算清点</strong>：统计可用于采样的物理核数，扣除学习器进程、驱动与系统占用，得到可分配给采样 worker 的核数上限。</li>
+      <li><strong>单实例标定</strong>：先用 1 个 worker、1 个环境实例测单实例步率 r，作为缩放曲线的基准点。</li>
+      <li><strong>缩放测量</strong>：按等比序列扩大总实例数，记录 SPS 与并行效率，找到效率跌破 0.8 的位置，作为搜索区间的上界参考。</li>
+      <li><strong>约束校验</strong>：选定批大小，按整除公式反推片段长度候选；对每个候选验证乘积等于批大小。</li>
+      <li><strong>回报复核</strong>：在缩小后的区间内做小规模搜索，以固定样本预算下的回报排序，选出兼顾吞吐与学习质量的工作点。</li>
+    </ol>
+    <h3>参数取值起点表</h3>
+    <table>
+      <tr><th>参数</th><th>常用起点</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>num_env_runners</td><td>4 至 16（本机）</td><td>进程级并行度</td><td>不超过物理核数，留 2 核给学习器与系统</td></tr>
+      <tr><td>num_envs_per_worker</td><td>1 至 4</td><td>进程内向量化</td><td>环境步可释放 GIL 时可提高，纯 Python 环境保持 1</td></tr>
+      <tr><td>rollout_fragment_length</td><td>100 至 500</td><td>每实例每轮贡献步数</td><td>由批大小除并行度推导，保持整除</td></tr>
+      <tr><td>batch_mode</td><td>truncate_episodes</td><td>片段与回合的取舍</td><td>回合长度不均匀时用截断模式保证批稳定</td></tr>
+    </table>
+    <div class="box warn">
+      <span class="box-title">与上一章的差异</span>
+      <p>第 082 章的参数决定"一批数据用几遍"，本章参数决定"一批数据多快采满"。两者通过批大小耦合：批大小固定时，提高并行度会缩短片段长度，反之亦然。搜索时应先定批大小，再动并行度，最后回到第 082 章复核复用预算是否仍然合理。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>以下片段基于 Ray 2.x 时期的通用写法，接口随版本演进，以对应版本的官方文档为准。</p>
+
+    <p><strong>片段 1：并行采样与整除约束的配置</strong></p>
+    <pre class="code"><code>from ray.rllib.algorithms.ppo import PPOConfig
+
+# 批大小作为不变量：所有并行度配置都从它反推片段长度
+BATCH = 4000
+
+def make_config(n_runners, n_envs_per_worker):
+    """按整除约束生成并行配置：片段长度 = 批大小 / 总实例数。"""
+    total = n_runners * n_envs_per_worker
+    assert BATCH % total == 0, f"总实例数 {total} 无法整除批大小 {BATCH}"
+    fragment = BATCH // total            # 每实例每轮贡献的步数
+    config = (
+        PPOConfig()
+        .environment("CartPole-v1")
+        .env_runners(
+            num_env_runners=n_runners,           # 进程级并行：真正占用多核
+            num_envs_per_worker=n_envs_per_worker,  # 向量化：摊薄每步固定开销
+            rollout_fragment_length=fragment,
+            # 截断模式保证每轮批大小精确可控，便于比较不同并行度
+            batch_mode="truncate_episodes",
+        )
+        .training(train_batch_size=BATCH)
+    )
+    return config
+
+# 8 个 worker x 2 个环境 = 16 个实例，每实例采 250 步即凑满 4000 步
+cfg = make_config(8, 2)</code></pre>
+    <p>解读：这段封装函数把三个约束集中在一个地方表达。<strong>（1）</strong>断言让"总实例数整除批大小"在配置生成阶段暴露，避免运行中框架静默截断。<strong>（2）</strong>片段长度由除法推导，不手工填写，搜索不同并行度时只改实例数一个变量。<strong>（3）</strong>把 <code>batch_mode</code> 显式写入并注释理由：截断模式牺牲了回合完整性，换来批大小的确定性，这是并行度对比实验成立的前提。</p>
+
+    <p><strong>片段 2：缩放曲线测量</strong></p>
+    <pre class="code"><code>import time
+
+def measure_scaling(algo, iterations=10):
+    """在固定配置下测量每轮迭代的采样耗时与采样步数。
+    返回吞吐与并行效率，供缩放曲线绘制使用。"""
+    total_steps, total_sample_time = 0, 0.0
+    for _ in range(iterations):
+        t0 = time.perf_counter()               # 用单调时钟排除系统时间调整干扰
+        result = algo.train()                  # 一轮迭代：采样 + 学习
+        total_sample_time += result["timers"]["sample_time_ms"] / 1000.0
+        total_steps += result["env_runners"]["num_env_steps_sampled_this_iter"]
+    t_single = 1.0 / result["env_runners"]["fps_single_env"]   # 单实例步率基准
+    n = result["env_runners"]["num_envs"]                       # 总实例数
+    sps = total_steps / max(total_sample_time, 1e-6)
+    efficiency = sps / (n * (1.0 / t_single))   # 实测吞吐 / 理想线性吞吐
+    print(f"实例 {n}: 采样吞吐 {sps:.0f} 步/秒，并行效率 {efficiency:.2f}")
+    return sps, efficiency
+
+# 对 {2,4,8,16} 个实例重复测量：效率从接近 1.0 开始，
+# 跌破 0.8 的规模视为工作点上界，继续扩大只增加开销</code></pre>
+    <p>解读：这段测量的三个设计细节决定了数据是否可用。<strong>（1）</strong>用 <code>perf_counter</code> 单调时钟测量整体，用框架计时器分解采样耗时，两者交叉核对，排除日志写入等外部干扰。<strong>（2）</strong>并行效率的分母使用"实例数 × 单实例步率"，把硬件性能归一化，曲线可跨机器对比。<strong>（3）</strong>测量时学习器仍在运行，采样时间包含与学习的竞争，这正是真实训练场景的吞吐口径；若只想测纯采样能力，可单独运行采样 worker 的基准脚本。</p>
+
+    <p><strong>片段 3：并行度搜索与片段长度联动</strong></p>
+    <pre class="code"><code>from ray import tune
+
+BATCH = 4000
+
+def build_candidates():
+    """枚举所有整除约束下的并行度组合，作为离散搜索空间。"""
+    candidates = []
+    for runners in (2, 4, 8, 16):
+        for envs in (1, 2, 4):
+            total = runners * envs
+            if BATCH % total == 0:
+                # 片段长度随实例数反比变化，保证批大小不变
+                candidates.append((runners, envs, BATCH // total))
+    return candidates
+
+# 离散候选替代连续搜索：并行度本身是整数，且素材数受核数约束
+space = {
+    "parallel": tune.choice(build_candidates()),
+}
+
+def apply_parallel(config, parallel):
+    """把候选三元组写回配置，搜索过程中的每次试验只改这一个维度。"""
+    runners, envs, fragment = parallel
+    return config.env_runners(
+        num_env_runners=runners,
+        num_envs_per_worker=envs,
+        rollout_fragment_length=fragment,
+    )</code></pre>
+    <p>解读：这段代码体现了"先约束、后搜索"的顺序。<strong>（1）</strong>候选集合在搜索前构造完毕，非法组合（不整除）根本不进入空间，避免调度器把试验浪费在会被静默调整的配置上。<strong>（2）</strong>用离散候选：并行度改变的是系统结构，相邻整数之间的行为差异不连续，连续参数在这里没有意义。<strong>（3）</strong>最终排序时若两个候选中报相近，优先选择并行效率更高的那个：工作效率高意味着后续扩大任务规模时仍有扩展余量。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>worker 数超过物理核数</strong>：操作系统在进程间切换，采样吞吐进入衰退区，且迭代时间方差变大。修复：先清点核预算，worker 数不超过可用核数减 2。</li>
+      <li><strong>纯 Python 环境用向量化求多核</strong>：把每 worker 环境数从 1 提到 8 却没有提高吞吐，因为环境步无法释放 GIL。修复：改用进程级并行，或把环境实现迁移到可释放 GIL 的扩展模块。</li>
+      <li><strong>片段长度与批大小不整除</strong>：实际采集量与配置不符，实验记录失真。修复：配置生成时加断言，或在启动日志中核对实际值。</li>
+      <li><strong>片段长度过小</strong>：每片段只有十几步时，采样结果的聚合与传输次数成倍上升，固定开销吞掉吞吐收益。修复：片段长度保持在 100 步以上，优先通过减少 worker 数提高每实例步数。</li>
+      <li><strong>长回合任务使用完整回合模式</strong>：回合长度波动大，批大小随之波动，学习速率不稳定且难以比较。修复：改用截断模式，或为回合长度设上限并记录截断比例。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>计算题：批大小 12000，候选并行度 (8, 4)、(16, 2)、(12, 4)、(24, 1)。哪些满足整除约束？各自片段长度是多少？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>总实例数为 32、32、48、24，四个候选都整除 12000：片段长度依次为 375、375、250、500。注意 (8,4) 与 (16,2) 总实例数相同，片段长度相同。</div></details>
+      </li>
+      <li>预测题：单实例步率固定的任务上，把总实例数从 8 提高到 64（物理核 32 个）。预测 SPS 与并行效率的变化，并说明迭代时间方差为何上升。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>超过核数后进入饱和并转向衰退：SPS 增量趋近零或下降，效率跌破 0.5；超订导致调度抖动，最慢 worker 与平均值的差距拉大。</div></details>
+      </li>
+      <li>设计题：为一个"回合长度 50 至 5000 步、环境步可释放 GIL"的任务设计并行采样方案：批大小、模式、进程级与向量化的分配比例，并给出验证吞吐工作点的测量计划。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>回合长度方差大选截断模式；向量化可用时每 worker 放 2 至 4 个实例；批大小取 8000 至 16000；按等比序列测 SPS 与效率找工作点。</div></details>
+      </li>
+      <li>分析题：解释"批内相关性下降"为什么对同策略方法有利，并从梯度方差的角度推导它对有效批大小的作用。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>独立轨迹越多，批内样本越接近独立同分布，梯度估计方差按实例数近似下降；等效于放大了有效样本量，裁剪触发减少，可支撑更高的复用次数。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>并行采样把核数转化为吞吐：进程级并行增加真实并行度，进程内向量化摊薄固定开销，两者适用条件不同。</li>
+      <li>吞吐随规模经历线性、饱和、衰退三个区间，由并行效率指标定位工作点。</li>
+      <li>批大小 = 采样 worker 数 × 每 worker 环境数 × 片段长度，搜索并行度时固定批大小并反推片段长度。</li>
+      <li>并行度同时改变批内相关性：更大并行度降低梯度方差，但缩短每实例轨迹片段，必须以回报指标复核学习质量。</li>
+      <li>下一章处理并行与批大小共同面对的物理约束：内存与显存预算。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch082.html">← 第 082 章：超参搜索实战：采样效率相关参数</a>
+    <a class="next" href="ch084.html">第 084 章：超参搜索实战：内存与显存预算 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

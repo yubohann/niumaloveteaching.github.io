@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第086章 多智能体SAC的分布式训练 | 深度强化学习课程 · PPO、SAC 与多智能体系统</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第四篇 · 多智能体强化学习</span>
+    <span class="sep">/</span>
+    <span>第 086 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第四篇 · 多智能体强化学习</div>
+    <h1>第 086 章：多智能体SAC的分布式训练</h1>
+    <p class="lead">让 3 个 SAC 智能体齐心协力把箱子推上目标点，并把训练改成"多采集器写共享回放池 + 学习端按比例消费"的分布式架构，对比无重叠的同步批量与线程重叠的异步采集-学习各能跑出多少吞吐。</p>
+    <ul class="meta">
+      <li>主题：多智能体机制 / off-policy 分布式训练（Ape-X 简化版）</li>
+      <li>关键公式：ρ = 梯度更新次数 / 环境步数（更新/采样比）</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 085 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解 off-policy 分布式训练与 on-policy 的本质差异：回放池让"采集"与"学习"在时间上解耦，允许二者完全并行。</li>
+      <li>掌握线程安全共享回放池的实现（容量受限的 deque + 锁 + 累计计数器），并处理采样与写入的并发。</li>
+      <li>实现同步批量（collect-then-learn）与异步采集-学习（Ape-X 风格简化版）两种架构，理解"更新/采样比"这个关键旋钮。</li>
+      <li>会用吞吐、池规模、成功率对比两种架构，识别异步模式下"策略快照陈旧"的信号。</li>
+      <li>完成本篇多智能体 SAC 部分的收官：把分布式训练与前面各章的技术串成一条完整的工程路径。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 085 章给 PPO 做了分布式采样，但 on-policy 有一条硬约束：数据必须来自"当前策略"，采集器和学习器只能轮流跑，重叠窗口有限。SAC 没有这条约束，它的回放池天然允许"一部分线程专门产数据、另一部分专门学"，两边同时开工，回放池就是二者的解耦缓冲。</p>
+    <p>这正是 off-policy 分布式系统（如 Ape-X、R2D2）的基本形态：多个采集器把经验写进共享回放池，学习器持续采样更新，采集器周期性拉取最新权重。本章把这个结构压缩成单机多线程实现，配上 3 智能体搬箱任务：箱子只有被"从正确一侧推"才会朝目标移动，逼着智能体学习包抄与分工，如果采集覆盖面不够，策略永远学不会"绕到箱子后面"，这也是对分布式探索质量的天然测试。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 采集与学习解耦</h3>
+    <p>on-policy 的更新目标依赖"当前策略产生的数据"，一旦过期只能小步复用（PPO 靠裁剪限制）。off-policy 的软 Q 学习目标对数据分布没有要求（只需覆盖足够广），回放池可以容忍任何时刻、任何策略产生的转移：</p>
+    <div class="formula">
+      L<sub>Q</sub>(θ) = 𝔼<sub>(s,a,r,s′)∼D</sub>[ (Q<sub>θ</sub>(s,a) − y)<sup>2</sup> ]，<br>
+      y = r + γ(1−d)·[ min<sub>k</sub> Q<sub>k</sub><sup>target</sup>(s′, a′) − α·log π<sub>θ</sub>(a′|s′) ]
+    </div>
+    <p>符号：D 是回放池分布、min<sub>k</sub> 取双 Q 较小值、α 是自动温度。注意 α·log π<sub>θ</sub>(a′|s′) 用的是<strong>学习器当前策略</strong> π<sub>θ</sub>，与采集时的策略无关，同一批数据在采集策略升级后依然有效，这就是解耦的技术基础。</p>
+
+    <h3>2. 更新/采样比：分布式系统的经济学</h3>
+    <p>分布式训练最重要的旋钮是"每采一个样本，学习器做几次梯度更新"：</p>
+    <div class="formula">
+      ρ = 梯度更新次数 / 环境步数
+    </div>
+    <p>ρ 太低（学习器吃不饱）→ 回放池膨胀、消费的数据越来越旧；ρ 太高（学习器跑满）→ 数据被反复咀嚼、策略过拟合于旧分布。代码里两种架构都显式实现了这个旋钮：同步模式按 <code>n_updates = 新样本数 × ρ</code> 批量补更新；异步模式用 <code>learner.updates &lt; steps × ρ</code> 当作闸门。</p>
+
+    <h3>3. 异步的代价：策略快照陈旧</h3>
+    <p>采集线程每段开始前复制一份权重快照，采样期间学习器可能已经更新很多次。设快照与当前策略的更新次数差为 k：</p>
+    <div class="formula">
+      k ↑ ⟹ 数据分布偏离当前策略 ↑ ⟹ 目标 Q 的偏差与池中"过时策略占比" ↑
+    </div>
+    <p>工程缓解手段：限制段长（<code>--segment</code> 调小）、提高同步频率、或让学习器跳过过旧样本。注意与 085 章的区别：那边用重要性比率+裁剪显式纠正新旧差异；这边 SAC 的 Q 学习本身就可以吸收一定程度的离策略，快照陈旧更多表现为"学得慢"，一般不会"训崩"。</p>
+
+    <h3>4. 搬箱环境为什么需要协作</h3>
+    <p>箱子速度为"贴近箱子的智能体推力之和"，推力方向从智能体指向箱子，线性衰减：<code>(d/‖d‖)·(1−dist/r)·push_strength</code>。若 3 个智能体都挤在同一侧，合力方向固定但大小有限；目标在箱子另一侧时，站错位置推会起反作用。最优策略近似"两人绕后推、一人侧面纠偏"，这要求采集数据里出现过"绕后"的样本，多采集器并行探索正好提高这种稀有行为的出现概率。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+
+    <h3>模块划分</h3>
+    <table>
+      <tr><th>组件</th><th>职责</th><th>关键点</th></tr>
+      <tr><td><code>CarryEnv</code></td><td>3 智能体协同搬箱（纯 numpy）</td><td>接触式推力；共享奖励；到达 +5 终止</td></tr>
+      <tr><td><code>SACLearner</code></td><td>学习端：策略 + 双 Q + 目标 + 温度</td><td><code>update(buffer, rng)</code> 从共享池采样</td></tr>
+      <tr><td><code>SharedReplay</code></td><td>线程安全回放池</td><td><code>deque(maxlen)</code> + 锁；<code>total</code> 记录累计写入</td></tr>
+      <tr><td><code>collect_segment</code></td><td>单采集段</td><td>支持随机动作预热；返回转移与回合统计</td></tr>
+      <tr><td><code>Collector</code></td><td>异步采集线程</td><td>每段前在锁内同步权重快照</td></tr>
+      <tr><td><code>run_sync</code> / <code>run_async</code></td><td>两种训练架构</td><td>同步可复现；异步重叠采集与学习</td></tr>
+    </table>
+
+    <h3>关键超参数</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用与取值理由</th></tr>
+      <tr><td><code>mode</code></td><td>async</td><td>默认展示分布式重叠；sync 作为可复现基线</td></tr>
+      <tr><td><code>collectors</code></td><td>3</td><td>采集线程/环境数量，与智能体数一致便于观察</td></tr>
+      <tr><td><code>segment</code></td><td>600</td><td>每段步数；越小快照越新鲜，但线程同步开销越多</td></tr>
+      <tr><td><code>update_ratio</code></td><td>1.0</td><td>每个环境步对应的梯度更新次数 ρ</td></tr>
+      <tr><td><code>buffer_capacity</code></td><td>150000</td><td>转移条数上限（约 5 万环境步的产出）</td></tr>
+      <tr><td><code>batch_size</code></td><td>256</td><td>学习端采样批量</td></tr>
+      <tr><td><code>warmup</code></td><td>2000</td><td>随机动作预热；off-policy 冷启动必需</td></tr>
+    </table>
+
+    <h3>数据流</h3>
+    <p><strong>sync：</strong>预热（随机动作）入池 → 循环 { 依次采集 K 段 → 统一入池 → 按 <code>新样本数×ρ</code> 更新 }，采集与学习严格串行。<strong>async：</strong>预热入池 → 启动 K 个 <code>Collector</code> 线程（各自快照+环境，持续写池）→ 主线程循环：若 <code>updates &lt; steps×ρ</code> 就更新，否则小睡 1 毫秒让出 CPU；打到步数预算后置位 <code>stop_event</code>、等待线程收尾。</p>
+
+    <h3>与前一章的差异</h3>
+    <p>第 085 章的分布式 PPO 是"采样完一批 → 更新 → 丢掉"，架构重心是<strong>批量前向</strong>与<strong>陈旧数据裁剪</strong>；本章的分布式 SAC 是"持续写入 → 持续消费"，重心变成<strong>回放池的并发安全</strong>与<strong>更新/采样比</strong>。前一章 worker 交付的是 GAE 后的整批轨迹，本章采集器交付的是原始转移，交付粒度的差别正来自 on-policy 与 off-policy 的算法约束。</p>
+
+    <div class="box key">
+      <span class="box-title">为什么累计计数器 total 不能省</span>
+      <p>回放池满后 <code>len(buffer)</code> 不再增长，如果拿它当训练进度，循环会永远"差一点点到预算"。<code>total</code> 记录曾经写入过的转移总数，与容量淘汰无关，它既是退出条件，也是吞吐统计的分母。这个小设计是"分布式系统里代理指标必须在锁内单调"的典型案例。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：箱子推力物理，协作的动力学来源</strong></p>
+    <pre class="code"><code># 箱子推力：每个贴近箱子的智能体贡献一份"朝向箱子外侧"的力
+push = np.zeros(2, dtype=np.float32)
+for i in range(self.n_agents):
+    d = self.box_pos - self.pos[i]
+    dist = float(np.linalg.norm(d)) + 1e-8
+    if dist &lt; self.touch_radius:                 # 只有接触（距箱子够近）才产生推力
+        # 线性衰减：贴得越近推力越大；方向是"智能体→箱子"，顶到哪边就推哪边
+        push += (d / dist) * (1.0 - dist / self.touch_radius) * self.push_strength
+self.box_vel = np.clip(0.9 * self.box_vel + push, -0.8, 0.8)   # 摩擦 + 合力
+self.box_pos = np.clip(self.box_pos + self.box_vel, -self.bound, self.bound)
+self.steps += 1
+
+dist_goal = float(np.linalg.norm(self.box_pos - self.goal))
+reward = -dist_goal                              # 共享奖励：全员看同一只箱子
+terminated = dist_goal &lt; 0.15                    # 箱子进入目标圈即成功
+if terminated:
+    reward += 5.0                                # 稀疏终局奖励
+truncated = (not terminated) and self.steps &gt;= self.max_steps</code></pre>
+    <p>解读：这段物理决定了任务的难度形状。<strong>（1）</strong>推力方向永远是"智能体→箱子"，所以站在箱子与目标之间的智能体推的是<strong>反方向</strong>，想赢就必须绕后，环境用物理规则强制了协作的必要性。<strong>（2）</strong>线性衰减 <code>(1−dist/r)</code> 让"贴上"与"在边上蹭"有明确的力量差，给策略提供了稠密的动作梯度；<code>1e-8</code> 防止位置重合时除零。<strong>（3）</strong>箱子限速 ±0.8、摩擦 0.9：松手后箱子会滑行一段，推箱子是"持续施力"的活，点一下的推力很快被摩擦吃掉。<strong>（4）</strong>奖励只用<strong>箱子到目标的距离</strong>：三个智能体拿到同一个数，没有任何个体的塑形项，信用要靠价值函数学出来，这是团队任务最干净的设定。</p>
+
+    <p><strong>片段 2：线程安全的共享回放池</strong></p>
+    <pre class="code"><code>class SharedReplay:
+    def __init__(self, capacity: int):
+        self.buffer = collections.deque(maxlen=capacity)  # 容量受限：旧数据自动淘汰
+        self.lock = threading.Lock()
+        self.total = 0        # 累计写入的转移数（不随容量淘汰而减少）
+
+    def push_many(self, entries):
+        with self.lock:                                   # 写入整段统一加锁
+            self.buffer.extend(entries)
+            self.total += len(entries)
+
+    def sample(self, batch_size: int, rng: np.random.Generator):
+        with self.lock:
+            n = len(self.buffer)
+            idx = rng.integers(0, n, size=batch_size)
+            items = list(self.buffer)                     # 锁内快照成列表
+        return [items[i] for i in idx]                    # 锁外取数据，缩短临界区</code></pre>
+    <p>解读：这是 off-policy 分布式的"公共基础设施"。<strong>（1）</strong><code>deque(maxlen=capacity)</code> 让淘汰自动化：写入超出容量时最老的条目被挤出，正好符合"新数据更相关"的直觉。<strong>（2）</strong>所有容器操作都在 <code>with self.lock</code> 内：deque 不是线程安全的，生产者 <code>extend</code> 与消费者迭代并发会抛 <code>RuntimeError: deque mutated during iteration</code>。<strong>（3）</strong><code>sample</code> 先在锁内拷贝成列表、再在锁外按下标取：把昂贵的列表构造留在临界区、把取条目的循环挪出去，临界区越短，采集线程被阻塞的概率越低。<strong>（4）</strong><code>rng</code> 由学习端传入，不作全局共享；分布式下每个随机源独立，避免多线程争抢同一个生成器（numpy 的 Generator 本身也不是锁保护的）。</p>
+
+    <p><strong>片段 3：采集线程的快照同步与持续写入</strong></p>
+    <pre class="code"><code>def run(self):
+    while not self.stop_event.is_set():
+        with self.lock:            # 同步一份策略权重快照（与 learner 更新互斥）
+            self.actor.load_state_dict(self.learner_actor.state_dict())
+        entries, stats, self.obs = collect_segment(
+            self.env, self.actor, self.rng, self.args.segment,
+            self.obs, self.device, random_actions=False)
+        self.replay.push_many(entries)    # 原始转移直接入池，不需要 GAE
+        self.ep_stats.extend(stats)       # 本地累积回合统计，训练结束再汇总</code></pre>
+    <p>解读：采集线程的全部工作只有四行，但每行都有讲究。<strong>（1）</strong>快照在锁内复制：学习器改参数时持有同一把锁，杜绝"半新半旧"的权重被读进快照。<strong>（2）</strong><code>collect_segment</code> 返回的是<strong>原始转移</strong>（obs/act/rew/next_obs/done），不是 GAE 批次，off-policy 的池子里不需要优势，采样时由学习端现算目标。<strong>（3）</strong>与 085 章的 Worker 对比：那边交付"处理好的批次"因为 on-policy 更新必须在同一批数据上做多轮；这边交付"原子数据"，因为 Q 学习对数据顺序、时间点都不敏感。<strong>（4）</strong>回合统计只存在线程本地（<code>self.ep_stats</code>），训练结束后统一汇总，避免多线程写共享统计的锁开销。</p>
+
+    <p><strong>片段 4：学习端的更新闸门</strong></p>
+    <pre class="code"><code>while True:
+    # 学习端：按"更新/采样比"消费数据；暂无新数据时小睡让出 CPU
+    steps = replay.total // CarryEnv.n_agents       # 用累计写入折算环境步（不随淘汰回落）
+    target_updates = int(steps * args.update_ratio)
+    if learner.updates &lt; target_updates:
+        learner.update(replay, rng)                 # 欠账就补一次梯度
+    else:
+        time.sleep(0.001)                           # 追平了就让出 CPU，等采集线程产数
+
+    now = time.time()
+    if now - last_log_t &gt; 3.0:
+        s_per_s = (steps - logged_steps) / max(now - last_log_t, 1e-6)
+        print(f"[async] 步 {steps:6d} | 更新 {learner.updates:5d} | "
+              f"池 {len(replay):6d} | 吞吐 {s_per_s:7.1f} 步/秒")
+        last_log_t, logged_steps = now, steps
+    if steps &gt;= args.max_steps:                     # 统一的退出条件：累计采样步数
+        break</code></pre>
+    <p>解读：学习端十几行实现了整个异步系统的"节奏控制器"。<strong>（1）</strong>闸门公式 <code>updates &lt; steps×ρ</code> 就是更新/采样比的直译：欠账就更新、追平就等；<code>sleep(0.001)</code> 是让出 GIL、避免主线程空转烧满一个核。<strong>（2）</strong>进度用 <code>replay.total</code> 记录：池满后它继续增长，<code>len(replay)</code> 则会停滞，用错会卡死循环。<strong>（3）</strong>折算 <code>// n_agents</code> 把"转移条数"换算成"环境步"，三个智能体一步产生三条转移，吞吐口径与 PPO 侧统一。<strong>（4）</strong>退出靠共享的"步数预算"控制，与墙钟时间解耦：两种架构的对比建立在相同的采样量上，这是与前几章一致的口径纪律。收尾时置位 <code>stop_event</code> 并 <code>join</code> 各线程，保证统计完整。</p>
+
+    <p>完整可运行脚本（附录）：<a href="../code/ch086.py" download>code/ch086.py</a></p>
+    <pre class="sh"><code>python code/ch086.py              # 默认 async：本机约 40 秒（环境吞吐高、更新次数少）
+python code/ch086.py --mode sync  # 同步基线（可复现；本机约 7 分钟，更新足量）
+python code/ch086.py --quick      # 快速跑通：约 20–60 秒</code></pre>
+    <p>日志每 3 秒打印步数、更新次数、池规模与吞吐。<strong>预期（以实跑为准）：async 的环境吞吐约为 sync 的 10 倍（本机实测约 700 对 70 步/秒），但学习端是单线程瓶颈：同样 3 万步预算，sync 完成约 2.9 万次更新、成功率约 0.2，async 只完成数百次更新、成功率仍接近 0</strong>。原因在闸门公式：异步不会为等待学习器而暂停采集，预算一到就退出，更新欠账留在那里；把箱子推到 (0.6,0.6) 需要学会绕后，比随机推难得多，欠训练的策略学不会。<strong>要让异步真学起来，先让两侧速率匹配</strong>：减少采集器数量给学习器让出 CPU，或测出学习器单步耗时（本机 15～70 毫秒）后按它反推可行的 ρ。单靠加大预算无效（实测 12 万步仍为 0.00）；异步结果受线程调度影响，请多次运行取中位数。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>用 <code>len(buffer)</code> 当训练进度</strong>：回放池满后长度不再增长，训练循环会误判"没进展"甚至死循环。必须维护不受淘汰影响的累计计数器（本实现的 <code>total</code>）。</li>
+      <li><strong>在锁外迭代回放池</strong>：<code>sample</code> 若在锁外直接 <code>list(shared.buffer)</code>，生产者同时 <code>extend</code> 会抛 <code>RuntimeError: deque mutated during iteration</code>。所有容器操作都要放进锁里。</li>
+      <li><strong>采集线程直接用学习器的在线网络前向</strong>：不复制快照、直接拿 <code>learner.actor</code> 使用，会在 <code>optimizer.step</code> 改参数的同时读到半新半旧的权重。必须加锁复制 <code>state_dict</code> 后再采样。</li>
+      <li><strong>预热数据没进池</strong>：off-policy 训练一开始就依赖回放池的覆盖度；预热段如果只走过场不入池，学习器最初几千次更新只能见到极少状态，策略先退化成"只推箱子一角"。预热数据必须和正式数据一样 <code>push_many</code> 进池。</li>
+      <li><strong>update_ratio 与采集速度互相打架</strong>：ρ 调大后学习器占满 CPU、采集变慢，<code>steps×ρ</code> 又反过来限制更新，调参时固定其他旋钮、一次只动一个，观察"池规模"这个健康指标。对比两种架构时，环境步数相同不代表训练量相同：务必把日志里的"更新次数"一列一起读。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>用同一个 <code>--seed</code> 分别跑 <code>--mode sync</code> 与 <code>--mode async</code>，先预测哪边吞吐更高、高多少，再比较实测吞吐与尾段成功率。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>sync 的输出在固定种子下逐位一致，可重复跑两次验证；async 受线程调度影响不可复现，需多跑两次取中位数再比较。</div></details>
+      </li>
+      <li>把 <code>--update-ratio</code> 从 1.0 调到 0.25 和 2.0 各跑一次，先预测"评估回报"与"池规模"分别往哪个方向变，再验证。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>ρ=0.25 时看池是否快速膨胀（learner.updates 追不上 steps×ρ）；ρ=2.0 时看评估曲线是否更抖、是否过拟合旧数据。哪个值让学习器开始跟不上数据产出？</div></details>
+      </li>
+      <li>给采集器加"探索退火"：每个 Collector 维护自己的噪声标准差并随时间线性衰减到 0.1，加在动作上再限幅，观察成功率是否更早上升。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>给 <code>collect_segment</code> 加一个 <code>noise_std</code> 参数，在 <code>actor.act_np(obs)</code> 之后加 <code>rng.normal(0, noise_std)</code> 并 clip 到 [-1,1]。多采集器配不同噪声水平，正是 Ape-X 提升探索多样性的核心手法。</div></details>
+      </li>
+      <li>给共享回放池加优先级采样：按 |TD 误差| 赋权、按权重抽样；再讨论分布式下优先级会不会被"快照新旧"污染。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>在 <code>update</code> 里把新 TD 误差写回对应条目（字典里加可写的 <code>priority</code> 字段），采样用 <code>rng.choice(weights=...)</code>。思考：旧策略样本的高 TD 误差是"信息量大"还是"分布错位"？</div></details>
+      </li>
+      <li>把 <code>push_strength</code> 从 0.06 改成 0.03（箱子更难推），先预测两种架构的成功率差距会拉大还是缩小，再用至少两个种子验证。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>任务变难时对探索覆盖的需求更高，多采集器理论上更有价值，但单核竞争也更重，两头对冲的净效果必须靠实验说话。注意成功率本身方差很大，单次比较不可信。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>off-policy 的分布式 SAC 用回放池把采集与学习解耦：多采集器持续写入、学习器按"更新/采样比"持续消费，线程重叠带来吞吐收益。</li>
+      <li>线程安全三件套：容量受限的 deque、全操作加锁（临界区尽量短）、独立于容量的累计计数器。</li>
+      <li>异步采集的关键代价是策略快照陈旧；<code>segment</code> 长度、采集频率与更新比是三个互相牵制的旋钮。</li>
+      <li>协同搬箱任务检验分布式探索：只有"从正确一侧推"的样本被采到，策略才可能学会包抄与分工。</li>
+      <li>多智能体 SAC 篇章到此收官：从独立 SAC、集中 Q、参数共享、通信、角色对称、信用分配，到对手建模、混合任务、算法对比与两种分布式架构，你已经有了一套完整的多智能体 SAC 工具箱。下一章进入第五篇，用 14 个轻量环境把它们逐一落地。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch085.html">← 第 085 章：多智能体PPO的分布式训练</a>
+    <a class="next" href="ch087.html">第 087 章：多智能体环境：粒子环境 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

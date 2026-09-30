@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第003章 PPO的裁剪目标与KL惩罚对比 | 深度强化学习课程 · PPO、SAC 与多智能体系统</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · 策略梯度与 PPO</span>
+    <span class="sep">/</span>
+    <span>第 003 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · 策略梯度与 PPO</div>
+    <h1>第 003 章：PPO的裁剪目标与KL惩罚对比</h1>
+    <p class="lead">把 PPO 的两种信任域实现，裁剪（clip）与自适应 KL 惩罚（kl），放进同一套训练框架，同种子、同预算各跑一遍，用样本效率、KL 波动和 β 漂移三条证据回答"到底该用哪个"。</p>
+    <ul class="meta">
+      <li>主题：信任域实现 / 目标函数对比</li>
+      <li>关键公式：L<sup>CLIP</sup> = 𝔼[min(r·Â, clip(r,1−ε,1+ε)·Â)]；L<sup>KL</sup> = 𝔼[r·Â] − β·KL</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 002 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解裁剪目标与 KL 惩罚目标各自的数学形式，以及它们在"限制新旧策略距离"上的不同方式。</li>
+      <li>实现原论文式的自适应 β 规则：KL 超过目标 1.5 倍则加倍，低于目标 1.5 分之一则减半。</li>
+      <li>在同一训练框架下对两种模式做受控对比，记录样本效率、平均/最大 KL、熵与评估回报。</li>
+      <li>观察 KL 模式中 β 的漂移轨迹，理解"自适应系数省心但难复现"这句话的具体含义。</li>
+      <li>能根据任务特征做选择：何时用裁剪、何时用 KL 惩罚、何时两者叠加（第 010、026 章会继续这个主题）。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>PPO 论文里其实给了两个版本的损失：一个是大家熟悉的裁剪目标，另一个是"策略梯度减去 KL 惩罚"，后者继承自 TRPO 的思想，把信任域写成罚项形式的软约束。工程实现里裁剪版本流行，原因是<strong>少一个自适应系数 β</strong>：KL 惩罚版本必须让 β 随训练动态调整，设小了约束不住策略、设大了学不动。</p>
+    <p>但"流行"不等于"永远更好"。裁剪只对"比率越界且方向正确"的样本掐梯度，是单侧、局部的约束；KL 惩罚则是把整批数据的新旧 KL 直接顶在损失里，约束更强但会持续挤压更新。本章不争论谁对，目标在于<strong>把两种目标放在同一份代码里，用同一随机种子和同样 12 万步预算跑给你看</strong>：刚度、KL 水平、β 的漂移、到达 475 所需的步数，各自长什么样。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 裁剪目标：单侧、局部的硬约束</h3>
+    <p>裁剪目标在第 001 章已经推导过，这里只强调它的"局部性"：</p>
+    <div class="formula">
+      L<sup>CLIP</sup> = 𝔼<sub>t</sub>[ min( r<sub>t</sub> Â<sub>t</sub>, clip(r<sub>t</sub>, 1−ε, 1+ε) Â<sub>t</sub> ) ]
+      <span class="note">r<sub>t</sub> = π<sub>θ</sub>(a<sub>t</sub>|s<sub>t</sub>) / π<sub>θ_old</sub>(a<sub>t</sub>|s<sub>t</sub>)；只有当 r<sub>t</sub>·Â<sub>t</sub> 还想继续变大时，梯度才被截断</span>
+    </div>
+    <p>注意一个容易被忽略的事实：<strong>裁剪并不直接控制 KL</strong>。它约束的是"每个样本带来多少收益改进"，KL 只是被间接压住。所以训练日志里 KL 偶尔跳到 0.03 以上是完全可能的，只要大多数样本没越界。判断裁剪是否起作用，要看 <code>clip_frac</code>（被裁剪样本比例）而不只是 KL。</p>
+
+    <h3>2. KL 惩罚目标：持续的软约束</h3>
+    <p>KL 版本去掉裁剪，在策略目标上直接加罚项：</p>
+    <div class="formula">
+      L<sup>KL</sup> = 𝔼<sub>t</sub>[ r<sub>t</sub> Â<sub>t</sub> ] − β · KL(π<sub>θ_old</sub> ‖ π<sub>θ</sub>)
+      <span class="note">β：自适应系数（罚的力度）；KL(π<sub>θ_old</sub> ‖ π<sub>θ</sub>)：旧策略到新策略的 KL 距离</span>
+    </div>
+    <p>在 θ = θ_old 处 KL 的值为零但曲率非零，所以它是"越走远、拉得越狠"的软墙：一开始几乎没有阻力，走远了惩罚线性增长。软墙的性质可以从梯度里直接看出来：单样本 KL 估计是 logp<sub>old</sub> − logp，对 θ 求导得 −∂logp/∂θ = π<sub>θ</sub> − 1<sub>a</sub>（softmax 对数概率的梯度等于"概率向量减 one-hot"）。对所有样本取期望，注意动作来自旧策略，得到</p>
+    <div class="formula">
+      ∇<sub>θ</sub> KL(π<sub>θ_old</sub> ‖ π<sub>θ</sub>) = π<sub>θ</sub> − π<sub>θ_old</sub>
+      <span class="note">偏差为零时拉力为零、曲率非零：这是"起点无阻力"的严格来源</span>
+    </div>
+    <p>这个恒等式的工程含义：KL 惩罚项提供的是一股"恢复力"，方向与新策略偏离旧策略的方向相反，大小正比于偏差；裁剪提供的则是离散门控，没有恢复力。两类失效模式由此分开：KL 模式被恢复力拴住，合格但更新慢、更依赖 β 的整定；裁剪模式放任未越界样本自由更新，平均漂移没有显式预算，KL 尖峰只能靠事后诊断发现。实践中用单样本估计：</p>
+    <div class="formula">
+      KL̂ = (1/N) Σ [ log π<sub>θ_old</sub>(a<sub>t</sub>|s<sub>t</sub>) − log π<sub>θ</sub>(a<sub>t</sub>|s<sub>t</sub>) ]
+      <span class="note">无偏但方差大；本章用它是因为它可以和裁剪模式共用同一个诊断量</span>
+    </div>
+
+    <h3>3. 自适应 β：把 KL 拉回目标附近</h3>
+    <p>β 不能让用户手调，否则每换一个任务都要重新试。PPO 论文给出的规则是：每完成一轮更新，看当前 KL 相对于目标 KL<sub>tgt</sub> 的位置，</p>
+    <div class="formula">
+      KL̂ &gt; 1.5 · KL<sub>tgt</sub> ⟹ β ← 2β<br>
+      KL̂ &lt; KL<sub>tgt</sub> / 1.5 ⟹ β ← β / 2
+    </div>
+    <p>这形成一个负反馈回路：更新太猛 → KL 偏高 → β 加倍 → 下一步被拉住；更新太怂 → KL 偏低 → β 减半 → 放开步子。<strong>代价是 β 会在训练中大幅漂移（常见跨两个数量级）</strong>，于是"复现实验"必须连同 β 的轨迹一起记录，本章的对比表就包含 β 初值、终值与过程最大值。如果 β 长期顶在上限或下限，说明目标 KL 和任务根本不匹配。</p>
+    <p>回路的两个设计细节值得用数字体会。第一，"加倍/减半"是指数搜索：从偏大 100 倍回到目标附近，按每 epoch 减半需要约 7 个 epoch（2<sup>7</sup>=128），对 10 epochs 一批的节奏来说速度刚好；换成线性调整（比如 β ← β − 0.1·KL），在 KL 尺度变化时要重新设计步长，这就是比值+倍率设计更通用的原因。第二，目标 KL 不能任意设小，因为估计量有噪声地板：单样本估计 KL̂ = (1/N)Σ(logp<sub>old</sub> − logp) 虽然在动作来自旧策略时对 KL(π<sub>old</sub>‖π<sub>θ</sub>) 无偏，但方差不为零，标准误差约为 std(logp<sub>old</sub> − logp)/√N。取每个样本对数差的标准差 0.1、批大小 2048，标准误差约 0.1/√2048 ≈ 0.0022。</p>
+    <p>拿它对照本章默认 <code>--target-kl 0.01</code>：0.01 是噪声的约 4.5 倍，反馈回路分辨得出真实偏差；若把目标设成 0.002，上下阈值 0.003 与 0.0013 都埋在噪声里，β 会被随机波动推着走，出现"β 每轮乱跳、KL 却不受控"的失效模式。经验判据：<strong>目标 KL 至少取估计标准误差的 3～5 倍</strong>；估算不出噪声水平时，先以 0.01 为起点上下试。补充一个估计量的性质：单样本估计对个别样本可以是负数（该动作概率被提高时 logp<sub>old</sub>−logp&lt;0），这是无偏估计的正常现象；参考文献里常用的 k3 估计 ratio−1−log(ratio) 恒非负，ratio=1.2 时等于 0.0177、ratio=0.8 时等于 0.0231，代价是计算稍贵，练习 4 会做替换对比。</p>
+
+    <div class="box key">
+      <span class="box-title">数值算例：β 在七个 epoch 里的完整轨迹</span>
+      <p>设 KL<sub>tgt</sub>=0.01，滞后带为 [0.01/1.5, 0.01×1.5] = [0.0067, 0.015]，β 初值 1.0。假设连续七轮的 epoch 平均 KL 依次是 0.042、0.040、0.038、0.020、0.011、0.008、0.005，按规则逐轮推演：</p>
+      <p>0.042 &gt; 0.015 → β 加倍到 2；0.040 → 4；0.038 → 8；0.020 → 16；0.011 落在带内 → 保持 16；0.008 仍在带内 → 保持 16；0.005 &lt; 0.0067 → 减半到 8。</p>
+      <p>解读：KL 偏高时 β 连续四轮翻倍，从 1 冲到 16，把"更新太猛"压回带内；进入滞后带后回路停止动作，这是"1.5 倍带"的设计目的，避免 β 每轮都抖动；最后 KL 掉到带下限之下，β 才回落到 8。整个过程 β 跨越 16 倍且没有人工干预。把它和"用最终 β=8 直接当手调初值"对比：初值 8 会让前期 KL 被过早压住、学习变慢，同一任务换一组超参数就推不出这份轨迹，这就是"复现要记录 β 曲线"的具体含义。</p>
+    </div>
+
+    <h3>4. 两种约束的本质差别</h3>
+    <p>把两式对照看：裁剪的作用点在<strong>样本级</strong>，谁越界谁没梯度，步长限制是离散的、不对称的；KL 惩罚的作用点在<strong>批次级</strong>，整批数据的平均距离都在损失里，步长限制是连续的、对称的。这带来两个可检验的推论：裁剪模式的 KL 波动上限更宽（尖峰可能漏过），KL 模式的 KL 均值更贴近目标但更容易被 β 的漂移主导。本章的 <code>max_kl</code> 指标就是为验证第一条设计的。</p>
+    <p>批次级平均还有一个容易忽略的盲区，用数字构造一例：假设一批数据里 5% 的样本对数差为 +0.5、5% 为 −0.5、其余 90% 只有 +0.001，则平均 KL̂ = 0.05×(−0.5) + 0.05×(+0.5) + 0.9×0.001 = 0.0009，看起来"健康得过分"；但 10% 的样本位移都超过了裁剪窗口 0.18/0.22，策略在两个方向上都发生了大位移。<strong>均值可以互相抵消，极值不会</strong>：这正是要同时记录 <code>approx_kl</code>（均值）与 <code>max_kl</code>（单次极值）的原因，只看均值会把这类"双向大位移"误判成稳定训练。裁剪模式同样有盲区，但方向相反：5% 的越界样本被掐掉梯度后，批均值可能很小，策略却在其余 95% 的样本上被连续推了很多轮。</p>
+    <table>
+      <tr><th>维度</th><th>裁剪（clip）</th><th>KL 惩罚（kl）</th></tr>
+      <tr><td>约束粒度</td><td>逐样本：越界样本失活</td><td>批次级：平均距离进损失</td></tr>
+      <tr><td>步长限制形状</td><td>离散、单侧（只掐改进方向）</td><td>连续、对称（双向都在损失里）</td></tr>
+      <tr><td>需要手调的参数</td><td>ε 一个，默认 0.2 通常够用</td><td>目标 KL 与 β 初值，缺一不可</td></tr>
+      <tr><td>训练中的额外状态</td><td>无</td><td>β 随 epoch 更新，必须回传与记录</td></tr>
+      <tr><td>监控指标</td><td>裁剪比例 + KL 均值/极值</td><td>KL 均值 + β 轨迹</td></tr>
+      <tr><td>典型失效签名</td><td>裁剪比例长期 &gt; 30%、KL 尖峰</td><td>β 贴上下限、KL 在带外漂移</td></tr>
+      <tr><td>适合场景</td><td>通用默认；批量大、更新次数多</td><td>需要显式控制平均位移；异步/分布式更新</td></tr>
+    </table>
+    <p>读表的方法：先用裁剪跑通（它只有一个旋钮），当训练日志显示"KL 极值反复失控但裁剪比例不高"时，再考虑换成 KL 惩罚获得显式的均值控制；反过来，如果团队需要为异步更新设置严格的平均漂移预算，KL 惩罚的形式更直接。两种机制在第 010 章还会各自叠加早停，构成三层停止体系。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+
+    <h3>模块划分</h3>
+    <table>
+      <tr><th>组件</th><th>职责</th><th>与第 002 章的关系</th></tr>
+      <tr><td><code>ppo_update(mode, beta)</code></td><td>按模式组合策略损失：clip 用 min/clamp；kl 用未裁剪比率加 β·KL</td><td><strong>核心改动</strong>：一个函数两条损失路径</td></tr>
+      <tr><td>β 自适应</td><td>每个 epoch 末按 KL 与目标的比值加倍/减半</td><td><strong>新增</strong>：只在 kl 模式下生效</td></tr>
+      <tr><td>KL 诊断</td><td>每个 minibatch 记录 <code>approx_kl</code>，并跟踪单次最大值 <code>max_kl</code></td><td>由 002 的平均 KL 扩展为均值 + 极值双指标</td></tr>
+      <tr><td><code>train_one(mode)</code></td><td>封装一种模式的完整训练，记录 β 轨迹</td><td>把 002 的 λ 轴换成"目标函数"轴</td></tr>
+      <tr><td><code>main</code></td><td>依次训练两种模式，输出对比表和 β 漂移摘要</td><td>对比表新增 β 列与最大 KL 列</td></tr>
+    </table>
+
+    <h3>关键超参数</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用与取值理由</th></tr>
+      <tr><td><code>--modes</code></td><td>clip kl</td><td>两种模式各训练一次；也可只跑一种</td></tr>
+      <tr><td><code>--clip</code></td><td>0.2</td><td>仅 clip 模式使用，PPO 默认值</td></tr>
+      <tr><td><code>--target-kl</code></td><td>0.01</td><td>kl 模式的目标 KL。取偏小值让 β 的调整更活跃，便于观察反馈回路</td></tr>
+      <tr><td><code>--kl-init</code></td><td>1.0</td><td>β 初值。故意选得偏大：观察自适应回路如何把它压回去</td></tr>
+      <tr><td><code>--max-steps</code></td><td>120000</td><td>每种模式各自 12 万步；默认达标（475）即提前结束并记录步数</td></tr>
+      <tr><td><code>--epochs</code></td><td>10</td><td>与 001 一致；KL 模式中 β 每 epoch 调整一次</td></tr>
+    </table>
+
+    <h3>数据流</h3>
+    <p>每个更新周期：采样 2048 步 → GAE 估计优势与回报（快照逻辑与 002 相同）→ 批内标准化优势 → <strong>10 epochs × 32 个 minibatch</strong>：每个 minibatch 同时算 <code>ratio</code> 与 KL 估计，然后按 <code>mode</code> 分叉：clip 路径取 min/clamp，kl 路径用未裁剪比率加 <code>beta * kl</code> → 每个 epoch 结束时，kl 模式按反馈规则更新 β → 记录 <code>approx_kl</code> 与 <code>max_kl</code> → 达标则 <code>break</code>。</p>
+
+    <div class="box key">
+      <span class="box-title">公平对比的两条纪律</span>
+      <p>1) <strong>同一种子重设</strong>：<code>train_one</code> 开头调用 <code>set_seed(args.seed)</code>，两种模式的初始化与采样序列一致，差异只来自损失函数。</p>
+      <p>2) <strong>达标即停的意义</strong>：<code>--stop-at-solved</code> 默认打开，把"首达 475 的回合数"当作样本效率的读数。想比较 KL 波动与最终稳定性时用 <code>--no-early-stop</code> 跑满预算，两种玩法各有用途，不要混用结论。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：一个更新函数，两条损失分支</strong></p>
+    <pre class="code"><code>    for _ in range(args.epochs):
+        idx = torch.randperm(N, device=obs.device)
+        for start in range(0, N, args.batch_size):
+            mb = idx[start:start + args.batch_size]
+            logits, value = net(obs[mb])
+            dist = Categorical(logits=logits)
+            logp = dist.log_prob(act[mb])
+            ratio = torch.exp(logp - logp_old[mb])
+
+            # KL 估计：KL̂ = E[logp_old − logp]，两种模式共用这个诊断量
+            kl = (logp_old[mb] - logp).mean()
+
+            if mode == "clip":
+                # 裁剪目标：越界样本梯度归零，约束是单侧、局部的
+                surr1 = ratio * adv[mb]
+                surr2 = torch.clamp(ratio, 1.0 - args.clip, 1.0 + args.clip) * adv[mb]
+                policy_loss = -torch.min(surr1, surr2).mean()
+            else:
+                # KL 惩罚目标：比率不裁剪，改由 β·KL 把整批更新拉住
+                policy_loss = -(ratio * adv[mb]).mean() + beta * kl
+
+            value_loss = F.mse_loss(value, ret[mb])
+            entropy = dist.entropy().mean()
+            loss = policy_loss + args.vf_coef * value_loss - args.ent_coef * entropy</code></pre>
+    <p>解读：两条分支只差三行，但行为完全不同。<strong>（1）</strong>clip 分支里 <code>min/clamp</code> 让越界的样本梯度归零；kl 分支里比率永远不裁剪，<strong>如果把 clamp 也留在 kl 分支，就等于同时用了两种约束，对比就不纯净了</strong>。<strong>（2）</strong><code>kl</code> 只从 <code>logp</code> 一侧反向传播：<code>logp_old</code> 是采样快照，当作常数；若误把两个 logp 都从当前网络重算，KL 恒为 0，惩罚项失效，这是本章最隐蔽的 bug。<strong>（3）</strong><code>kl</code> 的符号约定是 <code>logp_old − logp</code>，即"新策略对已发生动作的平均对数概率下降量"；它近似 KL 且与裁剪模式共用，但注意它是无偏估计、方差大，不能当精确 KL 用。</p>
+
+    <p><strong>片段 2：自适应 β 的负反馈回路</strong></p>
+    <pre class="code"><code>            epoch_kl += kl.item()
+            epoch_cnt += 1
+
+        # kl 模式：每个 epoch 结束后按 KL 反馈调整 β
+        # 按 epoch 粒度调整；逐 minibatch 调整会让 β 高频震荡
+        if mode == "kl":
+            mean_epoch_kl = epoch_kl / max(epoch_cnt, 1)
+            hi = args.target_kl * 1.5
+            lo = args.target_kl / 1.5
+            if mean_epoch_kl &gt; hi:
+                beta *= 2.0          # KL 超目标 1.5 倍：更新太猛，拉紧约束
+            elif mean_epoch_kl &lt; lo:
+                beta /= 2.0          # KL 低于目标 1/1.5：步子太怂，放开一点
+            beta = float(np.clip(beta, 1e-6, 1e6))   # 防数值爆炸的地板与天花板
+            epoch_kl = 0.0           # 计数器清零，下一轮重新累计
+            epoch_cnt = 0</code></pre>
+    <p>解读：这就是 PPO 论文公式 (9) 的实现。<strong>（1）</strong>判断用的是 <strong>epoch 均值</strong>：minibatch 的 KL 噪声大，逐批调 β 会让系数抖动，KL 反而更不稳定（练习 2 会让你亲眼看到）。<strong>（2）</strong>加倍/减半是"指数搜索"：即使 β 偏了 100 倍，十几个 epoch 内也能拉回目标附近；这也是它比手调参数省心的原因。<strong>（3）</strong><code>np.clip</code> 的上下限是保险丝，正常训练不会碰到；如果日志显示 β 贴着 1e6 或 1e-6 不动，说明 target_kl 与任务不适配。<strong>（4）</strong>换种写法，比如按 KL 的绝对差值线性调整 β，回路的收敛速度会依赖 KL 的尺度，换个环境就得重新设计，而"比值 + 倍率"是尺度无关的。</p>
+
+    <p><strong>片段 3：达标即停与 β 轨迹记录</strong></p>
+    <pre class="code"><code>    beta = args.kl_init
+    kls, betas = [], []
+    solved_at = None
+    while total_steps &lt; args.max_steps:
+        batch, ep_returns, obs_t = collect_rollout(
+            env, net, args.steps_per_update, obs_t, device, args.gamma, args.lam)
+        total_steps += args.steps_per_update
+        all_returns.extend(ep_returns)
+
+        stats, beta = ppo_update(net, optimizer, batch, args, mode, beta)
+        kls.append(stats["approx_kl"])
+        betas.append(beta)          # 记录 β 轨迹：复现实验必须能看到它
+
+        if solved_at is None and len(all_returns) &gt;= 100 and np.mean(all_returns[-100:]) &gt;= args.target_reward:
+            solved_at = len(all_returns)
+        if solved_at is not None and args.stop_at_solved:
+            break                    # 达标即停：首达回合数就是样本效率指标</code></pre>
+    <p>解读：<strong>（1）</strong><code>beta</code> 从 <code>ppo_update</code> 里返回后回传给下一轮，β 是随训练变化的"训练状态"，漏接这个返回值会让自适应静默失效（β 永远停在初值），这是把状态放在函数外的经典陷阱。<strong>（2）</strong><code>betas</code> 列表与 <code>kls</code> 一起进入结果字典，最后打印"初值 → 终值、过程最大"三件套。没有这个轨迹，写论文或对比实验时无法解释"为什么这次结果和上次不同"。<strong>（3）</strong>早停只对<strong>达标</strong>触发：用首达回合数衡量样本效率，同时避免两种模式跑不同预算导致的 KL 统计不可比，不过想看最终稳定性时记得关掉它（<code>--no-early-stop</code>），否则达标模式的数据被截断，KL 统计会偏乐观。</p>
+
+    <p>完整可运行脚本（附录）：<a href="../code/ch003.py" download>code/ch003.py</a></p>
+    <pre class="sh"><code>python code/ch003.py                    # 两种模式各 12 万步，CPU 约 4–7 分钟
+python code/ch003.py --quick            # 快速跑通：8000 步、4 轮、无早停，约 40–70 秒
+python code/ch003.py --target-kl 0.002  # 收紧 KL 目标，看 β 如何被推着走
+python code/ch003.py --no-early-stop    # 跑满预算，比较稳定性</code></pre>
+    <p>典型日志：<code>[clip] 步数 40960 | 回合 1100 | 近20均 431.7 | KL 0.0066 | 最大KL 0.0190 | 裁剪比例 0.079</code>；<code>[ kl] 步数 40960 | 回合 1180 | 近20均 372.5 | KL 0.0095 | 最大KL 0.0252 | β 2.0000</code>。</p>
+    <p>跨模式比较诊断量时有两处口径差异要留意：clip 模式的 <code>max_kl</code> 来自全体样本（包括被裁的），它不因梯度被掐而不涨；但用均值比较时，越界样本的位移对拟合的贡献已经停止，读数会显得"更稳"。因此报告里不要把两种模式的 KL 直接排序、宣称谁更稳，先写清口径，再给各自的绝对水平。另一处细节是 KL 的批内平均方式：按 minibatch 先平均再汇总，与把全部样本拼起来一次平均，最后一批不满时两者不严格相等；本实现按 minibatch 计数平均（分母 <code>stats["n_updates"]</code>），对比表中的数字都遵循同一口径。</p>
+    <p>β 的终值单独看没有意义，要和 KL 水平连读：β 抬到 16 而 KL 停在 0.012，是回路正常工作的证据；β 同样在 16 但 KL 长期 0.05，说明约束失效，多半是目标 KL 设得过宽或学习率过大，反馈回路追不上参数步长。读 <code>runs/ch003/</code> 下的结果文件时，把 β 初值、终值、最大值与平均 KL 当成一组四个数字一起看，才能判断这次训练是"回路在控"还是"回路在漂"。</p>
+    <p>预期结论（<strong>以实跑为准</strong>）：两种模式通常都能到达 475，但路径不同，clip 的 KL 稳定在 0.005～0.015、裁剪比例 5%～15%；kl 的 β 先被抬升、中段可能回落，终值常在 0.05～4 数量级。把 <code>--target-kl</code> 缩到 0.002 时 kl 模式明显变慢（首达 475 的回合数多 30%～100%）。<strong>更准确的结论是"裁剪几乎不用调参、KL 惩罚更依赖目标 KL 的设定"。</strong></p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>KL 惩罚项里带上 logp_old 的梯度</strong>：<code>logp_old</code> 是采样快照，必须当常数。若误用当前网络重新算两遍 logp 再相减，KL 恒为 0，惩罚项失效。症状：kl 模式与无约束策略梯度没有区别、KL 上升无阻力。正确做法是只对 <code>logp</code> 的反向路径求导。</li>
+      <li><strong>β 调整方向写反</strong>：KL 高于目标要<strong>增大</strong> β（拉紧约束），低于目标才减半。方向反了会形成正反馈，几步之后 KL 飙到 0.1 以上、策略崩溃。症状：KL 单调上升、近 20 均断崖。</li>
+      <li><strong>用两种模式各自不同的种子做对比</strong>：本章在 <code>train_one</code> 内重设同一种子。换种子后排序可能变化，所以结论要基于多个种子；单次运行的排序不足以支撑结论。</li>
+      <li><strong>把裁剪模式的 <code>clip_frac</code> 当成 KL 的替代指标</strong>：裁剪比例低不代表 KL 小，它只说明"少数样本越界"；kl 模式下这个量没有控制作用，仅作观察。</li>
+      <li><strong>忘了回传 β 或搞错调整粒度</strong>：<code>ppo_update</code> 返回的新 β 必须赋回循环变量；粒度选 epoch，逐 minibatch 调整会让 β 高频震荡、KL 更不稳。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>用 <code>--target-kl 0.05</code> 重跑 kl 模式，与默认 0.01 对比 β 轨迹与学习速度，解释目标 KL 变大后 β 的行为。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>target 变大意味着"允许走得更远"，β 会因为反馈回路长期停在低位甚至不断减半；观察结果文件里的 <code>beta_final</code> 和日志中的 KL 水平。</div></details>
+      </li>
+      <li>把 β 的调整粒度改成"每个 minibatch 调一次"，运行后对比 β 曲线与 KL 的波动，说明粒度的影响。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>把 <code>epoch_kl</code> 的统计改到 minibatch 循环内并在那里调整 β 即可。你会看到 β 高频抖动，KL 反而更不稳定。</div></details>
+      </li>
+      <li>在 clip 模式里加"KL 早停"：当某个 epoch 的平均 KL 超过 <code>3 * target_kl</code> 时跳过本批剩余的 epoch。对比开启前后 12 万步内的最大 KL 与近 100 均。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>在 epoch 循环里判断并 <code>break</code>。这相当于给硬约束加了一道安全阀，与第 010 章的早停主题相关。</div></details>
+      </li>
+      <li>实现 k3 形式的 KL 估计 <code>kl = (ratio - 1 - log(ratio)).mean()</code>，与当前的采样估计对比在同一批数据上的方差（多训练几个 epoch 看日志波动）。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>k3 估计非负且方差更低。替换 <code>kl</code> 的计算行即可，注意它和 <code>(logp_old - logp)</code> 在数值上不等价，需要在日志里同时打印两者观察差异。比较时固定种子。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>裁剪目标是单侧局部约束：只掐掉"还想继续变大"的越界样本，KL 只是被间接限制；KL 惩罚是软墙，用 β 把整批数据的新旧距离顶在损失里。</li>
+      <li>自适应 β 规则（KL &gt; 1.5·目标则加倍，&lt; 目标/1.5 则减半）让 KL 模式几乎不用手调 β，代价是 β 随训练漂移两个数量级，复现时要记录轨迹。</li>
+      <li>受控实验显示：两者在 CartPole 上都能达标；裁剪默认参数直接可用，KL 模式对 <code>target_kl</code> 明显更敏感。</li>
+      <li>推荐实践：从裁剪开始，需要更细的步长控制、或想做分布式/异步更新（第 024、025 章）时再考虑 KL 惩罚。</li>
+      <li>下一章同时动两个"规模"旋钮，每次采样的批量大小与学习率，用一张 2×2 网格观察它们如何共同决定样本效率与稳定性。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch002.html">← 第 002 章：PPO的广义优势估计（GAE）实现</a>
+    <a class="next" href="ch004.html">第 004 章：PPO的批量大小与学习率调优 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

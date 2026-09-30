@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第084章 多机器人协同运动规划 | 多机器人协同学习课程 · ROS2 通信与系统集成</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第四篇 · 系统集成与工程化</span>
+    <span class="sep">/</span>
+    <span>第 084 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第四篇 · 系统集成与工程化</div>
+    <h1>第 084 章：多机器人协同运动规划</h1>
+    <p class="lead">从"每条路径都不撞静态墙"升级到"轨迹之间不互相撞"：搞清顶点/边冲突、优先级规划、预约表与在线重规划，把碰撞风险消灭在时间维度上。</p>
+    <ul class="meta">
+      <li>主题：协同运动规划（时空冲突消解工程）</li>
+      <li>关键机制：冲突检测、优先级规划、时空预约表、重规划触发</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 083 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>区分路径（几何）与轨迹（时空）：理解多机器人规划失败的根源是"时间没对齐"，几何路径本身常常没问题。</li>
+      <li>掌握三类典型时空冲突，顶点冲突、边冲突、跟随冲突，的检测方法与数学条件。</li>
+      <li>理解两条工程主线：集中式（联合空间/CBS 思路，最优先贵）与解耦式（优先级规划 + 预约表，快但不完备），会按规模选路线。</li>
+      <li>能设计一个在线重规划回路：触发条件、频率、与预约表的更新协议、以及通信中断时的保守降级。</li>
+      <li>会在 ROS2 里组织"每机器人局部规划器 + 车队协调器"的双层结构，并说清协调器到底协调什么。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 046–048 章你做过协同路径规划：把多台机器人的路径放在一起检查、绕开彼此的静态路径。<strong>静态路径层面的无碰撞，不等于执行时无碰撞</strong>，两台机器人可能各走一条互不重叠的路径，但一台中途卡了 3 秒，另一台的轨迹正好在那一秒经过同一位置。真实系统里"撞"是时空事件：同一位置在"差不多的时间"被两具车身占据。</p>
+    <p>协同运动规划要解决的就是这件事：给每台机器人一条带时间戳的轨迹（每个时刻在哪、以什么速度），并保证任意两条轨迹在任意时刻的间距都不小于安全距离。这是从"规划几何"到"规划时空"的升级，也是多机器人系统里第一个真正需要<strong>交换大量结构化数据</strong>的环节：轨迹、预约、延迟报告。</p>
+    <p>本章走工程路线：冲突怎么检测、优先级怎么排、预约表怎么用、什么时候必须重规划。第 097 章再从科研视角拆解算法谱系（时空 A*、CBS 的完备性与最优性）。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 从路径到轨迹：目标函数与冲突分类</h3>
+    <p>给定机器人组各自的起点与终点，求一组无碰撞轨迹。两个常用指标：所有机器人完成时间的最大值，完工时间（makespan）；所有机器人轨迹时长或路程之和，总代价（sum-of-costs, SOC）。<strong>makespan 偏向"公平"（最慢的尽快结束），SOC 偏向"效率"（整体省力）</strong>，调度机器人给任务报价时选哪个，会改变它们的行为风格。</p>
+    <div class="formula">
+      makespan = max<sub>i</sub> T<sub>i</sub>；SOC = Σ<sub>i</sub> T<sub>i</sub>（或 Σ<sub>i</sub> 路程）
+      <span class="note">同一套轨迹集合，两种指标可以给出完全不同的"最优"</span>
+    </div>
+    <p>冲突按几何形态分三类，检测条件都不复杂（r 为单机安全半径，即两机心距需 ≥ 2r）：</p>
+    <ul>
+      <li><strong>顶点冲突</strong>：同一时刻两机心距 &lt; 2r，"同时到同一个地方"。</li>
+      <li><strong>边冲突</strong>：相邻两个采样步之间，两机互相朝对方的上一位置移动，"对穿"，即使采样点上从未同距过近。</li>
+      <li><strong>跟随冲突</strong>：同向同廊道跟进时前车急停，后车制动距离不足。它不进顶点/边冲突检测，却往往是实际追尾的原因，所以检测里要加"前向 2 秒可行距离"检查。</li>
+    </ul>
+
+    <h3>2. 集中式：联合空间的诱惑与爆炸</h3>
+    <p>理论上的"标准答案"是集中式：把 N 台机器人看成一个联合系统，在联合状态空间里搜最优解。问题在维数：单机状态空间 |S| 若有 1000 个位姿格，20 台机器人的联合空间就是 |S|<sup>20</sup> = 10<sup>60</sup> 量级，不可能穷举。这就是经典的<strong>维数灾难</strong>。集中式路线里真正能用的是"带约束树搜索"（Conflict-Based Search, CBS）思路：先各自规划，发现冲突后给冲突方加约束（"你在 t 时刻不能占用该格"），只对被约束的机器人重新规划，用逐步加约束代替全联合搜索。它可以保证最优，但冲突密集时约束树分支爆炸，工程上多用在 8–10 台以内或作为性能上限的参照，细节留给第 097 章。</p>
+
+    <h3>3. 解耦式：优先级规划 + 预约表</h3>
+    <p>工程主力是解耦式：<strong>排序后逐个求解（联合求解仅留作性能上限参照）</strong>。优先级规划（prioritized planning）按给定顺序逐台规划：第 k 台规划时，前 k−1 台的轨迹已被视为"随时间移动的障碍"，在时空 A*（状态为 x, y, t）里绕开它们。为什么把轨迹当障碍就有效？因为时空 A* 的状态里带了时间，<strong>"动态障碍"被展平成静态的三维障碍</strong>：某格在 t=3 s 被占用，就把它标成"三维空间中的一块墙"，搜索自然绕开。</p>
+    <div class="formula">
+      优先级规划总代价 ≈ N 次单机时空搜索；CBS 最坏需对冲突反复分支与重规划
+      <span class="note">优先级规划快但不完备：低优先级机器人可能被堵死；换一个顺序常常就通了，顺序即"路权"</span>
+    </div>
+    <p>更轻量的解耦手段是<strong>预约表</strong>（reservation table）：把每台机器人未来轨迹离散成"时空格子占用"（格子 0.5 m、时间片 0.1 s），后来的机器人在冲突检查时先查表。它的三个工程优点：查询退化为字典/映射表查找（O(1)）；占用可以有 TTL（超时自动释放，容忍机器人失联）；广播量小（只发增量占用）。缺点同样明显：<strong>表是"先到先得"，没有全局优化；时间片一旦对齐错位（时钟不同步），检测直接失效</strong>。</p>
+
+    <h3>4. 让路规则与死锁</h3>
+    <p>纯优先级在环形/对穿场景容易死锁：A 等 B、B 等 C、C 等 A，谁都不动。两条工程对策：<strong>（1）结构化路权</strong>，预先约定"右侧通行""环岛单向""路口先入先出"，把任意对穿变成确定顺序；<strong>（2）死锁检测与拆分</strong>，检测"所有相关机器人速度接近零持续 &gt; 2 s"的环，选环中最低优先级者执行一次"退让重规划"（退回上一个宽裕点或靠边微移），打破循环。死锁不是异常，是分布式决策的正常可能的稳态，必须显式处理。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>双层结构：每台机器人本地跑局部规划与跟踪（高频），车队级跑一个轻量协调器（低频）负责冲突检测、优先级裁定与预约表的权威维护。</p>
+    <table>
+      <tr><th>组件</th><th>频率</th><th>职责</th><th>通信内容</th></tr>
+      <tr><td>本地规划器</td><td>5–10 Hz</td><td>局部时空重规划、轨迹跟踪</td><td>发布自身轨迹（压缩后 0.5–2 KB）</td></tr>
+      <tr><td>车队协调器</td><td>1–2 Hz</td><td>冲突检测、优先级裁定、预约表维护</td><td>广播冲突裁决/预约更新（几百字节）</td></tr>
+      <tr><td>重规划触发</td><td>事件驱动</td><td>根据偏差/延迟/新障碍立即触发</td><td>通知相关机器人（点对点）</td></tr>
+    </table>
+    <h3>重规划触发条件（起点模板）</h3>
+    <table>
+      <tr><th>触发条件</th><th>阈值</th><th>动作</th></tr>
+      <tr><td>新动态障碍进入本机走廊</td><td>前方 3 m</td><td>本地局部重规划（不影响车队列）</td></tr>
+      <tr><td>轨迹跟踪偏差</td><td>横向 &gt; 0.3 m</td><td>本地校正 + 上报偏差</td></tr>
+      <tr><td>实际到达晚于计划</td><td>&gt; 1.0 s</td><td>上报协调器，更新预约并检查是否引发新生冲突</td></tr>
+      <tr><td>通信中断</td><td>&gt; 2 s</td><td>切保守模式：降速 50% + 纯本地避障，预约自动过期</td></tr>
+    </table>
+    <p>设计要点逐条给理由：<strong>本地重规划不打扰全局</strong>，因为大多数扰动（躲个行人）不影响其他机器人的时空计划；<strong>偏差阈值 0.3 m</strong> 取值依据是导航误差常态 5–10 cm，超过 3 倍说明真的"走歪了"；<strong>延迟 1.0 s 上报</strong>取在预约时间片粒度（0.1 s）的十倍，确保更新有意义又不刷屏；<strong>通信中断的保守降级</strong>让系统在"不知道别人在哪"时至少不超速，安全语义优先于效率语义。</p>
+    <div class="box key">
+      <span class="box-title">设计决策：协调器要不要是"单点"？</span>
+      <p>协调器是一个逻辑角色，不必是一台物理机器：可以指定车队里算力最充裕的一台兼任，也可以用"每台机器人各维护一份相同的预约表、用广播增量更新"的对称方案。前者的好处是裁决简单（谁冲突谁让，一句话说了算），代价是单点故障，它挂掉后车队应自动降级到纯本地避障模式并选主。选哪种取决于你对"冲突频率"的预期：每小时冲突低于 1 次的场景，对称方案就够。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：冲突检测，顶点冲突与边冲突</strong></p>
+    <pre class="code"><code>from math import dist
+
+def detect_conflicts(traj_a, traj_b, rid_a, rid_b, radius=0.35, dt=0.1):
+    """检测两条时空轨迹的冲突。traj 形如 [(t, (x, y)), ...]，等步长采样。
+    前提：两条轨迹时间已对齐到同一时钟（第 009 章的时间同步是必要条件）。"""
+    conflicts = []
+    n = min(len(traj_a), len(traj_b))
+    for k in range(n):
+        t_a, pa = traj_a[k]
+        t_b, pb = traj_b[k]
+        if abs(t_a - t_b) &lt; 1e-6 and dist(pa, pb) &lt; 2 * radius:
+            conflicts.append(("vertex", round(t_a, 1), rid_a, rid_b))  # 同时同地
+    for k in range(1, n):
+        # 边冲突：A 从上一格走向 B 的上一格，B 同时反向走来，形成对穿
+        if (dist(traj_a[k-1][1], traj_b[k][1]) &lt; 2 * radius and
+                dist(traj_b[k-1][1], traj_a[k][1]) &lt; 2 * radius):
+            conflicts.append(("edge", round(traj_a[k][0], 1), rid_a, rid_b))
+    return conflicts
+</code></pre>
+    <p>解读：这段代码短，但两个前提缺一不可。<strong>（1）时间对齐</strong>：检测的是"同一时刻"的两机位置，如果各机时钟差 100 ms、速度 1 m/s，位置判断就有 10 cm 系统误差，所以第 009 章的同步不是可选项。<strong>（2）等步长采样</strong>：顶点检测按索引配对（traj_a[k] 与 traj_b[k]），前提是两条轨迹在相同的时间网格上重采样过；真实轨迹时长不同，要先统一网格（不足的用"停在终点"补齐）。边冲突检测单列一个循环，因为它检查的是"交叉换位"的几何模式，采样点上可能一直不近、换位瞬间才危险。</p>
+
+    <p><strong>片段 2：优先级规划，排序即路权</strong></p>
+    <pre class="code"><code>def prioritized_plan(robots, planner, order):
+    """按优先级逐个规划：先规划者的轨迹成为后者的移动障碍。"""
+    planned = {}
+    moving_obstacles = []                  # (rid, trajectory) 列表
+    for rid in order:
+        r = robots[rid]
+        # planner 是时空 A*：状态 (x, y, t)，把 moving_obstacles 展平成三维障碍
+        traj = planner(r.start, r.goal, moving_obstacles, max_t=r.budget)
+        if traj is None:
+            # 低优先级被堵死：不静默失败，返回失败者供上层换序/让路
+            return None, rid, planned
+        planned[rid] = traj
+        moving_obstacles.append((rid, traj))
+    return planned, None, planned
+
+# 优先级怎么定？三条工程依据：任务截止期 > 电量余量 > 到达计划时间
+robots = {1: Robot(), 2: Robot(), 3: Robot()}
+order = [3, 1, 2]                          # 顺序不同，结果可能完全不同
+plan, failed_id, partial = prioritized_plan(robots, space_time_astar, order)
+</code></pre>
+    <p>解读：<strong>返回三元组、不抛异常</strong>是刻意设计：规划失败（低优先级被堵死）是这类算法的常态，调用方需要知道"谁失败了、前面的计划是什么"，这样协调器可以尝试换序重规划（把失败者提到最前）、或只让失败者延迟出发等待窗口。优先级排序依据是路权的工程翻译：任务截止期代表外部承诺，必须先兑现；电量余量代表"能不能等"；到达计划时间代表对下游的扰动。注意这不是公平性设计，<strong>固定优先级会饿死低优先机器人</strong>（练习 5 会让你量化这个问题）。</p>
+
+    <p><strong>片段 3：预约表，时空占用的 O(1) 检查与 TTL 过期</strong></p>
+    <pre class="code"><code>class ReservationTable:
+    """预约表：未来时空占用登记。格子 0.5 m、时间片 0.1 s（与冲突精度匹配）。"""
+    def __init__(self, cell=0.5, slot=0.1):
+        self.cell, self.slot = cell, slot
+        self.book = {}                     # (gx, gy, t_slot) -> (rid, ttl)
+
+    def _key(self, x, y, t):
+        return (int(x / self.cell), int(y / self.cell), int(round(t / self.slot)))
+
+    def reserve(self, rid, traj, ttl=10.0):
+        now = traj[0][0]
+        for t, (x, y) in traj:
+            # TTL 是失联安全阀：机器人掉线后占用自动过期，不会永久锁死路口
+            self.book[self._key(x, y, t)] = (rid, now + ttl)
+
+    def occupied(self, x, y, t):
+        e = self.book.get(self._key(x, y, t))
+        if e is None:
+            return None
+        rid, expire = e
+        if expire &lt; t:                     # 已过期：视为空闲并顺手清理
+            del self.book[self._key(x, y, t)]
+            return None
+        return rid
+</code></pre>
+    <p>解读：预约表把"冲突检测"从几何计算变成映射表查询，这是它比实时两两比对轨迹更受欢迎的原因，<strong>N 台机器人的两两比对是 O(N²) 条轨迹对，而查表是每个候选位置 O(1)</strong>。TTL 机制是分布式韧性的关键：如果锁依赖各机器人主动释放，一台死机会把路口永久锁死；改成"过期自动失效"，最坏情况退化为"失联机器人占用窗口过后，别人可以通行"，这在人手可干预的场景是正确取舍（宁可冒低概率碰撞风险也不全队瘫痪；若安全等级更高，则应保留锁并要求人工确认后才释放）。<code>int(round(t/slot))</code> 的取整会让相邻时间片语义重叠，选用 0.1 s 片是因为控制周期 20–50 ms 远小于它，精度足够。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>只查顶点冲突，忽略边冲突</strong>：两条轨迹在采样点上从未过近，却在两步之间"对穿"了，真机迎头相撞。修复：加上片段 1 的边冲突检测，或把采样步加密到车长/(2·v_max)。</li>
+      <li><strong>时钟不同步就做冲突检测</strong>：各机用自己的单调钟打时间戳，检测结果比噪声还差。修复：冲突检测前统一时间源（第 009 章的同步方案），并在消息里显式携带"本消息时间戳适用的时钟域"。</li>
+      <li><strong>重规划阈值过敏感</strong>：偏差阈值设成 0.05 m，机器人每 200 ms 重规划一次，计算负载爆炸且轨迹抖。修复：阈值取导航常态误差的 3 倍（约 0.3 m），并给重规划加最小间隔（如 1 s 限频）。</li>
+      <li><strong>死锁无处理</strong>：环形走廊里四台机器人互相等待，系统"安静地卡死"，无人报警。修复：显式死锁检测（相关机器人速度 &lt; 0.05 m/s 持续 2 s）+ 环拆分退让；监控里加"车队平均速度 &lt; 阈值持续 5 s"告警。</li>
+      <li><strong>轨迹消息过大挤掉控制流量</strong>：把 60 秒轨迹按 0.02 s 采样广播，每条几十 KB，20 台互发打满 WiFi。修复：轨迹降采样到 0.2 s + 增量发送（只发与本机上次计划不同的段）+ 事件驱动（计划变了才发）。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>算一算：两台机器人相向通过宽 1.0 m 的门洞，各自半径 0.35 m，速度均为 0.8 m/s，采样步长 0.1 s。门洞中心相距 3 m。请用片段 1 的判据判断：如果时间对齐，最先出现的冲突是顶点还是边，发生在什么时刻附近？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>相对接近速度 1.6 m/s，心距从 3 m 降到 0.8 m 需要约 1.4 s；从 2r=0.7 m 到交叉换位需要约 0.5 s。算一遍会发现在中心附近首先满足边冲突条件，两机在采样点上心距还没到最小就已经"换位"了，这正是必须单独检测边冲突的原因。</div></details>
+      </li>
+      <li>改配置并预测结果：把重规划触发阈值从 0.3 m 改成 0.1 m（更敏感），把重规划最小间隔从 1 s 改成 0.2 s。预测 CPU 负载、轨迹平滑性、任务完成时间三者的变化方向，再在仿真里验证。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>预测：重规划频率上升约一个数量级；轨迹在目标附近反复微调变"毛"；完成时间可能反而变长（不停地修路不如走稳）。结论：灵敏度过高是负优化。</div></details>
+      </li>
+      <li>设计：一个十字路口（四臂各 3 m 长、宽 1.2 m）有 4 台机器人可能同时通过。给出两种规则设计，(a) 单点协调器裁决；(b) 无中心预约表，各自说明通行顺序规则、死锁处理、失联降级，以及你会选哪个及理由。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>(a) 简单：先入先出 + 环内让行，脆弱点是协调器故障；(b) 平等：按预约时间先到先用 + TTL，需要处理两机同刻预约冲突（用 robot_id 作确定性的平局打破）。选择依据：冲突频率与可接受的单点风险。</div></details>
+      </li>
+      <li>推导：单机状态空间取 1000 格位姿，证明联合状态空间规模为 1000<sup>N</sup>；再算 CBS 思路下最坏要处理的冲突数上界（提示：两两机器人对 × 时间步）。解释"只对被约束机器人重规划"为什么把指数级问题压回工程可用。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>联合空间 1000^N 随 N 指数增长；CBS 每轮只给一条新约束、只重规划一台，单轮成本是"1 次单机搜索 + 冲突检测"，把全局耦合限制在冲突树上，避免一次枚举全部组合。</div></details>
+      </li>
+      <li>实验：3 台机器人在一个"T 形"走廊接力通行，随机生成 10 种优先级顺序各规划一次，统计成功率与 makespan 的分布；然后把失败案例的优先级顺序反转重试。用 5 行结论解释"优先级顺序敏感性"并对第 097 章的算法改进提出你的预期。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>预期：成功率 60–90% 随顺序波动，makespan 差值可达 2 倍；反序重试常能把失败救回。结论指向：固定顺序无完备性保证，需要 CBS 式回溯或大规模迭代改进算法。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>多机器人规划是时空问题：终点是"每时刻在哪"的轨迹，不是一条静态几何路径；指标在 makespan 与 SOC 之间选。</li>
+      <li>三类冲突检测：顶点（同时同地）、边（对穿换位）、跟随（制动距离），检测前提是统一时钟与统一采样网格。</li>
+      <li>集中式联合空间随 N 指数爆炸；工程主力是解耦式：优先级规划（顺序即路权 + 失败可见）与预约表（O(1) 查询 + TTL 过期）。</li>
+      <li>在线重规划靠四类触发：新障碍、跟踪偏差、到达延迟、通信中断；阈值取导航常态误差的 3 倍并限频。</li>
+      <li>死锁是正常稳态：结构化路权（右行/环岛/先入先出）+ 死锁环检测退让，两手都要有。</li>
+      <li>下一章收束第四篇：<strong>带故障恢复的任务系统</strong>，把版本管理、学习、控制、规划全部焊进一个可验收的阶段项目。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch083.html">← 第 083 章：多机器人协同控制策略</a>
+    <a class="next" href="ch085.html">第 085 章：阶段项目：带故障恢复的任务系统 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

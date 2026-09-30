@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第057章 实现无模型强化学习 | 机器人仿真学习课程 · Isaac Sim 强化学习训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第三篇 · 高级强化学习专题</span>
+    <span class="sep">/</span>
+    <span>第 057 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第三篇 · 高级强化学习专题</div>
+    <h1>第 057 章：实现无模型强化学习</h1>
+    <p class="lead">把这条贯穿全课的主线一次讲透：策略梯度定理、TD 与 GAE 的偏差-方差折中、PPO 的裁剪目标，以及在 Isaac Sim 大规模并行环境下无模型训练的落地细节。</p>
+    <ul class="meta">
+      <li>主题：高级专题 / 无模型算法核心</li>
+      <li>相关组件：Isaac Sim / Isaac Lab / rsl_rl 风格 PPO / Stable-Baselines3</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 056 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>能写出策略梯度定理 ∇J = E[∇logπ(a|s)·A(s,a)]，并解释优势函数在其中的角色。</li>
+      <li>理解 TD 残差与 GAE 递推：λ 如何塑造"偏差-方差"权衡，为什么 λ=0.95 是常见甜点。</li>
+      <li>掌握 PPO 裁剪目标的逐行含义：概率比、悲观下界、为什么它能替代复杂信任域机制。</li>
+      <li>分清 on-policy 与 off-policy 的样本经济学，并解释 Isaac Sim 海量并行下 PPO 的墙钟优势。</li>
+      <li>会写向量化 rollout 与训练循环：观测归一化、优势归一化、终止 bootstrap、minibatch 划分。</li>
+      <li>能说出 PPO 十项关键超参的典型值与调法，以及每项失控时的症状。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>前面章节直接使用各种 RL 算法接口，但没有一次把"无模型（model-free）"这条主线的数学与工程完整梳理。它值得单独一章，因为<strong>你未来 80% 的实验都会跑在这条线上</strong>：从 017 章的 Stable-Baselines3 到 044 章的四足、059 章的多智能体、065 章的 sim-to-real，内核都是这一套。</p>
+    <p>无模型的意思是：不学动力学模型，直接从交互数据里学策略或价值。它牺牲了"从模型免费生成数据"的红利，换来的是实现简单、对高维观测适应好、没有模型偏差。在 Isaac Sim 的设定下（几千个并行环境、GPU 物理），样本是"批量廉价"的，无模型方法的墙钟效率反而最高。本章同时为第 058 章（离线 RL）与第 061 章（RNN 策略）立下基准，它们都是在这套目标函数上的变体。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 无模型家族地图</h3>
+    <table>
+      <tr><th>家族</th><th>代表</th><th>学习对象</th><th>数据使用</th></tr>
+      <tr><td>值方法</td><td>DQN / TD3 / SAC</td><td>Q(s, a) 或 V(s)</td><td>off-policy（回放池可重用）</td></tr>
+      <tr><td>纯策略梯度</td><td>REINFORCE / A2C</td><td>π<sub>θ</sub>(a | s)</td><td>on-policy（用完即弃）</td></tr>
+      <tr><td>策略梯度 + 裁剪</td><td>PPO</td><td>π<sub>θ</sub> 与 V<sub>φ</sub></td><td>on-policy，批次内多用几轮</td></tr>
+    </table>
+    <p>本课程的主役是 PPO：它处在"够简单、够稳定、够并行"的甜点上，特别匹配 Isaac Sim 的批量采样（每批几千环境同时产生数据）。理解 PPO，要拆成三块：策略梯度的目标、优势估计的方法、限制更新步长的手段。</p>
+
+    <h3>2. 策略梯度定理：为什么按"优势"调概率</h3>
+    <p>目标是最大化期望回报 J(θ) = E<sub>πθ</sub>[Σγ<sup>t</sup>r<sub>t</sub>]。对 θ 求导得到经典的策略梯度定理：</p>
+    <div class="formula">
+      ∇<sub>θ</sub>J = E<sub>πθ</sub>[ ∇<sub>θ</sub>log π<sub>θ</sub>(a | s) · A<sup>π</sup>(s, a) ]
+      <span class="note">A(s,a) = Q(s,a) − V(s)：动作比"平均水平"好多少</span>
+    </div>
+    <p>直觉读法：<strong>不要管某条轨迹的绝对好坏，只看"这个动作比该状态下的平均选择好多少"</strong>。A 为正就提高该动作概率，为负就压低；除以平均基准（V）这一取消操作大幅降低了梯度的方差（否则所有动作都被"整体好成绩"拉高）。工程上还有两个改进：用好的基线（critic）估计 A，以及用 GAE 在偏差与方差之间找平衡，这就是下一节。</p>
+
+    <h3>3. TD 残差与 GAE：看得多远的问题</h3>
+    <p>估计优势的最朴素方式是"蒙特卡洛：走到回合结束累加奖励再减 V"，方差大（回报随机性全进来）；另一个极端是"单步 TD：只往前走一步"，偏差大（依赖 critic 的准确性）。GAE（generalized advantage estimation）用指数加权把两者连成谱系：</p>
+    <div class="formula">
+      δ<sub>t</sub> = r<sub>t</sub> + γV(s<sub>t+1</sub>) − V(s<sub>t</sub>) &nbsp;&nbsp;（TD 残差）<br>
+      A<sub>t</sub> = Σ<sub>l≥0</sub> (γλ)<sup>l</sup> δ<sub>t+l</sub>
+      <span class="note">λ = 0 退化为单步 TD（低方差、高偏差）；λ = 1 逼近蒙特卡洛（高方差、低偏差）</span>
+    </div>
+    <p>逆序递推实现只需一行：<code>gae = delta + γλ·gae</code>。λ = 0.95 的含义是"有效视界约 1/(1−γλ) ≈ 20 步"，大部分信用分配发生在 20 步内，更远的信息以很小的权重参与。对 Isaac Sim 的场景（回合 10–20 s、50 Hz），λ = 0.95–0.98 都常见；任务越长程（比如 055 章的 500 步抓放），越往 0.99 靠，但必须配合更准的 critic，否则偏差会拖后腿。</p>
+
+    <h3>4. PPO 裁剪：用"悲观"限制步长</h3>
+    <p>策略梯度的老问题是步长难控：一次更新太大，新策略采不到旧数据，训练崩掉。信任域方法（TRPO）用二阶约束解决但太重；PPO 用一个裁剪的替代目标近似它：</p>
+    <div class="formula">
+      r<sub>t</sub>(θ) = π<sub>θ</sub>(a<sub>t</sub>|s<sub>t</sub>) / π<sub>θold</sub>(a<sub>t</sub>|s<sub>t</sub>) &nbsp;&nbsp;（概率比）<br>
+      L<sup>CLIP</sup> = E[ min( r<sub>t</sub>A<sub>t</sub>, &nbsp; clip(r<sub>t</sub>, 1−ε, 1+ε)·A<sub>t</sub> ) ]
+      <span class="note">ε 常取 0.2：单次更新里该动作概率最多放大/缩小到 1.2 / 0.8 倍</span>
+    </div>
+    <p>关键在 <code>min</code> 的"悲观"语义：当优势为正、策略想把概率提高时，目标在 r = 1+ε 处被截断，提高再多也不加分；当优势为负、策略在降概率时，目标在 r = 1−ε 处截断，降得再狠也不额外加分。结果是"超过步长限制的改进拿不到收益"，优化器自然停在信任域附近。注意裁剪发生在<strong>每个样本的动作概率</strong>上，而实际参数可能仍越界（所以 PPO 依然需要早停或多轮上限）。</p>
+
+    <h3>5. on-policy 的样本经济学与并行红利</h3>
+    <p>PPO 的梯度公式依赖"用旧策略采的数据"，所以数据在若干轮更新（epochs = 3–10）后必须丢弃。单环境看，这很浪费；但 Isaac Sim 把"采样"做成了一条 GPU 流水线：4096 个环境并行、每环境每轮 24 步，一轮就产生约 9.8 万条转移，网络更新几秒完成，环境采样也只要几秒，两边都喂得饱。这就是为什么在仿真里 on-policy 的 PPO 常常打败样本效率更高的 SAC：<strong>评价标准是墙钟时间，而墙钟瓶颈在环境吞吐，不在数据复用率</strong>。反过来，真机（或单一环境）场景里 SAC/TD3 的 off-policy 复用优势就回来了。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>把 PPO 训练系统按"采样-估计-更新-监控"四段设计：</p>
+    <ol>
+      <li><strong>环境层</strong>：向量化环境（Isaac Lab 风格的 N = 4096 并行），auto-reset（回合结束在同一 env 槽位自动重置，不打断批处理）；控制 50 Hz、物理 200 Hz（decimation=4）。</li>
+      <li><strong>采样层</strong>：每轮 horizon = 24 步，边采边算价值，产出 (obs, action, logp, reward, value, done) 六件套；<strong>区分"终止"与"截断"</strong>，摔倒（终止）不 bootstrap，超时（截断）要 bootstrap，否则价值目标有系统性偏差。</li>
+      <li><strong>估计层</strong>：GAE(γ=0.99, λ=0.95)；优势归一化（减均值除标准差），不做的话不同任务阶段的优势尺度差异会让 PPO 的 clip 失去意义。</li>
+      <li><strong>更新层</strong>：5 个 epoch、每 epoch 8 个 minibatch；学习率 3e-4（线性退火到 1e-5）；clip=0.2；值损失系数 0.5；熵系数 0.005。</li>
+      <li><strong>观测归一化</strong>：RunningMeanStd 在线统计（每环境更新，跨环境同步），观测在进入网络前裁剪到 ±5；这是"训练不稳定"的第一嫌疑人与第一解药。</li>
+      <li><strong>监控</strong>：每轮记录回报、回合长度、KL 散度（近似策略变化）、clip 触发比例（0.1–0.3 健康）、价值损失、熵。KL 飙升立即降学习率或提前停止 epoch。</li>
+      <li><strong>评估</strong>：训练中每 N 轮用确定性动作（std 固定小值）跑 50 回合评估集，与"训练回报"分开报告，训练回报含探索噪声，容易高估。</li>
+    </ol>
+    <table>
+      <tr><th>超参</th><th>典型值</th><th>失配症状</th></tr>
+      <tr><td>γ</td><td>0.99（长任务 0.995+）</td><td>太小：只顾眼前、不做长期准备</td></tr>
+      <tr><td>λ</td><td>0.95</td><td>太小：梯度噪声大；太大：critic 偏差被放大</td></tr>
+      <tr><td>clip ε</td><td>0.2</td><td>太大：更新野、策略崩；太小：学得慢</td></tr>
+      <tr><td>学习率</td><td>3e-4（退火）</td><td>太大：KL 尖峰、熵崩塌；太小：停滞</td></tr>
+      <tr><td>熵系数</td><td>0.001–0.01</td><td>太大：策略乱动不精；太小：过早确定性</td></tr>
+      <tr><td>horizon×envs</td><td>24×4096</td><td>太小：估计方差大；太大：数据陈旧</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计思维：为什么"观测归一化"排在第一优先级？</span>
+      <p>神经网络对输入尺度极其敏感：末端位置（±1 m）与关节角速度（±20 rad/s）直接拼在一起，第一层权重的梯度会被大尺度维度主导。RunningMeanStd 把每个通道拉到均值 0、方差 1 附近，等价于给网络一张"尺度统一的地图"。经验上，机器人任务里"训练不收敛 → 加观测归一化"的命中率高达七八成，比调任何其它超参都划算。与奖励归一化（053 章）的区别：那是任务间的可比性，这是特征内部的均衡，两个都要做，作用在不同层。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：向量化 GAE 计算</strong></p>
+    <pre class="code"><code>import numpy as np
+
+def compute_gae(rewards, values, terminated, truncated, gamma=0.99, lam=0.95):
+    # 形状约定：rewards (T, N)，values (T+1, N) 含 bootstrap 末值
+    # terminated: 真实终止（摔倒/成功）；truncated: 时间上限截断
+    # 两者必须分开：终止时未来价值为 0，截断时未来价值仍要估计
+    T, N = rewards.shape
+    adv = np.zeros((T, N), dtype=np.float32)
+    gae = np.zeros(N, dtype=np.float32)
+    for t in reversed(range(T)):
+        # 关键掩码：只有"真实终止"让未来价值归零；超时截断不归零。
+        # 截断回合的末位 bootstrap 由收集层写入 values[T] 承担
+        delta = rewards[t] + gamma * values[t + 1] * (1.0 - terminated[t]) - values[t]
+        # GAE 递推：lambda 越接近 1 看得越远、方差越大
+        gae = delta + gamma * lam * (1.0 - terminated[t]) * gae
+        adv[t] = gae
+    returns = adv + values[:-1]     # 价值回归目标 = 优势 + 当前价值估计
+    return adv, returns</code></pre>
+    <p>解读：GAE 的代码很短，魔鬼全在两处掩码。<strong>第一处是 terminated 与 truncated 的区分</strong>：摔倒终止时，之后的"未来"不存在，TD 残差里的 γV(s′) 必须归零；而到达时间上限被截断时，世界并没有结束，V(s′) 是对未来的正常估计，必须保留，混淆两者会系统性地把"超时回合"的价值估低或估高，症状是机器人在训练后期变得"急功近利"或"磨洋工"。标准做法是：数据收集时给截断回合的末位补一个 bootstrap 值（放在 values[T] 的位置），GAE 里只对 terminated 归零掩码，片段 1 的写法正是如此。第二处是 <strong>values 数组长度 T+1</strong>：第 T 项是一次额外的前向（末状态价值），别漏算，否则每一步的误差都被推移一格，优势估计整体有偏。返回值 returns 用作 critic 的回归目标，与 adv 共享同一次计算，省一遍反传。</p>
+
+    <p><strong>片段 2：PPO 损失（裁剪目标 + 价值 + 熵）</strong></p>
+    <pre class="code"><code>import torch
+
+def ppo_loss(new_logp, old_logp, adv, values, returns, entropy,
+             clip_eps=0.2, vf_coef=0.5, ent_coef=0.005):
+    # 概率比 r_t：新旧策略在同一动作上的概率之比（用 log 差再 exp，数值更稳）
+    ratio = torch.exp(new_logp - old_logp)
+
+    # 裁剪目标：min(rat*adv, clip(rat)*adv)，超过信任域的改进不计分
+    unclipped = ratio * adv
+    clipped = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * adv
+    policy_loss = -torch.min(unclipped, clipped).mean()    # 取负：最大化变最小化
+
+    # 价值损失：对 returns 做回归（这里不自裁剪 value，简单版本已足够稳）
+    value_loss = 0.5 * ((values - returns) ** 2).mean()
+
+    # 熵：鼓励探索。系数取小值，只起"调味"作用
+    # 符号为负：损失下降方向 = 熵上升方向
+    loss = policy_loss + vf_coef * value_loss - ent_coef * entropy.mean()
+    return loss, policy_loss.detach(), value_loss.detach()</code></pre>
+    <p>解读：逐项说说"为什么长这样"。<code>ratio</code> 用 exp(log 差)：直接除概率在数值上更危险（极小概率除法），log 差再 exp 既等值又稳。<code>torch.min(unclipped, clipped)</code> 是悲观下界：正优势时 min 选中被截断的项（不让多提），负优势时 min 选中未被截断的项（不让多降），两边都"防激进"。取负号是因为优化器做最小化，这行是纯粹的程序性细节，但初学者写反符号后策略会主动变差，且症状不明显（回报缓降），务必单元测试：<strong>构造 ratio=1、adv=1 的假数据，损失应等于 −1</strong>。价值损失系数 0.5 是传统（相当于 value 网络的学习率减半）；如果你发现回报波动但价值拟合很好，把 vf_coef 降到 0.25；如果价值损失居高不下（critic 欠拟合），升到 1.0 并单独提高 critic 学习率。熵系数 0.005 的量级：对连续动作空间的高斯策略，entropy 典型值在 −1 到 −3 之间，这一项对总损失的贡献是 0.005–0.015，微小但持续，条件概率密度请把它理解为"防止策略过早坍缩成确定性动作"的保险。</p>
+
+    <p><strong>片段 3：向量化训练主循环</strong></p>
+    <pre class="code"><code>def train_loop(env, policy, optimizer, total_iters=2000, horizon=24,
+               epochs=5, n_minibatches=8):
+    obs = env.reset()                       # 形状 (N, obs_dim)，N 为并行环境数（如 4096）
+    obs_norm = RunningMeanStd(shape=obs.shape[1:])   # 观测归一化统计量
+    for it in range(total_iters):
+        # ---------- 1) 采样：所有环境同步推进 horizon 步 ----------
+        buf = collect_rollout(env, policy, obs, obs_norm, horizon)
+        # 六件套（obs/act/logp/rew/val/done）形状均为 (T, N, ·)
+
+        # ---------- 2) 优势估计与归一化 ----------
+        adv, returns = compute_gae(buf.rewards, buf.values,
+                                   buf.terminated, buf.truncated)
+        adv = (adv - adv.mean()) / (adv.std() + 1e-8)   # 归一化：消除尺度漂移
+
+        # ---------- 3) 多轮小批量更新（PPO 的"准 off-policy"复用）----------
+        for epoch in range(epochs):
+            for mb in split_minibatches(buf, adv, returns, n_minibatches):
+                out = policy(mb.obs)
+                loss, pl, vl = ppo_loss(out.logp, mb.logp, mb.adv,
+                                        out.value, mb.returns, out.entropy)
+                optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
+                optimizer.step()
+
+        # ---------- 4) 推进观测、日志、评估 ----------
+        obs = buf.last_obs
+        log_metrics(it, buf, pl, vl)         # 含 KL、clip 触发率、回合回报
+    return policy</code></pre>
+    <p>解读：主循环是"数据流"的模板，四段的职责必须分清。第一段采样的 <code>horizon=24</code>：太短（比如 8 步）优势估计被 critic 误差主导；太长（比如 100 步）则同一批数据的动作离旧策略太远，epochs 复用被破坏，24 与 5 的组合（每批 40 次梯度步）是足式与操作任务的常见配置。第二段的两件事别漏：<code>+1e-8</code> 防 4096 个环境恰好优势全同时除零；归一化在<strong>整个批次</strong>上做（T×N 个样本），不是逐环境，逐环境会抹掉"某些环境当前难度更高"的信号。第三段是开销大头：一个 epoch 的 8 个 minibatch，每个 12288 条样本，5 个 epoch 共 40 次前反向，这就是为什么 PPO 需要 GPU 训练、采样需要 GPU 物理，两边才配得起来。梯度裁剪 1.0 是第二道保险（第一道是 PPO 自身的 ratio 裁剪），防单 batch 的异常梯度。第四段的 <code>buf.last_obs</code>：采样时最后一步的观测要保存下来作为下一轮的起点，不能重新 reset（那会丢掉轨迹连续性）；日志里的 KL 与 clip 触发率是"训练健康度"最好的两个仪表，KL 突然上跳一个数量级就是学习率要降的信号。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>混淆终止与截断</strong>：超时回合被当成"世界终结"不做 bootstrap，价值目标整体偏悲观；或反过来，摔倒回合被 bootstrap，策略学"摔了也还有未来分"。修复：episode 元数据里分别标记两类结束原因，GAE 只对终止归零。</li>
+      <li><strong>网络与数据不同步（stale logp）</strong>：采样时存的 logp 与更新时重算的 logp 用了不同的观测（比如归一化统计量中途变了）。症状是 ratio 分布异常宽、KL 大。修复：采样时把"当轮观测（归一化后）"一起存下，更新时不再重新归一化。</li>
+      <li><strong>epochs 太大</strong>：数据复用 20–30 轮，策略跑出信任域太远，训练后期崩。症状是回报先升后断崖。修复：epochs 3–10，配合"KL 超阈值提前停止本轮"。</li>
+      <li><strong>优势不归一化</strong>：不同阶段的奖励尺度差异（比如 +50 的完成奖励占主导）让 clip 的实际作用随批次漂移。修复：逐批优势归一化；奖励本身的尺度用 053 章的归一化思路预处理。</li>
+      <li><strong>评估用随机策略</strong>：拿带探索噪声的回报当成绩，比真机部署（通常用确定性或低噪声动作）虚高。修复：评估时把动作 std 固定到小值或直接用均值动作，跑 50 回合取均值与方差。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把 λ 从 0.95 调到 0.5 与 1.0，记录训练回报曲线的方差与收敛速度，解释偏差-方差权衡。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>λ=0.5 曲线更抖（优势估计噪声大）但很少系统偏；λ=1.0 更平滑，但当 critic 不准时收敛上限明显低。画"回报均值 ± 标准差带"最直观。</div></details>
+      </li>
+      <li>把观测归一化去掉（其余不变），复现训练失败的场景并记录第一轮就出现的异常指标。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>重点看价值损失的初始量级（会大 10–100 倍）与第一层权重的梯度范数。这个实验建议在别处设置好随机种子，方便对照。</div></details>
+      </li>
+      <li>构造一个"超时惩罚"实验：同一任务分别把超时处理为终止（bootstrap 归零）与截断（bootstrap 保留），比较最终策略的行为差异（是否拖延）。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>把超时当终止时，超时前的状态价值被压低，策略会更积极完成任务；如果任务本来奖励"尽快"，这反而合理；在"稳扎稳打"任务里则可能过激。关键是用行为数据说话。</div></details>
+      </li>
+      <li>把 epochs 从 5 升到 20，观察 KL 与 clip 触发率曲线（论文级图），定性解释"信任域被突破"的机制。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>epochs 大时同一批数据被反复拟合，ratio 的外推出界样本增多；KL 后几轮会显著抬升，clip 触发率超过 0.3 通常意味着"该停了"。</div></details>
+      </li>
+      <li>在 4096 并行环境与 64 并行环境两种配置下训练到同一步数，对比墙钟（考虑采样与更新各自耗时占比），并回答"PPO 为什么在仿真里墙钟最快"。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>64 环境时采样慢（GPU 物理利用不足）而更新没变，墙钟差距主要来自采样段。可以记录"每秒环境步数（SPS）"，这是 Isaac Lab 训练日志的第一指标。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>无模型 = 不学动力学直接优化策略/价值；三大件：策略梯度（按优势调概率）、价值基线（降方差）、步长限制（保稳定）。</li>
+      <li>GAE 用 δ<sub>t</sub> = r + γV(s′) − V(s) 与 γλ 递推，λ=0.95 时有效视界约 20 步；终止与截断必须区别对待。</li>
+      <li>PPO 裁剪目标 min(rA, clip(r,1±ε)A) 用悲观下界近似信任域，ε=0.2 是常见步长闸门；ratio 用 log 差再 exp 计算。</li>
+      <li>训练四段流水：向量化采样 → GAE 与优势归一化 → epochs×minibatch 更新 → 监控（KL、clip 率、回报、评估）。</li>
+      <li>观测归一化是第一优先级；并行环境数与 horizon 决定采样吞吐，4096×24 是足式/操作任务常用配置。</li>
+      <li>下一章进入数据受限的极端：<strong>离线强化学习</strong>，没有新交互、只有一份固定数据，你会看到分布偏移如何摧毁朴素算法以及保守主义的解药。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch056.html">← 第 056 章：实现基于模型的强化学习</a>
+    <a class="next" href="ch058.html">第 058 章：实现离线强化学习 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

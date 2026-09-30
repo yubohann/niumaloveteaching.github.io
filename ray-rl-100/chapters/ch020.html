@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第020章 RLlib自定义训练器 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · RLlib 核心接口与训练</span>
+    <span class="sep">/</span>
+    <span>第 020 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · RLlib 核心接口与训练</div>
+    <h1>第 020 章：RLlib自定义训练器</h1>
+    <p class="lead">配置能改参数，改不了流程。本章继承算法基类，在标准训练步之上叠加自定义指标、更新节奏与提前停止，把训练循环改成任务需要的形状。</p>
+    <ul class="meta">
+      <li>主题：RLlib 训练 / 训练循环扩展</li>
+      <li>关键机制：算法子类化、训练步重写、自定义指标、停止条件</li>
+      <li>预计学时：70 分钟</li>
+      <li>前置章节：第 019 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解算法类的生命周期：构建、循环、清理，以及训练步方法在其中的位置。</li>
+      <li>掌握子类化的最小改动原则：包装标准训练步、追加行为、保持返回结构兼容。</li>
+      <li>会在训练循环中记录自定义指标，并让指标进入统一的结果字典。</li>
+      <li>会实现自定义停止条件与更新节奏，把任务特有的收敛判据写进训练流程。</li>
+      <li>能诊断四类问题：破坏基类流程、指标键冲突、重活阻塞采样、类不可导入。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>前几章的扩展点都在配置与组件层面：换环境、换网络、调参数。有一类需求配置表达不了：训练流程本身要变。例如按回报平台期提前停止、每若干轮注入一次课程参数、在结果字典里记录任务专属的统计量。<strong>这些需求属于控制流，唯一干净的实现位置是算法对象本身</strong>。</p>
+    <p>RLlib 的算法类把训练循环拆成了可重写的钩子：标准训练步完成采样与学习，子类可以在其前后叠加逻辑。这套扩展方式的设计哲学是开放闭合：核心流程保持稳定，扩展点显式暴露。<strong>正确姿势是包装基类训练步</strong>：调用基类拿到标准结果，再追加自定义行为，让评估、检查点、指标上报这些既有设施全部保留；重写内部流程会让这些设施失效。</p>
+    <p>本章交付一个可运行的子类：累积回报窗口、按平台期停止、记录自定义指标；并给出注册到搜索层的接线方式，为第 030 章与第 056 章的联合训练铺路。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 算法对象的三段生命周期</h3>
+    <table>
+      <tr><th>阶段</th><th>时机</th><th>子类可做的事</th></tr>
+      <tr><td>构建</td><td>配置校验后、训练前</td><td>建立自定义状态（窗口容器、统计量、辅助组件）</td></tr>
+      <tr><td>循环</td><td>每次训练调用一轮</td><td>包装训练步：跑标准流程、追加自定义逻辑、扩展结果</td></tr>
+      <tr><td>清理</td><td>对象销毁或显式释放</td><td>关闭自定义资源、冲刷未落盘的数据</td></tr>
+    </table>
+    <p>三段中真正的扩展重镇是循环阶段。<strong>标准训练步已经封装了采样、学习、评估、指标聚合的完整序列</strong>，子类的正确介入方式是：先调用基类拿到标准结果，再做增量动作。任何试图复制粘贴基类内部逻辑的做法都会在版本升级时付出代价，那些内部步骤的签名与顺序都属于易变实现细节。</p>
+
+    <h3>2. 训练步的输入输出契约</h3>
+    <p>训练步方法没有显式输入，输出是一个结果字典。契约有三条：</p>
+    <ol>
+      <li><strong>必含标准键</strong>：进度、时间、回报等既有键必须原样保留，监控与检查点流程依赖它们。</li>
+      <li><strong>允许新增键</strong>：自定义指标以新增键的形式加入，键名要避开标准命名空间，防止覆盖引发连锁误解。</li>
+      <li><strong>不得中断序列</strong>：训练步必须完成基类流程，中途跳过评估或学习的"优化"会破坏各设施的假设。</li>
+    </ol>
+    <div class="formula">
+      result = super().training_step()  然后  result[自定义键] = 自定义值
+      <span class="note">包装模式：标准结果不加改动地流过，自定义信息搭车传递</span>
+    </div>
+    <p>建议给自定义键统一前缀（例如以实验名缩写开头），让"标准指标与自定义指标"在日志里一眼可辨。<strong>键冲突比缺键更危险</strong>：用自定义值覆盖标准回报键，会污染后续所有分析，而且表面上工作正常。</p>
+
+    <h3>3. 停止条件：从轮数到任务判据</h3>
+    <p>固定轮数停止简单可靠，但资源利用率依赖人工估计。任务级停止条件更经济：</p>
+    <ul>
+      <li><strong>目标回报达标</strong>：评估回报超过阈值即停，适合有明确性能线的任务。</li>
+      <li><strong>平台期判据</strong>：近 K 次评估的改进量低于阈值即停，适合未知可达水平的任务。</li>
+      <li><strong>预算保护</strong>：无论判据如何，都设置最大轮数或最大步数兜底，防止判据永不触发。</li>
+    </ul>
+    <p>平台期判据的参数要用噪声量级校准：改进阈值应大于评估噪声（第 018 章的平方根公式给出参考），否则策略的正常波动会触发误停；K 太小同样会因单次抖动误判。<strong>停止判据先离线验证再接入训练</strong>：把历史评估曲线拿来试判据，确认不误停也不迟停。</p>
+
+    <h3>4. 结构位置：子类与配套设施的关系</h3>
+    <p>子类化的一个常见误解是"自定义训练器要接管一切"。实际关系是：</p>
+    <ul>
+      <li><strong>子类管流程</strong>：循环内的控制逻辑（指标、停止、节奏）。</li>
+      <li><strong>配置管参数</strong>：环境、采样、训练组的参数照旧走配置对象，子类不重复发明参数体系。</li>
+      <li><strong>回调管反应</strong>：对训练事件（轮次开始结束、检查点保存）的旁路逻辑放进回调机制（第 025 章），不挤占训练步。</li>
+    </ul>
+    <p><strong>训练步内只放轻量逻辑</strong>：它是每轮都执行的同步路径，任何重计算或输入输出都会直接拖慢采样节奏。重型自定义反馈（重新生成课程、重新采样数据集）应以异步方式在后台推进，训练步只读取其就绪结果。</p>
+
+    <h3>5. 平台期判据的噪声标定</h3>
+    <p>片段 1 的判据是"窗口极差不超过阈值"，极差是极值统计量，对噪声的放大比均值更猛。对 K 个独立同分布的正态评估点，极差期望约为 3.08σ（σ 为单次评估的回报标准差）：σ = 5、K = 10 时约 15.4。按此标定三档阈值的触发概率：δ = 1.0 时低于万分之一（真实平台期也几乎不触发，训练只能靠轮数兜底退出），δ = 10 时约 7.7%，δ = 15 时约 48.8%。</p>
+    <div class="formula">
+      E[窗口极差] ≈ 3.08σ（K = 10 的正态样本）
+      <span class="note">阈值远小于噪声极差时判据永不触发，接近噪声极差时每次检查的触发概率约五成；阈值取值必须与噪声量级挂钩，不能沿用单点噪声的倍数</span>
+    </div>
+    <p>另一侧的误差是分辨力：窗口内真实改进的总量约为 K × μ（μ 为每次评估的改进量），只有当它与噪声极差可比时，判据才能把"缓慢改进"与"平台"分开。σ = 5、K = 10 时，单次改进量低于约 1.5 的任务（窗口累计 15 以下）与真实平台期在统计上难以区分。<strong>两个方向的失效因此对称：阈值偏小使平台永不触发，阈值偏大使缓慢改进被误判为停滞。</strong>校准顺序是先估 σ（取评估结果的标准差，或按第 026 章的平方根公式用回合数换算），再让阈值落在噪声极差与"值得继续训练的最小改进量"之间。</p>
+    <p>降低噪声是比调阈值更根本的杠杆：评估回合数翻四倍可把 σ 减半，噪声极差同步减半；σ 从 5 降到 2.5 后，上面 1.5 的分辨力门槛随之降到 0.75。校准示例：评估回合回报标准差 50、每次评估 100 个回合时 σ = 5，σ 减半需要 400 个回合；预算允许时优先加回合数，预算受限时再放宽阈值并接受更慢的响应。四种停止判据的对照如下：</p>
+    <table>
+      <tr><th>判据</th><th>统计量</th><th>噪声敏感度</th><th>响应速度</th><th>适用情形</th></tr>
+      <tr><td>固定轮数</td><td>无（计数）</td><td>无</td><td>固定</td><td>预算明确的快速对照</td></tr>
+      <tr><td>目标回报达标</td><td>单点均值</td><td>高，单点被噪声左右</td><td>快</td><td>目标明确、阈值可定的任务</td></tr>
+      <tr><td>窗口极差</td><td>max 减 min</td><td>最高，极值统计放大噪声</td><td>慢一拍</td><td>上限未知且评估噪声小的任务</td></tr>
+      <tr><td>窗口均值差</td><td>前后窗口均值之差</td><td>低，均值抵消噪声</td><td>慢两拍</td><td>通用选择，推荐默认</td></tr>
+    </table>
+    <p>读表可得判据选择原则：噪声大时优先用均值类统计量，极差类判据留给评估抖动本来就小的场景；目标明确的任务直接改用达标停止，未知上限的任务用"均值差加轮数兜底"。<strong>无论选哪种判据，都先离线跑一遍历史曲线验证不误停、不迟停，再接入训练循环。</strong></p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>实现自定义训练器的步骤：</p>
+    <ol>
+      <li><strong>需求定位</strong>：确认需求属于控制流；参数层面的需求保持配置解决。</li>
+      <li><strong>确定扩展点</strong>：需要改循环的进训练步；只需响应事件的进回调；需要改损失的在策略层，不在训练器层。</li>
+      <li><strong>写子类</strong>：继承算法基类与配套配置类；构建阶段初始化自定义状态；训练步用包装模式。</li>
+      <li><strong>指标设计</strong>：自定义键加统一前缀；指标口径写进注释与实验文档。</li>
+      <li><strong>停止条件</strong>：实现判据函数，用历史曲线离线校准阈值，再接入循环。</li>
+      <li><strong>注册与联调</strong>：驱动脚本直接实例化；需要搜索层调度时注册为可训练对象。</li>
+    </ol>
+    <table>
+      <tr><th>参数</th><th>典型取值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>窗口长度 K</td><td>5–20 次评估</td><td>平台期判据样本</td><td>评估间隔与噪声水平的折中</td></tr>
+      <tr><td>改进阈值</td><td>评估噪声的 2–3 倍</td><td>判定"无改进"</td><td>由平方根公式估噪声后取安全系数</td></tr>
+      <tr><td>最大轮数</td><td>按预算设定</td><td>兜底停止</td><td>历史同类任务的收敛轮数乘冗余系数</td></tr>
+      <tr><td>指标前缀</td><td>任务缩写加下划线</td><td>命名隔离</td><td>避免与标准键冲突</td></tr>
+    </table>
+    <div class="box tip">
+      <span class="box-title">与上一章的差异点</span>
+      <p>第 019 章替换网络时"流程不变、部件变"；本章"部件不变、流程变"。两个方向的扩展互不冲突：自定义模型配自定义训练器时，模型经配置接线、流程经子类扩展，各自走各自的通道。</p>
+    </div>
+    <p><strong>判据接入前先做离线预演：</strong>构造一条合成评估曲线，前 30 次评估每次改进 2.0，之后 20 次完全持平，用窗口 10、阈值 1.0 回放。改进段的窗口极差约 18，判据不触发；进入平台段后，窗口仍保留若干改进样本，极差随改进样本滑出而收缩，约在平台开始后的第 10 次评估（即全程第 40 次）降为零并触发停止。预演给出的结论有两条：判据对平台的识别存在约一个窗口的固有延迟，延迟长度等于窗口填满所需次数；阈值与改进速率的组合决定"迟停"的严重程度，改进速率越接近阈值，迟停越长。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>以下片段采用 Ray 2.x 时期的通用写法；接口随版本演进，以对应版本官方文档为准。</p>
+    <p><strong>片段 1：算法子类与包装式训练步</strong></p>
+    <pre class="code"><code>from collections import deque
+from ray.rllib.algorithms.algorithm import Algorithm
+from ray.rllib.algorithms.algorithm_config import AlgorithmConfig
+class PlateauStopConfig(AlgorithmConfig):
+    """配套配置类：声明自定义训练器需要的参数。"""
+    def __init__(self, algo_class=None):
+        super().__init__(algo_class=algo_class or PlateauStopAlgorithm)
+        self.window = 10          # 平台期窗口：最近 10 次评估
+        self.min_delta = 1.0      # 改进阈值：低于它视为无进展
+        self.max_iterations = 50  # 兜底轮数：防止判据永不触发
+
+    def plateau(self, window=10, min_delta=1.0, max_iterations=50):
+        self.window, self.min_delta, self.max_iterations = (
+            window, min_delta, max_iterations)
+        return self
+
+class PlateauStopAlgorithm(Algorithm):
+    """在标准训练步之上叠加窗口统计与平台期判据。"""
+    @classmethod
+    def get_default_config(cls):
+        return PlateauStopConfig()
+
+    def setup(self, config):
+        super().setup(config)
+        self._eval_history = deque(maxlen=config.window)   # 构建阶段：状态容器
+        self._stop_reason = None
+    def training_step(self):
+        result = super().training_step()          # 先跑标准流程，不加改动
+        eval_mean = (result.get("evaluation", {})
+                     .get("env_runners", {}).get("episode_return_mean"))
+        if eval_mean is not None:                 # 只在评估轮更新窗口
+            self._eval_history.append(float(eval_mean))
+        if len(self._eval_history) == self._eval_history.maxlen:
+            spread = max(self._eval_history) - min(self._eval_history)
+            if spread &lt;= self.config.min_delta:    # 判据：窗口内改进不足
+                self._stop_reason = "plateau"
+        # 自定义指标搭车返回：键名带前缀，避免与标准指标冲突
+        result["ex_plateau_eval_mean"] = (None if not self._eval_history
+                                          else float(self._eval_history[-1]))
+        return result</code></pre>
+    <p>解读：三个设计点。<strong>其一，配置类与算法类配对</strong>：自定义参数声明在配置类上，使用方式与标准参数一致，校验与序列化机制自动覆盖。<strong>其二，包装式训练步</strong>：标准结果先完整产出，窗口更新只是旁路计算，不触碰标准键；评估返回空值的轮次被跳过，窗口只收有效样本。<strong>其三，判据与停止执行分离</strong>：这里只记录停止原因，真正的中止交给驱动循环（片段 2），让训练步保持轻量与可测。窗口状态在构建阶段初始化，恢复训练时随检查点机制一并处置，逻辑上没有隐藏状态。</p>
+
+    <p><strong>片段 2：驱动循环消费判据并停止</strong></p>
+    <pre class="code"><code>from ray.tune.registry import register_env
+from rl_lab.envs import LineTrackerEnv
+import ray
+
+ray.init(num_cpus=12, ignore_reinit_error=True)
+register_env("line_tracker", lambda cfg: LineTrackerEnv(cfg))
+
+config = (PlateauStopConfig()
+          .environment(env="line_tracker",
+                       env_config={"max_steps": 200, "goal": 5.0})
+          .env_runners(num_env_runners=4)
+          .training(train_batch_size=8192, minibatch_size=1024,
+                    num_epochs=6, lr=3e-4)
+          .evaluation(evaluation_interval=5, evaluation_duration=20,
+                      evaluation_num_env_runners=2)
+          .plateau(window=10, min_delta=1.0, max_iterations=50))   # 自定义段落
+
+algo = config.build()
+
+for it in range(config.max_iterations):        # 轮数兜底写在循环边界
+    result = algo.train()
+    reason = getattr(algo, "_stop_reason", None)
+    if reason == "plateau":
+        print(f"第 {it} 轮触发平台期停止: {reason}")
+        break
+else:
+    print("达到最大轮数，正常退出")
+ckpt = algo.save("/data/experiments/plateau/stop_ckpt")
+print("停止时的检查点:", ckpt)
+algo.stop()</code></pre>
+    <p>解读：停止逻辑放在驱动循环有两层考虑。<strong>判据可观测、可拦截</strong>：驱动进程先打印原因、保存检查点、再清理退出，整个过程可审计；若把停止硬编码进训练步，中断后的收尾动作没有插入点。<code>for-else</code> 结构同时表达两种退出路径：平台期与轮数兜底，日志里能区分"任务完成"与"预算用尽"。停止时保存检查点把"在哪停的"固化成可恢复状态，这是任务级停止正确接入训练体系的标准收尾。</p>
+
+    <p><strong>片段 3：注册到搜索层的接线</strong></p>
+    <pre class="code"><code>import ray
+from ray import tune
+from ray.tune.registry import register_env
+from rl_lab.envs import LineTrackerEnv
+
+ray.init(num_cpus=12, ignore_reinit_error=True)
+register_env("line_tracker", lambda cfg: LineTrackerEnv(cfg))
+
+def trainable(config):
+    """搜索层入口：每组超参一个试验，内部使用自定义训练器。"""
+    algo_config = (PlateauStopConfig()
+                   .environment(env="line_tracker",
+                                env_config={"max_steps": 200, "goal": 5.0})
+                   .env_runners(num_env_runners=2)      # 试验内并行度压低
+                   .training(train_batch_size=8192, lr=config["lr"],
+                             minibatch_size=1024, num_epochs=6)
+                   .evaluation(evaluation_interval=5, evaluation_duration=20)
+                   .plateau(window=8, min_delta=config["min_delta"],
+                            max_iterations=40))
+    algo = algo_config.build()
+    for it in range(algo_config.max_iterations):
+        result = algo.train()
+        eval_mean = (result.get("evaluation", {})
+                     .get("env_runners", {})
+                     .get("episode_return_mean"))
+        tune.report({"eval_return": eval_mean if eval_mean else -1e9},
+                    custom_metric=result.get("ex_plateau_eval_mean"))
+        if getattr(algo, "_stop_reason", None) == "plateau":
+            break
+    algo.stop()
+
+tuner = tune.Tuner(
+    trainable,
+    param_space={"lr": tune.grid_search([1e-4, 3e-4, 1e-3]),
+                 "min_delta": tune.grid_search([0.5, 1.0, 2.0])},   # 9 组
+    run_config=tune.RunConfig(storage_path="/data/tune_runs/plateau"),
+)
+results = tuner.fit()
+best = results.get_best_result(metric="eval_return", mode="max")
+print("最优试验:", best.config)
+</code></pre>
+    <p>解读：搜索层与自定义训练器的接线有三条纪律。<strong>其一，试验内并行度压低</strong>：搜索的并行单元是试验，若每个试验再开满采样副本，并发试验数会被资源饱和压到个位数，探索效率反而下降；试验内用 2 个副本、试验间并行，是常见的折中。<strong>其二，自定义指标一并上报</strong>：平台期窗口均值作为自定义指标进入试验记录，事后可以分析"哪组参数更早进入平台期"，这类信息对算法研究比最优值本身更有价值。<strong>其三，停止逻辑复用</strong>：试验内部同样消费平台期判据主动退出，把算力留给更有希望的试验；判据阈值本身也可以进入搜索空间（本例中的两项参数联合扫描），观察判据灵敏度对搜索效率的影响。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>不调用基类训练步</strong>：子类重写训练步时忘记调用基类，采样与学习全部缺失，结果字典里只有自定义键。修复：坚持包装模式，自定义逻辑一律写在基类调用之后。</li>
+      <li><strong>覆盖标准指标键</strong>：自定义统计量使用与标准回报相同的键名，监控面板被污染且难以察觉。修复：自定义键加统一前缀，接入前打印结果字典的键清单核对。</li>
+      <li><strong>训练步内塞重活</strong>：在每轮同步路径上拉取数据、重建课程或做完整评估，采样节奏被拖慢。症状是开启自定义逻辑后吞吐下降明显。修复：重活异步化或移入回调（第 025 章），训练步只读就绪结果。</li>
+      <li><strong>判据阈值未校准</strong>：平台期阈值小于评估噪声，策略正常波动被误判为停滞，训练过早停止。修复：用噪声公式与历史曲线离线校准，阈值取噪声的 2 至 3 倍。</li>
+      <li><strong>自定义类不可导入</strong>：子类或配置类定义在不可被副本导入的位置（脚本顶层临时定义），分布式执行时报导入失败。修复：把自定义类放进随作业分发的模块，所有入口统一导入。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把片段 1 的窗口从 10 缩到 3 与扩到 20，用同一训练运行对比停止轮数与"误停"情况，解释窗口长度与判据稳定性的关系。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>窗口过短时单次抖动即可触发判据，停止偏早；窗口拉长后判据更稳但响应变慢。稳定性与响应速度的对价与噪声量级直接相关。</div></details>
+      </li>
+      <li>预测题：把 <code>min_delta</code> 从 1.0 调到 5.0，停止轮数与最终评估回报如何变化？对"任务上限未知"与"目标明确"两类场景分别给出取值建议。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>阈值放大后判据更宽松，训练更久、回报略升但收益递减；未知上限的任务用小阈值加轮数兜底，目标明确的任务改用达标停止更直接。</div></details>
+      </li>
+      <li>设计题：为训练器增加"梯度范数监控"：给出数据来源（学习器输出）、记录方式（滑动平均与最大值）、异常阈值与告警动作，说明它放在训练步的理由，并对照回调方案给出取舍。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>梯度范数每轮产出且轻量，适合训练步内做滑动统计；突发事件（范数爆涨）需要与当轮结果同页记录以便关联分析，回调适合做低频的保存与外部通知。</div></details>
+      </li>
+      <li>分析：某自定义训练器在单机运行正常，迁移到集群后启动即报模块导入错误。列出两种可能原因与验证方法。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>原因一：类定义在仅存在于驱动的脚本里，工作节点无法导入；原因二：依赖包未随运行时环境分发。验证：把类移入包并核对各节点可导入性，或检查运行时环境的依赖声明。</div></details>
+      </li>
+      <li>推导：设评估噪声标准差为 σ、平台期窗口 K、阈值 δ。在"真实无改进"假设下，写出窗口内极差超过 δ 的近似概率表达式，并讨论 K 与 δ 的联合取值如何控制误停率。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>极差超过 δ 的概率随 K 增大而上升、随 δ/σ 增大而下降，两部分近似独立。误停率控制参考：先按平方根公式定 σ 估计，再取 δ 为 2–3 倍 σ，最后用 K 平衡响应速度。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>算法对象三段生命周期：构建阶段建状态、循环阶段包装训练步、清理阶段收资源。</li>
+      <li>训练步扩展遵守包装模式：基类结果原样流过，自定义信息以带前缀的新键搭车返回。</li>
+      <li>任务级停止条件用噪声校准阈值并设轮数兜底；<strong>停止动作放在驱动循环，先记录原因再收尾</strong>。</li>
+      <li>训练步只放轻量同步逻辑，重活交给异步流程或回调；自定义类放进可分发模块。</li>
+      <li>第二篇至此收官：环境、训练、配置、评估、模型、训练器六个扩展点全部打开。<strong>下一章继续深化环境方向：自定义环境与奖励设计</strong>。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch019.html">← 第 019 章：RLlib自定义模型</a>
+    <a class="next" href="ch021.html">第 021 章：RLlib自定义环境与奖励设计 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

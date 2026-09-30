@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第048章 多机器人协同路径规划 | 多机器人协同学习课程 · ROS2 通信与系统集成</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第三篇 · 协同控制与任务协同</span>
+    <span class="sep">/</span>
+    <span>第 048 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第三篇 · 协同控制与任务协同</div>
+    <h1>第 048 章：多机器人协同路径规划</h1>
+    <p class="lead">平等的规划者之间如何不打架：共享一张时空预约表，用协同 A* 顺序规划，再用速度协调把"必须绕行"变成"先后通过"，配合全局同步的计划周期消除振荡。</p>
+    <ul class="meta">
+      <li>主题：协同规划 / 协商式架构</li>
+      <li>关键机制：时空预约表、协同 A*、速度协调、计划周期（epoch）同步</li>
+      <li>预计学时：65 分钟</li>
+      <li>前置章节：第 047 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解"时空预约"思想：把路径冲突转化为 (格, 时间) 资源的占用冲突，维度升一格、问题大幅简化。</li>
+      <li>掌握协同 A*（Cooperative A*）的规划流程与预约表结构，能说出它与 CBS、纯分布式的异同。</li>
+      <li>会设计速度协调策略：同一走廊上的时间窗错开计算，以及"速度下限触发等待"的回退逻辑。</li>
+      <li>理解计划周期（epoch）同步的必要性，能设计去中心的节拍机制并处理丢拍与迟到。</li>
+      <li>能综合 046–048 三章做出架构选型：最优性、通信量、确定性、可扩展性的四方权衡。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>047 章用"让行"处理冲突，但让行是事后补救：两台机器人都先规划出会冲突的路径，接触点检测后再谈判谁让。绕行成本高、暂停时间长、路径质量随场景波动。能不能在规划阶段就让后规划者"看见"先规划者的时间安排？可以，把每条路径从"一串格子"升级为"一串 (格, 时间) 对"，共享给全队；后规划者在搜索时直接避开已被占用的时空格。这就是协同 A*（Cooperative A*，CA*）。</p>
+    <p>它比集中式 CBS 简单得多（不需要高层冲突树与约束分裂），比 047 的纯分布式聪明得多（后规划者在规划阶段就主动绕开时间占用，把谈判提前到出发之前）。代价是"顺序敏感 + 不完备"两个老问题需要通过纪律化的执行顺序与同步节拍来控制，本章的名字就叫"协同路径规划"：平等节点、共享资源、统一节拍。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 时空预约：升一维，换来线性可分</h3>
+    <p>几何路径冲突的根源是"同一时刻想占同一个地方"。给每个已发布的路径打上时间戳序列，形成预约：<strong>(x, y, t) → robot_id</strong>。后规划者搜索时，任何被预约的时空格都不可进入；"等一拍再走"表示为一个 (0, 0) 等待动作，也消耗一个时空格。一张表格、一个查询，就把 046 章里昂贵的"冲突树"替代掉了。代价是：预约表只覆盖"已知的队友计划"，搜索窗口（20 s）之外与未知队友都不在表内，完备性也因此不成立。</p>
+    <div class="formula">
+      预约键：(x, y, k)，k = Δt / dt，Δt = 0.25 s（时间分辨率）
+      <span class="note">20 s 窗口 → 80 个时间片；10 m × 10 m / 0.1 m → 100×100 格；单机预约行约数百个键</span>
+    </div>
+
+    <h3>2. 协同 A* 的执行顺序：真正的"协议"所在</h3>
+    <p>CA* 的算法本体是普通 A* 加了时空约束（下一节代码见），真正需要设计的是<strong>"谁先规划"</strong>：</p>
+    <ul>
+      <li>先规划者拥有"路权"，其路径在预约表中是既成事实；后规划者绕行或等待。</li>
+      <li>顺序敏感：同一场景换个顺序解的质量可能差 30%。</li>
+      <li>公平性：固定顺序 = 固定既得利益者。工程做法是<strong>每个计划周期内轮转</strong>：按"等待时长 + 任务紧迫度"排序，本周期的规划顺序写进周期公告，全员一致执行。</li>
+    </ul>
+    <p>这个"顺序"本身必须全网一致，否则两台机器人同时以为自己是第 3 个，会出现预约竞争。为此引入计划周期（epoch）：每 1 s 一次全局节拍，节拍内顺序确定、禁止重排，所有人在同一节拍里用同一顺序看同一张表规划，把分布式系统里最难的"共识"问题收敛为"节拍对齐"问题。</p>
+
+    <h3>3. 预约表的去中心化实现</h3>
+    <p>预约表不需要放在中央服务器上。用发布-订阅实现"分布式共享内存"：每台机器人把自己路径转换成的预约行发布到 <code>/fleet/reservation/robotN</code>（1 Hz 或每个 epoch 一次，Reliable + Transient-local），各机订阅所有行并在本地合并。合并是覆盖式的（同一机器人只保留其最新 epoch 的行），新加入的机器人靠 Transient-local 恢复全表。三处工程细节：</p>
+    <ul>
+      <li><strong>行带 epoch 与版本</strong>：合并时同机器人只保留最高 epoch 的行，杜绝旧行回潮。</li>
+      <li><strong>缺行容忍</strong>：合并前检查每个机器人是否都有当前 epoch 的行；缺者的位置按"最后已知速度外推 + 保守膨胀"处理，旁路它的预约。</li>
+      <li><strong>表规模控制</strong>：每行路径只保留未来 20 s、0.25 s 分辨率（最多 80 个点），路径点抽稀后可压到几十字节级，10 台机器人合计不到 10 kB。</li>
+    </ul>
+
+    <h3>4. 速度协调：用时间代替空间</h3>
+    <p>时空预约还有一个"软用法"：当两条路径共享一段走廊（几何必然重叠）时，完全绕开可能无路可走，而"错开时间通过"往往只需微调速度。做法是先把两条路径投影到共享段，得到各自的通过时间窗 [t<sub>0</sub>, t<sub>1</sub>]；若两窗重叠，则让其中一台（约定：优先级低者）按公式降速，把它的时间窗往后推 Δt：</p>
+    <div class="formula">
+      v' = d / (d / v<sub>nom</sub> + Δt)，其中 Δt = (t<sub>gap,required</sub> − t<sub>gap,current</sub>)
+      <span class="note">若算出的 v' 低于速度下限（0.15 m/s），停止降速，改用"接触点前等待"策略</span>
+    </div>
+    <p>"等待"与"降速"的关系值得体会：等待是速度为零的极端降速；降速是更平滑、不断流的等待。能用降速解决的，不要用等待；降速到低于阈值的，果断等待，否则会制造持续 0.1 m/s 的"龟速跟车"，全队节奏被拖垮。</p>
+
+    <h3>5. 三章选型：一张对照表</h3>
+    <p>046 最优但集中、047 灵活但保守、048 居两者之间：</p>
+    <table>
+      <tr><th>维度</th><th>046 集中式 CBS</th><th>047 分布式</th><th>048 协同 A*</th></tr>
+      <tr><td>信息摆放</td><td>中央集合全局地图与状态</td><td>各机局部地图 + 邻居路径</td><td>各机全图 + 共享预约表</td></tr>
+      <tr><td>解的质量</td><td>最优（给定代价）</td><td>优先级次序可行解</td><td>预约次序可行解（接近最优）</td></tr>
+      <tr><td>冲突消解时机</td><td>规划时（全局）</td><td>执行时（让行）</td><td>规划时（时空预约）</td></tr>
+      <tr><td>通信量</td><td>地图 + 状态汇聚</td><td>计划广播数 kB/s/人</td><td>预约行约 1 kB/次/人</td></tr>
+      <tr><td>典型规模</td><td>N ≤ 10–15</td><td>N 更大仍可用</td><td>N ≤ 30</td></tr>
+      <tr><td>关键纪律</td><td>版本号 + 降级</td><td>优先级公平 + 退避点</td><td>全局节拍 + 顺序轮转</td></tr>
+    </table>
+
+    <h3>6. 数值算例：从状态空间到速度下限</h3>
+    <p><strong>搜索规模账</strong>：10 m × 10 m、0.1 m 分辨率是 100 × 100 = 10<sup>4</sup> 个格子；时空 A* 把状态扩成 (x, y, k)，20 s 窗口、0.25 s 分辨率共 80 个时间片，状态空间约 8×10<sup>5</sup> 个，比几何 A* 放大 80 倍。窗口缩到 8 s（32 片）后放大倍数降到 32，计算量回到舒适区，代价是超过 8 s 才能到达的迂回解被截断。两个参数的取舍是"算力预算换可达性"：先按任务最长绕行时间定窗口，再按 CPU 富余挑时间分辨率。</p>
+    <p><strong>预约表规模账</strong>：每台机器人一行保留未来 20 s、0.25 s 一点，最多 80 个键；键用 3 个小整数（x, y, k）编码约 6 字节，10 台合计不到 5 kB，加上消息头与来源标记，一次全表广播在 10 kB 以内，1 Hz 或每拍一轮都毫无压力。这解释了为什么"集中式昂贵通信"的结论在 048 体系里不成立：贵的是第 046 章的全局地图，不是时空预约。</p>
+    <p><strong>速度协调的失效边界</strong>：按公式 v′ = d / (d/v<sub>nom</sub> + Δt)，目标错开量 Δt = 2 s 时，共享段越短越吃力。共享段 3 m、当前错开 0.4 s 时 Δt = 1.6 s，v′ = 3/(6 + 1.6) = 0.395 m/s（可接受）；共享段 0.3 m、当前错开 0 s 时 v′ = 0.3/(0.6 + 2) = 0.115 m/s，低于 0.15 m/s 的下限，必须改用等待。把 v′ = 0.15、错开差为零代回公式反解，共享段需要长于约 0.43 m 降速方案才可行。<strong>结论是"时间协调偏好长共享段"</strong>：长走廊用降速最平滑，零点几米的交叉口段用排队等待更干脆。</p>
+    <p><strong>节拍丢拍的成本</strong>：epoch 1 Hz、丢 3 拍才降级为让行模式，意味着降级判定需要 3 s；这 3 s 内全队都在按各自"猜"的顺序规划，预约冲突率会明显上升。缓解手段是把 epoch 消息按 3 Hz 重复（三条里收到一条即可对齐），丢拍率从链路 10% 降到 1% 以下，而带宽只增加几百字节每秒，这笔买卖划算。</p>
+    <p>预约表还埋着一个版本边界：收到"更旧 epoch 的行"必须直接丢弃，若实现成无差别覆盖，会造成旧行回潮、预约凭空消失；同时注意 epoch 回滚场景（主节点重启后计数从 0 开始），需要用带启动号的 (boot_id, seq) 二元组代替裸序号，否则全队会因"epoch 变小"集体拒绝新行，表现为系统整体僵住。重启语义是所有"单调计数"协议的通用坑，第 046 章的版本号设计同样适用。</p>
+    <p>再把三个方案的典型成本数一遍：CA* 顺序规划最坏要等前 N−1 台发布完才能定案，流水线化后每台的等待降到"前一位的一次低层搜索"（毫秒级）；CBS 最坏指数、实践中高层节点几十到几百；047 的让行把冲突推给执行层，规划成本最低但执行层延迟最长。场景是"20 台、结构化仓库、高通过率"时，048 居中：既不需要中央地图汇聚，也不把冲突留到路上，代价是节拍与顺序的纪律必须做扎实。</p>
+    <p>还有一处容易低估的实现成本：预约查询默认只查顶点占用，而"同窗换位"的边冲突需要额外比较双方相邻两拍的格子。顶点采样不漏检的条件是采样间隔小于同格时间窗 c/(2v)（c 为格距、v 为速度），0.1 m 格距、0.25 s 采样对应 v 必须低于 0.2 m/s，而本课速度上限是 0.5–1.0 m/s，显然超出，所以边冲突检查属于正确性要求，必须实现。参数联动规则可以写成一行：<strong>速度上限 × 时间分辨率不得超过半个格距时，必须打开边冲突检查或加密格距</strong>，两者任选其一，不能只调单一参数。把这条规则放进配置校验：启动时若速度上限与时间分辨率不满足约束则拒绝进入规划模式，把参数不一致挡在运行之前，联调阶段能省下大量"为什么规划器偶尔漏检"的排查时间，也避免了把参数错误带入真机测试。校验失败时应把两个参数的当前值与允许区间一并打印，便于现场一眼定位问题。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <ol>
+      <li><strong>全局节拍</strong>：串口最稳的机器人（或心跳最健康者，按最小 robot_id 选举）每 1 s 广播 <code>/fleet/epoch</code>（序号 + 规划顺序列表）。其余机器人按此对齐本地规划周期；丢拍 3 次进入"无节拍模式"（退化为 047 的让行规则）。</li>
+      <li><strong>规划流程</strong>：每个 epoch，全员按公告顺序依次规划：第 i 位用"当前合并表 + 自己前面的规划者已发布的最新行"做 CA*；规划完成后立即发布自己的预约行。为控制时延，规划次序流水线化：后位者在等待时用旧表预规划，收到前位者新行后做一次增量修正。</li>
+      <li><strong>预约表消息</strong>：<code>ReservationRow</code>（<code>robot_id</code>、<code>epoch</code>、<code>cells[](x, y, k)</code>、<code>stamp</code>），Reliable + Transient-local，1 kB 量级。</li>
+      <li><strong>共享走廊的软协调</strong>：规划器检测"无法完全避开但时间可错开"的段，返回速度调整建议；执行层（049 章）按建议生成速度曲线。</li>
+      <li><strong>降级链</strong>：CA* 无解 → 时间窗协调 → 等待 → 让行（047 规则）→ 请求人工。每一级都记录触发原因，形成可观测的降级统计。</li>
+      <li><strong>验收</strong>：20 台机器人、12 m × 12 m 网格仓库、80 个并发任务：任务完成率 100%；平均完成时间与集中式基线差距小于 15%；节拍丢拍率小于 1%；无碰撞、无持续 20 s 以上停滞。</li>
+    </ol>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：预约表的发布、合并与查询</strong></p>
+    <pre class="code"><code>class ReservationTable:
+    """分布式预约表：各机发布自己的行，本地合并为统一视图。"""
+    def __init__(self, dt=0.25):
+        self.dt = dt
+        self.cells = {}                      # (x, y, k) -&gt; robot_id
+        self.rows_epoch = {}                 # robot_id -&gt; 已合并的行 epoch
+
+    def make_row(self, robot_id, epoch, states):
+        """把自己的时空路径转成本机预约行：k 为 0.25 s 时间片序号。"""
+        cells = [(x, y, k) for (x, y, k) in states]
+        return {"robot_id": robot_id, "epoch": epoch, "cells": cells}
+
+    def merge(self, rows):
+        """覆盖式合并：同一机器人只保留最高 epoch 的行。"""
+        conflicts = []
+        keep = {}
+        for r in rows:
+            rid = r["robot_id"]
+            if r["epoch"] &gt;= self.rows_epoch.get(rid, -1):
+                keep[rid] = r                    # 新行替换旧行
+        self.cells.clear()
+        for rid, r in keep.items():
+            self.rows_epoch[rid] = r["epoch"]
+            for (x, y, k) in r["cells"]:
+                key = (x, y, k)
+                other = self.cells.get(key)
+                if other is not None and other != rid:
+                    conflicts.append((key, other, rid))  # 冲突留给降级链
+                self.cells[key] = rid
+        return conflicts
+
+    def occupied(self, x, y, t):
+        return (x, y, int(round(t / self.dt))) in self.cells</code></pre>
+    <p>解读：<code>merge</code> 的两个设计决定支撑了整个分布式一致性：<strong>按 epoch 覆盖</strong>，让新行天然淘汰旧行，不需要复杂的差量同步；<strong>冲突只上报、不抛错</strong>，因为分布式下两行的矛盾是"信息时序"问题（有人还在用上一拍的表），不是死锁，把冲突交给降级链（本拍跳过冲突格、下拍自然消解）比中断规划正确得多。<code>occupied</code> 是热路径，用 O(1) 映射表查询，保证 A* 每次扩展的常数开销最小，时空 A* 的节点数比几何 A* 大一个数量级，查询效率直接决定单机算力占用。</p>
+
+    <p><strong>片段 2：协同 A* ，把等待也当作一个动作</strong></p>
+    <pre class="code"><code>import heapq
+
+def ca_star(occ, start, goal, table, dt=0.25, horizon=20.0):
+    """时空协同 A*：(x, y, k) 状态，动作含等待，每步代价 1（时间片）。"""
+    t_max = int(horizon / dt)
+    open_set = [(0.0, start[0], start[1], 0)]
+    g = {(start[0], start[1], 0): 0.0}
+    parent = {}
+    while open_set:
+        _, x, y, k = heapq.heappop(open_set)
+        if (x, y) == goal:
+            states = [(x, y, k)]             # 回溯时空路径
+            cur = (x, y, k)
+            while cur in parent:
+                cur = parent[cur]
+                states.append(cur)
+            return states[::-1]
+        if k + 1 &gt; t_max:
+            continue                          # 超出窗口：该分支剪掉
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1), (0, 0)):
+            nx, ny = x + dx, y + dy
+            if not occ.is_free((nx, ny)):
+                continue
+            if table.occupied(nx, ny, (k + 1) * dt):
+                continue                      # 时空格被队友预约：绕开或等待
+            state = (nx, ny, k + 1)
+            ng = g[(x, y, k)] + 1.0           # 移动与等待同样消耗时间片
+            if ng &lt; g.get(state, float("inf")):
+                g[state] = ng
+                parent[state] = (x, y, k)
+                h = abs(nx - goal[0]) + abs(ny - goal[1])
+                heapq.heappush(open_set, (ng + h, nx, ny, k + 1))
+    return None                                # 窗口内无解：交降级链</code></pre>
+    <p>解读：与 047 章的 A* 对比，核心差异有三处。<strong>(1)</strong> 状态多了时间维 k，搜索空间变成 |G| × 时间片数，20 s 窗口、0.25 s 分辨率下是 80 倍于几何 A*，所以窗口与分辨率要克制。<strong>(2)</strong> 动作集合多了 (0, 0) 等待：等待是合法的"用时间换空间"，没有它很多窄道场景直接无解。<strong>(3)</strong> 每步代价都记 1.0（包括等待），于是搜索最小化的就是"到达时间"，等待自然不会滥用，如果等待记 0 代价，搜索会生成一堆"免费等待"的荒谬解。注意代码只查了顶点占用，完整实现还应查边冲突（同窗换位），查询方式与 046 章的 <code>find_conflict</code> 对称。</p>
+
+    <p><strong>片段 3：速度协调，把绕行变成先后通过</strong></p>
+    <pre class="code"><code>def tune_speed(seg_len, my_t0, other_t0, v_nom, v_min=0.15):
+    """共享段速度协调：错开时间窗优先，降速到下限则改等待。"""
+    gap = abs(my_t0 - other_t0)              # 两机进入共享段的时刻差
+    if gap &gt;= 1.0:
+        return v_nom                         # 天然错开 1 s：无需调整
+    delta = 2.0 - gap                        # 目标错开 2 s 所需的推迟量
+    v_new = seg_len / (seg_len / v_nom + delta)
+    if v_new &lt; v_min:
+        return None                          # 低于 0.15 m/s：龟速不可接受
+    return v_new
+
+# 调用侧：优先尝试速度协调，失败则交给等待/绕行决策
+# v = tune_speed(seg_len=3.0, my_t0=4.0, other_t0=4.4, v_nom=0.5)
+# 若 v 为 None：在共享段入口前 1.0 m 处插入 2 s 停等段后再继续</code></pre>
+    <p>解读：这个函数浓缩了"时间换空间"的经济学。目标错开量 2 s 的来源是：两台机器人以 0.5 m/s 通过共享段，加上车身长度与安全间距，需要约 2 s 的时间间隔才算"彻底错开"；<code>v_min = 0.15 m/s</code> 是"龟速阈值"，低于它，机器人占用通道的时间过长，收益变成负值。<code>seg_len = 3.0</code> 的例子算下来 v' = 3 / (6 + 1.6) ≈ 0.39 m/s，减速平滑且仍在合理区间；如果共享段长 10 m、需要推迟 2 s，v' = 10 / (20 + 2) ≈ 0.45 m/s 同样可行，说明速度协调对大共享段尤其划算。返回 <code>None</code> 让调用侧转入等待逻辑，保持了函数纯计算、决策在外部的干净分工。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>没有全局节拍，顺序各自为政</strong>：两台机器人同时认为自己是本拍第 3 位，预约竞争频发、冲突上报不断。修复：epoch 广播 + 顺序公告；无节拍时明确退化为 047 的让行规则，行为可预期。</li>
+      <li><strong>预约行缺行不作处理</strong>：一台机器人丢包导致行缺失，其他人当它"不存在"，规划出穿越其路径的计划。修复：缺行者的位置按速度外推 + 膨胀旁路；连续 3 拍缺行上报异常。</li>
+      <li><strong>时间分辨率太粗漏检擦肩</strong>：0.5 s 分辨率下，1 m/s 的机器人每片移动 0.5 m，可能与对向机器人"片中互换"而不被顶点检查捕捉。修复：分辨率满足 v·dt 小于膨胀后格距的一半，0.5 m/s 场景取 0.25 s；或增加边冲突检查。</li>
+      <li><strong>等待代价为 0 导致滥用等待</strong>：A* 生成看似最优却全是"停着不动"的路径。修复：每步（含等待）代价恒为 1 个时间片，从代价结构上让"到达时间最小化"成为唯一优化目标。</li>
+      <li><strong>顺序轮转实现成"先到先得"</strong>：又退化为饥饿。修复：顺序由公告确定并按等待时长轮转；注意公告本身要防伪造与防抖动（epoch 单调、顺序必须全体一致）。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>计算：20 s 窗口、0.25 s 分辨率、10 m × 10 m / 0.1 m 地图。单机时空 A* 的状态空间相比几何 A* 放大了多少倍？若把窗口缩到 8 s，计算量如何变化？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>时间片 80 个，放大 80 倍；窗口 8 s 后放大 32 倍，但窗口太短会截断长任务，需要在"算力"与"可达性"之间为场景取折中。</div></details>
+      </li>
+      <li>构造一个"顺序敏感"的两机例子：先规划者直达，后规划者绕行 3 m。换序后总代价如何变化？写出两种顺序的总路径长度并比较。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>窄道对头：先到者直行 5 m，后到者绕行 +3 m，总计 13 m；换序后直达者换成另一台，总长相同但个体差异翻转，公平性由轮转保证，总长优化管不了个体差异。</div></details>
+      </li>
+      <li>设计预约表的同步协议细节：消息字段、QoS、合并规则、缺行处理、epoch 回退（收到更旧的行怎么办），并写出一致性测试的用例清单。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>关键用例：乱序到达、缺一台、epoch 回滚、半程加入。回退规则建议"epoch 单调递增，旧行直接丢弃"；新加入者靠 Transient-local 拿回全表。</div></details>
+      </li>
+      <li>把速度协调的错开量从 2 s 改为 1 s 与 4 s，预测：共享段通过时间、安全层触发频率、龟速触发（返回 None）的占比如何变化？给出量化评估方法。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>1 s 更激进、安全层介入增多；4 s 更保守、更多等待。用"通过共享段的总时间分布"与"安全层/等待次数"两条曲线扫参。</div></details>
+      </li>
+      <li>综合 046–048：为你的场景写一份选型报告，给出场景参数（台数、地图大小、通信条件、事故代价），从三套方案中选定一套并给出降级链；说明为什么另外两套不合适。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>参考三章对照表；选型必须绑定降级链与验收指标，否则等于没选，真实系统里决定性因素经常是"故障时行为可控"。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>协同 A* 把路径升级为时空预约行：后规划者避开已占用的 (格, 时间)，搜索维度加一、协调复杂度大幅下降。</li>
+      <li>预约表的去中心化实现：各机发布行、本地合并；epoch 覆盖防旧行回潮、缺行保守旁路、冲突交给降级链。</li>
+      <li>计划周期（epoch）是全局纪律：统一节拍、公告顺序、轮转公平；无节拍时退化为让行规则，保持行为可预期。</li>
+      <li>速度协调是"用时间换空间"的首选手段；低于 0.15 m/s 的龟速不可接受，果断转为等待。</li>
+      <li>046–048 构成完整的规划谱系；下一章进入执行层，<strong>路径跟随与冲突消解</strong>，把规划出的时空路径真正走稳、走准。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch047.html">← 第 047 章：分布式路径规划</a>
+    <a class="next" href="ch049.html">第 049 章：路径跟随与冲突消解 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

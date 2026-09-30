@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第035章 实现运动规划与强化学习结合 | 机器人仿真学习课程 · Isaac Sim 强化学习训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 任务与技能实现</span>
+    <span class="sep">/</span>
+    <span>第 035 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 任务与技能实现</div>
+    <h1>第 035 章：实现运动规划与强化学习结合</h1>
+    <p class="lead">让"全局最优的路线"与"局部灵活的反应"接力：RRT 类规划器管绕障，RL 管接触与扰动，四套混合架构一次讲清。</p>
+    <ul class="meta">
+      <li>主题：任务实现 / 规划与学习的混合架构</li>
+      <li>相关组件：Isaac Sim、OMPL 系规划接口（概念）、Stable-Baselines3</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 034 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>说清规划与学习的互补性：规划强在全局可行与几何约束，弱在接触与不确定性；RL 恰好相反。</li>
+      <li>理解 RRT 类采样规划器的工作原理：构型空间搜索、概率完备、路径后处理，以及它在仿真工作流里的接入方式。</li>
+      <li>掌握四种混合架构：规划器当教师、路点 + RL 跟踪、残差 RL、规划器的势场奖励。</li>
+      <li>会实现"路点观测"与"手递手切换"：自由空间段跟规划、接触段交给 RL 的判定与切换逻辑。</li>
+      <li>能评估混合架构的收益：成功率、轨迹长度、规划调用频率与失败归因。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>到这一章，你手里已经有了两个"会走路的部件"：第 034 章的 IK（局部、能到点、不会绕障）和从 017 章一路练来的 RL（能学、能适应、但不知道全局几何）。把它们放进同一个任务，短板立刻显形：<b>纯 IK 的机械臂会径直穿过障碍物；纯 RL 的机械臂在长距离绕障任务里样本效率极低（几十万步才能背下障碍的几何）。</b></p>
+    <p>经典机器人学给出的答案是路径规划（motion planning）：在构型空间里搜一条无碰路径，这是纯几何搜索，不学也能做对。但它有三条硬伤：对接触无能为力（接触即碰撞，规划器只会绕开）、对不确定性迟钝（执行偏差不会自动纠正）、对约束堆叠（推、拧、插）没有模型。<strong>本章的主线：规划管"从 A 到 B 怎么绕"，RL 管"最后几厘米怎么磨"。理解这条分工线，你就能设计出比任何单一方法都强一个量级的系统。</strong></p>
+  </section>
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. RRT 类规划器：在构型空间里"撒点连线"</h3>
+    <p>规划=搜索。搜索空间是构型空间（C-space）：机械臂的每个位形是一个 n 维点。<b>RRT（Rapidly-exploring Random Tree）的循环只有三步：随机撒一个构型点 → 找树上离它最近的节点 → 朝它长出一步（并做碰撞检查）。</b>树就这样向空间的未探索区域生长。它不保证最优，但保证"只要解存在，点够多就找得到"（概率完备，probabilistically complete）。RRT\* 在长出一步后做"换父节点"的剪枝，让解逐步逼近最优；实践中更常用的是"快速 RRT + 路径平滑后处理"：</p>
+    <div class="formula">
+      原始路径 q<sub>0</sub> → q<sub>1</sub> → … → q<sub>k</sub>（带锯齿） → 捷径平滑（shortcut） → 时间参数化（速度/加速度约束）
+      <span class="note">平滑把锯齿路径换成短直线段；时间参数化给每段配速度曲线，否则直接跟点会速度突变</span>
+    </div>
+    <p>仿真工作流里的接入方式：用宿主提供的规划组件（Isaac 生态里围绕 OMPL 的规划接口、或 cuRobo 类的 GPU 规划库），输入"起始构型、目标构型、碰撞对象集合"，输出构型路径与时间参数化。注意规划一次通常要几十到几百毫秒，<strong>绝不能每控制步调用</strong>，应当作为"事件"：回合开始、目标更新、路径被阻挡时调用。</p>
+
+    <h3>2. 规划的边界在哪里</h3>
+    <ul>
+      <li><b>接触不可规划</b>：规划的定义域是"无碰"，而抓取、推动、插拔的本质是受控接触。让规划器"贴着物体推"在一开始就是矛盾的。</li>
+      <li><b>模型不确定性</b>：规划基于几何状态，执行时物体可能被动过、标定有偏差；重规划能处理"大偏差"，小偏差（毫米级）交给反馈控制/RL。</li>
+      <li><b>任务规格缺失</b>：规划器不知道"什么时候该停下抓取"，任务层的语义得由你的逻辑或 RL 提供。</li>
+    </ul>
+    <p>反过来，RL 的短板是规划的长处：探索长距离路径 = 用采样拟合几何，效率极低；而 RL 的长处恰是规划的死角：接触、扰动、容差。<strong>混合架构的设计原则：让每种方法只做它擅长的、且把接口做窄</strong>，接口越窄（如一个路点序列、一个残差动作），系统越可测。</p>
+
+    <h3>3. 四种混合架构的谱系</h3>
+    <table>
+      <tr><th>架构</th><th>规划器角色</th><th>RL 角色</th><th>适用</th></tr>
+      <tr><td>A. 规划当教师</td><td>生成无碰轨迹</td><td>BC 预训练 + RL 微调</td><td>需要专家数据又不想遥操作</td></tr>
+      <tr><td>B. 路点 + RL 跟踪</td><td>回合开始生成路点序列</td><td>在线跟踪路点、处理扰动</td><td>长距离移动 + 局部灵巧</td></tr>
+      <tr><td>C. 残差 RL</td><td>每个控制步给"参考动作"</td><td>输出修正量叠加在规划动作上</td><td>需要保持规划性能下限</td></tr>
+      <tr><td>D. 势场奖励</td><td>提供路径作为"进度尺"</td><td>在奖励里加"沿路径前进"项</td><td>教 RL 绕障、加速收敛</td></tr>
+    </table>
+    <p>四者可以叠加：B + C 是工业界常见的"规划跟到接触区、RL 接管精调"。<b>选择判据：规划能覆盖的比例越高，架构越靠 B/C；任务越接触密集、规划越不可用，越靠 A/D 让 RL 独立成长。</b></p>
+
+    <h3>4. 手递手切换：何时从规划切到 RL</h3>
+    <p>混合系统里最微妙的机制是"交接"。两种触发方式：</p>
+    <ul>
+      <li><b>空间触发</b>：末端进入"接触区"（距目标 &lt; 10 cm）或路径耗尽时切换。可预测、可测试，但阈值附近的切换抖动要处理（滞回：进入用 10 cm、退出用 15 cm）。</li>
+      <li><b>事件触发</b>：接触检测（第 030 章）第一次确认接触时切换。更语义化，但需要接触检测稳定可靠。</li>
+    </ul>
+    <p>切换时的状态衔接是失败高发区：RL 接手时策略看到的状态（相对目标位姿、接触力）必须与训练时的初始状态分布接近，否则"接手即崩"。<strong>对策：训练 RL 时就用"规划器的结束状态 + 随机扰动"做初始状态分布（domain randomization on start states），让交接口成为训练分布内的常见点。</strong>这是第 021 章域随机化思想在系统集成层的复用。</p>
+
+    <h3>5. 残差行动的数学形式</h3>
+    <p>最紧凑的混合形式是残差 RL：</p>
+    <div class="formula">
+      a<sub>t</sub> = a<sub>t</sub><sup>plan</sup> + k · a<sub>t</sub><sup>RL</sup>，  a<sup>RL</sup> ∈ (−1, 1)<sup>n</sup>，  k 为残差增益（如 0.1）
+      <span class="note">规划给基准动作，RL 只学"修正量"；k 控制修正幅度上限，系统的行为下限由规划保证</span>
+    </div>
+    <p>残差结构有两个漂亮性质：<b>(1) 性能下限</b>，RL 全零时系统退化为纯规划，不会比规划更差（除非学坏，所以奖励设计要保证"修正不亏"）；<b>(2) 小输出空间</b>，策略只需学 ±k 范围内的修正，探索空间小、样本效率高。代价是如果规划的基准动作系统性错误（模型偏差大），残差量不足以扳回来，此时要么修规划，要么退回架构 A/D。<b>实践判据：先用纯规划跑评估，成功率 &gt; 60% 时残差 RL 是高效选择；低于 40% 时应先让 RL 独立或换教师。</b></p>
+
+    <h3>6. 数值算例：时间参数化与规划开销预算</h3>
+    <p>规划器输出的构型路径只负责几何，要变成可执行的轨迹还需要时间参数化。以两个路点之间的一段直线段为例：段长 L = 0.30 m，按关节限速折算的末端速度上限 v<sub>max</sub> = 0.25 m/s，加速度上限 a<sub>max</sub> = 1.0 m/s²。梯形速度剖面的计算过程：加速段距离 d<sub>a</sub> = v<sub>max</sub>²/(2a<sub>max</sub>) = 0.03125 m，加速时间 v<sub>max</sub>/a<sub>max</sub> = 0.25 s；两端加减速共占 0.0625 m，剩余 0.2375 m 匀速段耗时 0.95 s，总时间 1.45 s。若把 v<sub>max</sub> 提到 0.5 m/s 而加速度不变，加速段距离涨到 0.125 m（按速度平方增长），但总时间反而缩短到 1.10 s。<b>这组数字说明"规划得快"与"跟得住"的折中点在加速度侧：速度上限翻倍时，加速段浪费按平方增长，距离足够长时总时间仍下降，距离很短时（L 接近 2d<sub>a</sub>）速度上限完全失效、总时间由加速度决定。</b>时间参数化的输出（每段的时刻表）还有第二个用途：路点跟踪器用它估计"按当前速度能否在预算内到达"，据此提前加速；等到落后再补，时间预算已经失守。</p>
+    <p>规划开销另算一笔账：单次规划耗时 150 ms，控制周期 16.7 ms（60 Hz）。把规划塞进控制循环，单步耗时变成 167 ms，控制频率跌到约 6 Hz，训练吞吐与动作平滑同时受损；把规划作为回合级事件、每 500 个控制步重规划一次，平均每步只分摊 0.3 ms，占比约 2%。<b>同样的计算量，摆放位置不同，摊到每个控制步的开销相差 500 倍（150 ms 对 0.3 ms），"规划按回合级事件调用"这句话有了定量版本。</b>若场景需要更高频的重规划（动态障碍靠近），正确的方向是换用更快的规划实现或增量式规划（复用上次树的样本）；缩短重规划间隔硬扛只会让每个控制步都背上规划开销。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p><strong>本章按"架构 B + C 组合"落地：回合开始规划一条路点序列，自由空间由轨迹跟踪器跟随，进入接触区后 RL 接管精调，并用残差形式保持规划的行为下限。</strong>五个实现模块：</p>
+    <ol>
+      <li><strong>规划模块</strong>：封装"起始构型 → 目标构型"的规划调用；只在 reset/目标更新时触发；规划失败（找不到路）时退回直线接近并记录事件。</li>
+      <li><strong>路点跟踪</strong>：把构型路径抽稀成 M 个路点（如 8–16 个）；跟踪器（IK + 限速）负责逐点跟随；到达阈值 3 cm 切下一个点。</li>
+      <li><strong>观测表达</strong>：给 RL 的观测含"当前路点相对位姿、路点序号/总进度、接触标志、末端—目标相对位姿"；路点序列作为观测的一部分让策略知道"后面还有没有"。</li>
+      <li><strong>切换逻辑</strong>：进入接触区（末端—目标距离 &lt; 10 cm）且接触标志为真 → 切 RL；用 15 cm 退出阈值形成滞回。</li>
+      <li><strong>RL 形态</strong>：残差动作 a = a<sup>track</sup> + 0.1·a<sup>RL</sup>；奖励沿用任务奖励 + 残差幅度小惩罚。</li>
+    </ol>
+    <table>
+      <tr><th>设计点</th><th>推荐值</th><th>理由</th></tr>
+      <tr><td>路点数 M</td><td>8–16</td><td>太少转弯失真；太多观测维度虚高</td></tr>
+      <tr><td>路点到达阈值</td><td>3 cm</td><td>太严会卡在路点前反复；太松会切太早积累误差</td></tr>
+      <tr><td>切换距离</td><td>进入 10 cm / 退出 15 cm</td><td>滞回防抖动；阈值对齐接触区的物理尺度</td></tr>
+      <tr><td>残差增益 k</td><td>0.1（关节增量的 10%）</td><td>修正能力与"不破坏规划"的平衡</td></tr>
+      <tr><td>重规划条件</td><td>偏差 &gt; 15 cm 或阻挡事件</td><td>重规划是事件不是周期任务；门槛保证不频繁打断</td></tr>
+      <tr><td>规划超时</td><td>200 ms</td><td>超时=规划失败，走退化路径并打点</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计思维：把"谁负责哪段"写进观测</span>
+      <p>切换架构最常见的事故是"RL 不知道自己在跟路点还是已到接触区"，策略在两种模式间行为矛盾。<strong>对策是把模式标志（跟路点/精调）作为一维观测显式给出</strong>：策略可以学着"模式=跟路点时尽量小修正、模式=精调时全力"。这与第 032 章"等级进观测"是同一条设计原则：<b>凡是影响最优行为的隐藏变量，都在观测里给它一票。</b>反过来，如果两个模式的行为差异不大，就说明架构可以简化，观测标志也提供了一个"是否需要切换"的检测手段。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：规划调用与路点抽取</strong></p>
+    <pre class="code"><code>def plan_waypoints(planner, start_conf, goal_conf, max_waypoints=12):
+    """回合级事件：规划构型路径并抽稀成路点。绝不放进控制循环内"""
+    path = planner.plan(start_conf, goal_conf)      # 返回 N 个构型点或 None（失败）
+    if path is None:
+        return None                                  # 调用方走退化路径：直线接近 + 打点记录
+    # 抽稀：等间隔取点。路点是"里程碑"；逐帧跟踪交给控制器
+    idx = torch.linspace(0, len(path) - 1, steps=max_waypoints).long()
+    wps = [path[i] for i in idx]                    # 首尾必含：第一个是起点、最后是目标构型
+    return wps
+
+class WaypointTracker:
+    """路点跟踪器：当前路点到达 3 cm 就切下一个；耗尽则进入交接准备"""
+    def __init__(self, waypoints, tol=0.03):
+        self.wps, self.tol = waypoints, tol
+        self.idx = 1                                # 从第二个路点开始（第一个是当前位形）
+
+    def current_target_conf(self, cur_conf):
+        while self.idx &lt; len(self.wps) - 1 and \
+              torch.linalg.norm(cur_conf - self.wps[self.idx]) &lt; self.tol:
+            self.idx += 1                            # 到达阈值后才推进：防"路点竞速"
+        return self.wps[self.idx]
+
+    def progress(self):
+        return self.idx / (len(self.wps) - 1)        # 0→1：给观测的进度标量</code></pre>
+    <p>解读：路点层有三个防坑细节。<b>(1) 抽稀到 12 个点</b>：RRT 输出可能几百个密点，全塞进观测既无必要又稀释学习信号；等间隔抽 12 个点保留"里程碑"语义，轨迹细节由控制器采样时补足。<b>(2) 到达阈值推进（while 循环）</b>：如果某帧跨过了两个路点（高速移动），循环一次性跳过，否则策略会"回头"去够已经被甩在身后的路点，产生折返。<b>(3) 进度标量</b>：<code>idx/(M−1)</code> 是给 RL 观测的"完成度"，与第 032 章的成功率、第 031 章的 goal 一样，是让策略"知道自己在哪"的关键状态量。跟踪器状态（idx）必须随回合重置，又一个"跨步状态入重置清单"的实例。</p>
+
+    <p><strong>片段 2：手递手切换与观测组装</strong></p>
+    <pre class="code"><code>class HybridController:
+    """混合控制：跟路点 → 接触区切换 → RL 精调；带滞回防抖动"""
+    def __init__(self, tracker, ik, enter_dist=0.10, exit_dist=0.15):
+        self.tracker, self.ik = tracker, ik
+        self.enter_dist, self.exit_dist = enter_dist, exit_dist   # 滞回双阈值
+        self.mode = "track"                        # 初始模式：自由空间跟踪
+
+    def build_obs(self, cur_conf, cur_pose, target, contact):
+        wp = self.tracker.current_target_conf(cur_conf)          # 当前路点（构型空间）
+        rel_wp = wp - cur_conf                     # 相对路点差：策略需要"往哪偏"
+        rel_goal = target - cur_pose               # 末端—目标相对位姿：精调阶段的核心信号
+        mode_flag = torch.tensor([1.0 if self.mode == "rl" else 0.0])
+        # 模式显式进观测：影响最优行为的隐藏变量必须给策略一票（本箱"设计思维"）
+        return torch.cat([rel_wp, rel_goal, [self.tracker.progress()],
+                          contact.float(), mode_flag])           # 拼接成策略输入的字典项
+
+    def switch(self, end_effector, target, contact):
+        d = (end_effector - target).norm(dim=-1)   # 末端到目标的距离
+        if self.mode == "track":
+            self.mode = "rl" if (d &lt; self.enter_dist) and contact else self.mode
+            # 双条件：进入接触区 且 检测到接触；只用距离会在未真正接触时误判
+        else:
+            self.mode = "track" if d &gt; self.exit_dist else self.mode
+            # 退出只在"离开足够远"时发生：滞回死区内的模式保持稳定
+        return self.mode</code></pre>
+    <p>解读：切换器是混合架构里最需要"防抖"的部件，三处设计都值得学。<b>(1) 双条件进入</b>：只看距离 10 cm 就交给 RL，会在"还没真正碰到"时提前切换，RL 的接触策略在空中的表现没训练过；加上接触标志后，"贴着目标的手"才是 RL 的上班时间。<b>(2) 滞回退出</b>：模式切换有成本（RL 接手要重新稳定），进入阈值 10 cm 与退出阈值 15 cm 之间是"保持现状"的死区，和第 032 章课程的滞回是同一种控制抖动的手法。<b>(3) 模式标志进观测</b>：设计思维里讲的"隐藏变量给一票"在这里落地；<code>mode_flag</code> 让策略能学出"跟随时克制、精调时积极"的分段行为。另外注意 <code>rel_wp</code> 与 <code>rel_goal</code> 都给的是"相对量"：绝对构型/绝对位姿的数值范围太大且随任务场景漂移，相对量在归一化前后都稳定，这与第 029 章"力要转工具系"的动机一致：<b>把观测组织成"策略直觉可读"的形式，是加速学习的一半。</b></p>
+
+    <p><strong>片段 3：残差 RL 的动作组装</strong></p>
+    <pre class="code"><code>def hybrid_step(env, controller, policy, cur_conf, cur_pose, target, contact):
+    """一个控制步的完整混合动作：跟踪器给基准，RL 给修正"""
+    controller.switch(cur_pose, target, contact)      # 先定模式：观测构建依赖它
+    obs = controller.build_obs(cur_conf, cur_pose, target, contact)
+
+    # 基准动作：跟踪模式用 IK 追路点；RL 模式用 IK 追目标（"参考但不锁死"）
+    if controller.mode == "track":
+        base_target = controller.tracker.current_target_conf(cur_conf)
+    else:
+        base_target = target                          # 精调阶段：不再跟路点，直追目标
+    a_base = controller.ik.solve(cur_conf, base_target)  # 关节增量基准（第 034 章）
+
+    a_rl, _ = policy.act(normalize(obs), deterministic=False)   # 策略输出 (-1,1)^n
+    k = 0.1                                           # 残差增益：修正幅度上限 10%
+    a = a_base + k * a_rl * env.joint_delta_scale     # 组合动作：规划主导、RL 微调
+    # k 太小（0.01）RL 学不动；k 太大（0.5）等于纯 RL；0.05–0.15 是常用带
+
+    env.apply_joint_delta(a)                          # 积分 + 限位（第 025/026 章同款安全层）
+    rew, done = env.step_reward(contact)              # 任务奖励 + 残差幅度小惩罚
+    return obs, a_rl, rew, done</code></pre>
+    <p>解读：残差结构把"规划的性能下限"与"RL 的上限能力"焊在一起。读三个关键词：<code>a_base</code> 是基准，<b>它保证即使策略输出全零、甚至学坏了，系统行为仍接近规划</b>（退化保障）；<code>k=0.1</code> 是残差频带，策略的探索空间被限制在基准动作 ±10% 的邻域内，第 026 章动作缩放讨论过的"探索半径"在这里由结构（k 的频带）设定，噪声只负责频带内的抖动；<code>deterministic</code> 在训练时用采样、评估时用确定性，与第 026 章纪律相通。一个容易被忽略的细节：<b>RL 模式的基准动作选择</b>。代码里精调阶段把 IK 的目标从"路点"换成"最终目标"，让基准自身也在收敛；如果没有这个切换，IK 停在最后一个路点不动，RL 的残差要独自完成最后 10 cm，超出 k 频带的修正能力，表现为"永远差一点"。残差幅度惩罚的权重建议 0.01 量级：它的作用是防止策略用满 ±k 乱动；修正本身仍被允许。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>每控制步调用规划器</strong>：规划耗时几十到几百毫秒，把 60 Hz 控制循环拖成 5 Hz。症状：训练吞吐暴跌、动作抖动。修复：规划只在 reset/目标更新/阻挡事件时调用，路点序列缓存起来。</li>
+      <li><strong>路点当逐帧轨迹</strong>：直接把路点位置当每帧的关节目标，路点之间的"跳跃"造成速度突变。症状：机械臂抽搐式前进。修复：路点给跟踪器（IK/限速插值），控制器负责连续性。</li>
+      <li><strong>切换无滞回</strong>：模式在阈值边界反复横跳，两种控制策略高频交替。症状：日志中模式切换频率异常高、接触力振荡。修复：进入/退出双阈值 + 最短保持时间。</li>
+      <li><strong>RL 训练分布与交接口不匹配</strong>：RL 只在"目标正前方"训练，实际接手时状态来自规划末尾（可能带偏差），分布外即崩。症状：混合系统成功率低于纯规划。修复：训练时用"规划终点 + 扰动"作为初始状态分布。</li>
+      <li><strong>规划器与仿真场景不同步</strong>：规划用的碰撞场景里没有随机化后的新障碍/大质量物体，规划出的路径在仿真里穿模。症状：碰撞事件、轨迹异常。修复：规划前把当前场景的障碍集合同步给规划器。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>计算题：规划一次耗时 150 ms（单次），控制周期 16.7 ms。若"每步重规划"会怎样？若"每 100 步重规划一次"，规划开销占训练时间的多少？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>每步重规划：单步时间变成 167 ms，控制频率跌到 6 Hz。每 100 步一次：平均每步多 1.5 ms，开销约 10%，这才是可接受的量级。</div></details>
+      </li>
+      <li>实验设计：对比"纯 IK 教师""RRT 教师""RRT+平滑教师"三种示教，用第 033 章的 BC 训练后比较成功率，解释差异来自轨迹的哪些性质。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>纯 IK 在绕障场景会撞（教师失败轨迹被过滤后数据变少）；RRT 原始路径锯齿大，BC 学到的动作抖动；平滑后轨迹动作连续，BC 最容易学。</div></details>
+      </li>
+      <li>实现题：给切换器加"最短保持时间"（模式切换后至少保持 20 个控制步不再切换），验证它对接触力振荡的抑制效果。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>监控指标：模式切换次数 / 回合、接触力方差。最短保持时间消除边界抖动，但太长会拖慢"该交不交"的响应。</div></details>
+      </li>
+      <li>消融实验：残差增益 k ∈ {0.02, 0.1, 0.3}，对比"最终成功率"与"早期学习速度"。解释为什么存在最优 k，以及它与"规划基准质量"的关系。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>规划越好，最优 k 越小（几乎不需要修正）；规划越差，需要更大 k，但 k 太大失去"下限保障"。把纯规划成功率与最优 k 画在一张图上，趋势应该一目了然。</div></details>
+      </li>
+      <li>思考题：为什么说"规划 + RL"的分工本质是"几何先验"与"经验先验"的分工？请从状态空间覆盖的角度，解释混合系统为什么比纯 RL 样本效率高。 <span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>规划用几何知识直接跳过"学习绕障"所需的大量样本；RL 只在其剩余的不确定性（接触/扰动/容差）上采样，训练分布被大幅收窄。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>规划强在全局几何与可行性，弱在接触与不确定性；RL 反之。混合的原则：让各自的"最强项"对接窄接口（路点/残差）。</li>
+      <li>RRT 类算法在构型空间采样搜索，概率完备；工程链路是"规划 → 捷径平滑 → 时间参数化 → 跟踪"。</li>
+      <li>四种架构 A 教师 / B 路点跟踪 / C 残差 / D 势场奖励；B+C 组合（跟到接触区、RL 精调）是通用主力。</li>
+      <li>手递手切换三件套：接触/距离双条件进入、滞回退出、模式标志进观测；RL 训练初始分布要覆盖交接口。</li>
+      <li>下一章开始任务实战：先用避障任务把第 028 章的点云观测、第 034 章的 IK 与本章的势场奖励全部用上。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch034.html">← 第 034 章：实现逆运动学控制</a>
+    <a class="next" href="ch036.html">第 036 章：实现避障任务 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

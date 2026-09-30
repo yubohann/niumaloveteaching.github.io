@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第071章 基于ROS2的多机器人任务调度 | 多机器人协同学习课程 · ROS2 通信与系统集成</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第四篇 · 系统集成与工程化</span>
+    <span class="sep">/</span>
+    <span>第 071 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第四篇 · 系统集成与工程化</div>
+    <h1>第 071 章：基于ROS2的多机器人任务调度</h1>
+    <p class="lead">把第 070 章的调度表变成跑在 ROS2 上的活系统：动作接口怎么设计、执行器怎么选、预派深度取多少、机器人掉线怎么对账，工程细节决定调度器是"纸面最优"还是"真能干活"。</p>
+    <ul class="meta">
+      <li>主题：系统集成 / 调度器的 ROS2 工程实现</li>
+      <li>关键机制：动作派发链、多线程执行器与回调组、预派深度、状态对账</li>
+      <li>预计学时：65 分钟</li>
+      <li>前置章节：第 070 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>会设计调度系统的 ROS2 接口三件套：上游任务接入（服务/话题）、下发执行（动作）、状态广播（话题），并给出各接口的 QoS 契约。</li>
+      <li>理解单线程执行器为什么会拖死调度器，掌握 MultiThreadedExecutor + 回调组的分工写法。</li>
+      <li>掌握"预派深度"概念：每台机器人提前发几个任务最合适，为什么不是越多越好。</li>
+      <li>会实现动作派发链：结果回调驱动下一个任务、拒绝回队、失败重派与掉线对账。</li>
+      <li>能对调度器做基础性能验证：调度计算延迟、派发时延、连续 200 个任务的吞吐。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>上一章的算法在笔记本上跑得很好，但把它搬进 ROS2 系统会遇到一堆"环境带来的"问题：调度计算在哪个回调里做？发送动作后睡觉等结果会不会把心跳饿死？机器人的动作队列里塞三个任务，第二台就变砖怎么办？机器人 3 号换电池期间它的任务谁来接？</p>
+    <p>本章不讲新算法，讲<strong>把分配、优先级、调度三章的能力装配成可运行系统</strong>的工程学：接口怎么切、线程怎么分、状态怎么对。它也是 074 章故障恢复与 080 章运维工具链的施工面，调度器是整个车队的中枢，它的线程模型与状态管理是后面所有可靠性的地基。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 角色拓扑与接口三件套</h3>
+    <table>
+      <tr><th>接口</th><th>方向</th><th>类型</th><th>语义</th><th>QoS / 备注</th></tr>
+      <tr><td><code>/fleet/task_request</code></td><td>上游 → 调度器</td><td>话题</td><td>新任务公告（只公告，不指定执行者）</td><td>Reliable + Transient-local</td></tr>
+      <tr><td><code>/fleet/schedule</code></td><td>调度器 → 全员/监控</td><td>话题</td><td>当前调度表快照（谁做啥、什么序）</td><td>Transient-local；新加入者也要看到</td></tr>
+      <tr><td><code>/fleet/robot_status</code></td><td>各机 → 调度器</td><td>话题</td><td>位置、电量、忙闲、当前任务 ID</td><td>Best-effort，2–5 Hz</td></tr>
+      <tr><td><code>execute_task</code>（命名空间下）</td><td>调度器 → 单机</td><td>动作</td><td>派发任务：接受/拒绝/反馈/结果/取消</td><td>长任务必须用动作（004 章语义）</td></tr>
+      <tr><td><code>/fleet/task_event</code></td><td>各机/调度器 → 监控</td><td>话题</td><td>任务生命周期事件（接受、开工、完成、失败）</td><td>Reliable；审计与复盘用</td></tr>
+    </table>
+    <p>为什么上游用话题而不用服务？<strong>任务到达是"事件流"不是"远程调用"</strong>：上游系统可能弱网、可能重发，服务调用会让上游和调度器的生命周期绑死。话题 + 任务 ID 去重（066 章）让双方解耦。为什么下发必须用动作？因为任务执行有明确的生命周期（接受→执行→结果），且需要取消通道，预抢占（068 章）本质上就是对动作的一串 cancel。话题给不了"是否被接受"的反馈，服务给不了执行中的进度反馈。</p>
+
+    <h3>2. 执行器模型：别让调度算法饿死呼吸</h3>
+    <p>rclpy 默认的 <code>SingleThreadedExecutor</code> 在一个线程里串行处理所有回调。调度器这类节点的回调有快有慢：状态消息 2–5 Hz（快）、调度重算 10–50 ms（中）、动作结果处理（中）、上游批量任务（可能一次性几十条）。<strong>单线程下，调度重算期间连机器人心跳都收不到</strong>，5 秒后系统把你判成"离线"，离线误判由此产生。正确姿势：</p>
+    <ul>
+      <li><code>MultiThreadedExecutor(num_threads=4)</code>：开一个 4 线程池。</li>
+      <li><strong>回调组</strong>：状态订阅、心跳等"快路径"放 <code>MutuallyExclusiveCallbackGroup</code>（各自独立，可并行）；调度重算放 <code>ReentrantCallbackGroup</code> 或独立的 <code>MutuallyExclusiveCallbackGroup</code>，用一把锁保护调度表数据结构。</li>
+      <li><strong>贵重物品不放回调</strong>：真正的重活（全量重排）可以丢给一个内部工作线程（Python 的 <code>threading.Thread</code>），回调只负责取结果，但初版不建议这么做，先把 50 ms 以内的重排留在受控回调组里。</li>
+    </ul>
+    <div class="formula">
+      调度计算预算 ≈ 控制周期 × 10% ≈ 每次 10–50 ms（10 Hz 调度节拍）
+      <span class="note">20 任务 / 6 机器人表调度实测 ≈ 2–10 ms（Python）；超过 50 ms 要么换实现要么降节拍</span>
+    </div>
+
+    <h3>3. 预派深度：滑窗派发</h3>
+    <p>调度表算出"机器人 2 依次做 T3、T7、T9"，派发时有两种极端：<strong>一次性把三个都发过去</strong>，机器人侧动作队列积压，前期任务变卦时无法收回（goal 已经在队里）；<strong>每完成一个再发下一个</strong>，机器人完成到收到新任务之间有网络往返空窗（50–300 ms），但控制精度最高。</p>
+    <p>折中是<strong>滑动窗口派发</strong>：每台机器人最多保持 1 个执行中 + 1 个已接受的待执行（预派深度 = 2），完成后立即用结果回调驱动发送下一个。这样空窗被预派任务填住，同时最多只有一个"还没开始的"任务可以被取消。预派深度的选择依据：</p>
+    <ul>
+      <li>网络时延 RTT 越大（无线跨区 &gt; 50 ms），越需要预派遮掩空窗；</li>
+      <li>任务不确定性越大（频繁重排、临时高优插队），越需要浅预派保证可撤销；</li>
+      <li>经验值 1（保守、确定性高）到 2（标准）；深于 2 几乎总是弊大于利。</li>
+    </ul>
+
+    <h3>4. 状态对账：调度器的账本</h3>
+    <p>调度器手里有两个状态源：<strong>自己做过的决策</strong>（账本）与<strong>机器人上报的实况</strong>（心跳/事件）。两者必然漂移，消息丢、机器人重启、任务失败上报失败。对账机制是调度器的兜底：</p>
+    <ol>
+      <li>账本里每个任务有状态机：QUEUED → DISPATCHED → ACCEPTED → RUNNING → DONE / FAILED / LOST。</li>
+      <li>周期性（1 Hz）抽样对账：对每个 RUNNING 任务，检查执行机心跳里报告的任务 ID 是否一致；超过 5 s 不一致或心跳缺失 → 标记 LOST。</li>
+      <li>LOST 任务的处置：若机器人在线，先发 cancel 再重排；若离线，直接重排并记该机器人故障次数（喂给 074 章的故障统计）。</li>
+      <li>任务事件话题是审计通道：状态机每次迁移都发一条事件，事后复盘时按任务 ID 能拼出完整轨迹。</li>
+    </ol>
+
+    <h3>5. 数值算例：派发空窗与预派深度的收益</h3>
+    <p>把一次任务交接的时延拆成可核对的小账。机器人侧任务完成判定 10 ms、结果消息传输 30 ms、结果回调到补窗派发 5 ms、新任务的接受确认 30 ms：如果预派深度为 0（纯结果驱动），机器人从完成上一个任务到开始下一个，要等完整一条 75 ms 的往返，这段时间车辆在任务点空等；把预派深度设为 2，下一个任务已经在机器人本地动作队列里，交接只剩"完成判定 + 回调补窗"约 15 ms，单次省下约 60 ms。按一次班次 200 个任务算，累计缩短的车辆空等约 12 s；数字不大，但它同时缩短了任务的端到端时延，且在无线跨区（RTT 更大）的场景会成比例放大，这也是参数表把"完成到派发延迟 ≤ 100 ms"写成验收线的依据。所有数值都要在本系统实测：用任务事件话题里的"完成时间戳"与"下一任务开工时间戳"差值统计 P95，避免拿纸面预算当结论。</p>
+
+    <h3>6. 数值算例：队列深度与线程数的选取</h3>
+    <p>队列深度遵守一条简单公式：深度 ≥ 消息频率 × 可容忍的消费停顿。状态话题 2 Hz、希望容忍执行器最长 5 s 的停顿（一次粗权重排或一次序列化抖动），则队列至少容纳 10 条消息，参数表里状态订阅深度取 10 正好匹配；因为状态是"最新值代表事实"，队列满时丢最旧消息完全无害，KEEP_LAST 语义天然合适。对照任务事件：审计事件一条都不能丢，必须用 Reliable + KEEP_ALL 或持久化落盘，两类数据在同一节点里用不同 QoS 是常态。线程数同样可以从量级上判断：6 台机器人 2 Hz 状态（12 次/秒）、若干动作结果与事件、加上 10 Hz 重排节拍，总回调约 30 次/秒，每次毫秒级，总占用远低于一个核；4 线程的意义在于"隔离"而不在"吞吐"：保证重排偶尔变慢时，心跳与结果回调仍有一条空闲线程可用。再往上加线程没有收益，反而增加锁竞争的面。</p>
+
+    <h3>7. 锁的边界：快照、锁外计算、短锁提交</h3>
+    <p>调度器内部的共享状态要划清边界。一次重排需要读取机器人与任务快照、构造代价矩阵、求解、把结果写回调度表；如果整个过程都握着账本锁，状态回调会被阻塞到计算结束，回调组分权的意义就被抵消。正确模式是"短锁快照、锁外计算、短锁提交"：在锁内复制只读快照（毫秒级），退出锁做矩阵构造与匹配（10–50 ms），再持锁把结果合并回账本，并处理"快照期间发生的变化"（任务被取消、机器人下线）。合并阶段的冲突规则要预先写死：以账本为准，快照里已失效的任务直接丢弃并记日志，绝不静默覆盖。按这个结构实现后，锁的最长持有时长与快照大小成正比、与被计算量无关，运行中最典型的"偶发卡顿 5 秒"会明显减少；观测手段是给临界区加计时，把 P99 持锁时长做成监控指标（验收线可设 5 ms），超标即说明有计算漏进了锁内。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>调度器节点内部划成四个模块，每个模块一种回调组：</p>
+    <table>
+      <tr><th>模块</th><th>职责</th><th>回调组</th><th>频率</th></tr>
+      <tr><td>Ingestor</td><td>任务接入、去重、校验、入账本</td><td>MutuallyExclusive（快）</td><td>事件驱动</td></tr>
+      <tr><td>Scheduler</td><td>重排触发、表调度、调度表发布</td><td>MutuallyExclusive + 锁</td><td>10 Hz 节拍 + 事件</td></tr>
+      <tr><td>Dispatcher</td><td>滑窗派发、结果回调、cancel</td><td>Reentrant（每机器人一个 client）</td><td>事件驱动</td></tr>
+      <tr><td>Reconciler</td><td>心跳对账、LOST 处置、统计</td><td>MutuallyExclusive</td><td>1 Hz</td></tr>
+    </table>
+    <p>落地顺序建议：先在单机器人上把"账本—派发—回调"跑通（无重排），再接第二台机器人验证取消路径，最后才打开重排与对账。每步都留可观测输出（任务事件、调度表快照），否则后面的 bug 你无从下手。</p>
+    <h3>关键参数表</h3>
+    <table>
+      <tr><th>参数</th><th>建议值</th><th>依据</th></tr>
+      <tr><td>执行器线程数</td><td>4</td><td>快路径 + 调度 + 派发互不饿死；再多是浪费</td></tr>
+      <tr><td>预派深度</td><td>2（执行 1 + 待执行 1）</td><td>遮掩 RTT，同时最多一个可撤销任务</td></tr>
+      <tr><td>完成→派发下一任务延迟</td><td>≤ 100 ms</td><td>结果回调里直接派发，不经过节拍等待</td></tr>
+      <tr><td>对账周期</td><td>1 Hz</td><td>与心跳同频；漏检窗口 ≤ 2 s</td></tr>
+      <tr><td>LOST 判定</td><td>心跳 5 s 缺失或任务 ID 不一致</td><td>5 s 是 2 Hz 心跳的 10 倍容错</td></tr>
+      <tr><td>goal 接受超时</td><td>3 s</td><td>与 066 章派发确认超时一致</td></tr>
+    </table>
+    <div class="box warn">
+      <span class="box-title">注意：动作客户端的 Future 回调运行在执行器线程里</span>
+      <p>rclpy 的动作客户端回调（接受/结果）由执行器线程执行。如果你在结果回调里做重活（例如直接触发一次全量重排），就要确保那把调度表的锁不会与状态订阅回调互等，<strong>回调间持锁顺序必须全局一致：永远"先状态锁、后调度锁"，绝不反向</strong>。这是调度器上线后最常见的偶发卡死原因（表现为"系统随机死机 5 秒"）。用 <code>threading.Lock</code> 时一律用 <code>with</code> 短临界区，禁止在持锁期间调用服务（那是同步等待，专门制造死锁）。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：调度器节点的线程模型</strong></p>
+    <pre class="code"><code>from rclpy.executors import MultiThreadedExecutor
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
+import threading
+
+class FleetScheduler(Node):
+    """状态回调、调度重算、动作派发三层并行，用锁保护共享账本。"""
+    def __init__(self):
+        super().__init__("fleet_scheduler")
+        self.fast_group = MutuallyExclusiveCallbackGroup()   # 状态/心跳快路径
+        self.plan_group = MutuallyExclusiveCallbackGroup()   # 重排（独占，防并发重算）
+        self.dispatch_group = ReentrantCallbackGroup()       # 每机一个动作客户端
+        self.ledger_lock = threading.Lock()                  # 保护账本与调度表
+        self.create_subscription(RobotStatus, "/fleet/robot_status",
+                                 self.on_status, 10, callback_group=self.fast_group)
+        self.create_timer(0.1, self.plan_tick, callback_group=self.plan_group)
+        # 每台机器人一个动作客户端：命名空间区分（/robotN/execute_task）
+        self.clients = {rid: ActionClient(self, ExecuteTask,
+                                          f"/robot{rid}/execute_task",
+                                          callback_group=self.dispatch_group)
+                        for rid in range(1, 7)}
+
+def main():
+    rclpy.init()
+    node = FleetScheduler()
+    executor = MultiThreadedExecutor(num_threads=4)   # 快路径与重排互不饿死
+    executor.add_node(node)
+    try:
+        executor.spin()
+    finally:
+        executor.shutdown()
+        node.destroy_node()
+        rclpy.shutdown()</code></pre>
+    <p>解读：线程模型是调度器的"地基代码"，理解它比看算法更重要。<strong>（1）</strong>三类回调组分权：fast_group 与 plan_group 都是互斥组（各自内部串行，组间并行），dispatch_group 可重入（多个机器人的结果回调可以并发处理）。<strong>（2）</strong>账本用一把锁保护，所有读改写都在 <code>with self.ledger_lock</code> 短临界区内完成，回调间不共享"半成品"数据。<strong>（3）</strong>每台机器人一个 ActionClient 是刻意的：共用客户端会让不同机器人的 goal/result 回调在同一队列竞争，且无法按机器人做背压。<code>executor.shutdown()</code> 先于 <code>destroy_node</code>，保证回调线程退出后再拆节点，反过来写会在退出时偶发 use-after-free。以对应发行版文档为准：Jazzy 对回调组的默认行为与 Humble 有细则差异，升级前先在测试车队验证。</p>
+
+    <p><strong>片段 2：滑动窗口派发与结果回调链</strong></p>
+    <pre class="code"><code>class Dispatcher:
+    """给定调度表，按预派深度 2 向每台机器人滑窗派发任务。"""
+    def __init__(self, node, clients, depth=2):
+        self.node = node
+        self.clients = clients
+        self.depth = depth
+        self.chain = {}      # robot_id -&gt; [task_id, ...] 预派队列
+        self.handles = {}    # robot_id -&gt; [goal_handle, ...]
+
+    def pump(self, rid):
+        """补窗：只要在手任务数小于深度，就派账本里该机的下一任务。"""
+        while len(self.chain[rid]) &lt; self.depth:
+            nxt = self.node.next_task_for(rid)      # 从调度表取下一任务
+            if nxt is None:
+                return                              # 该机任务已派完
+            goal = ExecuteTask.Goal(task_id=nxt.id, pose=nxt.pose)
+            fut = self.clients[rid].send_goal_async(goal)
+            fut.add_done_callback(lambda f, r=rid: self.on_accepted(r, f))
+            self.chain[rid].append(nxt.id)
+
+    def on_accepted(self, rid, future):
+        gh = future.result()
+        if gh is None or not gh.accepted:           # 拒绝：任务回账本排下一轮
+            tid = self.chain[rid].pop(0)
+            self.node.requeue(tid, reason="rejected")
+            self.pump(rid)
+            return
+        self.handles.setdefault(rid, []).append(gh)
+        gh.get_result_async().add_done_callback(   # 结果回调驱动下一环
+            lambda f, r=rid, g=gh: self.on_result(r, g, f))
+
+    def on_result(self, rid, gh, future):
+        tid = self.node.task_of(gh)                 # 由 goal 反查任务
+        code = future.result().status
+        self.chain[rid].remove(tid)                 # 出窗
+        self.node.mark_result(tid, code)            # 账本更新 + 事件广播
+        self.pump(rid)                              # 立即补窗：空窗最小化
+    </code></pre>
+    <p>解读：派发链的核心是"<strong>结果回调 → 补窗</strong>"这一条闭环，它让任务之间的衔接延迟从"调度节拍级"（100 ms）降到"回调级"（几毫秒）。三个工程点：<strong>（1）</strong><code>pump</code> 用 while 循环一次补齐到深度：机器人空闲时可能积压多个可派任务，单发会让每个任务各付一次全网往返；<strong>（2）</strong>拒绝路径立刻回队并重新补窗：任务不会因为一次拒绝而丢失或卡窗；<strong>（3）</strong>回调注册用默认参数 <code>r=rid</code> 固定循环变量，Python 闭包晚绑定（late binding）的经典坑，不固定的话所有回调都会读到最后一台机器人的 rid，而且这种 bug 在测试机（1 台）永远复现不了。真实实现里还要给每个 goal 记一个"派发时刻"用于统计派发时延；<code>task_of(gh)</code> 的反查表要在发送时同步维护，回调里再遍历查找会引入不一致窗口。</p>
+
+    <p><strong>片段 3：取消与对账，把失控的任务收回来</strong></p>
+    <pre class="code"><code>    def cancel_task(self, rid, tid):
+        """抢占/掉线时取消任务：取消是异步的，必须等结果确认。"""
+        gh = self.handle_of(rid, tid)
+        if gh is None:
+            return                                  # 已被接受但句柄未到：下轮对账处理
+        fut = gh.cancel_goal_async()
+        fut.add_done_callback(lambda f: self.on_canceled(rid, tid, f))
+
+    def on_canceled(self, rid, tid, future):
+        resp = future.result()
+        # 机器人可能"已开始执行、拒绝取消"：此时必须记 FAILED 并按已执行处理
+        if resp is not None and len(resp.goals_canceling) &gt; 0:
+            self.chain[rid].remove(tid)
+            self.node.mark_result(tid, status="CANCELED")
+        else:
+            self.node.mark_result(tid, status="CANCEL_REFUSED")
+            self.node.requeue(tid, reason="cancel_refused")</code></pre>
+    <p>解读：取消是"请求"不是"命令"，动作协议里机器人完全可以响应"我拒绝取消"（例如已过了承诺点）。这段代码把三种结局都收敛到账本上：取消成功（任务作废，不再重排）、取消被拒（任务继续执行，不得重排，否则同一任务出现两个执行者）、句柄缺失（交下一轮对账）。<strong>"取消被拒后绝不能重排"是很多团队的真实教训</strong>：调度器以为取消成功，把任务给了别人，于是两台机器人同时执行一个任务。配套的对账逻辑（片段 4 的 LOST 处置要做的第一件事是查询、查证后再决定是否重排）与此呼应：<strong>调度器永远不能假设自己的命令已生效，只认机器人上报的事实</strong>。</p>
+
+    <p><strong>片段 4：心跳对账与 LOST 处置</strong></p>
+    <pre class="code"><code>    def reconcile(self):
+        """1 Hz 对账：账本里的 RUNNING 与心跳实况抽样比对。"""
+        now = self.now()
+        for rid, tasks in self.node.running_by_robot().items():
+            hb = self.node.last_heartbeat.get(rid)
+            if hb is None or now - hb[0] &gt; 5.0:      # 心跳缺失 → 整机失联
+                for t in tasks:
+                    self.node.mark_lost(t, reason="robot_offline")
+                continue
+            reported = hb[1].current_task_id         # 心跳里带当前任务 ID
+            for t in tasks:
+                if t.id != reported and t.age(now) &gt; 5.0:
+                    # 在线但任务对不上：先问机器人，再决定是否重排
+                    self.query_and_recover(rid, t)</code></pre>
+    <p>解读：对账函数是调度器的"良心"，它承认自己的账本可能与世界脱节，并周期性拉回真相。两条判定路径对应两种故障：<strong>心跳缺失</strong>是整机级失联，直接标记该机全部运行中任务为 LOST（不重排，先登记，等 074 章的故障仲裁判决）；<strong>任务 ID 不一致</strong>是"在线但账目不符"，先通过服务查询机器人实况（可能在重连、可能在完成瞬间），查证后再决定。注意 <code>t.age(now) &gt; 5.0</code> 的宽限：任务刚派发的 1–2 秒内，心跳里还没更新到新任务 ID 是正常现象，不加宽限会产生假阳性对账风暴。这套"先查证、后处置"的纪律，是 074 章故障恢复的核心思想在调度器里的预演。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>单线程执行器跑调度</strong>：重排 40 ms 期间心跳回调被堵，连续几轮应验后系统误判掉线。修复：MultiThreadedExecutor + 回调组划分 + 短临界区锁。</li>
+      <li><strong>派发动作后同步等待结果</strong>：<code>spin_until_future_complete</code> 卡死本机线程，取消与重排全部停摆。修复：全异步回调链（片段 2），任何"等"都是敌人。</li>
+      <li><strong>预派深度放到最大</strong>：把整条链一次发完，紧急插入时无法取消，机器人还在做一小时前的计划。修复：滑窗深度 2，结果驱动补窗。</li>
+      <li><strong>取消被拒后仍重排</strong>：任务被两台机器人同时执行，重复送达/搬运。修复：取消被拒 → 标记 CANCEL_REFUSED 并保留原执行者，只有对账确认失败才重排。</li>
+      <li><strong>忽略 goal 拒绝</strong>：机器人拒绝任务（电量不足、能力不符）后账本还显示 RUNNING，任务凭空消失。修复：<code>accepted == false</code> 分支必须回队并记录拒绝原因。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把片段 1 的 <code>MultiThreadedExecutor(num_threads=4)</code> 改成默认单线程执行器，构造"6 台机器人 2 Hz 上报 + 10 Hz 重排"的负载，预测你会在日志里看到什么现象，并解释根因。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>现象：状态消息延迟抖动大、对账频繁误报 LOST、动作结果回调延迟；根因是重排与回调在同一线程串行。验证方法：给 plan_tick 打耗时日志，观察它期间心跳回调的间隔。</div></details>
+      </li>
+      <li>计算派发时延预算：机器人执行完任务判定 10 ms、结果消息传输 30 ms、结果回调到补窗派发 5 ms、新任务接受确认 30 ms。预派深度 0（纯结果驱动）与深度 2 分别的空窗时长是多少？<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>深度 0 空窗 ≈ 75 ms（整条往返）；深度 2 时下一个任务已在机器人手里，空窗 ≈ 10 + 5 ms（本地衔接）。这就是预派遮掩网络 RTT 的量化收益。</div></details>
+      </li>
+      <li>给片段 3 增加重排防御：当 CANCEL_REFUSED 的任务被再次尝试取消前，必须先查询执行机上报的当前任务 ID；写出查询的服务消息字段与状态机迁移，并说明为什么"查询"优先级应高于"再次取消"。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>查询 = 获取事实，取消 = 改变事实；事实明确后再动作，可避免对"已经完成 99%"的任务发取消（拒绝概率高且浪费）。字段建议 query_task(robot_id) → (task_id, phase, percent)。</div></details>
+      </li>
+      <li>搭建一个 2 机器人、20 个顺序任务的压测：连续运行 1 小时，统计"任务完成→下一任务开始"的平均空窗、对账误报次数、执行器线程占用。写出你的观测契约（哪些指标、什么采样率、验收线多少）。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>观测：空窗 P95 ≤ 150 ms、误报 ≤ 1 次/小时、CPU < 30%；数据源用 task_event 话题做时间差统计；各机自报的时间戳口径不一，不作为数据源。验收线超标时的第一排查顺序：预派深度 → 线程数 → 锁竞争。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>接口三件套：上游话题接入（事件流 + 去重）、下发用动作（生命周期 + 可取消）、状态广播（Transient-local 快照 + 事件审计）。</li>
+      <li>调度器必须多线程：MultiThreadedExecutor + 三类回调组分工，账本用短临界区锁；单线程跑重排等于自断心跳。</li>
+      <li>预派深度 2 是标准配置：遮掩 RTT 的同时保留可撤销性；宽度由"网络时延 vs 任务不确定性"决定。</li>
+      <li>派发链靠结果回调驱动，回调即补窗；取消是请求不是命令，取消被拒后绝不能重排同一任务。</li>
+      <li>对账先查证再处置；LOST 只登记不擅自重排。下一章转入保障主题：<strong>多机器人服务质量保障</strong>，时延、抖动、丢失的工程化守护。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch070.html">← 第 070 章：多机器人协同调度</a>
+    <a class="next" href="ch072.html">第 072 章：多机器人服务质量保障 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第019章 生命周期节点与系统启动编排 | 多机器人协同学习课程 · ROS2 通信与系统集成</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · 通信基础与系统搭建</span>
+    <span class="sep">/</span>
+    <span>第 019 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · 通信基础与系统搭建</div>
+    <h1>第 019 章：生命周期节点与系统启动编排</h1>
+    <p class="lead">"重启一下就好了"是启动竞态最贵的伪装。生命周期节点把"什么时候能干活"变成受控状态机，启动顺序从祈祷变成编排。</p>
+    <ul class="meta">
+      <li>主题：通信基础 / 系统生命周期</li>
+      <li>关键机制：生命周期状态机、激活/去激活语义、launch 事件编排、就绪上报</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 006 章、第 007 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解启动竞态的本质与代价，说清"sleep 编排"为什么是赌博：它用时间近似依赖，没有调度该有的语义。</li>
+      <li>掌握生命周期节点状态机：Unconfigured/Inactive/Active/Finalized 与四个转换回调的职责边界。</li>
+      <li>会设计分层启动顺序：硬件驱动 → 感知 → 定位与地图 → 控制与协同，以及反向的关闭顺序。</li>
+      <li>会用 launch 事件机制（状态转换事件、进程事件）做节点级编排，知道每步的验收标准。</li>
+      <li>会做跨机编排：每台机器人本地编排 + 车队级"就绪上报/等待"协调，故障局部化、单机故障不阻塞全队。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>前 18 章把通信层的每个零件都讲完了，但它们组装上线的时刻会冒出一个新的幽灵：<strong>竞态</strong>。控制器在定位还没收敛时就发出第一条速度；调度器把任务派给了"图里存在但还没准备好"的机器人；服务调用发向一个 300 毫秒后才起来的目标，失败一次，重启一下，就好了。这类"偶尔失败"是启动竞态最贵的伪装：它让团队把时间花在"玄学复现"上，而根因只是顺序没定义。</p>
+    <p>教科书式的解决分两层：<strong>节点级</strong>用生命周期节点（lifecycle node）把"初始化"与"工作"分成受控的阶段；<strong>系统级</strong>用启动编排把 20 台机器人、上百个节点的启动/关闭顺序定义成显式的依赖图。这套机制是 Nav2 等成熟栈的标准做法，也是第 020 章阶段项目"一键启动、有序关闭"的直接支撑。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 启动竞态：三种典型伤与它们的伪装</h3>
+    <ul>
+      <li><strong>数据未就绪型</strong>：控制器在 map/odom 到位前启动，第一帧决策基于空数据。伪装：偶发"开机后前几秒行为怪异"，因为几次重试后数据自己到了。</li>
+      <li><strong>服务/动作未就绪型</strong>：客户端在服务端注册前调用，超时失败后重试成功。伪装：偶发"第一个任务失败，第二个就好"。</li>
+      <li><strong>资源竞争型</strong>：两个节点同时抢同一设备/端口/共享资源，谁先谁后看调度运气。伪装：低频、难复现、日志里两边都"正常"。</li>
+    </ul>
+    <p>三种伤的根因相同：<strong>系统没有把"依赖满足"变成一个可表达、可等待、可验证的事实，只能用时间（sleep）去近似它。</strong>固定的 sleep 在开发机上够用，在负载高的现场就不够；一味把 sleep 加长去"解决问题"，就是把一个偶发 bug 换成一个确定性的慢启动，问题还在，只是不刺眼了。</p>
+
+    <h3>2. 生命周期状态机：把"能干活"显式化</h3>
+    <p>生命周期节点在普通节点外增加了一台显式状态机，核心状态与转换：</p>
+    <table>
+      <tr><th>状态/转换</th><th>含义</th><th>典型动作（回调职责）</th></tr>
+      <tr><td>Unconfigured → Inactive（configure）</td><td>资源分配与配置校验</td><td>读参数、建发布/订阅对象、打开设备、校验配置；<strong>但不产出业务数据</strong></td></tr>
+      <tr><td>Inactive → Active（activate）</td><td>开始工作</td><td>启动定时器、激活数据流、开始发布/响应</td></tr>
+      <tr><td>Active → Inactive（deactivate）</td><td>停止工作但保留资源</td><td>停止输出、停止计时；<strong>可供安全接管</strong>（急停依赖它）</td></tr>
+      <tr><td>Inactive → Unconfigured（cleanup）</td><td>释放资源</td><td>关设备、释放内存，回到可重新配置的洁净态</td></tr>
+      <tr><td>任意 → Finalized（shutdown）</td><td>终止</td><td>关闭路径：进程内不再工作；由系统负责退出</td></tr>
+    </table>
+    <p>语义关键点：<strong>Inactive 状态下端点"存在但不产数据"</strong>（处于未激活的发布/订阅），这让"等依赖就绪"可以基于状态查询完成，无需数据探测；<strong>deactivate 停止输出但保留资源</strong>，这是安全关闭与故障切换的抓手：一个机器人要进维护模式，应先用 deactivate 让控制器体面停机，再走关闭流程；直接杀进程是典型反例。转换是"协议"：每个转换的成败都有明确返回值，编排者可以依据结果继续或重试，<strong>竞态管理的本质就是把"等待"变成"查询状态 + 事件驱动"</strong>。</p>
+
+    <h3>3. launch 事件编排：不靠时钟，靠事件</h3>
+    <p>启动编排的自动化手段是 launch 的事件系统：<strong>进程事件</strong>（某进程启动/退出）与<strong>状态转换事件</strong>（某生命周期节点从 X 到 Y）。编排逻辑是"收到事件 → 触发动作（启动下一组/激活下一批/发通知）"，以事件取代"等 N 秒再说"。两种粒度的编排：</p>
+    <ul>
+      <li><strong>进程级</strong>：先起驱动进程，等它退出才算失败（只要活着就算就绪），适合无生命周期的普通节点。</li>
+      <li><strong>生命周期级</strong>：等某节点进入 Inactive 才 activate 下一环，精确、可查询、可失败重试，是首选。</li>
+    </ul>
+    <p>对应工具还有"生命周期管理器"模式（被 Nav2 等广泛采用）：一个管理器节点持有目标清单，按顺序对每个节点执行 configure/activate，周期性巡检状态，发现异常可自动降级或重启。<strong>管理器模式的价值是"可编程的编排"</strong>，清单、顺序、重试策略都进配置，不散落在 launch 的代码分支中。本章的跨机编排正是它的分布式版本。</p>
+    <table>
+      <tr><th>编排手段</th><th>依赖表达</th><th>失败定位</th><th>实现复杂度</th><th>适用</th></tr>
+      <tr><td>固定 sleep 序列</td><td>无，用时间近似</td><td>差：负载变化即失效</td><td>最低</td><td>临时脚本，不进正式部署</td></tr>
+      <tr><td>进程启动事件</td><td>进程存在即视为就绪</td><td>中：进程存活不等于功能就绪</td><td>低</td><td>无生命周期的普通节点</td></tr>
+      <tr><td>状态转换事件</td><td>逐节点状态精确表达</td><td>好：链条停在哪一环即病因</td><td>中</td><td>关键链路，首选</td></tr>
+      <tr><td>生命周期管理器</td><td>清单加重试策略配置化</td><td>好：集中巡检与降级</td><td>中高</td><td>节点多、策略复杂的大型栈</td></tr>
+    </table>
+    <p>选择顺序与依赖的表达精度一致：能给目标节点加生命周期就用状态事件；加不了生命周期但进程可靠就用进程事件；固定 sleep 只允许出现在一次性调试脚本里。<strong>编排手段的升级路径正是系统成熟的路径：从"猜时间"到"看状态"，再到"清单化的策略"。</strong></p>
+
+    <h3>4. 分层启动顺序：谁先谁后，有物理依据</h3>
+    <p>启动顺序由数据依赖的拓扑排序决定，与工程口味无关：</p>
+    <ol>
+      <li><strong>硬件/驱动层</strong>：底盘驱动、传感器驱动，一切数据的源头，最先。</li>
+      <li><strong>感知层</strong>：点云/图像处理、检测，依赖驱动。</li>
+      <li><strong>定位与地图层</strong>：定位、地图服务，依赖感知（地图服务可以先于定位，让后续查询有据）。</li>
+      <li><strong>控制与协同层</strong>：运动控制、编队、调度，依赖定位与地图；<strong>它们最后激活、最先关闭</strong>。</li>
+    </ol>
+    <p>关闭是启动的逆序，且有一层特殊语义：<strong>控制层先 deactivate（停止输出）再清理</strong>，反过来的后果是"先关感知，控制层还在用旧数据跑"的混乱窗口。给"关闭顺序"写一条验收：任一层关闭时，上一层必须已静默。这就是"体面停机"。</p>
+    <div class="formula">
+      串行编排上界 T_serial = Σ t_i；本地自治编排 T_parallel ≈ max(t_i) + t_report
+      <span class="note">20 台、单台启动 8–15 s、上报与聚合按亚秒级计：串行累加为 160–300 s，自治并行约 9–16 s，差距一个数量级以上，且并行模式下单台故障不阻塞其余成员开工</span>
+    </div>
+    <p>数值算例把重试策略也说清楚：本机编排对失败步骤设"间隔 5 s、重试 3 次"的预算，单节点失败判定上界约 15 s，超过即进入降级分支并上报 not_ready。对照上式，整机启动的期望时间由最慢的依赖链与重试预算里的较大者决定；若把重试次数加到 10 次，单点等待上界被拉到 50 s 量级，全队就绪时间随之被拖长，这就是"重试要有限度、降级要及时"的定量理由。<strong>编排器的每个参数都影响系统级的时间指标，所以它们应当出现在设计表里，不该散落在代码分支中。</strong></p>
+
+    <h3>5. 跨机编排：本地自治 + 车队级就绪协调</h3>
+    <p>20 台机器人不可能由一个中央进程逐个远程激活，遥控台要依赖 20 条通信链路的可用性，任何一台启动慢都会阻塞全队，故障域大得离谱。正确结构是两层：</p>
+    <ul>
+      <li><strong>本地编排（每台机器人内）</strong>：由本机 launch/管理器按上述分层顺序拉起所有节点，不依赖网络。启动完成的判据是"本机关键节点全 Active"。</li>
+      <li><strong>车队级协调</strong>：每台机器人完成本地编排后发布一条"就绪上报"（如 <code>/fleet/ready</code>，携带 robot_id、boot_id、时间戳，Reliable + Transient-local）；调度台收集 N 条就绪后开始发任务。<strong>调度台不指挥"怎么启动"，只关心"谁可以接活"</strong>，耦合最小化。</li>
+    </ul>
+    <p>设计细节两个：<strong>（1）</strong>就绪上报要幂等且带 boot_id，机器人重启后重新上报，调度台据此更新"这一台是新生命周期的"。<strong>（2）</strong>调度台对未就绪机器人要有超时策略（等 30 秒还没齐，先用已就绪的开工并记录缺失清单），<strong>永不把"全队就绪"设为唯一开工条件</strong>，那是把局部故障放大成全局故障。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>给"4 台机器人 + 调度台"设计启动编排，产出三张可评审的表：</p>
+    <ol>
+      <li><strong>状态表</strong>：每个节点在 configure/activate 阶段各做什么（谁能建资源、谁开始产数据）。</li>
+      <li><strong>顺序表</strong>：启动次序（四层依赖）与关闭次序（逆序 + 停输出在前），每步的"就绪判据"（状态查询/数据验收）。</li>
+      <li><strong>故障表</strong>：每步失败时的动作（重试几次、降级到什么模式、告警到哪）。</li>
+    </ol>
+
+    <h3>启动顺序表（单台机器人）</h3>
+    <table>
+      <tr><th>步骤</th><th>节点</th><th>就绪判据</th><th>失败动作</th></tr>
+      <tr><td>1</td><td>驱动（底盘/雷达/IMU）</td><td>进程存活且设备话题有数据</td><td>重试 3 次；失败进维护模式并上报</td></tr>
+      <tr><td>2</td><td>感知（scan 过滤/检测）</td><td>状态 Inactive</td><td>告警；允许以无感知模式限制运行</td></tr>
+      <tr><td>3</td><td>定位与地图</td><td>状态 Inactive 且地图服务可查询</td><td>拒绝进入自主模式（仅在手动模式下继续）</td></tr>
+      <tr><td>4</td><td>控制/编队/任务执行</td><td>前 3 步全就绪后 activate</td><td>保持 Inactive，等待依赖恢复</td></tr>
+      <tr><td>5</td><td>就绪上报</td><td>本机关键节点全 Active</td><td>无（上报本身可重试）</td></tr>
+    </table>
+
+    <div class="box key">
+      <span class="box-title">设计决策：为什么不直接"先启动全部节点、谁出错谁重试"？</span>
+      <p>因为没有依赖信息的重试会陷入三种恶性循环：<strong>（1）</strong>下游反复失败在下游自己的日志里，真正未就绪的上游没人看；<strong>（2）</strong>节点全启动后"图里全绿"，用图检查（第 006 章）也发现不了"控制已 Active 但地图还在加载"的语义不一致；<strong>（3）</strong>重试风暴互相挤压资源，恰好拖慢还没就绪的上游。<strong>生命周期编排把依赖关系变成显式的边与门：上游未就绪，下游根本不被允许激活</strong>，问题只有一个发生地（激活被拒 + 原因），重试只发生在一个地方（编排器）。这比"人人自己重试"的可观测性和可维护性高一个量级。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：生命周期节点骨架，三个回调的职责切分</strong></p>
+    <pre class="code"><code>from rclpy.lifecycle import LifecycleNode, TransitionCallbackReturn
+
+class ControllerLifecycle(LifecycleNode):
+    """运动控制器：configure 备料、activate 开工、deactivate 体面停机。"""
+    def __init__(self, robot_id):
+        super().__init__("controller", namespace=f"robot{robot_id}")
+        self.timer = None
+
+    def on_configure(self, state):
+        # 只做"资源与配置"：读参数、建端点、开设备；不产出任何业务数据
+        self.declare_parameter("control_rate", 100.0)
+        self.pub = self.create_lifecycle_publisher(Twist, "cmd_vel",
+                                                   QoSProfile(depth=1))
+        # 配置校验失败必须返回 FAILURE：让编排器知道"这一环没备好"
+        rate = self.get_parameter("control_rate").value
+        if not 10.0 &lt;= rate &lt;= 500.0:
+            self.get_logger().error("[CFG_INVALID] control_rate 超出安全范围")
+            return TransitionCallbackReturn.FAILURE
+        return TransitionCallbackReturn.SUCCESS
+
+    def on_activate(self, state):
+        # 真正开工：此时依赖（定位/地图）已由编排器确认就绪
+        self.timer = self.create_timer(0.01, self.tick)
+        self.get_logger().info("[CONTROL_ACTIVE] 控制器开始工作")
+        return super().on_activate(state)      # 基类处理生命周期发布器的激活
+
+    def on_deactivate(self, state):
+        # 体面停机：先停止输出，这是"关闭顺序"里的关键一步
+        if self.timer is not None:
+            self.destroy_timer(self.timer)
+            self.timer = None
+        self.get_logger().info("[CONTROL_INACTIVE] 输出已停止")
+        return super().on_deactivate(state)
+
+    def tick(self):
+        self.pub.publish(Twist())              # 简化示例：真实值来自控制算法</code></pre>
+    <p>解读：<strong>（1）</strong>三个回调的"职责切分"是生命周期最核心的纪律：configure 里出现数据发布、activate 里才建立设备连接，都是典型的职责错位，后果分别是"未激活状态偷跑数据"与"激活转换变成一个可能超时的重活"。<strong>（2）</strong>配置校验失败返回 FAILURE（注释里的 <code>[CFG_INVALID]</code> 事件码回扣第 018 章的结构化日志）：编排器因此能区分"启动失败"与"启动挂起"，进而决定重试还是降级。<strong>（3）</strong>deactivate 里先停定时器（停止输出），注释点明它与"关闭顺序"的关系，<strong>生命周期的价值一半在启动，一半在停机</strong>：机器人维护、故障切换、急停之后的"安全态"，都靠这条路径。</p>
+
+    <p><strong>片段 2：launch 事件编排，按状态转换推进启动链</strong></p>
+    <pre class="code"><code>from launch import LaunchDescription
+from launch.actions import EmitEvent, RegisterEventHandler
+from launch.event_handlers import OnStateTransition
+from launch.events import ChangeState
+from launch_ros.actions import LifecycleNode, Node
+
+def generate_launch_description():
+    perception = LifecycleNode(package="fleet_sense", executable="perception",
+                               namespace="robot1", name="perception")
+    # 定位节点配置完成后才 activate 感知：依赖边显式化，取代等 5 秒
+    localization = LifecycleNode(package="fleet_nav", executable="localization",
+                                 namespace="robot1", name="localization")
+    # 事件编排：感知进入 Inactive（配置完成）→ 请求激活
+    activate_perception = RegisterEventHandler(OnStateTransition(
+        target_lifecycle_node=perception, goal_state="inactive",
+        entities=[EmitEvent(event=ChangeState(
+            lifecycle_node_matcher=lambda a: a is perception,
+            transition_id="activate"))]))
+    # 感知 Active 之后才激活控制器：链式推进，一根链条每环都可验证
+    controller = LifecycleNode(package="fleet_ctrl", executable="controller",
+                               namespace="robot1", name="controller")
+    activate_controller = RegisterEventHandler(OnStateTransition(
+        target_lifecycle_node=perception, goal_state="active",
+        entities=[EmitEvent(event=ChangeState(
+            lifecycle_node_matcher=lambda a: a is controller,
+            transition_id="activate"))]))
+    return LaunchDescription([perception, localization, controller,
+                              activate_perception, activate_controller])</code></pre>
+    <p>解读：<strong>（1）</strong>这段编排的形态是"链条"：每个节点进入目标状态触发下一个动作。<strong>关键优势是失败定位变得平凡</strong>，链条停在哪一环，问题就在哪一环（对比"全启动后等数据"：不动时无从下手）。<strong>（2）</strong>每个节点都是生命周期节点时用状态事件；普通节点（无生命周期）则用进程事件（进程启动即视为就绪），两种粒度按被编排对象的能力选择，注释里给出原则。<strong>（3）</strong>launch 的事件 API 在发行版间有细节差异（事件对象与匹配器写法以对应版本为准），但"事件驱动链式推进"的结构稳定。真实系统若链条长、条件多，升级为"生命周期管理器 + 配置清单"模式（第 3 节），launch 只负责把管理器拉起来。</p>
+
+    <p><strong>片段 3：就绪上报，跨机编排的握手</strong></p>
+    <pre class="code"><code>class ReadyReporter(Node):
+    """本机编排完成后的就绪上报：让车队级协调与本地启动解耦。"""
+    def __init__(self, robot_id):
+        super().__init__("ready_reporter", namespace=f"robot{robot_id}")
+        self.robot_id = robot_id
+        qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
+                         durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        # Transient-local：调度台晚启动也能立刻收到"谁已就绪"
+        self.pub = self.create_publisher(Ready, "/fleet/ready", qos)
+
+    def report_ready(self, boot_id, key_nodes):
+        # 幂等上报：每 5 s 重复一条；重启后携带新 boot_id 再次上报
+        msg = Ready()
+        msg.robot_id = self.robot_id
+        msg.boot_id = boot_id
+        msg.stamp = self.get_clock().now().to_msg()
+        msg.nodes_active = key_nodes            # 关键节点清单：调度台可展示明细
+        self.pub.publish(msg)
+
+class FleetGate(Node):
+    """调度台的发车门：收集就绪上报，决定"何时允许接任务"。"""
+    def __init__(self, expected_ids, quorum=1):
+        super().__init__("fleet_gate")
+        self.expected = set(expected_ids)
+        self.ready = {}                         # rid -&gt; boot_id（最新一次）
+        self.quorum = quorum                    # 至少 N 台就绪即可开工
+        self.create_subscription(Ready, "/fleet/ready", self.on_ready, QoSProfile(depth=10))
+
+    def on_ready(self, msg):
+        if self.ready.get(msg.robot_id) != msg.boot_id:   # boot 变化=重启，重新登记
+            self.ready[msg.robot_id] = msg.boot_id
+            self.get_logger().info(f"[FLEET_READY] robot{msg.robot_id} 就绪")
+
+    def can_dispatch(self):
+        return len(self.ready) &gt;= self.quorum   # 永不等待"全队"，见第 5 节设计</code></pre>
+    <p>解读：<strong>（1）</strong>"本地编排完成 → 上报就绪"这条握手把两层解耦：机器人自己知道什么时候备好了，调度台只管理"谁可派单"，<strong>跨机启动不再需要中央进程逐台操作，网络中断也不影响各机完成本地启动</strong>。<strong>（2）</strong><code>boot_id</code> 是整个设计的灵魂：它区分"同一台机器人的不同生命周期"，让"重启后重新上报"在语义上成为幂等的正常更新。没有它，调度台无法区分"重复消息"与"真正重启"。<strong>（3）</strong><code>can_dispatch</code> 的门槛取 quorum（按任务需要的最小规模），注释再次点题：<strong>把"全队就绪"设成开工条件等于把任何单机故障升级为全局故障</strong>；正确姿势是按任务需要的规模设门槛（如 4 台中至少 1 台），缺员清单进值班界面。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>sleep 编排</strong>：launch 里一串"等 3 秒启动下一个"，负载一高全乱。修复：事件驱动（状态转换/进程事件）；无法接入事件的进程改用"就绪判据 + 超时"轮询，固定睡眠淘汰。</li>
+      <li><strong>configure 里做重活</strong>：设备连接、大文件加载放进 configure，转换超时或阻塞编排链。修复：configure 只做轻量资源准备与校验；重活放到 activate 或异步任务，并给出进度上报。</li>
+      <li><strong>忘记 deactivate 语义</strong>：关闭时直接杀进程，控制输出与感知同时断，留下一个"乱窗口"。修复：关闭逆序 + 先 deactivate（停输出）再 cleanup；把"停输出"写进验收。</li>
+      <li><strong>管理器成为新瓶颈</strong>：生命周期管理器同步等待 20 台，一台慢全家卡。修复：本地管理器只管网内本地节点；跨机走就绪上报 + quorum，异步、可超时、可降级。</li>
+      <li><strong>就绪上报没有 boot_id</strong>：重启后的上报被当作重复消息忽略，调度台认为"仍然是旧状态"。修复：boot_id（如启动时间戳/随机 ID）必带；收到即覆盖登记。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>排序题：给出下列节点的启动顺序与关闭顺序（并写判据）：雷达驱动、定位、地图服务、编队控制器、遥控输入。哪个节点的"先停输出"最关键？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>启动：雷达 → 地图服务 → 定位 → 编队控制 / 遥控输入（遥控可在控制前，但控制激活前不得输出）。关闭：先停编队输出（安全关键），再定位、地图、驱动。</div></details>
+      </li>
+      <li>改配置并预测：把片段 2 中"感知 Active → 激活控制器"的事件目标从 <code>perception</code> 改成 <code>localization</code>，预测行为：控制器会在什么条件下激活？会引入什么风险？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>控制器改等定位（原设计等感知），若感知是定位的上游，链条被绕开，可能出现"定位未激活但控制器已激活"的依赖漏洞。事件图的边=依赖图的边，改边即改语义。</div></details>
+      </li>
+      <li>设计题：为一个"搬运任务系统"设计故障表：某台机器人定位节点在启动阶段 configure 失败。给出本地编排的重试策略（次数/间隔）、降级模式（可做什么/不可做什么）、车队侧的通知内容。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>重试 3 次×5 s；降级：仅手动遥控，禁自主任务；车队侧：该机 not_ready 上报+告警，调度按 quorum 继续。参考本章故障表。</div></details>
+      </li>
+      <li>推导题：20 台机器人、每台启动耗时 8–15 s（波动）。方案 A：中央控制器同步启动每台（每台等前一台完成）；方案 B：各机本地启动 + 就绪上报。计算两方案"全队可开工"时间区间，并说明方案 B 在"一台失败"时的差异。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>A：累加 160–300 s，且单点故障阻塞全队；B：取决于最慢一台（8–15 s）再加上报延迟，故障机不影响他人，差距是数量级的，这就是自治编排的收益。</div></details>
+      </li>
+      <li>排障题：现象，开机后前几个任务偶发"目标不可达"，十秒后一切正常。用本章概念列出至少三条怀疑点与对应的验证方法（用生命周期/就绪机制如何提前发现）。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>①控制器早于地图就绪激活；②调度台未等待 ready 就派单；③服务端未就绪的首次调用超时。验证：状态查询时间线 + /fleet/ready 时间戳与派单时间对比。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>启动竞态三类伤（数据/服务/资源）同根：用时间近似依赖。纪律：把依赖变成状态与事件。</li>
+      <li>生命周期状态机：configure 备料、activate 开工、deactivate 停输出保留资源、cleanup 释放；每步成败显式返回。</li>
+      <li>编排用事件驱动：状态转换事件/进程事件链式推进；链条式结构的失败定位平凡。</li>
+      <li>启动顺序按数据依赖分层，关闭逆序且"控制先停输出"；写进验收。</li>
+      <li>跨机编排 = 本地自治 + 就绪上报（boot_id + TL）+ quorum 开工；永不等待"全队就绪"。</li>
+      <li>下一章是阶段项目：<strong>双机器人通信与遥控</strong>，把第一到第十九章的零件组装成一台可验收的系统。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch018.html">← 第 018 章：多机器人日志聚合与监控</a>
+    <a class="next" href="ch020.html">第 020 章：阶段项目：双机器人通信与遥控 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

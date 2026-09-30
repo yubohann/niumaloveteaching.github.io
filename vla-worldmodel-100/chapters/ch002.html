@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第002章 基于视觉语言动作数据集的预处理流程 | 具身智能学习课程 · VLA 与世界模型联合训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · 基础框架与联合训练</span>
+    <span class="sep">/</span>
+    <span>第 002 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · 基础框架与联合训练</div>
+    <h1>第 002 章：基于视觉语言动作数据集的预处理流程</h1>
+    <p class="lead">本章处理训练管线的源头：把原始演示数据编译成联合训练可直接消费的时间窗样本，覆盖 episode 层级结构、窗口切法、动作归一化、图像与语言预处理以及防泄漏的划分原则。</p>
+    <ul class="meta">
+      <li>主题：数据管线 / 数据预处理</li>
+      <li>关键公式：a<sub>norm</sub> = 2·(a - q<sub>01</sub>)/(q<sub>99</sub> - q<sub>01</sub>) - 1</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 001 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解视觉语言动作数据集（VLA Dataset）的 episode 层级结构，掌握观测、动作、指令、时间戳四类字段的职责。</li>
+      <li>掌握联合训练时间窗的构造方法：上下文帧数 k、动作块 H、预测步长 m 的索引关系与对齐规则。</li>
+      <li>掌握动作的分位数归一化（Quantile Normalization）与推理端反变换，理解重尾维度为何不用均值方差。</li>
+      <li>会设计图像增广与语言预处理的强度策略，保证增广不破坏动作标签的语义。</li>
+      <li>能诊断数据泄漏、时间戳漂移、变长补齐等常见数据缺陷并给出修复方案。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>预处理决定训练信号的质量上限。<strong>模型只能学到数据允许它学的东西，而同样的原始数据在不同窗口与归一化方案下，可以训练出性能差异明显的模型</strong>。001 章的骨架假定了“样本已经是整齐的时间窗”，本章补上从原始数据到该形态的全部工序。</p>
+    <p>视觉语言动作数据的特殊之处在于三路模态共享同一时间轴：图像帧、动作序列、语言指令必须以步为单位严格对齐；动作块（Action Chunk）与预测步长（Prediction Horizon）的索引又必须同时服务两个监督目标。机器人数据规模远小于视觉语言预训练数据，统计量泄漏与标注噪声都会被放大。<strong>本章建立一份可复核的数据契约，供后续训练章节共同使用。</strong></p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 数据层级与原子单位</h3>
+    <p>数据集按两级组织：一条 episode 是一次完整任务演示，含若干按时序排列的 step；每个 step 至少提供观测 o<sub>t</sub>（图像与本体感知）、动作 a<sub>t</sub> 与两路时间戳。<strong>episode 是划分与统计的原子单位，切分时必须整条分配，禁止按帧打散。</strong>相邻帧高度相关，按帧随机划分会把同一轨迹的近邻帧分到训练与验证两侧，验证指标虚高而失去意义。</p>
+    <p>指令通常挂在 episode 级别：一条演示对应一句任务描述。同义改写按概率替换以增强指令鲁棒性，验证集保留少量未见过改写以检验语言泛化。</p>
+
+    <h3>2. 时间窗构造与对齐</h3>
+    <p>联合训练对每个窗口提出三重要求：提供 k 帧观测上下文、H 步动作块、m 步未来观测，三者共享同一时间基准 t。</p>
+    <div class="formula">
+      窗口 [t-k, t+H+m] ：观测 o<sub>t-k:t</sub>、动作 a<sub>t:t+H-1</sub>、未来 o<sub>t+1:t+m</sub>
+      <span class="note">t 为窗口锚点；k 取 1–2，H 取 8–16，m 取 5–15；窗口总长即 k+H+m 步</span>
+    </div>
+    <p>合法锚点范围为 t ∈ [k, N-H-m]，N 为 episode 步数，越界窗口在索引期排除，运行期不再补齐。<strong>动作块在相邻窗口间刻意重叠（stride 小于 H）</strong>，同一动作在不同上下文中被多次监督；重叠过密放大冗余，stride 一般取 H/4 到 H/2。</p>
+    <p>对齐规则：o<sub>t</sub> 与 a<sub>t</sub> 同刻，a<sub>t</sub> 执行后产生 o<sub>t+1</sub>。世界模型监督目标是 o<sub>t+1:t+m</sub>，条件端含 a<sub>t</sub>，这一错位关系最容易写错，是防泄漏检查的重点。</p>
+
+    <h3>3. 动作归一化与反变换</h3>
+    <p>动作各维度的量纲差异极大（关节角弧度、夹爪开度、末端位移米），必须归一化后输入网络。常规做法是分位数归一化：</p>
+    <div class="formula">
+      a<sub>norm</sub> = 2 · (a - q<sub>01</sub>) / (q<sub>99</sub> - q<sub>01</sub> + ε) - 1
+      <span class="note">q<sub>01</sub>、q<sub>99</sub> 为按维度统计的 1% 与 99% 分位数；ε 取 1e-6 防除零</span>
+    </div>
+    <p><strong>选用分位数而不用均值方差，原因是动作分布普遍重尾</strong>：急停与快速换向的极端值撑大方差，把正常动作压进零附近的小区间。分位数截断 1% 以外的极端点，训练信号集中在主体分布。统计量在训练集拟合后冻结，推理端按 a = (a<sub>norm</sub> + 1)·(q<sub>99</sub> - q<sub>01</sub> + ε)/2 + q<sub>01</sub> 反变换，<strong>遗忘反变换或使用验证集统计都会造成执行幅度错位</strong>。</p>
+
+    <h3>4. 图像与语言预处理</h3>
+    <p>图像侧三段式：缩放至 224×224 或 256×256、轻量几何与颜色增广、按主干统计量归一化。增广强度受动作语义约束：裁剪平移改变目标物在画面中的位置，强度过大时标签与视觉内容错位，随机裁剪尺度下界一般不低 0.9；颜色扰动用于覆盖光照漂移，幅度取 0.1–0.2。</p>
+    <p>语言侧先分词再截断到固定预算（32–64 token），超出部分按“动作动词与目标物体优先”的规则保留，避免截断丢失任务关键信息。同义改写按 30% 概率在训练期替换，验证集固定使用原始指令与少量未见改写，用于分离“指令理解”与“场景记忆”两类能力。</p>
+
+    <h3>5. 划分、统计量与防泄漏</h3>
+    <p>防泄漏三条硬规则：<strong>按 episode 整条划分，训练、验证、测试互不共享轨迹；归一化与增广统计量只在训练集拟合；指令改写池按 episode 划分。</strong>违反任一条都会让验证指标偏离真实泛化。数据量偏小时用分层划分并固定随机种子。</p>
+
+    <h3>6. 数值算例：窗口计数与重尾归一化</h3>
+    <p>取一条 200 步的 episode，k=2、H=16、m=8，窗口总长 26。合法锚点 t 的范围为 [2, 176]，共 175 个，端点保证最晚窗口的动作块与未来观测都落在 200 步之内；按 stride=4 取样时窗口数为 44，采样倍率比 stride=1 低约 3.98 倍。窗口数与步长的完整关系如下表，计数口径与代码片段 1 的 range 边界完全一致，据此估算训练步数与算力：</p>
+    <table>
+      <tr><th>窗口步长 stride</th><th>窗口数</th><th>单步重复监督上限</th><th>适用场景</th></tr>
+      <tr><td>1</td><td>175</td><td>16 次</td><td>小数据集的密集增强</td></tr>
+      <tr><td>4（默认）</td><td>44</td><td>4 次</td><td>冗余与覆盖的折中</td></tr>
+      <tr><td>8</td><td>22</td><td>2 次</td><td>大数据集节省算力</td></tr>
+      <tr><td>16</td><td>11</td><td>1 次</td><td>退化为无重叠切片</td></tr>
+    </table>
+    <p>再估算数据规模：500 条 episode、平均长度 150 步时为 75,000 步原始数据；单条合法窗口 32 个（stride=4），全部 episode 合计约 16,000 个训练窗口；批量 128 时一个 epoch 约 125 个训练步。窗口总数直接决定 epoch 长度，进而决定学习率调度的时间尺度。</p>
+    <p>第二组算例针对分位数归一化的动因。构造一段重尾动作数据：99 个取值来自区间 [-0.1, 0.1] 的均匀分布，另加 1 个离群值 10。该数据均值约 0.109、标准差约 0.996，按均值方差归一化后，占 99% 的正常动作被映射到 [-0.21, -0.01] 的窄带，宽度约 0.2，仅占归一化区间的 10%；模型容量被一个离群值产生的尺度大量挤占。改用 1%/99% 分位数后，同一批正常动作映射到从下边界到约 0.34 的较宽区间，训练信号集中在分布主体。<strong>代价是越界值被截断到 ±1 附近，极端运动幅度信息丢失，截断强度需要与执行端限幅策略一致。</strong></p>
+    <p>常量维度是归一化的边界情形：某维度在训练集中恒为零时，q<sub>01</sub> 与 q<sub>99</sub> 都是零，代入公式得到 2×0/(0+1e-6) - 1 = -1。该维度被整体映射成常数 -1，网络会把 -1 当作有效信号学习。正确做法是对常量维度输出掩码，或在归一化后显式置零，将该维度从损失中排除。</p>
+    <p>图像增广的强度也可量化。面积尺度下界 0.9 对应边长缩放 sqrt(0.9) ≈ 0.949，224 像素图中裁剪窗口相对中心最多平移约 5.7 像素，约占画面宽度的 2.6%。目标物越小、越靠近画面边缘，在 2.6% 的平移下离开视野的概率越高，这是把裁剪下界定在 0.9 附近的直接原因。</p>
+    <p>窗口重叠同时承担动作增强的职责。stride=4、H=16 时，平均每个可用动作步被约 4 个窗口监督（重复倍数等于 H/stride），同一动作在不同观测上下文中出现四次，窗口数因此高估了独立信息量。批次构成上还有一个隐性开销：按批内最长 episode 补齐时，平均长度 140 步的批次补齐到 200 步，30% 的算力花在掩码位置上；按长度分桶后再组批可把该开销压到 10% 量级，属于纯吞吐收益，不影响任何超参数语义。</p>
+    <p>时间戳校验存在一个单位陷阱。校验阈值按秒设定为 1e-3，当采集端以毫秒写时间戳时，正常的 30 毫秒抖动会被放大成 30 的差值，几乎全部 episode 被误判为异常；反向的错误同样存在，阈值按毫秒设定而数据是秒时校验形同虚设。修复方式是在加载入口做量级断言：200 步、10 Hz 的 episode 首末时间戳差应为 (200-1)/10 = 19.9 秒，断言实测差值与理论值相对误差不超过 1%，单位问题会在这一步被拦下。</p>
+
+    <h3>7. 边界与失效模式</h3>
+    <p>预处理的三类边界情形需要显式处理，否则问题会推迟到训练阶段才暴露：</p>
+    <ul>
+      <li><strong>分布漂移</strong>：新数据与训练数据来自不同设备或不同增益设置时，冻结的分位数失效，反变换后动作系统性偏大或偏小。监控手段是统计推理动作超出训练分位范围的样本比例，比例上升即触发重新拟合与版本对照。</li>
+      <li><strong>混合帧率</strong>：10 Hz 与 30 Hz 数据混入同一训练集时，同一“一步”的物理时长相差三倍，动作幅度标签不可比。修复：按时间戳统一重采样到基准帧率后再切窗，配置中显式声明 dt。</li>
+      <li><strong>构型维度不一致</strong>：单臂 7 维与双臂 14 维数据混用时，缺失维度若直接补零，模型会在这些维度上学习“恒为零”的伪模式。修复：按构型分桶训练，或引入动作掩码并让损失按掩码加权。</li>
+      <li><strong>episode 过短</strong>：长度不足 26 步的演示无法产生任何窗口，静默丢弃会损失数据，补齐则产生伪样本。修复：构造期统计短 episode 占比，占比偏高说明采集流程需要调整，训练侧掩盖只会隐藏问题。</li>
+    </ul>
+    <p>再补三组常用数量关系。其一，混长组批的掩码比例：长度 150、80、200 的三条 episode 同批补齐到 200，无效位置占 (600-430)/600 ≈ 28.3%，该比例是评估组批效率的直接口径。其二，划分比例：500 条 episode 按 8:1:1 分层划分为 400/50/50，任务类型不足 10 条的分层在验证集里凑不满一条完整轨迹，这类分层需要合并后再分。其三，分位数估计的样本量经验规则：估计 1% 分位时单维度样本少于约一千条时估计量抖动明显，工程上改用 5%/95% 分位或按物理量程固定缩放系数，数据量回升后再切回 1%/99%。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>预处理管线按五段式组织：原始数据加载与校验、episode 级划分、窗口索引预计算、训练期变换（图像增广与指令改写）、批内整理（补齐与掩码）。<strong>校验段放在最前，用可量化的拒绝率衡量数据质量，异常 episode 在进入训练前剔除。</strong></p>
+    <h3>关键参数起点</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>上下文帧数 k</td><td>2</td><td>提供运动信息</td><td>相邻帧差即可表达速度，再增收益有限</td></tr>
+      <tr><td>动作块 H</td><td>16</td><td>策略监督长度</td><td>与 001 章约定一致，10 Hz 下约 1.6 秒</td></tr>
+      <tr><td>预测步长 m</td><td>8</td><td>世界模型监督长度</td><td>误差累积与信号密度折中</td></tr>
+      <tr><td>窗口步长 stride</td><td>4</td><td>窗口重叠密度</td><td>取 H/4，兼顾增强与冗余控制</td></tr>
+      <tr><td>图像尺寸</td><td>224×224</td><td>视觉输入分辨率</td><td>主流视觉主干的标准输入</td></tr>
+      <tr><td>归一化分位</td><td>1% / 99%</td><td>动作缩放与截断</td><td>重尾分布的常规截断点</td></tr>
+      <tr><td>指令截断</td><td>48 token</td><td>语言预算</td><td>覆盖常规任务描述长度</td></tr>
+      <tr><td>改写概率</td><td>0.3</td><td>指令增强强度</td><td>兼顾多样性与语义保真</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：窗口索引在数据集构造期预计算</span>
+      <p>合法锚点一次性算好存入列表，训练期只查表取数：越界错误在构造期暴露，批次采样可做长度分层，断点续训时索引可复现。运行期动态判断边界会引入开销与隐蔽的越界缺陷。</p>
+    </div>
+    <p>衔接与差异：001 章定义模型输入输出契约，本章供给符合契约的样本；003 章起消费未来观测字段，005 章起对两路损失加权，都依赖本章的对齐与归一化约定。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>片段以公开数据格式（RLDS 与 LeRobot 风格）的公开设计为参照，接口随版本演进。第 1 段给出时间窗数据集。</p>
+
+    <p><strong>片段 1：episode 切窗数据集</strong></p>
+    <pre class="code"><code>import torch
+import numpy as np
+
+class EpisodeWindowDataset(torch.utils.data.Dataset):
+    """把 episode 序列切成联合训练时间窗，同时服务策略与预测两个目标。"""
+    def __init__(self, episodes, k=2, chunk=16, horizon=8, stride=4):
+        self.episodes = episodes            # 每条 episode 含 obs/action/text/时间戳
+        self.k, self.chunk, self.horizon = k, chunk, horizon
+        # 构造期预计算全部合法锚点：越界窗口提前排除，运行期无需补齐逻辑
+        self.index = []
+        for eid, ep in enumerate(episodes):
+            n = len(ep["action"])
+            for t in range(k, n - chunk - horizon + 1, stride):
+                self.index.append((eid, t))
+
+    def __getitem__(self, i):
+        eid, t = self.index[i]
+        ep = self.episodes[eid]
+        # 观测窗口取 t-k 到 t（含端点），与动作 a_t 严格同刻，避免错位
+        obs = ep["obs"][t - self.k:t + 1]
+        # 动作块 a_t 到 a_{t+chunk-1} 长度固定；相邻窗口重叠，起到动作增强作用
+        act = ep["action"][t:t + self.chunk]
+        # 世界模型监督目标：执行 a_t 之后的未来观测 t+1 到 t+horizon
+        fut = ep["obs"][t + 1:t + 1 + self.horizon]
+        return {"obs": obs, "action": act, "future": fut,
+                "text": ep["text"], "eid": eid}
+
+    def __len__(self):
+        return len(self.index)</code></pre>
+    <p>解读：<strong>（1）</strong>锚点遍历从 k 开始，保证每条样本都有完整上下文；终点减去 chunk 与 horizon，保证动作块与未来观测都不越界，<strong>长度校验前移到构造期是这套实现最重要的设计</strong>。<strong>（2）</strong>三个切片区间两两不重叠交叉：观测止于 t、动作始于 t、未来始于 t+1，落位关系与理论节的对齐规则一致。<strong>（3）</strong>返回字典保留 eid，便于按 episode 聚合指标与复现定位。</p>
+
+    <p><strong>片段 2：动作分位数归一化</strong></p>
+    <pre class="code"><code>class QuantileNormalizer:
+    """按维度做分位数归一化：训练把动作压到 [-1,1]，推理端严格反变换。"""
+    def __init__(self, q_low=0.01, q_high=0.99, eps=1e-6):
+        self.q_low, self.q_high, self.eps = q_low, q_high, eps
+        self.lo = None
+        self.hi = None
+
+    def fit(self, actions):
+        # 只在训练集上调用：验证集统计混入会造成信息泄漏，指标虚高
+        actions = np.asarray(actions)
+        self.lo = np.quantile(actions, self.q_low, axis=0)
+        self.hi = np.quantile(actions, self.q_high, axis=0)
+        return self
+
+    def transform(self, x):
+        # 重尾维度用分位数缩放：急停与快速换向的极端值被截断在边界
+        return 2.0 * (x - self.lo) / (self.hi - self.lo + self.eps) - 1.0
+
+    def inverse(self, y):
+        # 推理端反变换必须与 transform 使用同一组参数，否则执行幅度整体偏移
+        return (y + 1.0) * (self.hi - self.lo + self.eps) / 2.0 + self.lo</code></pre>
+    <p>解读：<strong>（1）</strong>fit、transform、inverse 三方法分离，对应训练期拟合、训练期变换、部署期反变换三个生命周期，避免统计量在管线中隐式漂移。<strong>（2）</strong>eps 既防除零，又为常量维度（例如始终为 0 的夹爪通道）提供数值兜底。<strong>（3）</strong>参数序列化后随权重一同发布，<strong>归一化参数属于模型资产，缺失它会造成部署事故</strong>。</p>
+
+    <p><strong>片段 3：入口对齐校验</strong></p>
+    <pre class="code"><code>def check_alignment(ep, atol=1e-3, max_bad_ratio=0.01):
+    """入口校验：动作与观测的时间戳必须同刻，超差比例过高则拒绝该 episode。"""
+    ts_obs = np.asarray(ep["obs_ts"], dtype=np.float64)
+    ts_act = np.asarray(ep["action_ts"], dtype=np.float64)
+    n = min(len(ts_obs), len(ts_act))
+    # 逐对作差取绝对值：对齐异常常表现为整段偏移，零星抖动落在阈值内属正常
+    diff = np.abs(ts_obs[:n] - ts_act[:n])
+    bad_ratio = float((diff > atol).mean())
+    if bad_ratio > max_bad_ratio:
+        # 直接抛出异常：异常率升高通常意味着采集端系统性退化，需要复盘
+        raise ValueError(f"对齐异常比例 {bad_ratio:.3f} 超过阈值 {max_bad_ratio}")
+    return ep</code></pre>
+    <p>解读：<strong>（1）</strong>校验只依赖时间戳字段，代价极低，适合放在数据加载入口对全量数据执行一遍。<strong>（2）</strong>阈值 1%：偶发丢帧造成少量错位属正常范围，超过则说明采集端存在系统性问题。<strong>（3）</strong>选择抛错终止：静默跳过会改变数据分布且难以察觉，<strong>数据侧的问题需要在数据侧显式暴露</strong>。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>按帧随机划分数据集</strong>：同一轨迹的近邻帧分落训练与验证两侧，验证损失虚低，上线表现远差于预期。修复：按 episode 整条划分，固定随机种子并核对轨迹编号无交叠。</li>
+      <li><strong>归一化统计量跨集泄漏</strong>：在训练加验证的全量数据上拟合分位数，验证指标偏乐观。修复：只在训练集统计，并用单元测试断言。</li>
+      <li><strong>动作块标签错位一帧</strong>：把 a<sub>t+1</sub> 起作为窗口动作，模型学到“提前一拍”的行为，闭环时表现为反应超前且抖动。修复：在数据集构造处断言动作块首元素与锚点动作相等。</li>
+      <li><strong>变长补齐污染损失</strong>：批内按最长 episode 补零但未生成掩码，模型把补零当作真实动作拟合。修复：整理阶段同步输出有效掩码，损失按掩码加权（001 章片段 2 已预留该接口）。</li>
+      <li><strong>增广强度破坏动作语义</strong>：强裁剪或大角度旋转把目标移出画面，标签与视觉内容脱节。修复：约束裁剪尺度下界与旋转角度，抽样可视化复核。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>某 episode 共 200 步，k=2、H=16、m=8、stride=4，计算合法窗口数量，并说明 stride 改为 1 时窗口数与重复监督倍数的变化。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>窗口数约 44；stride=1 时增至 175 左右，重复监督倍数与算力同步上升。</div></details>
+      </li>
+      <li>把归一化分位从 1%/99% 改为 5%/95%，预测训练稳定性与执行精度的可能变化。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>截断更强，极端动作压到边界，训练更稳；快速运动的动态范围被削，精细动作精度可能下降。</div></details>
+      </li>
+      <li>推导：若原始动作某维度近似均匀分布 U(0,1)，分位数归一化后该维度的取值范围是多少？若分布为重尾，说明截断对均值与方差的影响方向。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>近似均匀时归一化后接近 [-1,1]；重尾分布下 1% 截断会移除极端值，方差显著减小而均值受截断方向影响。</div></details>
+      </li>
+      <li>设计一套数据契约检查清单：至少包含对齐、越界、统计量来源、划分方式四项，并为每项给出可自动化的检查方法。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>对齐用时间戳差值断言；越界用索引上界断言；统计量强制只在训练集 fit；划分用 episode 编号集合求交验证。</div></details>
+      </li>
+      <li>构造一个小实验：故意将动作标签整体后移一帧，观察训练损失与闭环成功率的分离现象，并解释为什么损失曲线无法直接暴露该问题。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>相邻帧变化小，错位标签仍是可行动作，损失只小幅上升；闭环误差逐步累积，成功率显著下降。训练损失对错位不敏感，数据校验必须独立存在。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>数据以 episode 为原子单位组织与划分，按帧打散会造成近邻泄漏。</li>
+      <li>联合训练时间窗由 k+H+m 三段构成，锚点 t 处观测与动作同刻，未来观测从 t+1 起算。</li>
+      <li>动作归一化采用分位数口径截断重尾，均值方差会被极端值撑大；统计量只在训练集拟合，推理端严格反变换。</li>
+      <li>图像增广以不破坏动作语义为边界，语言改写按 episode 划分防止泄漏。</li>
+      <li>入口校验把对齐与越界问题暴露在数据侧，<strong>训练损失不能替代数据检查</strong>。</li>
+      <li>下一章进入世界模型的第一个具体目标：预测下一帧图像。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch001.html">← 第 001 章：搭建VLA与世界模型联合训练的基础框架</a>
+    <a class="next" href="ch003.html">第 003 章：世界模型预测下一帧图像 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

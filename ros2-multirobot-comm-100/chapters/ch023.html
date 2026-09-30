@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第023章 大消息传输：图像与点云压缩 | 多机器人协同学习课程 · ROS2 通信与系统集成</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 数据分发与协同感知</span>
+    <span class="sep">/</span>
+    <span>第 023 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 数据分发与协同感知</div>
+    <h1>第 023 章：大消息传输：图像与点云压缩</h1>
+    <p class="lead">跨机链路是根硬管子：图像不压缩每秒几十 MB，四台机器人就能压垮千兆网。本章把"压缩比"变成可计算的决策，并为图像与点云各配一套可落地的传输方案。</p>
+    <ul class="meta">
+      <li>主题：通信优化 / 大规模数据分发</li>
+      <li>关键机制：image_transport 插件、JPEG/PNG 取舍、点云降采样与 Draco、带宽预算</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 022 章（共享内存与零拷贝传输）</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>掌握图像与点云的带宽算术：原始大小、压缩比、CPU 代价三者之间的定量关系。</li>
+      <li>理解压缩的物理来源（空间冗余、时间冗余、量化）以及有损/无损的适用边界。</li>
+      <li>掌握 image_transport 插件机制与 Python 下的 JPEG 发布/订阅写法，知道 compressedDepth 为什么必须用专用插件。</li>
+      <li>掌握点云降采样与压缩的工程组合：先减点、再量化、最后才考虑上链。</li>
+      <li>能为一支车队设计"传感器 → 传输 → 使用方"的数据精简链条，并给出理由与参数。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 022 章解决了"同机搬运贵"的问题，但跨机链路的物理定律没有商量余地：信道带宽固定，你要么少发，要么压小。算一笔账就明白形势有多严峻：1280×720 的 RGB 图像，原始大小约 2.7 MB；30 Hz 发布，单台机器人就是 83 MB/s；再来三台，330 MB/s，千兆网直接打满，控制指令跟着一起遭殃。</p>
+    <p>更常见的情形是"多机器人协同感知"：机器人要把"自己看到了什么"分享给队友。如果分享的是原始图像，带宽会先于算法崩溃。压缩是协同感知系统的<strong>准入条件</strong>，其地位先于任何算法优化。本章给出两条主线：图像走"变换插件 + JPEG"的成熟路线，点云走"降采样 + 量化压缩"的组合拳；并贯彻一条总原则，<strong>能在边缘提炼出小消息，就绝不上传大消息</strong>。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 带宽算术：压缩比是数量级游戏</h3>
+    <p>先建立数量级直觉。图像的有损压缩（JPEG）利用相邻像素的高度相关性，典型压缩比 15–50 倍；无损压缩（PNG）只去熵冗余，2–5 倍；视频编码（H.264 等）再利用帧间冗余，可达 100 倍以上，代价是编码复杂度与延迟。点云的字符串几何特点不同：每个点 12–16 字节浮点，但空间分布稀疏、相邻点相关性强，Draco 类压缩常达 10–20 倍；不过在很多场景，<strong>最有效的压缩其实是"少发点"</strong>，体素降采样直接砍掉一半以上的点，而且对下游建图的损失常常可以接受。</p>
+    <div class="formula">
+      上行带宽 ≈ 单帧字节 × 帧率 × 机器人台数 × 压缩比⁻¹
+      <span class="note">例：2.7 MB × 30 Hz × 4 台 ÷ 40（JPEG）≈ 8.1 MB/s，从"打满千兆"变成"留有余量"</span>
+    </div>
+    <p>压缩比不是白拿的：<strong>编码要花 CPU</strong>。一台嵌入式板卡上，720p JPEG 编码约 5–15 ms/帧，Draco 压缩一帧 3 万点约 20–50 ms。所以压缩节点要当作"计算任务"来排布：不能挤占控制环的实时预算，也最好不要与 SLAM 抢同一个核。</p>
+
+    <h3>2. 压缩的物理来源与有损/无损边界</h3>
+    <ul>
+      <li><strong>空间冗余</strong>：图像相邻像素、点云的局部平面结构。JPEG 的 DCT 变换与量化、Draco 的顶点预测都属于这一类。</li>
+      <li><strong>熵冗余</strong>：统计分布不均匀，用 Huffman 类编码去掉。PNG、zstd 属于无损范畴。</li>
+      <li><strong>时间冗余</strong>：帧间只传变化。视频编码器利用它，代价是缓冲区与延迟，对需要"最新一帧"的感知链路往往得不偿失。</li>
+      <li><strong>量化</strong>：直接降低精度换体积。JPEG 的质量因子、Draco 的位置量化位数都是"可调的旋钮"。</li>
+    </ul>
+    <p>选有损还是无损，取决于数据到达下游后的用途：<strong>人/神经网络看的图像可以有损</strong>（JPEG 质量 70–90 对检测精度影响通常 &lt; 1 个百分点）；<strong>用于几何测量的数据要谨慎</strong>，深度图的每个像素都是距离测量值，普通 JPEG 会把它当成 8 位图像破坏掉，必须用 compressedDepth 这类保留 16 位结构的插件；建图用的点云量化到 1–2 cm 一般无碍，量化到 10 cm 就会在重叠区看到"台阶"。</p>
+
+    <h3>3. ROS2 的传输插件体系：话题名背后的"影子话题"</h3>
+    <p><code>image_transport</code> 的设计非常巧妙：它以"传输插件"的方式为同一个图像话题生成一族影子话题，发布者发布到 <code>/cam/image</code>（原始）与 <code>/cam/image/compressed</code>（JPEG），<code>/cam/image/compressedDepth</code>（深度专用），<code>/cam/image/theora</code>（视频）等；订阅者选择其一即可。<strong>收益是"带宽按需选择"：本机可视化订原始的，跨机感知订压缩的，互不影响。</strong>点云侧有对应的 <code>point_cloud_transport</code> 与 Draco 插件，生态成熟度随发行版而异，使用前先确认插件可用。</p>
+    <p>工程上还有一个比压缩更狠的杠杆：<strong>改变传输内容</strong>。检测节点在边缘把 2.7 MB 的图像变成一张 200 字节的目标列表；占用栅格节点把 2 MB 的点云变成几 KB 的栅格块。<strong>信息提炼的压缩比比任何编解码器都高两个数量级</strong>，这才是协同感知系统的第一性设计。</p>
+
+    <h3>4. 压缩链路上的 QoS 与投递语义</h3>
+    <p>压缩改变的不只是大小，还有链路的时间特性：一次编码 10–30 ms，会引入固有的流水线延迟。因此压缩话题的 QoS 通常选 <code>BEST_EFFORT</code> + <code>KEEP_LAST(1)</code>：<strong>宁可丢帧，绝不积压</strong>。反直觉的一点是：JPEG 帧的"部分损坏"比"整帧丢失"更糟，解码器会输出花屏图，污染下游检测。所以要么整帧可靠（对小画面），要么干脆尽力而为（大画面高帧率），不要用 Reliable + 大深度去追求"一帧不丢"，那只会把延迟堆成雪球。</p>
+    <table>
+      <tr><th>数据类型</th><th>方案</th><th>典型压缩比</th><th>代价</th><th>适用</th></tr>
+      <tr><td>RGB 图像</td><td>JPEG（质量 70–90）</td><td>15–50×</td><td>编码 5–15 ms，轻微块效应</td><td>检测、可视化、回传</td></tr>
+      <tr><td>深度图</td><td>compressedDepth（PNG 16 位）</td><td>2–4×</td><td>体积仍大，必须降分辨率</td><td>跨机建图、避障</td></tr>
+      <tr><td>点云</td><td>体素降采样 + Draco</td><td>10–30×</td><td>几何细节损失（cm 级）</td><td>协同建图、地图融合</td></tr>
+      <tr><td>点云（本机）</td><td>不压缩，零拷贝（022）</td><td>—</td><td>无</td><td>同机 SLAM 全精度</td></tr>
+    </table>
+
+    <h3>5. JPEG 质量因子在调什么：量化步长的定量含义</h3>
+    <p>JPEG 编码分三步：把图像切成 8×8 小块做离散余弦变换（Discrete Cosine Transform, DCT），对 DCT 系数做除法量化，最后对量化结果做熵编码。质量因子 Q 控制的正是第二步的除数。行业通用的 IJG 量化表缩放规则是：<strong>Q ≥ 50 时缩放系数 s = 200 − 2Q；Q &lt; 50 时 s = 5000 / Q</strong>，基准量化表的每个元素乘以 s/100 后取整。</p>
+    <div class="formula">
+      Q(80) → s = 40%，亮度 DC 步长 16 × 0.40 ≈ 6.4；Q(60) → s = 80%，步长 12.8
+      <span class="note">量化步长翻倍，高频系数的非零数量大幅减少，码率通常下降 25%–35%</span>
+    </div>
+    <p>用 DC 系数可以估算亮度保真度：8×8 块的 DC 系数等于 8 倍块均值，量化误差最多为半步长。Q = 80 时亮度 DC 步长 6.4，折算到像素灰度的最坏误差为 6.4 ÷ 2 ÷ 8 = 0.4 个灰度级，肉眼与检测器都难以察觉；Q = 40 时步长 20，误差上限升到 1.25 个灰度级，块边界开始可见。另一个常被忽略的旋钮是色度抽样：4:2:0 让亮度保持全分辨率、两个色度通道各降为半分辨率，样本总量从每像素 3 个降到 1.5 个，仅此一项就省约一半原始数据，对目标检测影响很小，但对颜色敏感的任务（红绿灯识别、色标对位）要先用实拍数据验证。经验数据给一个锚点：720p、中等纹理场景，Q = 80 的 JPEG 约 60–90 KB/帧，Q = 60 约 40–60 KB，Q = 40 约 25–40 KB；高纹理画面（草地、树叶、噪点重的低照度图）码率接近上浮一倍，做预算时按最坏场景乘 1.5–2 的系数。</p>
+
+    <h3>6. 数值算例：四机器人传感器队的带宽复盘</h3>
+    <p>设一支 4 机器人队伍，每台搭载：1280×720 彩色相机 30 Hz、640×480 16 位深度相机 30 Hz、3 万点的 16 线激光雷达 10 Hz。链路为千兆以太网，线速换算 1000 Mbps ÷ 8 = 125 MB/s，工程可用量按 85% 计约 106 MB/s。先算原始总量：</p>
+    <ul>
+      <li>彩色图：1280 × 720 × 3 B = 2.7648 MB/帧，30 Hz 即 82.94 MB/s/台；</li>
+      <li>深度图：640 × 480 × 2 B = 0.6144 MB/帧，30 Hz 即 18.43 MB/s/台；</li>
+      <li>激光雷达：30000 × 16 B = 0.48 MB/帧，10 Hz 即 4.8 MB/s/台。</li>
+    </ul>
+    <p>每台合计 106.18 MB/s，四台 424.7 MB/s，达到千兆线速的 3.4 倍。也就是说，不压缩的"全传感器共享"在物理上不可能成立，这就是本章开头所说"压缩是准入条件"的算术依据。再做压缩规划：彩色 JPEG 40 倍降到 2.07 MB/s/台，深度按 16 位 PNG 约 3 倍降到 6.14 MB/s/台，点云 Draco 15 倍降到 0.32 MB/s/台，四台合计 34.15 MB/s，仅占线速的 27.3%；计入 DDS 心跳、重传与突发（按 +15% 计）约 39.3 MB/s，仍有约 2.7 倍的余量。若再把彩色与深度降频到 15 Hz，总量降到 17.7 MB/s，余量扩大到约 6 倍，可以容纳第二阶段新增的机器人。</p>
+    <p>这个算例给出三条可迁移的结论。<strong>第一条：先算总量再看链路。</strong>424.7 MB/s 这个数字必须在写第一行代码之前算出来，否则任何压缩参数选择都没有参照系。<strong>第二条：瓶颈排序会变化。</strong>原始数据里彩色图占 78%，压缩后深度图反而占 72%（24.6 ÷ 34.15），因为它只有 3 倍压缩比，所以第二阶段的优化重点应从图像转向深度图降分辨率（640×480 减为 320×240 直接再省 4 倍）。<strong>第三条：预算要按最坏场景。</strong>高纹理图像与高噪声深度会把压缩比打对折，余量不足时优先动频率与分辨率，最后才动量化参数。</p>
+
+    <h3>7. 失效模式与边界条件</h3>
+    <ul>
+      <li><strong>低照度噪声</strong>：噪声是高频成分，会大量消耗 JPEG 码率。同一场景把照度减半，噪点使码率上浮 30%–100%。边界动作：编码前做轻量降噪或先降分辨率。</li>
+      <li><strong>运动模糊与块效应叠加</strong>：快速旋转时帧间差异大，时间冗余编码（视频）收益骤降，还引入 I 帧周期带来的延迟尖峰，感知链路应退回逐帧 JPEG。</li>
+      <li><strong>Draco 量化与 ICP 配准冲突</strong>：跨机点云用于精配准时，1 cm 量化在近距离（2–3 m）平面上的法向扰动可能达到配准收敛容差的同一量级。边界动作：配准用的点云单独走无损或 5 mm 量化链路。</li>
+      <li><strong>深度图无效值处理</strong>：无效像素（NaN/0）被按普通数值编码会浪费码率；先替换为统一哨兵值再编码，PNG 的行程编码可把大面积无效区压到接近零成本，实拍深度图的整体压缩比因此可从 3 倍升到 4–6 倍。</li>
+      <li><strong>压缩 CPU 峰值与实时预算冲突</strong>：熵编码的耗时不均匀，单帧耗时可能达到均值的 2–3 倍。边界动作：给编码线程设独立核与固定优先级，或限制编码队列为 1（超时丢帧）。</li>
+      <li><strong>极端压缩比下的语义破坏</strong>：JPEG 质量降到 20 以下时 8×8 块边界成网格，小目标检测框会沿网格抖动；QoS 上体现为"消息都收到了，但下游指标突然劣化"，属于最难定位的一类失效。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>给一支车队设计大消息传输，按四步收敛：</p>
+    <ol>
+      <li><strong>清点"谁要看"</strong>：把每种大数据的消费方列出，本机 SLAM、跨机融合、人工监控。消费方决定精度等级，精度等级决定压缩策略。人工监控是最容易被忽略的"带宽黑洞"，给它单独降帧。</li>
+      <li><strong>先提炼，再压缩</strong>：能在边缘计算的（检测、栅格化）就在边缘算完，只传结果。只有"确实需要原始数据"的链路（如跨机建图）才进入编解码器。</li>
+      <li><strong>选编解码与参数</strong>：图像 JPEG 质量 80 起步，按任务指标微调；点云体素 0.05–0.1 m + 量化 1–2 cm。参数必须用下游任务的指标验收（检测 mAP、建图重叠误差）；肉眼看"画质还行"不能作为验收依据。</li>
+      <li><strong>配 QoS 与频率</strong>：压缩话题一律 Best-effort + KEEP_LAST(1)，按消费方需求定频率（可视化 5 Hz、检测 15 Hz、建图 10 Hz），<strong>把"发送频率"也当成压缩旋钮</strong>，降一半频率等于省一半带宽。</li>
+    </ol>
+    <div class="box key">
+      <span class="box-title">设计决策：为什么"上传检测结果"比"上传压缩图像"更根本？</span>
+      <p>JPEG 只能把 2.7 MB 压到 70 KB，而一个目标框（类别 + 位姿 + 置信度）只有 50–200 字节，相差三个数量级。只要下游任务允许（融合、跟踪、协同决策），就把计算放在数据源头上。<strong>压缩是传输层的优化，提炼是架构层的优化；先做架构再做传输。</strong>这也是第 031、032 章协同感知的数据基础。</p>
+    </div>
+    <h3>参数起点表</h3>
+    <table>
+      <tr><th>参数</th><th>起点值</th><th>调整方向与依据</th></tr>
+      <tr><td>JPEG 质量</td><td>80</td><td>降到 60 省 30% 带宽；用检测指标验证损失</td></tr>
+      <tr><td>发送频率</td><td>15 Hz</td><td>按消费方需求降频，是最安全的"压缩"</td></tr>
+      <tr><td>点云体素</td><td>0.05 m</td><td>影响 5 cm 级几何精度，与建图分辨率匹配</td></tr>
+      <tr><td>Draco 量化</td><td>1 cm</td><td>调到 5 cm 以上重叠区可见错位</td></tr>
+      <tr><td>可视化降帧</td><td>5 Hz</td><td>人眼够用，独立于算法链路</td></tr>
+    </table>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：JPEG 压缩发布节点（把图像"瘦身"后上链）</strong></p>
+    <pre class="code"><code>import rclpy
+import numpy as np
+import cv2
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from sensor_msgs.msg import Image, CompressedImage
+
+class JpegPublisher(Node):
+    """订阅原始图像，编码为 JPEG 后发布到 /cam/image/compressed 风格话题。"""
+    def __init__(self):
+        super().__init__("jpeg_pub")
+        # 压缩链路 QoS：尽力而为 + 只留最新，帧率越高越不能积压
+        qos = QoSProfile(depth=1)
+        qos.history = HistoryPolicy.KEEP_LAST
+        qos.reliability = ReliabilityPolicy.BEST_EFFORT
+        self.pub = self.create_publisher(CompressedImage, "cam/image/compressed", qos)
+        # 本机消费的全精度图像留在同机：zero-copy 或直接进程内传递（第 022 章）
+        self.sub = self.create_subscription(Image, "cam/image", self.on_image, 5)
+
+    def on_image(self, img):
+        # 原始字节流 → numpy：注意 step 是行跨距，尾部可能有对齐填充
+        frame = np.frombuffer(img.data, dtype=np.uint8)
+        frame = frame.reshape(img.height, img.step)[:, :img.width * 3]
+        frame = frame.reshape(img.height, img.width, 3)
+        # IMWRITE_JPEG_QUALITY 是唯一的"体积-保真"旋钮：80 起步
+        ok, enc = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        if not ok:
+            self.get_logger().warning("JPEG 编码失败，本帧丢弃")
+            return
+        msg = CompressedImage()
+        msg.header = img.header          # 时间戳与 frame_id 必须原样保留
+        msg.format = "jpeg"
+        msg.data = enc.tobytes()
+        self.pub.publish(msg)            # 2.7 MB 已变成约 70 KB</code></pre>
+    <p>解读：这段代码演示了"压缩节点"的典型形态，一个纯转发节点，职责单一：解码尺寸、编码 JPEG、保留时间戳。<strong>（1）</strong><code>msg.header = img.header</code> 是关键细节：压缩后时间戳必须保持"拍摄时刻"；若改用编码时刻，第 030 章的时间对齐会凭空多出 10–30 ms 的假延迟。<strong>（2）</strong>QoS 是 Best-effort + 深度 1：编码本身耗时，若积压两三帧再发，延迟会比不压缩更糟。<strong>（3）</strong>这类节点还有一个隐含设计点：JPEG 质量参数应做成 ROS 参数，便于在实车上不重启地扫描不同档位做验证。生产代码里可用 image_transport 的 C++ 插件直接发布影子话题，本片段给出的是不依赖插件生态的等价 Python 实现。</p>
+
+    <p><strong>片段 2：点云"降采样 + 打包"，先减点再上链</strong></p>
+    <pre class="code"><code>import numpy as np
+from sensor_msgs_py import point_cloud2 as pc2
+
+def voxel_downsample(xyz, voxel=0.05):
+    """体素降采样：每个体素只留一个代表点（质心），点数立减 50%–80%。"""
+    if len(xyz) == 0:
+        return xyz
+    keys = np.floor(xyz / voxel).astype(np.int32)   # 每个点落到哪个体素
+    uniq, inv, counts = np.unique(keys, axis=0, return_inverse=True,
+                                  return_counts=True)
+    centers = np.zeros((len(uniq), 3), dtype=np.float64)
+    for d in range(3):                              # 按体素求质心：Bincount 向量化
+        centers[:, d] = np.bincount(inv, weights=xyz[:, d]) / counts
+    return centers
+
+def on_cloud(self, msg):
+    """收到原始点云（典型 2 MB，约 3 万点）后生成"上链版"。"""
+    # skip_nans 丢掉无效点：无效点在压缩时全是浪费
+    pts = pc2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True)
+    xyz = np.column_stack((pts["x"], pts["y"], pts["z"]))
+    # 第一步永远是几何缩减：0.05 m 体素与建图分辨率匹配
+    small = voxel_downsample(xyz, voxel=0.05)
+    # 第二步才是量化压缩（这里示意 float32 直发；生产可接 Draco 编码）
+    out = pc2.create_cloud_xyz32(msg.header, small.astype(np.float32))
+    self.pub.publish(out)   # 点数量级下降 + 后续量化，总收益 10–30 倍</code></pre>
+    <p>解读：点云链路的原则是"几何优先"：<strong>体素降采样是第一道闸门，量化压缩是第二道</strong>。原因有二：降采样是 O(n) 的简单操作，CPU 代价远低于 Draco；而且它同时减轻了压缩器与下游融合算法的负担。<code>skip_nans</code> 这种小开关常被忽略，NaN 点在被压缩和解码后可能变成"幽灵点"，污染地图。<code>float32</code> 相对 float64 直接省一半字节；若下游对精度要求更低，还可把坐标换成 int16（毫米单位，量程 ±32 m），再省一半。注意 <code>read_points</code> 的返回类型在发行版间有差异（结构化数组/生成器），以对应发行版文档为准，必要时加类型判断兼容。</p>
+
+    <p><strong>片段 3：压缩策略选择器，把决策写成可执行的算术</strong></p>
+    <pre class="code"><code>def plan_link(n_robots=4, link_mbps=300, jpeg_ratio=40, draco_ratio=15,
+              scan_pts=30000, scan_hz=10):
+    """按链路容量决定每条流的传输方案，输出规划表。"""
+    img_raw = 1280 * 720 * 3 * 30 / 1e6              # MB/s/台，未压缩
+    scan_raw = scan_pts * 16 * scan_hz / 1e6          # 每点 16 B（XYZI 浮点）
+    print(f"原始图像 {img_raw:5.1f} MB/s/台，原始点云 {scan_raw:5.1f} MB/s/台")
+    for name, raw, ratio in (("JPEG", img_raw, jpeg_ratio),
+                             ("Draco", scan_raw, draco_ratio)):
+        total = raw / ratio * n_robots
+        verdict = "可上链" if total &lt; link_mbps * 0.5 else "需要降频/降分辨率"
+        # 50% 阈值是余量：留给控制流与突发流量，不是理论极限
+        print(f"{name:6s}: {total:5.1f} MB/s（4 台） -> {verdict}")
+
+plan_link()</code></pre>
+    <p>解读：把"该不该压、压完够不够"写成函数，是架构评审时最有效的沟通工具。这里刻意用了两个设计原则：<strong>（1）</strong>阈值取链路容量的 50%，由此留出余量：DDS 心跳、重传、控制流、突发帧都要活在余量里（呼应第 013 章的峰值预算）；<strong>（2）</strong>两种流的压缩比是"起点值"，真实系统要用实验校准：JPEG 40 倍是 720p 场景的经验值，低纹理画面能到 60 倍，高纹理可能只有 20 倍。这个脚本的正确用法是"先用保守值规划，再用实测值更新"。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>压缩话题用 Reliable + 深度 10</strong>：丢一帧要重传，队列里还堆着 10 帧旧图，端到端延迟从 30 ms 涨到 300 ms。症状：可视化"越看越慢"。修复：BEST_EFFORT + KEEP_LAST(1)。</li>
+      <li><strong>深度图当普通图像压</strong>：JPEG 把 16 位深度截成 8 位，近距离"墙面"变成斑块，避障直接失效。修复：compressedDepth 插件或自定义 16 位编码，并对照无效值（NaN/0）处理。</li>
+      <li><strong>质量因子凭感觉降</strong>：为了省带宽把 JPEG 降到 40，检测 mAP 掉 5 个百分点却无人察觉。修复：用下游任务指标做压测，把"质量-带宽-精度"曲线画出来再定档。</li>
+      <li><strong>压缩节点和 SLAM 抢核</strong>：编码 CPU 突发让 SLAM 帧率抖动，建图出现回环断裂。修复：CPU 亲和/优先级规划，把压缩放在空闲核或限制并发。</li>
+      <li><strong>只看平均带宽不看峰值</strong>：检测结果与地图上传的突发流量叠加，高峰 1 秒打满链路，控制指令延迟翻倍。修复：关键流做限速与错峰（第 014 章），预算按 p95 峰值算。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>3 台机器人，各以 15 Hz 上传 960×540 灰度图。按 JPEG 35 倍压缩，估算总带宽；若链路为 100 Mbps（约 12 MB/s 量级），余量多少？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>960×540×1 B ≈ 0.52 MB；÷35 ≈ 15 KB/帧；×15 Hz×3 ≈ 0.67 MB/s，余量充足。但记得加上 DDS 开销（+10%–20%）与突发。</div></details>
+      </li>
+      <li>把 JPEG 质量从 80 改到 60，预测带宽与检测精度各变化多少？设计一个一次性得到两条曲线的实验（同一段录包，离线扫描质量档）。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>带宽约降 25%–35%，精度通常变化 &lt; 1 个百分点，但小目标类别可能更敏感。录一次原始数据，离线压到不同质量重跑检测器，是成本最低的校准法。</div></details>
+      </li>
+      <li>推导：体素边长从 0.05 m 增至 0.10 m，点数大致如何变化？在平面为主的室内场景与植被/杂物场景各会差多少？<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>点云近似落在 2D 流形上，点数随体素边长约按 1/v 变化；0.05 → 0.10 约减半。植被场景点云更"体积化"，减幅更大但细节损失也更明显。</div></details>
+      </li>
+      <li>设计题：为"跨机协同建图"设计点云链路，带宽目标 2 MB/s/台以内，说明体素、量化、频率三个旋钮各取什么值、如何验证对地图对齐精度的影响。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>参考参数起点表；验证用重叠区对齐误差（第 025/026 章），不达标就收紧量化步长、放宽体素或降频，三者按"先频率、再体素、后量化"顺序调。</div></details>
+      </li>
+      <li>思考：为什么说"上传目标检测结果"的压缩比比 JPEG 高两个数量级？什么场景下这个做法不成立、必须回传图像？<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>结果消息是几十到几百字节的语义信息，而图像含全部像素信息。需要原始数据的情形：结果精度不足（小目标/密集遮挡）、下游要做重识别或人工复核、检测模型版本不一致需要交叉验证。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>跨机大消息的第一性问题永远是带宽算术：单帧大小 × 频率 × 台数 ÷ 压缩比，先算再设计。</li>
+      <li>压缩来源三类：空间冗余（JPEG/Draco）、熵冗余（PNG/zstd）、时间冗余（视频）；量化是最好用的连续旋钮。</li>
+      <li>图像走影子话题体系（compressed/compressedDepth），点云走"先降采样、再量化"的组合；深度数据严禁当普通图像压。</li>
+      <li>压缩链路的 QoS 是 Best-effort + KEEP_LAST(1)，并且"降频"本身就是最安全有效的压缩手段。</li>
+      <li>下一章离开大消息，进入协同感知的基础设施：<strong>多机器人坐标变换广播</strong>，没有统一的时间与坐标系，再好的数据也无法对齐。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch022.html">← 第 022 章：共享内存与零拷贝传输</a>
+    <a class="next" href="ch024.html">第 024 章：多机器人坐标变换广播 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

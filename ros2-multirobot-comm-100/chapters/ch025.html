@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第025章 统一坐标框架设计与标定 | 多机器人协同学习课程 · ROS2 通信与系统集成</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 数据分发与协同感知</span>
+    <span class="sep">/</span>
+    <span>第 025 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 数据分发与协同感知</div>
+    <h1>第 025 章：统一坐标框架设计与标定</h1>
+    <p class="lead">上一章说了桥接边要连到 world，这一章回答桥接上的数字从哪来：用两台机器人共同观测的同一组点，解出它们之间的刚体变换。</p>
+    <ul class="meta">
+      <li>主题：协同感知基础 / 外参标定</li>
+      <li>关键机制：REP-105 坐标层次、SVD 刚体配准（Kabsch 算法）、标定数据采集与验证</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 024 章（多机器人坐标变换广播）</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解统一坐标框架的分层语义：world / map / odom / base_link 各自承诺什么、容忍什么。</li>
+      <li>掌握两台机器人之间刚体变换的求解原理：最小二乘配准与 SVD 分解（Kabsch/Umeyama 算法）。</li>
+      <li>会设计标定流程：选共视特征、静止采样、多样本平均、留出验证。</li>
+      <li>会用残差 RMS 与重复性指标评估标定质量，并把结果固化进启动配置或 static TF。</li>
+      <li>能区分"离线标定"与"在线估计"的分工边界，知道标定误差如何影响下游协同任务。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>多机器人协同的精度上限，往往由<strong>坐标框架和标定决定</strong>，算法层面的改进补不回框架的误差。两台机器人各自定位得很准（各自 2 cm），但如果它们对"世界的原点在哪、X 轴朝哪"的理解差 5°，那么在 5 米外交汇处的目标就会错位 40 cm 以上，任何融合算法都救不回来。</p>
+    <p>本章做两件事：第一，把"统一坐标框架"这个词变成可执行的规范，哪些帧全局一致、哪些帧允许漂移、变换由谁发布；第二，解决框架落地的核心数字问题，<strong>求两台机器人之间的刚体变换</strong>。这个问题在数学上叫点集配准：只要两台机器人看过同一批物理点（标定板、墙角、立柱），我们就能从两组观测中解出唯一的旋转与平移。方法不新，但把它做对（采样设计、验证、误差控制）才是工程难点。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 坐标框架的分层语义：谁的承诺更"硬"</h3>
+    <p>统一坐标框架是一组有明确承诺的分层（REP-105 的精神，多机扩展），原点的选择有实际约束：</p>
+    <table>
+      <tr><th>帧</th><th>承诺</th><th>容忍</th><th>多机角色</th></tr>
+      <tr><td><code>world</code></td><td>全局唯一、跨机共享、近似不变</td><td>无（唯一参考）</td><td>所有机器人的共同祖先</td></tr>
+      <tr><td><code>robotN/map</code></td><td>与 world 一致（标定后）</td><td>慢漂移由定位修正</td><td>每机自己的全局地图原点</td></tr>
+      <tr><td><code>robotN/odom</code></td><td>局部连续、平滑、绝不吃跳变</td><td>允许长期漂移</td><td>控制与插值的时间基准</td></tr>
+      <tr><td><code>robotN/base_link</code></td><td>本体真实位姿</td><td>—</td><td>各传感器变换的根</td></tr>
+    </table>
+    <p>分层的意义在于<strong>把"误差"关进正确的笼子</strong>：定位修正只允许改 map → odom 这条边（可以跳变）；odom → base_link 永远平滑（控制环依赖它）；world → map 在"离线标定"体系里是常量。设计时先问："这条边允许多久变一次、允许多大跳变？"答案决定它该由谁发布、用什么频率。</p>
+
+    <h3>2. 刚体配准：从两组点到唯一的 (R, t)</h3>
+    <p>设两台机器人分别观测同一批 K 个共视点（例如标定板的四个角点，或一段激光扫描里的墙角特征）。在机器人 1 的坐标系下得到点集 {p<sub>i</sub>}，在机器人 2 的坐标系下得到对应点集 {q<sub>i</sub>}，i = 1…K。假设两组点之间只差一个刚体变换：</p>
+    <div class="formula">
+      q<sub>i</sub> = R · p<sub>i</sub> + t + ε<sub>i</sub>，求使 Σ‖ε<sub>i</sub>‖² 最小的 (R, t)
+      <span class="note">R 是 3×3 旋转矩阵（RᵗR = I 且 det R = +1），t 是平移向量</span>
+    </div>
+    <p>解法分三步，这就是著名的 Kabsch 算法（也称正交 Procrustes 问题）：</p>
+    <ol>
+      <li><strong>去质心</strong>：p̄、q̄ 分别是两组点的质心；令 p'<sub>i</sub> = p<sub>i</sub> − p̄，q'<sub>i</sub> = q<sub>i</sub> − q̄。这一步把"旋转"和"平移"解耦，旋转只由相对形状决定。</li>
+      <li><strong>构造互协方差并分解</strong>：H = Σ p'<sub>i</sub> q'<sub>i</sub><sup>t</sup>，做奇异值分解 H = U Σ V<sup>t</sup>。</li>
+      <li><strong>组装旋转与平移</strong>：R = V · diag(1, 1, det(V U<sup>t</sup>)) · U<sup>t</sup>；最后平移取 t = q̄ − R p̄。</li>
+    </ol>
+    <p>要注意那个 <code>diag(1, 1, det(VUᵗ))</code> 因子：它专门处理"镜像"退化。直接取 R = VUᵗ 在某些噪声配置下会得到 reflected 解（行列式为 −1 的"旋转"，实际是镜面翻转），用在机器人上，地图会左右颠倒且毫无直觉。直觉理解：<strong>形状匹配可以翻转，物理世界的旋转不行</strong>，这个因子就是把翻转折回旋转的开关。</p>
+    <p>把 Kabsch 放进配准方法谱系里，才能看清它的使用条件：</p>
+    <table>
+      <tr><th>方法</th><th>配对要求</th><th>流程</th><th>典型适用</th></tr>
+      <tr><td>Kabsch/SVD 闭式解</td><td>配对已知且正确</td><td>一步解析求解，复杂度 O(K)</td><td>标定板、人工确认的特征点</td></tr>
+      <tr><td>ICP 类迭代配准</td><td>无需已知配对</td><td>最近点配对与求解交替迭代</td><td>点云精配准，依赖初值</td></tr>
+      <tr><td>特征 + RANSAC</td><td>候选配对含离群</td><td>随机采样、Kabsch 求解、投票一致性</td><td>未知环境、误匹配率高</td></tr>
+    </table>
+    <p>标定场景的配对可以人工保证，因此直接用闭式解最稳；这也解释了为什么第 3 小节的"配对要可靠"是本章的第一优先级。</p>
+
+    <h3>3. 标定数据：质量决定成败</h3>
+    <p>SVD 是闭式解，代码只有十几行，难的是喂给它什么数据。三条工程原则：</p>
+    <ul>
+      <li><strong>点要"铺开"</strong>：点集的几何分布决定解的可观测性。所有点都在一条直线上，绕这条线的旋转就无法确定（最小二乘解病态）。让标定特征覆盖三个维度：高度差至少 0.5 m、水平覆盖至少 2–3 m。</li>
+      <li><strong>配对要可靠</strong>：p<sub>i</sub> 与 q<sub>i</sub> 必须对应同一个物理点。自动配对（近期特征匹配）要加一致性检查；人工配对（标定板的确定角点）更稳。</li>
+      <li><strong>静止采样、多样本平均</strong>：运动中的观测会因时间不同步产生错位（第 030 章）。静止采集 N 组（如 20 组），对每组解一次，再对结果做平均/选残差最小者，比拿一堆移动数据解一次可靠得多。</li>
+    </ul>
+    <p>标定结果是"世界系里 2 台机器人的相对位姿"（或等价地，两台机器人的 map 原点相对 world 的偏移）。评估指标用<strong>留出法</strong>：用前 70% 的点解变换，剩余 30% 计算残差 RMS。<strong>残差 RMS 是标定质量的直接体检报告</strong>，室内激光标定典型值 1–3 cm，超过 5 cm 说明数据或配对有问题，不要急着上线。</p>
+
+    <h3>4. 数值算例：四个共视点的配准逐步复盘</h3>
+    <p>用一个可以手算的二维例子把三步走一遍。机器人 1 观测到四个特征点 p₁(1.0, 0.0)、p₂(2.0, 0.5)、p₃(1.5, 2.0)、p₄(0.5, 1.5)，单位米；机器人 2 对同一批物理点的观测为 q₁(3.9397, 1.3420)、q₂(4.7084, 2.1539)、q₃(3.7255, 3.3924)、q₄(2.9568, 2.5805)。两组数据之间真实相差"绕 z 轴旋转 20°、平移 (3.0, 1.0)"。</p>
+    <p>第一步去质心：p̄ = (1.25, 1.0)，q̄ = (3.8326, 2.3672)。第二步构造互协方差矩阵，把去质心后的两组点逐对相乘求和，得到 H = [[1.2601, 0.1926], [−1.0900, 2.2637]]；对 H 做奇异值分解并按 R = V·diag(1, det(VUᵗ))·Uᵗ 组装，恢复出的旋转矩阵为 [[0.9397, −0.3420], [0.3420, 0.9397]]，对应偏航角 atan2(0.3420, 0.9397) = 20.00°。第三步求平移：t = q̄ − R·p̄ = (3.0, 1.0)。训练残差 RMS 为 5.6×10⁻¹⁶ 米，即浮点精度极限，说明数据完全自洽时算法不引入额外误差。</p>
+    <p>对照实验再给观测加 1 cm 标准差的高斯噪声：同一批数据下恢复出偏航角 19.78°、平移 (2.993, 1.003)，输入残差 RMS 为 0.91 cm，与噪声标准差同量级。这条对照给出两个工程判断：<strong>求解精度首先由观测噪声决定；残差 RMS 与噪声同量级是健康信号，明显大于噪声则说明配对里有离群点</strong>。1 cm 噪声下旋转估计出现 0.22° 的波动，也说明四点小样本只能作为演示，生产数据必须靠"多点、多站位"压噪声。</p>
+
+    <h3>5. 精度预算：点数与杠杆臂如何决定不确定度</h3>
+    <p>标定能到多少精度，在采集数据之前就大致可以预估。对白噪声标准差为 σ 的观测，配准参数估计的不确定度有两个近似公式（K 为共视点数，r̄ 为点到质心的均方根距离，也称杠杆臂）：</p>
+    <div class="formula">
+      σ<sub>t</sub> ≈ σ / √K，σ<sub>θ</sub> ≈ σ / ( r̄ · √K )
+      <span class="note">平移精度跟着点数开根号走；旋转精度还要除以杠杆臂，点集越"铺开"越准</span>
+    </div>
+    <p>代入 σ = 1 cm 算一张表，可以看到参数取值的依据：</p>
+    <table>
+      <tr><th>共视点数 K</th><th>杠杆臂 r̄</th><th>平移不确定度 σ<sub>t</sub></th><th>旋转不确定度 σ<sub>θ</sub></th><th>10 m 处横向误差</th></tr>
+      <tr><td>10</td><td>0.5 m</td><td>3.2 mm</td><td>0.36°</td><td>6.3 cm</td></tr>
+      <tr><td>20</td><td>1.0 m</td><td>2.2 mm</td><td>0.13°</td><td>2.2 cm</td></tr>
+      <tr><td>50</td><td>2.0 m</td><td>1.4 mm</td><td>0.04°</td><td>0.7 cm</td></tr>
+    </table>
+    <p>表里最醒目的一列是"10 m 处横向误差"：同样是 1 cm 的观测噪声，K 小、点集紧缩的组合会把 10 m 外的目标推到 6.3 cm 之外，而"多点 + 大杠杆臂"能压到 1 cm 以内。这就是设计参数表的依据：<strong>特征跨度要求 2 m 以上，本质是在把 r̄ 做大；要求 K ≥ 20，是在把统计噪声压小</strong>。两条曲线一个按 1/√K 收缩、一个按 1/r̄ 收缩，杠杆臂在量级上更重要（K 从 10 涨到 50 只换来 √5 ≈ 2.2 倍改善，r̄ 从 0.5 m 到 2 m 直接 4 倍）。边界情形也要认识：当 σ 不再是白噪声、混入系统性偏差（测距偏置随距离增长、时间错位残留）时，公式失效，K 与 r̄ 再怎么加大也压不下去，唯一手段是消除偏差源本身。</p>
+
+    <h3>6. 边界条件与失效模式</h3>
+    <ul>
+      <li><strong>最小点数</strong>：三维刚体有 6 个自由度，至少 3 个不共线点才能给出唯一解；平面运动降为 3 个自由度，2 个不同点即可解出，但实际系统样本量远高于下限才抗噪。</li>
+      <li><strong>共面/共线退化</strong>：点集落在单一平面时，绕平面法向量的旋转依然可观测（平面内散布提供杠杆臂），但点集一旦退化为一条直线，绕线的旋转完全不可观测，解由噪声决定。检测方法是看点集协方差矩阵的最小奇异值与最大奇异值之比。</li>
+      <li><strong>系统偏差不随样本平均</strong>：激光测距的入射角偏差、相机畸变残差、时间错位都会以固定方向偏移进入观测，多采样本只会把错误值平均得更精确。对策：控制观测几何（正对特征面）、先做时间同步与内参标定。</li>
+      <li><strong>离群配对</strong>：K 较小时一个 10 cm 的错配对足以把结果拉偏 2–3 cm。对策：解后逐点残差筛查，超过 3σ 剔除重解。</li>
+      <li><strong>只标定不验证</strong>：训练残差小只说明拟合了训练点。必做留出验证，以及独立会话重测：重新摆位再标一次，比较两次结果的差异是否落在预期不确定度内。</li>
+    </ul>
+    <div class="box key">
+      <span class="box-title">离线标定与在线估计的分工</span>
+      <p>"标定"回答世界原点与长期不变的相对关系，"在线估计"（第 029 章定位融合）回答随时间漂移的实时修正。正确用法：<strong>标定给出先验初值，在线估计在其附近持续修正</strong>。把标定误差全部推给在线算法，等于让滤波器去拟合一个它不该负责的常数。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>标定工程按六步执行，每步有交付物与验收点：</p>
+    <ol>
+      <li><strong>定框架规范</strong>：写一页纸：world 的物理锚点（如厂房西南角立柱）、各机器人前缀、每类边的归属与频率。交付物：坐标框架文档。</li>
+      <li><strong>选共视特征</strong>：激光可观墙角/立柱、视觉可用标定板/AprilTag。特征要<strong>两机都能稳定观测</strong>（避开视角盲区与反光面）。</li>
+      <li><strong>采集</strong>：两台机器人静止摆放到不同相对姿态（至少 3–5 个站位），每个站位记录 20 组特征观测与各自定位数据。<strong>站位变化让点集"铺开"，是提高可观测性的关键。</strong></li>
+      <li><strong>求解与验证</strong>：脚本按站位解变换、留出法算残差；残差超标先查配对，算法本身最后再动。</li>
+      <li><strong>固化</strong>：把结果写进启动配置（static TF 边或参数文件），并在系统里记录标定版本号与日期。</li>
+      <li><strong>复标周期</strong>：传感器被碰撞、底盘维修、场地搬迁后必须重标；日常运行用在线估计吸收小漂移。</li>
+    </ol>
+    <table>
+      <tr><th>环节</th><th>建议参数</th><th>依据</th></tr>
+      <tr><td>共视点数 K</td><td>≥ 20（含多站位）</td><td>统计充分性，抗单点噪声</td></tr>
+      <tr><td>样本数</td><td>每站位 20 组静止观测</td><td>随机噪声平均，抑制时间错位</td></tr>
+      <tr><td>特征跨度</td><td>水平 ≥ 2 m、垂直 ≥ 0.5 m</td><td>可观测性：三个轴向的旋转都要被激发</td></tr>
+      <tr><td>验收指标</td><td>留出残差 RMS ≤ 3 cm</td><td>室内激光典型水平；超标先查数据</td></tr>
+      <tr><td>标定版本</td><td>version + 日期写入配置</td><td>可追溯：出问题时知道用哪次标定</td></tr>
+    </table>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：Kabsch 配准，20 行解出刚体变换</strong></p>
+    <pre class="code"><code>import numpy as np
+
+def rigid_transform(p, q):
+    """求 q ≈ R @ p + t 的最小二乘刚体变换。
+    p, q: (K, 3) 数组，第 i 行是同一物理点在两机坐标系下的观测。"""
+    p_bar, q_bar = p.mean(axis=0), q.mean(axis=0)
+    pc, qc = p - p_bar, q - q_bar          # 去质心：旋转与平移解耦
+    H = pc.T @ qc                          # 互协方差矩阵（K 个点的贡献求和）
+    U, S, Vt = np.linalg.svd(H)            # 分解出两组"主方向"
+    # 修正镜像：det 为负时把最小奇异值方向翻转，得到纯旋转解
+    d = np.sign(np.linalg.det(Vt.T @ U.T))
+    R = Vt.T @ np.diag([1.0, 1.0, d]) @ U.T
+    t = q_bar - R @ p_bar                  # 平移 = 质心差减去旋转项
+    return R, t
+
+def residual_rms(p, q, R, t):
+    """留出点上的残差 RMS：标定质量的直接体检报告（单位与输入一致）。"""
+    err = (R @ p.T).T + t - q
+    return float(np.sqrt((err ** 2).sum(axis=1).mean()))</code></pre>
+    <p>解读：这段代码短，但每一行都值得讲。<strong>（1）</strong>去质心那一步是数学必需：目标函数里 R 与 t 耦合，先去掉质心贡献才能让 SVD 干净地解出旋转。<strong>（2）</strong><code>np.sign(det)</code> 修正镜像：没有这一行，标定在某些数据分布下会输出行列式 −1 的"翻转"，两台机器人的地图会像照镜子一样左右颠倒，而且这种错误用肉眼看标定残差往往是"看起来还不错"的假象。<strong>（3）</strong>残差函数独立出来很关键：<strong>求解用一部分点、验证用另一部分点</strong>，两段代码分开，避免"用训练误差自证清白"。如果留出残差明显大于训练残差，说明点集里有离群配对。</p>
+
+    <p><strong>片段 2：共视特征采集器，静止判据与多样本</strong></p>
+    <pre class="code"><code>class CalibCollector(Node):
+    """收集两台机器人对同一标定物的观测，静止后取平均样本。
+    话题示意：/robotN/landmarks 为小消息（id, x, y, z, stamp）。"""
+    def __init__(self):
+        super().__init__("calib_collector")
+        self.samples = {1: dict(), 2: dict()}      # robot_id -> {lid: [观测...]}
+        for rid in (1, 2):
+            self.create_subscription(Landmark, f"/robot{rid}/landmarks",
+                                     lambda m, r=rid: self.on_lm(r, m), 10)
+        self.last_motion = {1: 0.0, 2: 0.0}        # 每机累计运动量
+
+    def on_lm(self, rid, msg):
+        # 静止判据：只有"没在动"的观测才进入标定集，消除时间错位影响
+        if self.last_motion[rid] > 0.01:           # 阈值 1 cm 量级
+            return
+        self.samples[rid].setdefault(msg.id, []).append(
+            (msg.x, msg.y, msg.z, msg.stamp))
+        # 每个特征攒够 20 组就取中位数作为该特征的稳健估计
+        obs = self.samples[rid][msg.id]
+        if len(obs) == 20:
+            arr = np.array([o[:3] for o in obs])
+            self.stable[rid][msg.id] = np.median(arr, axis=0)
+
+    def ready(self):
+        # 每个机器人至少稳定观测 6 个特征才允许求解
+        return all(len(self.stable[r]) >= 6 for r in (1, 2))</code></pre>
+    <p>解读：采集器的设计核心是"<strong>把噪声挡在求解之外</strong>"。<strong>（1）</strong>静止判据用累计运动量：瞬时速度会被一时抖动干扰，累计位移能更稳健地识别"确实停稳了"。<strong>（2）</strong>聚合 20 组观测用中位数，均值留作质量统计：中位数对偶发离群（一次错误匹配、一帧遮挡）不敏感，代价是你不能再用方差做统计，所以生产实现里两者都要统计，取中位数做估计、用方差做质量门限。<strong>（3）</strong><code>ready()</code> 把"数据够了没有"显式化：标定流程应该是一个有前置条件的确定性过程，"随便跑一会就出结果"是反面教材。注意每个特征的观测必须来自同一静止窗口，混入不同站位的观测会让平均失去物理意义。</p>
+
+    <p><strong>片段 3：标定结果固化，生成桥接边配置</strong></p>
+    <pre class="code"><code>import numpy as np
+import datetime as dt
+
+def emit_bridge_yaml(results, path="calib_bridges.yaml"):
+    """把标定结果写成静态桥接边：world -> robotN/map 的 x y z yaw。
+    results: {rid: (R_3x3, t_3)}，均为"world 中该机器人 map 原点"的位姿。"""
+    lines = ["# 由标定脚本自动生成，请勿手工修改",
+             f"# version: {dt.datetime.now():%Y-%m-%d %H:%M}"]
+    for rid, (R, t) in sorted(results.items()):
+        yaw = float(np.arctan2(R[1, 0], R[0, 0]))  # 平面运动只需偏航角
+        # 平面标定假定滚转与俯仰可忽略；三轴完整标定则应改用四元数
+        lines.append(f"robot{rid}:")
+        lines.append(f"  parent: world")
+        lines.append(f"  child: robot{rid}/map")
+        lines.append(f"  xyz: [{t[0]:.4f}, {t[1]:.4f}, {t[2]:.4f}]")
+        lines.append(f"  yaw: {yaw:.4f}")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    return path</code></pre>
+    <p>解读：标定脚本的最后一步是<strong>生成机器可读的配置</strong>（不止于"打印结果"），这里示范输出 YAML，供第 024 章的 static_transform_publisher 或部署工具消费。<strong>（1）</strong>版本与时间是第一行：三个月后出现"地图突然错位"，第一个要回答的问题就是"用的哪次标定"，没有版本号就得全系统考古。<strong>（2）</strong>平面系统只取 yaw 是合理的简化（室内差速底盘滚转俯仰微乎其微），但如果你的标定允许三维姿态，就必须改用完整四元数输出，否则等于把三维标定的人为压扁。<strong>（3）</strong>文件头注明"自动生成"：防止有人手改配置后与标定记录脱节，配置是标定的<strong>产物</strong>，不是可以随意讨论的草稿。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>点集共线导致解病态</strong>：全部特征贴在一条走廊的同一面墙上，绕墙线方向的旋转由噪声决定。症状：标定 RMS 很小但实际使用错位。修复：换站位、加高低差与横向分布。</li>
+      <li><strong>镜像解未修正</strong>：<code>det</code> 为 −1 的"旋转"让整个地图左右翻转，且残差可能并不大。修复：见片段 1 的 <code>d</code> 因子，并写断言检查 <code>det(R) ≈ +1</code>。</li>
+      <li><strong>用运动中的观测</strong>：两机时间差 + 运动使数据库中"同一时刻"的点并不对应同一物理位置，解出的 R、t 系统性偏差。修复：静止采样，或先做时间对齐（第 030 章）。</li>
+      <li><strong>配对错误混入一个坏点</strong>：一个错配对就能把结果拉偏十几厘米。修复：解完看每个点的残差，剔除超过 3σ 的点重解（稳健配准），再跑留出验证。</li>
+      <li><strong>标定结果没固化、每次靠参数手递</strong>：上电顺序或参数失效时系统悄悄退回"无桥接"，表现为所有跨机数据在 world 下重叠。修复：把配置纳入仓库与启动检查，缺失时直接报错，禁止默默降级。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>给定 4 对点（构造一个已知 R、t 再人为加 1 cm 噪声），跑一遍片段 1 的代码，验证残差与噪声量级的关系。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>无明显离群时，留出残差 RMS 应与单点噪声同量级（约 1 cm）。若明显偏大，检查配对顺序是否错位。</div></details>
+      </li>
+      <li>把点集改成全部共线（只沿 x 轴分布），预测哪个自由度不可观测，并写出一个能自动检测该问题的判据。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>绕直线方向的旋转不可观测；判据可以是点集协方差矩阵最小特征值与最大特征值之比低于阈值时告警。</div></details>
+      </li>
+      <li>改站位方案：从 2 个站位改到 5 个站位，预测标定残差与重复性如何变化？设计实验量化（每组站位解一次，统计 R、t 的散布）。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>更多站位让点集更"铺开"、观测噪声平均得更彻底；预期残差略降、重复性明显改善（R、t 散布收窄）。对比时要固定其他条件。</div></details>
+      </li>
+      <li>设计题：为你的场地写一份"统一坐标框架规范"半页纸 + 一页标定流程（特征选择、站位布置、采集量、验收指标、复标触发条件）。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>规范参考本节表格；流程要明确交付物（YAML + 版本记录）与责任人，并写清"标定不合格时怎么办"。</div></details>
+      </li>
+      <li>思考：标定残差 2 cm 的系统，在 10 m 外融合目标时误差至少多大？如果目标靠近两台机器人连线的延长线，误差会更大还是更小？<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>旋转分量会随距离放大，2 cm 位置 + 0.5° 朝向在 10 m 外可放大到 10 cm 量级；沿连线方向误差以平移为主，垂直方向最敏感于朝向误差。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>统一坐标框架是一组分层承诺：world 全局唯一、odom 平滑连续、map 吸收漂移、base_link 是本体。</li>
+      <li>两机外参标定 = 点集刚体配准：去质心解耦、SVD 求旋转、修正镜像、质心差求平移（Kabsch 算法）。</li>
+      <li>数据质量决定标定质量：点要铺开、配对要准、静止采样、多样本平均、留出验证。</li>
+      <li>标定结果是配置产物：带版本号固化进启动配置，残差 RMS 是验收指标，碰撞/维修后必须复标。</li>
+      <li>标定负责"常量"，在线估计负责"漂移"。下一章进入地图域：<strong>静态地图合并</strong>，把两张各自建好的栅格地图拼成一张全局一致的地图。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch024.html">← 第 024 章：多机器人坐标变换广播</a>
+    <a class="next" href="ch026.html">第 026 章：静态地图合并 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

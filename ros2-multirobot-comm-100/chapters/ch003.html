@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第003章 服务调用实现远程控制 | 多机器人协同学习课程 · ROS2 通信与系统集成</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · 通信基础与系统搭建</span>
+    <span class="sep">/</span>
+    <span>第 003 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · 通信基础与系统搭建</div>
+    <h1>第 003 章：服务调用实现远程控制</h1>
+    <p class="lead">什么时候"喊一声等回应"比"不停广播"更合适：服务调用把远程控制做成有回执的事务，本章讲透它的超时、重试与幂等三件风险装备。</p>
+    <ul class="meta">
+      <li>主题：通信基础 / 请求-响应原语</li>
+      <li>关键机制：服务发现与就绪、超时与重试、幂等语义、异步调用</li>
+      <li>预计学时：50 分钟</li>
+      <li>前置章节：第 002 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解请求/响应（request/response）模型与发布/订阅的本质差异，能给一个具体遥控操作说出"为什么它该用服务"。</li>
+      <li>掌握服务调用完整生命周期：发现、就绪等待、发起、等待响应、超时处理，知道每一步可能出什么错。</li>
+      <li>建立"超时不等于失败"的判断：理解至少一次语义，会为命令设计幂等或带序号的去重机制。</li>
+      <li>会写不阻塞的客户端代码：call_async + 执行器驱动，避免在回调里同步调用造成的死锁与卡顿。</li>
+      <li>能按数据语义选择通信原语：短快有回执用服务、高频流用话题、长任务有反馈用动作（下一章展开）。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>多机器人系统里有一类交互和"数据流"完全不同：<strong>遥控台想让 3 号机器人切换到手动模式，并知道切换成功没有。</strong>这不需要持续的数据流，需要的是一次明确的往返：请求发出去，结果收回来。用话题来做这件事，你得自己再造一套"请求 ID + 应答话题 + 超时"的协议，这正是服务（service）原语要省掉的工作。</p>
+    <p>服务在 ROS2 里适用面很宽：设置模式、校准传感器、触发标定、查询配置、急停复位。它也是最容易被用错的：把耗时较长的任务塞进服务、在回调里同步等待、重试导致夹爪重复闭合……本章围绕"远程控制"这个典型场景，把服务的正确用法与风险装备讲全。它与话题（002）互补、与动作（004）分工，三者构成通信原语的入门三件套。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 请求/响应模型：一次有回执的往返</h3>
+    <p>服务是<strong>同步语义的远程过程调用</strong>：客户端（client）发出一个请求，服务端（server）执行处理并返回一个响应，一次交互 = 一请求一响应两条消息。与话题对照：</p>
+    <table>
+      <tr><th>维度</th><th>话题（发布/订阅）</th><th>服务（请求/响应）</th></tr>
+      <tr><td>方向</td><td>单向广播，N:M</td><td>点对点往返，1:1</td></tr>
+      <tr><td>时序</td><td>异步、连续数据流</td><td>同步语义、单次事务</td></tr>
+      <tr><td>回执</td><td>无（不知道谁收到）</td><td>有（响应即回执）</td></tr>
+      <tr><td>失败模式</td><td>丢帧、延迟堆积</td><td>超时、重复执行、服务端忙</td></tr>
+      <tr><td>典型频率</td><td>10–500 Hz 持续流</td><td>0.1–5 Hz 偶发调用</td></tr>
+    </table>
+    <p><strong>心智图景：话题像广播电台，服务像打电话办事。</strong>打电话要先拨号确认对方在（服务发现与就绪），说清事情（请求），等对方答复（响应）。对方占线或没接（超时），你就得决定：再打一次，还是改天。每一次"再打一次"都可能让对方把同一件事办了两遍，这就是下一节的幂等问题。</p>
+
+    <h3>2. 发现与就绪：为什么要先等</h3>
+    <p>服务端启动时向 DDS 注册自己的服务端点（名字 + 类型），客户端的发现不是瞬时的：注册要传播、匹配要时间，在刚启动的两三秒内，客户端可能还"看不见"服务端。因此正确调用序列是：<strong>先等就绪（wait_for_service / service_is_ready），再发起调用</strong>。跳过等待直接调用，会立刻得到"service not available"的失败，这属于发现时序问题，与网络无关。</p>
+    <p>服务调用还有一个隐蔽的陷阱：<strong>类型唯一标识不匹配同样是静默的</strong>。两端自定义的 .srv 定义有差异（哪怕一个字段名），服务照样"存在"，调用却永远不成功。因此遥控系统的部署检查单里，"两端接口包版本一致"是和"网络连通"同级的前置条件。</p>
+
+    <h3>3. 超时、至少一次语义与幂等</h3>
+    <p>请求发出后，客户端等一个响应。等待期间可能发生：响应丢包、服务端忙、服务端进程刚好重启。客户端只能观察到一件事，<strong>在超时前没有等到响应</strong>。注意这句话的精确含义：<strong>超时 ≠ 失败</strong>，它只说明"结果未知"：请求可能没到；可能到了没执行；也可能已经执行了，只是响应丢了。</p>
+    <p>于是重试的语义是"至少一次"：可能重复执行。把一个非幂等的命令（夹爪闭合、弹药上膛、地图重置）无脑重试，是远程控制系统里最危险的一类错误。三种防护手段：</p>
+    <ul>
+      <li><strong>把命令设计成幂等的</strong>：优先用"设置式"命令，慎用"动作式"："把模式设为 teleop"重复执行一万次结果相同；"切换模式"（toggle）重复执行就会来回跳变。</li>
+      <li><strong>带序号去重</strong>：客户端为每个请求附带递增序号（或 UUID），服务端记录"最近处理过的序号"，重复的直接返回缓存结果。适合无法转成设置式的命令。</li>
+      <li><strong>带时效</strong>：命令附过期时间（如 2 s），过期请求直接拒绝，无人机遥控里"迟到的指令不如没有指令"。</li>
+    </ul>
+    <p>超时值怎么定？用实测 RTT 的 p99 作基准，留 3–5 倍余量：有线局域网 RTT 通常 2–10 ms，超时可取 50–100 ms；经过 WiFi 的多跳场景 RTT 抖动到 20–50 ms，超时取 200–500 ms。超时太短会误判失败引发重试风暴；太长则让遥控台"卡住"的时间不可接受。</p>
+    <p><strong>算例：重试把可靠性抬到多少，代价是什么？</strong>设单次调用超时率 20%。不重试时，两成的遥控操作要人工处理；重试 2 次（共 3 次尝试）且各次独立时，"完全没有答案"的概率降到 0.2³ = <strong>0.8%</strong>。代价有两笔：最坏等待从 200 ms 拉长到 3 × 200 ms，叠加 100 ms 与 300 ms 的退避节奏后接近 1 s；那 20% 的超时里若有请求其实已经执行，重试就制造了重复执行，需要下面的幂等与去重手段接住。工程上更稳妥的做法是退避式重试（例如 0 / 100 ms / 300 ms），给服务端留出喘息窗口，避免三连发把瞬时并发再抬高一层。</p>
+
+    <h3>4. 阻塞与执行器：不要在回调里等回调</h3>
+    <p>rclpy 的同步接口 <code>client.call(req)</code> 会阻塞当前线程直到响应或失败。它在"脚本式"用法里很方便，但放进节点回调里就是灾难：单线程执行器上，回调本身占着唯一的线程，而响应要靠同一个执行器才能分发进来，<strong>形成"自己等自己"的死锁</strong>。</p>
+    <p>正确姿势是异步：<code>call_async()</code> 立即返回一个 future，执行器在后台把响应装进 future。你选择在什么地方等它：在脚本里用 <code>spin_until_future_complete</code> 驱动等待（等待期间执行器仍在处理其他消息）；在节点逻辑里注册 done 回调，让"结果处理"变成又一次事件。多机器人遥控台通常把每个待发命令的 future 存进一个表，超时检查交给定时器，<strong>这样界面线程永不阻塞，慢服务端也不会冻结整个遥控程序。</strong></p>
+
+    <h3>5. 延迟构成与适用边界</h3>
+    <p>一次服务调用的端到端时间由四段构成：请求序列化 + 网络往返（RTT）+ 服务端处理 + 响应序列化。在 20 台规模的局域网里，典型总计 5–20 ms；经 WiFi 中继可到 20–50 ms。这个量级决定了两条边界：</p>
+    <div class="formula">
+      T<sub>call</sub> ≈ T<sub>序列化</sub> + RTT + T<sub>服务端处理</sub> ≈ 5–50 ms（局域网/WiFi）
+      <span class="note">服务适合"秒级的人机交互"；把它放进 100 Hz（10 ms 周期）的控制环里，单次调用就吃掉整个周期，必然超时</span>
+    </div>
+    <p><strong>选择标准（何时该用/不该用）</strong>：短小（处理时间几毫秒内）、低频（每秒几次以内）、需要明确回执的操作 → 服务；持续高频的数据 → 话题；耗时长（秒到分钟级）、需要中途反馈或可取消 → 动作。还有一个隐蔽边界：<strong>服务端是单队列的</strong>，一个慢回调会挡住后续所有请求，所以"服务端回调里不做重活"是硬规矩。</p>
+    <table>
+      <tr><th>原语</th><th>交互模型</th><th>典型单次处理时长</th><th>典型调用频率</th><th>回执</th><th>可取消</th></tr>
+      <tr><td>话题</td><td>单向数据流，N:M</td><td>不适用（持续产生）</td><td>10–500 Hz</td><td>无</td><td>不适用</td></tr>
+      <tr><td>服务</td><td>点对点事务，1:1</td><td>百毫秒以内</td><td>0.1–5 Hz</td><td>有</td><td>否</td></tr>
+      <tr><td>动作</td><td>事务加进度流</td><td>秒到分钟级</td><td>按任务</td><td>有（最终结果）</td><td>是（含中途反馈）</td></tr>
+    </table>
+    <p><strong>算例：中央服务的排队延迟从哪来？</strong>20 台机器人各有一个客户端，平时每秒调用 1 次、服务端每次处理 2 ms，总利用率仅 40 ms/s = 4%，平均几乎不排队。风险在"同时性"：某事件让 20 台机器人同时发起调用时，服务端只能串行处理，第 20 个响应要等 19 × 2 ms = <strong>38 ms</strong> 才开始被处理。客户端超时 200 ms 时这一轮突发仍然安全；但突发规模涨到 100 个调用时，末尾排队约 99 × 2 ms = 198 ms，直接逼近超时线。结论：<strong>单队列服务的排队延迟由"最坏瞬时并发 × 服务时间"决定</strong>，削峰手段是给周期性调用加随机抖动，把并发摊开。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>以"遥控台对 4 台机器人"为例走一遍服务层设计。遥控台要提供四类操作，先做原语决策：</p>
+    <table>
+      <tr><th>操作</th><th>建议原语</th><th>理由</th></tr>
+      <tr><td>设置模式（idle/teleop/auto）</td><td>服务</td><td>短、需要回执、天然幂等（设置式）</td></tr>
+      <tr><td>急停 / 复位</td><td>服务</td><td>必须确认"谁执行了"；急停还要叠加保全链路（见坑与练习）</td></tr>
+      <tr><td>持续遥控（摇杆到速度）</td><td>话题</td><td>100 Hz 流式数据，服务往返延迟吃不消</td></tr>
+      <tr><td>返航（可能几分钟）</td><td>动作</td><td>长任务、要进度反馈、可能要取消（004 章）</td></tr>
+      <tr><td>查询一次性配置</td><td>服务</td><td>读操作，无副作用，重试无风险</td></tr>
+    </table>
+    <p>接着定接口契约。响应不要只返回 <code>bool</code>，要返回"结果 + 原因"：上位机需要区分"参数非法"（改参数重发）与"当前状态不允许"（等状态变化再发）。服务端设计三条原则：</p>
+    <ol>
+      <li><strong>先校验后执行</strong>：非法请求立即拒绝，绝不让对端等到超时；</li>
+      <li><strong>回调只做短操作</strong>：落地状态变更、组织响应即可；需要长时间工作的场景改用动作或"受理 + 异步执行"模式；</li>
+      <li><strong>幂等或可去重</strong>：要么命令天然幂等，要么维护"最近序号表"。</li>
+    </ol>
+    <p>去重表的实现要点：按 <code>client_id</code> 分桶，每桶只保留最近 K 个序号及其响应缓存，K 取"最大在途请求数 × 2"，遥控场景取 16 已足够。算内存：20 个客户端 × 16 条 × 0.5 KB ≈ <strong>160 KB</strong>，可以忽略；但若错误地保留全部历史（上万条），内存与查找成本都会失控。去重命中时要返回<strong>缓存过的原响应</strong>，让客户端看到与第一次完全相同的结果，对端无法区分重试与首次，这样才能真正做到"重试等于没重试"。</p>
+    <h3>客户端超时/重试策略表</h3>
+    <table>
+      <tr><th>操作类型</th><th>超时</th><th>重试</th><th>幂等保障</th></tr>
+      <tr><td>查询类（读配置）</td><td>200 ms</td><td>2 次</td><td>无副作用，直接重试</td></tr>
+      <tr><td>设置类（模式/上限）</td><td>200 ms</td><td>2 次</td><td>设置式命令天然幂等</td></tr>
+      <tr><td>动作类（校准/复位）</td><td>500 ms</td><td>1 次</td><td>序号去重 + 服务端结果缓存</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：为什么"急停"也要用服务，而不只靠控制话题的超时兜底？</span>
+      <p>控制话题（<code>cmd_vel</code>）断了，机器人本地的看门狗超时会停车，这是"沉默保险"。但急停是<strong>主动命令</strong>：遥控台要知道"急停被谁、何时、以什么结果执行了"，还必须有明确回执进日志。服务正好提供这个事务语义。生产系统两者叠加：服务负责"确认执行"，本地看门狗负责"通信已死也要停"。单一机制无论是谁都覆盖不了这两类需求。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：接口定义与服务端，先校验、快返回、给原因</strong></p>
+    <pre class="code"><code># SetMode.srv：请求/响应字段设计决定了排障体验
+# 响应不是单个 bool：上位机要区分"参数错"与"状态不允许"
+string mode        # 目标模式：idle / teleop / auto
+string client_id   # 发起方标识：多遥控台场景用于审计与幂等去重
+---
+bool success       # 是否受理并完成（拒绝也是有效答案，不是通信失败）
+string reason      # 失败原因（成功后为空串），直接显示在遥控台
+uint8 error_code   # 0=成功 1=非法参数 2=状态不允许 3=繁忙，便于程序分支
+</code></pre>
+    <pre class="code"><code>from robot_srvs.srv import SetMode    # 接口包：以你们工程的实际命名为准
+
+class ModeServer(Node):
+    """远程模式切换：短操作、要回执，典型的服务场景。"""
+    def __init__(self, robot_id):
+        super().__init__("mode_server", namespace=f"robot{robot_id}")
+        self.mode = "idle"
+        self.valid = {"idle", "teleop", "auto"}
+        # 服务端只声明"名字+类型+回调"：一对多、多对一都自动适配
+        self.srv = self.create_service(SetMode, "set_mode", self.on_set_mode)
+
+    def on_set_mode(self, request, response):
+        # 先校验再执行：非法参数立刻拒绝，绝不让对端白白等到超时
+        if request.mode not in self.valid:
+            response.success = False
+            response.reason = f"unknown mode: {request.mode}"
+            response.error_code = 1          # 非法参数：客户端改参数后可安全重发
+            return response                 # 显式返回结构体：这是"拒绝"不是"失败"
+        self.mode = request.mode            # 纯状态赋值：微秒级、无阻塞，且天然幂等
+        response.success = True
+        response.reason = ""
+        response.error_code = 0
+        self.get_logger().info(f"mode -&gt; {self.mode}")
+        return response                     # 服务端绝不在这里 sleep / 发长消息</code></pre>
+    <p>解读：<strong>（1）</strong>响应设计成 <code>success + reason</code> 是远程控制的可用性底线，遥控台把 <code>reason</code> 直接显示给操作员，比对着一句笼统的"调用失败"猜原因强太多。<strong>（2）</strong>"设置式"命令（mode = X）重复执行无害，这让客户端重试变得安全；如果接口设计成 toggle，重试就会变成 bug 驱动器，接口设计阶段就要把幂等性想进去。<strong>（3）</strong>回调里只有赋值与日志：服务端是单队列的，回调慢 100 ms，后面的请求全部要多等 100 ms，涨的是整个车队的遥控延迟。</p>
+
+    <p><strong>片段 2：客户端，等待就绪、异步调用、超时不误判</strong></p>
+    <pre class="code"><code>class RemoteCommander(Node):
+    """向指定机器人发送模式切换：带就绪等待、硬超时与有限重试。"""
+    def __init__(self, target_id):
+        super().__init__("remote_cmd")
+        # 绝对服务名跨机指向：不随本节点命名空间漂移，明确指向目标机器人
+        self.cli = self.create_client(SetMode, f"/robot{target_id}/set_mode")
+
+    def set_mode(self, mode, timeout=0.2, retries=2):
+        # 发现不是瞬时的：刚上电时服务端可能还不可见，先等它出现
+        if not self.cli.wait_for_service(timeout_sec=1.0):
+            return ("unavailable", None)      # 服务端根本没出现：网络/发现问题
+        for _ in range(retries + 1):
+            req = SetMode.Request()
+            req.mode = mode                   # 设置式命令：重试天然安全（幂等）
+            fut = self.cli.call_async(req)    # 非阻塞：执行器在后台收响应
+            # 设硬超时等待：超时只代表"没等到答案"，不代表对方没执行
+            rclpy.spin_until_future_complete(self, fut, timeout_sec=timeout)
+            if fut.done():
+                return ("ok", fut.result())   # 成功或收到结构化拒绝，都算有答案
+        # 全部超时：可能的因果链是"响应丢包/服务端忙/仍在重传"
+        return ("timeout", None)              # 交给上层：再试一次还是告警值班员</code></pre>
+    <p>解读：<strong>（1）</strong><code>wait_for_service</code> 与硬超时解决的是两类不同问题，前者等"服务存在"，后者等"本次响应"。把两者混为一谈的代码会在启动阶段随机失败。<strong>（2）</strong><code>call_async + spin_until_future_complete</code> 的组合让等待期间执行器照常运行：这不是文字游戏，同步 call 在节点进程里会阻塞整个执行器线程，其他话题处理全被冻住。<strong>（3）</strong>超时返回 <code>"timeout"</code>，把"结果未知"当作独立状态传给上层；返回 <code>"failed"</code> 会把"没等到答案"与"确定失败"混为一谈。返回"ok"时，注意拒绝也是合法答案（<code>fut.result().success == False</code>），不要只判断 future 是否完成。</p>
+
+    <p><strong>片段 3：CLI 排查与手动遥控</strong></p>
+    <pre class="code"><code># 服务排障四连：列表、类型、实例、呼叫，从"有没有"查到"通不通"
+ros2 service list -t                          # 列出所有服务与类型，确认 /robotN 前缀
+ros2 service type /robot1/set_mode            # 单点查询类型，与接口包比对版本
+ros2 service find robot_srvs/srv/SetMode      # 反向：这个类型注册了哪些实例
+ros2 service call /robot1/set_mode robot_srvs/srv/SetMode "{mode: teleop}"
+ros2 service call /robot1/set_mode robot_srvs/srv/SetMode "{mode: auto}"   # 设置式：重复调用结果一致
+# call 卡住不返回：优先怀疑服务端回调阻塞或服务端不存在（等不到响应）
+ros2 node info /robot1/mode_server            # 确认服务端进程活着且注册了服务</code></pre>
+    <p>解读：<code>ros2 service call</code> 是"自带客户端"，排障时用它绕过你的遥控台代码，可以立刻回答"是通信问题还是我的客户端问题"。注意 <code>call</code> 在终端上的表现：如果服务端不存在，它会卡住等发现；这时看 <code>service list</code> 有没有目标，比盯着终端发呆高效。类型不一致时 <code>call</code> 会直接报错，比程序里的静默不匹配友好，这也是把 CLI 检查纳入部署流程的原因。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>在回调里同步 call</strong>：单线程执行器的回调里调用另一个服务（哪怕是别的节点），等待线程与派发响应是同一个执行器，轻则卡住整个节点几秒，重则死锁。修复：call_async + future 表 + 定时器检查；或至少换多线程执行器并理解回调组的语义。</li>
+      <li><strong>超时后无脑重试非幂等命令</strong>："闭合夹爪"超时后重发，若第一次其实成功，会出现"关—再关"的二次动作甚至过载。修复：设置式接口、序号去重、或重试前先查询状态（读服务）。</li>
+      <li><strong>把慢任务塞进服务</strong>：回充校准这类长耗时操作在服务端回调里同步执行，客户端全部超时，其他机器人的请求也排在队列后面。修复：回调返回"已受理"，任务本体走动作（下一章）或工作线程 + 状态话题。</li>
+      <li><strong>直接 call 不等发现</strong>：遥控台刚启动就按下按钮，服务端明明在线却报"不可用"。修复：wait_for_service 后再启用按钮，启动 UI 加三秒就绪窗。</li>
+      <li><strong>忘记服务端也会"忙"</strong>：多个客户端同时打同一个服务，服务端串行处理；20 台机器人若共用一个中央服务，单队列会成为全局瓶颈。修复：服务按机器人分区（<code>/robotN/...</code>）或限制客户端并发。另一个变体是<strong>同名服务多实例</strong>：两台机器人的 <code>set_mode</code> 因漏配命名空间而同名同类型地落在同一域，客户端与哪个实例配对不由你控制，属于必须靠命名空间避免的配置事故。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把片段 2 的超时从 0.2 s 改为 0.05 s，并在片段 1 的回调里插入 <code>time.sleep(0.1)</code>。预测客户端的返回序列（含重试），并解释 <code>spin_until_future_complete</code> 的行为变化。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>每次调用都会超时（服务端固定 100 ms &gt; 50 ms），三次都进 "timeout" 分支；但服务端其实每次都执行了，这正是"超时≠失败"的现场。把 sleep 去掉再测，一切恢复正常。</div></details>
+      </li>
+      <li>给六个操作选原语并说明理由：开舱盖、50 Hz 轮速上报、读取传感器标定值、机械臂归位（约 20 s）、急停、切换导航目标点。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>开舱盖=服务（短、有回执）；轮速=话题；读标定=服务；归位=动作（长任务）；急停=服务+本地兜底；导航目标=动作（可取消可反馈）。</div></details>
+      </li>
+      <li>某遥控台每秒轮询 20 台机器人的配置服务各一次。计算调用负载；假设每次服务端处理 2 ms 且各服务独立，最坏排队延迟是多少？如果所有机器共享一个中央配置服务（单队列），情况如何变化？<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>20 次/秒 × 2 ms = 40 ms/s，利用率 4%，独立队列几无排队；中央服务下利用率仍是 4%，但一次网络抖动让请求突发时会出现短队，排队延迟随利用率非线性上升（第 013 章给公式）。</div></details>
+      </li>
+      <li>设计"远程校准"服务的安全协议：超时值、重试策略、幂等方案、服务端拒绝条件、失败后的状态回滚。写成一页设计说明。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>校准属于"动作类"：序号去重 + 结果缓存 + 拒绝条件（机器人必须在 idle 且电量 &gt; 30%）；失败回滚=恢复到校准前参数快照；超时 500 ms、重试 1 次。</div></details>
+      </li>
+      <li>设计实验：在客户端记录请求发出到响应收到的 RTT 分布（100 次），对比有线与 WiFi 两组的 p50/p99；再用同一对机器人的话题往返 ping-pong 测 RTT，解释两组数字的差距来源。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>服务 RTT ≈ 话题单程 × 2 + 服务端处理 + 两段序列化；WiFi 的无竞争与有竞争工况要分开测，p99 才是超时参数的设计依据。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>服务 = 点对点请求/响应：短、低频、要回执的操作首选；高频流仍归话题，长任务归动作。</li>
+      <li>调用序列：先 wait_for_service 等发现，再 call_async；同步 call 只适合脚本，禁止放进回调。</li>
+      <li>超时只说明"结果未知"；重试语义是至少一次，用设置式接口、序号去重或时效把它们变成安全操作。</li>
+      <li>超时按 RTT p99 的 3–5 倍设置（有线 50–100 ms、WiFi 200–500 ms）；服务端回调必须快，单队列会让慢回调拖慢整个车队。</li>
+      <li>响应返回"结果 + 原因"；拒绝与失败分开表达，让上位机能自动决策。</li>
+      <li>下一章进入第三种原语：<strong>动作</strong>，长任务如何带着进度反馈执行，并支持随时取消。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch002.html">← 第 002 章：多机器人话题通信基础</a>
+    <a class="next" href="ch004.html">第 004 章：动作通信执行复杂任务 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

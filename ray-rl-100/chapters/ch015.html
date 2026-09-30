@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第015章 RLlib环境接口实现 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · RLlib 核心接口与训练</span>
+    <span class="sep">/</span>
+    <span>第 015 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · RLlib 核心接口与训练</div>
+    <h1>第 015 章：RLlib环境接口实现</h1>
+    <p class="lead">环境是训练循环的数据源头，接口一个字段对不上，后面采样、训练、评估全链受阻。本章把一个符合标准接口的自定义环境从零写对、注册好、验证通过。</p>
+    <ul class="meta">
+      <li>主题：RLlib 训练 / 环境接口与注册</li>
+      <li>关键机制：环境接口契约（reset 与 step）、空间定义、环境注册、配置注入</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 014 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>掌握环境接口契约：reset 与 step 的签名、返回结构与终止语义（terminated 与 truncated 的区别）。</li>
+      <li>会定义观测空间与动作空间，理解空间声明与模型输入之间的映射关系。</li>
+      <li>掌握环境注册机制：把环境名映射到构造函数，并安全地注入配置。</li>
+      <li>会用标准校验工具验证自定义环境的合规性，在进入训练前拦截接口错误。</li>
+      <li>能诊断四类问题：返回值形态不符、空间不匹配、配置闭包陷阱、回合不终止。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>RLlib 把采样过程分布式化：几十个环境副本同时推进，样本汇总成训练批次。这套并行结构要求环境遵守一份严格的契约，接口的每个字段都有明确语义。<strong>环境是训练系统中唯一由业务方完全掌控的组件，也是接口错误最集中的地方</strong>：返回值多一层元组、观测类型不对、回合终止标记写错，都会让采样端静默产出错误分布，训练曲线随之失去意义。</p>
+    <p>另一个动机是复用已有环境库。标准接口是事实标准，绝大多数现成环境都实现了它，RLlib 与它们对接的核心动作就是注册与配置注入。把这一层写对，后续换环境只改注册参数，训练代码保持稳定。</p>
+    <p>本章的成果物是一个可注册、可校验、可被训练流程消费的最小环境；自定义环境的进阶议题（奖励设计与包装器）在第 021 章展开，向量化与并行在第 022、024 章展开。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 接口契约：两个方法、五个字段</h3>
+    <p>环境与训练端之间是一份双向契约，由两个方法承载：</p>
+    <table>
+      <tr><th>方法</th><th>输入</th><th>输出</th><th>语义要点</th></tr>
+      <tr><td>重置 reset</td><td>可选随机种子</td><td>（初始观测，辅助信息字典）</td><td>开始一个新回合；同一种子应产生同一初始状态</td></tr>
+      <tr><td>单步 step</td><td>动作</td><td>（观测，奖励，终止标记，截断标记，信息字典）</td><td>推进一帧；终止与截断分开表达</td></tr>
+    </table>
+    <p><strong>终止（terminated）与截断（truncated）必须分开</strong>：前者表示任务本身完成（到达目标、输掉比赛），后者表示达到步数上限等外部限制。分开的意义在训练端：终止状态的价值估计应归零，截断状态的价值估计应保留，混用会让引导（Bootstrap）语义出错，价值网络在两个本应不同的方向上被拉扯。这份区分是现代接口相对早期接口最重要的修订。</p>
+    <div class="formula">
+      step 返回：观测 o<sub>t+1</sub>、奖励 r<sub>t</sub>、terminated、truncated、info
+      <span class="note">终止与截断任一为真即回合结束；训练端对两者采用不同的价值引导处理</span>
+    </div>
+
+    <h3>2. 空间：观测与动作的规格说明</h3>
+    <p>空间（Space）声明观测与动作的取值范围与形状，训练端据此搭建模型与处理动作：</p>
+    <ul>
+      <li><strong>观测空间</strong>：向量观测用连续空间声明上下界与形状；图像观测用三维形状（高、宽、通道）；离散状态用离散空间。</li>
+      <li><strong>动作空间</strong>：连续控制用有界连续空间（每维给出上下界）；离散选择用离散空间（给出取值个数）。</li>
+</ul>
+    <p>两条经验规则。<strong>其一，观测用单精度浮点（float32）</strong>：默认模型对输入精度有预期，双精度不仅浪费带宽，还可能触发不必要的类型转换。<strong>其二，空间边界即动作裁剪边界</strong>：训练端会按空间对输出的动作做裁剪，边界声明过窄会让策略的有效输出被截掉，声明过宽则让无效动作进入环境。</p>
+    <p>空间与模型的连接可以量化：观测维度 d 决定输入层宽度，第一个 256 单元隐含层的参数量为 256 × (d + 1)，d = 4 时约 1280 个，d = 64 时约 16,640 个，维度选择直接决定输入层在模型参数中的占比。观测数值的纪律同样要落到检查上：校验脚本用空间包含关系逐帧核对，一旦实际观测越界（比如归一化遗漏、单位换算错位），断言立即拦截，问题无须等到训练曲线出现异常才回头排查。</p>
+
+    <h3>3. 注册：名字到构造函数的映射</h3>
+    <p>训练配置里通常只写环境名字符串，运行时通过注册表找到构造函数。注册机制承担三件事：</p>
+    <ol>
+      <li><strong>解耦</strong>：配置不引用类对象，跨进程传输的只是名字与配置字典。</li>
+      <li><strong>注入</strong>：构造函数接收配置字典（含环境参数与副本标识），每个副本据标识使用不同随机种子。</li>
+      <li><strong>一致性</strong>：所有副本走同一个构造函数路径，保证环境行为对等。</li>
+    </ol>
+    <p>注册代码有一个经典的闭包陷阱：在循环或函数内用延迟求值的方式引用循环变量，所有副本会共享最后一份配置。<strong>安全写法是把配置在注册时立即绑定进闭包，或使用偏函数固定参数</strong>。这个坑在后续的多环境注册与参数扫描场景出现频率很高。</p>
+
+    <h3>4. 环境运行在何处</h3>
+    <p>训练时，环境副本由采样进程（EnvRunner）创建与持有，每个副本是一个独立的进程内对象，随后被 Actor 包装分发到各节点。开发阶段不必先搭分布式：单进程内直接实例化环境，用标准循环推进若干步，检查返回值形态与空间一致性，再交给训练流程。<strong>先离线校验、后上训练，是环境开发的基本节奏</strong>，因为训练流程里的接口错误往往以"采样分布异常"这种间接形式暴露，定位代价高。</p>
+
+    <h3>5. 数值算例：截断语义的价值偏差与单步预算</h3>
+    <p>用一组数把终止与截断的差别摆出来。设折扣因子 0.99，每步平均奖励为 -0.5，训练端对截断状态保留自举、对终止状态把价值归零。一个被截断状态按剩余视野 100 步计的续价值约为 -0.5 × (1 − 0.99<sup>100</sup>) ÷ 0.01 ≈ -31.7。若实现里把截断错写成终止，价值网络被要求在该处输出 0，与真值相差约 31.7；误差沿自举链回传，在距截断 d 步的状态上约为 0.99<sup>d</sup> × 31.7，d = 10 时仍有约 28.7，接近整段末端奖励的总尺度。混用的直接后果是价值估计在回合末端系统性偏向零，优势估计随之失真，训练曲线表现为长回合任务的末端行为异常。校验脚本应专门构造两标记同时为真的用例：把成功条件设在初始位置附近、截断阈值设为最小步数，核对实现是否按统一口径处理。</p>
+    <table>
+      <tr><th>情形</th><th>terminated</th><th>truncated</th><th>训练端价值处理</th></tr>
+      <tr><td>到达目标或任务失败</td><td>真</td><td>假</td><td>末端价值按终局处理</td></tr>
+      <tr><td>步数上限用尽</td><td>假</td><td>真</td><td>用末端观测的价值自举</td></tr>
+      <tr><td>两者同时为真</td><td>真</td><td>真</td><td>按终止优先，代码内保持统一口径</td></tr>
+    </table>
+    <p>单步预算同样可算：一个采样副本目标每秒 1 万步，单步耗时预算为 100 微秒；8 个副本并行推进 8 万步每秒，聚合视角每步 12.5 微秒。任何百微秒量级的单步开销（深拷贝观测、每步格式化日志、逐帧写盘）都会把副本速率拖到目标以下。而奖励尺度与步数下界也联动：跟踪任务初始距离 10、动作每步上限 0.5 时，最短需要 20 步，截断阈值定得太小会让任务在可达之前被强行中断。</p>
+
+    <h3>6. 边界情形与失效模式</h3>
+    <p>空间声明过窄会把策略的功率截掉一半：任务需要每秒 1.0 的动作步长，声明上限取 0.5，到达时间翻倍，截断阈值不变时大量回合以"未完成"收场。声明过宽则裁剪形同虚设：上限 5.0 允许单步跨越整个目标区间，策略在目标两侧来回震荡。判据是把动作价值范围与任务的可达速度需求对齐，再留一档余量。</p>
+    <p>另一个边界是 reset 的种子语义：只有传入种子时才重建随机流，<code>seed=None</code> 表示沿用当前流。校验脚本要覆盖两种调用形态，否则恢复训练时可能遇到"重置却回到同一初始状态"的死循环。观测泄漏是接口层的隐性失效：观测里混入了当前动作的结果或未来一帧，策略会"未卜先知"，训练指标虚高而部署后崩塌；排查方式是核对观测字段的来源时刻，逐字段标注产生时机。</p>
+    <p>info 字典也参与跨进程传递，写着调试数组与长字符串的 info 会随样本一路序列化，采样吞吐随其体积下降。纪律是 info 只放标量与短标识；训练端真正需要的历史信息应进入观测空间并计入维度预算，藏在 info 里指望下游透传会持续放大样本体积。校验脚本可以顺带打印 info 的平均字节数，把它作为一项量化指标纳入上线前的检查清单。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>实现自定义环境的步骤：</p>
+    <ol>
+      <li><strong>定状态与转移</strong>：写出环境的状态变量、动作对状态的影响、奖励函数与终止条件，形成一页纸的规格。</li>
+      <li><strong>声明空间</strong>：按规格给出观测与动作空间，形状与精度一次定对（观测用单精度）。</li>
+      <li><strong>实现两个方法</strong>：reset 接受种子并初始化随机流；step 按规格推进、计算奖励、返回五元组。</li>
+      <li><strong>处理截断</strong>：设置最大步数，达到上限时置截断标记并结束回合，避免无限回合。</li>
+      <li><strong>注册与注入</strong>：用注册函数绑定环境名与构造函数，配置字典经参数传入，避开闭包捕获。</li>
+      <li><strong>离线校验</strong>：用标准校验工具或手写循环验证接口合规，再进入训练流程。</li>
+    </ol>
+    <table>
+      <tr><th>参数</th><th>典型取值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>观测维度</td><td>4–64</td><td>状态表示规模</td><td>信息完整性与模型容量的折中</td></tr>
+      <tr><td>最大步数</td><td>200–1000</td><td>截断阈值</td><td>任务典型完成长度乘冗余系数</td></tr>
+      <tr><td>奖励范围</td><td>每步 ±1 至 ±10</td><td>数值尺度</td><td>与折扣因子配合，避免回报发散</td></tr>
+      <tr><td>副本种子</td><td>基种子加副本编号</td><td>采样多样性</td><td>保证不同副本互不同步又不失可复现</td></tr>
+    </table>
+    <div class="box tip">
+      <span class="box-title">与上一章的差异点</span>
+      <p>第 014 章的"生产者"是自定契约的模拟器；本章的环境必须遵守 RLlib 的标准契约才能接入训练。契约的意义在于：训练端可以不加区分地驱动任何合规环境，这正是强化学习工程规模化的前提。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>以下片段采用 Ray 2.x 时期的通用写法；接口随版本演进，以对应版本官方文档为准。</p>
+    <p><strong>片段 1：最小合规环境</strong></p>
+    <pre class="code"><code>import numpy as np
+import gymnasium as gym
+from gymnasium import spaces
+
+class LineTrackerEnv(gym.Env):
+    """一维跟踪任务：观测当前位置与目标位置，动作是位置增量。"""
+    def __init__(self, env_config=None):
+        super().__init__()
+        cfg = env_config or {}
+        self.max_steps = cfg.get("max_steps", 200)     # 截断阈值来自配置
+        self.goal = cfg.get("goal", 5.0)
+        # 观测为 [位置, 目标] 两个浮点；动作是单维增量，边界必须写实
+        self.observation_space = spaces.Box(
+            low=-20.0, high=20.0, shape=(2,), dtype=np.float32)
+        self.action_space = spaces.Box(
+            low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
+        self.pos = 0.0
+        self.steps = 0
+        self.np_random = np.random.default_rng(0)      # 可重置的随机流
+
+    def _obs(self):
+        return np.array([self.pos, self.goal], dtype=np.float32)
+
+    def reset(self, *, seed=None, options=None):
+        if seed is not None:
+            self.np_random = np.random.default_rng(seed)   # 同种子同起点
+        self.pos = float(self.np_random.normal(0.0, 1.0))
+        self.steps = 0
+        return self._obs(), {}                     # 观测与信息字典成对返回
+
+    def step(self, action):
+        delta = float(np.clip(action[0], -1.0, 1.0))   # 双保险：环境侧也裁剪
+        self.pos += delta
+        self.steps += 1
+        dist = abs(self.pos - self.goal)
+        reward = -dist                     # 越接近目标回报越高（负距离）
+        terminated = dist &lt; 0.1            # 任务成功：真正终止
+        truncated = self.steps &gt;= self.max_steps        # 步数上限：截断
+        return self._obs(), reward, terminated, truncated, {}</code></pre>
+    <p>解读：这份实现把契约要点逐条落实。<strong>reset 返回二元组</strong>（观测与信息字典），旧式接口只返回观测，混用会在训练端触发解包错误；<code>seed</code> 参数控制随机流重建，同一种子保证可复现。<strong>step 返回五元组</strong>，终止与截断来自两个独立条件：到达目标是任务完成，步数打满是被动截断。<strong>动作裁剪在环境侧做了一次</strong>：训练端一般会按空间裁剪输出，但环境作为最后防线再裁剪一次，能防住手写测试脚本传入越界动作。<code>np_random</code> 使用可重建的随机数生成器，样本代码里常见的全局随机调用会破坏可复现性。</p>
+
+    <p><strong>片段 2：注册与配置注入</strong></p>
+    <pre class="code"><code>import functools
+from ray.tune.registry import register_env
+
+def env_creator(env_config):
+    """构造入口：每个采样副本调用一次，参数经由 env_config 注入。"""
+    from rl_lab.envs import LineTrackerEnv      # 延迟导入：注册阶段不拉起重依赖
+    return LineTrackerEnv(env_config)
+
+# 方式一：直接注册。构造函数引用本身没有闭包捕获问题，最简洁
+register_env("line_tracker", env_creator)
+
+# 方式二：带默认参数时用偏函数固定，避免闭包捕获循环变量
+def make_env(env_config, param_a=0.1, param_b=200):
+    from rl_lab.envs import LineTrackerEnv
+    merged = {"param_a": param_a, "max_steps": param_b, **env_config}
+    return LineTrackerEnv(merged)
+
+for preset in ("slow", "fast"):
+    settings = {"slow": (0.1, 200), "fast": (0.5, 400)}[preset]
+    register_env(f"line_tracker_{preset}",
+                 functools.partial(make_env, param_a=settings[0],
+                                   param_b=settings[1]))   # 立即绑定，无捕获问题
+
+# 训练配置里只需使用名字与配置字典，不引用类对象
+env_name = "line_tracker"
+env_config = {"max_steps": 200, "goal": 5.0}</code></pre>
+    <p>解读：注册表是"名字到构造函数"的映射，训练配置只携带字符串与字典，这两样都能安全序列化并跨进程传输。<strong>方式二是本章要防的经典陷阱的反例</strong>：如果直接在循环里写匿名函数引用 <code>settings</code> 而不绑定，等到副本实际构造时才求值，两个预设会共享最后一份参数。偏函数在注册瞬间固定实参，语义清晰且经得起审阅。<strong>延迟导入</strong>让注册模块保持轻量：注册发生在驱动进程，环境的重量级依赖（仿真引擎、物理库）等到副本构造时再加载。</p>
+
+    <p><strong>片段 3：上线前的离线校验</strong></p>
+    <pre class="code"><code>import numpy as np
+from rl_lab.envs import LineTrackerEnv
+
+def validate_env(cls, n_episodes=3, max_steps=500):
+    """手工合规校验：逐条核对契约字段，不依赖训练流程。"""
+    env = cls({"max_steps": max_steps, "goal": 5.0})
+    for ep in range(n_episodes):
+        obs, info = env.reset(seed=100 + ep)        # 校验返回二元组
+        assert env.observation_space.contains(obs), "初始观测超出空间"
+        assert isinstance(info, dict), "信息字段必须是字典"
+        total, steps = 0.0, 0
+        done = False
+        while not done and steps &lt; max_steps + 1:
+            action = env.action_space.sample()      # 随机策略采样动作
+            out = env.step(action)
+            assert len(out) == 5, "step 必须返回五元组"
+            obs, reward, terminated, truncated, info = out
+            assert np.isscalar(reward) or np.ndim(reward) == 0, "奖励应为标量"
+            total += float(reward)
+            steps += 1
+            done = bool(terminated or truncated)    # 两种结束标记都要尊重
+        assert done, "回合未在最大步数内结束：检查截断逻辑"
+        print(f"回合 {ep}: {steps} 步, 回报 {total:.2f}")
+
+validate_env(LineTrackerEnv)
+# 验证同一 seed 的可复现性
+e1, e2 = LineTrackerEnv({}), LineTrackerEnv({})
+o1, _ = e1.reset(seed=7); o2, _ = e2.reset(seed=7)
+print("同种子可复现:", np.allclose(o1, o2))</code></pre>
+    <p>解读：校验脚本逐条核对契约：返回结构、空间包含关系、奖励标量性、回合必然结束、种子可复现。<strong>断言里的失败信息直接指出违反的字段</strong>，比训练报错时的间接症状好用得多。<code>done</code> 同时尊重两种结束标记，任何一方缺失都会触发"回合未结束"断言：这是捕捉"忘记置截断标记"的最直接手段。最后一段做同种子对照：两次重置产生同一起点，环境进入训练前的随机性纪律就此立住。全部断言通过后，再把环境名交给训练配置，采样端出现的问题就能排除接口层。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>reset 只返回观测</strong>：沿用旧版接口形态，训练端解包二元组时报错或拿到错误对象。修复：统一返回观测与信息字典的二元组，校验脚本纳入断言。</li>
+      <li><strong>终止与截断混用</strong>：用单一 done 标记表达两种结束，价值引导在任务完成与步数用尽时被同等对待。症状是价值估计在长回合末端系统性偏差。修复：两个标记独立计算，训练端分别处理。</li>
+      <li><strong>观测精度与空间声明不一致</strong>：空间声明双精度而实际返回单精度（或相反），空间包含检查失败或触发隐式转换。修复：观测统一单精度，其他数值字段也显式给出类型。</li>
+      <li><strong>注册闭包捕获循环变量</strong>：多个环境预设共享最后一份参数，行为全部趋同。修复：用偏函数在注册时绑定实参，或为每个预设写独立构造函数。</li>
+      <li><strong>回合不终止</strong>：缺少步数上限或终止条件永远无法满足，采样端被单个回合挂住。症状是训练启动后长时间没有回合指标。修复：设置截断阈值并在校验中强制回合结束。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>扩展 LineTrackerEnv：把观测改为"位置、速度、目标"三维，动作改为加速度。给出新的空间声明与转移方程，预测最大步数需要如何调整。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>观测空间形状变 3，动作仍是单维有界连续；二阶动态系统到达目标更慢且可能过冲，最大步数应上调并重新校准奖励尺度。</div></details>
+      </li>
+      <li>预测题：把片段 1 的奖励从负距离改为负距离平方，预测最优策略轨迹的差异，并说明奖励尺度对折扣因子的影响。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>平方惩罚对大偏差更敏感，策略收缩末期更谨慎；尺度变小后同样的折扣因子下有效视野变长，等价视野约为原视野的平方根量级。</div></details>
+      </li>
+      <li>设计题：为一个"库存补货"环境设计空间与转移：每步观测库存与需求，动作是补货量，奖励平衡持有与缺货。给出空间声明、奖励函数与截断设置。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>观测含当前库存与近期需求摘要；动作是连续或离散的补货量；奖励为负的持有量减去缺货惩罚；截断按季度长度设置。</div></details>
+      </li>
+      <li>分析：某环境校验全部通过，但训练样本里的回报分布明显偏负。列出三个接口层的排查点（提示：奖励尺度、终止条件、观测泄漏），并给出各自的验证方法。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>奖励尺度失控看每步回报直方图；终止条件误置看成功回合占比；观测泄漏看策略是否"未卜先知"（例如观测包含了动作结果）。</div></details>
+      </li>
+      <li>设计：为自定义环境写一份接口合规清单（不少于 8 项），覆盖返回值形态、空间包含、终止语义、可复现性、性能（单步耗时上限）五类要求，用于团队内的环境评审。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>清单项逐条对应校验脚本的断言与性能计时；单步耗时上限按采样吞吐目标反推（例如 8 副本各 1 万步每秒对应单步微秒级预算），把接口合规与性能预算写进同一份文档。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>环境契约由 reset 与 step 承载：重置返回观测与信息，单步返回观测、奖励、终止、截断、信息五元组。</li>
+      <li><strong>终止与截断分开表达，训练端对两种结束采用不同的价值引导处理</strong>。</li>
+      <li>空间声明即模型与动作的规格：观测统一单精度，动作边界即裁剪边界。</li>
+      <li>注册把名字映射到构造函数，配置经参数注入；用偏函数固定实参规避闭包捕获陷阱。</li>
+      <li>下一章把环境接进训练流程：<strong>用 PPO 训练第一个策略</strong>，观察一轮迭代的完整数据流。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch014.html">← 第 014 章：阶段实践：分布式数据流水线</a>
+    <a class="next" href="ch016.html">第 016 章：RLlib训练第一个策略 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

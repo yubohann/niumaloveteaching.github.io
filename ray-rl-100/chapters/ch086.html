@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第086章 异步更新与同步更新对比 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第五篇 · 训练工程与系统进阶</span>
+    <span class="sep">/</span>
+    <span>第 086 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第五篇 · 训练工程与系统进阶</div>
+    <h1>第 086 章：异步更新与同步更新对比</h1>
+    <p class="lead">一句话：本章对比同步更新（Synchronous Update）与异步更新（Asynchronous Update）两种执行模型，把屏障成本、策略滞后（Policy Lag）与修正机制放在同一套账里计算。</p>
+    <ul class="meta">
+      <li>主题：训练工程 / 更新模型</li>
+      <li>关键机制：屏障同步、长尾效应、策略滞后、重要性修正、混合更新</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 085 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解同步更新的屏障结构与其长尾成本：迭代时间由最慢的采样单元决定。</li>
+      <li>理解异步更新的两种误差来源：策略滞后与经验分布偏移，以及有界滞后的设计原则。</li>
+      <li>掌握吞吐比较的方法：分别写出两种模型的吞吐上限，判断哪一侧先饱和。</li>
+      <li>了解重要性修正（Importance Correction）与截断修正的基本形式及其偏差与方差取舍。</li>
+      <li>会根据环境时长的方差、学习器能力与样本效率要求选择更新模型，并给出验证方案。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 085 章指出，同步更新下每轮迭代的时间约等于"最慢采样单元的耗时加上聚合开销"。当所有环境实例的步时接近时，这个最大值接近平均值，浪费不大；<strong>当步时方差大时，屏障把大量空闲时间计入每轮成本，吞吐被长尾拖住。</strong>异步更新取消屏障，让采样单元独立推进、学习器持续消费，把空闲时间转化为数据供给；代价是数据与当前策略之间出现滞后，梯度带上了偏差。</p>
+    <p>两种模型没有普适的优胜者：环境时长方差大、节点异构、追求硬件利用率时异步占优；样本预算紧张、要求数据新鲜、学习器本身是瓶颈时同步占优。本章的目标是给出可计算的判据，替代经验印象。需要强调的是，更新模型属于系统结构决策，<strong>一旦选定会同时约束算法族的选择</strong>：异步采样需要配合重要性修正算法（如 V-trace）或有界滞后过滤，同策略算法无法直接套用。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p><strong>同步与异步的分野在于是否让采样等待全局最慢者：前者用等待换数据新鲜，后者用数据陈旧换硬件利用率。</strong>本节先量化两侧的成本与收益，再讨论修正机制与选择判据。</p>
+
+    <h3>1. 同步模型的屏障成本</h3>
+    <p>同步更新每轮迭代等待全部采样单元完成后聚合。设第 i 个单元完成一轮片段的时间为 T<sub>i</sub>，则迭代时间与理论下限为：</p>
+    <div class="formula">
+      T<sub>iter</sub> = max<sub>i</sub> T<sub>i</sub> + C<sub>agg</sub>，下限为 T̄ + C<sub>agg</sub>
+      <span class="note">T̄ 为平均耗时，C<sub>agg</sub> 为聚合与广播开销；max 与 T̄ 的差距即长尾浪费</span>
+    </div>
+    <p>长尾的量化可以借助极值统计：当 T<sub>i</sub> 近似独立同分布时，最大值随单元数增长。以指数分布为例，n 个单元的最大值期望为平均值的 H<sub>n</sub> 倍（调和数），8 个单元时约为 2.7 倍，64 个单元时约为 4.7 倍；<strong>单元越多，单轮里"等最慢者"的绝对量越大</strong>。均匀分布下增长较慢，n 个单元最大值约为均值的 n/(n+1) 位置。这一差异说明：长尾浪费程度由步时分布的形状决定，步时方差越大，同步模型越吃亏，测量步时分布应作为更新模型决策的输入数据。</p>
+
+    <h3>2. 异步模型的结构与滞后定义</h3>
+    <p>异步更新中，采样单元用某个历史版本的策略参数采集数据，学习器持续消费到达的数据并发布新参数，两侧都保持忙碌。样本从采集到被消费之间隔了若干次参数更新，这个间隔称为策略滞后，记为 L。滞后带来两类后果：</p>
+    <ul>
+      <li><strong>梯度偏差</strong>：数据来自旧策略，梯度方向与新策略的最优方向不一致，偏差随 L 增大。</li>
+      <li><strong>分布偏移</strong>：旧策略访问的状态分布与新策略不同，价值目标与优势估计随之失真。</li>
+    </ul>
+    <p>有界设计是工程上的关键：给每批样本标注策略版本号，学习器只消费滞后不超过阈值 k 的样本，更旧的样本被丢弃或降权。k 的取值与学习率联动：单次更新步长越大，等效滞后越大，k 应越小。<strong>滞后分布应作为训练指标持续记录，中位数与 95 分位数一起观察</strong>，只关心中位数会漏掉长尾拖慢收敛的部分。</p>
+
+    <h3>3. 吞吐上限的比较</h3>
+    <p>两种模型的吞吐上限可以写成：</p>
+    <div class="formula">
+      同步：SPS<sub>sync</sub> = B / (max<sub>i</sub>T<sub>i</sub> + C<sub>agg</sub>)，异步：SPS<sub>async</sub> = min(R<sub>sample</sub>, R<sub>learn</sub>)
+      <span class="note">R<sub>sample</sub> 为采样总供给速率，R<sub>learn</sub> 为学习器每分钟可消化的样本量；异步吞吐由较小者决定</span>
+    </div>
+    <p>比较规则由此产生：先估计 R<sub>learn</sub>（用第 085 章的学习侧测量得到），再估计 R<sub>sample</sub> 与最大步时。<strong>若 max<sub>i</sub>T<sub>i</sub> 显著高于均值且学习器的消化能力有富余，异步能把浪费的空闲换成实打实的样本供给；若学习器先饱和，异步只是把等待从采样端搬到学习端，吞吐提升有限，还会引入滞后偏差。</strong>这就是"异步不必更快"的定量解释：瓶颈决定收益，模型选择只是把资源重新分配。</p>
+
+    <h3>4. 重要性修正与截断</h3>
+    <p>修正滞后偏差的标准工具是重要性采样（Importance Sampling）：用新旧策略在动作上的概率比 ρ 对样本加权，使旧数据在期望意义上等价于新策略数据。完整的重要性比方差随滞后增长而迅速膨胀，工程实现普遍采用截断形式：</p>
+    <div class="formula">
+      v<sub>trace</sub> ≈ Σ<sub>t</sub> γ<sup>t</sup> (Π ρ<sub>s</sub>) δ<sub>t</sub>，ρ<sub>s</sub> 截断于 [0, c]
+      <span class="note">c 为截断常数，典型取值 1 到 3；截断把极端比率压回可控范围，代价是放弃部分无偏性</span>
+    </div>
+    <p>截断常数 c 的取舍是经典的偏差与方差交换：c 越大越接近无偏，方差越大；c 越小方差越小，偏差越大。实践起点常取 c = 1，并通过观察截断比例校准。<strong>修正机制只能减小偏差，不能消除滞后本身</strong>，因此有界滞后与修正需配合使用。</p>
+
+    <h3>5. 混合模型：异步采样与同步学习</h3>
+    <p>工程上常用的折中结构是"异步采样、同步学习"：采样单元持续回传片段，学习器按固定批大小从回放队列中凑齐一批再更新，更新期间采样不停止。这样学习侧保持批量同步的稳定语义，采样侧保持无屏障的利用率；队列深度成为控制滞后的旋钮。典型实现是带经验回放的异步策略优化（Asynchronous PPO, APPO）：回放槽位（Replay Slots）限制队列长度，回放比例（Replay Proportion）控制每批中新旧样本的配比。<strong>队列越深、回放比例越高，滞后越大但吞吐越稳，旋钮位置应根据滞后分布与学习曲线共同标定。</strong></p>
+
+    <h3>6. 选择判据</h3>
+    <p>把前述内容收束为四条判据：<strong>其一</strong>，测量步时分布，最大值与均值之比超过 1.5 且单元数超过 8 时，同步的长尾成本显著；<strong>其二</strong>，测量学习侧消化速率，若学习器空闲时间长，异步的收益上限大；<strong>其三</strong>，评估样本效率容忍度，预算紧张时优先同步以保数据新鲜；<strong>其四</strong>，确认算法支持，同策略算法需切换到支持修正的变体或改用混合结构。四条判据全部指向异步时再切换，并用同一预算下的回报与滞后分布联合验证。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>更新模型的对比实验分六步，产出"吞吐差、样本效率差、滞后分布"三张表。</p>
+    <ol>
+      <li><strong>测量基线</strong>：在同步配置下记录步时分布（均值、95 分位、最大值）与学习侧空闲比。</li>
+      <li><strong>计算判据</strong>：按上一节的四条判据给出先验判断，确定异步的预期收益区间。</li>
+      <li><strong>配置对照</strong>：搭建同步与异步两套配置，冻结除更新模型外的全部参数（批大小、网络、学习率）。</li>
+      <li><strong>同预算运行</strong>：两套配置消耗相同的环境步预算，记录回报曲线与吞吐；异步配置额外记录滞后分布与样本丢弃率。</li>
+      <li><strong>调旋钮</strong>：若异步胜出，再调队列深度与回放比例，观察滞后与回报的权衡曲线；若同步胜出，记录判据偏差，修正步时分布模型。</li>
+      <li><strong>固化结论</strong>：把更新模型选择与其依据（判据数值）一并写入实验档案。</li>
+    </ol>
+    <h3>参数取值起点表</h3>
+    <table>
+      <tr><th>参数</th><th>常用起点</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>更新模型</td><td>同步起步，异步按判据切换</td><td>执行结构</td><td>步时方差与学习侧空闲比</td></tr>
+      <tr><td>replay_proportion</td><td>0.2 至 0.5</td><td>每批中回放样本比例</td><td>越高吞吐越稳、滞后越大</td></tr>
+      <tr><td>replay_buffer_num_slots</td><td>采样并行度的 1 至 4 倍</td><td>队列深度</td><td>按滞后分布的 95 分位标定</td></tr>
+      <tr><td>max_lag 过滤阈值</td><td>2 至 8 个版本</td><td>丢弃过期样本</td><td>与学习率联动，步长大则取小</td></tr>
+      <tr><td>截断常数 c</td><td>1 至 3</td><td>修正强度</td><td>观察截断比例，控制在 10% 内</td></tr>
+    </table>
+    <div class="box warn">
+      <span class="box-title">与上一章的差异</span>
+      <p>第 085 章测量两种更新模型各自的表现量（四段分解与空闲比），本章用这些测量值做结构选择，并引入新的状态量（策略滞后）作为异步配置的监控对象。分解是诊断，选择是行动，滞后分布是行动后的新观测。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>以下片段基于 Ray 2.x 时期的通用写法，接口随版本演进，以对应版本的官方文档为准。</p>
+
+    <p><strong>片段 1：同步与异步两套配置的对照框架</strong></p>
+    <pre class="code"><code>from ray.rllib.algorithms.ppo import PPOConfig
+from ray.rllib.algorithms.appo import APPOConfig
+
+def sync_config():
+    """同步基线：屏障等待最少者，数据最新，吞吐受长尾约束。"""
+    return (
+        PPOConfig()
+        .environment("CartPole-v1")
+        .env_runners(num_env_runners=8, num_envs_per_worker=2)
+        .training(train_batch_size=4000, sgd_minibatch_size=256, num_sgd_iter=6)
+    )
+
+def async_config(replay_proportion=0.3, slots=16):
+    """异步对照：采样不停、学习按批消费回放队列。
+    slots 与 replay_proportion 是控制滞后的两个旋钮。"""
+    return (
+        APPOConfig()
+        .environment("CartPole-v1")
+        .env_runners(num_env_runners=8, num_envs_per_worker=2)
+        .training(
+            train_batch_size=4000,
+            # 回放比例：每批中来自队列的旧样本占比，越高吞吐越稳
+            replay_proportion=replay_proportion,
+            # 队列深度：槽位越多，允许的滞后越大，是滞后的上限装置
+            replay_buffer_num_slots=slots,
+        )
+    )</code></pre>
+    <p>解读：两套配置的对照设计遵循"只改一个结构变量"的原则。<strong>（1）</strong>并行度、批大小、小批与更新轮数全部保持一致，回报差异只能归因于更新模型。<strong>（2）</strong>异步侧显式暴露两个滞后旋钮：队列深度是硬上限，回放比例是软配比；分别标注它们的调节方向，避免实验中只动一个而误判另一个的作用。<strong>（3）</strong>若任务本身支持计算加速（例如环境时长方差极小），该对照预期同步不逊色；保留该配置即保留对照基线。</p>
+
+    <p><strong>片段 2：长尾成本的量化模拟</strong></p>
+    <pre class="code"><code>import random
+
+def straggler_cost(n_units, n_trials=20000, dist="exp"):
+    """模拟同步屏障的长尾成本：期望最大值与期望均值之比。
+    该比值即每轮相对理想同步的浪费倍数，用于更新模型判据。"""
+    random.seed(0)                     # 固定种子保证判据数值可复现
+    total_max, total_mean = 0.0, 0.0
+    for _ in range(n_trials):
+        if dist == "exp":
+            times = [random.expovariate(1.0) for _ in range(n_units)]
+        else:
+            times = [random.random() for _ in range(n_units)]   # 均匀分布对照
+        total_max += max(times)
+        total_mean += sum(times) / n_units
+    ratio = total_max / total_mean
+    print(f"单元数 {n_units}，步时分布 {dist}：max/mean ≈ {ratio:.2f}")
+    return ratio
+
+# 指数分布下 8 个单元约 2.7 倍，64 个单元约 4.7 倍；
+# 均匀分布下同单元数仅 1.1 至 1.5 倍：分布形状决定屏障代价
+straggler_cost(8)
+straggler_cost(64)</code></pre>
+    <p>解读：这段模拟把"长尾浪费"从直觉变成可代入判据的数字。<strong>（1）</strong>固定随机种子，判据可复现；模拟得到的比值直接回答"同步模型每轮浪费了几成"。<strong>（2）</strong>两种分布的对照揭示关键结论：<strong>决定屏障代价的是步时分布形状</strong>，单元数量本身只起次要作用；方差小的环境即使单元多，长尾也可忽略。<strong>（3）</strong>实践中最可靠的做法是把真实步时样本喂给该函数，用实测分布替换理想分布，再产出判据。</p>
+
+    <p><strong>片段 3：滞后过滤与样本版本追踪</strong></p>
+    <pre class="code"><code>from collections import deque
+
+class LagBoundedQueue:
+    """有界滞后队列：样本携带策略版本号，过期样本在入队与出队时过滤。
+    版本号用学习器的全局更新计数单调递增，保证滞后可精确计算。"""
+    def __init__(self, max_lag):
+        self.max_lag = max_lag
+        self.queue = deque()
+        self.current_version = 0        # 学习器当前策略版本，仅由学习侧推进
+
+    def push(self, batch, version):
+        # 入队前先丢弃：滞后超限的样本进入队列只会占用内存
+        if self.current_version - version &lt;= self.max_lag:
+            self.queue.append((version, batch))
+
+    def pop(self):
+        # 出队时二次过滤：样本在排队期间版本差可能已超限
+        while self.queue:
+            version, batch = self.queue.popleft()
+            if self.current_version - version &lt;= self.max_lag:
+                return version, batch
+        return None                      # 无可用样本：学习器短暂空转或降级处理
+
+    def advance(self):
+        # 每次参数更新后推进版本号，滞后的度量基准随之移动
+        self.current_version += 1</code></pre>
+    <p>解读：这个队列是异步训练中最小的正确性装置。<strong>（1）</strong>入队与出队双重过滤覆盖了两个时间差：样本等待期间版本推进造成的过期，以及分发延迟造成的乱序到达。<strong>（2）</strong>版本号来自学习器的单调计数，滞后 = 当前版本 − 样本版本，计算精确且无需时钟同步。<strong>（3）</strong>返回空值的分支对应"样本供给不足"：调用方可以选择学习器空转等待，或按回放比例降低标准，该决策应显式写入配置，避免隐式发生。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>默认异步更快</strong>：学习器已饱和时切换异步，吞吐不变且引入滞后偏差。修复：先用吞吐上限公式估算两侧速率，再决定切换。</li>
+      <li><strong>滞后无上限</strong>：慢单元的数据在队列中停留数十个版本后仍被消费，梯度偏差超出修正能力。修复：给队列设深度上限与版本差阈值，丢弃过期样本。</li>
+      <li><strong>学习率按同步配置沿用</strong>：异步的有效批由多版本样本混合，单步可承受的策略变化变小，沿用同步学习率易越界。修复：切换时下调学习率或收紧截断常数，并观察截断比例。</li>
+      <li><strong>只记录滞后的中位数</strong>：95 分位的长尾决定最坏样本的偏差贡献，中位数掩盖它。修复：滞后分布按分位数记录，长尾显著时加深队列或缩短片段。</li>
+      <li><strong>混用两套模型的评估口径</strong>：异步配置的评估由旧参数执行而日志标为新版本，回报曲线出现跳变。修复：评估固定用最新发布版本，并在结果中记录评估时的版本号。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>计算题：8 个采样单元，步时服从指数分布，均值 100 ms；聚合开销 20 ms。求同步模型的期望迭代时间与长尾浪费比例；若改为均匀分布（0 至 200 ms），结论如何变化？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>指数分布下期望最大值为 100×H<sub>8</sub>≈272 ms，加聚合 292 ms，浪费约 1.9 倍相对理想值；均匀分布下最大值期望约 178 ms，浪费明显更小。</div></details>
+      </li>
+      <li>预测题：学习器消化速率是采样供给速率的一半。把同步切成异步，预测 SPS、滞后分布与回报曲线的变化方向。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>采样端空闲被消除但学习端成为瓶颈，SPS 基本不变；队列积压使滞后上升；回报可能因偏差略降。</div></details>
+      </li>
+      <li>设计题：为"节点性能差异大、步时方差大、样本预算中等"的任务设计混合更新方案：队列深度、回放比例、滞后阈值与学习率调整策略，并给出验证矩阵。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>队列按并行度的 2 倍起步，回放比例 0.2 至 0.3，滞后阈值随学习率联动；验证用同预算回报加滞后 95 分位两列。</div></details>
+      </li>
+      <li>推导题：在均匀步时假设下推导 n 个单元最大值的期望 n/(n+1)，并说明指数分布下 H<sub>n</sub> 增长更快的直观原因。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>均匀分布 CDF 的 n 次幂求期望得 n/(n+1)；指数分布尾部无界，单个慢样本即可显著抬升最大值。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>同步用屏障换数据新鲜，成本由最大步时决定；步时分布形状决定长尾浪费的规模。</li>
+      <li>异步用数据陈旧换利用率，误差来自策略滞后；滞后需有界设计并配合重要性修正。</li>
+      <li>吞吐比较有公式可依：同步看最大步时，异步看采样与学习两侧速率的较小者。</li>
+      <li>混合结构（异步采样、同步学习）是常用折中；队列深度与回放比例是滞后旋钮。</li>
+      <li>下一章进入数据长期复用的机制：经验共享（Experience Sharing）与缓冲设计。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch085.html">← 第 085 章：训练吞吐与采样效率分析</a>
+    <a class="next" href="ch087.html">第 087 章：经验共享与数据复用 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

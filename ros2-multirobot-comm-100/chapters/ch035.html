@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第035章 通信丢包与重传策略 | 多机器人协同学习课程 · ROS2 通信与系统集成</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 数据分发与协同感知</span>
+    <span class="sep">/</span>
+    <span>第 035 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 数据分发与协同感知</div>
+    <h1>第 035 章：通信丢包与重传策略</h1>
+    <p class="lead">无线网络里丢包是常态，属于正常现象。本章把"可靠性"拆成两层，让 DDS 管的归 DDS，该自己管的用序号、确认与幂等设计兜住。</p>
+    <ul class="meta">
+      <li>主题：通信可靠性 / 重传机制</li>
+      <li>关键机制：序号与确认（ACK）、超时与退避（RTO）、幂等设计、ARQ 与 FEC 取舍</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 034 章（自建主题路由与数据分发中间件）</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解无线链路丢包的真实分布：平均丢包率、突发丢包（burst）与它们对协议的影响。</li>
+      <li>掌握两层可靠性的分工：DDS Reliable 的重传机制与代价，应用层 ARQ 的适用边界。</li>
+      <li>会设计带序号与确认的可靠指令通道：超时估计、重传上限、失败判定与幂等接收。</li>
+      <li>理解 ARQ 与 FEC（前向纠错）的取舍，能用失败概率模型估算重传次数。</li>
+      <li>会度量"可靠性交付"：交付率、p95/p99 延迟、重传率，并警惕拥塞时的可靠性反噬。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>有线网络的丢包率通常在 10<sup>−5</sup> 以下，而 WiFi 在真实厂房里轻松达到 0.5%–5%，拥塞或干扰时超过 10%；更麻烦的是丢包<strong>不是独立均匀</strong>的，强干扰会造成连续几十毫秒的突发丢失，一口气吞掉一整批控制指令。多机器人系统对这种信道质量很敏感：一条速度指令丢失可能意味着一台机器人少执行一个动作节拍；一条"停止"指令丢失则可能是安全事故。</p>
+    <p>ROS2/DDS 自带可靠性机制（Reliable QoS 的心跳-确认-重传），似乎"配个 QoS 就完了"。但真实工程里这远远不够：DDS 的重传以"历史深度"为边界，超时策略不透明，而且对"指令必须执行"这种业务语义缺乏表达。本章把可靠性设计分两层讲清楚：<strong>哪些交给 DDS，哪些必须自己实现，以及自己实现时的核心配方，序号、确认、超时、幂等</strong>。这也是第 036 章"分区一致性"的前置：重传管"一条消息别丢"，一致性管"一段时间的状态别乱"。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 丢包的两个面孔：平均率与突发性</h3>
+    <p>描述信道质量至少需要两个参数：<strong>平均丢包率 p</strong>（个别消息丢失的倾向）与<strong>突发长度</strong>（连续丢失的规模）。独立丢包下，重传 2 次后失败概率是 p³；但突发丢包时同一时刻的多条消息被整批吞掉，队列深度与重传间隔都要按"整批丢失"来设计。诊断手段：统计每 100 ms 窗口的丢包数分布，若方差远大于均值（泊松假设），就是突发型信道。</p>
+    <div class="formula">
+      独立丢包重传失败率 ≈ p<sup>n+1</sup>（n 次重传）
+      <span class="note">p = 1% 时重传 2 次 ≈ 10<sup>−6</sup>；p = 20%（拥塞）时重传 2 次仍有 0.8% 失败，高负载下重传不是万能药</span>
+    </div>
+    <p>突发性还可以用"两态信道"来建模：链路在好态（丢包率接近 0）与坏态（丢包率接近 1）之间切换，平均丢包率 = 坏态时长 ÷ 总时长。举一个例子：每 5 秒出现一次 50 ms 的干扰突发，平均丢包率只有 1%，看起来"链路很好"，但对 100 Hz 的指令流意味着每次突发固定吃掉 5 条连续指令。也就是说，<strong>同样 1% 的平均丢包，突发型信道对延迟敏感业务的破坏远大于独立型</strong>。评估信道时必须同时记录"平均率"与"突发长度"两个数字，只报平均值等于把最关键的信息丢掉。</p>
+
+    <h3>2. 两层可靠性：DDS 与你自己的 ARQ</h3>
+    <table>
+      <tr><th>维度</th><th>DDS Reliable QoS</th><th>应用层 ARQ（自建）</th></tr>
+      <tr><td>语义</td><td>"消息别丢"（传输层保证）</td><td>"事情要做成"（业务层保证，如"必须确认执行"）</td></tr>
+      <tr><td>重传边界</td><td>受 history depth 限制，超出即丢</td><td>受业务重试策略控制（次数、时长、退避）</td></tr>
+      <tr><td>延迟代价</td><td>RTT 级（毫秒到几十毫秒）</td><td>可显式设计（超时 → 重传 → 判定失败）</td></tr>
+      <tr><td>可见性</td><td>内部机制，日志有限</td><td>完全可观测：序号、ACK、重传计数都是你的数据</td></tr>
+      <tr><td>适用</td><td>状态同步、地图块、配置</td><td>指令、任务、两阶段动作</td></tr>
+    </table>
+    <p>选型判断：<strong>数据类用 DDS Reliable 就够；指令类要"送达且知道送达"，需要应用层 ACK</strong>。原因是 DDS 的确认对应用不可见：消息进了对端 DDS 层就算"送到了"，但对面节点可能还没处理、甚至可能重启了，指令要的是"执行确认"，不是"传输确认"。</p>
+
+    <h3>3. 超时与退避：RTO 的来路</h3>
+    <p>重传的触发器是"确认超时"。超时估计算法（TCP 的 RTO 思想，工程上可用简化版）：</p>
+    <div class="formula">
+      RTO = RTT<sub>平滑</sub> + 4 × RTT<sub>抖动</sub>（抖动用指数加权平均方差估计）
+      <span class="note">巷道 WiFi 典型 RTT 5–30 ms、抖动 5–20 ms → RTO 取 50–100 ms 量级起步</span>
+    </div>
+    <p>三个纪律：<strong>（1）超时不能拍死</strong>，短于 RTT 会引发无谓重传（重复消息），长于任务时限则错了也来不及；<strong>（2）重传必须指数退避</strong>，每次失败间隔翻倍，给拥塞涨落留恢复时间；<strong>（3）退避在拥塞时的意义是"防止雪崩"</strong>，所有人同时重传会把已经拥塞的信道推向崩溃（congestion collapse），这是"越可靠越糟糕"的真实陷阱。</p>
+
+    <h3>4. 幂等：重传协议的另一半</h3>
+    <p>重传必然带来重复，重复必然要求接收端能<strong>幂等处理：同一条指令执行两次与一次效果相同</strong>。三种实现路径：</p>
+    <ul>
+      <li><strong>序号去重</strong>：接收端维护"已处理序号"集合（或滑动窗口），重复序号直接忽略并重新回 ACK，这同时解决了"ACK 丢失导致发送方误判"的问题。</li>
+      <li><strong>设计可重复的指令</strong>：把"增加 10 速度"改成"设定速度 = 1.2 m/s"（绝对值 vs 增量），绝大多数字节级指令可以设计成天然幂等。</li>
+      <li><strong>带状态的两阶段</strong>：复杂动作（如"去充电桩"）用任务 id + 状态机，接收端对同任务 id 的重复请求直接返回当前状态，不再重新执行。</li>
+    </ul>
+    <p><strong>把"重复执行两次会不会出事"作为指令设计的第一问</strong>，它决定了重传协议能否安全存在。两个对照例子："前进 2 米"是增量语义，重传一次就走 4 米；"设定线速度 0.5 m/s，直到累计里程达到第 N 段目标"则天然可重复，同一条消息执行两次结果相同。设计评审时把每条指令过一遍这个问题，比事后加去重代码便宜得多。</p>
+
+    <h3>5. 数值算例：重传的期望代价与突发恢复时间</h3>
+    <p>把重传的账算成两个期望值。设单次发送成功率 1 − p，最多重传 n 次：</p>
+    <div class="formula">
+      期望发送次数 E[T] = (1 − p<sup>n+1</sup>) / (1 − p)；最终失败概率 = p<sup>n+1</sup>
+      <span class="note">p = 0.1、n = 4：E[T] ≈ 1.11 次，失败率 10⁻⁵；p = 0.3、n = 4：E[T] ≈ 1.43 次，失败率约 0.24%</span>
+    </div>
+    <p>期望延迟用"平均重发次数 × RTO"估算（忽略退避的简化）：RTO = 100 ms 时，p = 0.1 的平均确认延迟约 11 ms，p = 0.3 约 43 ms。这两组数字说明中等丢包下 ARQ 的延迟代价温和，但流量代价随 p 增长：p = 0.1 时重传流量占 11%，p = 0.3 时占 43%。<strong>当重传流量开始明显抬高链路负载，系统就进入"越重传越拥塞"的负反馈，这正是降级策略的触发点。</strong></p>
+    <p>再看突发场景。100 Hz 指令流遇到一次 50 ms 的干扰突发，连续丢失 5 条。RTO = 100 ms、退避 ×2 的重传时间线：第 1 次重发在约 100 ms 后、第 2 次约 300 ms、第 3 次约 700 ms、第 4 次约 1500 ms。若突发在 150 ms 内结束，5 条消息在 100–300 ms 内全部重发成功，端到端确认延迟 0.1–0.3 s；若突发持续 1 s，恢复时间推到 0.7–1.5 s 区间，此时业务 deadline（如 500 ms）会比重试上限更早宣布失败。<strong>这就是 deadline 与重试上限必须同时存在的理由：一个管"最多等多久"，一个管"最多试几次"</strong>，只设其一的系统要么无限等待，要么过早放弃。</p>
+
+    <h3>6. ARQ 与 FEC：两条可靠性路线的定量对比</h3>
+    <p>前向纠错（Forward Error Correction, FEC）的思路与 ARQ 相反：不等确认，发送时就带上冗余，接收端在丢包位置自行恢复。最常用的模型是每 k 个数据包附带 r 个校验包，任意丢不超过 r 个都能恢复（里德-所罗门码）。以一帧 12 个包为例（k = 10、r = 2，冗余 20%）：</p>
+    <ul>
+      <li>丢包率 5% 时，一帧失败（丢 3 个及以上）的概率约 2.0%，帧内可恢复的损耗不产生任何重传；</li>
+      <li>同样 5% 丢包下，纯 ARQ 把整帧的送达失败率压到 p 的高次幂，代价是每次失败都要等一个 RTT 以上；</li>
+      <li>丢包率 20% 时，r = 2 的 FEC 失败率升到约 44%；把冗余加到 60%（r = 6）失败率才回到约 3%，流量代价已经很难接受。</li>
+    </ul>
+    <p>选择判据归纳为三条：<strong>低丢包（小于 1%）用 ARQ 即可</strong>，重传稀少、代价可忽略；<strong>中等丢包且对延迟敏感、或链路 RTT 明显时，用 FEC 把重传次数压下去</strong>；<strong>高丢包（大于 10%）下两者都吃力，先降低发送速率（降级）</strong>，让信道回到可用区间。工程上常见的组合是"FEC 挡小突发、ARQ 兜大遗漏"：FEC 处理帧内可恢复的损耗，ARQ 只处理 FEC 也盖不住的缺口，两条机制的开关都挂在链路丢包监测（片段 3）上。</p>
+
+    <h3>7. 失效模式与边界条件</h3>
+    <ul>
+      <li><strong>序号回绕</strong>：序号字段用 int16 时，100 Hz 的指令流约 5.5 分钟（32767 ÷ 100 ≈ 328 s）就绕一圈；接收端若只用"大于已见最大序号"做比较，回绕瞬间全部新指令会被误判为"太旧"。修复：序号用 64 位整数，或用带模运算的滑动窗口比较。</li>
+      <li><strong>未确认表泄漏</strong>：对端离线后未确认条目持续堆积，100 条/秒 × 5 分钟就是 3 万条记录。边界动作：未确认表设容量上限与超时清理，触及上限即视为对端不可用并进入失败流程。</li>
+      <li><strong>RTO 小于真实 RTT</strong>：重传风暴把有效带宽砍半；接收端靠去重保正确性，发送端却以为网络很糟，形成误诊闭环。修复：RTO 按实测 RTT 加抖动校准，并监控"重发后很快收到 ACK"的比例。</li>
+      <li><strong>deadline 用远程时钟</strong>：deadline 若是绝对时间戳且来自发送方时钟，接收端时钟偏差会让判定整体偏移（第 030 章的账）。边界动作：deadline 用相对时长，或统一时间基后再比较。</li>
+      <li><strong>去重集合与重启</strong>：接收端重启后去重集合清空，迟到的重传可能被二次执行。边界动作：执行函数按幂等设计兜底（"设定值"语义），并持久化关键动作的最近序号。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <ol>
+      <li><strong>给数据分类</strong>：状态/遥测（容忍丢失）、事务通知（可重传幂等）、关键指令（必须确认执行）。三类走不同通道。</li>
+      <li><strong>关键指令通道设计</strong>：自建 <code>Command</code>（seq、deadline、payload）与 <code>Ack</code>（seq、status）消息；发送端维护"未确认表"；接收端维护"已处理表"。</li>
+      <li><strong>参数落点</strong>：RTO 50–150 ms 起步（按实测 RTT 校准）、重传上限 3–5 次、指数退避、deadline 与业务时限对齐。</li>
+      <li><strong>失败语义</strong>：超过上限怎么办？上报状态机（第 064 章任务层）、进入安全降级（停止、原地待命）、或改用上层服务调用重试；绝不能"静默放弃"。</li>
+      <li><strong>度量</strong>：交付率（成功确认 / 发送）、重传率、端到端确认延迟的 p50/p95/p99、失败事件计数。</li>
+    </ol>
+    <table>
+      <tr><th>数据类别</th><th>机制</th><th>参数起点</th><th>失败处理</th></tr>
+      <tr><td>遥测/状态</td><td>Best-effort</td><td>KEEP_LAST(1)，丢就丢</td><td>不处理（下一帧还有）</td></tr>
+      <tr><td>事务通知（配置下发）</td><td>DDS Reliable</td><td>depth 10</td><td>超时后人工/上层重来</td></tr>
+      <tr><td>关键指令</td><td>自建 seq+ACK</td><td>RTO 100 ms、重试 3–5 次、退避 ×2</td><td>上报 + 安全降级，绝不静默</td></tr>
+    </table>
+    <p>通道隔离是设计里的另一条纪律：指令通道、遥测通道、大消息通道在话题与 QoS 上分开，最好在网络层也分开（不同 VLAN 或不同无线频段）。安全回路（紧急停止）通常完全独立：独立频段或硬线、周期心跳 10 Hz、连续丢 3 拍（300 ms）即判定失联并触发停止。<strong>它与"重传直至送达"的哲学相反，安全设计的目标是"失效方向可预测"（fail-safe）：任何不确定都导向停止，杜绝"再试一次"的侥幸</strong>。这也是本章把"关键指令"与"安全回路"分开处理的原因，两者对"可靠"的定义不同。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：带序号与确认的指令发送端</strong></p>
+    <pre class="code"><code>import time
+
+class ReliableSender:
+    """关键指令发送端：序号 + ACK + 超时重传 + 指数退避。
+    RTO 与重试上限作为构造参数：不同任务用不同可靠性等级。"""
+    def __init__(self, publish_fn, rto=0.1, max_retries=4, backoff=2.0):
+        self.publish = publish_fn            # 注入发布函数，便于测试与替换通道
+        self.rto = rto
+        self.max_retries = max_retries
+        self.backoff = backoff
+        self.next_seq = 1
+        self.unacked = dict()                # seq -> (报文, 下次重发时刻, 已重试数)
+
+    def send(self, payload, deadline):
+        seq = self.next_seq
+        self.next_seq += 1
+        msg = {"seq": seq, "payload": payload, "deadline": deadline}
+        self.publish(msg)
+        self.unacked[seq] = [msg, time.monotonic() + self.rto, 0]
+        return seq
+
+    def on_ack(self, ack):
+        # ACK 携带序号即可：迟到/重复的 ACK 对已确认条目是幂等的
+        self.unacked.pop(ack["seq"], None)
+
+    def tick(self):
+        now = time.monotonic()
+        for seq in list(self.unacked):
+            msg, due, tries = self.unacked[seq]
+            if now &lt; due:
+                continue
+            if msg["deadline"] &lt; now:        # 业务时限已过：重传早已无意义
+                self.on_failure(seq, "deadline_exceeded")
+                del self.unacked[seq]
+                continue
+            if tries &gt;= self.max_retries:
+                self.on_failure(seq, "retries_exhausted")
+                del self.unacked[seq]        # 失败必须上报，绝不静默消失
+                continue
+            self.publish(msg)                # 重传：同序号 = 接收端可去重
+            interval = self.rto * (self.backoff ** tries)
+            self.unacked[seq] = [msg, now + interval, tries + 1]
+
+    def on_failure(self, seq, reason):
+        # 接入第 039 章健康监测：失败事件是系统级告警源
+        print(f"指令 {seq} 失败：{reason}")</code></pre>
+    <p>解读：这段发送端把 ARQ 的全部纪律装进了一个小类。<strong>（1）</strong>超时判据用 <code>time.monotonic()</code>（单调时钟）：墙钟可能被校时跳变，重传计时会因"时间旅行"而失真；凡是计时都必须单调时钟。<strong>（2）</strong>deadline 检查排在重试上限之前：一条"2023 年就该执行"的指令重传 4 次毫无意义，业务时限是第一道闸。<strong>（3）</strong>退避间隔 <code>rto × backoff^tries</code>：100 ms、200 ms、400 ms、800 ms，既给信道恢复空间，又保证总时长可控。<strong>（4）</strong>失败处理是显式回调，删除条目之前先完成回调：<strong>可靠性协议最危险的形态是"静默放弃"</strong>，系统以为指令在执行，实际什么都没发生。失败事件必须能触发告警（第 039 章）或状态机降级（第 064 章）。</p>
+
+    <p><strong>片段 2：接收端去重，滑动窗口的简化实现</strong></p>
+    <pre class="code"><code>class DedupReceiver:
+    """关键指令接收端：序号去重 + 重复请求重发 ACK。
+    窗口只记录"最近一段"序号：内存恒定，且容忍乱序。"""
+    def __init__(self, window=256, ack_fn=None):
+        self.window = window                 # 覆盖远超在途消息数的历史
+        self.seen = set()                    # 已处理序号集合
+        self.max_seen = 0                    # 已见到的最大序号
+        self.ack = ack_fn                    # 处理器返回 ACK 的函数
+
+    def on_command(self, msg, execute_fn):
+        seq = msg["seq"]
+        if seq in self.seen:
+            # 重复（ACK 丢失的典型场景）：不重复执行，但要再回一次 ACK
+            self.ack({"seq": seq, "status": "duplicate"})
+            return
+        if seq &lt;= self.max_seen - self.window:
+            # 超窗口的旧序号：无法区分"真旧"与"攻击/错误"，保守拒收
+            self.ack({"seq": seq, "status": "too_old"})
+            return
+        execute_fn(msg["payload"])           # 执行：execute_fn 必须自身幂等
+        self.seen.add(seq)
+        self.max_seen = max(self.max_seen, seq)
+        self.ack({"seq": seq, "status": "executed"})
+
+    def trim(self):
+        # 周期性裁剪：只保留窗口内序号，控制内存
+        cutoff = self.max_seen - self.window
+        self.seen = {s for s in self.seen if s &gt; cutoff}</code></pre>
+    <p>解读：接收端的每行代码都对应一个经典的 ARQ 陷阱。<strong>（1）</strong>"重复命令再回 ACK"是必须的：重复的原因通常是"我上次的 ACK 丢了"，如果这次只忽略不回执，发送方永远等不到确认、会一直重传到上限，<strong>重复检测与确认重发是一体两面</strong>。<strong>（2）</strong>窗口的用途是给"旧序号"一个明确的拒绝策略：窗口内的乱序正常处理，远低于窗口的序号拒收（可能是错误注入、录制回放或攻击），拒绝也要回 ACK 说明原因，让发送方尽快走失败流程，避免白等一个超时。<strong>（3）</strong><code>execute_fn</code> 注释里强调"必须自身幂等"：去重集合只在进程存活期间有效，机器人重启后集合清空，一个迟到的重传仍可能被"二次执行"。<strong>彻底的安全靠两层：接收端去重 + 指令本身可重复执行。</strong><strong>（4）</strong>定期 <code>trim</code> 防内存泄漏：高频指令下 <code>seen</code> 集合会无限增长，窗口化是内存上界也是安全边界。</p>
+
+    <p><strong>片段 3：丢包率统计与自适应策略切换</strong></p>
+    <pre class="code"><code>class LinkMonitor:
+    """用序号连续性估计丢包率（类似 RTP 的统计思路），驱动策略切换。"""
+    def __init__(self, window=200):
+        self.last_seq = None
+        self.lost = 0
+        self.received = 0
+        self.window = window
+        self.history = []                    # 窗口化的丢包率序列
+
+    def on_packet(self, seq):
+        if self.last_seq is not None:
+            gap = seq - self.last_seq - 1    # 序号跳跃 = 中间丢了几个
+            if gap &gt; 0:
+                self.lost += gap
+        self.received += 1
+        self.last_seq = seq
+        if self.received % self.window == 0:
+            total = self.received + self.lost
+            rate = self.lost / total if total else 0.0
+            self.history.append(rate)
+            if rate &gt; 0.10:
+                # 高丢包：暂停"可靠流的重传轰炸"，避免拥塞崩溃
+                self.degrade_to("essential_only")
+            elif rate &gt; 0.03:
+                self.degrade_to("reduced_rate")   # 中丢包：降频保交付
+            else:
+                self.degrade_to("normal")
+
+    def degrade_to(self, mode):
+        # 切换策略：由上层根据模式调整 QoS/频率/通道分配
+        print(f"链路模式 -> {mode}（丢包史 {['%.3f' % r for r in self.history[-5:]]}）")
+</code></pre>
+    <p>解读：链路监测把"丢包"从被动忍受变成主动管理。<strong>（1）</strong>用序号连续性估计丢包率（gap 累加），不必依赖"没收到就计数"：发送方视角的序号跳跃是丢包的可靠证据，接收方"沉默"可能是发送方本就没发。<strong>（2）</strong>阈值分档驱动策略切换：正常（&lt; 3%）、降频（3%–10%）、只保关键流（&gt; 10%）。这是教科书级的降级设计，值得作为常规手段落地：<strong>拥塞时减小负载是正确方向，把可靠性调得更高会在重传雪崩里把事情变得更糟</strong>。<strong>（3）</strong>历史窗口保留最近几档丢包率，为事后复盘（"那次事故前后链路到底什么样"）留下数据。<strong>（4）</strong>降级动作要落在具体通道上：暂停哪条流、降低哪个频率、保留什么关键数据，策略切换本身也要写进配置评审：它属于配置决策，不应埋在代码分支里。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>没有序号的重传导致重复执行</strong>：同一指令执行两次（开门两次、前进两段）。修复：seq + 接收端去重，且指令一律采用绝对值语义。</li>
+      <li><strong>ACK 丢失引发无关重传</strong>：接收端不重发 ACK，发送方一直重传直到上限，白白占用信道。修复：重复命令回 "duplicate" ACK（片段 2）。</li>
+      <li><strong>用墙钟做超时</strong>：校时跳变让 RTO 计算"穿越"，重传行为诡异。修复：monotonic 时钟。</li>
+      <li><strong>把 DDS Reliable 当"业务可靠"</strong>：消息送达了对端 DDS，但节点可能没处理、没确认。修复：关键动作走应用层 ACK 通道。</li>
+      <li><strong>高丢包时还加大重传</strong>：重传流量与拥塞互相成全，链路彻底瘫痪。修复：丢包率驱动的降级（片段 3）；FEC 或"接受损失"有时比"强求全程可靠"更安全。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>p = 10% 独立丢包，重传 3 次后失败概率是多少？p = 30% 呢？解释为什么高丢包场景要换思路，加重传的路线问题出在哪里。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>10%^4 = 10⁻⁴；30%^4 ≈ 0.81%。高丢包下 4 次重传才勉强可用，而 4 倍流量会进一步推高拥塞，这就是"降级保吞吐"的动机。</div></details>
+      </li>
+      <li>把 RTO 从 100 ms 改到 20 ms（低于真实 RTT），预测现象：重传率、重复消息量、交付率怎么变？<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>无谓重传暴增，接收端全靠去重兜底，信道利用率恶化，但交付率未必提升，RTO 低于 RTT 是在惩罚网络，对交付率毫无帮助。</div></details>
+      </li>
+      <li>推导：突发丢包（一次丢 50 ms 内的全部消息）下，100 Hz 指令流一次突发丢多少条？你的重传与去重设计能恢复多少？<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>50 ms × 100 Hz = 5 条连续丢失；逐条重传（间隔 ≥ RTO）可以在数百毫秒内恢复全部，但要确保重传不与新指令互相挤占队列。</div></details>
+      </li>
+      <li>设计题：为"紧急停止"指令设计可靠性方案：通道选择、确认语义、失败动作、与常规指令流的隔离，并说明为什么 e-stop 通常另走独立链路，不依赖应用层重传。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>安全回路讲究"失效可预测"：独立频段/硬线、周期性心跳（存在即安全）、丢失即触发停止，与"重传直至送达"的哲学相反。</div></details>
+      </li>
+      <li>思考：为什么工程师很容易写出"静默放弃"的可靠性代码？在你的项目里做一次审计：找出所有"重试失败后什么都不说"的位置。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>静默放弃的根源是"错误处理只打印日志"。审计标准：失败必须产生一个能被聚合、告警、触发降级的信号。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>无线丢包是常态且常为突发型；可靠性设计要同时考虑平均率与突发长度。</li>
+      <li>两层分工：数据类交给 DDS Reliable；关键指令用应用层 seq+ACK 获得"执行级"确认。</li>
+      <li>ARQ 配方：单调时钟计时、RTO = RTT + 抖动余量、指数退避、deadline 与重试上限、失败必上报。</li>
+      <li>幂等是重传的另一半：序号去重 + 重复请求重发 ACK + 指令设计成可重复执行。</li>
+      <li>下一章把视角从"一条消息"升到"一段时间"：<strong>网络分区下的数据一致性</strong>，当通信彻底断开，系统如何各自为政又不永久分叉。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch034.html">← 第 034 章：自建主题路由与数据分发中间件</a>
+    <a class="next" href="ch036.html">第 036 章：网络分区下的数据一致性 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>
+

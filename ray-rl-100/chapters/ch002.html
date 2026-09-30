@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第002章 Ray远程函数与Actor基础 | 分布式强化学习课程 · Ray RLlib 训练与调优</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · Ray 基础与分布式编程</span>
+    <span class="sep">/</span>
+    <span>第 002 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · Ray 基础与分布式编程</div>
+    <h1>第 002 章：Ray远程函数与Actor基础</h1>
+    <p class="lead">Ray 只有两种执行原语：一次性的远程函数与长期存活的有状态 Actor。本章讲清两者的调度语义差异，以及"状态该放在哪里"这个设计问题的判定标准。</p>
+    <ul class="meta">
+      <li>主题：Ray 核心 / 两大执行原语</li>
+      <li>关键机制：任务调度语义、Actor 方法队列、句柄传递、并发语义</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 001 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解远程函数（Remote Function）的调度语义：每次调用独立调度、无状态、可重试、执行位置不保证。</li>
+      <li>理解 Actor 的调度语义：创建时锁定资源、方法调用经队列串行执行、状态在进程存活期间保持。</li>
+      <li>掌握"状态放函数还是放 Actor"的判定标准，并能解释全局变量在远程函数中失效的原因。</li>
+      <li>会写带状态的服务型 Actor，并理解 Actor 句柄（Handle）的序列化传递机制。</li>
+      <li>能诊断两类典型问题：方法队列阻塞与 Actor 生命周期失控。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>并行程序的核心困难是状态：哪些计算可以随意复制到任意进程，哪些计算必须固定在某个进程里累积状态。Ray 用两种原语切开这条边界。<strong>远程函数面向"可复制的纯计算"，Actor 面向"需要累积状态的实体"</strong>。混淆两者是分布式程序中最隐蔽的错误来源之一：把状态塞进远程函数，代码在单机测试时正常，上集群后结果随调度顺序漂移。</p>
+    <p>在强化学习训练链路里，这个区分无处不在：环境推进是有状态的（每一步改变环境内部状态），必须住在 Actor 里；一段奖励整形函数、一次优势估计、一批梯度聚合是无状态的，适合做远程函数。RLlib 内部的采样器（Sampler）、回放缓冲（Replay Buffer）也都按这一标准分别落在 Actor 与任务两种形态上。</p>
+    <p>本章把两种原语的语义讲透，并给出一条可操作的判定标准，后续章节的对象存储、并行池、异步接口都以此为基础展开。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 远程函数：可复制、可重排、无状态</h3>
+    <p>远程函数的语义可以浓缩为一句话：<strong>每次调用都是一次独立的任务，任务之间互不可见</strong>。这带来三个推论：</p>
+    <ul>
+      <li><strong>执行位置不保证</strong>：同一个函数的前后两次调用可能落在不同机器、不同进程上。函数内定义的局部变量在任务结束后销毁。</li>
+      <li><strong>可重试性成立</strong>：因为无状态，节点故障后任务可以在别的节点重新执行，结果不受影响（第 009 章展开容错）。</li>
+      <li><strong>可重排性成立</strong>：调度器认为任务之间无依赖，可以按任意顺序、任意并行度执行。这也是远程函数天然并行、Actor 默认串行的根源。</li>
+    </ul>
+    <p>关键陷阱在于 Python 的全局变量。工作进程是长期存活的进程，远程函数被反复调用时，模块级变量会在同一个进程内"看起来"被保留，但下一次调用可能换到另一个进程，取值随即归零或错乱。<strong>依赖全局变量的远程函数行为随调度波动，必须视为错误设计</strong>。</p>
+
+    <h3>2. Actor：一次创建，长期存在的串行服务</h3>
+    <p>Actor 的语义是把一个 Python 对象放进专属工作进程：</p>
+    <ol>
+      <li><strong>创建即占资源</strong>：<code>Counter.remote()</code> 在创建时按类装饰器声明的规格锁定 CPU/GPU，直到 Actor 销毁才释放。资源占用是持久的，这与任务"用完即还"截然不同。</li>
+      <li><strong>方法调用排队</strong>：同一 Actor 的方法调用进入一个先进先出的队列，默认串行执行。任何两个方法不会交叠，因此方法内部读写实例变量无需加锁。</li>
+      <li><strong>状态持续累积</strong>：实例变量在多次方法调用之间保持，这正是环境副本、计数器、回放缓冲需要的行为。</li>
+      <li><strong>句柄可传递</strong>：Actor 句柄（ActorHandle）本身可以序列化，作为参数传给其他任务或其他 Actor。远程进程拿到句柄后即可调用该 Actor 的方法，调用路径与调用方位置无关。</li>
+    </ol>
+    <div class="formula">
+      方法队列执行时间 ≈ T₁ + T₂ + … + T<sub>n</sub>（串行）
+      <span class="note">默认并发度为 1；单次方法耗时过长会把后续调用全部堵在队列中，这是单 Actor 吞吐的硬上限</span>
+    </div>
+    <p><strong>串行队列既是安全边界也是吞吐瓶颈</strong>。它免去了锁与竞态，代价是所有方法共享一条执行流。需要更高并发时有两类手段：增加 Actor 副本把负载分片（第 005 章），或声明方法为异步执行（第 006 章）。</p>
+    <p>从实现层面看，Actor 方法调用走的是"确认加应答"协议：调用方发出请求后立即拿到对象引用，方法真正执行完成后结果被写入对象存储。这个协议与远程函数一致，因此 <code>ray.get</code>、<code>ray.wait</code>、依赖调度这些机制对两者通用。</p>
+
+    <h3>3. 选用标准：状态在谁身上</h3>
+    <table>
+      <tr><th>维度</th><th>远程函数（Task）</th><th>Actor</th></tr>
+      <tr><td>状态</td><td>无状态，调用间不保留</td><td>有状态，跨调用累积</td></tr>
+      <tr><td>资源占用</td><td>执行期间占用，结束释放</td><td>创建时占用，存活期间一直持有</td></tr>
+      <tr><td>调用并发</td><td>任意并行，可跨节点重排</td><td>默认串行排队</td></tr>
+      <tr><td>典型用途</td><td>批量计算、数据变换、统计聚合</td><td>环境副本、计数器、回放缓冲、参数服务器</td></tr>
+      <tr><td>容错语义</td><td>失败可自动重试（声明后）</td><td>失败默认整体丢失，需显式配置重启</td></tr>
+    </table>
+    <p>判定口诀：<strong>计算前后需要"记得住"的东西，就用 Actor；一次调用内能自洽算完的，就用远程函数</strong>。介于两者之间的场景（例如每步推进都需要环境的随机数流）应按最强约束选 Actor，因为状态一致性比并行自由度更难事后补救。</p>
+    <p>判定标准之外还有一类混合形态值得单独识别：计算逻辑本身无状态，但初始化成本高昂（加载大模型权重、建立数据库连接、编译计算图）。每次调用都重新初始化会让固定成本压过收益，此时把初始化结果放进 Actor，让它以"缓存服务"的形态存在，方法调用只做查询与轻量变换。口诀可以扩展为第二句：<strong>无状态但初始化昂贵的组件，用 Actor 承载缓存，用远程函数做批量计算</strong>。RLlib 中策略推理服务（Policy Server）正是这一形态，第 020 章会把它的接口完整展开。</p>
+
+    <h3>4. 数值算例：方法队列的等待放大</h3>
+    <p>设某缓冲 Actor 单次方法的平均服务时长 s = 0.5 ms（对应吞吐上限 μ = 2000 次/秒），64 个生产者以合计 λ 的速率并发写入。服务时长近似固定、到达过程近似泊松时，等待时间可用 M/D/1 排队模型估算：平均排队等待 W<sub>q</sub> = ρ × s ÷ (2 × (1 − ρ))，平均逗留时间 W = s + W<sub>q</sub>，其中利用率 ρ = λ ÷ μ。系统内的平均排队长度约为 λ × W。</p>
+    <div class="formula">
+      W<sub>q</sub> = ρ s ÷ (2 (1 − ρ))，W = s + W<sub>q</sub>，ρ = λ ÷ 2000
+      <span class="note">ρ → 1 时等待时间发散：利用率每逼近上限一档，延迟放大倍率增长更快</span>
+    </div>
+    <table>
+      <tr><th>写入速率 λ（次/秒）</th><th>利用率 ρ</th><th>平均等待 W<sub>q</sub></th><th>平均逗留 W</th><th>相对服务时长放大</th></tr>
+      <tr><td>1280（每生产者 20 次/秒）</td><td>0.64</td><td>0.44 ms</td><td>0.94 ms</td><td>1.89 倍</td></tr>
+      <tr><td>1600</td><td>0.80</td><td>1.00 ms</td><td>1.50 ms</td><td>3.00 倍</td></tr>
+      <tr><td>1900</td><td>0.95</td><td>4.75 ms</td><td>5.25 ms</td><td>10.50 倍</td></tr>
+    </table>
+    <p>代入过程以 ρ = 0.64 一档为例：W<sub>q</sub> = 0.64 × 0.5 ÷ (2 × 0.36) = 0.444 ms，四舍五入为 0.44 ms。表格给出两条工程结论。第一，利用率从 0.64 提到 0.95，吞吐只提升约 48%（1900 ÷ 1280 ≈ 1.48），平均延迟却放大 10 倍以上，队列长度从约 1.2 涨到约 10。第二，延迟对利用率的敏感度在 ρ 逼近 1 时并无上限，这正是单 Actor 缓冲必须在 ρ 超过 0.8 之前分片的原因。第 005 章的 Actor 池设计、第 087 章的经验缓冲分片都复用这一测算。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>把一个待实现的组件落到两种原语上的设计步骤：</p>
+    <ol>
+      <li><strong>梳理状态</strong>：列出组件内所有跨越调用的变量（环境内部状态、随机数生成器、计数器、缓冲区）。列表非空即倾向 Actor。</li>
+      <li><strong>评估调用频率与单次耗时</strong>：Actor 的吞吐上限由单次方法耗时决定；若单次耗时是瓶颈且状态可分片，就设计成 N 个 Actor 并行。</li>
+      <li><strong>声明资源</strong>：函数在装饰器上声明单次调用需求；Actor 在类装饰器上声明持久需求。Actor 的声明值按峰值需求取，因为运行中不可回收。</li>
+      <li><strong>规划生命周期</strong>：明确 Actor 何时创建、由谁持有、何时销毁。持有句柄的进程退出或句柄引用被回收后，Actor 可能连带销毁。</li>
+      <li><strong>设计重试边界</strong>：无状态任务可放心重试；Actor 需要显式配置重启策略并承担状态重置的代价（第 009 章）。</li>
+    </ol>
+    <table>
+      <tr><th>参数</th><th>典型取值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>num_cpus（任务）</td><td>0.5–2</td><td>单次调用的核数需求</td><td>按实测单核占用与并发目标反推</td></tr>
+      <tr><td>num_gpus（Actor）</td><td>1 或 0</td><td>锁定整卡直到销毁</td><td>推理与训练进程显存独占需求</td></tr>
+      <tr><td>max_concurrency</td><td>1–16</td><td>Actor 方法并发上限</td><td>默认 1 保串行安全；异步场景按事件循环能力提升</td></tr>
+    </table>
+
+    <h3>Actor 生命周期与重试语义</h3>
+    <p>生命周期部分需要补充三条运行时规则。<strong>其一，句柄引用计数决定存活</strong>：创建者与所有持有句柄的进程都丢弃引用后，Actor 会被自动销毁；把句柄存在局部变量里且函数返回，等同于发出销毁信号，跨调用复用必须让句柄在存活期被持续引用。<strong>其二，命名或分离模式</strong>：通过命名注册（namespace 加命名参数）创建的 Actor 可以脱离创建者存活，适用于跨作业复用的服务型实例，代价是销毁责任转移给使用方，忘记清理会留下长期占用资源的孤儿 Actor。<strong>其三，资源锁定在销毁前不释放</strong>：4 张显卡的机器上创建第 5 个声明 <code>num_gpus=1</code> 的 Actor 会永久排队，前 4 个不销毁就不会归还配额；<code>ray.available_resources()</code> 显示 GPU 为 0、进程状态却一切正常，这类"假死"用 <code>ray list actors</code> 核对常驻声明值即可定位。</p>
+    <p>重试语义在两种原语之间是非对称的。任务因节点故障默认自动重试（上限与版本相关，通常为 3 次），应用层异常不会被重试，会在 <code>ray.get</code> 取回时以异常形式抛出；Actor 默认不重启也不重试方法（重启与任务重试参数默认都是 0），进程崩溃即状态全部丢失。需要状态延续的 Actor 必须显式声明重启参数，并在"从上一次检查点恢复"与"清零重建"之间明确选择一种语义，这个选择在第 009 章结合回放缓冲与采样器再次出现。</p>
+    <div class="box tip">
+      <span class="box-title">与上一章的差异点</span>
+      <p>第 001 章的任务在结束后释放资源、丢弃全部上下文；本章的 Actor 引入持久资源占用与状态延续。资源账本的视角随之改变：Actor 越多，常驻占用越高，空闲 Actor 同样是成本。</p>
+    </div>
+
+    <h3>设计示例：把一个环境副本落到 Actor 上</h3>
+    <p>以强化学习环境副本为例走一遍五步流程，检验判定标准是否可操作。状态清单：环境当前观测、内部随机数生成器、累计步数与回合统计，四者都跨调用存活，判定落在 Actor。调用频率与耗时：单步推进为亚毫秒级，一个回合需要数千步，单 Actor 每秒可承载的步数即为采样吞吐上限，副本数按目标吞吐除以单副本步速反推。资源声明：环境推进以 CPU 计算为主，声明 <code>num_cpus=1</code>；若观测渲染需要 GPU，按峰值声明并在训练全程持有。生命周期：与训练流程同生共死，创建发生在训练开始前，销毁在训练结束或异常处理路径中显式执行。重试边界：环境内部状态无法从故障中恢复，因此不声明自动重启，由上层重建实例并重置。接口清单落为三项：<code>reset()</code>、<code>step(action)</code>、<code>stats()</code>。这份清单与 RLlib 环境执行器（EnvRunner）的职责划分一一对应，第 015 章的环境接口实现将逐项落地，第 023 章则讨论采样阶段的批次切分。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>以下片段采用 Ray 2.x 时期的通用写法；接口随版本演进，以对应版本官方文档为准。</p>
+    <p><strong>片段 1：远程函数无状态性的实证</strong></p>
+    <pre class="code"><code>import ray
+
+ray.init(num_cpus=4)
+
+@ray.remote(num_cpus=1)
+def count_with_global(x):
+    global_counter[0] += x     # 试探性依赖模块级可变对象
+    return global_counter[0]
+
+@ray.remote(num_cpus=1)
+def count_local(x):
+    return x + 1               # 无状态：结果只由参数决定，与执行位置无关
+
+refs = [count_local.remote(i) for i in range(8)]
+print(ray.get(refs))  # [1, 2, 3, 4, 5, 6, 7, 8]，与调度顺序无关
+
+# 同一函数连续调用两次，观察两次读取到的"全局状态"是否一致
+a = ray.get(count_with_global.remote(1))
+b = ray.get(count_with_global.remote(1))
+print(a, b)  # 可能为 1 2，也可能为 1 1：取决于两次调用是否落进同一进程</code></pre>
+    <p>解读：留意两个函数的对比。<code>count_local</code> 的输出只由输入参数决定，无论调度器把它放到哪个进程、哪个节点，结果恒等，这就是可重试与可重排的物理基础。<code>count_with_global</code> 的返回值依赖执行进程的局部历史，两次同样的调用可能返回同样结果（落进同一进程）或不同结果（换到另一个进程），<strong>行为不可预测的根源是进程边界由调度器决定，全局变量只是暴露这一事实的载体</strong>。分布式程序里任何"记得住"的意图都必须显式建模为 Actor 状态或对象存储中的对象。</p>
+
+    <p><strong>片段 2：计数器 Actor 与串行语义</strong></p>
+    <pre class="code"><code>import ray
+
+ray.init(num_cpus=4)
+
+@ray.remote
+class StepCounter:
+    def __init__(self, name):
+        self.name = name
+        self.total = 0            # 实例状态：在 Actor 存活期间持续累积
+
+    def add(self, n):
+        self.total += n           # 方法默认串行执行，读写无需加锁
+        return self.total
+
+    def snapshot(self):
+        return self.name, self.total   # 快照接口：便于外部观察当前状态
+
+counter = StepCounter.remote("env-0")   # 创建即占用资源，返回句柄
+
+# 提交多次调用：它们按先进先出顺序在该 Actor 内执行
+refs = [counter.add.remote(i) for i in range(1, 5)]
+print(ray.get(refs))          # [1, 3, 6, 10]：调用顺序决定累加顺序
+print(ray.get(counter.snapshot.remote()))   # ('env-0', 10)
+
+# 两个独立 Actor 完全并行：状态互不干扰，编号即分区键
+envs = [StepCounter.remote(f"env-{i}") for i in range(4)]
+ray.get([envs[i].add.remote(1) for i in range(4)])
+print(ray.get([e.snapshot.remote() for e in envs]))</code></pre>
+    <p>解读：这份代码展示了 Actor 的三条语义。<strong>第一，队列顺序即执行顺序</strong>：四个 <code>add</code> 调用虽同时提交，但在 Actor 内严格串行，返回值 1、3、6、10 对应累计过程，任何两个调用不会交错。<strong>第二，状态与身份绑定</strong>：编号 <code>env-0</code> 到 <code>env-3</code> 的四个实例各自持有独立计数，这正是环境副本、分片统计的标准建模方式。<strong>第三，句柄是唯一访问入口</strong>：外部只能通过方法读写状态，无法绕过队列直接触碰实例变量，状态一致性由运行时保证。</p>
+
+    <p><strong>片段 3：句柄跨进程传递</strong></p>
+    <pre class="code"><code>import ray
+
+ray.init(num_cpus=4)
+
+@ray.remote
+class ReplayBuffer:
+    def __init__(self):
+        self.items = []
+
+    def push(self, sample):
+        self.items.append(sample)
+        return len(self.items)
+
+@ray.remote(num_cpus=1)
+def producer(buffer, sample_id):
+    # buffer 是 ActorHandle：参数序列化时只传"访问凭据"
+    size = ray.get(buffer.push.remote({"id": sample_id, "obs": [0.1] * 8}))
+    return sample_id, size
+
+buffer = ReplayBuffer.remote()          # 创建唯一缓冲实例，集中持有全部样本
+refs = [producer.remote(buffer, i) for i in range(8)]
+print(ray.get(refs))   # 8 个生产者并发写入同一缓冲，由 Actor 队列保证顺序安全</code></pre>
+    <p>解读：本片段是后续"分布式采样加集中缓冲"模式的雏形。关键机制在于 <code>buffer</code> 作为参数被序列化时，传递的只是 Actor 句柄，对象内容留在原进程，因此 8 个生产者进程可以并发调用同一个缓冲 Actor，写入顺序由队列裁定，数据始终只有一份。<strong>把"聚合点"建模为单一 Actor，可以避免每个生产者各持一份副本导致的合并开销</strong>；代价是聚合 Actor 成为吞吐瓶颈，拆分方案与队列治理留到第 005 章讨论。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>用远程函数模拟有状态服务</strong>：把计数、缓冲、环境状态放进模块级变量或函数属性，单次运行内看似正常，任务被调度到其他进程后状态散落。症状是统计值随机偏小、环境重置行为异常。修复：迁移为 Actor。</li>
+      <li><strong>长方法堵死 Actor 队列</strong>：单次方法调用耗时过长，后续所有调用排队等待，表现为 P99 延迟剧烈恶化。修复：拆分方法、增加 Actor 副本，或对 IO 型方法启用并发（第 006 章）。</li>
+      <li><strong>为每次调用创建新 Actor</strong>：把 Actor 当廉价对象，循环内反复创建，导致资源申请与进程启动开销叠加，且失去状态累积的意义。修复：Actor 在循环外创建一次，循环内复用句柄。</li>
+      <li><strong>Actor 生命周期意外终结</strong>：创建句柄后没有在存活进程中保留引用，解释器回收句柄，Actor 被判定为无人引用而销毁。症状是"忽然调用失败"或状态被重置。修复：在驱动进程显式持有句柄，或使用命名 Actor 并理解其引用规则。</li>
+      <li><strong>在 Actor 方法内长时间阻塞等待外部引用</strong>：方法内部调用 <code>ray.get</code> 等待另一个未就绪任务，整个队列被占用，形成互相等待。修复：先取回依赖再进入 Actor 调用，或改用异步 Actor。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把片段 1 的 <code>count_with_global</code> 运行 20 次，记录返回值分布，解释为什么同一输入会产生不同输出，并给出两种修复方案。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>返回值取决于调用落进哪个工作进程及其历史。修复方案：改为 Actor 持有计数，或让每次调用把前置状态作为参数显式传入，用对象引用串起依赖。</div></details>
+      </li>
+      <li>预测：把片段 2 中四个 <code>add</code> 调用的提交顺序改为 4、3、2、1，<code>snapshot</code> 的返回值是多少？如果换成四个独立 Actor 并行累加，最终总计数是多少？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>单 Actor 串行下最终值仍是 10，中间快照不同；四个独立 Actor 每人加 1，总和为 4，聚合需要额外一层汇总调用。</div></details>
+      </li>
+      <li>设计题：实现一个"滑动窗口统计器"，持续接收延迟样本，维护最近 100 个样本的均值与最大值。说明为什么它必须是 Actor，并给出接口清单与状态变量列表。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>窗口是跨调用累积的状态；接口至少包含 add(sample)、stats()、reset()。内部用双端队列维护窗口并增量更新统计量，避免每次重算。</div></details>
+      </li>
+      <li>分析：某流水线用 64 个生产者任务向单个缓冲 Actor 写入，平均每个样本写入耗时 0.5 毫秒。估算该 Actor 的每秒写入上限，并给出两种提升吞吐的分片策略。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>串行队列上限约 2000 次/秒。分片策略：按生产者编号取模分配到 4–8 个缓冲 Actor，或按批次写入让单次方法承载多样本，用批量摊薄每样本开销。</div></details>
+      </li>
+      <li>判断题：下列组件在强化学习训练链路中各应设计为远程函数还是 Actor，并陈述理由：奖励整形函数、环境副本、优势估计、梯度聚合、随机种子管理器。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>环境副本与随机种子管理器持有跨步状态，选 Actor；梯度聚合若需要多轮累积状态选 Actor，单轮归约可用远程函数；奖励整形与优势估计是无状态变换，选远程函数。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>远程函数语义：每次调用独立调度、执行位置不保证、无状态、可重试；依赖全局变量即错误设计。</li>
+      <li>Actor 语义：创建时锁定资源、方法经队列默认串行、状态跨调用保持；句柄可跨进程传递。</li>
+      <li>判定标准：<strong>跨调用需要"记得住"的状态就放 Actor，单次调用能自洽算完的计算就放远程函数</strong>。</li>
+      <li>Actor 的串行队列既是免锁的安全边界，也是单实例吞吐上限；瓶颈出现时用分片或异步化解。</li>
+      <li>下一章深入两者共同的底层设施：<strong>对象存储与共享内存</strong>，解释结果如何在进程间零拷贝流转。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch001.html">← 第 001 章：Ray环境搭建与第一个分布式任务</a>
+    <a class="next" href="ch003.html">第 003 章：Ray对象存储与共享内存 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

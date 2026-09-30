@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第032章 SAC的自动温度系数调整 | 深度强化学习课程 · PPO、SAC 与多智能体系统</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 离策略方法与 SAC</span>
+    <span class="sep">/</span>
+    <span>第 032 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 离策略方法与 SAC</div>
+    <h1>第 032 章：SAC的自动温度系数调整</h1>
+    <p class="lead">把 SAC 里最像"玄学"的超参数 alpha 交给梯度自己学：在 Pendulum-v1 上对比固定温度与自动温度调节，看 alpha 如何随"熵缺口"先升后降。</p>
+    <ul class="meta">
+      <li>主题：自动熵调节 / 温度系数</li>
+      <li>关键公式：L(α) = −𝔼[ log α · ( log π(a|s) + H̄ ) ]，H̄ = −dim(A)</li>
+      <li>预计学时：50 分钟</li>
+      <li>前置章节：第 031 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解温度系数 alpha 在 SAC 目标函数中的角色：它把"探索值多少钱"从一个超参数变成可优化的量。</li>
+      <li>推导自动温度调节的损失函数，说清 log_alpha 的梯度方向为什么由"熵缺口"决定。</li>
+      <li>实现固定与自动两种 alpha 模式，共用同一套双 Q、重参数化与软更新代码。</li>
+      <li>在 <code>Pendulum-v1</code> 上对比两条评估曲线，读出 alpha 轨迹的典型形状（先升后降/稳）。</li>
+      <li>掌握目标熵 = −动作维度的启发式，并知道它什么时候不适用。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>SAC 的目标是"回报加上 α 倍的熵"：策略既要拿高 Q 值，又要保持足够的随机性。alpha 就是这两者的<strong>汇率</strong>，alpha 偏大，策略不敢收敛，回报上不去；alpha 偏小，策略早早坍缩成一个确定性动作，遇不到更好的轨迹。第 031 章里 alpha 是手写的常数，而 Pendulum 的奖励尺度、回合长度一换，同一个常数就未必合适。</p>
+    <p>更麻烦的是，训练不同阶段需要的探索强度本来就不同：<strong>早期要多探索</strong>（策略还差，熵值应该高），<strong>后期要精调</strong>（策略接近最优，熵值应该降下来）。一个好的自动机制应该让 alpha 随"当前熵离目标熵有多远"实时调整；整场一个常数的做法在奖励尺度变化时就会失效。本章就把这件事实现出来，并用同种子对照实验证明：自动模式几乎不损失性能，却省掉了调参。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. alpha 在损失里的位置</h3>
+    <p>SAC 的策略更新最大化软目标：</p>
+    <div class="formula">
+      J(π) = 𝔼<sub>s∼𝒟, a∼π</sub>[ Q(s,a) − α·log π(a|s) ]
+      <span class="note">等价写法：最大化 Q 的同时最大化熵 H(π(·|s))，因为 H = −𝔼[log π]</span>
+    </div>
+    <p>本章代码里的策略损失是 <code>(alpha * logp - q_new).mean()</code>，正是把上式取了负号。α 越大，同样的熵梯度被放大得越狠，固定 α 时，这个"汇率"只能靠人工试。</p>
+
+    <h3>2. 把 α 变成可学习参数</h3>
+    <p>直接优化 α 会撞上"熵是策略演化的结果、不是 α 的单调函数"这个问题。SAC 原文的做法是：构造一个关于 log α 的替代损失（surrogate objective），让 α 去弥补"当前熵"与"目标熵"的缺口：</p>
+    <div class="formula">
+      L(α) = −𝔼<sub>a∼π</sub>[ log α · ( log π(a|s) + H̄ ) ]<br>
+      其中 log π 的梯度被 detach 掉，H̄ = target_entropy
+    </div>
+    <p>求导看方向是最直观的：对 log α 求梯度，得到 −( log π + H̄ ) 的均值。把 E[log π] 与 −H̄ 比较即可判断方向：若 E[log π] &gt; −H̄（等价于熵 H = E[−log π] 低于目标 H̄），括号为正、梯度为负，梯度下降<strong>抬升 log α</strong>（α 增大、探索被加强）；若 E[log π] &lt; −H̄（熵高于目标），α 被压低。平衡条件是 E[log π] = −H̄，即熵 H 收敛到 H̄ = −dim(A)。也就是说，<strong>α 永远朝"减少熵缺口"的方向走</strong>，缺口越大步子越急，缺口闭合后梯度均值趋近零。α = exp(log α) 保证了非负。</p>
+    <p>这个替代损失有严格来路，它来自带约束的对偶问题。把 SAC 的目标写成"在保持平均熵不低于 H̄ 的前提下最大化 Q 值"：</p>
+    <div class="formula">
+      max<sub>π</sub> 𝔼[Q(s,a)]　s.t.　𝔼[−log π(a|s)] ≥ H̄<br>
+      ℒ(π, α) = 𝔼[Q(s,a)] + α · ( 𝔼[−log π(a|s)] − H̄ )，α ≥ 0
+      <span class="note">固定 α 时对 π 求最大，正好还原出策略损失；外层再对 α 求最小</span>
+    </div>
+    <p>对偶函数 g(α) = max<sub>π</sub>ℒ 的梯度由包络定理给出：dg/dα = 𝔼[−log π] − H̄ = H − H̄。而实现里用的替代损失对 log α 的梯度恰好也是 H − H̄（推导：∂[−log α·(log π + H̄)]/∂log α = −(log π + H̄) = H − H̄ 的均值），两者方向与尺度一致，因此可以直接用一波样本的 log π 估计这个梯度，不需要显式求解约束问题。</p>
+
+    <h3>3. 目标熵怎么定</h3>
+    <p>连续动作的常用启发式是 H̄ = −dim(A)。Pendulum 动作 1 维，H̄ = −1。它的直觉是"每维动作保留约 1 nat 量级的随机性"；这并不保证最优，但在不同环境与奖励尺度上表现稳定。注意 log π 是 tanh 压缩后的对数密度、可以取正值，所以 H̄ 为负并不奇怪。</p>
+    <p>使用这个启发式时有三个边界要留意。其一，动作维度按"独立控制量"计数：二维动作 H̄ = −2，若两维高度相关（例如机械臂的成对关节），照搬 −2 会让策略偏随机，此时可以适当调高（如 −1.2）。其二，动作尺度被 <code>act_scale</code> 放大时，密度在动作空间的平移不改变熵，因此不需要按尺度换算。其三，奖励尺度变化不影响 H̄ 的定义，这正是自动温度相对固定 α 的优势场景：Pendulum 的奖励在 −16～0 之间，若换到奖励放大十倍的变体，固定 α=0.2 的探索强度相对回报会显得过小，而自动模式的平衡点仍由熵缺口决定。把奖励整体放大 c 倍，软目标 Q+αH 中的 Q 被放大 c 倍，要保持相同的探索权重，α 也近似乘 c；固定 α 若不跟着调整，相对探索强度就缩水到原来的 1/c，第 035 章的奖励尺度实验会把这个比例关系放在两条曲线里直接对照。</p>
+
+    <div class="box key">
+      <span class="box-title">数值例子：两次温度更新的方向</span>
+      <p>设 α=0.2（log α ≈ −1.609）、alpha_lr=3e-4、H̄=−1，观察两次相隔较远的更新：</p>
+      <p><strong>早期策略很随机</strong>，E[−log π] = 2.0，高于目标 −1 → E[log π] = −2.0，E[log π] + H̄ = −3.0。更新量 ≈ 3e-4 × (−3.0) = −9e-4，α ≈ 0.2 × e<sup>−0.0009</sup> ≈ 0.1998，方向向下、步子很小。</p>
+      <p><strong>后期策略过度确定</strong>，E[−log π] = −1.5，低于目标 −1 → E[log π] = 1.5，E[log π] + H̄ = 0.5。更新量 ≈ 3e-4 × 0.5 = +1.5e-4，α ≈ 0.20003，方向向上。</p>
+      <p>解读：单次更新只动约 1e-4 量级，几千次更新后 α 平滑地增减，这就是 alpha 轨迹"先升后降/稳"的微观来源。alpha_lr 越大，追赶缺口越快，也越容易冲过平衡点形成震荡；若观测到 α 在两个评估点之间大幅跳动，优先调小 alpha_lr；改目标熵解决不了震荡问题。</p>
+    </div>
+
+    <h3>4. 固定与自动的公平对比</h3>
+    <p>两种模式必须<strong>只差 alpha 的处理方式</strong>：网络结构、双 Q、软更新、经验回放、随机种子全部相同，这样回报差异才能归因到 alpha 机制本身。代码里用同一个 <code>train_mode()</code> 加 <code>--mode</code> 开关实现这个设计；每个模式开头重新 <code>set_seed</code>，连初始回放池的随机轨迹都一致。</p>
+    <table>
+      <tr><th>维度</th><th>固定 α</th><th>自动 α</th></tr>
+      <tr><td>参数数量</td><td>零（手写常数）</td><td>1 个可学习标量 log α + 独立优化器</td></tr>
+      <tr><td>调参成本</td><td>每换任务都要重新搜索</td><td>只需设定目标熵 H̄</td></tr>
+      <tr><td>训练中行为</td><td>全程恒温</td><td>随熵缺口实时调整，早期加强探索、后期自动回收</td></tr>
+      <tr><td>主要风险</td><td>奖励尺度变化后常数失效</td><td>目标熵不当或 alpha_lr 过大导致轨迹震荡</td></tr>
+      <tr><td>典型轨迹</td><td>水平直线</td><td>先升后降/稳</td></tr>
+      <tr><td>适用建议</td><td>需要完全复现某条已知曲线时</td><td>默认选择，换环境、换奖励尺度时省去搜索</td></tr>
+    </table>
+
+    <h3>5. 温度翻倍需要多少步：一个可算的时间尺度</h3>
+    <p>把更新式写成连续近似，可以估算温度变化的时间尺度。设每一步的熵缺口 g = 𝔼[log π + H̄] 保持不变，n 次更新后 <code>log α</code> 累积变化 n·lr·g（g 为正表示熵低于目标、α 上升），α 变为 α<sub>0</sub>·e<sup>n·lr·g</sup>。代入 lr=3e-4 得到几组参考数字：g=1.5 时 α 翻倍约需 1540 次更新；g=0.5 时约 4621 次；g=0.1 时约 2.3 万次。课程脚本每 4000 步评估一次，因此只有当早期缺口接近 1 nat 时，第一个评估点附近才能看到 α 明显上探；缺口小的时候曲线看似"没有反应"属于正常现象，与自动调节是否失效无关。反过来核对单步幅度：g=1 时每次更新移动 3e-4，4000 步累计约 1.2 的对数变化，足以让 α 从 0.2 升到 0.66，与"前 4000 步上探到 0.3～0.6"的观测一致。</p>
+    <p>这段估算还给出两条调参直觉。<strong>（1）</strong>alpha_lr 放大 10 倍，所有时间尺度等比缩短，超调风险也等比放大：一旦 α 冲过平衡点，缺口符号翻转，下一阶段又朝反方向冲回去，在评估序列上表现为低频震荡。<strong>（2）</strong>目标熵设置偏离时，缺口永远不闭合，α 会一路漂到极端值；若日志里 α 长期单调爬升而回报没有改善，先核对目标熵的数量级（例如是否把 −1 误设成 2），再检查 alpha_lr 是否过大。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+
+    <h3>模块划分</h3>
+    <table>
+      <tr><th>组件</th><th>职责</th><th>关键点</th></tr>
+      <tr><td><code>ReplayBuffer</code></td><td>预分配的定长回放池，存 (s, a, r, s′, done)</td><td>done 只记真实终止；Pendulum 到 200 步是时间截断，仍要 bootstrap</td></tr>
+      <tr><td><code>GaussianPolicy</code></td><td>tanh 压缩高斯策略，<code>rsample()</code> 重参数化采样并做雅可比修正</td><td>动作乘 <code>act_scale</code> 映射到 [−2, 2]</td></tr>
+      <tr><td><code>SACAgent</code></td><td>双 Q + 目标网络 + 策略 + 温度系数，一步更新返回诊断量</td><td>alpha 分支是本章唯一的结构差异：auto 模式下 log_alpha 可学习、配独立优化器</td></tr>
+      <tr><td><code>train_mode()</code></td><td>单模式完整训练循环与日志</td><td>前 1000 步纯随机探索；每 4000 步评估一次</td></tr>
+      <tr><td><code>maybe_plot()</code></td><td>（可选）画评估回报与 alpha 轨迹</td><td>惰性导入 matplotlib，Agg 后端，只写文件</td></tr>
+    </table>
+
+    <h3>关键超参数</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用与取值理由</th></tr>
+      <tr><td><code>--mode</code></td><td>both</td><td>依次跑 fixed 与 auto，共用种子做对照</td></tr>
+      <tr><td><code>--alpha</code></td><td>0.2</td><td>fixed 模式的常数，同时是 auto 模式的初值（SAC 论文的常用起点）</td></tr>
+      <tr><td><code>--target-entropy</code></td><td>−1.0</td><td>目标熵，等于负的动作维度</td></tr>
+      <tr><td><code>--max-steps</code></td><td>20000</td><td>每种模式的步数预算；两模式合计 4 万步</td></tr>
+      <tr><td><code>--batch-size</code> / <code>--lr</code></td><td>256 / 3e-4</td><td>SAC 在连续控制上的稳妥起点</td></tr>
+      <tr><td><code>--tau</code> / <code>--gamma</code></td><td>0.005 / 0.99</td><td>软更新系数与折扣因子，第 031 章以来的默认值</td></tr>
+      <tr><td><code>--alpha-lr</code></td><td>3e-4</td><td>log_alpha 的学习率，与网络同量级即可</td></tr>
+    </table>
+
+    <h3>数据流</h3>
+    <p>每个模式：<strong>纯随机探索 1000 步垫池</strong> → 之后每步：策略采样动作 → 入回放 → <strong>一步 SAC 更新</strong>（评论家 → 演员 → [auto 模式] 温度 → 软更新）→ 每 4000 步做确定性评估并记录 <strong>alpha / 平均熵 / |Q|</strong> 三条诊断序列。训练结束保存各自的模型，最后打印对比汇总（含两条 alpha 轨迹）。</p>
+
+    <h3>与前一章的差异点</h3>
+    <ul>
+      <li>第 031 章的 alpha 是固定常数；本章把 <code>log_alpha</code> 提升为可学习变量，新增 <code>alpha_loss</code> 与独立优化器。</li>
+      <li>新增 <code>--mode</code> 控制变量框架：同一份训练代码跑两种 alpha 机制，输出可直接对比。</li>
+      <li>新增诊断量：每次评估时记录 alpha、平均熵、|Q|，用于解释"回报为什么变好/变差"。</li>
+      <li>主流程从"训练一次"变为"训练两种模式并打印对比汇总"。</li>
+    </ul>
+
+    <h3>诊断三件套：alpha / 熵 / |Q| 怎么读</h3>
+    <p>每次评估记录的三个量拼在一起是一份训练体检报告，单独看任何一个都容易被误导，配成组合才有诊断力：</p>
+    <table>
+      <tr><th>观察到的组合</th><th>含义</th><th>处置</th></tr>
+      <tr><td>回报停滞、熵高于目标、α 持续下降</td><td>探索仍过剩，价值还没被压到可收敛的程度</td><td>训练早期属正常形态；若持续到后半段，检查奖励尺度是否过小</td></tr>
+      <tr><td>回报停滞、熵低于目标、α 持续上升</td><td>策略过早确定，Q 估计卡住，温度在尝试补偿探索</td><td>观察 |Q| 是否同步停滞；必要时提高 alpha_lr 让补偿更快到位</td></tr>
+      <tr><td>回报改善、|Q| 异常放大</td><td>自举在放大价值，与温度机制无关</td><td>转入第 033、042 章的过估计检查（双 Q 与目标网络）</td></tr>
+      <tr><td>α 在相邻评估点之间大幅跳动</td><td>alpha_lr 过大，或目标熵与熵读数的量纲不匹配</td><td>先把 alpha_lr 降一个数量级，再核对目标熵设置</td></tr>
+    </table>
+    <p>用法可以归纳成一句话：<strong>回报决定训练好不好，熵与 α 的配合决定探索预算对不对，|Q| 决定价值估计有没有失控</strong>。三者交叉读，才能把归因落到具体组件上，避免笼统地归罪于超参数没调好。</p>
+
+    <div class="box key">
+      <span class="box-title">detach 的边界就是"谁在学习"的边界</span>
+      <p>温度损失里 <code>(logp + target_entropy).detach()</code> 是本章的地基：梯度只流向 <code>log_alpha</code>，策略不会"为了让温度好过"而被扭曲。反过来，策略损失里 <code>logp</code> 必须带梯度（策略靠它调整随机性），而 <code>current_alpha</code> 是标量、天然无梯度。三个损失的梯度归属理清楚了，这套代码就不会出现"两个参数互相带偏"的怪现象。验证方法也简单：在温度损失反向传播后用 <code>log_alpha.grad</code> 打印一次梯度，它应当等于 −(logp + H̄) 的均值，只与熵读数有关。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：alpha 分支，一个参数、两种模式</strong></p>
+    <pre class="code"><code>        # 自动模式下：log_alpha 是可学习参数，用独立优化器更新
+        if self.mode == "auto":
+            self.log_alpha = torch.tensor(math.log(alpha), requires_grad=True)
+            self.alpha_optimizer = torch.optim.Adam([self.log_alpha], lr=alpha_lr)
+
+    @property
+    def current_alpha(self) -&gt; float:
+        """对外统一暴露当前温度：auto 读 log_alpha，fixed 读常数。"""
+        if self.mode == "auto":
+            return float(self.log_alpha.exp().item())
+        return self.alpha</code></pre>
+    <p>解读：整个"自动温度"开关就藏在这十行里。<strong>（1）</strong>参数化用 <code>log_alpha</code>：<code>exp</code> 保证温度恒为正，而参数本身可以在整个实数轴上自由移动（负数、小数都合法），直接优化 alpha 会在接近零处出现"一步跨过负号"的灾难。<strong>（2）</strong>只给 <code>log_alpha</code> 建了一个单参数优化器：Adam 的动量只影响温度，不与其他网络混淆。<strong>（3）</strong><code>current_alpha</code> 作为 property 统一了两种模式对外的接口（fixed 返回常数），于是 TD 目标、策略损失、日志三处都写 <code>agent.current_alpha</code>，不需要任何 if。这是"把差异收进一个角落"的典型写法。</p>
+
+    <p><strong>片段 2：温度损失的梯度方向</strong></p>
+    <pre class="code"><code>        # ---------------- 2) 演员：最大化 Q - alpha * log pi ----------------
+        new_act, logp = self.policy.sample(obs)
+        q_new = torch.min(self.q1(obs, new_act), self.q2(obs, new_act))
+        policy_loss = (self.current_alpha * logp - q_new).mean()
+
+        self.policy_optimizer.zero_grad()
+        policy_loss.backward()
+        self.policy_optimizer.step()
+
+        # ---------------- 3) 温度系数：本章的核心差异 ----------------
+        alpha_loss_val = 0.0
+        if self.mode == "auto":
+            # logp 视为常数（detach），只把 log_alpha 往"熵缺口"方向推：
+            # 对 log_alpha 的梯度 = -(logp + H̄) 的均值；熵不足则抬升 α
+            alpha_loss = -(self.log_alpha * (logp + self.target_entropy).detach()).mean()
+            self.alpha_optimizer.zero_grad()
+            alpha_loss.backward()
+            self.alpha_optimizer.step()
+            alpha_loss_val = float(alpha_loss.item())</code></pre>
+    <p>解读：两段损失共用同一批前向的 <code>logp</code>，但梯度去向完全不同。<strong>（1）</strong>策略损失 <code>(α·logp − Q).mean()</code>：<code>logp</code> 带梯度（策略靠它调整分布的随机性），<code>current_alpha</code> 是不带梯度的标量（float），对策略来说它只是一个权重。<strong>（2）</strong>温度损失里 <code>(logp + H̄)</code> 整体 detach：把策略的当前熵状态当成"观测量"，梯度不会因此流回策略。梯度只剩 <code>−(logp + H̄)</code> 的均值，<strong>熵不足（logp 高于 H̄）时梯度为负，Adam 抬升 log α；熵过剩时压低</strong>。方向分析在这一行代码里完成闭合。<strong>（3）</strong>两段损失的顺序不能换：温度用的必须是与策略损失同一批 <code>logp</code>（同一时刻的熵读数），否则读数与决策错位。diagnostics 里的 <code>alpha_loss_val</code> 在 fixed 模式为 0，日志格式不需要分支。</p>
+
+    <p><strong>片段 3：评分子系统，采样与雅可比修正</strong></p>
+    <pre class="code"><code>    def sample(self, obs, deterministic=False):
+        """返回 (动作, log 概率)。确定性模式下只返回动作与 None。"""
+        mean, log_std = self.forward(obs)
+        if deterministic:
+            return torch.tanh(mean) * self.act_scale, None   # 评估用，无随机性
+        std = log_std.exp()
+        dist = torch.distributions.Normal(mean, std)
+        x = dist.rsample()                      # 重参数化：梯度可穿过采样
+        y = torch.tanh(x)
+        action = y * self.act_scale
+        # tanh 变换后的对数概率，减去雅可比修正项 log(1 - y^2)
+        log_prob = dist.log_prob(x) - torch.log(1.0 - y.pow(2) + 1e-6)
+        log_prob = log_prob.sum(dim=-1)         # 各动作维度求和成一个标量
+        return action, log_prob</code></pre>
+    <p>解读：<code>sample()</code> 是温度损失的数据源头，三个细节直接决定 alpha 学得对不对。<strong>（1）</strong><code>deterministic=True</code> 时返回 <code>tanh(mean)·scale</code>，评估走这条无噪路径，评估曲线才能反映"策略的真实水平"，不受采样噪声干扰。<strong>（2）</strong><code>rsample()</code> 让 <code>log_prob</code> 对 μ、σ 可导：温度损失要读它、策略损失也要读它。<strong>（3）</strong>雅可比项 <code>−log(1 − y² + 1e-6)</code>：tanh 压缩会改变密度的体积，缺了这项，<code>logp + H̄</code> 的"熵读数"整体失真，温度会朝着错误的目标追。<code>1e-6</code> 防止 y 饱和时 log(0)。</p>
+
+    <p><strong>片段 4：训练循环，两种模式共用同一条管道</strong></p>
+    <pre class="code"><code>    for step in range(1, args.max_steps + 1):
+        # 前 start_steps 步纯随机探索，先把回放池垫起来
+        if step &lt;= args.start_steps:
+            action = env.action_space.sample()
+        else:
+            action = agent.act(obs, deterministic=False)
+
+        next_obs, rew, terminated, truncated, _ = env.step(action)
+        buf.add(obs, action, rew, next_obs, float(terminated))   # 只记真终止
+        obs = next_obs
+        ep_ret += rew
+
+        if terminated or truncated:
+            ep_returns.append(ep_ret)
+            ep_ret = 0.0
+            obs, _ = env.reset()
+
+        if buf.size &gt;= args.batch_size:
+            last_stats = agent.update(buf.sample(args.batch_size))  # 每步一次更新
+
+        if step % args.eval_every == 0 or step == args.max_steps:
+            eval_ret = evaluate(eval_env, agent, args.eval_episodes)
+            history["eval_return"].append(eval_ret)
+            history["alpha"].append(agent.current_alpha)   # alpha 轨迹也是产出</code></pre>
+    <p>解读：fixed 与 auto 共用的主循环，公平对比的载体就在这里。<strong>（1）</strong>前 <code>start_steps</code> 步纯随机：两种模式看到的是同一批填充数据，alpha 的差异不可能来自"初始经验不同"。<strong>（2）</strong><code>buf.add(..., float(terminated))</code> 再次强调终止语义；Pendulum 的 200 步上限是截断，这些样本照常 bootstrap。<strong>（3）</strong><code>agent.update()</code> 内部通过 <code>self.mode</code> 分派行为，循环本身零分支，要做差异实验时，改动被约束在 <code>SACAgent</code> 内部，循环统计口径永远一致。<strong>（4）</strong><code>history["alpha"]</code> 每 4000 步记一次 <code>agent.current_alpha</code>：对 auto 而言这是学习出来的轨迹，对 fixed 则是常数参照线，两条线叠在一起，才能看出"自动调节到底干了什么"。</p>
+
+    <p>完整可运行脚本（附录）：<a href="../code/ch032.py" download>code/ch032.py</a></p>
+    <pre class="sh"><code>python code/ch032.py           # fixed 与 auto 依次训练：CPU 约 4–8 分钟
+python code/ch032.py --quick   # 快速跑通：约 1 分钟
+python code/ch032.py --mode auto --max-steps 40000   # 只跑自动模式</code></pre>
+    <p>以实跑为准：两种模式最终评估都在 <strong>−300 ~ −150</strong> 附近；auto 的 alpha 轨迹通常<strong>先升后降/稳</strong>（前 4000 步熵缺口大、α 上探 0.3～0.6，后期回落到 0.2 附近）。<code>--target-entropy</code> 越低，α 稳态越低；一路飙到 2 以上降不下来，多半是目标熵设得过高。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>忘记 detach 温度损失里的 logp</strong>：<code>(logp + target_entropy)</code> 若参与反传，alpha 的梯度会顺着 <code>log_alpha</code> 一路污染策略参数，策略会被"为了让 alpha 好过"而扭曲。<strong>修复</strong>：必须 <code>.detach()</code>。</li>
+      <li><strong>直接用 alpha 当参数</strong>：直接优化 alpha 无法保证非负，一步更新就可能把它推成负数，熵奖励符号翻转。<strong>修复</strong>：参数化 <code>alpha = exp(log_alpha)</code>。</li>
+      <li><strong>把 auto 模式的初值当成"随便"</strong>：初值太极端（如 1e-3）时早期熵缺口巨大，log_alpha 需要很多步才爬上来，白白浪费样本。<strong>修复</strong>：0.1～0.2 起步。</li>
+      <li><strong>对比实验没有共享种子</strong>：固定与自动模式若各自随机初始化，差异里混入初始化噪声，无法归因。<strong>修复</strong>：每个模式开头重新 <code>set_seed(args.seed)</code>。</li>
+      <li><strong>策略损失里的 alpha 带了梯度</strong>：若用未 detach 的 <code>log_alpha.exp()</code> 乘 <code>logp</code>，策略梯度里会混入温度路径。<strong>修复</strong>：策略损失用 <code>current_alpha</code> 标量缓存。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把 <code>--target-entropy</code> 分别改成 <code>-3</code> 和 <code>-0.2</code>，各跑一次 auto 模式。解释 alpha 轨迹与最终熵为什么朝相反方向变化。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>目标熵越低，需要保留的随机性越小，alpha 应该越小。只看日志中的 alpha 与熵两列，10 次评估点足够看出方向。</div></details>
+      </li>
+      <li>把 fixed 模式的 <code>--alpha</code> 改成 0.02 和 1.0 各跑一次，找出"太小"和"太大"各自的失败形态（回报卡住 / 熵压不下来）。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>alpha=0.02 时策略很早变确定，Pendulum 容易卡在 −800 以上；alpha=1.0 时策略过于随机，Q 学不动。对比评估回报与熵列。</div></details>
+      </li>
+      <li>把 <code>--alpha-lr</code> 从 3e-4 改成 3e-3，观察 alpha 轨迹的抖动。这个实验说明 log_alpha 的学习率主要影响什么？<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>学习率大 → alpha 追缺口的步子大 → 轨迹震荡甚至超调。关注相邻两次评估之间 alpha 的变化幅度；终值不是重点。</div></details>
+      </li>
+      <li>修改 <code>update()</code>，在 auto 模式下把 <code>target_entropy</code> 也随训练时间线性降低（例如从 0 降到 −2）。跑训练并解释这与第 041 章"熵系数调度"的关系。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>在 <code>SACAgent</code> 里加一个 <code>set_target_entropy()</code> 方法，训练循环里按步数比例调用。这里改的是 alpha 追踪的目标，alpha 参数本身不动。</div></details>
+      </li>
+      <li>把评估频率从 4000 步改成 1000 步，画出更密的 alpha 曲线，观察它在两次评估之间是否单调。把曲线与 <code>alpha_loss_val</code> 的符号对照，验证"损失为正时 α 在下降"的推论。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>只改 <code>--eval-every</code>，评估本身耗时很小。alpha_loss 为负意味着 (logp + H̄) 均值为正，即熵低于目标、α 正在被抬升。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>自动温度调节把 alpha 从超参数变成可学习量：损失 <code>−log_alpha·(logp + H̄)</code> 的梯度指向"缩小熵缺口"的方向。</li>
+      <li>关键实现细节有三个：参数用 log_alpha、logp 要 detach、目标熵取负的动作维度。三者缺一，温度就会朝错误方向漂移。</li>
+      <li>在 Pendulum-v1 上，auto 模式的 alpha 典型轨迹是"先升后稳/降"，最终评估回报与手调的 0.2 相当，但不需要人工搜索。</li>
+      <li>诊断三件套 alpha / 熵 / |Q| 能解释大多数"回报不动"的原因：熵压不下来看 alpha 上界，Q 学不起来看 alpha 下界。</li>
+      <li>替代损失的梯度 H − H̄ 与对偶问题的梯度一致，因此"按熵缺口调 α"既有直观解释，也有约束优化的依据；替代损失只是把这个梯度做成了一行可求导的表达式。</li>
+      <li>下一章拆开 SAC 的两个稳定器：双 Q 网络与目标网络，用单 Q、无目标网络的消融实验看清它们各自防住了什么，并解释为什么这两个组件无法用调参替代。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch031.html">← 第 031 章：SAC在Pendulum上的首次实现</a>
+    <a class="next" href="ch033.html">第 033 章：SAC的双Q网络与目标网络 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

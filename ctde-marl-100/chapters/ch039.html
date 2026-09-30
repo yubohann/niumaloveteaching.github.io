@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第039章 异步更新与同步更新对比 | 多智能体强化学习课程 · CTDE 框架与协同算法</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 训练工程与稳定性</span>
+    <span class="sep">/</span>
+    <span>第 039 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 训练工程与稳定性</div>
+    <h1>第 039 章：异步更新与同步更新对比</h1>
+    <p class="lead">本章讲更新时序的两类方案：同步批次更新与异步流水更新。讨论策略版本偏离度、截断重要性修正（V-trace）、半同步等待因子、更新与数据比，以及多智能体非平稳性与滞后叠加的后果。</p>
+    <ul class="meta">
+      <li>主题：更新语义 / 滞后与修正</li>
+      <li>关键公式：ρ<sub>t</sub> = min(ρ̄, π(a<sub>t</sub>|s<sub>t</sub>) / μ(a<sub>t</sub>|s<sub>t</sub>))</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 038 章 分布式训练与并行采样</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解同步与异步更新在数据构成与优化过程上的语义差异，能写出两者的训练循环流程。</li>
+      <li>掌握异步更新中策略版本偏离度的来源与度量，理解截断重要性修正的动机与形式。</li>
+      <li>掌握半同步更新的等待因子设计，理解其在吞吐与一致性之间的连续调节作用。</li>
+      <li>理解多智能体场景下滞后与队友漂移双重叠加的效应，能评估对同策略与离策略算法的影响差异。</li>
+      <li>能按更新与数据比对齐不同架构的对照实验，避免架构对比中的配置漂移。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 038 章建立了并行采样架构，留下的问题是更新如何消费这些数据。同步更新在固定的数据批次上执行优化，数据与参数版本严格对应；异步更新让学习器持续消费到达的数据，数据可能由若干个更新步之前的策略产生。两者的差异无法简单归结为吞吐与正确性的取舍：异步释放了等待时间，代价是优化目标偏离当前策略的真实梯度方向，偏离程度需要修正或管理。</p>
+    <p>多智能体训练对这个问题的敏感度更高。队友策略持续更新（第 032 章）已经让数据分布随时间漂移，版本滞后在时间轴上再叠加一层偏离：一批数据不仅由旧版本的自身策略产生，也记录着旧版本队友的行为。学习器用当前参数去拟合旧行为下的联合回报，误差随滞后时间与队友漂移速度共同增长。本章把偏离度、修正手段与选择判据整理成可操作的设计框架。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 同步与异步的语义差异</h3>
+    <p>两种循环的结构对比：</p>
+    <div class="formula">
+      同步：采集固定步数 B → 等待全部完成 → 用同一批数据执行若干次更新 → 广播权重 → 重复
+      <span class="note">数据与参数版本严格对应，批内版本一致</span>
+    </div>
+    <div class="formula">
+      异步：演员持续采集并推送 → 学习器持续取用并更新 → 权重周期性广播
+      <span class="note">数据版本散布在一个区间内，学习器不等待任何特定数据</span>
+    </div>
+    <p>同步循环的等待发生在&quot;最慢演员&quot;处：吞吐受短板制约，且随着演员数量增加，长尾延迟让等待比例上升。异步循环消除等待，但引入了策略版本偏离。管理偏离的量化起点是滞后度：</p>
+    <div class="formula">
+      滞后度 τ = 当前学习器版本号 − 数据产生时的策略版本号
+      <span class="note">沿队列统计 τ 的分布（均值与 95 分位）；τ = 0 表示数据与当前策略版本一致</span>
+    </div>
+    <p><strong>τ 的分布比均值更重要：平均滞后很小的队列里可能存在少量长期滞留的批次，它们对损失的贡献权重固定，反复扭曲梯度方向。工程上以 τ 的 95 分位作为新鲜度指标。</strong></p>
+    <p>滞后分布的尾部为什么是重点：全队列平均滞后 2 个版本、95 分位为 8 个版本时，长期滞留的少数批次以接近固定的权重反复参与更新，梯度方向的系统性偏移由这部分样本决定。监控面板把 τ 的均值与 95 分位并列展示，均值正常而分位异常时优先排查演员的延迟分布与背压配置。</p>
+
+    <h3>2. 截断重要性修正</h3>
+    <p>同策略算法在异步数据上需要修正旧行为策略与新目标策略的分布差。V-trace 形式给出两条规则：截断的单步比率与累积乘积：</p>
+    <div class="formula">
+      ρ<sub>t</sub> = min(ρ̄, π(a<sub>t</sub> | s<sub>t</sub>) / μ(a<sub>t</sub> | s<sub>t</sub>))；c<sub>t</sub> = min(c̄, π(a<sub>t</sub> | s<sub>t</sub>) / μ(a<sub>t</sub> | s<sub>t</sub>))
+      <span class="note">π 为学习器当前策略，μ 为产生数据的行为策略；ρ̄、c̄ 为截断上界（常取 1.0 与略大值）</span>
+    </div>
+    <p>直观解释：比率大于 1 表示当前策略比行为策略更倾向该动作，截断把放大效应限制在上界内；比率小于 1 的收缩不截断，保留对低估的修正。累积乘积 c 控制多步回报中偏差的传播半径。截断参数与同策略裁剪（第 027 章）可以并列理解：裁剪限制单步更新幅度，截断限制旧数据的影响力，两者都用部分理论正确性换取方差控制；区别在作用对象，裁剪作用于损失对当前批数据的方向，截断作用于数据分布对目标的权重。两者并用时，诊断常用判据是裁剪触发率与滞后分位是否同步变化，同步抬升说明两个机制都在响应同一批陈旧数据。<strong>截断引入偏差换取方差控制，这是与第 023 章重要性采样修正相同的权衡结构，区别在于对象从&quot;采样优先级&quot;变为&quot;时序步&quot;。</strong>离策略自举算法（Q 学习类）对分布差不要求显式修正，但目标值的自举仍会受旧行为影响，通常用目标网络与较小更新率吸收（第 024 章）。</p>
+
+    <h3>3. 半同步与等待因子</h3>
+    <p>两端之间存在连续调节：半同步更新等待 N 个演员中的 K 个，用已到达的数据执行更新，不等待其余演员。等待因子 λ = K / N 取值从同步（λ = 1）到异步（λ 趋向 0）连续变化，滞后分布随 λ 单调放宽。</p>
+    <table>
+      <tr><th>方案</th><th>等待行为</th><th>滞后分布</th><th>适用条件</th></tr>
+      <tr><td>完全同步</td><td>等待全部演员</td><td>恒为零</td><td>同策略算法、小规模、延迟稳定</td></tr>
+      <tr><td>半同步</td><td>等待 K 个先到者</td><td>窄分布，尾部受控</td><td>需要吞吐但容忍轻度偏离</td></tr>
+      <tr><td>完全异步</td><td>不等待</td><td>宽分布，需上限管理</td><td>离策略算法、异构硬件、长尾延迟严重</td></tr>
+    </table>
+    <p>多智能体场景还有一条偏向同步的论据：参数共享结构下全体智能体共享策略，同步更新保证&quot;队友版本&quot;与&quot;自身版本&quot;严格一致；异步更新中一次广播前的所有数据记录的是旧队友，学习器离线拟合自身的同时也被迫拟合队友的历史行为，双重偏离使有效修正更复杂。<strong>因此多智能体同策略算法的默认选择是同步或小滞后半同步；异步主要留给离策略算法与对吞吐极敏感的系统。</strong></p>
+    <p>半同步的工程实现需要注意读取语义：先到者判定基于带超时的通道读取，超时后回退到已就绪集合，避免阻塞等待指定演员；否则一个挂起的演员会把整个调度器卡死。等待因子的取值按硬件延迟分布标定，同构集群取 0.6 到 0.8，异构集群按最慢档的延迟决定，必要时改为批次就绪即更新的加权半同步。</p>
+
+    <h3>4. 更新与数据比</h3>
+    <p>架构对比实验中最容易被忽视的控制变量是更新与数据比（Update-to-Data Ratio, 也叫回放比）：单位环境步的数据被优化器消费的次数。定义与计算：</p>
+    <div class="formula">
+      更新与数据比 = 优化步数 × 批大小 / 环境步数
+      <span class="note">正文报告为无量纲比值；同步方案中由配置直接决定，异步方案中随吞吐与优化频率漂移</span>
+    </div>
+    <p><strong>比较同步与异步配置时必须对齐该比值：异步系统的优化吞吐更高，若不相应减少优化频率，同一批数据会被消费更多次，收益上的差距可能来自&quot;训练更充分&quot;，与&quot;数据更新鲜&quot;的贡献无法区分。</strong>第 040 章讨论样本效率时会再次用到这个量，两者口径约定保持一致。</p>
+
+    <h3>5. 数值算例：等待因子、截断权重与比值对齐</h3>
+    <p>用指数分布刻画演员延迟可以核算等待成本：设 8 个演员的单批延迟服从均值 1 的指数分布，完全同步要等最慢者，其均值等于调和级数 H<sub>8</sub> ≈ 2.72；等待因子 0.75 时只等前 6 个到达，第 6 个次序统计量的均值约 1.22；因子 0.5 时等前 4 个，约 0.64；完全异步取第 1 个到达，约 0.125。<strong>等待因子从 1 降到 0.75，等待时间减少约五成，跳过的只是两个最慢的采集者；继续降低因子的收益递减，同时滞后分布变宽，吞吐与一致性的交换曲线由此得到刻度。</strong>指数分布是延迟的理想模型，真实系统长尾更重，各档等待成本的差距还会更大。</p>
+    <p>V-trace 的截断效果用两个比率核对：当前策略对某动作的比率 ρ = 1.5 而截断上界 ρ̄ = 1.0 时，权重被压到 1.0，0.5 的放大部分被放弃；比率 ρ = 0.6 时整个值保留，收缩方向不截断。<strong>截断只切右侧尾部，偏差来自被放弃的那部分放大，方差收益来自避免个别大比率样本主导梯度。</strong>累积系数的传播范围用短序列示意：单步截断系数 c = (0.8, 1.0, 0.5) 时，前向累积得 cs = (c<sub>1</sub>c<sub>2</sub>, c<sub>2</sub>, 1) = (0.5, 0.5, 1.0)，第 1 步之外的偏差在向后传播时被 0.5 的总折扣限制。</p>
+    <p>更新与数据比的对齐用一次换算说明：某同步配置的环境吞吐为每秒 12800 步、批大小为 256，按比值 1.0 得到每秒 50 次优化；异步架构测得吞吐为 1.2 倍，不限速时每秒约 60 次优化，等效比值 1.2。<strong>把优化频率压回每秒 50 次之后再比较两种架构的回报曲线，结论才能归因到数据新鲜度与更新语义。</strong>实验档案记录限速后的实际比值，与目标值偏离超过一成时触发复核。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>更新调度器统一管理三种模式的实现：同步模式直接以批次为单位循环；异步模式以队列门槛与滞后上限管理消费节奏；半同步模式在两者之间按等待因子参数化，三种模式共享采集与学习两侧的代码路径。</p>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>更新模式</td><td>同步</td><td>调度语义</td><td>同策略多智能体任务的默认；离策略可选异步</td></tr>
+      <tr><td>等待因子 λ</td><td>0.75</td><td>半同步等待比例</td><td>吞吐优先下调，稳定性优先上调</td></tr>
+      <tr><td>滞后上限 τ<sub>max</sub></td><td>4 个版本</td><td>数据新鲜度门槛</td><td>与广播频率联动：广播越稀，上限越小</td></tr>
+      <tr><td>截断上界 ρ̄</td><td>1.0</td><td>V-trace 单步比率上限</td><td>文献惯例；偏离重时下调减小方差</td></tr>
+      <tr><td>累积截断 c̄</td><td>1.0 到 1.2</td><td>多步传播半径</td><td>任务回合越长取值越保守</td></tr>
+      <tr><td>更新与数据比</td><td>1.0</td><td>实验对照控制量</td><td>架构对比时必须对齐并写入实验档案</td></tr>
+    </table>
+    <p>与第 038 章的衔接点：本章的滞后管理直接消费第 038 章的版本标记字段；有界队列的容量参数与滞后上限 τ<sub>max</sub> 联动设置，容量过大时先压缩队列再调 τ<sub>max</sub>。</p>
+    <p>模式切换的成本应当接近零：调度器在初始化时选择等待策略，训练中途不切换；需要对比时用配置区分运行实例，让每个实例的模式在全过程中保持固定。中途切换引入的策略行为变化会污染对照曲线，这一纪律与第 036 章的单变量对照原则一致。同一次实验中的广播频率也应固定，滞后统计在两种频率之间没有可比性。</p>
+    <p>等待因子与广播频率的标定顺序是先固定一个再调另一个：滞后分位长期贴住上限时先调等待因子，回报曲线抖动而滞后正常时再调广播频率；两个参数同时调整会让诊断失去参照，也无法把行为变化归因到具体机制；复测保持同一档位组合，结论才有累积性。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：同步与半同步的最小调度器</strong></p>
+    <pre class="code"><code>class SyncScheduler:
+    """三种更新模式的统一入口：wait 参数决定等待策略。"""
+    def __init__(self, mode="sync", wait_factor=0.75):
+        self.mode = mode
+        self.wait_factor = wait_factor            # 半同步模式生效
+
+    def collect_batch(self, actors):
+        """从演员集合取一批数据，返回 (batch, 版本区间)。"""
+        if self.mode == "sync":
+            batches = [a.get_batch() for a in actors]      # 等待全部到位
+        elif self.mode == "semisync":
+            # 只等待先到达的 K 个演员：K 取 ceil(wait_factor * N)
+            k = max(1, int(len(actors) * self.wait_factor + 0.5))
+            batches = self._first_k(actors, k)
+        else:
+            batches = [actors[0].get_batch()]              # 异步：不等待
+        versions = [b["policy_version"] for b in batches]
+        return batches, (min(versions), max(versions))
+
+    def _first_k(self, actors, k):
+        """等待前 k 个到达的数据；生产者各自的队列只会在就绪时返回。"""
+        return [a.get_batch() for a in actors[:k]]</code></pre>
+    <p>解读：<strong>三种模式共用一条数据出口，唯一的差异是等待范围，这让模式切换停留在配置层，代码路径无需分叉。</strong>返回的版本区间进入监控：区间宽度是滞后度的直接观测，半同步下若区间长期超过 τ<sub>max</sub>，说明等待因子偏低需要上调。<code>_first_k</code> 的写法是示意性的（真实实现用带超时的通道读取先到者），接口语义保持&quot;取回就绪数据、未就绪则等待&quot;一致。同步模式下版本区间理论上退化为单点，可加断言验证。</p>
+
+    <p><strong>片段 2：V-trace 截断权重</strong></p>
+    <pre class="code"><code>import torch
+
+def v_trace_weights(logp_behavior, logp_target, rho_bar=1.0, c_bar=1.0):
+    """按轨迹计算截断比率与累积系数，供多步回报修正使用。"""
+    ratio = torch.exp(logp_target - logp_behavior)     # 单步重要性比率
+    rho = torch.minimum(ratio, torch.tensor(rho_bar))  # 上截断：放大受限
+    c = torch.minimum(ratio, torch.tensor(c_bar))      # 累积截断：传播受限
+    # 累积乘积 cs[:, t] = c_t * c_{t+1} * ... * c_{T-1}：
+    # 给出第 t 步之外偏差向后传播时的总折扣，范围越大越保守
+    T = ratio.shape[1]
+    cs = torch.ones_like(c)
+    for t in range(T - 2, -1, -1):
+        cs[:, t] = cs[:, t + 1] * c[:, t + 1]
+    return rho, cs
+
+def v_trace_value_loss(values, rewards, gamma, rho, cs):
+    """截断修正的多步价值目标：偏差与方差的受控折中。"""
+    T = rewards.shape[1]
+    targets = torch.zeros_like(rewards)
+    acc = values[:, -1]                                # 末步价值作为自举起点
+    for t in reversed(range(T)):
+        # 反向累积：v_t = r_t + gamma * (c_t * (rho 修正的 td) + 余项)
+        delta = rho[:, t] * (rewards[:, t] + gamma * values[:, t + 1] - values[:, t])
+        targets[:, t] = values[:, t] + delta + gamma * cs[:, t] * (acc - values[:, t + 1])
+        acc = targets[:, t]
+    return targets</code></pre>
+    <p>解读：<strong>两个截断参数分工明确：<code>rho_bar</code> 限制单步比率的上传放大，<code>c_bar</code> 限制偏差沿时间传播的范围；比率小于 1 的收缩方向不截断，保留对低估的修正。</strong>反向累积循环按回合维度组织，与第 023 章的回合式缓冲结构对齐；逐步累乘的显式写法便于调试，生产实现可用对数域累加替代以避免下溢。该损失与第 024 章的目标网络正交：前者修正新旧分布差，后者平滑自举目标，异步同策略系统通常两者并用。</p>
+
+    <p><strong>片段 3：更新与数据比的对照控制</strong></p>
+    <pre class="code"><code>def align_update_ratio(arch, target_ratio=1.0):
+    """按目标更新与数据比反推优化频率：跨架构对照的控制手段。"""
+    # 环境步吞吐量由架构决定（第 038 章测量）
+    steps_per_sec = arch.measured_steps_per_sec
+    batch_size = arch.batch_size
+    # 优化步频率 = 目标比值 * 环境步率 / 批大小
+    updates_per_sec = target_ratio * steps_per_sec / batch_size
+    arch.set_optimizer_rate(updates_per_sec)
+    # 返回实际比值预估，供实验档案记录：仅记录目标值不足以反映真实情况
+    return updates_per_sec * batch_size / steps_per_sec</code></pre>
+    <p>解读：<strong>该函数把&quot;架构吞吐差异&quot;翻译成&quot;优化频率差异&quot;，让两种架构在同一更新与数据比下比较。</strong>函数回传的是实际值：异步系统中的限速设置总有误差，实验档案记录实际比值，报告时以实际值为准。与之配套的监控项是优化队列的积压长度，积压持续增长说明优化跟不上采集，比值被系统强制压低，此时要么提高更新频率要么降低采集速率，不能放任两种资源竞争。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>异步数据上直接用同策略目标。</strong>策略比率失真的同时梯度方向被旧分布主导。症状是策略熵异常、回报振荡。修复：引入截断重要性修正，或退回半同步。</li>
+      <li><strong>滞后无上限。</strong>个别批次长期滞留队列，反复以固定权重参与更新。修复：τ<sub>max</sub> 门槛与队列容量联动，超限数据丢弃并记录比例。</li>
+      <li><strong>半同步等待因子设为 1。</strong>等价于完全同步，失去吞吐收益且在长尾延迟下等待放大。修复：按硬件延迟分布选 0.6 到 0.8 的等待因子。</li>
+      <li><strong>架构对比未对齐更新与数据比。</strong>异步系统的收益被&quot;多消费数据&quot;混淆。修复：按片段 3 对齐并记录实际比值。</li>
+      <li><strong>版本一致性边界。</strong>独立策略架构下各智能体副本刷新时点不同，联合数据来自多个版本组合；评测进程读取的策略状态不确定。修复：刷新做成单次原子广播；评测固定读取指定版本快照。</li>
+          </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>推导：设单步比率 ρ 的对数服从均值 m、方差 s² 的正态分布，写出截断 min(ρ̄, ρ) 引入的偏差与方差表达式方向，并说明 ρ̄ 增大时两者的变化。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>截断切掉右侧尾部：ρ̄ 增大时偏差减小、方差回升；极端大比率（方差大）场景宁可保留偏保守的截断。</div></details>
+      </li>
+      <li>改参数预测：把等待因子从 0.75 降到 0.25，预测滞后度 95 分位、吞吐率与训练回报曲线三个量的变化方向。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>滞后分位显著上升，吞吐提高；同策略算法下回报曲线更抖或走低，离策略算法下差异小。</div></details>
+      </li>
+      <li>设计：为一个 8 演员、参数共享的多智能体任务选择更新模式并给出参数（等待因子、广播频率、滞后上限），说明为什么不采用完全异步。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>共享参数下同步或高等待因子半同步即可满足吞吐；完全异步让数据同时记录旧自身与旧队友行为，双重偏离的修正成本高于收益。</div></details>
+      </li>
+      <li>实验设计：在相同更新与数据比与相同种子集合下比较同步、半同步、异步三种模式的回报曲线与吞吐，给出三种模式下&quot;是否值得异步&quot;的定量结论模板。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>报告每组：吞吐（步/秒）、达到固定回报的环境步数、达到同回报的墙钟时间；异步的墙钟优势与回报劣势同时呈现。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>同步与异步的本质差异在数据与参数版本的对应关系；异步的代价是滞后度分布，需以 95 分位指标管理。</li>
+      <li>截断重要性修正用上传受限、收缩不截断的规则控制分布差，与目标网络在稳定化上正交配合。</li>
+      <li>半同步以等待因子在吞吐与一致性之间连续调节；多智能体同策略任务默认同步或高等待因子半同步。</li>
+      <li>更新与数据比是架构对比的必控变量；实验档案记录实际比值与优化队列积压。</li>
+      <li>下一页收束第二篇：<strong>经验共享如何组织跨智能体、跨环境的数据复用，把样本效率推到算法相位的极限</strong>。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch038.html">← 第 038 章：分布式训练与并行采样</a>
+    <a class="next" href="ch040.html">第 040 章：经验共享与样本效率 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第013章 PPO的循环神经网络策略 | 深度强化学习课程 · PPO、SAC 与多智能体系统</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · 策略梯度与 PPO</span>
+    <span class="sep">/</span>
+    <span>第 013 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · 策略梯度与 PPO</div>
+    <h1>第 013 章：PPO的循环神经网络策略</h1>
+    <p class="lead">自建一个"线索只在起点可见"的 T 型迷宫：MLP 策略上限 50%，GRU 策略把线索带进隐状态。用整段回合重放 + padding/mask 的标准做法，把循环 PPO 的工程细节一次写对。</p>
+    <ul class="meta">
+      <li>主题：部分可观测 / 循环策略</li>
+      <li>关键公式：h<sub>t</sub> = GRU(o<sub>t</sub>, h<sub>t−1</sub>)；π(a<sub>t</sub>|o<sub>1:t</sub>) 依赖整段历史</li>
+      <li>预计学时：65 分钟</li>
+      <li>前置章节：第 012 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解部分可观测（POMDP）下"当前观测不充分"的含义，以及为什么 MLP 会在记忆任务上撞到性能上限。</li>
+      <li>实现 GRUCell 循环 Actor-Critic：采样时逐状态前向、回合边界重置隐状态。</li>
+      <li>实现带 padding/mask 的定长序列批次，更新时按整段回合重放并只在有效时间步计算损失。</li>
+      <li>在 CueTMaze 上对比 MLP 与 GRU：MLP ≈ 0.5、GRU 通常 &gt; 0.9，理解差距的来源。</li>
+      <li>掌握循环 PPO 的三个工程要点：序列边界、mask、以及为什么不逐帧混淆样本。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>前面的所有策略都建立在马尔可夫假设上：观测就是决策所需的全部信息。但真实任务经常违反它，股票交易看不到全部持仓历史、导航没有地图、对话机器人只拿到当前一句话。这类任务叫<strong>部分可观测马尔可夫决策过程（Partially Observable MDP, POMDP）</strong>，观测背后还有隐藏状态，而最优动作往往依赖历史。</p>
+    <p>循环神经网络（Recurrent Neural Network, RNN）是处理这类问题的标准工具：把每一步观测喂进 GRU/LSTM，隐状态逐渐积累历史信息，策略从这个"记忆"里读数。<strong>难点不在网络定义，而在训练管线</strong>：回合边界必须重置隐状态、批处理必须按序列回放、padding 不能计入损失。本章用 4 步 T 型迷宫把这个闭环完整写出来，任务预算只有 2 万回合，但所有真实 POMDP 问题需要的结构都在。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. POMDP 与"信息集"</h3>
+    <p>POMDP 里环境状态 s<sub>t</sub> 不可见，策略只能看到观测 o<sub>t</sub> ~ O(o|s)。决策的依据实际上是<strong>观测历史</strong>的压缩：</p>
+    <div class="formula">
+      π(a<sub>t</sub> | o<sub>1:t</sub>)　（决策依据是观测历史；π(a<sub>t</sub> | o<sub>t</sub>) 只是它的特例）
+    </div>
+    <p>本环境中线索 c 只在第 0 步可见，第 3 步做决定。MLP 在第 3 步看到 [1.0, 0]，与线索无关，最优策略只能在两个方向里固定选一个，成功率 50%。GRU 把 c 写进隐状态，第 3 步的决策可以依赖 o<sub>1:4</sub>。</p>
+    <p>更形式化地说，决策的真实依据是<strong>信念状态</strong> b<sub>t</sub>(s) = P(s<sub>t</sub>=s | o<sub>1:t</sub>, a<sub>1:t−1</sub>)：对历史的条件分布。最优策略是信念的函数，RNN 的隐状态就是信念的学习式压缩；无记忆策略的信息集只有当前观测，当观测里不含线索时，它对"该往哪边走"的后验始终是 50/50，任何动作选择都无法改进期望得分。</p>
+
+    <div class="box key">
+      <span class="box-title">数值算例：0.5 上限的推导与诊断窗口的噪声</span>
+      <p>第 3 步的观测对两种线索完全相同（都是 [1.0, 0]），确定性策略必须对两种线索选同一个动作：选动作 1 时只在 cue=+1 的回合正确，选动作 0 时只在 cue=−1 的回合正确，两种线索各占 50%，所以成功率上限 = 0.5×1 + 0.5×0 = 0.5。随机策略也无法超过它：以概率 p 选动作 1 时正确率是 0.5p + 0.5(1−p) = 0.5，与 p 无关。这条推导给出清晰判据：在学习正常但天生无记忆的策略上，成功率必然收敛到 0.5，不会更高也不会更低。</p>
+      <p>再看窗口噪声：500 回合窗口的成功率近似二项比例，标准误为 √(p(1−p)/500)。p=0.5 时是 0.022（2.2 个百分点），p=0.90 时是 0.013。0.5 与 0.9 的差距约 18 个标准误，"GRU 是否真的利用线索"的判断绰绰有余；但 0.89 与 0.90 这样的细差在单个窗口下无法分辨（不足 1 个标准误）。若要以 0.01 的分辨率比较两条曲线，窗口需要约 3600 回合：n = p(1−p)/SE² = 0.09/0.005²。两个数字一起用：大窗口负责排除粗差，重复种子负责收窄细差。</p>
+    </div>
+
+    <h3>2. 用 RNN 表示记忆</h3>
+    <p>GRU 的更新是：</p>
+    <div class="formula">
+      h<sub>t</sub> = GRU(o<sub>t</sub>, h<sub>t−1</sub>)，　π(a<sub>t</sub>|·) = softmax(W<sub>a</sub> h<sub>t</sub>)，　V<sub>t</sub> = w<sub>v</sub><sup>⊤</sup>h<sub>t</sub>
+      <span class="note">h：隐状态；W<sub>a</sub>、w<sub>v</sub>：策略头与价值头的参数</span>
+    </div>
+    <p>PPO 的比率要求"同一段历史下两次评估"：采样时隐藏状态从回合起点逐步累积，更新时必须<strong>从同一个初始状态出发、按同一顺序重放整段序列</strong>。因为采样用零初始状态（每个回合重置），更新时也从头重放即可，这是最容易写错的地方：如果把一批转移打乱成 minibatch、每步独立前向，记忆结构就没了，训练退化成无记忆策略。</p>
+
+    <div class="box key">
+      <span class="box-title">数值算例：终局奖励如何回传到序列起点</span>
+      <p>取一个 4 步回合，奖励序列 [0, 0, 0, 1]（只有第 3 步得分），价值网络在四个时刻都输出 V=0.5，γ=0.99、λ=0.95。从后往前算：δ<sub>3</sub> = 1 − 0.5 = 0.5（终止步，不做 bootstrap）；前三个时刻 δ = 0 + 0.99×0.5 − 0.5 = −0.005（价值高估 0.5，每步扣一点）。向后递推得到优势 [0.402, 0.433, 0.465, 0.500]。</p>
+      <p>逐项读：终局奖励的好消息以 γλ=0.9405 每步衰减，到达第 0 步只剩 0.5×0.9405<sup>3</sup> ≈ 0.416；再把三处价值高估的 −0.005 项累计扣除约 0.014，得到 0.402。这段计算解释三件事：信用沿序列按 γλ 衰减；价值误差也沿序列累积；第 0 步的优势只能通过完整的隐状态链条拿到。逐帧打乱批次时第 0 步拿不到任何终局信息，记忆层因此永远学不到"线索与决策"的关联。</p>
+    </div>
+
+    <h3>3. 定长序列批处理：padding + mask</h3>
+    <p>把每个回合当作一条序列，批次形状 (B, L, D)。回合长度不等时垫到最大长度 L，并生成 mask（有效步为 1）。损失只在有效步上求平均：</p>
+    <div class="formula">
+      L<sup>CLIP</sup> = Σ<sub>t</sub> m<sub>t</sub>·min(r<sub>t</sub>Â<sub>t</sub>, clip(r<sub>t</sub>)Â<sub>t</sub>) / Σ<sub>t</sub> m<sub>t</sub>
+      <span class="note">本环境所有回合都是 4 步，padding 实际上不触发，但写法保持通用</span>
+    </div>
+    <p>本实现一次性重放整个回合（4 步），属于"完整 BPTT"。长回合任务要改成<strong>截断式 BPTT</strong>：把回合切成固定长度的片段，片段起点用采样时保存的隐状态（detach）作为初始状态，否则显存和计算会随回合线性增长。</p>
+    <p>变长序列还有一处细节：GAE 的 <code>last_value</code> 必须在每个回合自己的终止边界上使用，不能把 batch 里最长回合的 bootstrap 值套到短回合的尾巴上。本章回合固定 4 步且真实终止，这个问题不出现；一旦改成长短混杂的回合，短回合的尾部样本会被接上一个不存在的未来价值，优势与回报都会系统性偏移。正确做法是在采集阶段为每个回合单独计算优势；在垫齐后的张量上统一算会引入跨回合的串台。</p>
+    <p><strong>边界：回合长度差异造成的 padding 浪费。</strong>按最长回合垫齐的代价取决于长度分布。极端例子：一个 batch 里 64 个回合，其中 1 个长 200 步、其余 63 个各 4 步；垫齐后的张量有 64×200 = 12800 个时间步位置，有效位置只有 200 + 63×4 = 452 个，约 96% 的计算打在空位上。对策分三档：按长度分桶再组 batch、把超长回合切片（与截断式 BPTT 共用机制）、或对长度分布稳定的任务直接设回合上限。本章环境每回合固定 4 步，浪费为零；一旦换成长短混杂的真实任务，这个比例要先估再训练。</p>
+    <p><strong>边界：记忆半径。</strong>梯度沿时间连乘，RNN 的有效记忆不是无限的，GRU 通常能覆盖 10～100 步量级的依赖，具体取决于信号强度。本任务只需保留 4 步，处于舒适区；把间隔拉到几百步后，常见做法是截断 BPTT 配合片段起点的状态回传、加大隐状态，或改用带注意力的序列模型。判断是否越界有个便宜的方法：逐步拉长线索与决策之间的间隔，观察达标所需回合数；若增长越来越快甚至不再达标，说明已经接近或越过记忆半径。</p>
+
+    <h3>4. 循环 PPO 的代价</h3>
+    <p>三个成本要心里有数：更新不能随便打乱时间步（序列回放比逐帧样本慢）；隐状态重置点必须与回合边界严格一致；GRU/Cell 的逐帧循环在 GPU 上不如矩阵乘高效。所以实践中常先试"帧堆叠"（把最近 k 帧观测拼起来喂 MLP）作为无参数记忆方案，它够用就不上 RNN，本章练习 3 会让你亲手比较。</p>
+    <table>
+      <tr><th>方案</th><th>记忆载体</th><th>参数量增量</th><th>记忆范围</th><th>适用场景</th></tr>
+      <tr><td>帧堆叠（k 帧）</td><td>最近 k 步观测拼接</td><td>输入维度变 k 倍，网络结构不变</td><td>固定 k 步，看不见更早</td><td>线索必然落在最近 k 步内</td></tr>
+      <tr><td>GRU/LSTM</td><td>隐状态 h<sub>t</sub></td><td>GRUCell 约 3h(d+h)+6h 个参数</td><td>可学 10～100 步的衰减记忆</td><td>依赖长度未知或随时间变化</td></tr>
+    </table>
+    <p>量级感受：hidden=32、观测 2 维的 GRUCell 约 3×32×34 + 192 ≈ 3.5 千参数，hidden=64 时约 1.3 万，相对 MLP 躯干都不算大，真正的开销在逐帧循环的串行计算。选择顺序建议：先用帧堆叠估算"线索需要保留多少步"；窗口固定且小时帧堆叠更省，需要变长记忆或任务结构本身是部分可观测时再上 RNN。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+
+    <h3>模块划分</h3>
+    <table>
+      <tr><th>组件</th><th>职责</th><th>与第 012 章的关系</th></tr>
+      <tr><td><code>CueTMaze</code></td><td>4 步固定回合；线索只在第 0 步可见；第 3 步二选一得分</td><td><strong>新增</strong>：POMDP 环境</td></tr>
+      <tr><td><code>MLPActorCritic</code></td><td>无记忆基线；<code>forward_seq</code> 与 GRU 版接口对齐</td><td>沿用 MLP 但补齐序列接口</td></tr>
+      <tr><td><code>GRUActorCritic</code></td><td>GRUCell(obs→hidden) + 策略头 + 价值头；单步与整段两种接口</td><td><strong>新增</strong>：循环策略</td></tr>
+      <tr><td><code>collect_episodes</code></td><td>采集完整回合，垫成 (B, L, ·) 张量 + mask</td><td>采样单位从"步"变成"回合"</td></tr>
+      <tr><td><code>ppo_update</code></td><td>按回合批打乱、整段重放、mask 内求损失</td><td><strong>核心改动</strong>：序列化更新</td></tr>
+      <tr><td>指标</td><td>近 500 回合成功率 + 首达 90% 的回合数 + 评估成功率</td><td>从网格成功率升级为记忆任务成功率</td></tr>
+    </table>
+
+    <h3>关键超参数</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用与取值理由</th></tr>
+      <tr><td><code>--arms</code></td><td>mlp gru</td><td>无记忆 vs 有记忆的单变量对照</td></tr>
+      <tr><td>GRU 隐状态维度</td><td>32</td><td>线索只有 1 bit，32 维足够；过大会拖慢训练</td></tr>
+      <tr><td><code>--episodes-per-update</code></td><td>256</td><td>每轮 256 回合×4 步 = 1024 个时间步进入更新</td></tr>
+      <tr><td><code>--episode-batch</code></td><td>64</td><td>按回合分批，保证序列完整；4 个小批/轮</td></tr>
+      <tr><td><code>--total-episodes</code></td><td>20000</td><td>每个 arm 2 万回合（约 8 万步），任务单步开销小，总预算固定</td></tr>
+      <tr><td><code>--success-window</code></td><td>500</td><td>回合极短，大窗口才能压住二项噪声</td></tr>
+    </table>
+
+    <h3>数据流</h3>
+    <p>每个 arm 一条完整训练：重设种子 → <code>collect_episodes</code> 采集 256 个完整回合（GRU 版每回合从零隐状态开始，逐帧采样并记录）→ 每回合独立算 GAE → padding 成 (B, L, ·) + mask → <strong>8 epochs × episode_batch=64</strong>：按回合打乱、<code>forward_seq</code> 整段重放、mask 加权求损失 → 大窗口成功率统计 → 跑满 2 万回合 → 贪婪评估。</p>
+
+    <div class="box key">
+      <span class="box-title">统一接口：让 MLP 也实现 forward_seq</span>
+      <p>MLP 版假装"没有隐状态"，但同样提供 <code>forward_seq((B,L,D)) → (B,L,·)</code>：内部把序列摊平成 (B·L, D) 一次前向再 reshape 回来。这样更新的代码与两种网络完全解耦，GRU 换成 MLP 只需要换构造函数，其余一行不用改。这种"接口对齐"是写对比实验时最省事的结构。</p>
+      <p>评估路径要单独交代：贪婪评估按回合逐步前向并携带隐状态，<code>init_hidden</code> 每回合调用一次。若忘了重置、复用上一回合残留的隐状态，第一个回合之后的读数都会被旧记忆污染。有条低成本的验证：把评估回合数从 20 加到 40，若成功率出现系统性漂移，先查隐状态重置点，再查评估环境是否是新实例。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：把"记忆压力"造进环境里</strong></p>
+    <pre class="code"><code>    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        self.t = 0
+        self.cue = 1.0 if self.np_random.random() &lt; 0.5 else -1.0   # 每回合重抽线索
+        return self._obs(), {}
+
+    def _obs(self):
+        cue_visible = self.cue if self.t == 0 else 0.0   # 线索只在第 0 步可见
+        return np.array([self.t / 3.0, cue_visible], dtype=np.float32)
+
+    def step(self, action):
+        if self.t &lt; 3:
+            self.t += 1                    # 前 3 步是空操作：只推进时间
+            return self._obs(), 0.0, False, False, {"correct": None}
+        # 第 3 步：做决定
+        correct = bool(int(action) == (1 if self.cue &gt; 0 else 0))
+        self.t = 4
+        r = 1.0 if correct else 0.0
+        return self._obs(), r, True, False, {"correct": correct}</code></pre>
+    <p>解读：<strong>（1）</strong>观测是 <code>[t/3, cue]</code> 两维：第一维是时间戳（告诉策略"现在在第几步"），第二维就是记忆压力的来源，<strong>只有 t=0 时非零，之后恒为 0</strong>。MLP 在第 3 步看不到线索，物理上决定了它的成功率上限是 0.5。<strong>（2）</strong>奖励只在第 3 步产生（正确 +1、错误 0），前 3 步全是 0：GAE 会把终局奖励的信用通过 γλ 递归回传到序列前端，这正是 RNN 更新"重放整段序列"的原因，切断序列 = 切断信用分配。<strong>（3）</strong><code>cue</code> 每回合重抽（各 50%）且写在观测里：如果线索跨回合不变，MLP 也能靠"记住自己的参数偏好"侥幸达到 50%，但那不是解题；重抽保证"必须当回合记住"才是唯一解。<strong>（4）</strong>回合固定 4 步、终止是真实终止：本任务的 last_value 实际用不到，但代码保留了通用 bootstrap 写法，换变长环境时不需要重写。</p>
+
+    <p><strong>片段 2：GRU 的两个接口，单步采样与整段重放</strong></p>
+    <pre class="code"><code>    def init_hidden(self, batch: int, device):
+        return torch.zeros(batch, self.hidden_size, device=device)   # 回合起点：零状态
+
+    @torch.no_grad()
+    def step(self, obs: torch.Tensor, hidden: torch.Tensor):
+        """单步前向（采样用，无梯度）。obs: (1, D)。"""
+        h = self.gru(obs, hidden)
+        logits = self.actor(h)
+        value = self.critic(h).squeeze(-1)
+        return logits, value, h
+
+    def forward_seq(self, obs: torch.Tensor):
+        """按整段序列重放，返回 (B, L, act_dim) 的 logits 与 (B, L) 的价值。"""
+        B, L, D = obs.shape
+        h = self.init_hidden(B, obs.device)
+        logits_list, values_list = [], []
+        for t in range(L):
+            h = self.gru(obs[:, t], h)        # 逐帧推进；不 detach，梯度穿过整段
+            logits_list.append(self.actor(h))
+            values_list.append(self.critic(h).squeeze(-1))
+        return torch.stack(logits_list, dim=1), torch.stack(values_list, dim=1)</code></pre>
+    <p>解读：<strong>（1）</strong>两个接口是同一段数学的两种"形态"：<code>step</code> 用于"我不知道整段序列"的采样场景（步进式），<code>forward_seq</code> 用于"我拿得到整段序列"的更新场景（批处理）。分开写的目的：采样时套 <code>no_grad</code> 省显存，更新时保留计算图让梯度穿过时间。<strong>（2）</strong><code>forward_seq</code> 的循环起点是 <code>init_hidden(B)</code>：注意采样时也是从零状态开始的（每回合重置），两处起点一致，比率才可比。<strong>（3）</strong>循环体内<strong>不能 <code>detach</code></strong>：梯度必须穿过整段历史，GRU 才能学"第 0 步的线索与第 3 步动作的关系"；如果 detach，记忆层得不到训练信号，策略退化成"每帧独立"的 MLP。<strong>（4）</strong>注意 <code>obs[:, t]</code> 的取值顺序：stack 时 <code>dim=1</code> 把逐帧结果拼回 (B, L, ·)，与观测的 (B, L, D) 对齐，这是形状上最容易错的地方之一。</p>
+
+    <p><strong>片段 3：padding 与 mask，把变长回合装进定长张量</strong></p>
+    <pre class="code"><code>    # padding 到最长回合，构建 (B, L, 特征) 张量与 mask
+    max_len = max(len(e["obs"]) for e in episodes)
+    B = len(episodes)
+    obs_t = torch.zeros(B, max_len, env.observation_space.shape[0], device=device)
+    act_t = torch.zeros(B, max_len, dtype=torch.long, device=device)
+    logp_t = torch.zeros(B, max_len, device=device)
+    adv_t = torch.zeros(B, max_len, device=device)
+    ret_t = torch.zeros(B, max_len, device=device)
+    mask_t = torch.zeros(B, max_len, device=device)      # 有效时间步为 1
+    for i, e in enumerate(episodes):
+        L = len(e["obs"])
+        obs_t[i, :L] = torch.as_tensor(e["obs"], device=device)
+        act_t[i, :L] = torch.as_tensor(e["act"], device=device)
+        logp_t[i, :L] = torch.as_tensor(e["logp"], device=device)
+        adv_t[i, :L] = torch.as_tensor(e["adv"], device=device)
+        ret_t[i, :L] = torch.as_tensor(e["ret"], device=device)
+        mask_t[i, :L] = 1.0</code></pre>
+    <p>解读：<strong>（1）</strong>所有字段统一垫成 (B, L, ·)：观测是三维（带特征维）、其余是两维；<code>mask_t</code> 在写入有效步后才置 1。<strong>（2）</strong>为什么不用 <code>torch.nn.utils.rnn.pad_sequence</code> 之类的工具：本章想让你看清"垫零 + 掩码"的全部机制；工具函数只是把这段代码封装起来，原理不变。<strong>（3）</strong>padding 的内容是无意义的全零：<strong>它们绝不允许进入损失</strong>（片段 4 的 mask 加权就是为了这个），否则网络会被训练成"对零观测输出什么都不做"。<strong>（4）</strong>本环境每回合恰好 4 步，padding 不触发，这个通用写法是为练习 2 的长走廊与真实变长任务准备的：结构先写对，规模再放大。</p>
+
+    <p><strong>片段 4：序列化更新，打乱回合，不打乱时间步</strong></p>
+    <pre class="code"><code>        idx = torch.randperm(B, device=obs.device)     # 打乱的是“回合”，不是时间步
+        for start in range(0, B, args.episode_batch):
+            mb = idx[start:start + args.episode_batch]
+            logits, values = net.forward_seq(obs[mb])  # 整段重放，保持时间顺序
+            dist = Categorical(logits=logits)
+            logp = dist.log_prob(act[mb])
+            m = mask[mb]
+
+            ratio = torch.exp(logp - logp_old[mb])
+            surr1 = ratio * adv[mb]
+            surr2 = torch.clamp(ratio, 1.0 - args.clip, 1.0 + args.clip) * adv[mb]
+            policy_loss = -(torch.min(surr1, surr2) * m).sum() / m.sum().clamp(min=1.0)
+            value_loss = (((values - ret[mb]) ** 2) * m).sum() / m.sum().clamp(min=1.0)
+            entropy = (dist.entropy() * m).sum() / m.sum().clamp(min=1.0)
+            loss = policy_loss + args.vf_coef * value_loss - args.ent_coef * entropy</code></pre>
+    <p>解读：<strong>（1）</strong><code>torch.randperm(B)</code> 打乱的单位是<strong>回合索引</strong>：时间步顺序完整保留，这是循环策略与 MLP 更新在结构上最大的区别，如果按时间步打乱，<code>forward_seq</code> 拿到的就不是真实序列，记忆结构被破坏。<strong>（2）</strong>损失三项全部写成 <code>(x * m).sum() / m.sum().clamp(min=1.0)</code>：分子按有效步加权、分母是有效步数，等价于"只在有效步上求平均"；<code>clamp(min=1.0)</code> 防止整个 batch 无有效步时除零。<strong>（3）</strong>注意策略损失这里用的是 mask 加权的手写平均，没有直接用默认 <code>mean()</code>：这是全书唯一一处不能用默认 <code>.mean()</code> 的 PPO 损失，padding 步在 <code>ratio</code> 与 <code>adv</code> 里都是垫零，不排除就会稀释梯度。<strong>（4）</strong>优势标准化在进循环前、只在 <code>valid</code> 位置上统计（见 <code>ppo_update</code> 开头）：跨 padding 统计均值/方差会让标准化参数失真。</p>
+
+    <p>完整可运行脚本（附录）：<a href="../code/ch013.py" download>code/ch013.py</a></p>
+    <pre class="sh"><code>python code/ch013.py            # mlp 与 gru 各 2 万回合，CPU 约 1–3 分钟
+python code/ch013.py --quick    # 两组各 3000 回合，约 20–40 秒
+python code/ch013.py --arms gru --total-episodes 60000   # 加大预算看 GRU 上限</code></pre>
+    <p>预期结论（<strong>以实跑为准</strong>）：MLP 的成功率稳稳停在 0.5 附近（它学到"总选一边"，这是它的信息上限）；GRU 通常在 3000～8000 回合内把近 500 回合成功率推过 0.9，熵同步从 0.69 下降，这两个信号都说明它确实在利用线索。若 GRU 跑满 2 万回合仍接近 0.5，优先检查三件事：<strong>隐状态是否在回合边界重置、更新时是否被逐帧打乱、<code>forward_seq</code> 的循环是否破了梯度链路</strong>。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>更新时把序列打散成逐帧样本</strong>：记忆任务必须按"同一段历史"重放；逐帧更新会让 GRU 退化成只看当前帧的 MLP，成功率掉回 0.5。批处理的单位是回合，不是步。</li>
+      <li><strong>隐状态跨回合泄漏</strong>：回合结束不重置隐状态，会把上回合的线索/噪声带进新回合，训练信号被污染。采样与评估都要在 <code>reset()</code> 时同步重置。</li>
+      <li><strong>padding 参与损失</strong>：垫零的假时间步如果计入策略/价值损失，梯度会被拉向"对零观测输出什么都不做"。必须用 mask 加权或只取有效步。</li>
+      <li><strong>序列重放时切断梯度</strong>：为了省显存给隐状态 <code>detach</code> 可以，但要在正确的边界上（截断 BPTT 的片段起点）；整段回合内 detach 会让"记忆"学不到任何东西。</li>
+      <li><strong>优势标准化把 padding 算进去</strong>：垫零步的优势会压低方差、偏移均值。标准化统计必须只在 <code>mask &gt; 0.5</code> 的位置做。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把 <code>GRUActorCritic</code> 换成 <code>nn.LSTMCell</code>（需要同时维护 cell state），对比到达 90% 的回合数。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>LSTMCell 返回 (h, c)，要把 cell state 一起沿回合传递；本任务很短，GRU 与 LSTM 的差距通常不大，但参数量与速度会有差别。</div></details>
+      </li>
+      <li>把走廊加长（第 0 步之后插入更多空步，比如 9 步后再决策），测试 GRU 的记忆长度极限，并观察需要多少回合才能学会。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>修改环境的时间戳分母与阈值即可（如 <code>t/8</code>、第 8 步决策）。间隔越长，信用分配越难，GRU 的达标回合数会显著上升。</div></details>
+      </li>
+      <li>为 MLP 实现"帧堆叠"：把最近 4 步观测拼接成 8 维输入，重跑对比。它能追平 GRU 吗？<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>在采集时维护观测队列拼成输入；这样 MLP 也能"看见"第 0 步线索。注意帧堆叠改变了观测维度，两种方法的参数量要一起报告才公平。</div></details>
+      </li>
+      <li>实现截断式 BPTT：把整段回合切成两个长度为 L/2 的片段，第二段起点用采样时保存的隐状态 <code>detach</code> 后继续。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>在 <code>collect_episodes</code> 里记录每个回合切分点的隐状态并断开梯度；更新时对片段循环（不整段重放）。本任务太短看不出差别，但换成 200 步的 Pendulum 会立刻体现计算与内存差异。</div></details>
+      </li>
+      <li>用二项标准误 √(p(1−p)/n) 设计一次公平比较：在 p≈0.85 附近要把两个 GRU 变体的差距分辨到 0.02，窗口需要多大？单窗口不够时跨种子重复，报告均值与标准误。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>取 SE=0.01（差距 0.02 的一半），n = 0.85×0.15/0.01² ≈ 1275 回合；三个种子均值后标准误再除以 √3。先算清预算再跑，比跑完再争论曲线可靠。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>POMDP 下策略应基于观测历史；RNN 用隐状态充当历史摘要，T 型迷宫用 1 bit 线索就能区分记忆与无记忆策略。</li>
+      <li>循环 PPO 的两个接口：采样用单步 <code>step</code>（无梯度）、更新用 <code>forward_seq</code>（整段重放）。</li>
+      <li>批数据按回合组织、padding 配 mask、损失只算有效步；长回合任务改用截断式 BPTT。</li>
+      <li>实验结果：MLP 被信息上限锁在 0.5，GRU 在数千回合内超过 0.9，记忆能力的价值被清晰量化。</li>
+      <li>下一章换到"对抗条件"：给训练好的策略加入观测扰动与梯度对抗扰动，测量它的鲁棒性边界，并对比普通训练与噪声训练两种防御。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch012.html">← 第 012 章：PPO的离散动作空间的分类策略</a>
+    <a class="next" href="ch014.html">第 014 章：PPO的对抗性扰动鲁棒性 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

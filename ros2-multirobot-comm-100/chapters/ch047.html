@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第047章 分布式路径规划 | 多机器人协同学习课程 · ROS2 通信与系统集成</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第三篇 · 协同控制与任务协同</span>
+    <span class="sep">/</span>
+    <span>第 047 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第三篇 · 协同控制与任务协同</div>
+    <h1>第 047 章：分布式路径规划</h1>
+    <p class="lead">拆掉中央大脑：每台机器人只用自己的局部地图与邻居的路径意图做规划，用动态膨胀、增量重规划与让行规则换取可扩展性与抗断连，并精确计算为此付出的通信账单。</p>
+    <ul class="meta">
+      <li>主题：协同规划 / 分布式架构</li>
+      <li>关键机制：局部代价地图、邻居计划意图广播、滚动 A*、优先级让行</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 046 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解分布式路径规划的动机与代价：无中心、可扩展、抗断连，但只有"局部最优 + 优先级公平"的保证。</li>
+      <li>掌握优先级规划机制，能解释顺序敏感性与饥饿问题，并设计动态优先级。</li>
+      <li>会实现"把邻居预测位置写入局部代价地图"的动态膨胀方法，并推理膨胀半径的参数依据。</li>
+      <li>理解增量重规划（D* Lite 类算法）的核心思想：障碍变化只更新受影响节点。</li>
+      <li>能设计让行规则与死锁恢复流程，并会计算分布式方案的通信开销与集中式对比。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>046 章的集中式方案在一个地方最脆弱：那个"大脑"。它一旦离线，全队失去规划能力；它想扩展，计算与地图汇聚开销按台数增长；它要求全队处于同一网络域，而真实场地里的 WiFi 覆盖总有死角。分布式方案的立场相反：<strong>没有谁离不开谁</strong>，每台机器人用自己的 20 m × 20 m 局部地图、自己的搜索、邻居广播来的路径意图，独立规划、独立执行。</p>
+    <p>代价写在合同背面：分布式没有全局最优，只有"在优先级次序下可解释的解"；没有全局死锁保证，需要一套让行与恢复规则兜底；每台机器人都在重复消耗算力。理解这笔交易以及通信开销的精确定量，才能在 046/047/048 三条路线之间为你的场景选型。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 优先级规划：把"同时求解"换成"依次求解"</h3>
+    <p>分布式规划的最简骨架是优先级规划：按某个顺序给机器人排序，第 1 台按静态障碍规划；第 2 台把第 1 台的路径视为"时空占用"绕开；第 k 台把前 k−1 台的计划全部当障碍。整个过程无中心、每人只依赖比自己优先级高的邻居的路径，通信是单向的（高优先级广播、低优先级收听）。三个已知性质必须记住：</p>
+    <ul>
+      <li><strong>顺序敏感</strong>：换一个顺序可能得到差很多的解，先规划者占便宜。</li>
+      <li><strong>静态优先级不公</strong>：永远按 id 排序时，低 id 机器人一路畅通，高 id 机器人永远绕路（饥饿）。</li>
+      <li><strong>不完备</strong>：某些场景固定顺序无解，而换顺序有解（例如两台在窄道对头，谁先规划谁"合法占道"）。</li>
+    </ul>
+    <p>工程对策是<strong>动态优先级</strong>：优先级随"等待时长、距目标距离、任务紧迫度"变化，并周期性轮转。一个常用公式是优先级得分 = 等待秒数 × w<sub>w</sub> + （任务截止紧迫度）× w<sub>t</sub>，等待越久得分越高，这把"饥饿"从结构问题降级为时间问题。</p>
+
+    <h3>2. 局部代价地图与动态膨胀</h3>
+    <p>低优先级机器人的信息源是邻居广播的路径。把邻居路径上的点写进自己的代价地图，让 A* "自然绕着走"，比在执行层临时躲避更平滑。膨胀半径要覆盖三层不确定性：</p>
+    <div class="formula">
+      R<sub>infl</sub> = r<sub>i</sub> + r<sub>j</sub> + v<sub>j</sub>·T<sub>look</sub> + ε
+      <span class="note">前两项是物理半径，v<sub>j</sub>·T<sub>look</sub> 补偿邻居计划刷新间隔（1 Hz 下 T<sub>look</sub> 取 1 s），ε 为定位误差余量</span>
+    </div>
+    <p>量级举例：两台半径 0.25 m 的机器人、邻居速度 0.6 m/s、刷新 1 Hz、ε = 0.15 m，膨胀半径约 1.25 m，在 1.5 m 宽的走廊里这几乎占满通道。这就是分布式方案最现实的一组矛盾：<strong>刷新越慢、越保守，越容易把窄道"堵死"给自己</strong>。缓解手段：把膨胀代价做成"软代价"（加权重），允许搜索必要时进入高代价区；提高邻居广播频率（2 Hz 时 T<sub>look</sub> 降到 0.5 s）；对未来更远的路径点衰减权重（越远越不确定，惩罚越低）。</p>
+
+    <h3>3. 增量重规划：地图变了不等于从头搜</h3>
+    <p>滚动规划每 1 s 重跑一次 A*，每次都从零搜索太浪费。D* Lite 类增量算法的洞察是：局部地图的变化（新出现的邻居、消失的动态障碍）只影响搜索树的一小部分，把变化位置的代价更新，然后沿依赖关系反向传播修正（rhs 值传播），通常只需几十次节点更新就恢复最优路径。实现上可以先用"全量 A* + 上一轮路径做热启动（把上次路径点先压入 open 集）"近似获得大部分收益，再在需要时引入完整增量版本。这里的关键工程判断是：<strong>重规划频率由环境的动态程度决定</strong>，走廊场景 1 Hz 足够，人流密集的大厅建议 2–5 Hz 并配合更短的窗口。</p>
+
+    <h3>4. 让行与死锁：两条走廊法则</h3>
+    <p>分布式最经典的事故是窄道对头僵持：双方互相把对方膨胀成障碍，都判定"过不去"，同时停下。解决办法是"交通化"：</p>
+    <ul>
+      <li><strong>让行判定</strong>：检测未来窗口内与邻居计划的接触点，低优先级者产生"让行意图"，在接触点前 1 m 处减速停等，保留前进姿势。</li>
+      <li><strong>退避点</strong>：走廊里预定义或在线检测"凹龛"（宽度大于 1.3 倍通道平均宽度的侧向空间），让行者退入凹龛，把通道净空交给对方。</li>
+      <li><strong>超时升级</strong>：等待 10 s 仍未通过，升级处理，降低己方膨胀半径（冒险挤压）或呼叫邻居协同（第 048 章的协商机制），避免无限等待。</li>
+    </ul>
+
+    <h3>5. 分布式 vs 集中式：定量对照</h3>
+    <p>把两章的账放在一张表里。计划广播是分布式的主要增量开销：一条 20 点、每点 16 字节的计划约 320 字节，2 Hz 广播、每人收听 N−1 台，N = 10 时每人约 5.8 kB/s，全队约 58 kB/s，仍远低于一帧未压缩图像，普通 WiFi 没问题。真正的代价在解的质量与确定性：分布式平均路径比集中式长 5–20%，极端场景可能无解；集中式则有单点风险与规模上限。</p>
+    <table>
+      <tr><th>维度</th><th>集中式（046）</th><th>分布式（本章）</th></tr>
+      <tr><td>最优性</td><td>给定代价下最优（CBS）</td><td>优先级次序下的可行解，通常次优</td></tr>
+      <tr><td>通信形态</td><td>全图 + 状态汇聚到中央，计划下发</td><td>点对邻居广播计划，无汇聚</td></tr>
+      <tr><td>带宽量级（N = 10）</td><td>地图增量 + 状态 20 kB/s 级（帧发时更高）</td><td>计划广播约 58 kB/s（按 2 Hz 全收听估）</td></tr>
+      <tr><td>规模弹性</td><td>N ≤ 10–15 后计算吃紧</td><td>近似线性增长，数十台仍可运行</td></tr>
+      <tr><td>故障模式</td><td>中央离线 → 全队失能（需降级）</td><td>单机离线 → 局部影响，其余照常</td></tr>
+      <tr><td>保证</td><td>无冲突、可验证；最坏指数求解</td><td>无全局保证，需让行/超时兜底</td></tr>
+    </table>
+
+    <h3>6. 数值算例：膨胀半径与软代价的换算</h3>
+    <p>把公式代进一条具体走廊：两台半径 0.25 m 的机器人、邻居速度 0.6 m/s、广播刷新 1 Hz（T<sub>look</sub> = 1 s）、定位余量 ε = 0.15 m，膨胀半径 R = 0.25 + 0.25 + 0.6 + 0.15 = 1.25 m。1.5 m 宽的走廊里，这个半径左右一撑就没有净空，双方都判"过不去"。把刷新率提到 2 Hz（T<sub>look</sub> = 0.5 s）后 R 降到 0.95 m，窄道开始有解；再往上提刷新率边际收益递减，因为物理半径 0.5 m 是硬底。这组数字解释了为什么"提高邻居广播频率"常常比"调代价权重"更有效。</p>
+    <p>"软代价"的设计值也能换算成实际代价：权重 5.0 表示进入一个格子的额外代价是 5，等于绕行 5 格 = 0.5 m（0.1 m 分辨率）。把邻居膨胀圆沿直径横穿的代价积分近似看作权重 × R，R = 1.25 m 时约 6.25 个格子当量，折合 0.63 m 的绕行距离。<strong>权重 5.0 的含义是"绕行 0.6 m 以内不如直接穿过高代价区"</strong>，与设计表里"必要时可进"的意图完全吻合。想让机器人更保守就把权重加倍，想提高窄道通过率就减半，每次调整都用"停滞占比"与"安全层触发次数"两条曲线验证。</p>
+    <table>
+      <tr><th>邻居刷新</th><th>T<sub>look</sub></th><th>R<sub>infl</sub></th><th>软代价积分（w = 5）</th><th>适合场景</th></tr>
+      <tr><td>1 Hz</td><td>1.0 s</td><td>1.25 m</td><td>约 0.63 m 绕行当量</td><td>开阔、稀疏</td></tr>
+      <tr><td>2 Hz</td><td>0.5 s</td><td>0.95 m</td><td>约 0.48 m 绕行当量</td><td>常规室内</td></tr>
+      <tr><td>4 Hz</td><td>0.25 s</td><td>0.80 m</td><td>约 0.40 m 绕行当量</td><td>窄道、密集</td></tr>
+    </table>
+    <p>通信开销对账：计划消息 20 点、每点 16 字节 = 320 B，2 Hz 广播、每人收听其他 7 台，每人接收 7 × 320 × 2 = 4.5 kB/s，全队合计约 36 kB/s；把广播提到 4 Hz 就是 72 kB/s。对照第 046 章集中式的地图汇聚（20 kB/s 级）与状态同步（8 × 50 × 30 = 12 kB/s），分布式方案在计划广播上并不便宜，换来的是"不依赖任何单点、不用全图"。窄道场景把频率提到 2–4 Hz 值得，开阔场景降回 1 Hz，省下的带宽留给地图增量。</p>
+    <p>边界与失效：膨胀公式里的 v·T<sub>look</sub> 假设邻居直线运动，若邻居正在转弯或原地旋转，"线性外推"的预测位置会偏出真实扫掠区，1 Hz 刷新下偏差可达 0.3 m 量级。补偿办法是按邻居角速度追加一点膨胀，或对"正在转向的邻居"用两倍半径；另外，速度突变（丢拍后重启）会让膨胀区跳跃，检测到突变时本拍直接按最大半径膨胀，宁可保守一拍。</p>
+    <p>增量重规划省下的量级同样可以估算：全量 A* 在 10<sup>4</sup> 格地图上是上万次节点扩展，热启动后通常只需重扩展几百个节点，常态应控制在全量的 5% 以内；把"本轮扩展节点数"做成指标，超过 20% 说明场景动态程度已超出增量算法的预期，应考虑提高重规划频率或缩小窗口；继续加大算力也补不上动态性的缺口。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <ol>
+      <li><strong>每机一套规划栈</strong>：局部代价地图（20 m × 20 m、0.1 m 分辨率，滚动更新）+ A* 搜索 + 计划广播节点。<code>/fleet/plans/robotN</code> 发布自己的未来 8 s 计划（1 Hz，Best-effort 即可，路径会持续更新）。</li>
+      <li><strong>邻居计划订阅与预测</strong>：订阅所有 <code>/fleet/plans/*</code>；收到计划后按时间戳检查新鲜度，过期用其最后速度外推最多 1 s；把预测位置写入代价地图（软代价 + 距离衰减）。</li>
+      <li><strong>动态优先级</strong>：得分 = 等待时长 × 0.5 + 距目标距离 × 0.01 + 任务紧迫度 × 1.0，每 2 s 重算；同级时按 id 打破平局（保证确定性）。</li>
+      <li><strong>规划循环</strong>：1 Hz 定时 + 事件触发（新动态障碍、邻居计划变化超过 0.5 m、自身偏差超过 0.4 m）。</li>
+      <li><strong>让行协议</strong>：规划阶段检测接触点，低优先级者在接触点前生成停等段；执行层按 049 章的让行状态机减速停等；10 s 超时升级。</li>
+      <li><strong>验收</strong>：10 台、10 m × 16 m 双向走廊地图，20 组任务流：零碰撞；平均完成时间与集中式基线相差不超过 20%；死锁事件 0 次、最长等待小于 15 s。</li>
+    </ol>
+    <h3>参数表</h3>
+    <table>
+      <tr><th>参数</th><th>取值</th><th>依据</th></tr>
+      <tr><td>局部地图</td><td>20 m × 20 m / 0.1 m</td><td>覆盖 2–3 个决策周期行程；分辨率与膨胀精度匹配</td></tr>
+      <tr><td>计划广播</td><td>1 Hz</td><td>更高增加带宽，更低让预测外推变长；1 Hz 是起点</td></tr>
+      <tr><td>膨胀余量 ε</td><td>0.15 m</td><td>覆盖定位误差与计划外推误差</td></tr>
+      <tr><td>软代价权重</td><td>5.0</td><td>等于绕行 5 格（0.5 m）的成本，让"必要时可进"</td></tr>
+      <tr><td>让行提前量</td><td>接触点前 1.0 m</td><td>0.5 m/s 速度下约 2 s 减速距离</td></tr>
+      <tr><td>超时升级</td><td>10 s</td><td>两倍于典型对头通过时长（4–5 s）</td></tr>
+    </table>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：邻居预测写入动态代价地图</strong></p>
+    <pre class="code"><code>import numpy as np
+
+class InflationMap:
+    """把邻居的预测位置写成软代价：越近越贵，但允许必要时穿越。"""
+    def __init__(self, size, res=0.1, weight=5.0):
+        self.cost = np.zeros(size)
+        self.res, self.weight = res, weight
+
+    def update(self, neighbors):
+        self.cost.fill(0.0)                    # 每轮重建，避免旧痕迹累积
+        for pos, vel, radius in neighbors:
+            # 外推 1.0 s：补偿邻居计划 1 Hz 刷新的间隔
+            px = pos[0] + vel[0] * 1.0
+            py = pos[1] + vel[1] * 1.0
+            r = radius + 0.15                  # 安全余量
+            x0, x1 = int((px - r) / self.res), int((px + r) / self.res)
+            y0, y1 = int((py - r) / self.res), int((py + r) / self.res)
+            for ix in range(x0, x1 + 1):
+                for iy in range(y0, y1 + 1):
+                    d = np.hypot(ix * self.res - px, iy * self.res - py)
+                    if d &lt; r:
+                        # 距离越近代价越高；软代价允许窄道场景硬着头皮通过
+                        self.cost[ix, iy] += self.weight * (1.0 - d / r)</code></pre>
+    <p>解读：这段代码三个决定的动机都值得说透。<strong>(1) 每轮重建</strong>：如果只做增量累加，邻居停留过的位置会留下"幽灵代价"，机器人莫名其妙绕路，重建成本在 200 × 200 的格子上可以忽略。<strong>(2) 外推 1 s</strong>：邻居计划 1 Hz 刷新，意味着你手里的计划最多已老化 1 s；不外推就把"过去的邻居"当成"现在的邻居"。<strong>(3) 软代价设计</strong>：权重 5.0 相当于"绕行超过 0.5 m 不如直接挤过去"，这让窄道场景有解；如果做成硬障碍，两台机器人互相堵门的概率会显著上升。代价函数的设计参数（weight、外推时长）就是分布式方案的"性格旋钮"：越保守越安全、越容易死锁。</p>
+
+    <p><strong>片段 2：带邻居代价的 A* 搜索核心</strong></p>
+    <pre class="code"><code>import heapq
+
+def astar(occ, cost_map, start, goal):
+    """四邻接 A*：f = g（移动代价 + 邻居软代价）+ h（曼哈顿距离）。"""
+    open_set = [(0.0, start)]
+    g = {start: 0.0}
+    parent = {}
+    while open_set:
+        _, cur = heapq.heappop(open_set)
+        if cur == goal:
+            path = [cur]                       # 回溯父指针得到路径
+            while cur in parent:
+                cur = parent[cur]
+                path.append(cur)
+            return path[::-1]
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            nxt = (cur[0] + dx, cur[1] + dy)
+            if not occ.is_free(nxt):
+                continue                       # 硬障碍：静态地图占用
+            step = 1.0 + cost_map[nxt[0], nxt[1]]   # 邻居软代价进 g
+            ng = g[cur] + step
+            if ng &lt; g.get(nxt, float("inf")):
+                g[nxt] = ng
+                parent[nxt] = cur
+                h = abs(nxt[0] - goal[0]) + abs(nxt[1] - goal[1])
+                heapq.heappush(open_set, (ng + h, nxt))
+    return None                                # 局部地图内无解：上报降级</code></pre>
+    <p>解读：标准 A* 只改了一行，<code>step</code> 里加了 <code>cost_map</code> 的软代价，但这行决定了全局行为：搜索会把邻居"未来的位置"当作昂贵区域提前绕开，把冲突化解在规划阶段，不必等避障层急救。启发函数仍用曼哈顿距离（<= 真实代价，保证最优性与效率的平衡）；软代价只进 g 不进 h，否则启发式不再可采纳，A* 可能返回次优路径。返回 <code>None</code> 时不要静默吞掉：这通常意味着局部地图内的候选路径全被邻居软代价"挤爆"，应立即上报（请求重试、等待、或按 048 章的协商机制处理），并记录场景用于事后分析，分布式方案里，"局部无解"的统计数据是调权重的主要依据。</p>
+
+    <p><strong>片段 3：接触点检测与让行决策</strong></p>
+    <pre class="code"><code>def first_crossing(my_plan, their_plan, safety=0.35, horizon=8):
+    """检测未来 horizon 个采样点内与邻居计划的最近接触（时间窗法）。"""
+    for k in range(min(len(my_plan), len(their_plan), horizon)):
+        tm, xm, ym = my_plan[k]
+        tn, xn, yn = their_plan[k]
+        if abs(tm - tn) &gt; 0.6:                 # 时间错开超过 0.6 s：不算冲突
+            continue
+        if (xm - xn) ** 2 + (ym - yn) ** 2 &lt; safety ** 2:
+            return k, (tm, xm, ym)             # 返回接触点
+    return None
+
+def should_yield(mine, theirs):
+    """让行决策：低优先级让；同级时离接触点更远者让（近者先行）。"""
+    hit = first_crossing(mine["plan"], theirs["plan"])
+    if hit is None:
+        return None
+    _, (t_hit, x_hit, y_hit) = hit              # 接触点的时间与坐标
+    if mine["priority"] &lt; theirs["priority"]:
+        return (x_hit, y_hit)                  # 我让：接触点前停等
+    if mine["priority"] == theirs["priority"]:
+        d_mine = (mine["pos"][0] - x_hit) ** 2 + (mine["pos"][1] - y_hit) ** 2
+        d_theirs = (theirs["pos"][0] - x_hit) ** 2 + (theirs["pos"][1] - y_hit) ** 2
+        if d_mine &gt; d_theirs:                  # 同级：更远者让，避免双双刹停
+            return (x_hit, y_hit)
+    return None</code></pre>
+    <p>解读：<code>first_crossing</code> 体现"冲突是时空事件"这个反复出现的主题：位置接近还不够，时间也必须接近（0.6 s 窗）才算冲突，两台机器人先后 1 s 通过同一路口完全不该触发避让。0.6 s 窗口的选取依据是执行层减速的能力：0.5 m/s 下 0.6 s 恰好是 0.3 m 的位移裕度，配合 0.35 m 的安全距离，能在接触前完成减速。<code>should_yield</code> 里同级规则特意写成"更远者让"：如果写反（近者让），两个都在接近路口的机器人会同时刹停，形成分布式里最常见的"礼貌死锁"。最后返回的是接触点坐标这样的物理量，因为执行层需要的是"在哪停等"，规则与执行的数据接口要对齐。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>静态优先级导致饥饿</strong>：固定小 id 优先，高 id 机器人每轮都被挤出可行解，任务超时。修复：动态优先级 + 等待时长权重；观察指标是"任务加权等待时间的分布"，头部与尾部差距不宜超过一个常数倍。</li>
+      <li><strong>膨胀半径过大把窄道堵死</strong>：两台机器人各自把对方膨胀 1.25 m，而通道只有 1.5 m，双方都判无解。修复：软代价 + 权重下调（本片段方案）、外推时长缩到 0.5 s、允许"临时进入高代价区但减速通过"。</li>
+      <li><strong>邻居计划过期仍当有效</strong>：邻居已停/已离开，本地还按 1 s 前的旧计划绕路。修复：计划带时间戳，超过 2 个刷新周期按"最后速度外推"降级处理；超过 5 s 视为离线从代价图移除。</li>
+      <li><strong>重规划节拍不同步造成 ping-pong</strong>：A 改路逼 B 改路、B 改路再逼 A 改路，两条路径来回摆动。修复：重规划加随机抖动（±0.3 s）去同步；对"邻居计划变化"设阈值（超过 0.5 m 才触发本轮重规划）。</li>
+      <li><strong>对头僵持无升级机制</strong>：双方礼貌不动、任务都超时。修复：让行必须实现为"退到凹龛或接触点前停等 + 10 s 超时升级"，让行的一方永远保持前进姿势，不做无限期原地等待。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>计算：8 台机器人，计划 20 点、每点 16 字节，2 Hz 广播，每台收听其他所有机器人的计划。每人每秒接收多少字节？全队总网络负载多少？与"每台 30 Hz 发一个 50 字节状态"的状态同步相比孰大孰小？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>每人 7 × 320 × 2 = 4.5 kB/s；全队 36 kB/s；状态同步是 8 × 50 × 30 = 12 kB/s，计划广播反而更大，因为计划体积大。</div></details>
+      </li>
+      <li>构造一个优先级饥饿场景（两台机器人恒在同一瓶颈争夺），写出你的动态优先级公式，并说明它如何保证饥饿机器人在有限步内获得通行权。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>让等待时长权重无上界（随时间线性增长），任何固定权重的"对手"最终都会被反超；注意给得分加饱和上限防溢出。</div></details>
+      </li>
+      <li>把膨胀权重从 5.0 改到 20.0 和 1.0，预测并论证：双向走廊的通过时间、死锁发生率、路径长度分别如何变化。给出用哪个指标选参数的方法。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>20 太保守（绕行与僵持增多），1 太激进（避让频繁贴身，安全层介入）。用"完成任务的平均时间 + 停滞占比 + 安全层触发次数"三指标扫参数。</div></details>
+      </li>
+      <li>设计分布式与集中式的混合切换策略：给出切换判据（带宽、台数、中央心跳、场景结构）、切换时的状态迁移步骤（谁接管、计划如何交接）、以及来回切换的防抖条件。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>判据示例：N 超过 12 或中央心跳丢失 2 s 切分布式；N 回落且网络恢复 10 s 后切回。防抖用滞回窗口；交接时分布式先"认领"现有计划再逐步接管。</div></details>
+      </li>
+      <li>实现并测试"时间窗对齐"的必要性：把 <code>first_crossing</code> 里的 0.6 s 窗口分别设为 5.0 s、0.6 s、0 s（只比同采样点），用两机先后通过同一路口的场景观察误报与漏报。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>5 s 窗口会把正常先后通过判成冲突（过度让行）；0 s 会漏掉采样间隙的擦肩。用录包回放统计误报率与漏报率两条曲线。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>分布式规划 = 局部地图 + 优先级次序 + 邻居计划意图；无中心、可扩展、抗断连，但没有全局最优与死锁保证。</li>
+      <li>动态膨胀半径 R = r<sub>i</sub> + r<sub>j</sub> + v·T<sub>look</sub> + ε，用软代价保持窄道可通行，是分布式最关键的调参旋钮。</li>
+      <li>优先级规则、时间窗接触检测、退避点让行与 10 s 超时升级，共同把"对头僵持"从故障变成流程。</li>
+      <li>增量重规划（D* Lite 思想、热启动 A*）让 1–2 Hz 的在线重规划可持续运行。</li>
+      <li>计划广播带宽约与状态同步同量级（数 kB/s 每人），真正贵的还是全图；下一章<strong>多机器人协同路径规划</strong>在平等节点间引入协商与时空预约，让分布式方案比"让行"更聪明。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch046.html">← 第 046 章：集中式路径规划</a>
+    <a class="next" href="ch048.html">第 048 章：多机器人协同路径规划 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

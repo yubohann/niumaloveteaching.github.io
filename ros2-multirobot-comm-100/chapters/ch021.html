@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第021章 多机器人状态同步 | 多机器人协同学习课程 · ROS2 通信与系统集成</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 数据分发与协同感知</span>
+    <span class="sep">/</span>
+    <span>第 021 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 数据分发与协同感知</div>
+    <h1>第 021 章：多机器人状态同步</h1>
+    <p class="lead">第二篇开篇：把 N 台机器人的位姿、模式与任务状态汇成一张"所有人共享的近况图"，并诚实处理它必然存在的陈旧与时滞。</p>
+    <ul class="meta">
+      <li>主题：数据分发 / 状态一致性</li>
+      <li>关键机制：状态模型与序列号、广播/汇聚拓扑、新鲜度窗口、失联标记</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 002、011、020 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解"状态同步"的问题本质：分布式系统里不存在瞬时一致的全局视图，只有带时间戳的近况图。</li>
+      <li>会设计状态消息：字段、频率、序列号与时间戳，并为"高频位姿"与"低频模式"分配不同的 QoS 通道。</li>
+      <li>掌握广播与汇聚两种拓扑的代价模型，能按规模选择并在两者之间设计合理的混合结构。</li>
+      <li>会实现新鲜度（staleness）窗口：接收端按本地时钟判定陈旧、降权或标记失联，绝不用旧状态冒充新状态。</li>
+      <li>能按消费者定义同步指标：不同任务对"多新才算新"的要求不同，验收按任务分层写。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 020 章的系统里，2 号只关心 1 号一个邻居；而在第二篇将要展开的协同感知、编队与探索里，每台机器人都是"需要知道其他所有人在干什么"的成员。这时一个基础组件必须先行：<strong>状态同步（state synchronization），把每台机器人的位姿、速度、电量、模式、任务打包成状态消息，发布出来，并让所有消费者以明确的"新鲜度预期"使用它们。</strong></p>
+    <p>状态同步听起来像"多发一个话题"这么简单，但工程师们在这里踩的坑最深：用旧状态做编队的"幽灵机器人"、时间戳错配导致的状态跳变、20 台全连接时接收侧 CPU 被回调淹没。<strong>根因是同一个误解：把"同步"想象成"所有机器人看到同一张瞬时快照"。物理上做不到，光速、队列与调度都会引入延迟；工程上要做的是把它变成显式的、被管理的、按消费者分层容忍的量，在容忍范围内与延迟共处。</strong>本章把这件事做对，它直接支撑第 024 章（多机 TF）、第 031 章（协同感知）与第三篇的编队控制。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 问题本质：带时间戳的近况图（瞬时快照不可得）</h3>
+    <p>机器人 i 在 t<sub>i</sub> 时刻打包自己的状态，消息经过网络在 t<sub>j</sub> 时刻到达机器人 j。对 j 来说，这条状态描述的是<strong>过去</strong>，其"年龄"为 t<sub>j</sub> − t<sub>i</sub>（还需扣除时钟偏差，第 009 章的依赖在此再次落地）。因此状态同步系统的正确心智模型是：<strong>每台机器人维护一张"他机近况表"，每行都带时间戳与新鲜度；决策者按自己的容忍度使用它，过期行必须被标记，不得当作真值。</strong></p>
+    <p>接受这个现实后，整个设计就顺了：消息要带时间戳（别用接收时刻冒充产生时刻）、要带序列号（判断丢了哪几帧、消息是否乱序）、消费端要有新鲜度策略（用多久算过期）。<strong>"最终一致性"是这个系统的目标语义：不追求每毫秒全员一致，只保证"任何时刻，全体成员对彼此的认知都在各自的容忍窗口内"。</strong></p>
+    <p><strong>算例：陈旧位姿值多少米？</strong>把"年龄"换算成几何误差只要乘速度：邻机 1 m/s、age 200 ms 时，它可能已经比缓存中的位置前进 0.2 m。再算一次安全间距就更完整：自机速度 1.5 m/s、反应时间 0.3 s、他机状态年龄 0.2 s、他机速度 1 m/s、最小间距 0.3 m，安全距离 ≈ 1.5×0.3 + 1×0.2 + 0.3 = <strong>0.95 m</strong>。<strong>窗口、速度、间距三者的换算关系把"新鲜度"从审美问题变成了安全参数</strong>：缩短窗口或增大间距，是同一张账上的两种取舍。</p>
+
+    <h3>2. 状态消息设计：字段、频率、序列号</h3>
+    <p>一条多机器人状态消息的推荐字段（在"够用"与"精简"之间平衡）：</p>
+    <table>
+      <tr><th>字段组</th><th>内容</th><th>为什么需要</th></tr>
+      <tr><td>身份</td><td>robot_id + boot_id</td><td>区分成员与生命周期（重启后 boot_id 变化，回扣 019）</td></tr>
+      <tr><td>时序</td><td>stamp（ROS 时钟）+ seq（递增）</td><td>新鲜度判定与丢包/乱序检测</td></tr>
+      <tr><td>位姿</td><td>位置 + 姿态（或直接四元数）</td><td>编队、避障、协同感知的主数据</td></tr>
+      <tr><td>运动</td><td>线/角速度</td><td>预测与安全间距判断（他机过会儿在哪）</td></tr>
+      <tr><td>运行态</td><td>模式（idle/teleop/auto）+ 任务号</td><td>协同策略的决策输入</td></tr>
+      <tr><td>健康</td><td>电量 + 状态码</td><td>调度与任务分配（第三、四篇）</td></tr>
+    </table>
+    <p>频率设计两个档：<strong>位姿类状态 10–20 Hz</strong>（编队与显示的带宽与实时感的平衡点）、<strong>模式/任务类 事件式</strong>（变化才发，Reliable + Transient-local 让晚加入者拿到现状，第 011 章四象限的直接应用）。把两者塞进同一条消息、用同一频率发，是最常见的浪费：位姿要快但不能丢，模式不快但绝不能丢，语义不同就该用不同通道。频率也不是越高越好：位姿从 10 Hz 提到 20 Hz，带宽与接收侧回调次数同步翻倍，而平均时滞只从 50 ms 压到 25 ms，只有在高速编队或密集避让场景里这笔开销才值得。</p>
+
+    <h3>3. 拓扑选择：广播还是汇聚</h3>
+    <table>
+      <tr><th>拓扑</th><th>数据路径</th><th>接收侧成本</th><th>适用</th></tr>
+      <tr><td>全网广播</td><td>每台发布自身状态到共享话题（<code>/fleet/state</code>）或各自私名，所有成员订阅全部</td><td>每台处理 N−1 路输入；N=20 时 19 路 × 10 Hz = 190 条/秒/台</td><td>N ≤ 30 的常规车队；实现最简单</td></tr>
+      <tr><td>中心汇聚</td><td>各机上报中央聚合器；中央转发一张汇总状态</td><td>每台只处理 1 路汇总</td><td>有大屏/调度中心的场景；中心是单点</td></tr>
+      <tr><td>混合</td><td>位姿全广播（谁都需要）；模式与任务走汇聚（调度关心的子集）</td><td>按数据语义分流</td><td>大多数真实系统的最优解</td></tr>
+    </table>
+    <p>代价提醒：广播的"链路成本"与"接收侧成本"不是一回事。链路上一份状态如果走共享话题只需传输一次（多播）或按订阅关系复制；但<strong>每台机器人的 CPU 都要真实处理 N−1 条回调</strong>，N=20、10 Hz 时每台每秒 190 次回调，回调里再放重活就是灾难（第 002 章的纪律：回调只写缓存）。中心汇聚省了接收侧，代价是"聚合器挂了全车队变瞎"，它需要真正的冗余或快速重启（第 019 章编排）。<strong>选型口诀：位姿等"人人要"的数据广播，任务等"少数要"的数据汇聚，中心必须能被降级容忍。</strong></p>
+    <p>把接收侧成本再具体化：回调本身不贵（一次写缓存约几十微秒），贵的是"回调里做决策"。190 次/秒 × 50 μs 的轻回调约 9.5 ms/s，占用一个核的 1% 以内，完全可接受；一旦每次回调 5 ms（读文件、发同步服务、调优化器），就是 950 ms/s，单核直接饱和。<strong>同一个拓扑，因回调纪律不同，CPU 占用能差出两个数量级</strong>，这就是"回调只写缓存"被反复强调的量化背景。</p>
+
+    <h3>4. 新鲜度窗口：把"过期"变成一等公民</h3>
+    <p>接收端的核心机制是新鲜度（staleness）判定：对每台他机记录<strong>最后收到的时间戳</strong>与<strong>本地时刻</strong>，按用途定义窗口：</p>
+    <div class="formula">
+      age = 本地时钟 − robo_id 状态的 stamp（需时间同步，或用"到达时刻差"近似）
+      <span class="note">编队控制：age &gt; 200 ms 判陈旧并减速/保持距离；显示：&gt; 1 s 变灰；调度决策：&gt; 5 s 视为不可派单</span>
+    </div>
+    <div class="formula">
+      行动窗口 W ≥ 状态周期 T + k × 链路抖动 p99（k 取 2–3）
+      <span class="note">T = 100 ms（10 Hz）、抖动 p99 = 33 ms 时 W ≥ 200 ms；抖动 p99 涨到 80 ms 则要 260–340 ms。窗口取小与"灵敏"无关，太小会让可用集频繁清空（练习 2 的现场）</span>
+    </div>
+    <ul>
+      <li><strong>行动级窗口（数百毫秒）</strong>：编队、避障等实时行为。陈旧他机状态不能直接进入控制律，必须降权、保持安全距离或切换到保守模式（"看不到邻居时，先停下或让路"的协商规则在第三篇展开）。</li>
+      <li><strong>展示级窗口（秒级）</strong>：监控界面。超窗显示灰色/未知，绝不显示"最后已知"却谎称实时。</li>
+      <li><strong>决策级窗口（数秒到数十秒）</strong>：任务分配等优化决策可容忍更旧，但必须把"数据年龄"作为决策输入（对一台 10 秒没更新的机器人派任务，等于赌它还在原地）。</li>
+    </ul>
+    <p>实现上推荐"<strong>缓存 + 时间窗</strong>"：接收回调只更新缓存（robot_id → 最新状态 + 接收时刻），定时器里评估各行的 age 并产出"可用状态集"。另一个重要子机制是<strong>失联标记</strong>：连续多个状态周期没收到（或 age 超最大窗口），把他机标记为 LOST 并保持上一次已知姿态（供避障保守使用），从"图上消失"到"显式失联"是安全性的分水岭。</p>
+
+    <h3>5. 乱序与丢包：序列号的两个用途</h3>
+    <p>网络可能乱序（路径变化、重传），接收端<strong>只接受比已见序号更大的状态</strong>，旧序号直接丢弃，防止"旧状态覆盖新状态"的回退。序列号还给出丢包率观测：连续序号中的缺口计数即丢包统计（第 035 章的链路监测同源）。这两个用途让状态消息里的 <code>seq</code> 字段从"可选"升级为"必须有"，它的成本是一个整数。</p>
+    <p>序列号之外还有一类异常要显式处理：<strong>age 为负</strong>。它通常意味着双方时钟跳变或同步质量劣化（第 009 章），与"收到了未来的数据"是两回事；正确做法是把该样本标记为不可信、不参与决策并触发告警，绝不能取绝对值继续用。<strong>把"异常 age"当作时钟健康指标上报</strong>，等于免费获得一份跨机同步质量监测。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>为 20 台巡逻车队设计状态同步系统，四步：</p>
+    <ol>
+      <li><strong>分通道</strong>：位姿状态（10 Hz，Best-effort，depth 5）与模式/任务事件（事件式，Reliable + TL，depth 1）两条流，前者要新鲜，后者要完整（第 011 章四象限的现场应用）。</li>
+      <li><strong>定拓扑</strong>：位姿走共享话题广播；监控与调度需要的"全队汇总"由一个聚合器发布 <code>/fleet/state_summary</code>（2 Hz），供大屏与跨网段桥接使用（第 016 章的跨段场景）。</li>
+      <li><strong>定窗口</strong>：行动级 200 ms、展示级 1 s、决策级 5 s，三档写进设计表，每个消费方写明自己用哪档。</li>
+      <li><strong>定验收</strong>：状态流健康（频率、丢包缺口率）、失联检测时间、恢复收敛时间、以及"陈旧状态不进入控制律"的代码级检查。</li>
+    </ol>
+
+    <h3>状态通道表</h3>
+    <table>
+      <tr><th>通道</th><th>话题</th><th>频率</th><th>QoS</th><th>消费方与窗口</th></tr>
+      <tr><td>位姿状态</td><td><code>/robotN/state</code></td><td>10 Hz</td><td>Best-effort、depth 5、Volatile</td><td>编队（200 ms）、显示（1 s）</td></tr>
+      <tr><td>模式/任务</td><td><code>/robotN/task_event</code></td><td>事件</td><td>Reliable + Transient-local、depth 1</td><td>调度（5 s）、审计</td></tr>
+      <tr><td>车队汇总</td><td><code>/fleet/state_summary</code></td><td>2 Hz</td><td>Reliable、depth 1</td><td>大屏、跨网段桥接</td></tr>
+      <tr><td>失联标记</td><td><code>/fleet/robot_lost</code></td><td>事件</td><td>Reliable + Transient-local、depth 5</td><td>所有成员的安全模块</td></tr>
+    </table>
+
+    <div class="box key">
+      <span class="box-title">设计决策：为什么位姿状态选 Best-effort 档？</span>
+      <p>位姿状态是"新闻类"数据：10 Hz 意味着每 100 ms 就有一条新的（第 011 章的判据）。丢一帧的后果是"邻机位置少了 100 ms 前的样本"，下一次更新立刻补上，而重传旧帧反而制造"新旧打架"：重传的 300 ms 前的位姿与刚到的当前位姿争抢缓存，处理不当就是状态回跳。<strong>让缓存永远只写"更新的 seq"，接受丢帧、拒绝旧帧</strong>，这就是 Best-effort + 序号门限的组合。反过来，模式与任务事件绝不能丢（任务号丢失会让协同逻辑把机器人当成"没有任务"），用它的是低频、可靠、TL 通道。<strong>重点在于把每条数据流放进四象限里语义正确的那一格，"哪种 QoS 更高级"是伪命题。</strong></p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：状态发布，字段、频率与序号</strong></p>
+    <pre class="code"><code>class StatePublisher(Node):
+    """本机状态播报：10 Hz 位姿 + 事件式模式，两条流各用各的 QoS。"""
+    def __init__(self, robot_id, boot_id):
+        super().__init__("state_pub", namespace=f"robot{robot_id}")
+        self.robot_id = robot_id
+        self.boot_id = boot_id                     # 生命周期标识：重启即换（第 019 章）
+        self.seq = 0
+        # 位姿状态：新闻类 → Best-effort；depth 5 仅作接收端缓冲
+        qos_state = QoSProfile(depth=5,
+                               reliability=ReliabilityPolicy.BEST_EFFORT,
+                               durability=DurabilityPolicy.VOLATILE)
+        self.pub_state = self.create_publisher(RobotState, "state", qos_state)
+        # 模式/任务：账本类 → Reliable + TL（晚加入者必须知道"现在在干什么"）
+        qos_task = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
+                              durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self.pub_task = self.create_publisher(TaskEvent, "task_event", qos_task)
+        self.create_timer(0.1, self.tick)          # 10 Hz：编队与显示的平衡点
+
+    def tick(self):
+        self.seq += 1                              # 递增序号：接收端用它防旧盖新
+        msg = RobotState()
+        msg.robot_id = self.robot_id
+        msg.boot_id = self.boot_id
+        msg.seq = self.seq
+        msg.stamp = self.get_clock().now().to_msg()  # 产生时刻：唯一合法的新鲜度锚点
+        self.fill_pose(msg)                        # 位姿：来自定位子系统（第 029 章）
+        self.fill_twist(msg)                       # 速度：供邻机做短时预测
+        msg.battery = self.battery_pct()
+        self.pub_state.publish(msg)
+
+    def set_task(self, task_id, mode):
+        ev = TaskEvent()                           # 事件式：变化时调用一次
+        ev.robot_id, ev.task_id, ev.mode = self.robot_id, task_id, mode
+        ev.stamp = self.get_clock().now().to_msg()
+        self.pub_task.publish(ev)                  # TL 保留最后一条给晚到订阅者</code></pre>
+    <p>解读：<strong>（1）</strong>两条流的 QoS 与频率决策在代码里一目了然，形成"位姿快而不补、任务慢而必达"的对照，这正是本章设计表的最小实现。<strong>（2）</strong><code>seq</code> 与 <code>boot_id</code> 一个管"会话内顺序"、一个管"跨会话身份"：接收端看到 boot_id 变化就知道这台机器人重启过，旧会话的缓存必须作废（否则重启前的高序号会把重启后的低序号全挡掉，这是很容易踩的顺序坑）。<strong>（3）</strong>时间戳在每次 tick 都刷新：状态消息的时效性是它的全部价值，<strong>一条没有正确时间戳的状态消息等于噪声</strong>。</p>
+
+    <p><strong>片段 2：状态缓存，序号门限与新鲜度评估</strong></p>
+    <pre class="code"><code>class StateCache(Node):
+    """他机状态缓存：收 19 路状态，产出"可用状态集"供本机决策。"""
+    def __init__(self, robot_ids, action_window=0.2, lost_window=1.0):
+        super().__init__("state_cache")
+        self.action_window = action_window         # 行动级窗口：200 ms（编队）
+        self.lost_window = lost_window             # 失联窗口：1 s
+        self.cache = {}                            # rid -&gt; (boot_id, seq, recv_t, state)
+        qos = QoSProfile(depth=5, reliability=ReliabilityPolicy.BEST_EFFORT)
+        for rid in robot_ids:                      # N 路订阅：回调只做写缓存
+            self.create_subscription(RobotState, f"/robot{rid}/state",
+                                     partial(self.on_state, rid), qos)
+        self.create_timer(0.05, self.evaluate)     # 20 Hz 评估：与状态同量级
+
+    def on_state(self, rid, msg):
+        old = self.cache.get(rid)
+        # 会话门限：boot_id 变化=对方重启，直接覆盖（见片段 1 的顺序坑）
+        if old is not None and old[0] == msg.boot_id and msg.seq &lt;= old[1]:
+            return                                 # 旧序号/乱序：丢弃，不许旧盖新
+        self.cache[rid] = (msg.boot_id, msg.seq, self.get_clock().now(), msg)
+
+    def evaluate(self):
+        now = self.get_clock().now()
+        self.usable, self.lost = {}, []
+        for rid, (boot, seq, recv_t, msg) in self.cache.items():
+            age = (now - recv_t).nanoseconds / 1e9  # 用本地到达时刻近似（免同步）
+            if age &lt;= self.action_window:
+                self.usable[rid] = msg              # 行动级可用：可进控制律
+            if age &gt; self.lost_window:
+                self.lost.append(rid)               # 失联标记：保持上次位置做保守避让
+        if self.lost:
+            self.get_logger().warn(f"[ROBOT_LOST] {self.lost}")  # 安全事件（第 018 章）</code></pre>
+    <p>解读：<strong>（1）</strong><code>on_state</code> 里的三行是"消息正确性门限"：会话检查（boot_id）+ 序号检查（旧盖新），注意注释里的顺序坑：重启后的新会话序号从头开始，如果不先比 boot_id，之前的"高序号"会把新消息全部挡掉。<strong>（2）</strong>新鲜度用<strong>本地到达时刻</strong>近似 age（免时间同步），它把网络延迟混进了 age，但对"反应是否够快"这个工程问题反而更贴切；需要精确的"数据年龄"时改用消息时间戳 + 同步（第 009 章），两种口径在文档里要写明。<strong>（3）</strong><code>evaluate</code> 的输出是"可用集 + 失联集"，让消费方按集合行动，<strong>陈旧和失联都变成显式状态，消费方不需要各自去猜</strong>。日志里的 <code>[ROBOT_LOST]</code> 事件码接上第 018 章的聚合与告警。</p>
+
+    <p><strong>片段 3：同步健康检查（CLI）</strong></p>
+    <pre class="code"><code>ros2 topic hz /robot1/state            # 10 Hz ±10%：先看本机播报是否健康
+ros2 topic bw /robot3/state            # 单条大小 × 频率：核对带宽预算
+ros2 topic echo /robot1/state --once   # 字段抽查：stamp/seq/boot_id 是否在刷新
+# 丢包观测：连续采样 seq 找缺口（缺口率 = 丢包率的近似）
+ros2 topic echo /robot3/state --field seq | head -50
+# 失联演练：断开 robot5 的状态源，观察各机 [ROBOT_LOST] 出现时间（≈1 s 窗口）
+# 恢复演练：恢复后确认 boot_id 未变（未重启）或已变（重启），缓存行为符合设计
+# 汇总端核对：/fleet/state_summary 的成员数应与在线机器人数一致</code></pre>
+    <p>解读：这份检查单覆盖了状态同步的全部验收面：<strong>频率（基本盘）→ 带宽（预算）→ 字段（时序完整性）→ 丢包（链路质量）→ 失联与恢复（机制正确性）→ 汇总一致性（端到端）</strong>。用 <code>--field seq</code> 连续采样找缺口，是最朴素也最可靠的丢包观测法，比盯着 <code>hz</code> 的数字更有信息量：频率正常但有缺口，说明"发得稳但路上丢了"。最后一行把汇聚端的视角纳入验收：<strong>每台机器人自检健康不等于系统视角健康</strong>，两端对上才算同步成立。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>用接收时刻冒充产生时刻</strong>：状态消息不带 stamp（或下游覆盖成接收时间），导致融合/预测把"传输延迟"当成"运动位移"。修复：stamp 一律由产生方用 ROS 时钟写入；接收端区分"消息时间"与"到达时间"两种口径。</li>
+      <li><strong>没有新鲜度窗口</strong>：拿 10 秒前的状态做编队，等于与"幽灵"编队。修复：缓存 + 三档窗口（行动/展示/决策）；陈旧即显式降级。</li>
+      <li><strong>旧序号覆盖新状态</strong>：乱序消息让位姿"回跳"。修复：序号门限 + boot_id 会话检查（片段 2 的顺序坑）。</li>
+      <li><strong>N 路回调里做重活</strong>：20 台全广播时每台 190 回调/秒，回调里做决策会把执行器拖垮。修复：回调只写缓存；评估与决策放定时器；必要时用多线程执行器并明确共享数据加锁。</li>
+      <li><strong>失联后仍用最后已知位姿激进规划</strong>：一台机器人掉线 5 秒后位置可能完全变了（被推走、重启漂移）。修复：LOST 集合进入保守规则（保持距离/停让）；调度级决策排除失联成员。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>计算题：20 台、状态 200 B、10 Hz。全网广播下：(a) 共享话题（假设多播等价单次传输）的链路带宽；(b) 每台接收端每秒处理的消息数与入口带宽。若改为中心汇聚（各机上报 + 中央转发汇总），两项数字如何变化？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>(a) 全多播口径约 40 KB/s；若不做多播、按每条消息 19 份副本计约 760 KB/s（副本口径必须在答案里注明）；(b) 190 条/s、38 KB/s/台。汇聚：每台入口仅 1 路汇总；中心侧 2N 条链路，省的是接收侧 CPU，代价是中心单点。</div></details>
+      </li>
+      <li>改配置并预测：把片段 2 的 <code>action_window</code> 从 0.2 s 改成 0.05 s（更严），在 WiFi 抖动 p99=80 ms 的现场，预测"可用集"大小的变化与后果（编队会看到几台机器人）。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>10 Hz 流中位间隔 100 ms，加上 80 ms 抖动，半数以上状态会超过 50 ms 窗口，可用集频繁清空，编队"看不到人"而误停。窗口要 ≥ 状态周期 + 链路抖动 p99 的 2–3 倍。</div></details>
+      </li>
+      <li>设计题：给"协同探索"设计状态需求：探索队需要他机的哪些字段、什么频率、什么窗口？与"编队控制"的需求画表对比，并解释两条通道能否合并。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>探索：位置 + 当前目标/覆盖区域，1–2 Hz 足够（决策级窗口 1–5 s）；编队：位姿 + 速度 10–20 Hz（行动级 200 ms）。需求差异大，合并会要么浪费带宽要么拖慢编队，分通道。</div></details>
+      </li>
+      <li>推导题：设计"状态丢失可见性"测试：给出至少四种注入（停发、丢 30%、乱序、时钟跳变），分别写出预期系统行为与观测点（哪个话题/哪个日志）。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>停发→[ROBOT_LOST] ≈1 s；丢 30%→seq 缺口率统计上升、可用集仍健康；乱序→被序号门限丢弃（观察丢弃计数）；时钟跳变→age 负值/突变，触发第 009 章的跳变告警。</div></details>
+      </li>
+      <li>综合题：为第 020 章的双机系统升级到 4 台编队，画出状态同步的最终拓扑图（发布者、话题、订阅者、窗口、QoS），并标出新增的带宽与 CPU 成本点。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>位姿广播 + 任务汇聚的混合拓扑；成本点：每台接收侧 3 路回调（N−1=3）、汇总端 1 路、失联事件 1 路；把回调预算与执行器模型写进设计表。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>状态同步 = 带时间戳的近况图：接收到的永远是过去的他机；把延迟显式化，承认它的存在。</li>
+      <li>状态消息必备：robot_id + boot_id、stamp + seq、位姿与运动、模式与健康；位姿快而不补（BE）、任务慢而必达（Reliable + TL）。</li>
+      <li>拓扑按语义分：位姿广播（人人要）、任务汇聚（少数要）、中心可降级；接收侧 CPU 成本随 N 线性增长，回调只写缓存。</li>
+      <li>新鲜度三档窗口（行动 200 ms / 展示 1 s / 决策 5 s）+ 失联标记；陈旧与失联都是一等公民状态。</li>
+      <li>序号门限防旧盖新，boot_id 区分会话与重启；两者合起来才能正确处理乱序与恢复。</li>
+      <li>第二篇继续深入：下一章 <strong>共享内存与零拷贝传输</strong>，同机大消息不再拷来拷去。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch020.html">← 第 020 章：阶段项目：双机器人通信与遥控</a>
+    <a class="next" href="ch022.html">第 022 章：共享内存与零拷贝传输 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

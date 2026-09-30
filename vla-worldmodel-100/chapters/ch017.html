@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第017章 世界模型的隐空间学习 | 具身智能学习课程 · VLA 与世界模型联合训练</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · 基础框架与联合训练</span>
+    <span class="sep">/</span>
+    <span>第 017 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · 基础框架与联合训练</div>
+    <h1>第 017 章：世界模型的隐空间学习</h1>
+    <p class="lead">本章深入世界模型的表示层：隐空间压缩的动机、重建与 KL 目标的权衡、类别潜变量的结构化设计，以及无解码器自预测路线与表示质量评估，构成从像素预测到潜空间预测的完整升级路径。</p>
+    <ul class="meta">
+      <li>主题：世界模型 / 隐空间表示学习</li>
+      <li>关键公式：L<sub>ELBO</sub> = -E[log p(o|z)] + β·D<sub>KL</sub>(q(z|o) ‖ p(z))</li>
+      <li>预计学时：70 分钟</li>
+      <li>前置章节：第 016 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解隐空间预测替像素预测的三层动机：计算成本、抽象层次、任务信息与渲染信息的分离。</li>
+      <li>掌握变分自编码器（Variational Autoencoder, VAE）的重建与 KL 目标，理解 KL 坍缩的机理与防护（Free Bits、KL 平衡）。</li>
+      <li>掌握结构化潜变量设计：确定性循环状态与随机潜变量的分工，类别潜变量与直通梯度的实现。</li>
+      <li>理解无解码器自预测路线的目标与表示坍缩问题，掌握停止梯度与 EMA 教师的配合。</li>
+      <li>能设计隐空间质量评估：探测任务、多步预测误差、紧致度指标的组合。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>003 与 011 章在像素空间完成世界模型基础形式，代价在计算量与信息分配：与任务无关的纹理、光照、背景占据大量重建容量。<strong>隐空间学习把观测压到低维表示，在表示空间做动力学预测，让容量集中于任务相关的变化。</strong></p>
+    <p>这一升级同时改变三件事：推演成本（潜向量维数比像素低三到四个数量级，006 章的批量 rollout 可在潜空间高频执行）、预测对象（从画面细节转为状态本质）、评估方式（重建指标不再充分，需要探测与预测类指标）。Dreamer 系列证明了潜空间世界模型在控制任务上的可行性，本章把其中的表示学习机制抽出来单独讲解。</p>
+    <p>与相邻章节的边界：本章只处理“表示怎么学”，潜空间动力学的结构在 011 章已给出模板；057 章深入随机性建模，036 章处理多步误差修正；017 章是后续第三、四篇中一切潜空间方法的公共基础。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 隐空间压缩的三层动机</h3>
+    <p><strong>成本动机</strong>：潜向量序列取代帧序列后，注意力矩阵规模、激活显存与 rollout 时间都按维度比例下降，006 章的“短视界、多分支、海量重锚定”在潜空间下才算得过来。<strong>抽象动机</strong>：控制相关的变化（物体位移、关节角）远小于画面总信息，隐空间把动力学问题的有效维度降下来。<strong>分离动机</strong>：解码器负责渲染细节，动力学只面对状态摘要，两件事的容量不再互相挤占（003 章结论的延续）。</p>
+    <p>压缩的量级用数字界定：224×224×3 的画面含 150528 个数值，压到 256 维后按元素数之比为 588 倍；若按存储口径（uint8 像素 150528 字节对 fp32 潜向量 1024 字节）则为 147 倍。真正决定 rollout 成本的是后续计算的对象：011 章主干在每帧 196 个 token 上做注意力，单帧分数矩阵约 196×196 ≈ 3.8×10<sup>4</sup> 个；潜空间下每帧只有一个 256 维向量，时间注意力的分数规模降到帧数的平方量级，006 章批量 rollout 的分支数因此可以放大一到两个数量级。</p>
+
+    <h3>2. 重建与 KL：VAE 目标</h3>
+    <p>编码器给出后验分布，解码器负责重建，两者用变分下界联合训练：</p>
+    <div class="formula">
+      L<sub>ELBO</sub> = -E<sub>q(z|o)</sub>[ log p(o|z) ] + β · D<sub>KL</sub>( q(z|o) ‖ p(z) )
+      <span class="note">第一项为重建负对数似然；第二项约束后验接近先验；β 控制两项相对强度</span>
+    </div>
+    <p>连续潜变量经重参数化采样（z = μ + σ⊙ε）保持梯度通路。训练动态由 β 主导：β 过小则潜空间缺少约束、动力学难学；β 过大则 KL 主导，后验被压向先验、潜变量不再携带观测信息，即 KL 坍缩（Posterior Collapse）。<strong>防护手段有二：Free Bits 给每维 KL 设下限、低于下限不再优化（保证信息通道）；KL 平衡调整先验与后验两侧的梯度配比。</strong></p>
+    <p>KL 的数值行为用一个单维算例展开：标准正态先验下，μ=0、σ=1 时 KL 为 0；μ=1、σ=1 时 KL 为 0.5；μ=0、σ=0.5 时 KL 为 0.318；μ=0、σ=2 时 KL 为 0.807。把 Free Bits 设成每维 1 nat 后，0.318 与 0.807 中低于 1 的部分被截断为零梯度，只有超过 1 nat 的维度继续受 KL 约束。<strong>截断的含义是“每维至少携带 1 nat 的信息不被惩罚”</strong>，256 维全部处于 σ=0.5 水平时理论 KL 总量约 81 nat，而优化目标实际收到的只有超出下限的部分。β 的预热调度给信息通道先开路：β 从 0.1 线性升到 1.0、窗口 1 万步时，第 0、5000、10000 步的取值分别为 0.1、0.55、1.0，前段低权重让编码器先把观测信息装进潜变量，后段再收紧先验约束。</p>
+
+    <h3>3. 结构化潜变量：确定与随机的分工</h3>
+    <p>纯随机潜变量承担记忆职责时效率低，Dreamer 系列给出分工：确定性循环状态 h<sub>t</sub> 记录历史（记忆），随机潜变量 z<sub>t</sub> 表示当前观测中未被历史解释的新信息（随机性）。</p>
+    <div class="formula">
+      h<sub>t</sub> = f<sub>rec</sub>(h<sub>t-1</sub>, z<sub>t-1</sub>, a<sub>t-1</sub>) ； z<sub>t</sub> ~ q(z<sub>t</sub> | h<sub>t</sub>, o<sub>t</sub>)，先验 ŷ<sub>t</sub> ~ p(z<sub>t</sub> | h<sub>t</sub>)
+      <span class="note">q 为后验（见到观测），p 为先验（只有历史）；动力学训练同时约束两者</span>
+    </div>
+    <p>结构化设计的收益：<strong>推演时只依赖先验（无观测可看），训练时用后验吸收信息，两者的 KL 距离正是“历史对当前观测的预测误差”</strong>。类别潜变量（多组离散分类变量）对长程依赖更稳定，直通梯度把采样操作的前向离散性与反向连续性拼在一起；KL 平衡按比例缩放先验侧与后验侧的梯度，防止一侧主导。</p>
+    <p>典型配置把两种状态并列：确定性状态 512 维承担记忆，随机潜变量 256 维承担新信息，动力学输入为 768 维。分工的判据在推演阶段：给定相同历史与动作，先验采样的多次 z 应呈现“同分布但不同样本”的行为，方差来自真实的环境随机性；若先验方差趋近零，说明随机通道退化为第二份记忆，结构化收益消失，应检查 KL 平衡与 β 的设置。</p>
+    <p>KL 平衡的权重分配给出另一种调节手段：修正项写作 α·KL(sg(q)‖p) + (1-α)·KL(q‖sg(p))，α=0.8 时后验侧承担八成纠正压力，先验侧只拿两成；调低到 0.5 让两侧均衡、先验在早期获得更多训练信号；调高到 0.9 则先验更新过慢，推演（只依赖先验）与训练（依赖后验）的行为差距扩大，典型症状是训练损失正常但 rollout 明显偏离。α 的扫描应与“先验与后验的 KL 距离”曲线联合观察，距离长期偏大说明先验没有跟上。</p>
+    <p>潜空间 rollout 的成本模型可以一句话给出：单分支成本为 H 次动力学前向，每次前向的矩阵规模由状态维数决定，768 维状态下单步约 768<sup>2</sup> ≈ 6×10<sup>5</sup> 次乘加，8 步约 5×10<sup>6</sup>，相对像素级单帧编码的开销低约两个数量级。006 章的多分支重锚定由此从“勉强可行”变为“常态配置”，这是隐空间升级最直接的工程回报。</p>
+    <p>低维潜空间的边界在多物体场景显现：多个物体同时运动时，压缩后的表示可能出现混叠，不同物理配置映射到相近潜码，动力学对二者给出近似预测，表现为规划推演在遮挡与交错场景下“张冠李戴”。缓解按代价递增：提高潜维数；在编码器引入空间归纳偏置（分块编码后再池化）；对场景物体数分档评估，确认混叠出现的物体数阈值，把该阈值写进任务适用范围。</p>
+
+    <h3>4. 无解码器自预测路线</h3>
+    <p>重建目标把大量容量耗在渲染细节上，另一条路线完全不建解码器：让表示在时间上可预测, 用“预测下一步表示”作为唯一学习信号：</p>
+    <div class="formula">
+      L<sub>SPR</sub> = ‖g(z<sub>t</sub>, a<sub>t</sub>) - sg(z̄<sub>t+1</sub>)‖<sup>2</sup>
+      <span class="note">z̄ 为目标表示（EMA 教师或同批次另一视图）；sg 为停止梯度</span>
+    </div>
+    <p>自预测路线的天然风险是表示坍缩：把一切输入映射到同一常数，预测损失为零但表示无信息。<strong>两道防护：停止梯度加 EMA 教师打破对称性，方差或去相关的正则项维持表示的散布度。</strong>掩码潜预测（对部分 token 预测其余 token 的表示）在视觉表示上表现突出，其思想与本章的自预测一致，区别在预测的空间与时间方向不同。</p>
+    <p>坍缩解的损失可以算出来：所有输入映射到常数向量时，预测项精确为零，逐维方差为零使方差 hinge 取满值 1，总损失只剩 0.1×1 = 0.1 的正则项；而正常解的预测误差通常远大于 0.1 量级，优化器在早期倾向先压低预测项，一旦表示开始趋同，方差项成为唯一梯度来源并把表示推回散布状态。<strong>方差 hinge 的权重因此不能太小</strong>：小于 0.01 时坍缩解的损失优势过大，优化路径上出现“先坍缩再挣脱”的无效阶段。监控手段是逐维方差直方图，健康表示的有效维度随训练上升，坍缩征兆是方差分布持续向零端堆积。</p>
+
+    <h3>5. 表示质量评估</h3>
+    <p>重建指标（PSNR、感知损失）只反映渲染质量，无法判断表示的决策价值。评估组合三项：<strong>探测任务</strong>，冻结表示后训练线性分类器预测关键状态量（物体位置、末端姿态），准确率反映信息保真度；<strong>多步预测误差</strong>，在表示空间展开 5–15 步的动态误差，反映动力学适配度；<strong>紧致度</strong>，表示的有效维度或方差分布，反映容量利用。三项指标共同构成“信息足够、动态可预测、维度不冗余”的判据。</p>
+    <p>探测指标必须与基线并列报告：位置回归给随机猜测的方差基线，分类给多数类基线，只有相对基线的增益才说明表示携带信息；线性探测刻意限制容量，增益归因更干净。紧致度用有效秩度量：对表示协方差矩阵的特征值归一化为分布 p，有效秩为 exp(H(p))，H 为熵。算例：特征值占比为 2/3、1/6、1/6 时熵约 0.868，有效秩约 2.4，说明 256 维表示实际只用了两到三个方向；有效秩过低提示容量浪费，过高且探测增益不涨提示维度冗余，两个方向的修复分别是加宽动力学容量与收紧 KL。</p>
+    <p>多步预测误差按 5、10、15 步分档报告，健康形态是误差单调上升且 15 步内不越过训练集统计阈值（阈值取训练集误差分布的 95% 分位，跨模型对比时保持同一口径）；若 5 步档已经越线，问题在单步动力学质量，先查动作注入对齐（011 章）；若曲线在 10 步附近出现拐点，通常是潜空间的长期漂移，处理手段是 036 章的多步误差修正。三条指标的组合判读规则：探测增益高加预测误差低属于健康；探测增益高但预测误差高说明表示信息足而动力学弱；探测增益低则无论其他指标如何都应回到编码器与 β 的设置重查。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>三路线选型：连续潜变量衔接扩散生成方法；类别潜变量适合长程推演；无解码器自预测用于表示预训练。三者可组合：自预测预训练编码器，再接结构化动力学。</p>
+    <table>
+      <tr><th>路线</th><th>监督信号</th><th>表示特性</th><th>主要失效</th><th>适用</th></tr>
+      <tr><td>连续潜变量（VAE）</td><td>重建加 KL</td><td>连续、可采样</td><td>KL 坍缩、多物体混叠</td><td>衔接扩散生成与连续控制</td></tr>
+      <tr><td>类别潜变量</td><td>重建加 KL 平衡</td><td>离散、结构化</td><td>直通梯度尺度失衡</td><td>长程推演</td></tr>
+      <tr><td>无解码器自预测</td><td>下一状态表示预测</td><td>任务相关信息浓缩</td><td>表示坍缩</td><td>表示预训练</td></tr>
+    </table>
+    <p>选择判据按可用监督排序：有可靠重建目标且需要可视化回溯时取连续潜变量路线；推演步数长、随机性结构重要时叠加类别潜变量；只有表示质量目标、下游另有解码路径时用自预测路线，三者的组合顺序是先自预测预训练、再接结构化动力学。</p>
+    <h3>关键参数起点</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>连续潜维数</td><td>256</td><td>压缩比基准</td><td>画面 224×224×3 压到千分之一量级</td></tr>
+      <tr><td>类别潜结构</td><td>32 组 × 32 类</td><td>结构化随机性</td><td>Dreamer 系列的常用配置量级</td></tr>
+      <tr><td>β（KL 权重）</td><td>0.1 → 1.0 预热调度</td><td>信息与正则的平衡</td><td>从低起步给信息通道先通路的时间</td></tr>
+      <tr><td>Free Bits</td><td>每维 1 nat</td><td>防 KL 坍缩</td><td>低于下限的 KL 不再被优化</td></tr>
+      <tr><td>EMA 教师系数</td><td>0.99</td><td>自预测目标平滑</td><td>与 007 章目标网络同量级</td></tr>
+      <tr><td>掩码比例</td><td>0.5（预训练期）</td><td>自预测任务难度</td><td>覆盖一半 token 预测其余</td></tr>
+      <tr><td>探测步长</td><td>5–15 步</td><td>动力学评估</td><td>与全课程预测视界约定一致</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：解码器保留但降权，不作为主监督</span>
+      <p>去掉解码器会失去可视化与检查手段，重建为主又挤占表示容量。折中：保留轻量解码器、重建权重调到 0.2 量级，主监督交给动力学与自预测项；关键帧解码仍按 006 章约定执行。</p>
+    </div>
+    <p>衔接与差异：本章替换的是“预测对象”，保留“预测框架”：011 章的时空主干、004 章的动作条件、006 章的 rollout 循环在潜空间下全部保留，只是张量形状从像素换为潜向量；016 章的显存预算公式随之更新主导项。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>片段以 Dreamer 系列与自监督表示学习的公开设计为参照，接口随版本演进。第 1 段给出连续潜变量编码与 KL 目标。</p>
+
+    <p><strong>片段 1：变分编码与 KL 目标</strong></p>
+    <pre class="code"><code>import torch
+import torch.nn as nn
+
+class VariationalEncoder(nn.Module):
+    """连续潜变量编码器：输出均值与对数方差，经重参数化采样保持梯度通路。"""
+    def __init__(self, d_in=512, d_latent=256):
+        super().__init__()
+        self.to_stats = nn.Linear(d_in, 2 * d_latent)   # 一半均值一半对数方差
+
+    def forward(self, feat):
+        mu, log_sigma = self.to_stats(feat).chunk(2, dim=-1)
+        # 对数方差限幅：扩散过大会让采样噪声淹没信号，过小则 KL 估计不稳
+        log_sigma = log_sigma.clamp(min=-6.0, max=2.0)
+        # 重参数化：噪声的随机性与参数的可导性分离，梯度可回传统计量
+        eps = torch.randn_like(mu)
+        z = mu + torch.exp(0.5 * log_sigma) * eps
+        return z, mu, log_sigma
+
+def vae_kl(mu, log_sigma, free_bits=1.0):
+    """标准正态先验下的 KL：按维度计算，Free Bits 只保留超下限的部分。"""
+    # 解析式 KL(N(mu,sigma) || N(0,1))：逐维求和后除以样本数
+    kl = 0.5 * (mu.pow(2) + log_sigma.exp() - 1.0 - log_sigma)   # (B, d)
+    if free_bits &gt; 0:
+        # 低于下限的维度不再被优化：信息通道保底，防后验坍缩到先验
+        kl = torch.clamp(kl - free_bits, min=0.0)
+    return kl.sum(dim=-1).mean()</code></pre>
+    <p>解读：<strong>（1）</strong>对数方差限幅是数值稳定的常规手段，上下界分别防“噪声淹没信号”与“梯度不稳”。<strong>（2）</strong>KL 用解析式逐维计算，Free Bits 逐维生效：整样本级的下限会让“个别维度携带信息、其余坍缩”被掩盖。<strong>（3）</strong>β 乘在 KL 项外（调用方组合），与 005 章的权重设施一致，调度 β 的预热曲线即可控制“先学信息、再加约束”的节奏。</p>
+
+    <p><strong>片段 2：类别潜变量与直通梯度</strong></p>
+    <pre class="code"><code>def categorical_latent(logits, n_cat=32, straight_through=True):
+    """类别潜变量：采样离散码，直通梯度保持反向可导。"""
+    # logits (B, C, K)：C 组、每组 K 类；softmax 得到组内分布
+    dist = torch.distributions.Categorical(logits=logits)
+    idx = dist.sample()                              # (B, C) 离散采样结果
+    onehot = nn.functional.one_hot(idx, n_cat).float()
+    if straight_through:
+        # 直通：前向用 onehot，反向借用 softmax 概率的梯度路径
+        soft = nn.functional.softmax(logits, dim=-1)
+        z = (onehot - soft).detach() + soft          # 前向等于 onehot，反向等于 soft
+    else:
+        z = onehot
+    return z.flatten(1)                              # (B, C*K) 展平供动力学使用
+
+def kl_balance(post_logits, prior_logits, alpha=0.8):
+    """KL 平衡：后验侧梯度放大、先验侧压缩，防止一侧主导表示学习。"""
+    post = torch.distributions.Categorical(logits=post_logits)
+    prior = torch.distributions.Categorical(logits=prior_logits)
+    # 交叉熵形式的 KL 估计：kl_bal = alpha·KL(sg(post)||prior) + (1-alpha)·KL(post||sg(prior))
+    kl_post = torch.distributions.kl_divergence(post, prior.detach()).sum(dim=-1)
+    kl_prior = torch.distributions.kl_divergence(post.detach(), prior).sum(dim=-1)
+    return alpha * kl_post + (1.0 - alpha) * kl_prior</code></pre>
+    <p>解读：<strong>（1）</strong>onehot - soft 的 detach 组合实现直通：前向值等于离散采样、反向梯度等于连续松弛，两类需求同时满足。<strong>（2）</strong>alpha 取 0.8：梯度更多给后验侧纠正，先验侧只承担被预测部分。<strong>（3）</strong>展平后的类别潜变量进入动力学前通常再加一层嵌入映射，避免离散码的直接数值进入线性层造成统计异常。</p>
+
+    <p><strong>片段 3：无解码器自预测与表示分布保护</strong></p>
+    <pre class="code"><code>@torch.no_grad()
+def ema_update(teacher, student, decay=0.99):
+    """EMA 教师：为自预测提供平滑目标，打破学生与目标之间的对称性。"""
+    for pt, ps in zip(teacher.parameters(), student.parameters()):
+        pt.mul_(decay).add_(ps.detach(), alpha=1.0 - decay)
+
+def self_prediction_loss(student, teacher, z, action):
+    """自预测：学生预测教师对下一状态的表示；停止梯度防止表示坍缩。"""
+    # 学生侧：从当前表示与动作预测下一表示；教师侧目标整体 detach
+    pred = student.predict(z, action)
+    with torch.no_grad():
+        target = teacher.encode_next(z, action)      # 目标表示不回传梯度
+    loss_pred = nn.functional.mse_loss(pred, target)
+    # 方差保护：表示逐维方差的 hinge 下限，防止全体坍缩到常数向量
+    var = z.var(dim=0)
+    loss_var = torch.clamp(1.0 - var, min=0.0).mean()
+    return loss_pred + 0.1 * loss_var</code></pre>
+    <p>解读：<strong>（1）</strong>教师网络用 EMA 更新，不做直接复制，目标表示的变化速度受限，自预测任务不会随目标一起塌缩。<strong>（2）</strong>目标侧整体 no_grad：梯度只经学生路径，配合 EMA 构成经典的“学生预测教师”结构。<strong>（3）</strong>方差 hinge 是坍缩的最后防线；权重 0.1 起步，过大会损失判别性，需与预测误差联合调参。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>KL 坍缩</strong>：重建正常但潜变量对观测不敏感，动力学学不到有效变化。修复：Free Bits 保底、β 预热调度、KL 平衡三件套联合启用。</li>
+      <li><strong>直通梯度尺度失衡</strong>：离散码展平后直接进线性层，数值尺度与连续特征不匹配。修复：加嵌入映射并做归一化，监控潜变量的逐维统计。</li>
+      <li><strong>表示坍缩（无解码器）</strong>：自预测损失降为零但探测任务准确率同步下降。修复：检查 EMA 与停止梯度是否生效，增大方差正则权重。</li>
+      <li><strong>只用重建指标评估</strong>：解码画面漂亮但下游任务表现差，问题被掩盖。修复：加入探测与多步预测两类指标，重建指标降级为检查项。</li>
+      <li><strong>潜维数配置过小</strong>：压缩比过高导致细节状态丢失，任务成功率下降。修复：按探测任务的信息保真度扫描维数，找到“信息足够”的下限再压。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>224×224×3 的观测压到 256 维连续潜变量，计算压缩比，并估算 rollout 中注意力矩阵规模的下降倍数。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>压缩比按元素数约 588 倍（按存储字节约 147 倍）；注意力矩阵从 196×196 级降到帧向量级，规模下降约四个数量级。</div></details>
+      </li>
+      <li>把 β 从 0.1 提到 5.0，预测重建指标与探测准确率的走向，给出判断依据。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>重建劣化、探测准确率下降，潜变量趋于忽略观测；用两项指标与潜变量方差曲线联合判断坍缩程度。</div></details>
+      </li>
+      <li>推导：说明重参数化技巧为什么能让采样操作反向可导，并写出方差的梯度表达式。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>把随机性转移到与参数无关的 ε 上，z 成为 μ 与 σ 的确定性函数；对 σ 的梯度经 exp(0.5·log σ)·ε 项传导。</div></details>
+      </li>
+      <li>设计隐空间质量的完整评估协议：探测任务清单、预测误差曲线、紧致度指标、通过阈值，写出各指标的采集方式。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>探测用冻结表示加线性头评估位置与姿态；预测误差按 5/10/15 步分档；紧致度用有效秩或方差熵；阈值取训练集统计分位。</div></details>
+      </li>
+      <li>构造实验：在同一编码器上分别接入“重建为主”“自预测为主”“两者组合”三种目标，比较探测准确率与可视化质量，解释结果。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>重建为主的可视化最好、探测一般；自预测为主的探测最好、可视化差；组合方案两项均衡。结论应结合下游任务需求给出选型建议。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul>
+      <li>隐空间压缩的动机是成本、抽象、容量分离三层；推演与预测对象随之从像素转向状态摘要。</li>
+      <li>VAE 目标由重建与 KL 构成，β 主导权衡，Free Bits 与 KL 平衡防坍缩。</li>
+      <li>结构化潜变量让确定性状态记历史、随机潜变量表新信息，类别码配直通梯度与 KL 平衡。</li>
+      <li>无解码器自预测用 EMA 教师与停止梯度防坍缩，方差正则兜底。</li>
+      <li>表示质量用探测、多步预测、紧致度三项评估，<strong>重建指标不再是主证据</strong>。</li>
+      <li>下一章给训练过程加入难度调度：联合训练中的课程学习。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch016.html">← 第 016 章：VLA策略的端到端训练</a>
+    <a class="next" href="ch018.html">第 018 章：联合训练中的课程学习 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2726%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.10;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.07;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:12.5px;letter-spacing:.06em;color:rgba(51,65,85,.6);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#94a3b8;font-size:12.5px;line-height:1.8;text-align:center;padding:7px 14px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.10 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:12.5px !important;letter-spacing:.06em !important;color:rgba(51,65,85,.6) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#94a3b8 !important;font-size:12.5px !important;line-height:1.8 !important;text-align:center !important;padding:7px 14px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>
