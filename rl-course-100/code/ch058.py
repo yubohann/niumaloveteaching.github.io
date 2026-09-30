@@ -19,8 +19,10 @@ Pendulum 回报恒为负，用幅度比的口径：1 表示无损失，越小损
     python code/ch058.py           # 训练 2 个策略 + 扰动电池（CPU 约 2-4 分钟）
     python code/ch058.py --quick   # 快速跑通（约 40 秒）
 
-预期：noisy 在观测噪声条件下保持率明显更高；对动作噪声与延迟，两者
-差距较小；动力学偏移上 clean 甚至可能略好（训练分布未覆盖偏移）。
+预期：观测噪声档位上两个策略的保持率几乎相同，噪声增强没有带来可辨的
+差异；出现差异的是重力偏移 g=12 与动作延迟 4 步档位（参考实跑中 noisy
+的保持率分别高出约 0.17 与 0.06）。每种条件只评估 4 回合，读数噪声很大，
+方向性结论需要多种子、更多回合复核。以实跑为准。
 """
 import argparse
 import os
@@ -368,9 +370,10 @@ def main():
     avg_clean = np.mean([base["clean"] / min(r["clean"], -1e-9) for _, r in results[1:]])
     avg_noisy = np.mean([base["noisy"] / min(r["noisy"], -1e-9) for _, r in results[1:]])
     print(f"平均保持率（不含干净基线）：clean {avg_clean:.2f} | noisy {avg_noisy:.2f}")
-    print("结论提示：观测噪声上 noisy 的保持率更高（训练分布覆盖了扰动）；动作")
-    print("噪声、延迟与动力学偏移上两者接近——它们属于不同的鲁棒性维度，想在")
-    print("哪一维变强，就需要在训练里针对性地覆盖它。")
+    print("结论提示：参考实跑（种子 0，默认配置）中，观测噪声档位上两个")
+    print("策略的保持率几乎相同，噪声增强没有带来可辨的差异；出现差异的是重力")
+    print("偏移 g=12 与动作延迟 4 步档位。单次条件评估的读数噪声很大，方向性")
+    print("结论需要多种子、更多回合复核；四类扰动分开测量，才能说清强弱在哪。")
 
     os.makedirs(args.save_dir, exist_ok=True)
     print(f"输出目录：{args.save_dir}")

@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第035章 路径约束 | 机械臂规划学习课程 · ROS2 MoveIt2 运动规划与操作</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 规划场景与碰撞管理</span>
+    <span class="sep">/</span>
+    <span>第 035 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 规划场景与碰撞管理</div>
+    <h1>第 035 章：路径约束</h1>
+    <p class="lead">把任务语义写进规划问题：本章讲目标约束与路径约束的分工、约束可行集的流形结构、采样投影的牛顿迭代与切空间分解，以及约束施加、清除、复核的完整流程。</p>
+    <ul class="meta">
+      <li>主题：运动学约束 / 规划请求约束</li>
+      <li>关键机制：约束流形与可行集、投影采样、约束的请求级生命周期</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 034 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>分清目标约束（Goal Constraints）与路径约束（Path Constraints）的作用域差异，知道什么任务要求应当施加在哪一类。</li>
+      <li>理解约束在配置空间中的几何含义：可行集是自由空间与约束流形的交，交集为空时任何规划器都无解。</li>
+      <li>掌握投影采样的原理：牛顿迭代把采样点拉回流形，切空间分解说明流形方向的自由度。</li>
+      <li>会完整执行约束的施加、规划、清除、复核四步流程，避免约束泄漏到后续任务。</li>
+      <li>能诊断约束引起的规划失败：空集、容差失配、参考系解析失败三类成因与验证手段。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>避障规划只回答"能否无碰撞地到达"，任务语义还包含额外的几何要求：焊接时工具要保持在接缝所在的平面上，浇注时壶口方向要维持竖直，扫描时末端要沿一条直线平动。这些要求不能只落在终点上，它们描述的是"轨迹全程的姿态纪律"。规划请求为此提供两类约束槽位：目标约束只参与终点投影，路径约束作用于每一个被规划器考虑的状态。</p>
+    <p>约束把规划问题从"在自由空间找一条路"变成"在自由空间与约束曲面的交集中找一条路"。交集越小，问题越难；交集为空，问题无解。<strong>约束设计的本质是在"任务表达的精确性"与"可行集的体积"之间取舍：过宽等于没约束，过紧会让规划器耗尽预算。</strong>本章讲这条曲线的数学结构与工程流程，第 036、037 章分别展开位置方向约束与关节可见性约束的具体构造。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 两类约束：作用域决定一切</h3>
+    <p>规划请求（MotionPlanRequest）携带两组约束。目标约束（goal_constraints）是一组可替换的目标区域，规划器把终点投影到其中；路径约束（path_constraints）则在规划过程中作用于每个候选状态，任何不满足它的状态都被视为无效，与碰撞状态同级处理。两者的差异可以用一句判据概括：<strong>要求"到达时成立"的写进目标约束，要求"全程成立"的写进路径约束。</strong></p>
+    <table>
+      <tr><th>维度</th><th>目标约束</th><th>路径约束</th></tr>
+      <tr><td>作用范围</td><td>轨迹终点</td><td>轨迹全程的每个状态</td></tr>
+      <tr><td>规划器用法</td><td>目标采样与投影</td><td>状态有效性判定的一部分</td></tr>
+      <tr><td>不满足的后果</td><td>终点候选被丢弃</td><td>状态被判无效，路径发散</td></tr>
+      <tr><td>典型例子</td><td>末端到达指定位姿区域</td><td>工具始终保持竖直、末端沿直线运动</td></tr>
+    </table>
+    <p>把全程要求误写进目标约束是常见错误：规划器只保证终点满足，中途姿态完全自由，执行时才发现工具撞上工装或方向失控。</p>
+
+    <h3>2. 可行集与约束流形</h3>
+    <p>每条约束在配置空间中划出一个可行子集：关节约束是箱体，位置约束是末端位置落入空间区域的构型集合，方向约束是姿态落入容差集合的构型集合。全部约束的交集与自由空间进一步相交，构成规划真正搜索的可行集：</p>
+    <div class="formula">
+      C<sub>feas</sub> = C<sub>free</sub> &cap; { q | &Phi;<sub>i</sub>(q) &isin; B<sub>i</sub>，&forall; i }
+      <span class="note">&Phi;<sub>i</sub> 为第 i 条约束的映射（如末端位置），B<sub>i</sub> 为其允许区间；交集为空意味着无解</span>
+    </div>
+    <p>把约束写成近似等式时，可行集退化为低维曲面，称为约束流形。维数账本可以快速估计难度：六轴机械臂固定末端位置（三个等式）后，流形维数从 6 降到 3，这三个剩余自由度称为自运动自由度；再固定末端方向（三个等式）后维数为 0，可行集退化为孤立的构型点（或小容差球）。<strong>维数越低，满足约束的构型在空间中越稀疏，采样命中的概率越低，规划时间随之上升。</strong></p>
+
+    <h3>3. 投影与切空间：流形上的采样机制</h3>
+    <p>采样规划器需要在流形上产生候选点。直接在整个配置空间采样再检查约束的命中率随维数骤降，标准做法是先采样、再投影：从流形附近的随机点出发，用牛顿类迭代把约束残差压到容差之内。对约束函数 &Phi;（向量值），投影的一步迭代为：</p>
+    <div class="formula">
+      q &larr; q - J<sub>&Phi;</sub>(q)<sup>+</sup> &Phi;(q)
+      <span class="note">J<sub>&Phi;</sub><sup>+</sup> 为雅可比矩阵的伪逆；在奇异或病态处步长变大，需要阻尼与步数上限</span>
+    </div>
+    <p>迭代收敛后，点位于流形上；沿流形的运动方向由切空间刻画。把任意速度向量投影到切空间用同一个雅可比完成：</p>
+    <div class="formula">
+      v<sub>tangent</sub> = ( I - J<sub>&Phi;</sub><sup>+</sup> J<sub>&Phi;</sub> ) v
+      <span class="note">括号内为投影矩阵：剔除违反约束的速度分量，保留流形方向</span>
+    </div>
+    <p>规划器在流形上扩展路径时沿切空间方向生长，再对新点做投影修正，两者配合形成"扩展、拉回"的循环。<strong>这条机制解释了约束规划的性能特征：每次采样额外付出雅可比计算与迭代投影的代价，流形越薄收敛越慢，接近奇异时迭代可能不收敛而丢弃该采样。</strong></p>
+
+    <h3>4. 约束的构造与请求生命周期</h3>
+    <p>MoveIt 把约束消息转换成内部可判定的约束集合，转换过程需要解析各约束携带的参考系（通过当前变换信息），随后规划器的约束采样器据此工作。请求级生命周期有四个动作：</p>
+    <ol>
+      <li><strong>构造</strong>：填写约束消息（各分量的字段结构在第 036、037 章展开），参考系与连杆名与实际场景一致；</li>
+      <li><strong>施加</strong>：把约束装入规划请求的对应槽位；使用高层接口时按其接口语义设置；</li>
+      <li><strong>复核</strong>：规划完成后对结果轨迹逐状态核对约束满足情况（规划器内部检查存在采样近似）；</li>
+      <li><strong>清除</strong>：任务结束后清空约束槽位。高层接口里约束是持久状态，忘记清除会让下一条无关任务也背着它规划。</li>
+    </ol>
+    <p>容差的取值是本节最重要的工程判断：容差代表"任务可接受的偏差"，通常由工艺公差给出，再叠加标定与建模误差。把容差减去误差后剩余的空间就是规划器的搜索余地；余地为负时应当先改工艺或改标定，避免只调规划参数。</p>
+
+    <h3>5. 与相邻功能的边界</h3>
+    <p>约束与三样东西容易混淆，划清边界能减少误用。<strong>（1）与碰撞：</strong>约束不承担安全机制职责，碰撞检测独立进行；用容差覆盖障碍属于错误用法（第 028 章）。<strong>（2）与后处理：</strong>平滑与捷径化在约束问题中必须尊重流形，部分管线的平滑步骤对约束支持有限，规划成功不等于平滑后仍满足约束，复核步骤不可省略。<strong>（3）与执行：</strong>约束保证的是规划结果的性质，执行期的伺服跟随误差由控制器负责；把约束容差设计成控制误差的上界是常见的过度设计，两者应分别预算。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>引入路径约束的标准流程：</p>
+    <ol>
+      <li><strong>从工艺公差出发</strong>：把任务要求翻译为约束类型与容差（哪些自由度受限、各允许多大偏差），形成约束清单。</li>
+      <li><strong>校验可达性</strong>：用正逆运动学验证约束流形与工作空间的交集非空，至少找到两个可用构型（起点与目标附近的实例）。</li>
+      <li><strong>构造消息</strong>：按约束类型填写字段，统一参考系为稳定世界系，逐个核对连杆名。</li>
+      <li><strong>施加与规划</strong>：装入请求槽位，先做不带约束的对照规划，确认差异符合预期。</li>
+      <li><strong>复核结果</strong>：逐状态核对约束满足与碰撞有效性；两项都过才进入执行。</li>
+      <li><strong>清除与回归</strong>：任务结束立即清除约束；把该约束任务纳入回归集，防止后续配置变更破坏可行集。</li>
+    </ol>
+    <h3>约束设计要点</h3>
+    <table>
+      <tr><th>项目</th><th>常用取值</th><th>说明</th></tr>
+      <tr><td>位置容差</td><td>任务公差加 2–5 mm 余量</td><td>过小使流形过薄，规划失败率上升</td></tr>
+      <tr><td>方向容差</td><td>任务公差加 0.5°–2°</td><td>方向约束对流形体积影响显著（第 036 章）</td></tr>
+      <tr><td>目标约束用容差</td><td>可按工艺收紧</td><td>只影响终点，对全程搜索压力小</td></tr>
+      <tr><td>投影迭代上限</td><td>规划器内部参数</td><td>收敛慢的采样被丢弃，表现为成功率下降</td></tr>
+      <tr><td>复核采样率</td><td>轨迹全量或高密度抽样</td><td>约束满足是任务性质，建议全量核对</td></tr>
+    </table>
+    <p><strong>与上一章的差异点</strong>：第 034 章处理感知世界的内容融合；本章开始处理任务语义到规划问题的翻译，场景内容不变，规划请求的结构发生变化。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：C++ 施加路径约束并规划、清除</strong>（接口以对应 ROS2 发行版与 MoveIt2 版本的官方文档为准）</p>
+    <pre class="code"><code>// 路径约束：整条轨迹全程都要满足；本次示例限制工具点保持在一个薄板区域内
+moveit_msgs::msg::Constraints path_cs;
+path_cs.name = "slide_along_top";     // 命名便于日志识别与回归对照
+
+moveit_msgs::msg::PositionConstraint pc;
+pc.header.frame_id = "world";         // 约束区域在世界系中定义
+pc.link_name = "tool0";               // 受约束的连杆（工具点所在连杆）
+pc.target_point_offset.x = 0.0;       // 相对连杆原点的偏置，这里取连杆原点
+pc.constraint_region.primitives.resize(1);
+pc.constraint_region.primitives[0].type =
+    shape_msgs::msg::SolidPrimitive::BOX;
+// 薄板区域：允许沿 x 与 y 平移，z 方向仅留 2 cm 裕量
+pc.constraint_region.primitives[0].dimensions = { 0.6, 0.2, 0.02 };
+pc.constraint_region.primitive_poses.resize(1);
+pc.constraint_region.primitive_poses[0].position.x = 0.5;
+pc.constraint_region.primitive_poses[0].position.y = 0.0;
+pc.constraint_region.primitive_poses[0].position.z = 0.4;
+pc.constraint_region.primitive_poses[0].orientation.w = 1.0;
+pc.weight = 1.0;                      // 约束权重；位置与方向约束的分量展开见第 036 章
+path_cs.position_constraints.push_back(pc);
+
+move_group-&gt;setPathConstraints(path_cs);          // 装入请求槽位
+moveit::planning_interface::MoveGroupInterface::Plan plan;
+bool ok = (move_group-&gt;plan(plan) == moveit::core::MoveItErrorCode::SUCCESS);
+move_group-&gt;clearPathConstraints();              // 任务语义结束立即清除
+
+if (!ok)
+{
+  // 失败常见来源：可行集为空、容差过紧、参考系解析失败（见常见坑）
+  RCLCPP_WARN(node-&gt;get_logger(), "路径约束下规划失败，检查可行集");
+}</code></pre>
+    <p>解读：<strong>（1）</strong>约束区域在世界系中定义、绑定了连杆名与偏置，三要素缺一不可；区域形状（这里是薄板盒）决定受限的平移自由度，z 方向 2 cm 的厚度就是位置容差。<strong>（2）</strong>setPathConstraints 之后的每次规划都自动携带该约束，直到显式清除；高层接口的约束是会话级状态，把清除动作紧跟规划放置，是避免约束泄漏最直接的结构化手段。<strong>（3）</strong>失败分支注释列出三类主要成因，与本章理论与常见坑两节的排查条目一一对应，让日志信息直接指向下一步动作。</p>
+
+    <p><strong>片段 2：Python 牛顿投影把采样点拉回约束流形</strong></p>
+    <pre class="code"><code>import numpy as np
+
+L1, L2 = 0.4, 0.3                     # 平面二连杆臂的杆长
+
+def tip(q):
+    """正向运动学：返回末端位置（二维）。"""
+    q1, q2 = q
+    return np.array([L1 * np.cos(q1) + L2 * np.cos(q1 + q2),
+                     L1 * np.sin(q1) + L2 * np.sin(q1 + q2)])
+
+def constraint(q, radius=0.55):
+    """等式约束：末端落在半径 0.55 m 的圆上（g=0 时为流形上的点）。"""
+    return np.linalg.norm(tip(q)) - radius
+
+def numeric_jacobian(q, h=1e-6):
+    """数值雅可比：真实系统使用解析或自动微分版本。"""
+    J = np.zeros(2)
+    for i in range(2):
+        dq = np.zeros(2)
+        dq[i] = h
+        J[i] = (constraint(q + dq) - constraint(q - dq)) / (2 * h)
+    return J
+
+q = np.array([0.9, -0.4])             # 一个靠近但不在流形上的采样点
+for step in range(5):
+    g = constraint(q)
+    J = numeric_jacobian(q)
+    q = q - J * g / (J @ J)           # 标量约束的最小二乘投影一步
+    print(f"第 {step + 1} 次迭代：残差 {abs(g):.2e}，"
+          f"构型 ({q[0]:.3f}, {q[1]:.3f})")</code></pre>
+    <p>解读：<strong>（1）</strong>投影迭代把"任意采样点"变成"满足约束的采样点"，这是约束采样器的最小内核；示例用等式约束（末端在圆上），不等式约束（区域内容差）在残差量化后复用同一套迭代。<strong>（2）</strong>残差按步数指数下降，两三次迭代即到数值精度；真实规划每次采样都付这份代价，约束规划的额外开销正来源于此。<strong>（3）</strong>当雅可比接近退化（末端处于奇异构型附近）时，J &middot; J 接近零，步长放大且方向失准，工程实现加入阻尼与步数上限，用丢弃该采样为代价保住数值稳定。</p>
+
+    <p><strong>片段 3：C++ 规划结果逐状态复核约束</strong></p>
+    <pre class="code"><code>// 独立复核：规划器内部的约束检查带采样近似，任务性质要求全量核对
+kinematic_constraints::KinematicConstraintSet kset(robot_model);
+kset.add(path_cs, planning_scene-&gt;getTransforms());
+
+std::size_t violations = 0;
+for (std::size_t i = 0; i &lt; trajectory.getWayPointCount(); ++i)
+{
+  // decide 返回该状态是否满足全部约束；细节可另取向量展开
+  kinematic_constraints::ConstraintEvaluationResult r =
+      kset.decide(trajectory.getWayPoint(i));
+  if (!r.satisfied)
+  {
+    ++violations;
+    RCLCPP_WARN(node-&gt;get_logger(), "路点 %zu 不满足约束", i);
+  }
+}
+RCLCPP_INFO(node-&gt;get_logger(), "%zu 个路点，违规 %zu 个",
+            trajectory.getWayPointCount(), violations);</code></pre>
+    <p>解读：<strong>（1）</strong>复核使用与规划独立的判定路径：约束集合从消息重建（参考系按当前变换解析），避免"规划器说满足就满足"的单点信任。<strong>（2）</strong>逐状态核对的成本与路点数线性，长轨迹可按固定间隔抽样、对靠近边界的抽样点加密；违规点索引同样为可视化复查服务（与第 029 章的路径校验形成对照）。<strong>（3）</strong>复核不替代规划内检查：前者面向任务验收，后者服务搜索过程；两层都保留，能区分"实现偏差"与"任务设计问题"。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>全程要求写进目标约束</strong>：工具保持竖直的纪律只约束了终点，中途任意倾斜，执行时工件被撞。修复是按第 1 小节的判据重新分类，把"全程成立"的要求移入路径约束槽位。</li>
+      <li><strong>约束交集为空</strong>：位置区域与方向容差在工作空间内找不到共同的可用构型，规划必然失败且与尝试次数无关。修复是用正逆运动学预检可行集，逐步放松一条约束并复测，把"哪条约束制造了空集"定位出来。</li>
+      <li><strong>约束泄漏到后续任务</strong>：高层接口的约束是持久状态，完成后未清除，下一条任务的规划莫名变慢或失败。修复是把清除与规划成对放置，并在任务开始时显式清空约束槽位作为防御。</li>
+      <li><strong>参考系解析失败</strong>：约束区域挂在临时参考系或拼写错误的参考系上，约束无法解析、被忽略或直接失败。修复是统一使用稳定世界系，核对参考系名称存在且在变换树中可达。</li>
+      <li><strong>复核只信规划器</strong>：规划内部检查在采样点之间不做判定，路点之间的短段可能短暂越界。修复是复核阶段对轨迹加密采样（或按最短段长度补充检查点），把越界拦截在执行之前。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>分类练习：把以下要求分别归入目标约束或路径约束。（a）末端到达工件上方 5 cm；（b）整个冲压过程中末端不离开垂直平面；（c）最终姿态与装配面平行；（d）手腕在全程保持在线缆弯曲允许范围内。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>（a）目标（到达时成立）；（b）路径（全程成立）；（c）目标（终态性质）；（d）路径（全程成立，手腕相关的关节级约束见第 037 章）。</div></details>
+      </li>
+      <li>维数计算：六轴机械臂固定末端位置（3 个等式）后，约束流形的维数是多少？再固定末端方向后维数是多少？据此解释"位姿全约束问题为什么最难规划"。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>固定位置后流形维数 3（自运动），再固定方向后为 0（孤立构型或小容差球）。维数越低，采样命中概率越小，规划失败率与耗时随之上升。</div></details>
+      </li>
+      <li>设计题：为"沿 0.5 m 长的水平接缝匀速焊接"设计约束集合：给出位置区域、方向容差的量级与参考系选择，并说明为什么这条任务适合路径约束。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>接缝定义细长区域（宽数毫米、长为缝长），方向容差取工艺公差加 1° 以内；任务要求全程维持，属于路径约束；参考系取工件或世界系中稳定者。注意匀速属于轨迹参数化问题（第 039 章），不属于运动学约束。</div></details>
+      </li>
+      <li>诊断题：同一条紧容差约束任务，目标位姿单独可达、约束单独可行，但搭在一起规划必失败。给出两种最可能原因与验证方法。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>原因一：可行集交集为空（目标姿态不在流形可达范围内），用逆运动学在目标附近采样验证；原因二：流形过薄导致采样命中率极低，放松一条容差后成功率恢复即为佐证。两类都在第 2 小节的维数账本里有对应解释。</div></details>
+      </li>
+      <li>分析题：比较"在配置空间采样后投影"与"在任务空间采样后逆解"两种约束采样路线，从奇异构型、解的分支选择、成功率三个角度分析，并给出两种路线混用的系统设计。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>配置空间投影路线天然覆盖自运动自由度，但近奇异时投影不稳；任务空间加逆解路线直接控制末端，但受解分支与可达性限制。混用方案：任务空间采样产生种子、配置空间投影维护流形，奇异附近回退冗余自由度利用（第 056 章展开）。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>目标约束作用于终点，路径约束作用于全程，任务要求按"何时成立"分类后入对应槽位。</li>
+      <li>约束把可行集收紧为自由空间与约束流形的交集，维数账本可快速估计规划难度，交集为空时任何规划器都无解。</li>
+      <li>流形采样靠"扩展加投影"循环：牛顿迭代压残差，切空间投影管方向，近奇异处需要阻尼与步数控制。</li>
+      <li>约束的会话级生命周期按构造、施加、复核、清除四步管理，清除缺失是最具迷惑性的工程错误。</li>
+      <li>下一章展开两类几何约束的构造细节：<strong>方向约束与位置约束</strong>，讲容差的几何含义与字段语义。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch034.html">← 第 034 章：规划场景中的传感器数据融合</a>
+    <a class="next" href="ch036.html">第 036 章：方向约束与位置约束 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.06 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:11.5px !important;letter-spacing:.06em !important;color:rgba(71,85,105,.45) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#7e8ba0 !important;font-size:11.5px !important;line-height:1.8 !important;text-align:center !important;padding:5px 12px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

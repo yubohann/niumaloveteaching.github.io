@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第021章 当前状态监视器 CurrentStateMonitor | 机械臂规划学习课程 · ROS2 MoveIt2 运动规划与操作</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 规划场景与碰撞管理</span>
+    <span class="sep">/</span>
+    <span>第 021 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 规划场景与碰撞管理</div>
+    <h1>第 021 章：当前状态监视器 CurrentStateMonitor</h1>
+    <p class="lead">规划从机器人的真实当前状态出发：本章讲 CurrentStateMonitor 如何把 /joint_states 话题流维护成一份随时可查询的机器人状态（RobotState）快照，以及完整状态、状态新鲜度、超时等待这三个语义为什么决定规划的成败。</p>
+    <ul class="meta">
+      <li>主题：场景状态同步 / 关节状态监视</li>
+      <li>关键机制：joint_states 订阅、机器人状态快照、完整状态判定与新鲜度检查</li>
+      <li>预计学时：45 分钟</li>
+      <li>前置章节：第 020 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解当前状态监视器（CurrentStateMonitor）在规划场景监视器（PlanningSceneMonitor）中的位置与职责：把异步到达的关节状态（Joint State）转换成同步可查询的状态快照。</li>
+      <li>掌握完整状态（Complete State）的集合定义，以及 waitForCompleteState、waitForCurrentState 两个等待接口的语义差异与超时行为。</li>
+      <li>能配置关节状态话题名、初始等待超时与状态新鲜度门限，并解释每个取值的依据。</li>
+      <li>会诊断状态不完整的典型成因：话题不一致、QoS（Quality of Service，服务质量）不匹配、部分关节未发布。</li>
+      <li>能设计"规划前状态校验"流程，在规划循环中把起点误差拦截在状态同步环节。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>运动规划（Motion Planning）的解，是针对一个确定的起点状态 q<sub>start</sub> 与目标状态 q<sub>goal</sub> 计算的。目标由任务给定，起点却来自运行时数据：控制器与编码器上报的当前关节角度。如果起点状态缺失、残缺或过期，规划器给出的轨迹就会从"错误的现在"出发，执行时第一帧就产生位置跳变，轻则触发安全停止，重则发生碰撞。<strong>状态同步是规划链条的第一个正确性条件，需要按核心环节对待。</strong></p>
+    <p>上一章（第 020 章）把规划场景监视器拆成状态、世界几何、八叉树、场景差分四路输入，本章深入其中的第一路：当前状态监视器（CurrentStateMonitor）。它订阅 joint_states 话题，把消息按键名写入内部的机器人状态（RobotState，参见第 009 章），并向规划模块提供一致性的快照。后面第 022 至 034 章讨论环境物体的管理，那些内容全部建立在"机器人自身状态已经可靠"这一基础之上。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 从异步话题到同步快照</h3>
+    <p>关节状态以话题消息形式异步到达，消息内部用并行数组携带关节名与位置：name[]、position[]、velocity[]、effort[]。数组顺序由发布端决定，没有任何约束要求两次消息顺序一致。规划模块需要的却是一份自洽的状态对象：起点状态的所有关节值应当来自同一时刻，不能一半来自 t1、一半来自 t2。</p>
+    <p>当前状态监视器在这两个世界之间架桥，职责可以概括为三点：<strong>（1）按键名把最新关节值写入内部 RobotState；（2）在一次消息处理完成时原子地更新"当前状态"，保证快照自洽；（3）对外提供带超时的等待接口，让调用方可以同步地"等到可用为止"。</strong>查询接口 getCurrentState() 返回的是内部状态的一份拷贝，这个设计让读取方与状态回调线程解耦：规划计算可以持有一份不变化的状态，状态回调继续更新监视器内部值，两者互不阻塞。</p>
+
+    <h3>2. 完整状态：集合定义与判定</h3>
+    <p>机器人模型（RobotModel）中的关节分为三类：活动关节（Actuated Joints，由电机驱动）、随动关节（Mimic Joints，位置跟随另一关节）与被动关节（Passive Joints，无驱动）。描述机器人整体状态时，只需要活动关节的取值，随动与被动关节可以由模型推导。于是完整状态有一个干净的集合定义：</p>
+    <div class="formula">
+      完整状态 &hArr; &forall; j &isin; J<sub>act</sub>，关节 j 至少被一条已接收消息覆盖
+      <span class="note">J<sub>act</sub> 为活动关节集合，由 URDF/SRDF 决定（第 003、016 章）；组级等待只要求组内关节满足该条件</span>
+    </div>
+    <p>若某个活动关节从未出现在任何消息里，监视器只能为它保留模型默认值（通常为 0）。<strong>默认值与真实值的偏差会直接进入规划起点，使轨迹首段出现跳变，这类故障在仿真中往往表现得很隐蔽。</strong>两个等待接口对应两种判定范围：waitForCompleteState(group, timeout) 只要求给定关节组内的关节就绪，适合多机械臂系统中"只关心本臂"的场合；waitForCurrentState(time, timeout) 则会等到存在时间戳不早于给定时刻的完整状态为止，多用于执行前的时序校核。</p>
+
+    <h3>3. 新鲜度：完整是历史属性，有效是当前属性</h3>
+    <p>完整状态解决"有没有值"的问题，新鲜度解决"值是否还代表现在"的问题。设状态时间戳为 t<sub>state</sub>，当前时刻为 t<sub>now</sub>，则状态年龄为：</p>
+    <div class="formula">
+      age = t<sub>now</sub> - t<sub>state</sub>；规划前要求 age &lt; &tau;<sub>stale</sub>
+      <span class="note">&tau;<sub>stale</sub> 常用取值 0.2–0.5 s，比状态周期（5–20 ms）高一个量级，容错空间来自对偶发丢帧的容忍</span>
+    </div>
+    <p>之所以要单独设置这道门限，是因为监视器的"完整"标记是历史属性：系统曾经收齐过全部关节，该标记就保持为真，即使此后十分钟没有任何新消息。<strong>规划前的正确做法是先判完整、再判新鲜，两个条件同时满足才允许提交规划请求。</strong>时间比较还隐含一个前提：状态时间戳与本地时钟出自同一时间基准。使用仿真时间（/clock）的系统中若部分节点未启用 use_sim_time，waitForCurrentState 会因时间基准错位而永久超时，这类问题的表现极具迷惑性。</p>
+
+    <h3>4. 状态流入规划请求的路径</h3>
+    <p>监视器把状态同步到规划场景（Planning Scene）的"当前状态"字段后，运动规划管线在填充请求时会默认使用这份快照作为 start_state。若请求中显式给出了 start_state，则以显式值为准，这条路径服务于轨迹回放与离线分析：起点是"已知的过去某个状态"，与实时数据无关（第 015 章的回放场景）。规划请求适配器中的 FixStartStateCollision 可以在起点碰撞时尝试微调状态（第 042 章展开），但其修正幅度受参数约束，无法弥补丢失整组关节这类结构性缺陷。<strong>状态质量是根，适配器修正只是叶。</strong></p>
+
+    <h3>5. 更新节奏与开销权衡</h3>
+    <p>状态回调随消息到达触发，典型频率为 50 到 200 Hz；除此之外，规划场景监视器可以按固定频率执行一次场景级状态同步（由更新频率参数控制）。同步动作包含一次状态拷贝与一次碰撞相关的场景登记，频率过高会增加锁竞争与内存拷贝，频率过低会让"场景中的当前状态"滞后于真实值。数量级上，一条六轴关节状态消息不足 1 KB，100 Hz 下的带宽不足 0.1 MB/s，可以忽略；<strong>这项配置的代价在同步与拷贝次数，而不在带宽。</strong>多线程执行器下状态回调与其他回调并发运行，监视器内部以互斥量保护共享状态，查询端拿到的拷贝进一步避免了长时间持锁，这一设计在实时性敏感的场景中尤为关键。</p>
+
+    <div class="box key">
+      <span class="box-title">设计决策：为什么等待接口要有超时参数？</span>
+      <p>等待接口若无限阻塞，一次状态源故障就会冻结整个规划服务，上层既无法降级也无法报错。超时参数把"故障"转换成"返回值 false"，让调用方可以记录、重试或拒绝本次任务。规划循环中推荐的做法是：单次等待 1–2 s，超时后放弃本轮规划，避免在状态源已经掉线时堆积无效请求。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>把状态通道搭正确，按以下顺序推进，每一步都可以独立验证：</p>
+    <ol>
+      <li><strong>确定状态源</strong>：真实系统用 ros2_control 的 joint_state_broadcaster，仿真或模型验证用 joint_state_publisher。确认它发布的活动关节集合与 URDF 一致，发布频率在 50–200 Hz 之间。</li>
+      <li><strong>对齐话题名与 QoS</strong>：规划场景监视器的状态订阅话题通过参数配置，默认 /joint_states。用 <code>ros2 topic info -v</code> 核对发布端与订阅端的可靠性设置，可靠订阅端只能与可靠发布端接通。</li>
+      <li><strong>设置初始等待</strong>：启动阶段留出足够时间等第一条完整状态，上限由等待参数给出，典型 5–15 s，覆盖控制器上电与驱动初始化过程。</li>
+      <li><strong>规划循环加闸门</strong>：每次提交规划请求前，先执行"完整 + 新鲜"双条件检查，两条件都通过再调用规划接口。</li>
+      <li><strong>观测与回归</strong>：用 <code>ros2 topic hz</code> 检查频率，用 <code>ros2 topic echo</code> 检查 name 数组是否覆盖全部活动关节，把这两项做成常规验证步骤。</li>
+    </ol>
+    <h3>状态通道参数表</h3>
+    <table>
+      <tr><th>参数</th><th>常用取值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>joint_state_topic</td><td>/joint_states</td><td>状态订阅话题名</td><td>与状态源一致；命名空间部署时注意重映射</td></tr>
+      <tr><td>wait_for_initial_state_timeout</td><td>5–15 s</td><td>启动阶段等待首条完整状态的上限</td><td>覆盖控制器上电与驱动初始化时间</td></tr>
+      <tr><td>请求级等待超时</td><td>1–2 s</td><td>规划前等待完整状态</td><td>高于状态周期两个数量级，容忍偶发丢帧</td></tr>
+      <tr><td>新鲜度门限 &tau;<sub>stale</sub></td><td>0.2–0.5 s</td><td>拒绝过期状态</td><td>与任务节拍相关；执行前可收紧到 0.1 s</td></tr>
+      <tr><td>场景状态更新频率</td><td>10–50 Hz</td><td>场景级状态同步节奏</td><td>控制锁竞争与拷贝开销</td></tr>
+    </table>
+    <p><strong>与上一章的差异点</strong>：第 020 章给出规划场景监视器的整体结构与四路输入的协作关系；本章只深入状态通道，把"完整、新鲜、超时"三个语义落实到接口与参数层面。与执行环节的衔接在第 014 章已经出现过：轨迹执行前后都需要状态校核，那里关心的是执行时序，这里关心的是规划起点。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：C++ 侧的状态监视器用法</strong>（以对应 ROS2 发行版与 MoveIt2 版本的官方头文件为准）</p>
+    <pre class="code"><code>// 构造监视器：机器人模型提供关节定义，节点提供通信，变换缓冲供时间对齐使用
+// 构造参数随发行版演进（部分旧版本在构造时传入话题名），以所用版本头文件为准
+auto tf_buffer = std::make_shared&lt;tf2_ros::Buffer&gt;(node-&gt;get_clock());
+auto state_monitor = std::make_shared&lt;planning_scene_monitor::CurrentStateMonitor&gt;(
+    node, robot_model, tf_buffer, node-&gt;get_parameter("use_sim_time").as_bool());
+// 订阅话题名在启动调用中给出：必须与真实状态源一致，否则监视器永远等不到消息
+state_monitor-&gt;startStateMonitor("joint_states");
+
+// 规划前的第一道门槛：等到组内关节全部就绪
+// 组级等待只要求本臂关节完整，适合多机械臂系统里"只管自己"的场景
+if (!state_monitor-&gt;waitForCompleteState("arm_group", 2.0))
+{
+  RCLCPP_WARN(node-&gt;get_logger(), "关节状态不完整，跳过本轮规划");
+  return false;
+}
+
+// 取快照：返回内部 RobotState 的拷贝，读取与状态回调线程解耦
+moveit::core::RobotStatePtr current = state_monitor-&gt;getCurrentState();
+
+// 按变量名取值：数组顺序不可依赖，键名才是稳定标识
+double q_elbow = current-&gt;getVariablePosition("elbow_joint");
+
+// 新鲜度检查：完整是历史属性，有效与否还要看状态年龄
+double age = (node-&gt;now() - state_monitor-&gt;getCurrentStateTime()).seconds();
+if (age &gt; 0.5)
+{
+  RCLCPP_WARN(node-&gt;get_logger(), "状态已过期 %.2f s，拒绝规划", age);
+  return false;
+}</code></pre>
+    <p>解读：这段代码把本章的三个语义全部落到调用顺序上。<strong>（1）</strong>waitForCompleteState 放在最前，因为起点残缺时后续计算没有意义；超时值 2.0 s 高于状态周期一到两个数量级，兼顾"偶发丢帧"与"快速失败"。<strong>（2）</strong>getCurrentState() 拷贝的语义让规划计算期间状态可以继续更新，读到的这份值在本次规划内恒定，避免起点在计算中途悄然变化。<strong>（3）</strong>新鲜度检查以监视器记录的状态时间戳为准，本地接收时间只作参考，仿真系统中接收时间受调度抖动影响，状态时间戳更能反映数据本身的时刻。</p>
+
+    <p><strong>片段 2：Python 侧实现同语义的状态闸门</strong></p>
+    <pre class="code"><code>import rclpy
+from sensor_msgs.msg import JointState
+
+class StateGate(rclpy.node.Node):
+    """规划前的状态闸门：集齐全部活动关节后再放行请求。"""
+
+    def __init__(self, expected_joints):
+        # 节点名固定，避免多个实例在同一话题上重复订阅相互干扰
+        super().__init__("state_gate")
+        # 期望集合来自 robot_description 的活动关节清单
+        self.expected = set(expected_joints)
+        self.latest = {}
+        # 与 MoveIt 状态订阅保持同样的可靠 QoS 语义：
+        # 可靠订阅端无法与尽力而为（Best-effort）发布端接通
+        self.create_subscription(JointState, "joint_states", self.on_state, 10)
+
+    def on_state(self, msg):
+        # 按名字配对：不同驱动、不同版本的发布顺序不保证一致
+        for name, pos in zip(msg.name, msg.position):
+            self.latest[name] = pos
+
+    def complete(self):
+        # 完整性的集合表述：期望集合是已知键集合的子集
+        return self.expected.issubset(self.latest.keys())
+
+# 使用侧：等到完整再放行，超时则拒绝本轮规划
+gate = StateGate(["joint_1", "joint_2", "joint_3",
+                  "joint_4", "joint_5", "joint_6"])
+deadline = gate.get_clock().now().nanoseconds + int(2e9)
+while gate.get_clock().now().nanoseconds &lt; deadline and not gate.complete():
+    rclpy.spin_once(gate, timeout_sec=0.05)</code></pre>
+    <p>解读：这段脚本在应用层复刻监视器的核心判定，适合在没有 MoveIt 依赖的轻量节点里做前置检查，也便于理解监视器行为。<strong>（1）</strong>用集合表达期望关节，因为完整性关心的是覆盖关系，与顺序无关；issubset 一行即可表达"全部覆盖"。<strong>（2）</strong>订阅深度取 10，只保留最新若干条消息，状态数据的价值随时间衰减，队列过深只会带来无意义的处理。<strong>（3）</strong>循环采用带截止时间的等待方式，拒绝无限阻塞，与监视器超时参数的设计动机一致：把故障转换为可处理的返回值。</p>
+
+    <p><strong>片段 3：规划场景监视器的状态通道配置</strong></p>
+    <pre class="code"><code># move_group 侧规划场景监视器配置：状态通道的对外接口就是这几项
+move_group:
+  ros__parameters:
+    planning_scene_monitor_options:
+      name: "planning_scene_monitor"
+      robot_description: "robot_description"    # 关节定义来源，决定活动关节集合
+      joint_state_topic: "/joint_states"        # 必须与真实状态源一致
+      attached_collision_object_topic: "/attached_collision_object"
+      publish_planning_scene_topic: "/publish_planning_scene"
+      monitored_planning_scene_topic: "/monitored_planning_scene"
+      wait_for_initial_state_timeout: 10.0      # 等待首条完整状态的上限（秒）</code></pre>
+    <p>解读：配置层面能控制的只有"接哪条线、等多久"，判定语义由代码里的等待与新鲜度检查承担，两层配合才构成完整防护。<strong>（1）</strong>robot_description 参数决定活动关节集合的来源，URDF 变更后如果这个参数未同步指向新描述，完整性判定会与新模型脱节。<strong>（2）</strong>wait_for_initial_state_timeout 只作用于启动阶段，面对"运行中状态源掉线"的场景不起作用，运行期防护必须依赖每轮规划前的检查。<strong>（3）</strong>各发行版的参数组织位置可能不同，配置时以安装目录中的模板 launch 与官方文档为准。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>话题名不一致导致状态永不完整</strong>：多机械臂或分层命名空间部署时，状态源发布 /arm/joint_states，规划场景订阅 /joint_states。症状为 waitForCompleteState 每次超时；修复是核对监视器话题参数与状态源话题，必要时用重映射对齐。</li>
+      <li><strong>QoS 不匹配的静默断连</strong>：状态源以尽力而为（Best-effort）发布，监视器以可靠（Reliable）订阅，两端直接无法接通，日志里没有任何报错。用 <code>ros2 topic info -v</code> 比对两端可靠性设置，把发布端改为可靠是标准修复。</li>
+      <li><strong>部分关节长期缺失</strong>：抓手或第七轴关节未接入状态发布，监视器保留默认值 0。症状为规划起点与实际姿态偏差固定且集中在特定关节；修复是补齐发布源，或在组级检查中明确该关节是否应参与状态。</li>
+      <li><strong>时间基准错位</strong>：仿真系统部分节点未启用 use_sim_time，状态时间戳与本地时钟出自不同基准，waitForCurrentState 永久超时或新鲜度判断恒为过期。修复是统一 /clock 订阅状态并重启全部相关节点。</li>
+      <li><strong>长时间停机后直接规划</strong>：完整标记仍为真、数据早已停止更新，系统按"有效状态"提交规划。修复是保留新鲜度门限作为最终兜底，任何规划入口都经过双条件检查。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>从并发与一致性两个角度解释：监视器为什么采用"返回拷贝"的设计，而不直接暴露内部状态。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>状态回调线程持续写入，直接暴露引用会让规划计算读到中途更新的值，起点变得不自洽；拷贝把"某一时刻的一致快照"固定下来，同时让状态回调不受调用方持锁时间影响。</div></details>
+      </li>
+      <li>参数预测：状态源 100 Hz，新鲜度门限从 0.2 s 放松到 1.0 s。系统能容忍的连续丢帧数从多少条变为多少条？这样做会引入什么新风险？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>0.2 s 对应 20 条消息，1.0 s 对应 100 条。容忍度提升的代价是起点偏差窗口变长：机器人若在丢帧期间被外力移动，规划仍会以过期状态放行，首段轨迹误差随之增大。</div></details>
+      </li>
+      <li>设计题：为一条装配工位流程设计"规划前状态校验"流程图，至少包含完整检查、新鲜度检查、超时处理三个分支，并说明每个分支失败时的降级动作。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>参考本章 design 一节的五步与代码片段 2 的截止时间循环；降级动作可以定义为"等待重试一次、仍失败则拒绝本轮任务并上报错误码"，注意重试次数要有上限。</div></details>
+      </li>
+      <li>诊断题：仿真启动后监视器一直等不到完整状态，列出至少三种可能原因，并为每种给出验证命令或检查点。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>三种常见原因：状态源未启动（ros2 topic list 或 hz 无输出）；话题名不一致（ros2 node info 查看订阅）；QoS 不匹配（ros2 topic info -v 比对可靠性）。另可检查 use_sim_time 是否统一。</div></details>
+      </li>
+      <li>分析题：比较"监视器快照作为起点"与"显式指定 start_state"两种方式，分别说明适用场景、需要放弃的能力与必须增加的防护措施。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>显式起点用于回放、离线规划与单元测试，可重复性强，但与实时系统脱节，执行前必须校核"当前状态与规划起点之差"是否在容忍范围内；快照方式贴近实时，防护重点转为完整性与新鲜度。两条路径都需要在执行前做起点校核，只是失败后的处置不同。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>当前状态监视器把异步的 joint_states 话题流转换为自洽的机器人状态快照，规划起点的正确性从这里开始。</li>
+      <li>完整状态是集合命题：全部活动关节至少被一条消息覆盖；组级等待接口只检查组内关节。</li>
+      <li>完整属于历史属性，新鲜属于当前属性，规划前必须双条件同时检查，新鲜度门限常用 0.2–0.5 s。</li>
+      <li>话题名、QoS 可靠性、时间基准是三处最常见的断点，排查顺序固定为"连接是否建立、消息是否覆盖、时间是否有效"。</li>
+      <li>下一章转向机器人之外的场景内容：<strong>添加碰撞物体</strong>，把环境中的障碍物写进规划场景的世界。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch020.html">← 第 020 章：规划场景监视器 PlanningSceneMonitor</a>
+    <a class="next" href="ch022.html">第 022 章：添加碰撞物体 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.06 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:11.5px !important;letter-spacing:.06em !important;color:rgba(71,85,105,.45) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#7e8ba0 !important;font-size:11.5px !important;line-height:1.8 !important;text-align:center !important;padding:5px 12px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

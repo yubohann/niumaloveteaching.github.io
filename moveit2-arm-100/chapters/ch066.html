@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第066章 夹具控制接口 | 机械臂规划学习课程 · ROS2 MoveIt2 运动规划与操作</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第四篇 · 抓取与操作任务</span>
+    <span class="sep">/</span>
+    <span>第 066 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第四篇 · 抓取与操作任务</div>
+    <h1>第 066 章：夹具控制接口</h1>
+    <p class="lead">把消息层的姿态轨迹落到控制器：夹爪三类控制接口的机理差异、夹持力上限的三方约束、基于位置与力双信号的抓取确认策略。</p>
+    <ul class="meta">
+      <li>主题：末端执行器 / 夹具控制接口（Gripper Control Interface）</li>
+      <li>关键机制：GripperCommand 动作 / 力与位置反馈判定 / 夹持力预算</li>
+      <li>预计学时：50 分钟</li>
+      <li>前置章节：第 065 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>掌握夹爪三类控制接口：GripperCommand 动作、关节轨迹控制器、厂商专有 IO 与气动接口，能说明各自适用条件。</li>
+      <li>理解位置控制夹爪与力控夹爪的机理差异，能解释"位置误差累积与电流上升"的因果关系。</li>
+      <li>会做夹持力预算：需求下限、夹爪出力上限与物体承受上限三方取小，并纳入搬运加速度。</li>
+      <li>会设计基于位置与力双信号的抓取确认逻辑，区分夹住、空抓、堵转三类结果。</li>
+      <li>能诊断夹爪动作无响应、误报空抓、闭合过冲三类故障并给出修复路径。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 065 章的手爪姿态轨迹只描述"指到哪个状态"，真正的开合动作由夹爪控制器执行。夹爪是任务链中唯一直接改变物体约束状态的部件，<strong>它的时序与反馈质量决定抓取作业能否闭环：夹得太晚、太紧或没有确认，都会让后续阶段在错误的假设上继续运行</strong>。</p>
+    <p>夹爪在不同系统中的形态差异很大：电动夹爪提供位置与电流反馈，气动夹爪往往只有开关阀，欠驱动夹爪的两指位置由机构耦合。统一的控制接口层需要把这些差异封装在同一个抽象之下，向上提供"张开、闭合、查询结果"三件事，向下适配具体硬件。</p>
+    <p>本章与第 062 章的附着时序、第 065 章的姿态轨迹字段直接相关：姿态轨迹落地的可靠性由本章讨论的接口与确认逻辑保证；本章也为第 067 章的真空吸盘建立"接触后确认"的统一视角。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 接口族与分层</h3>
+    <table>
+      <tr><th>接口</th><th>形态</th><th>反馈内容</th><th>适用条件</th></tr>
+      <tr><td>GripperCommand 动作</td><td>control_msgs 标准动作</td><td>位置、出力、堵转标志、到位标志</td><td>电动夹爪，具备位置与电流反馈</td></tr>
+      <tr><td>关节轨迹控制器</td><td>ros2_control 位置轨迹</td><td>关节位置、速度</td><td>夹爪关节已接入控制器管理器</td></tr>
+      <tr><td>IO 与气动接口</td><td>数字输出或阀门控制</td><td>通常无反馈</td><td>气动夹爪，需外接传感器补足确认</td></tr>
+    </table>
+    <p>分层关系为：消息层的姿态轨迹经执行适配器转换为具体接口调用，适配器同时负责结果归一化。<strong>把"目标位置加出力上限"作为统一语义是 GripperCommand 的设计核心：位置决定合拢程度，出力上限同时承担过载保护职责。</strong></p>
+
+    <h3>2. 位置控制与力控的机理</h3>
+    <p>位置控制夹爪内部是位置闭环：电机驱动丝杠或齿轮机构推动指爪，控制器按目标位置与编码器反馈调节。<strong>当指爪夹住物体后，位置误差无法消除，电流随之上升，夹持力与电流近似成正比</strong>。这一因果链是无力传感器时估算夹持力的基础：</p>
+    <div class="formula">
+      F ≈ k<sub>t</sub> · I · η / r
+      <span class="note">k<sub>t</sub> 为电机转矩常数，η 为传动效率，r 为等效半径（丝杠导程或齿轮节圆折算）；比例系数由标定实验拟合</span>
+    </div>
+    <p>力控夹爪直接以力为目标，由电流环或力矩传感器闭环，其出力对物体宽度不敏感。欠驱动夹爪由单电机与连杆机构驱动两指，两指位置耦合，<strong>夹持力随被抓物宽度变化，确认逻辑必须结合宽度估计，固定阈值在宽度变化时必然失效</strong>。</p>
+
+    <h3>3. 抓取确认：为什么需要双信号</h3>
+    <p>单一信号存在歧义：只看位置，则"到达目标位置且无力"可能是空抓（指爪合拢到底）也可能是夹住薄件；只看力，则"有力但未到位"可能是夹住物体也可能是撞到异物。把两类信号组合后，状态空间可分辨：</p>
+    <table>
+      <tr><th>位置状态</th><th>力状态</th><th>判定</th><th>处置</th></tr>
+      <tr><td>未到目标</td><td>高于阈值</td><td>夹住物体（指爪被物体挡住）</td><td>继续后续阶段</td></tr>
+      <tr><td>到达目标</td><td>低于阈值</td><td>空抓（指爪合拢到底）</td><td>回退并换候选</td></tr>
+      <tr><td>未到目标</td><td>接近上限并持续</td><td>堵转（夹到硬物或异物）</td><td>松开、报警、终止</td></tr>
+      <tr><td>到达目标</td><td>高于阈值</td><td>异常（薄件与摩擦并存）</td><td>按保守策略处理并记录</td></tr>
+    </table>
+    <p><strong>确认逻辑的价值在于把"抓手是否真的持物"变成可判定的状态，避免把物体未夹住的情况带入搬运阶段。</strong>判定阈值中的位置容差典型取 2 mm，力阈值按夹爪电流折算标定，典型对应 3–10 N 的接触力。</p>
+
+    <h3>4. 夹持力预算：三方取小</h3>
+    <p>夹持力上限由三方共同约束：摩擦与加速度决定的需求下限、夹爪机械与驱动的出力上限、物体允许的承压上限。搬运阶段存在加速度时，摩擦需求按最坏方向估算：</p>
+    <div class="formula">
+      N ≥ s · m (g + a) / (2 μ)
+      <span class="note">m = 1 kg、μ = 0.4、安全系数 s = 2、搬运加速度 a = 1 m/s² 时 N ≥ 27 N</span>
+    </div>
+    <p>需求值向上，物体承压与夹爪能力向下，可行区间由三者的交集确定。若交集为空，需要降低搬运加速度、更换高摩擦指面材料，或调整抓取位置减小力臂。<strong>把 max_effort 设为可行区间的中值：相对需求下限保留抗扰余量，相对承压上限保留安全裕度，过载保护更从容。</strong></p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>夹爪适配层的实现步骤：</p>
+    <ol>
+      <li><strong>接口探测</strong>：启动时探测可用控制器（GripperCommand 动作、轨迹控制器或 IO 通道），选择优先级最高的接口并记录能力集。</li>
+      <li><strong>统一抽象</strong>：对外暴露"开合（目标开口、出力上限、超时）"与"查询状态"，对内路由到具体接口。</li>
+      <li><strong>确认逻辑</strong>：动作结束后按双信号判定，返回枚举结果供任务层分支。</li>
+      <li><strong>参数校验</strong>：出力上限经过三方取小钳制，超过物体承压上限时告警并降额。</li>
+      <li><strong>时序接入</strong>：与第 062 章阶段状态机串行衔接，闭合确认成功后才执行物体附加。</li>
+    </ol>
+    <h3>夹爪控制参数表</h3>
+    <table>
+      <tr><th>参数</th><th>典型值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>目标开口（夹紧）</td><td>物体宽度 − 2 mm</td><td>闭合目标位置</td><td>保证指面压紧且不空走</td></tr>
+      <tr><td>max_effort</td><td>20–40 N</td><td>出力上限与过载保护</td><td>三方取小后的中值</td></tr>
+      <tr><td>位置容差</td><td>2 mm</td><td>到位判定阈值</td><td>大于编码器噪声，小于薄件厚度</td></tr>
+      <tr><td>力阈值</td><td>等效 3–10 N</td><td>夹持判定阈值</td><td>高于空载摩擦，低于误报上限</td></tr>
+      <tr><td>稳定等待</td><td>0.2 s</td><td>判定前的稳定时间</td><td>滤除闭合末段的瞬态</td></tr>
+      <tr><td>动作超时</td><td>0.8 s</td><td>开合动作时间上限</td><td>覆盖全行程时间并留余量</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：为什么稳定等待放在力判定之前？</span>
+      <p>夹爪闭合末段存在速度突变与结构弹性振荡，瞬时电流可能短暂超过阈值。若不做稳定等待，判定会把振荡峰值误读为"夹住"。等待 0.2 s 后读取稳定段的位置与力，等同于用时间维度对信号做低通，代价是可忽略的周期延长。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：GripperCommand 动作客户端封装</strong></p>
+    <pre class="code"><code>import rclpy
+from rclpy.action import ActionClient
+from control_msgs.action import GripperCommand
+
+class Gripper:
+    """统一夹爪接口：一条命令同时给出目标开口与出力上限。"""
+    def __init__(self, node):
+        self.node = node
+        self.client = ActionClient(
+            node, GripperCommand, "/gripper_controller/gripper_cmd")
+        self.client.wait_for_server()      # 启动期等待，避免首条命令丢失
+
+    def command(self, width, max_effort, timeout=0.8):
+        goal = GripperCommand.Goal()
+        goal.command.position = width          # 目标开口：夹紧时略小于物体宽度
+        goal.command.max_effort = max_effort   # 出力上限：兼作过载保护
+        send = self.client.send_goal_async(goal)
+        rclpy.spin_until_future_complete(self.node, send, timeout_sec=timeout)
+        handle = send.result()
+        if handle is None or not handle.accepted:
+            return None                        # 目标被拒或超时：上层重试或换候选
+        res = handle.get_result_async()
+        rclpy.spin_until_future_complete(self.node, res, timeout_sec=timeout)
+        return res.result().result if res.done() else None</code></pre>
+    <p>解读：<strong>（1）</strong>目标接口只有一个命令结构，位置与出力同时给出，避免了"先给位置再补出力"的两段式通信，减少时序窗口。<strong>（2）</strong><code>max_effort</code> 的语义是"允许的最大出力"，夹爪持续压靠时由驱动器限制电流，因此它同时是保护参数。<strong>（3）</strong>两次等待都设超时：动作服务器无响应与动作执行超长是两类不同故障，都必须在有界时间内返回给上层。<strong>（4）</strong>返回值为结果对象或空值，空值语义统一为"未完成"，由调用方决定重试或换候选。</p>
+
+    <p><strong>片段 2：双信号抓取确认</strong></p>
+    <pre class="code"><code>def grasp_check(result, target_width, width_tol=0.002, effort_thresh=3.0):
+    """按位置与力两个信号判定夹取结果：单一信号存在歧义。"""
+    if result is None:
+        return "NO_RESULT"                     # 无结果：动作未完成
+    pos, eff = result.position, result.effort  # 实际开口与出力
+    reached, stalled = result.reached_goal, result.stalled
+    within = abs(pos - target_width) &lt;= width_tol
+    if not within and eff &gt; effort_thresh:
+        return "GRASPED"                       # 未到位却有力：指爪被物体挡住
+    if reached and within and eff &lt;= effort_thresh:
+        return "EMPTY"                         # 到位且无力：合拢到底，空抓
+    if stalled and eff &gt; effort_thresh:
+        return "JAMMED"                        # 堵转：夹到硬物或机构卡滞
+    return "UNKNOWN"                           # 到位却有力等异常组合：保守处理并记录</code></pre>
+    <p>解读：<strong>（1）</strong>判定顺序按"信息强度"排列：先判夹住（最可能且最需要快速进入后续阶段），再判空抓与堵转，最后兜底为未知。<strong>（2）</strong>三个返回值直接对应任务层的三条分支：继续、换候选、报警终止。<strong>（3）</strong>阈值与容差必须来自标定：力阈值随夹爪型号与指面材料变化，位置容差受编码器分辨率与机构间隙限制，写死在代码中会让设备更换后判定失效。</p>
+
+    <p><strong>片段 3：夹持力预算与钳制</strong></p>
+    <pre class="code"><code>import math
+
+def required_force(mass, mu, s=2.0, a=0.0, g=9.81):
+    """摩擦需求下限：按搬运加速度最坏方向估算。"""
+    return s * mass * (g + a) / (2.0 * mu)
+
+def clamp_effort(need, gripper_max=40.0, object_limit=25.0):
+    """三方取小：摩擦需求、夹爪能力、物体承压上限。"""
+    return max(0.0, min(need, gripper_max, object_limit))
+
+need = required_force(1.0, 0.4, s=2.0, a=1.0)
+used = clamp_effort(need)
+print(f"摩擦需求 {need:.1f} N，实际设定 {used:.1f} N")
+if used &lt; need:
+    print("可行区间为空：需降低加速度或提高摩擦系数")</code></pre>
+    <p>解读：<strong>（1）</strong>需求公式把安全系数与加速度纳入，避免只按静态重量估算导致动态搬运打滑。<strong>（2）</strong><code>clamp_effort</code> 的语义是可行区间取中值前的保守钳制，当需求超过物体承压上限时输出小于需求的设定值并触发告警，把不可行状态显式暴露。<strong>（3）</strong>示例中需求 27 N、物体上限 25 N，输出 25 N 并提示区间为空，这是典型的"参数组合不可行"信号，处置方向为降低搬运加速度。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>只用位置判定抓取结果</strong>：指爪合拢到底（空抓）与夹住薄件在位置信号上几乎相同，误判后搬运阶段物体坠落。修复：引入力或电流信号做双信号判定，并按标定确定阈值。</li>
+      <li><strong>max_effort 设置高于物体承压上限</strong>：易碎或软包装被压坏，故障在多次作业后才以破损形式暴露。修复：统一走三方取小逻辑，并在参数校验阶段拒绝超限配置。</li>
+      <li><strong>关节名或话题名与控制器不一致</strong>：动作发送后无响应或静默丢弃。修复：名称从控制器配置读取，启动自检时打印解析到的控制器与关节清单。</li>
+      <li><strong>夹爪与机械臂动作并行</strong>：接近段尚未结束就发出闭合指令，指爪在运动中被物体撞击。修复：阶段串行执行，闭合指令在接近段结果返回后发出，闭合完成前不启动回退段。</li>
+      <li><strong>气动夹爪缺少反馈却按电动夹爪的确认流程使用</strong>：确认结果恒为未知，任务层无法分支。修复：加装位置传感器或压力开关，或调整任务层策略为"闭合后依赖后续传感器（如吸盘真空开关、视觉）验证"。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>物体质量 0.8 kg、摩擦系数 0.35、安全系数 2、搬运加速度 0.5 m/s²，求夹持力下限；若物体承压上限为 20 N，判断可行区间是否为空。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>N ≥ 2 × 0.8 × (9.81 + 0.5) / (2 × 0.35) ≈ 23.6 N，已超过 20 N 的承压上限，区间为空；处置方向为降低加速度或提高摩擦系数。</div></details>
+      </li>
+      <li>给出位置与力信号的四种组合，分别说明物理含义与建议处置，指出哪种组合需要人工介入。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>未到位且有力为夹住；到位且无力为空抓；未到位且力持续接近上限为堵转，需要人工介入处理异物或机构问题；到位且有力为异常组合，按保守策略处置并记录样本。</div></details>
+      </li>
+      <li>把 max_effort 从 20 N 提高到 40 N，预测夹持成功率、物体破损风险与堵转判定阈值的变化，说明为什么这一改动需要配套更新力阈值参数。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>更高上限降低滑落概率，同时提高破损与机构磨损风险；堵转判定使用绝对阈值时，上限变化会改变电流基线与判定灵敏度，阈值需重新标定。</div></details>
+      </li>
+      <li>设计欠驱动夹爪的抓取确认策略：两指位置耦合、夹持力随宽度变化，说明可用的信号组合与标定流程。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>可用信号为驱动关节位置、电机电流与指端行程开关；先离线标定"宽度—电流"曲线，运行时以电流对宽度的相对偏离作为夹持判据，处理耦合带来的非单值问题。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>夹爪接口分三类：GripperCommand 动作、关节轨迹控制器、IO 与气动接口，适配层负责把它们统一为"开合加查询状态"。</li>
+      <li>位置控制夹爪的夹持力与电流近似成正比，力控与欠驱动夹爪的确认逻辑需考虑出力与宽度的耦合。</li>
+      <li>抓取确认采用位置与力双信号，可区分夹住、空抓、堵转与异常四种状态，阈值来自标定实验。</li>
+      <li>夹持力设定遵循三方取小：摩擦需求下限、夹爪能力上限、物体承压上限，需求公式纳入安全系数与搬运加速度。</li>
+      <li>夹爪动作与机械臂阶段串行衔接，闭合确认成功后执行物体附加，下一章讨论真空吸盘的密封条件与法向力估算。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch065.html">← 第 065 章：Grasp 消息与 PlaceLocation 消息</a>
+    <a class="next" href="ch067.html">第 067 章：真空吸盘建模与控制 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.06 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:11.5px !important;letter-spacing:.06em !important;color:rgba(71,85,105,.45) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#7e8ba0 !important;font-size:11.5px !important;line-height:1.8 !important;text-align:center !important;padding:5px 12px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

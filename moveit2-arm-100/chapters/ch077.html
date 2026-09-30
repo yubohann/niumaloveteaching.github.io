@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第077章 真机通信与部署 | 机械臂规划学习课程 · ROS2 MoveIt2 运动规划与操作</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第四篇 · 抓取与操作任务</span>
+    <span class="sep">/</span>
+    <span>第 077 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第四篇 · 抓取与操作任务</div>
+    <h1>第 077 章：真机通信与部署</h1>
+    <p class="lead">从仿真到真机的最后一公里：五层部署链路、周期与延迟对精度的影响、执行监控参数与恢复策略，以及标定与安全限幅的验证清单。</p>
+    <ul class="meta">
+      <li>主题：系统验证 / 真机部署（Real Robot Deployment）</li>
+      <li>关键机制：ros2_control 硬件接口 / 执行监控（Execution Monitoring）/ 标定与安全限幅</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 076 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>掌握真机部署链路的五层结构（规划、执行管理、控制器、硬件接口、总线与驱动）与各层的周期量级。</li>
+      <li>理解通信延迟与控制周期如何转化为轨迹跟踪误差，能完成延迟项的精度预算。</li>
+      <li>会配置执行监控参数（时长缩放、时长余量、起点容差、完成确认），并说明放宽与收紧的后果。</li>
+      <li>掌握标定链（连杆、工具中心点、手眼）的残差量级与其在抓取误差预算中的位置。</li>
+      <li>能按分阶段放量流程部署真机：低速空载起步、逐档提速、每档设定通过条件。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>仿真中的机器人状态由物理引擎理想给出，真机中相同的一条轨迹要经过控制器插值、硬件接口、总线传输与伺服驱动若干环节，每个环节都引入周期、延迟与误差。<strong>部署工作的实质是把这些环节的时序与精度逐项对齐，使 MoveIt2 的规划假设在执行端成立</strong>：规划假设轨迹按时执行、起点与当前状态一致、位置误差可控，任何一项被打破都需要监控参数或恢复逻辑兜底。</p>
+    <p>安全约束在这条链路的最底层：力矩与速度限幅、碰撞检测、急停回路必须独立于上层软件工作。部署流程的每一步都要回答两个问题：这一步让哪些环节进入了验证范围，失败时如何安全退出。</p>
+    <p>本章与第 076 章的衔接：仿真输出的差距清单在这里逐项验证；与第 078 章的衔接：本章完成部署，下一章把整条抓取流水线放到真机上做阶段验收。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 部署链路的五层与周期量级</h3>
+    <table>
+      <tr><th>层</th><th>组件</th><th>周期或频率</th><th>典型故障</th></tr>
+      <tr><td>规划层</td><td>move_group 与规划场景</td><td>1–10 Hz，事件驱动</td><td>场景不同步、起点过期</td></tr>
+      <tr><td>执行管理</td><td>轨迹执行管理器与控制器接口</td><td>事件驱动</td><td>控制器未加载、时长不符</td></tr>
+      <tr><td>控制器</td><td>关节轨迹控制器</td><td>100–1000 Hz</td><td>跟踪误差、超调</td></tr>
+      <tr><td>硬件接口</td><td>ros2_control 硬件抽象</td><td>0.5–10 ms</td><td>读写失败、状态跳变</td></tr>
+      <tr><td>总线与驱动</td><td>EtherCAT、CAN 或实时以太网</td><td>1 ms 量级</td><td>抖动、丢包、同步丢失</td></tr>
+    </table>
+    <p>链路自上而下周期递减：规划层的毫秒级波动被控制器与硬件接口的固定周期"吸收"，总线层的微秒到毫秒级抖动则由驱动器的位置环消化。<strong>部署验证的顺序应自下而上：先确认总线周期与读写稳定，再确认控制器跟踪，最后接入规划层</strong>，与第一篇的调试路线一致。</p>
+
+    <h3>2. 周期、延迟与跟踪误差</h3>
+    <p>控制周期决定插值粒度，通信延迟决定指令的滞后，两者叠加为轨迹跟踪误差。滞后与速度的关系是线性放大：</p>
+    <div class="formula">
+      e<sub>lag</sub> ≈ v · t<sub>delay</sub>
+      <span class="note">末端速度 0.25 m/s、总延迟 5 ms 时滞后约 1.25 mm；延迟清单包含控制器计算、总线传输与驱动器响应</span>
+    </div>
+    <p>把延迟项放入抓取误差预算（第 064 章的误差分层）：定位 0.5 mm、抓取抓偏 1.5 mm、延迟 1.25 mm 的合成误差约 2.02 mm，<strong>延迟项与抓取抓偏同量级，忽略它会让实际精度比预算差近一倍</strong>。抑制手段包括：降低接近段速度（延迟乘速度减小）、提高控制器频率（周期项减小）、使用前馈补偿（控制器侧手段）。</p>
+
+    <h3>3. 执行监控与恢复</h3>
+    <table>
+      <tr><th>参数</th><th>典型值</th><th>作用</th><th>放宽的后果</th></tr>
+      <tr><td>时长缩放</td><td>1.2</td><td>实际时长上限为计划的 1.2 倍</td><td>执行异常延迟暴露变慢</td></tr>
+      <tr><td>时长余量</td><td>0.5 s</td><td>额外时间缓冲</td><td>小轨迹的异常被掩盖</td></tr>
+      <tr><td>起点容差</td><td>0.01–0.05 rad</td><td>轨迹起点与当前状态的允许偏差</td><td>从偏差位姿起步，首帧跳变</td></tr>
+      <tr><td>完成确认</td><td>开启</td><td>等待控制器报告完成再判成功</td><td>轨迹未走完即进入下一阶段</td></tr>
+    </table>
+    <p>监控的目的是把"执行异常"转换为可处理的失败事件：超时中止后，恢复策略按代价递增为"重规划同段轨迹、退回到安全位形、上报人工"。<strong>起点容差需要与状态更新频率匹配：状态发布 50 Hz 时，一个周期的运动量约 0.005 rad 量级，容差取 0.01 rad 可吸收发布间隔，过小则频繁拒绝执行、过大则失去保护意义。</strong></p>
+
+    <h3>4. 标定链与安全限幅</h3>
+    <p>标定链三级串联，残差逐级进入抓取误差预算：</p>
+    <ul>
+      <li><strong>连杆与零位标定</strong>：修正 URDF 中的连杆几何与关节零位，残差 0.1–0.3 mm 量级。</li>
+      <li><strong>工具中心点（Tool Center Point, TCP）标定</strong>：确定工具坐标系相对法兰的位姿，残差 0.1–0.5 mm。</li>
+      <li><strong>手眼标定</strong>：确定相机与机械臂或工作台的相对位姿，残差 0.5–2 mm，是感知抓取精度的主导项。</li>
+    </ul>
+    <p>安全限幅分三层，缺一不可：<strong>控制器层的速度与加速度限制（软件）、驱动器层的力矩限幅（通常在驱动固件）、独立的急停回路（硬件，不经软件路径）</strong>。软件限幅负责把常规动作约束在安全包络内，硬件回路负责失效安全：任何一层失效，下一层仍能阻止危险动作（第 093 章展开）。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>真机部署的步骤：</p>
+    <ol>
+      <li><strong>底层验证</strong>：接通总线与驱动器，确认读写周期稳定、关节方向与零位正确（手动示教小角度往复）。</li>
+      <li><strong>控制器验证</strong>：加载关节状态广播与轨迹控制器，空载执行单关节轨迹，测量跟踪误差。</li>
+      <li><strong>标定</strong>：依次完成连杆零位、TCP 与手眼标定，记录各项残差。</li>
+      <li><strong>安全验证</strong>：限幅参数逐项生效，急停回路独立动作，碰撞检测灵敏度符合预期。</li>
+      <li><strong>分阶段放量</strong>：速度缩放 0.3 起步，空载走通全轨迹；带载验证夹持；随后逐档提速。</li>
+      <li><strong>监控与恢复</strong>：执行监控参数生效，恢复策略按"重规划、回退、上报"三级验证。</li>
+    </ol>
+    <h3>部署参数表</h3>
+    <table>
+      <tr><th>参数</th><th>典型值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>控制器更新率</td><td>500–1000 Hz</td><td>插值精度</td><td>高于规划层两个量级</td></tr>
+      <tr><td>初始速度缩放</td><td>0.3</td><td>首次试运行速度</td><td>误差与冲击随速度线性下降</td></tr>
+      <tr><td>时长缩放</td><td>1.2</td><td>执行超时判定</td><td>覆盖减速与通信波动</td></tr>
+      <tr><td>起点容差</td><td>0.02 rad</td><td>起点一致性</td><td>匹配状态发布周期的运动量</td></tr>
+      <tr><td>TCP 标定残差</td><td>&lt; 0.5 mm</td><td>工具精度</td><td>进入抓取误差预算</td></tr>
+      <tr><td>手眼标定残差</td><td>&lt; 2 mm</td><td>感知精度</td><td>感知抓取的主导误差项</td></tr>
+      <tr><td>跟踪误差上限</td><td>2 mm</td><td>控制器健康指标</td><td>小于抓取位姿容差</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：为什么从 0.3 速度缩放起步？</span>
+      <p>跟踪误差中与速度成正比的项（延迟滞后、离心与科氏项、柔性激励）在低速下都显著减小，首轮运行的目标是把时序与流程问题暴露出来而不放大其后果。每档缩放的通过条件预先定义（跟踪误差、完成率、无异常中止），达标才允许提升，最终以验收节拍对应的缩放值收尾。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：执行监控参数配置</strong></p>
+    <pre class="code"><code>move_group:
+  ros__parameters:
+    trajectory_execution:
+      execution_duration_monitoring: true     # 开启执行时长监控
+      allowed_execution_duration_scaling: 1.2 # 实际时长上限 = 计划时长 × 1.2
+      allowed_goal_duration_margin: 0.5       # 额外余量（秒）：吸收减速与通信波动
+      allowed_start_tolerance: 0.02           # 起点容差（弧度）：与当前状态的允许偏差
+      wait_for_trajectory_completion: true    # 等控制器确认完成后再判成功
+# 参数含义与默认值随 MoveIt2 发行版演进，以官方文档为准</code></pre>
+    <p>解读：<strong>（1）</strong>五个参数共同回答两个问题：轨迹是否按时完成（时长监控与缩放）、轨迹是否从正确的位置开始（起点容差与完成确认）。<strong>（2）</strong>时长余量 0.5 s 对小段轨迹而言比例很大，收紧时应按最长轨迹的 5%–10% 折中设定，避免把异常拖延藏在余量里。<strong>（3）</strong>起点容差的量级与状态发布的周期匹配：0.02 rad 对应状态更新间隔内机械臂的正常运动量，既不会误拒也不会放过真实的起点偏移。配置后要做两类注入实验：人为滞后状态更新验证容差行为，人为延长执行验证时长监控。</p>
+
+    <p><strong>片段 2：硬件接口的 read 与 write 周期</strong></p>
+    <pre class="code"><code>#include &lt;hardware_interface/system_interface.hpp&gt;
+
+// 简化的系统硬件接口骨架：每个控制周期执行一次 read 与 write
+class ArmSystem : public hardware_interface::SystemInterface {
+public:
+  hardware_interface::return_type read(const rclcpp::Time &amp;t,
+                                       const rclcpp::Duration &amp;period) override {
+    int rc = driver_.readPositions(&amp;positions_[0], positions_.size());
+    if (rc != 0) {
+      // 读取失败不抛异常：保留上次位置，避免规划层看到跳变而中止
+      ++read_failures_;
+      RCLCPP_WARN_THROTTLE(logger_, *clock_, 1000, "总线读取失败 %d 次", read_failures_);
+    }
+    return hardware_interface::return_type::OK;
+  }
+
+  hardware_interface::return_type write(const rclcpp::Time &amp;t,
+                                        const rclcpp::Duration &amp;period) override {
+    driver_.writeCommands(commands_.data(), commands_.size());  // 驱动层再复检限幅
+    return hardware_interface::return_type::OK;
+  }
+
+private:
+  Driver driver_;                       // 总线驱动封装：负责协议与错误码映射
+  std::vector&lt;double&gt; positions_;       // 状态接口缓冲区
+  std::vector&lt;double&gt; commands_;        // 指令接口缓冲区
+  int read_failures_{0};                // 读取失败计数：超阈值应触发安全降级
+  rclcpp::Clock::SharedPtr clock_;
+  rclcpp::Logger logger_{rclcpp::get_logger("arm_system")};
+};</code></pre>
+    <p>解读：<strong>（1）</strong>read 与 write 在固定周期内被调用，接口函数的执行时间必须远小于周期；把耗时的诊断逻辑放在这里会直接破坏周期稳定性。<strong>（2）</strong>读取失败时保留上次位置是常见折中：状态不跳变，但会静默过期，因此必须配合失败计数与阈值降级，否则规划层会在错误的状态上持续工作。<strong>（3）</strong>指令限幅在硬件接口与驱动层各做一次，属于防御式设计的双保险；接口层限幅保护机械臂，驱动层限幅保护电机与减速器。</p>
+
+    <p><strong>片段 3：分阶段放量的通过条件表</strong></p>
+    <pre class="code"><code>def deployment_stages():
+    """真机放量阶梯：每档的通过条件预定义，达标才允许提升。"""
+    return (
+        {"scale": 0.3, "pass_if": "空载轨迹跟踪误差 &lt; 1 mm，无执行中止"},
+        {"scale": 0.5, "pass_if": "带载轨迹成功，夹持确认与附着时序正确"},
+        {"scale": 0.8, "pass_if": "连续 20 次抓放成功，无恢复事件"},
+        {"scale": 1.0, "pass_if": "节拍与第 078 章验收指标全部达标"},
+    )
+
+for s in deployment_stages():
+    print(f"速度缩放 {s['scale']}：通过条件 {s['pass_if']}")</code></pre>
+    <p>解读：<strong>（1）</strong>通过条件把"感觉没问题"换成可判定的数字：跟踪误差、成功次数与恢复事件数，每一档的验证范围比上一档扩一档（空载、带载、连续运行、节拍）。<strong>（2）</strong>速度缩放是覆盖全链路的单一控制变量：它同时缩放规划层的轨迹速度、控制器的插值速率与硬件层的运动幅度，用它做放量阶梯可以用最小复杂度控制风险。<strong>（3）</strong>达标条件写入部署记录，回退时按档位反向执行（1.0 退回 0.8 退回 0.5），保证任何异常都能退到已验证的安全状态。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>起点容差过小</strong>：轨迹频繁被拒绝执行，日志显示起点偏差超限。修复：容差与状态发布频率匹配（0.01–0.05 rad），并确认状态订阅的时延没有异常。</li>
+      <li><strong>时长缩放过大</strong>：控制器异常或机械卡滞时执行被拖延很久才报错，小段轨迹的异常被余量掩盖。修复：缩放收紧到 1.2 附近、余量按最长轨迹比例设定，并开启时长监控事件上报。</li>
+      <li><strong>跳过 TCP 与手眼标定直接抓取</strong>：抓取位姿存在系统性偏移，方向误差随距离放大。修复：标定入验收清单，残差超限不允许进入带载阶段。</li>
+      <li><strong>总线读取失败静默处理</strong>：状态停滞数秒后规划层在过期状态上工作，恢复执行时位置跳变。修复：失败计数与时间阈值联动，超限即触发控制器停止并上报。</li>
+      <li><strong>用软件限幅替代急停回路</strong>：软件层僵死时失去最后保护。修复：急停回路独立布线，任何部署阶段都必须先验证回路动作有效。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>控制器通信延迟合计 5 ms，末端接近段速度 0.25 m/s。计算延迟引入的位置滞后；若抓取容差为 2 mm，说明该项在误差预算中的占比。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>滞后 = 0.25 × 0.005 = 1.25 mm，占容差的六成以上；与第 064 章的分层误差合并计算时，延迟项与抓取抓偏同量级。</div></details>
+      </li>
+      <li>把起点容差从 0.01 rad 放宽到 0.05 rad，预测执行拒绝率与首帧跳变的可能后果，并给出选择依据。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>拒绝率下降、可用性提高；代价是允许从较大偏差起步，首帧位置跳变转化为速度尖峰，可能激励柔性（第 075 章）与触发碰撞阈值。选择依据是状态更新周期对应的正常运动量。</div></details>
+      </li>
+      <li>TCP 标定残差 0.3 mm、手眼标定残差 1.0 mm、定位误差 0.5 mm。按平方和开方合成，并说明哪一项优先改进。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>RSS = √(0.09 + 1.0 + 0.25) ≈ 1.16 mm；手眼标定为主导项，优先改进标定流程与验证方法。</div></details>
+      </li>
+      <li>为一条六轴臂编写部署验证清单：列出每个层的验证项、量化判据与失败处置，并标注哪些项必须在带载前完成。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>底层：读写周期、零位与方向；控制器：跟踪误差小于 2 mm；标定：TCP 小于 0.5 mm、手眼小于 2 mm；安全：限幅与急停动作；以上四项均在带载前完成，带载阶段验证夹持确认、附着时序与恢复策略。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>部署链路分五层，周期自上而下递减，验证顺序自下而上：总线、控制器、标定、安全，最后接入规划层。</li>
+      <li>通信延迟与速度的乘积构成轨迹跟踪误差的延迟项，量级与抓取抓偏相当，必须纳入误差预算。</li>
+      <li>执行监控由时长监控、时长缩放与余量、起点容差与完成确认共同构成，参数放宽会掩盖异常、收紧会降低可用性。</li>
+      <li>标定链的残差逐级进入抓取精度，手眼标定通常为主导项；安全限幅分软件与硬件两层，急停回路必须独立验证。</li>
+      <li>分阶段放量以速度缩放为单一控制变量，每档设定量化通过条件，下一章给出完整流水线的验收指标与阶段实践方案。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch076.html">← 第 076 章：仿真环境中的操作任务</a>
+    <a class="next" href="ch078.html">第 078 章：阶段实践：完整抓取流水线 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.06 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:11.5px !important;letter-spacing:.06em !important;color:rgba(71,85,105,.45) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#7e8ba0 !important;font-size:11.5px !important;line-height:1.8 !important;text-align:center !important;padding:5px 12px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

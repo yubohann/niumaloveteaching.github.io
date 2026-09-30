@@ -4,7 +4,7 @@
 实验内容（4 人重复公共品博弈，纯 numpy + 表格 Q 学习）：
   - 每轮 4 个玩家同时选择贡献 c ∈ {0,1,2,3}；总贡献乘以系数 1.6 后
     四人均分：u_i = 1.6·Σc / 4 − c_i
-  - 一次性博弈里"贡献 0"是占优策略，但全员贡献 3 时社会福利最高——
+  - 一次性博弈里"贡献 0"是占优策略，但全员贡献 3 时社会福利最高，
     这是经典的搭便车困境；重复博弈里玩家可以用"条件合作"互相回应
   - 观测（记忆 1 轮）：自己上轮贡献的独热(4)、他人上轮贡献均值(1)、
     他人上轮贡献最小值(1)、回合进度(1)
@@ -16,8 +16,9 @@
     python code/ch094.py           # 完整训练（CPU 约 1-3 分钟）
     python code/ch094.py --quick   # 快速跑通（约 15-30 秒）
 
-预期：学习到的策略介于纳什与条件合作之间——重复博弈下合作水平显著高于
-全 0，但通常低于社会最优，且存在"终局崩塌"（最后几十轮贡献下降）。
+预期：默认配置下合作维持不住，学习策略塌向搭便车：平均贡献 0.03～0.11、
+合作率接近 0、福利 0.06～0.27，远低于随机基线（随机平均贡献约 1.5）；
+首尾对比没有稳定的"先高后低"，因为合作从未建立。以实跑为准。
 """
 
 import argparse
@@ -134,7 +135,7 @@ def scripted_action(name: str, env: PublicGoodsGame, i: int,
         return 3
     if name == "random":
         return int(rng.integers(0, env.n_actions))
-    if name == "conditional":       # 跟随他人上轮平均贡献（四舍五入），首轮给 3
+    if name == "conditional":       # 跟随他人上轮平均贡献（四舍五入）；全员从 0 出发，首轮即退化为 0
         others = np.delete(env.last, i)
         return int(np.clip(np.round(others.mean()), 0, 3))
     raise ValueError(name)

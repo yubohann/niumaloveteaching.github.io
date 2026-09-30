@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第031章 点云更新规划场景 | 机械臂规划学习课程 · ROS2 MoveIt2 运动规划与操作</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 规划场景与碰撞管理</span>
+    <span class="sep">/</span>
+    <span>第 031 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 规划场景与碰撞管理</div>
+    <h1>第 031 章：点云更新规划场景</h1>
+    <p class="lead">从一帧点云到地图体素：本章讲点云消息的组织方式、坐标变换与时间戳的约束、量程截断与降采样等过滤链路、射线插入的命中与清除语义，以及更新频率与规划缓存之间的节拍取舍。</p>
+    <ul class="meta">
+      <li>主题：感知数据通路 / 点云集成</li>
+      <li>关键机制：PointCloud2 消息解析、TF 时间戳对齐、射线插入与过滤链</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 030 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>掌握点云消息（PointCloud2）的组织方式：字段描述、步长与数据块，理解"有序点云"与"无序点云"的区别。</li>
+      <li>能说明从点云消息到地图体素的完整通路：坐标变换、过滤、射线插入三个阶段各自解决什么问题。</li>
+      <li>理解射线插入的命中与清除语义：为什么穿越观测会擦除体素，清除能力依赖什么条件。</li>
+      <li>会配置量程截断、点抽稀与自过滤三类参数，并按数据量账本估算链路开销。</li>
+      <li>能设计更新节拍策略：在场景新鲜度与规划缓存失效之间取得平衡。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 030 章定义了占据地图这种表示，本章回答数据如何流入其中。传感器给出的原始形式是点云：一帧几十万个带坐标的采样点，它们带着自己的参考系与时间戳，需要在正确的时刻变换到地图参考系，经过过滤压缩，再以射线方式写入八叉树。这条通路上每一环都有失败模式：变换取不到导致整帧静默丢弃、机器人自身的点进入地图形成"自障碍"、过滤过猛让小障碍消失、更新过频让规划缓存反复失效。</p>
+    <p>这条通路也是整篇"感知驱动规划"的主动脉：第 032 章讲深度相机如何产生点云，第 033 章讲感知接口的扩展方式，第 034 章讲多路数据的融合。<strong>把本章的通路理顺，后面三章各自只需要替换其中的一个环节。</strong>规划侧对它只有一个要求：场景新鲜、干净、开销可控。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 点云消息：字段描述加数据块</h3>
+    <p>点云消息（sensor_msgs/PointCloud2）采用"数据块加字段描述"的组织方式：头部给出参考系与时间戳，高度与宽度描述点阵规模，字段数组描述每个点包含哪些分量（坐标、强度、颜色、环号等），点步长（point_step）给出单个点占用的字节数，行步长（row_step）给出一行占用的字节数，最后是纯字节数据块。这种布局让不同传感器可以共用一种消息类型，同时把解析负担交给消费方。</p>
+    <p>两个分类概念决定消费方式。<strong>（1）有序点云：</strong>高度大于 1，点按图像网格排列，行列坐标隐含空间邻接，适合做邻域滤波；深度相机输出通常属于此类。<strong>（2）无序点云：</strong>高度为 1，点仅是一维列表，是否密集需借助消息中的密集标志与无效点约定判断。解析时读到的无效点（无效值或零距离）必须先剔除再参与任何几何计算，否则无效值会污染整批统计。</p>
+
+    <h3>2. 通路三段：变换、过滤、插入</h3>
+    <p>从消息到体素的通路分三段，各有明确的成功条件：</p>
+    <table>
+      <tr><th>阶段</th><th>动作</th><th>成功条件</th><th>失败表现</th></tr>
+      <tr><td>坐标变换</td><td>把点从传感器参考系变换到地图参考系</td><td>消息时间戳上存在完整变换链</td><td>整帧被丢弃，地图不更新且通常只在调试日志可见</td></tr>
+      <tr><td>过滤</td><td>量程截断、抽稀、自过滤、降采样</td><td>参数与传感器特性匹配</td><td>障碍缺失（过滤过猛）或噪声入库（过滤不足）</td></tr>
+      <tr><td>射线插入</td><td>对每个点做射线命中与穿越更新</td><td>具备传感器原点与合理的量程上限</td><td>已消失障碍无法清除、远处噪点形成幻影障碍</td></tr>
+    </table>
+    <p>坐标变换有一个常被低估的约束：变换必须在"消息时间戳"上求值。传感器数据在链路上有延迟，如果按到达时刻取变换，机器人正在运动时会产生系统性错位。变换链缺环（静态链未发布、时间同步缺失）时，多数实现选择丢弃整帧，这种行为正确且安静，因此"地图不动"的第一检查项永远是变换可用性。<strong>用消息时间戳对齐是硬性要求，任何精度偏好都不能替代它。</strong></p>
+
+    <h3>3. 射线插入：命中与清除</h3>
+    <p>占据更新的标准实现是射线插入：每条从传感器原点指向测量点的射线经过两类更新。射线的终点体素按命中模型处理（占据概率上升）；射线沿途的体素按未命中模型处理（概率下降，即清除）。这一设计让同一帧数据同时完成两件事：写入看到的表面、擦除被看穿的体积。地图"能自动清除已消失障碍"这一能力完全建立在穿越观测之上：如果传感器视角发生变化或某区域长期无射线穿过，该区域的旧体素就会保留。</p>
+    <p>两个参数直接塑造清除行为。量程上限决定射线的最大长度：设得过小，远处表面不写但也无妨；设得过大，远距离测量噪声（深度误差随距离平方增长）会写入密集噪点，形成悬空的幻影障碍。传感器原点必须精确：它不仅是几何参数，也是"清除从谁的眼睛出发"的语义参数，移动平台场景中它随平台运动而变，需要逐帧更新。<strong>射线结束处是"看到表面"，射线不要越过表面继续清除背后的体素，这一"遮挡"语义让地图与可见性一致。</strong></p>
+
+    <h3>4. 过滤链：四项标准过滤与其量级</h3>
+    <p>直接把原始点云喂给射线插入会浪费大量计算：同一体素被同一帧的多个点或相邻帧的重复点反复更新。标准过滤链由四项组成：</p>
+    <ul>
+      <li><strong>量程截断</strong>：剔除超出观测范围的点，同时切断远距离噪声。</li>
+      <li><strong>点抽稀</strong>：按固定间隔抽样（例如每 4 个点取 1 个），代价线性下降，是最经济的提速手段。</li>
+      <li><strong>自过滤</strong>：把落在机器人本体上的点剔除，防止机械臂被写进地图形成跟随自身的障碍。</li>
+      <li><strong>降采样</strong>：按体素粒度合并重复点，每格保留代表点，进一步压缩写入次数。</li>
+    </ul>
+    <p>数据量账本能说明这些过滤为什么必要。一帧 640 &times; 480 的深度点云含约 3.1 &times; 10<sup>5</sup> 个点，单点 16 字节时约 4.9 MB；30 Hz 持续输入约 147 MB/s 的链路负荷与等量的解析开销。抽稀 4 倍并限制写入频率至 5 Hz 后，写入负荷降到约 6 MB/s 量级，降低约二十余倍。<strong>链路预算的第一杠杆是抽稀与节流，第二杠杆是量程截断；两者都不损失规划关心的核心几何。</strong></p>
+
+    <h3>5. 节拍取舍：新鲜度与缓存失效</h3>
+    <p>更新频率存在一个反直觉的权衡。频率越高，场景越新鲜，感知驱动的避障越及时；但每次地图更新都会使规划场景的碰撞检测缓存失效（第 029 章讲过预计算与缓存的收益），规划在更新间隙内必须重建缓存，频率越高规划越慢。规划侧的经验值是更新频率落在 1 至 10 Hz 区间：对以秒计的规划与执行节拍而言，秒级以内的地图年龄已经足够新；对快速动态环境，规划本身就该切换到更短周期的小步重规划模式（第 094、095 章展开）。</p>
+    <p>把这条权衡落实为工程参数，就是"更新节拍与任务阶段的对应"：大范围移动阶段允许较低频率；接近操作阶段提高频率或暂停更新（把场景冻结在最后一次可信快照上），避免规划期间场景持续变化造成的验证-执行不一致。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>点云通路的搭建与验证步骤：</p>
+    <ol>
+      <li><strong>确认输入源</strong>：核对点云话题名、字段构成与频率；用单次抓取查看消息规模与无效点比例。</li>
+      <li><strong>打通变换链</strong>：确认传感器参考系到地图参考系的静态链完整，检查时间戳分布（含零时间戳与回放时间）。</li>
+      <li><strong>配置过滤参数</strong>：量程、抽稀、降采样、自过滤逐项设定；自过滤需要机器人几何掩膜参与（检测机器人本体占用体素并剔除对应点）。</li>
+      <li><strong>设定更新节拍</strong>：从 1 至 10 Hz 区间选值，观察规划耗时随节拍的变化曲线。</li>
+      <li><strong>写入验证</strong>：在已知位置放置标准障碍，核对地图中的出现位置、尺寸与清除时间。</li>
+      <li><strong>运行期监测</strong>：监测点云新鲜度与地图叶子规模，把"地图是否在被更新"变为可告警的量。</li>
+    </ol>
+    <h3>通路参数要点</h3>
+    <table>
+      <tr><th>参数</th><th>常用取值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>量程上限</td><td>3–5 m</td><td>射线与点的距离上限</td><td>覆盖工位并留余量；抑制远距噪声</td></tr>
+      <tr><td>点抽稀间隔</td><td>2–8</td><td>每 N 点取 1</td><td>写入负荷与细节的折中</td></tr>
+      <tr><td>降采样体素</td><td>0.01–0.03 m</td><td>合并重复点</td><td>与地图分辨率同级或略小</td></tr>
+      <tr><td>更新频率</td><td>1–10 Hz</td><td>地图写入节拍</td><td>场景新鲜度与缓存失效成本的平衡</td></tr>
+      <tr><td>新鲜度告警阈值</td><td>0.5 s</td><td>点云停更检测</td><td>高于标称周期一个量级</td></tr>
+    </table>
+    <p><strong>与上一章的差异点</strong>：第 030 章回答"地图是什么"，本章回答"地图怎么长出来"。数据结构不变，新增的是时间维度：消息时间戳、变换求值时刻、清除的时间依赖，时间一致性是本章的核心考点。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：Python 解析点云并做量程截断与体素降采样</strong></p>
+    <pre class="code"><code>from sensor_msgs_py import point_cloud2
+import numpy as np
+
+def cloud_preprocess(msg, max_range=3.5, voxel=0.02):
+    """一帧点云的预处理：解析、量程截断、体素降采样。"""
+    # skip_nans 剔除无效点：无效点会污染距离统计与体素量化
+    pts = point_cloud2.read_points_numpy(
+        msg, field_names=("x", "y", "z"), skip_nans=True)
+    if pts.size == 0:
+        return pts
+    # 量程截断：远距离深度噪声随距离增长，先按半径过滤
+    radius = np.linalg.norm(pts, axis=1)
+    pts = pts[radius &lt;= max_range]
+    # 体素降采样：坐标量化到体素格，每格保留一个代表点
+    # 减少同一体素被同帧多个点反复写入的浪费
+    keys = np.floor(pts / voxel).astype(np.int64)
+    _, first_idx = np.unique(keys, axis=0, return_index=True)
+    sampled = pts[first_idx]
+    print(f"输入 {msg.width} x {msg.height}，截断后 {len(pts)}，"
+          f"降采样后 {len(sampled)}")
+    return sampled</code></pre>
+    <p>解读：<strong>（1）</strong>读取时显式给出所需字段并开启无效点剔除，解析只搬运需要的分量；坐标数组以浮点形式返回，避免了手工按步长切片取字节的错误来源。<strong>（2）</strong>量程截断放在降采样之前：先减量再量化，省下的计算按截断比例线性放大。<strong>（3）</strong>体素量化用整除取键值去重，是降采样的一种最小实现；它保留的是每格首个点，未取几何中心，对占据地图这类"每格只需存在性证据"的用途已经足够。该流程与传感器插件内部的过滤逻辑一一对应，自定义插件时在相同位置替换即可。</p>
+
+    <p><strong>片段 2：C++ 以射线方式把点云写入八叉树</strong>（octomap 库接口以所用版本为准）</p>
+    <pre class="code"><code>// 准备点云容器：点坐标已变换到地图参考系，单位米
+octomap::Pointcloud scan;
+scan.reserve(points.size());
+for (const auto&amp; p : points)
+{
+  scan.push_back(p.x, p.y, p.z);   // 越界点已在过滤阶段剔除
+}
+
+// 传感器原点：射线的起点，决定"清除从谁的眼睛出发"
+octomap::point3d sensor_origin(0.2, -0.1, 1.4);
+
+// 插入语义：每条约指到测量点的射线
+// 终点体素命中（概率上升），沿途体素未命中（概率下降，即清除）
+// 量程上限截断射线，遮挡语义让表面背后的体素不被误清除
+tree-&gt;insertPointCloud(scan, sensor_origin, /*max_range=*/3.5,
+                       /*lazy_eval=*/false);</code></pre>
+    <p>解读：<strong>（1）</strong>传感器原点参数把传感器位姿引入地图维护：机械臂上相机场景中它随关节运动变化，需要逐帧按当前运动学计算后传入，写错会让清除射线的几何完全偏离。<strong>（2）</strong>量程上限在插入阶段再次生效，与过滤阶段的截断形成双重防线：过滤阶段省计算，插入阶段保证射线几何正确。<strong>（3）</strong>注释点明遮挡语义：射线止于测量表面，表面之后保持原状；这一性质意味着地图的更新质量与传感器视角直接相关，盲区不更新也不清除，设计验证用例时要覆盖视角切换。</p>
+
+    <p><strong>片段 3：Python 点云新鲜度监测</strong></p>
+    <pre class="code"><code>import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import PointCloud2
+
+class CloudWatchdog(Node):
+    """监测点云新鲜度：地图停更会直接动摇规划可信度。"""
+
+    def __init__(self):
+        super().__init__("cloud_watchdog")
+        self.last_time = None
+        # 队列深度 5：监测只关心"最近有没有数据"，浅队列即可
+        self.create_subscription(PointCloud2, "/camera/depth/points",
+                                 self.on_cloud, 5)
+        self.create_timer(0.5, self.check)
+
+    def on_cloud(self, msg):
+        # 只记录到达时刻，不做解析：监测逻辑保持常数开销
+        self.last_time = self.get_clock().now()
+
+    def check(self):
+        if self.last_time is None:
+            self.get_logger().warn("尚未收到点云，场景尚无感知输入")
+            return
+        age = (self.get_clock().now() - self.last_time).nanoseconds / 1e9
+        # 超过 0.5 s 无更新：规划前应降级处理或拒绝感知驱动的任务
+        if age &gt; 0.5:
+            self.get_logger().warn(f"点云已 {age:.2f} s 未更新")</code></pre>
+    <p>解读：<strong>（1）</strong>监测器与第 021 章的关节状态闸门同构：把"数据流是否活着"变成一个可判定条件，规划循环据此选择正常执行或降级。<strong>（2）</strong>回调只记录时间戳，解析与统计留给需要的地方，确保监测本身几乎零开销。<strong>（3）</strong>告警语义按"感知驱动的任务拒绝执行、显式物体驱动的任务可继续"分流，把数据新鲜度与任务风险等级挂钩，避免一刀切停机。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>变换链缺失导致整帧静默丢弃</strong>：地图长时间不更新，规划看到的场景停留在启动时刻。症状是"感知看起来正常但避障行为不变"。修复是核对传感器到地图参考系的变换可用性与消息时间戳分布。</li>
+      <li><strong>机器人自身点进入地图</strong>：机械臂在相机视野内，手臂表面被写成障碍，且随臂运动"跟随"，规划全部失败。修复是启用自过滤，用机器人几何掩膜剔除本体点，并验证掩膜覆盖夹具全貌。</li>
+      <li><strong>抽稀过猛</strong>：抽稀间隔从 4 提到 16，细小障碍（线材、薄板边缘）在点云中消失，地图里只有大平面。修复是按最小关注障碍的采样密度反推抽稀上限，用标准障碍回归验证。</li>
+      <li><strong>更新频率过高的反效果</strong>：为追求"实时"把更新提到 30 Hz，规划时间反而成倍上升（缓存持续失效）。修复是按任务预算设定 1 至 10 Hz 的节拍，在高动态场景改用降低单次规划规模的策略。</li>
+      <li><strong>无效点未剔除</strong>：解析时未开启无效点过滤，无效坐标参与距离统计与量化，产生位于坐标原点的虚假密集障碍。修复是所有解析路径统一剔除无效点，并把零距离点单独统计作为传感器健康指标。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>链路预算：640 &times; 480 点云、单点 16 字节、30 Hz 输入。计算原始链路负荷；若在源头抽稀 4 倍并把写入限制在 5 Hz，写入端的负荷是多少？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>原始约 4.9 MB/帧，30 Hz 约 147 MB/s；抽稀后约 1.2 MB/帧，5 Hz 约 6 MB/s，降低约二十四倍。规划场景消费的是抽稀后的数据，输入链路负荷需要靠相机端配置另行控制。</div></details>
+      </li>
+      <li>结果预测：把降采样体素从 0.01 m 调到 0.04 m（地图分辨率为 0.05 m）。预测写入次数、障碍最小可分辨尺寸与清除行为的变化。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>写入次数显著下降，最细可辨特征从厘米级升到 4 cm 量级；清除行为变粗（射线的空间密度随降采样变稀），薄壁与细小突起最先从地图中消失。</div></details>
+      </li>
+      <li>设计题：为一台"机械臂加装腕部相机"的系统设计点云通路参数（量程、抽稀、降采样、更新频率、自过滤），并给出三个验证用例（正常障碍、自过滤、清除）。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>腕部相机随臂运动，量程取接近操作距离（如 2 m 内），传感器原点逐帧计算；验证用例分别为：标准障碍的位置与尺寸核对；镜头前扫过自身臂段后地图无自障碍；移走障碍后限定时间内体素清除。</div></details>
+      </li>
+      <li>诊断题：RViz 中机械臂表面持续出现随臂运动的障碍点云。列出一种最可能原因与两步验证，并说明为什么该现象会迅速导致规划全面失败。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>最可能原因是自过滤未启用或掩膜未覆盖当前姿态下的臂身；验证一看地图中障碍与臂表面是否重合，验证二临时禁用地图观察规划是否恢复。规划失败的原因是自障碍使起点状态直接被判碰撞。</div></details>
+      </li>
+      <li>分析题：论证更新频率与规划耗时之间的非单调关系，并给出"任务阶段自适应节拍"的设计：大范围移动、接近操作、精密嵌合三个阶段各应采取什么策略，为什么。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>频率升高让场景更新鲜，但缓存失效使单次规划变慢，总耗时先降后升；移动阶段取中低频（2–5 Hz），接近阶段中频并缩短规划视野，嵌合阶段冻结场景或暂停感知驱动规划，因为它依赖毫米级一致的场景快照。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul>
+      <li>点云消息按字段描述加数据块组织，解析需剔除无效点；有序与无序点云决定过滤方式。</li>
+      <li>通路分变换、过滤、插入三段；变换必须按消息时间戳求值，缺链时整帧被静默丢弃。</li>
+      <li>射线插入以命中与穿越两类更新同时写入表面并清除体积，清除能力依赖穿越观测与正确的传感器原点。</li>
+      <li>过滤链（量程、抽稀、自过滤、降采样）直接决定链路开销与地图质量，先减量再量化是成本原则。</li>
+      <li>下一章看向点云的源头：<strong>深度相机接入</strong>，讲成像模型、噪声特性与安装标定的工程要点。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch030.html">← 第 030 章：使用 Octomap 表示环境</a>
+    <a class="next" href="ch032.html">第 032 章：深度相机接入 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.06 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:11.5px !important;letter-spacing:.06em !important;color:rgba(71,85,105,.45) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#7e8ba0 !important;font-size:11.5px !important;line-height:1.8 !important;text-align:center !important;padding:5px 12px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

@@ -13,8 +13,10 @@ SAC 的熵最大化准则更新（无重参数化，直接对分类分布求梯�
     python code/ch081.py --quick   # 快速跑通（约 30-60 秒）
     python code/ch081.py --credit coma
 
-预期（以实跑为准）：COMA 基线的逐智能体信用信号让协调行为出现得更早、更稳定；
-shared 基线实现更省（只需采样若干联合动作），但把功劳混在一起。
+预期（以实跑为准）：两种方案的最终回报接近（约 -6 ~ -3），智能体间优势差异
+（std）都在 0.4 上下，COMA 在碰撞与末距等细节上通常略优；信用分配的收益更多
+体现在"谁做了什么"的分化上，账面分数未必暴涨。shared 基线实现更省（只需采样
+若干联合动作），但把功劳混在一起。
 """
 
 import argparse
@@ -432,7 +434,8 @@ def main():
               f"最终（回报/末距/碰撞） {final[0]:7.2f} / {final[1]:.3f} / {final[2]:.2f}")
     if len(results) == 2:
         print("提示：两种方案共用同一个联合双 Q 与同一批数据，唯一区别是演员收到的"
-              "信用信号；COMA 的智能体间优势差异（std）大于 0，shared 恒为 0。")
+              "信用信号；两种方案的智能体间优势差异（std）都不为零（实跑约 0.4 上下），"
+              "差别在基线怎么扣。")
 
     os.makedirs(args.save_dir, exist_ok=True)
     for name, (tr, curve, _, _) in results.items():

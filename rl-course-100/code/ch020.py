@@ -20,7 +20,7 @@ MountainCar-v0 是稀疏奖励的经典代表：每步固定 −1、只有把车
     python code/ch020.py --quick    # 快速跑通（约 30-60 秒）
     python code/ch020.py --arms shaping --eta 200
 
-预期：baseline 在 20 万步内很少稳定成功；shaping 通常 10 万步内成功率过 90%，
+预期：baseline 在 20 万步内很少稳定成功；shaping 通常在 8 万～15 万步内把成功率推过 90%，
 但塑形回报的数值与原始回报不可直接比较（见正文说明）。
 """
 
@@ -347,7 +347,7 @@ def main():
     print("  - 成功率是唯一公平指标：塑形回报与原始回报的数值不可直接比较；")
     print("  - baseline 需要靠自己撞出成功轨迹，经常 20 万步都学不稳；")
     print("  - 势能塑形只改变过程奖励，最优策略不变（Ng 等 1999 的定理）；")
-    print("  - η 太大时策略可能过度追求势能、忽视到达终止；η 太小则信号不足。")
+    print("  - η 太大时价值尺度失衡、拟合更吃力；η 太小则塑形信号不足。")
 
     os.makedirs(args.save_dir, exist_ok=True)
     path = os.path.join(args.save_dir, "sparse.txt")

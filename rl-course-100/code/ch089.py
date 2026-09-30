@@ -109,7 +109,7 @@ class SoccerEnv:
         approach = self.ball_pos + d / (np.linalg.norm(d) + 1e-8) * 0.18
         actions[0] = np.clip((approach - self.pos[2]) * 4.0, -1.0, 1.0)
 
-        # 3 号：占住球与自家球门的连线中点
+        # 3 号：占住球与自家球门连线的 35% 处
         guard = self.ball_pos + (own_goal - self.ball_pos) * 0.35
         actions[1] = np.clip((guard - self.pos[3]) * 4.0, -1.0, 1.0)
         return actions

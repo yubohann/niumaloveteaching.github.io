@@ -77,7 +77,7 @@ class GridDispatchEnv:
         return self._obs()
 
     def _demand(self, t: float) -> np.ndarray:
-        """日负荷曲线：早晚双峰 + 区域差异 + 噪声。"""
+        """日负荷曲线：正午单峰 + 区域差异 + 噪声。"""
         base = np.array([1.5, 1.7, 1.4], dtype=np.float32)
         amp = np.array([0.8, 0.9, 0.7], dtype=np.float32)
         phase = np.array([0.0, 0.4, -0.3], dtype=np.float32)

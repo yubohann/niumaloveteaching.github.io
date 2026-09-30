@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第044章 使用 CHOMP 规划器 | 机械臂规划学习课程 · ROS2 MoveIt2 运动规划与操作</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第三篇 · 规划算法与求解器</span>
+    <span class="sep">/</span>
+    <span>第 044 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第三篇 · 规划算法与求解器</div>
+    <h1>第 044 章：使用 CHOMP 规划器</h1>
+    <p class="lead">CHOMP（Covariant Hamiltonian Optimization for Motion Planning）把轨迹优化做成规划器插件：给定起点、终点与一条初值轨迹，通过协变梯度与哈密顿蒙特卡洛迭代降低平滑与障碍代价。本章讲透它的泛函结构、关键参数与工程用法。</p>
+    <ul class="meta">
+      <li>主题：优化型规划器 / CHOMP</li>
+      <li>关键机制：协变梯度、障碍代价场、HMC 扰动、初值轨迹</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 043 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>写出 CHOMP 的代价泛函分解，理解平滑项与障碍项各自的计算方式与梯度来源。</li>
+      <li>理解协变更新 ξ ← ξ − ηA<sup>−1</sup>∇F 与岭正则（ridge regularization）的作用，能解释更新为何比朴素梯度平滑。</li>
+      <li>掌握 CHOMP 的配置项：迭代上限、时间上限、安全间隙、HMC 标准差、初值生成方式，并知道每项调大调小的后果。</li>
+      <li>会通过管线标识（pipeline id）与规划器标识（planner id）在请求层选择 CHOMP，并保证输出轨迹带时间参数。</li>
+      <li>能设计"采样规划器提供初值、CHOMP 做优化"的组合流程，并用轨迹指标验证收益。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 043 章建立了代价泛函与梯度更新的通用框架，本章落到第一个工程可用的优化型规划器。CHOMP 的工程价值在于：<strong>它对初值做连续变形，天然产出平滑轨迹，且每次迭代的计算量固定，时间行为可预测。</strong>在接近、扫查、节拍敏感的操作中，平滑轨迹意味着更少的关节冲击与更稳定的控制跟踪。</p>
+    <p>同时，CHOMP 暴露了优化型规划器的典型约束：需要可行初值、只能收敛到局部最优、输出的是几何轨迹。理解这些约束的边界，才能在选型时与 OMPL 族规划器形成互补（第 060 章展开决策表）。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 代价泛函与梯度来源</h3>
+    <p>CHOMP 最小化的泛函由平滑项与障碍项构成（可选动力学项）：</p>
+    <div class="formula">
+      F[ξ] = w<sub>s</sub> · F<sub>smooth</sub> + w<sub>o</sub> · F<sub>obstacle</sub>
+      <span class="note">ξ 为离散化轨迹；平滑项解析求梯度，障碍项经距离场求梯度后沿雅可比映射回关节空间</span>
+    </div>
+    <p>平滑项惩罚速度与加速度的组合范数，其海森近似记为矩阵 A；障碍项对工作空间中轨迹的每个采样点查询有符号距离（signed distance），在安全间隙 c<sub>min</sub> 之内产生代价，并把工作空间梯度经雅可比转置映射回关节空间：</p>
+    <div class="formula">
+      ∇<sub>q</sub> c = J(q)<sup>T</sup> ∇<sub>x</sub> c
+      <span class="note">J 为末端或查询点的几何雅可比（Jacobian）；距离场由规划场景的碰撞结构构建</span>
+    </div>
+    <p><strong>障碍代价按弧长积分并归一化，使轨迹"走得远的段"和"走得近的段"获得一致的权重；本质上是软惩罚，优化结束后仍要独立校验碰撞。</strong></p>
+
+    <h3>2. 协变更新与岭正则</h3>
+    <p>迭代更新使用协变梯度形式：</p>
+    <div class="formula">
+      ξ ← ξ − η A<sup>−1</sup> ∇F[ξ]，其中 A = 平滑项海森 + λI
+      <span class="note">λ 即岭因子（ridge factor），防止 A 在接近直线轨迹上奇异</span>
+    </div>
+    <p>A<sup>−1</sup> 相当于把梯度沿轨迹方向"抹匀"，单点上的尖锐梯度被平滑成整条曲线的缓变力。当轨迹接近直线时 A 的最小特征值趋近零，直接求逆会放大噪声；岭因子 λ 抬高特征值下界，代价是更新略偏保守。<strong>λ 的调参区间很窄：过小产生数值振荡，过大拖慢收敛，常见量级 10<sup>−4</sup> 到 10<sup>−2</sup>。</strong></p>
+
+    <h3>3. HMC 扰动：偶尔"踢一脚"</h3>
+    <p>纯梯度下降会卡在局部极小（典型的"贴墙滑行"或"折角"形状）。CHOMP 以一定概率执行哈密顿蒙特卡洛（Hamiltonian Monte Carlo, HMC）步骤：给轨迹注入动量做一次模拟推进，然后按能量判据接受或拒绝。动量标准差由 <code>hmc_stdev</code> 控制：</p>
+    <ul>
+      <li>取 0：退化为纯梯度下降，确定性增强，复杂场景易卡住。</li>
+      <li>取较大值（如 0.1 以上）：逃逸能力增强，但轨迹在收敛前出现可见抖动，时间行为变差。</li>
+      <li>常用量级 0.005 到 0.05。</li>
+    </ul>
+    <p><strong>HMC 让 CHOMP 带有随机成分：同一请求两次运行的轨迹可能不同，性能评估同样要用多次重复实验（与第 041、047 章的方法一致）。</strong></p>
+
+    <h3>4. 初值与输出</h3>
+    <p>CHOMP 不搜索全局路径。初值来自三条途径：请求中携带的参考轨迹（reference trajectory）、按配置的插值方法生成的直线型初值、或工具链上游规划器的结果。<strong>初值穿越障碍时，障碍代价会把路径点推向障碍两侧，形成折叠畸形解，工程上应先获得可行初值再交给 CHOMP。</strong>输出为无时间戳的几何轨迹，必须经过时间参数化才能执行。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>接入 CHOMP 的步骤：</p>
+    <ol>
+      <li><strong>开启管线</strong>：在机器人配置中加入 CHOMP 管线条目（插件 <code>chomp_interface/CHOMPPlanner</code>，管线与规划器标识常见为 <code>chomp</code> 与 <code>CHOMP</code>，以发行版配置为准）。</li>
+      <li><strong>确认响应链</strong>：CHOMP 管线配置中必须包含时间参数化条目，否则输出轨迹不可执行。</li>
+      <li><strong>准备初值</strong>：简单场景可用插值初值；复杂场景用 OMPL 规划结果作为参考轨迹注入请求。</li>
+      <li><strong>设定预算</strong>：先给迭代上限 200、时间上限 2 s 量级跑通，再按代价曲线收敛情况收紧。</li>
+      <li><strong>验证结果</strong>：复检碰撞、间隙与限位，并计算平滑度指标与基线对照。</li>
+    </ol>
+    <h3>参数总览（字段名以所用发行版配置为准）</h3>
+    <table>
+      <tr><th>参数</th><th>典型取值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>迭代上限</td><td>100 到 400 次</td><td>梯度下降的最大轮数</td><td>观察代价曲线进入平台的位置</td></tr>
+      <tr><td>时间上限</td><td>1.0 到 3.0 s</td><td>优化过程墙钟上限</td><td>与服务水平约定对齐</td></tr>
+      <tr><td>安全间隙</td><td>0.02 到 0.10 m</td><td>障碍代价生效距离</td><td>按机械臂速度与感知噪声留裕量</td></tr>
+      <tr><td>岭因子 λ</td><td>10<sup>−4</sup> 到 10<sup>−2</sup></td><td>矩阵求逆正则化</td><td>出现数值振荡时向上调</td></tr>
+      <tr><td>HMC 标准差</td><td>0.005 到 0.05</td><td>随机扰动强度</td><td>卡局部极小时向上调，抖动过大时向下调</td></tr>
+      <tr><td>初值插值方式</td><td>样条或线性</td><td>未提供参考轨迹时的初值生成</td><td>自由空间用样条，近似直线任务用线性</td></tr>
+    </table>
+    <div class="box tip">
+      <span class="box-title">组合模式：OMPL 出可行解，CHOMP 出好解</span>
+      <p>推荐流程是两段式：先用 RRTConnect 在 0.5 到 1.0 s 内求可行路径，再以其为参考轨迹调用 CHOMP 优化 1 到 2 s。该组合把"概率完备的可行性"与"梯度方法的平滑性"叠加，避免了 CHOMP 直接面对复杂障碍初值问题。<strong>注意两段的失败要独立处理：第一段失败则报无解，第二段失败则回退第一段结果。</strong></p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：CHOMP 管线配置</strong></p>
+    <pre class="code"><code># chomp_planning.yaml（结构示意，字段以所用发行版为准）
+planning_plugins:
+  - chomp_interface/CHOMPPlanner    # 规划器插件类名（插件描述文件中的注册名）
+request_adapters: &gt;-
+  default_planner_request_adapters/FixStartStateBounds
+  default_planner_request_adapters/FixStartStateCollision
+  default_planner_request_adapters/AddTimeParameterization
+# 注：时间参数化是 CHOMP 输出的必需环节，输出几何轨迹缺少时间戳将无法执行
+
+planner_configs:
+  CHOMP:
+    max_iterations: 200            # 梯度迭代上限：向平台期取值，避免空转
+    planning_time_limit: 2.0       # 优化墙钟上限（秒）
+    collision_clearance: 0.05      # 安全间隙（米）：期望保持的最小距离
+    ridge_factor: 1.0e-3           # 岭因子：稳定 A 的求逆
+    hmc_stdev: 0.01                # HMC 扰动强度：逃逸局部极小
+    use_stochastic_descent: true   # 随机步长策略，配合 HMC 提高搜索面
+    trajectory_initialization_method: "quintic-spline"  # 无参考轨迹时的初值方式
+arm_group:
+  default_planner_config: CHOMP</code></pre>
+    <p>解读：这份配置展示了三条设计线索。<strong>第一，预算双保险</strong>：迭代上限与时间上限同时存在，任一触发即停止，避免病态初值下的无限迭代。<strong>第二，安全间隙与岭因子量级分离</strong>：前者是物理量（米），后者是数值量（无量纲），调参时切勿混用经验值。<strong>第三，初值策略显式声明</strong>：在没有参考轨迹的调用中决定轨迹起步形状；接入 OMPL 参考轨迹后该项自动让位。所有字段名随发行版演进，迁移时对照官方模板逐项核对。</p>
+
+    <p><strong>片段 2：请求层选择 CHOMP 管线（C++）</strong></p>
+    <pre class="code"><code>#include &lt;moveit/planning_interface/planning_interface.h&gt;
+
+// 用规划管线标识与规划器标识选择 CHOMP：请求字段是最终生效的控制点
+bool plan_with_chomp(moveit::planning_interface::MoveGroupInterface&amp; mg,
+                     const std::vector&lt;double&gt;&amp; goal,
+                     moveit::planning_interface::MoveGroupInterface::Plan&amp; plan)
+{
+  mg.setPlanningPipelineId("chomp");   // 选择 CHOMP 管线：包含其适配器与响应链
+  mg.setPlannerId("CHOMP");            // 选择管线内的规划器实例
+  mg.setPlanningTime(2.0);             // 优化型规划器：时间上限决定迭代轮数
+  mg.setNumPlanningAttempts(1);        // 迭代收敛过程确定性较强，无需多次重启
+
+  mg.setJointValueTarget(goal);
+  auto code = mg.plan(plan);
+  if (code != moveit::core::MoveItErrorCode::SUCCESS)
+    return false;                      // 失败原因见第 049 章的错误码诊断流程
+
+  // 输出为几何+时间轨迹；如需校验间隙，可在规划场景中对 plan.trajectory 逐点检测
+  return true;
+}</code></pre>
+    <p>解读：选择的落点是请求字段 <code>pipeline_id</code> 与 <code>planner_id</code>，这两个字段会随请求传入管线，覆盖节点默认配置。<strong>把尝试次数设为 1 的依据是 CHOMP 的失败模式：失败多源于时间耗尽，重启同一初值会沿同一路径再次失败，收益有限。</strong>若期望多次尝试，更有效的做法是更换初值（例如先用 OMPL 重新求一条参考轨迹），并避免盲目重启。校验环节放在规划成功之后，体现"软惩罚需独立验证"的原则。</p>
+
+    <p><strong>片段 3：以 OMPL 结果为初值的组合调用（Python 伪代码层次）</strong></p>
+    <pre class="code"><code># 组合流程：第一段求可行，第二段做优化。接口以发行版为准，此处突出控制结构。
+def plan_feasible_then_optimize(arm, goal, feasible_time=1.0, optimize_time=2.0):
+    # 第一段：RRTConnect 快速给出可行路径（几何折线）
+    arm.set_planner_id("RRTConnect")
+    arm.set_planning_time(feasible_time)
+    ok, feasible, _, err = arm.plan()
+    if not ok:
+        return None, err                 # 无可行解：交由上层压缩工作空间或放宽约束
+    # 第二段：把可行解作为参考轨迹交给 CHOMP 优化平滑度与间隙
+    arm.set_planner_id("CHOMP")
+    arm.set_planning_time(optimize_time)
+    if hasattr(arm, "set_reference_trajectories"):   # 参考轨迹注入接口随版本不同
+        arm.set_reference_trajectories([feasible])
+    ok2, optimized, _, err2 = arm.plan()
+    if ok2:
+        return optimized, None           # 优先交付优化解
+    return feasible, err2                # 优化失败时回退可行解，保证可交付</code></pre>
+    <p>解读：组合结构的关键在于两级返回策略：优化失败不影响可行性结论，回退路径让最差情况仍有结果。<strong>参考轨迹的注入方式因接口版本而异，代码中用能力探测保护，工程实现里应替换为所选定接口的正式写法。</strong>两段时间预算分别控制：第一段追求"快而可行"，第二段追求"慢而平顺"，与各自的算法特性匹配。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>输出缺少时间参数化</strong>：选用 CHOMP 管线但漏配响应链，轨迹无法执行，控制器返回轨迹无效。修复：核对管线配置中的时间参数化条目。</li>
+      <li><strong>初值穿越障碍</strong>：直接以直线插值起步，优化结果在障碍两侧折叠。症状是轨迹形状怪异且间隙指标差。修复：改用 OMPL 结果作初值，或缩小安全间隙先打通流程。</li>
+      <li><strong>安全间隙大于可行空间</strong>：目标附近本身距离障碍较近时，间隙设置过大导致代价始终无法降到收敛水平，规划时间耗尽仍报失败。修复：按最紧通道宽度的一半设置间隙，或对目标附近放宽。</li>
+      <li><strong>岭因子过小引发数值振荡</strong>：代价曲线在迭代后期上下跳动，轨迹出现高频抖动。修复：把岭因子提高一个数量级并重新观察。</li>
+      <li><strong>把 CHOMP 当全局规划器</strong>：环境出现新的通道时 CHOMP 无法重新选路，稳定失败。修复：选型阶段明确其定位为优化层，全局可行性交给采样规划器。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>把 <code>hmc_stdev</code> 从 0 调到 0.05，预测三类场景（自由空间、单个障碍、窄通道）的规划成功率与轨迹稳定性变化。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>自由空间：几乎无差异；单障碍：成功率上升，轨迹在收敛前抖动；窄通道：逃逸能力有帮助但画面抖动明显，时间增加。用重复 30 次的成功率对照验证。</div></details>
+      </li>
+      <li>推导：为什么协变更新能抑制"单点尖峰"而朴素梯度不能？从 A<sup>−1</sup> 的平滑作用角度说明。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>A 由二阶差分构成，其特征向量是离散余弦基，低特征值对应高频分量。A<sup>−1</sup> 对高频分量的放大被显著压缩，等价于低通滤波后再更新。</div></details>
+      </li>
+      <li>设计实验对比"直线初值 + CHOMP"与"OMPL 初值 + CHOMP"两种流程，在含两个障碍的场景中各运行 30 次，报告成功率、平滑度与最小间隙。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>用第 041 章的重复测量方法；平滑度与间隙用第 043 章的指标函数。预期直线组失败率显著更高，且成功样本的间隙分布更差。</div></details>
+      </li>
+      <li>某任务要求末端保持接近直线。分析 CHOMP 的泛函中哪一项会与"接近直线"的目标冲突，并给出权重调整或改用其他规划器的理由。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>障碍项会把轨迹推离直线以保持间隙，平滑项只在关节空间拉直。当直线与障碍冲突时，应改用笛卡尔空间直线规划（如第 046 章的工业运动规划器）并对直线段做碰撞与奇异校验。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>CHOMP 把轨迹优化封装为规划器插件：平滑项解析求梯度，障碍项经距离场与雅可比映射求梯度。</li>
+      <li>协变更新 ξ ← ξ − ηA<sup>−1</sup>∇F 通过平滑度矩阵抑制高频噪声，岭因子保证求逆数值稳定。</li>
+      <li>HMC 扰动提供局部极小逃逸能力，代价是引入随机性与抖动，参数取值需实验标定。</li>
+      <li>CHOMP 依赖可行初值且只做局部优化；与 OMPL 组合的两段式流程是复杂场景的稳妥配置。</li>
+      <li>输出为几何轨迹，必须经过时间参数化；软惩罚结果必须经过碰撞与间隙的独立校验。</li>
+      <li>下一章进入搜索型规划器：<strong>SBPL</strong> 的离散栅格与任意时间修复搜索。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch043.html">← 第 043 章：轨迹优化基础</a>
+    <a class="next" href="ch045.html">第 045 章：使用 SBPL 规划器 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.06 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:11.5px !important;letter-spacing:.06em !important;color:rgba(71,85,105,.45) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#7e8ba0 !important;font-size:11.5px !important;line-height:1.8 !important;text-align:center !important;padding:5px 12px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

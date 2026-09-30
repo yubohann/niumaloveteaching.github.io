@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第020章 规划场景监视器 PlanningSceneMonitor | 机械臂规划学习课程 · ROS2 MoveIt2 运动规划与操作</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 规划场景与碰撞管理</span>
+    <span class="sep">/</span>
+    <span>第 020 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 规划场景与碰撞管理</div>
+    <h1>第 020 章：规划场景监视器 PlanningSceneMonitor</h1>
+    <p class="lead">本章拆解权威场景的维护机制：监视器的子模块如何从三条通道合成场景、加锁读取的并发模型，以及客户端获取场景快照的标准协议。</p>
+    <ul class="meta">
+      <li>主题：场景维护 / 监视器架构与并发</li>
+      <li>关键机制：场景监视、世界几何监视、状态监视、加锁快照</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 019 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>说出 PlanningSceneMonitor 的组成模块与各自职责，理解三通道合成一份权威场景的过程。</li>
+      <li>理解读锁与快照的并发模型，能识别持锁执行长任务导致的阻塞与死锁。</li>
+      <li>掌握客户端获取权威场景的标准协议：首次全量快照加后续差分订阅。</li>
+      <li>能解释监视场景话题的节流与差分特性，避免对外部观察数据产生错误依赖。</li>
+      <li>能诊断监视器相关故障：状态冻结、场景不合成、锁定冲突、单权威原则被破坏。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 019 章建立了场景的静态结构，接下来的问题是：这份场景由谁维护、如何保证它时刻新鲜且一致。答案是规划场景监视器（PlanningSceneMonitor）：它订阅关节状态、接收场景差分、合成世界几何，在锁的保护下维护一份权威场景，并向外界提供查询与观察接口。</p>
+    <p>监视器相关的故障有一个共同特征：症状出现在使用方（规划失败、起点陈旧、物体错位），根因在维护方（通道未启动、锁竞争、发布节流）。<strong>本章把监视器的内部结构讲透，让"场景为什么不更新"从玄学问题变成按模块排查的清单问题。</strong>下一章的当前状态监视器是本章状态通道的深入展开，两章合起来覆盖维护侧的完整机制。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p>本节解释监视器的模块构成、数据合成流程、并发模型与客户端同步协议。</p>
+
+    <h3>1. 模块构成：一个总控，三个子监视器</h3>
+    <table>
+      <tr><th>模块</th><th>职责</th><th>数据来源</th></tr>
+      <tr><td>场景监视（Scene Monitor）</td><td>接收外部场景差分并应用</td><td>规划场景话题或服务</td></tr>
+      <tr><td>世界几何监视（World Geometry Monitor）</td><td>合成碰撞物体与感知几何</td><td>物体话题、占据地图、点云</td></tr>
+      <tr><td>状态监视（Current State Monitor）</td><td>维护机器人当前状态</td><td>关节状态话题、附加物体话题</td></tr>
+      <tr><td>占据地图监视（可选）</td><td>维护三维栅格地图</td><td>点云与深度数据</td></tr>
+    </table>
+    <p>子监视器按需启动：每个模块都有独立的启动入口，未启动的通道数据完全不会进入场景。<strong>"场景里没有某个来源的数据"的第一检查点就是对应子监视器是否启动、订阅的话题名是否与实际一致。</strong>各模块在锁保护下把变更应用到同一份场景对象，因此最终场景是三通道的合成结果。</p>
+
+    <h3>2. 数据合成与权威性</h3>
+    <p>以 move_group 部署为例：它启动时构建监视器并维护场景；外部写入（任务的物体增删）经场景通道进入；关节状态经状态通道持续刷新；感知数据经世界几何通道融合。每当场景发生实质变更，监视器可以向外发布监视场景消息，供 RViz 等观察者消费。</p>
+    <div class="formula">
+      权威场景 = 初始描述 ⊕ 场景差分序列 ⊕ 状态更新序列 ⊕ 感知几何更新
+      <span class="note">⊕ 表示按到达顺序在锁保护下叠加；顺序不同可能产生不同结果</span>
+    </div>
+    <p>权威性意味着唯一性：多客户端部署下，场景只有服务端一份，所有读写者围绕它工作。<strong>破坏单权威原则的常见方式是同时运行两个规划服务进程，各持一份场景，客户端在两个进程间穿插调用，看到"时有时无"的物体；排查这类问题时先画一遍进程与场景的归属图。</strong></p>
+
+    <h3>3. 并发模型：锁与快照</h3>
+    <p>场景被多个线程共享：订阅回调写入，规划请求读取，发布流程遍历。监视器用读写锁保护场景对象：写侧独占，读侧共享。使用方读取场景的标准姿势是"持锁取快照、锁外做事"。</p>
+    <ul>
+      <li><strong>持锁时间要短</strong>：锁内只做读取与必要的拷贝，规划、服务调用、日志输出全部放在锁外。</li>
+      <li><strong>不嵌套取锁</strong>：持读锁的情况下再调用需要写锁的接口，或者回调内再次请求读锁，都可能自锁或死锁。</li>
+      <li><strong>用快照保证一致性</strong>：读取返回的拷贝是某一时刻的完整视图，不会被并发更新撕裂成"半新半旧"。</li>
+    </ul>
+    <p><strong>典型事故模式：在状态订阅回调里请求读锁，同时规划线程持有读锁等待某个来自该回调的服务响应，两个方向互相等待；或者持锁期间发起长时间规划，把场景更新冻结数秒，用户看到"物体加了但规划器不认"。</strong>识别信号是场景更新与规划耗时出现相关性，解决办法统一为缩短锁内路径。</p>
+
+    <h3>4. 客户端同步协议：全量加差分</h3>
+    <p>进程外客户端需要一份本地场景视图时，标准协议分两步：启动时向场景查询服务请求一次全量快照，随后订阅监视场景话题的差分，把变更增量应用到本地副本。两步的顺序不能颠倒：先订阅再查询会重复应用，先查询不订阅会永久滞后。</p>
+    <p>监视场景话题需要注意两个特性：发布可能被节流，话题上的消息未必逐条对应每次变更；消息内容可能是差分，需要按操作语义合成。<strong>因此话题只用于观察与近似同步；需要精确时刻的权威数据时，一律回到查询服务取快照。这个分工与第 019 章"服务管关键路径、话题管流式观察"的原则一致。</strong></p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>本节给出使用方与集成方两套视图，主线课程聚焦使用方，集成要点用于第 089 章的系统部署。</p>
+
+    <h3>使用方协议（进程外客户端）</h3>
+    <ol>
+      <li><strong>查询快照</strong>：调用场景查询服务获取全量视图。</li>
+      <li><strong>订阅差分</strong>：订阅监视场景话题，维护本地副本。</li>
+      <li><strong>周期校验</strong>：按固定周期（例如每 30 s 或每个任务批次前）重新取一次快照，抵消丢帧与节流造成的漂移。</li>
+      <li><strong>关键操作前校验</strong>：执行依赖场景的规划前，用快照校验目标物体在位。</li>
+    </ol>
+
+    <h3>集成方检查表（创建监视器的场合）</h3>
+    <table>
+      <tr><th>检查项</th><th>内容</th><th>失败症状</th></tr>
+      <tr><td>通道启动</td><td>场景、世界几何、状态三个子监视器均已启动</td><td>对应来源的数据完全不出现</td></tr>
+      <tr><td>话题名匹配</td><td>启动参数中的话题名与实际发布者一致</td><td>静默无数据，无报错</td></tr>
+      <tr><td>首帧状态</td><td>等待第一帧有效状态后再允许规划</td><td>首条轨迹基于空状态</td></tr>
+      <tr><td>锁内路径</td><td>读取临界区只含拷贝操作</td><td>场景更新卡顿、偶发死锁</td></tr>
+      <tr><td>单权威</td><td>同一场景只有一个维护进程</td><td>物体清单在不同调用间跳变</td></tr>
+    </table>
+
+    <div class="box key">
+      <span class="box-title">设计决策：为什么查询与订阅要组合使用、不能二选一？</span>
+      <p>只用查询会在两次查询之间失去变更，物体状态可能过期；只用订阅会在启动时错过订阅前的全部历史，差分无从叠加。组合协议用一个全量快照锚定起点，用差分保持近似同步，再用周期校验兜底漂移。<strong>三段结构的关键是把"精确"和"新鲜"解耦：精确性由快照保证，新鲜度由差分提供，周期校验处理两者的误差累积。</strong></p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>本节给出三段片段：监视器的创建与启动、加锁快照的正确姿势、Python 客户端的同步骨架。</p>
+
+    <p><strong>片段 1：创建并启动监视器</strong></p>
+    <pre class="code"><code>#include &lt;moveit/planning_scene_monitor/planning_scene_monitor.h&gt;
+
+// 监视器聚合三类数据来源：场景差分、世界几何、关节状态
+auto psm = std::make_shared&lt;planning_scene_monitor::PlanningSceneMonitor&gt;(
+    node, "robot_description");
+
+// 场景监视：接收外部差分并合成到权威场景
+psm-&gt;startSceneMonitor("/planning_scene");
+// 世界几何监视：合成碰撞物体与感知来源（占据地图、点云）
+psm-&gt;startWorldGeometryMonitor();
+// 状态监视：订阅关节状态与附加物体变更（第 021 章展开）
+psm-&gt;startStateMonitor();
+
+// 等待第一帧有效状态：避免用空状态开始任何规划
+if (!psm-&gt;waitForCurrentRobotState(node-&gt;now(), 2.0)) {
+  RCLCPP_WARN(node-&gt;get_logger(), "等待当前状态超时：检查状态话题发布者");
+}</code></pre>
+    <p>解读：启动顺序与等待机制是这段代码的两个要点。<strong>（1）</strong>三个 start 对应三条通道，注释把每条通道的数据来源写清；漏启任何一个，对应来源的数据会完全缺席且没有报错，这是最隐蔽的配置类故障。<strong>（2）</strong>话题名参数与发布者的实际名称必须一致，多机部署中前缀差异是高频错因。<strong>（3）</strong>等待第一帧状态的调用把"状态就绪"变成明确的同步点，集成代码在通过它之前不应对外提供规划能力。</p>
+
+    <p><strong>片段 2：加锁快照的正确姿势</strong></p>
+    <pre class="code"><code>moveit::core::RobotState snapshot(robot_model);
+{
+  // 读锁只覆盖拷贝过程：临界区越短，写侧被阻塞的概率越低
+  planning_scene_monitor::LockedPlanningSceneRO scene(psm);
+  snapshot = scene-&gt;getCurrentState();     // 拷贝语义：获得一致视图
+}                                          // 此处解锁，更新线程恢复
+
+// 长耗时部分全部在锁外：规划、服务调用、日志输出
+// 规划基于快照状态进行；快照与最新状态的时间差由任务层决定是否可接受
+moveit::planning_interface::MoveGroupInterface::Plan plan;
+group.plan(plan);
+
+// 若任务要求"基于最新场景"再规划，可在锁外循环：
+// 取快照 → 规划 → 成功后再次校验场景版本，版本变化则丢弃重试</code></pre>
+    <p>解读：这段代码演示两条并发纪律。<strong>（1）</strong>锁的花括号范围就是设计的一部分：锁内只保留赋值语句，任何可能阻塞的操作移出。<strong>（2）</strong>快照的时间差是并发系统的固有代价：读取与使用之间场景可能变化，任务层要容忍这一点，或在关键任务中用"规划后校验"收紧。<strong>（3）</strong>注释给出乐观重试模式：取快照、规划、校验变化、必要时重做；这是动态环境规划的标准策略，第 029 章展开。</p>
+
+    <p><strong>片段 3：客户端同步骨架（Python）</strong></p>
+    <pre class="code"><code>from rclpy.node import Node
+from moveit_msgs.srv import GetPlanningScene
+from moveit_msgs.msg import PlanningScene, PlanningSceneComponents, CollisionObject
+
+class SceneSync(Node):
+    """客户端场景同步：全量快照锚定，差分订阅维持近似同步。"""
+    def __init__(self):
+        super().__init__("scene_sync")
+        self.client = self.create_client(GetPlanningScene, "/get_planning_scene")
+        # 先查后订：顺序颠倒会重复应用变更或永久滞后
+        self.sub = self.create_subscription(
+            PlanningScene, "/monitored_planning_scene", self.on_change, 10)
+        self.local_ids = set()               # 本地副本：物体名集合形式的示意
+
+    def full_snapshot(self):
+        req = GetPlanningScene.Request()
+        # 只取物体名与机器人状态：按需裁剪数据量
+        req.components.components = (PlanningSceneComponents.WORLD_OBJECT_NAMES
+                                     | PlanningSceneComponents.ROBOT_STATE)
+        future = self.client.call_async(req)
+        future.add_done_callback(self.on_snapshot)   # 异步：不阻塞执行器
+
+    def on_snapshot(self, future):
+        scene = future.result().scene
+        self.local_ids = {obj.id for obj in scene.world.collision_objects}
+        self.get_logger().info(f"快照载入 {len(self.local_ids)} 个物体")
+
+    def on_change(self, msg):
+        # 差分按操作语义合成：本示例只演示物体名的增删
+        for obj in msg.world.collision_objects:
+            if obj.operation == CollisionObject.REMOVE:
+                self.local_ids.discard(obj.id)
+            else:
+                self.local_ids.add(obj.id)</code></pre>
+    <p>解读：骨架代码把协议的两段结构落实为方法。<strong>（1）</strong>全量查询按组件裁剪：只请求需要的部分，避免传输整个场景；组件掩码的常量名以消息定义为准。<strong>（2）</strong>订阅差分时按操作语义合成：这里演示移除与新增两类分支，APPEND 与 MOVE 的完整语义在第 023 章展开。<strong>（3）</strong>周期校验与关键操作前校验未在片段中实现，属于任务层的调用约定；第 029 章的避障规划会按这个骨架组织场景同步。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>子监视器漏启动</strong>：某个来源的数据完全缺席，且没有报错。修复：按集成检查表逐通道确认启动与话题名。</li>
+      <li><strong>持锁执行长任务</strong>：场景更新被冻结，出现"写入后长时间不生效"。修复：锁内只拷贝，计算与通信移出临界区。</li>
+      <li><strong>回调内嵌套取锁</strong>：自锁或与其它线程互相等待，进程无响应。修复：梳理锁的获取路径，保持单一获取层级。</li>
+      <li><strong>把节流话题当精确数据源</strong>：观察到的场景比实际滞后，据此做出的判断失效。修复：精确判断回归查询服务，话题只做观察。</li>
+      <li><strong>双进程共管场景</strong>：物体清单在不同调用间跳变，排查方向被误导。修复：保证单权威，其余参与者只读写不维护。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>列出监视器的三个子监视器与各自数据来源，并为每个来源写一条"数据缺席时最先查什么"。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>状态来源查关节状态发布者与话题名；场景来源查写入通道与差分标志；世界几何来源查感知节点与融合话题。</div></details>
+      </li>
+      <li>手工发布一条添加物体的差分消息，随后用查询服务确认物体在列，并观察监视场景话题上是否出现对应变更。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>话题上的变更可能被合并或节流，未必逐条出现；查询服务的结果才是权威。对照两者理解"观察与权威"的分工。</div></details>
+      </li>
+      <li>预测实验：停掉关节状态发布者后继续调用规划，预测监视器对外提供的状态会如何变化，规划结果会出现什么症状。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>当前状态冻结在最后一帧；规划起点变为陈旧状态，执行前的起点校验可能失败，症状与第 014 章的起点不匹配一致。</div></details>
+      </li>
+      <li>设计题：为"多任务共享一个规划服务"的系统编写场景同步规范：客户端协议、周期校验频率的依据、冲突写入的仲裁规则与单权威的部署约束。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>冲突仲裁按命名空间划分写入权限；周期与任务批次节奏挂钩；单权威约束写入部署文档并纳入启动检查。第 089 章会在此规范上扩展多机器人场景。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>监视器由场景、世界几何、状态三个子监视器构成，三通道在锁保护下合成一份权威场景。</li>
+      <li>并发纪律是"锁内拷贝、锁外干活"；快照保证一致视图，锁的临界区决定场景更新的流畅度。</li>
+      <li>客户端同步协议为全量快照加差分订阅，周期校验兜底漂移。</li>
+      <li>监视场景话题可被节流且携带差分，只用于观察；精确判断回归查询服务。</li>
+      <li>场景维护保持单权威原则；下一章深入状态通道：<strong>当前状态监视器 CurrentStateMonitor</strong> 的工作机制与状态新鲜度管理。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch019.html">← 第 019 章：规划场景组成与生命周期</a>
+    <a class="next" href="ch021.html">第 021 章：当前状态监视器 CurrentStateMonitor →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.06 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:11.5px !important;letter-spacing:.06em !important;color:rgba(71,85,105,.45) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#7e8ba0 !important;font-size:11.5px !important;line-height:1.8 !important;text-align:center !important;padding:5px 12px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

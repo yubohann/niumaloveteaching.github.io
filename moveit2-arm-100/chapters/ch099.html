@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第099章 长时运行稳定性与数值漂移分析 | 机械臂规划学习课程 · ROS2 MoveIt2 运动规划与操作</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第五篇 · 组件详解与系统集成</span>
+    <span class="sep">/</span>
+    <span>第 099 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第五篇 · 组件详解与系统集成</div>
+    <h1>第 099 章：长时运行稳定性与数值漂移分析</h1>
+    <p class="lead">把系统从"能跑通"推进到"能久跑"：分析状态、数值、时间、场景与资源五类漂移的来源，给出检测方法、复位策略与重标定判据。</p>
+    <ul class="meta">
+      <li>主题：可靠性设计 / 长时稳定性</li>
+      <li>关键机制：漂移检测、四元数归一化、角度环绕处理、周期复位</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 098 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解五类漂移来源：状态估计、数值运算、时间基准、场景数据与资源占用。</li>
+      <li>掌握数值漂移的两个典型机理：四元数范数偏离与关节角环绕，及对应处理方式。</li>
+      <li>会设计漂移检测器：以命令与反馈的终点偏差序列估计漂移率，并设定触发阈值。</li>
+      <li>会设计周期复位计划：场景重建、状态重同步与计数器清理的时机与前置条件。</li>
+      <li>能给出重标定的判据与验证方法，把稳定性维护变成例行技术动作。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>短时演示中不可见的误差，在连续运行中会累积成可观测的偏移：抓取点缓慢偏移、场景中残留物体增多、内存与延迟逐周期上升。<strong>长时稳定性问题具有共同特征：单次不可察、趋势可预测、可在阈值处主动干预。</strong></p>
+    <p>漂移治理有两个层次：检测与复位。检测把"感觉变差了"变成"偏差斜率超过阈值"；复位把系统拉回已知状态，且复位时机必须落在任务的边界处，不能打断执行中的动作。</p>
+    <p>上一章处理一次性标定精度，本章把精度与状态放到长时间尺度上维护，两者共同保证系统在生命周期内的空间与状态可信度。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 五类漂移来源</h3>
+    <p>漂移按来源分类，每类的检测信号与治理手段不同。<strong>先分类再治理，可以避免用重启手段处理本应重标定的问题。</strong></p>
+    <table>
+      <tr><th>类别</th><th>来源</th><th>观测信号</th><th>治理手段</th></tr>
+      <tr><td>状态估计</td><td>编码器零偏、关节零点偏移</td><td>命令终点与反馈终点持续偏差</td><td>重同步、零点校准</td></tr>
+      <tr><td>数值运算</td><td>四元数范数漂移、角度环绕、积分累积</td><td>姿态异常跳变、范数偏离</td><td>逐次归一化、环绕处理</td></tr>
+      <tr><td>时间基准</td><td>时钟偏移、消息时间戳滞后</td><td>变换查询间歇失败</td><td>时间同步、按戳查询规范</td></tr>
+      <tr><td>场景数据</td><td>残留物体、栅格体积增长</td><td>场景对象计数与体素数趋势</td><td>周期重建、淘汰策略核查</td></tr>
+      <tr><td>资源占用</td><td>句柄与缓存增长</td><td>内存曲线、回调耗时上升</td><td>周期重启子系统、缓存上限</td></tr>
+    </table>
+
+    <h3>2. 数值漂移的两个机理</h3>
+    <p>四元数逐次乘法会引入范数偏离：理论上模长恒为 1，浮点累积后略微偏移。<strong>偏移本身不大，但参与后续旋转复合与插值时会被放大，处理方式是每次更新后归一化；只在读取时归一化会让误差在乘法链中累积。</strong></p>
+    <div class="formula">
+      q ← q / ‖q‖（每次乘法更新后）；‖q‖ − 1 超过 1e−6 即触发告警
+      <span class="note">插值前未归一化会让旋转路径偏离测地线，表现为轨迹姿态轻微扭曲并随运行时间累积</span>
+    </div>
+    <p>关节角环绕是另一类表示问题：相差 2π 的两个值表示同一物理角度。<strong>求差值时必须取"最短差"：先环绕到 [−π, π]，再计算差值，否则插值与误差统计会出现整圈跳变。</strong></p>
+    <div class="formula">
+      Δ(q<sub>目标</sub>, q<sub>当前</sub>) = wrap( q<sub>目标</sub> − q<sub>当前</sub> )，wrap(x) = x − 2π·round( x / 2π )
+      <span class="note">缺少环绕处理的症状：误差序列偶发约 6.28 rad 的尖峰，控制器收到大幅反向修正命令</span>
+    </div>
+
+    <h3>3. 漂移检测：从单点到趋势</h3>
+    <p>漂移检测的对象是误差的时间序列，单次误差交由异常路径处理。每次任务周期记录终点偏差，用滑动窗口拟合斜率：<strong>斜率显著为正且外推到维护点时超过预算，即触发重标定或复位。</strong></p>
+    <div class="formula">
+      漂移模型 e(t) ≈ e<sub>0</sub> + k · t；触发重标定条件：e<sub>0</sub> + k · T<sub>维护间隔</sub> &gt; e<sub>预算</sub>
+      <span class="note">例：偏差初值 1 mm、斜率 0.2 mm/千周期、维护间隔 5000 周期时预测偏差 2 mm；预算 3 mm 则暂缓，预算 1.5 mm 则提前维护</span>
+    </div>
+    <p>检测器需要抑制单次噪声：取滑动窗口的中位数做斜率拟合，窗口长度覆盖至少数十个周期；<strong>突发大偏差走异常路径，慢变趋势走漂移路径，两条路径共享同一个偏差序列但判定规则不同。</strong></p>
+
+    <h3>4. 周期复位策略</h3>
+    <p>复位把系统拉回已知状态，手段按成本升序为：状态重同步、场景重建、子系统重启。<strong>复位时机必须落在任务边界，且有前置条件检查：无执行中的轨迹、无持有的工件、无等待中的外部请求。</strong></p>
+    <table>
+      <tr><th>复位动作</th><th>时机</th><th>前置条件</th><th>成本</th></tr>
+      <tr><td>状态重同步</td><td>每个任务周期开始</td><td>无执行动作</td><td>毫秒级</td></tr>
+      <tr><td>场景重建</td><td>每若干任务周期</td><td>无附着物体、无进行中规划</td><td>秒级，需重新感知</td></tr>
+      <tr><td>子系统重启</td><td>漂移超过重启阈值的维护点</td><td>任务队列空、人工确认</td><td>数十秒，需重新初始化</td></tr>
+    </table>
+    <p>复位是有成本的维护动作：场景重建会丢失当前感知，重启会丢失未持久化的运行状态。<strong>复位计划把成本与检测信号关联：低频重建应对缓慢增长，高阈值重启应对检测器无法解释的异常。</strong></p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>稳定性设计按"检测项、判据、动作、计划"四要素组织。<strong>每个检测项都有明确判据与对应动作，动作分告警、复位、重标定三级。</strong></p>
+
+    <h3>1. 监测项与判据表</h3>
+    <table>
+      <tr><th>监测项</th><th>采样</th><th>判据</th><th>动作</th></tr>
+      <tr><td>终点偏差序列</td><td>每任务周期</td><td>滑动窗口中位数的斜率超限</td><td>重标定或补偿</td></tr>
+      <tr><td>四元数范数偏离</td><td>每次姿态更新</td><td>超过 1e−6</td><td>归一化加告警</td></tr>
+      <tr><td>变换查询失败率</td><td>每查询批</td><td>窗口失败率超 1%</td><td>时间同步检查</td></tr>
+      <tr><td>场景对象与体素数</td><td>每场景更新</td><td>趋势增长且不回落</td><td>场景重建</td></tr>
+      <tr><td>内存与回调耗时</td><td>每分钟级</td><td>斜率持续为正</td><td>维护点重启子系统</td></tr>
+    </table>
+
+    <h3>2. 复位计划设计</h3>
+    <ol>
+      <li>快周期：状态重同步，每任务周期执行，成本最低。</li>
+      <li>中周期：场景重建，按任务计数触发（例如每 500 个任务周期一次），或对象计数超限触发。</li>
+      <li>长周期维护点：重标定检查与子系统重启，按检测器信号触发并人工确认。</li>
+    </ol>
+    <div class="box key">
+      <span class="box-title">设计决策：为什么复位要按任务计数？</span>
+      <p>任务计数与磨损、感知累积、场景增长的因果关系更直接：搬运次数决定零点偏移的累积，感知次数决定场景数据的堆积。时钟计时会受空闲与负载波动影响，同样的运行时长内实际任务量可能相差数倍，维护判据随之失真。</p>
+    </div>
+
+    <h3>3. 重标定判据</h3>
+    <p>重标定不按固定日程执行，按判据触发：终点偏差趋势外推超预算、独立验证残差超阈值、设备发生移动或碰撞事件。<strong>重标定完成后必须重跑独立验证并更新残差摘要，未通过则不替换既有标定文件。</strong></p>
+
+    <p>与上一章的差异点：第 098 章产出一次标定的精度，本章维护精度的时间有效性；两章组合覆盖"标得准"与"保得住"。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：数值工具：环绕处理与四元数归一化</strong></p>
+    <pre class="code"><code>import math
+
+
+def wrap_angle(x):
+    """把角度环绕到 [-pi, pi]：关节差与插值前必须调用。"""
+    return x - 2.0 * math.pi * round(x / (2.0 * math.pi))
+
+
+def joint_delta(target, current):
+    """最短关节差：避免整圈跳变引起的反向大修正。"""
+    return wrap_angle(target - current)
+
+
+def normalize_quaternion(q):
+    """四元数归一化：在每次乘法更新后调用；只在读取时归一化会放过累计误差。"""
+    norm = math.sqrt(sum(c * c for c in q))
+    if norm &lt; 1e-12:
+        raise ValueError("四元数退化")   # 零四元数是数据错误，不可静默修复
+    if abs(norm - 1.0) &gt; 1e-6:
+        # 偏离超阈值时记录：频繁触发说明存在累积误差源
+        report_quaternion_drift(norm)
+    return tuple(c / norm for c in q)</code></pre>
+    <p>解读：两个工具函数对应两类经典数值问题。<strong>设计要点：（1）</strong>环绕处理在差值计算处就近调用，保证所有消费关节差的模块行为一致；<strong>（2）</strong>四元数归一化在写入路径上执行，使存储的值始终接近单位模长，避免误差参与后续复合；<strong>（3）</strong>零范数抛异常，数据错误需要暴露；静默替换会把故障藏起来；<strong>（4）</strong>偏离超阈值上报，把"修好了"与"有累源"两件事区分开。这些函数看似微小，缺失任何一个都会在长时运行中产生可见的周期性异常。</p>
+
+    <p><strong>片段 2：终点偏差漂移监测器</strong></p>
+    <pre class="code"><code>import statistics
+
+
+class DriftMonitor:
+    """以任务周期为刻度的漂移检测：滑动窗口拟合斜率并外推。"""
+
+    def __init__(self, window=50, budget=0.003, horizon=5000):
+        self.window = window          # 窗口覆盖的报告周期数
+        self.budget = budget          # 终点偏差预算（米）
+        self.horizon = horizon        # 外推维护间隔（周期数）
+        self.samples = []             # (周期序号, 终点偏差)
+        self.cycle = 0
+
+    def report(self, end_error):
+        """每个任务周期结束调用一次：记录终点偏差。"""
+        self.cycle += 1
+        self.samples.append((self.cycle, end_error))
+        if len(self.samples) &gt; self.window:
+            self.samples.pop(0)
+
+    def slope(self):
+        """最小二乘拟合斜率：对噪声不敏感的是中位数先行的斜率估计。"""
+        if len(self.samples) &lt; 10:
+            return None
+        xs = [c for c, _ in self.samples]
+        ys = [e for _, e in self.samples]
+        mx, my = statistics.fmean(xs), statistics.fmean(ys)
+        num = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+        den = sum((x - mx) ** 2 for x in xs)
+        return num / den if den else 0.0
+
+    def maintenance_due(self):
+        """外推判据：当前偏差加斜率乘维护间隔超过预算即触发。"""
+        if len(self.samples) &lt; 10:
+            return False, "样本不足"
+        e_now = statistics.median(e for _, e in self.samples)
+        k = self.slope()
+        projected = e_now + k * self.horizon
+        return projected &gt; self.budget, f"外推 {projected*1000:.1f} mm"</code></pre>
+    <p>解读：监测器把"逐渐变差"翻译为可触发的数值条件。<strong>设计要点：（1）</strong>以任务周期作自变量，与磨损的因果关系更直接；<strong>（2）</strong>斜率拟合前用窗口内中位数作为当前水平，抑制单点噪声；<strong>（3）</strong>判据用外推值，给出提前维护的提前量；<strong>（4）</strong>样本不足时明确返回"样本不足"，不给出不可靠判断。窗口与维护间隔是示例值，应按任务节奏与实测漂移特性标定。</p>
+
+    <p><strong>片段 3：周期复位的编排</strong></p>
+    <pre class="code"><code>class ResetScheduler:
+    """按任务计数触发的复位编排：先检查前置条件，再按成本升序执行。"""
+
+    def __init__(self, scene_rebuild_every=500):
+        self.interval = scene_rebuild_every
+        self.count = 0
+
+    def on_cycle_boundary(self, ctx):
+        """任务边界调用：无执行动作、无附着物体时才允许复位。"""
+        self.count += 1
+        if self.count % self.interval != 0:
+            return "none"
+        # 前置条件检查失败则顺延到下一个边界，绝不在任务中间复位
+        if ctx.has_running_motion() or ctx.has_attached_objects():
+            return "deferred"
+        ok = ctx.rebuild_scene()          # 场景重建：清空并重新感知
+        if not ok:
+            return "rebuild_failed"
+        ctx.resync_state()                # 重建后重新对齐状态与时间戳
+        ctx.reset_counters()              # 清理窗口计数器：避免旧样本污染新窗口
+        return "rebuilt"</code></pre>
+    <p>解读：复位编排把维护动作放到安全边界。<strong>设计要点：（1）</strong>触发条件是任务计数取模，周期稳定且与工况相关；<strong>（2）</strong>前置条件不满足时顺延，复位最终一定会发生；<strong>（3）</strong>复位动作按"重建、重同步、清计数器"顺序执行，重建后的状态必须重新对齐；<strong>（4）</strong>返回状态字符串供运行记录与告警使用。该编排与第 088 章的状态机共享"边界执行"原则：任何维护动作都不打断进行中的任务。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>关节差未做环绕处理</strong>：误差统计出现约 6.28 rad 的尖峰，控制器收到反向大幅修正。修复：所有差值计算统一走最短差函数。</li>
+      <li><strong>只在读取时归一化四元数</strong>：乘法链内部范数偏离持续累积，姿态插值路径扭曲。修复：在写入路径归一化，读取侧只做防御性检查。</li>
+      <li><strong>场景从不重建</strong>：对象计数与栅格体积随运行持续增长，规划延迟上升且幽灵碰撞增多。修复：按任务计数或计数阈值触发重建，重建前检查附着物体为空。</li>
+      <li><strong>在任务中间复位</strong>：复位打断执行中的动作或清除附着关系，造成工件跌落或状态错乱。修复：复位只在任务边界执行，前置条件不满足即顺延。</li>
+      <li><strong>只看当前偏差不看斜率</strong>：偏差到达预算时才处理，缺少提前量导致任务中途触发维护。修复：用外推判据留出提前量，维护安排落在计划停机边界。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>计算：终点偏差初值 0.8 mm、斜率 0.15 mm/千周期，预算 2.5 mm。求达到预算所需的周期数，并说明按 5000 周期维护间隔时的提前量。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>还需 1.7 mm，每千周期 0.15 mm，约 11.3 千周期到达预算；5000 周期维护点时外推 1.55 mm，仍在预算内。</div></details>
+      </li>
+      <li>构造数据说明无环绕处理的后果：当前角 3.10 rad，目标角 −3.10 rad，分别计算"直接差"与"最短差"，并说明物理含义。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>直接差约 −6.20 rad，最短差约 0.083 rad（另一方向绕行）；物理上两者只差 0.083 rad，直接差会让关节反向转近一整圈。</div></details>
+      </li>
+      <li>设计漂移检测实验：在受控条件下人为引入零点偏移，验证监测器在多长窗口后触发，并给出窗口与灵敏度的取舍。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>偏移注入后记录偏差序列，窗口过短噪声导致误触发，过长则响应滞后；用多档窗口的误报与漏报率选择折中点。</div></details>
+      </li>
+      <li>改参数并预测：把场景重建间隔从 500 个任务周期缩短到 100，场景新鲜度、感知成本与幽灵碰撞率分别如何变化？<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>重建更频繁，残留更少、幽灵碰撞率下降；感知重采集与重新对齐成本上升，任务节拍受影响，需要与吞吐指标共同评估。</div></details>
+      </li>
+      <li>设计重标定的触发与验证流程，要求包含趋势判据、事件判据与验证样本的来源，并说明未通过时的处理。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>趋势判据来自监测器外推；事件判据覆盖搬动与碰撞；验证样本来自独立采集点；未通过时保留旧标定并通报，不得覆盖文件。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>五类漂移来源各配检测信号与治理手段，分类处理避免手段错配。</li>
+      <li>四元数在写入路径归一化，关节差统一环绕到最短差，两类数值处理缺一不可。</li>
+      <li>漂移检测基于终点偏差序列的斜率与外推，判据给出维护提前量。</li>
+      <li>复位按任务计数触发，前置条件检查加边界执行保证不打断任务。</li>
+      <li>重标定按判据触发，不设固定日程；验证未通过时保留旧标定不覆盖。</li>
+      <li>下一章是课程收束：<strong>综合项目实践：桌面抓取放置系统</strong>，把全部组件组装成可验收的完整系统并回顾全课程。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch098.html">← 第 098 章：机械臂标定与坐标系对齐</a>
+    <a class="next" href="ch100.html">第 100 章：综合项目实践：桌面抓取放置系统 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.06 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:11.5px !important;letter-spacing:.06em !important;color:rgba(71,85,105,.45) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#7e8ba0 !important;font-size:11.5px !important;line-height:1.8 !important;text-align:center !important;padding:5px 12px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

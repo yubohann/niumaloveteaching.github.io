@@ -15,8 +15,10 @@
     python code/ch099.py           # 完整训练（CPU 约 2-4 分钟）
     python code/ch099.py --quick   # 快速跑通（约 20-40 秒）
 
-预期：知情交易者的学习盈亏为正、噪声交易者接近零或为负；学习后的
-价格发现误差比"零订单"基线显著更低（以实跑为准）。
+预期：学习策略让两类交易者都转为激进同向交易，评估盈亏都约 +69（类型
+分化没有出现）；价格发现误差不降反升（约 0.36，零订单基线约 0.07），
+波动率放大到约 0.71（零订单基线约 0.03）；追动量基线巨亏约 -73 并抬高
+波动率；本模型的合计盈亏并不守恒。以实跑为准。
 """
 
 import argparse
@@ -112,7 +114,7 @@ class TradingMarketEnv:
                   + float(self.rng.normal(0.0, self.price_noise)))
         self.price_changes.append(self.p - self.prev_p)
 
-        # 2) 实现盈亏：以当前价建仓，按下一期基本面结算（教学简化）
+        # 2) 实现盈亏：以上期价格 prev_p 建仓，按下一期基本面 F_next 结算（教学简化）
         rewards = orders * (self.F_next - self.prev_p) - self.fee * np.abs(orders)
         self.tot_pnl += rewards
         self.last_order = orders.copy()

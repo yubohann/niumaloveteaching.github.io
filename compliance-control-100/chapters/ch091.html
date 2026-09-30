@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第091章 导纳控制中的力传感器校准 | 机器人柔顺控制课程 · 阻抗与导纳控制算法</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第五篇 · 鲁棒控制与工程实践</span>
+    <span class="sep">/</span>
+    <span>第 091 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第五篇 · 鲁棒控制与工程实践</div>
+    <h1>第 091 章：导纳控制中的力传感器校准</h1>
+    <p class="lead">在导纳控制里，力的误差会变成运动，一个 0.5 N 的零点偏差就是 17 mm/s 的持续爬行。本章把力传感器校准做成一条工程流水线：静置采样求零点、稳健统计抗异常、运行时"只在不接触时"跟踪漂移、用噪声定死区与检测阈值。</p>
+    <ul class="meta">
+      <li>主题：力传感器校准 / 零点与漂移管理</li>
+      <li>关键公式：bias = median(F<sub>1..n</sub>)，漂移速度 ≈ b/D<sub>d</sub>，死区 = 3σ</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 090 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解为什么"零点偏差"在导纳控制里比在阻抗控制里危险得多：导纳把力误差积成位移，偏差 = 持续漂移。</li>
+      <li>会区分四类校准：零点（bias）、标度与交叉耦合（matrix）、温度漂移（bias(T)）、姿态相关外力（线缆/气管），并说出各自的物理来源与量级。</li>
+      <li>会实现静置零点标定：中位数 + MAD 的稳健统计、异常剔除、以及"均值/噪声/趋势"三项验收判据。</li>
+      <li>会设计运行时漂移跟踪：静止窗口检测、慢速泄漏更新、冻结条件，保证"接触力永远不会被学进零点"。</li>
+      <li>会从噪声统计推出控制参数：死区取 3σ（第 083 章用），接触/碰撞检测阈值取 5–8σ（第 096/097 章用）。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>力传感器是一台会"变心"的仪器：上电时零点偏 1 N，运行半小时后因为温升又漂 0.3 N，换了工具、拖了线缆再偏 2 N。在阻抗控制里，1 N 的零点偏差不过是让柔顺平衡点挪 1/K<sub>d</sub>（500 N/m 时 2 mm）；但在<strong>导纳控制里它是致命的</strong>：导纳方程 M<sub>d</sub>ẍ<sub>c</sub> + D<sub>d</sub>ẋ<sub>c</sub> + K<sub>d</sub>(x<sub>c</sub>−x<sub>r</sub>) = F<sub>d</sub> − F<sub>meas</sub> 里，偏置 b 相当于一个不会消失的"虚拟外力"，若 K<sub>d</sub> 取 0（纯力跟踪），机器人会以 ẋ<sub>c</sub> = b/D<sub>d</sub> 的速度一直爬：b = 0.5 N、D<sub>d</sub> = 30 N·s/m，爬行速度 17 mm/s，半分钟跑出去半米，直接撞上限位或保护停机。</p>
+    <p>所以导纳控制的现场调试有一句行话："<strong>先校力，再调参</strong>"。本章把这件事做成流水线：<em>上电标定 → 验收 → 运行时漂移跟踪 → 参数导出</em>。这一章是前面所有导纳章节能在真实设备上成立的地基，属于必备环节。第 092 章的工件重力补偿、第 093 章的负载适应、第 096/097 章的检测，也都建立在本章的噪声统计与零点管理之上。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 误差如何在导纳回路里传播：两个数字</h3>
+    <p>设真实接触力为 F、测量值为 F<sub>meas</sub> = F + b（b 为总偏置，含零点、温漂、线缆力）。看两种典型导纳结构：<strong>（1）带虚拟弹簧的力跟踪型</strong>（第 083 章）：稳态力为 F = [F<sub>d</sub> − K<sub>d</sub>(x<sub>e</sub>−x<sub>r</sub>)]/(1+K<sub>d</sub>/K<sub>env</sub>)，把 F<sub>meas</sub> 代进控制目标（F<sub>meas</sub> = F<sub>d</sub>）后，真实力误差 ∝ b：b = 1 N 直接变成约 1 N 的接触力偏差；<strong>（2）纯力跟踪型</strong>（K<sub>d</sub> = 0）：平衡条件变成 F<sub>meas</sub> = F<sub>d</sub>，即 F = F<sub>d</sub> − b；如果这个"少 1 N"的力在自由空间无法实现（F = 0），方程就没有静平衡点，机器人持续爬行，速度 ẋ = b/D<sub>d</sub>。</p>
+    <div class="formula">
+      b = 0.5 N，D<sub>d</sub> = 30 N·s/m ⟹ 爬行速度 ẋ = b/D<sub>d</sub> = 16.7 mm/s
+      <span class="note">偏置在"纯力跟踪"结构里不是误差，是运动，这是导纳控制校准重要性的全部理由</span>
+    </div>
+    <p><strong>工程直觉：阻抗控制里，力误差是"弹簧的位移"；导纳控制里，力误差是"积分器的输入"。位移有界，积分无界，所以导纳对力校准的要求比阻抗高一个数量级。</strong>目标：总偏置控制在 0.2 N 以内，并保证它在运行中不偷偷长大。</p>
+
+    <h3>2. 四类校准：从零点到姿态</h3>
+    <p>一台典型的腕部六维力传感器（六路输出：F<sub>x</sub>, F<sub>y</sub>, F<sub>z</sub>, M<sub>x</sub>, M<sub>y</sub>, M<sub>z</sub>）需要处理四类系统性误差：</p>
+    <table>
+      <tr><th>类型</th><th>物理来源</th><th>典型量级</th><th>处理方式</th></tr>
+      <tr><td>零点偏置 b<sub>0</sub></td><td>应变片电桥失衡、放大电路失调</td><td>0.2–5 N</td><td>静置采样标定（本节重点）</td></tr>
+      <tr><td>标度/交叉耦合</td><td>贴片位置公差、结构串扰（厂家 6×6 标定矩阵）</td><td>1–3%</td><td>用已知砝码验证，超差返厂</td></tr>
+      <tr><td>温度漂移</td><td>应变片与电路温漂</td><td>0.05–0.3 N/°C</td><td>运行时零点跟踪 / 温度模型</td></tr>
+      <tr><td>姿态相关外力</td><td>工具重力、线缆拖拽、气管张力</td><td>0.5–5 N，随位姿变化</td><td>重力补偿（第 092 章）+ 走线优化</td></tr>
+    </table>
+    <p>注意分工：<strong>零点与温漂是"加性、慢变"的，适合本节的统计方法；姿态相关力是"结构化、可建模"的，交给第 092 章的解析方法</strong>。混在一起的常见后果是：用零点跟踪去"吸收"工具重力，跟踪器到处乱跑（工具一转动，重力投影变了，零点就不稳）。所以正确顺序是先做重力补偿（把姿态相关项剥掉），再做零点跟踪。</p>
+
+    <h3>3. 静置零点标定：稳健统计的三件套</h3>
+    <p>上电标定的场景很朴素：机器人停在自由空间（无接触、无运动），以 1 kHz 采 2–3 秒六维力信号，算出一个可信的零点。<strong>用均值是不够的</strong>，现场总有偶发尖峰（电磁干扰、相邻设备启停、电缆被碰）；用中位数抗尖峰但扔掉了有效信息。工程上标准的组合是：</p>
+    <div class="formula">
+      b<sub>0</sub> = mean{ F<sub>i</sub> : |F<sub>i</sub> − median(F)| &lt; 5·MAD·1.4826 }，σ = std(保留样本)
+      <span class="note">MAD = median(|F<sub>i</sub> − median(F)|)：稳健标准差（乘 1.4826 后与 σ 同尺度）</span>
+    </div>
+    <p>验收三条：<strong>（1）</strong>剔除后的噪声 σ &lt; 0.1 N（腕部传感器典型值）；<strong>（2）</strong>前半段与后半段均值之差 &lt; 0.05 N（排除"还在漂"的状态）；<strong>（3）</strong>剔除比例 &lt; 5%（异常太多说明环境不干净，需要排查）。三条全过才允许使能导纳功能，把这条写进开机流程，能消灭一大半"手感不对"的现场投诉。</p>
+
+    <h3>4. 运行时漂移跟踪：只在不接触时学习的慢速零点</h3>
+    <p>温漂让零点在几十分钟里慢速移动，不能只靠上电标定。运行时跟踪的设计核心只有一句话：<strong>零点只在"确定不接触"的时刻更新，而且更新得极慢</strong>。判定"确定不接触"需要三条件同时成立：机器人速度小于阈值（静止）、力的波动小（不是接触中的抖动）、导纳控制器处于"自由段"状态（没有追踪到接触标志）。三者满足并持续一段时间（如 0.5 s）后，才允许以时间常数几十秒的速率把零点朝当前读数挪动。接触一旦建立，立刻冻结，否则接触力会被"学"进零点，下一轮任务中机器人就会"看不见"力，压穿工件。</p>
+    <p>这个"慢速 + 门控"的设计还有一个副产品：它能自动补偿温度、供电波动等慢变因素，但<strong>绝不会掩盖真实的接触</strong>。参数经验：更新速率 0.02–0.05 s<sup>−1</sup>（时间常数 20–50 s），单次任务时长内零点漂移量被限制在 0.1 N 以内，恰好落在验收容差里。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <ol>
+      <li><strong>上电流程</strong>：展开、回零、等待 30 s（机械热稳定）→ 采样 2 s → 稳健统计 → 三项验收 → 写入运行时偏置。</li>
+      <li><strong>采样窗口</strong>：1 kHz、2048 点（2.048 s）；窗口内做一次速度检查（编码器速度 RMS &lt; 1 mm/s），否则重采。</li>
+      <li><strong>运行时跟踪</strong>：BiasTracker 以 0.5 s 静止窗口为门控、0.03 s<sup>−1</sup> 泄漏速率更新；接触标志（第 096 章）优先于本模块，一旦置位立即冻结。</li>
+      <li><strong>参数导出</strong>：把标定得到的 σ 写入下游模块，导纳死区 = 3σ（第 083 章），接触检测阈值 = 5σ（第 096 章），碰撞检测阈值 = 8σ（第 097 章）。</li>
+      <li><strong>日志与告警</strong>：记录每次标定的 b<sub>0</sub>、σ、剔除率、温漂速率；温漂 &gt; 0.5 N/h 或零点跳变 &gt; 1 N/h 触发维护工单（应变片老化、接插件松动的典型信号）。</li>
+      <li><strong>换工具后再标</strong>：任何工具变更（第 092 章）都会改变重力与线缆状态，必须重做重力辨识 + 零点复核。</li>
+    </ol>
+    <div class="box key">
+      <span class="box-title">设计决策：为什么不用"每次任务开始自动清零"？</span>
+      <p>听上去很省事，但有一个致命场景：<strong>如果任务开始时工具正顶着工件，自动清零就把接触力一起清掉</strong>，机器人随后会以为"没有力"，继续压入直到力大到无法解释。所以自动清零必须满足"确定不接触"的门控，这又依赖接触检测或状态机信息。工程安全顺序是：<em>状态机确认自由 → 门控计时 → 慢速更新</em>，缺一不可。宁可容忍 0.2 N 的残余偏置多等几秒，也不能清零清出一次压穿事故。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：稳健零点标定与验收</strong></p>
+    <pre class="code"><code>import numpy as np
+
+def calibrate_bias(samples):
+    """静置采样（n x 6）求零点：中位数抗异常，MAD 估噪声，均值保精度。"""
+    samples = np.asarray(samples, dtype=float)
+    med = np.median(samples, axis=0)                       # 中位数：先划出"正常区"
+    mad = np.median(np.abs(samples - med), axis=0) * 1.4826  # 稳健标准差（≈sigma）
+    tol = 5.0 * np.maximum(mad, 1e-6)                      # 防 0 除：量化误差兜底
+    keep = np.all(np.abs(samples - med) &lt; tol, axis=1)     # 尖峰样本整行剔除
+    bias = samples[keep].mean(axis=0)                      # 均值：保留全部有效信息
+    noise = samples[keep].std(axis=0)
+    ratio = 1.0 - keep.mean()                              # 剔除比例
+    return bias, noise, ratio
+
+def accept(samples, noise, ratio, noise_max=0.1, ratio_max=0.05, halves_tol=0.05):
+    """三项验收：噪声、剔除比例、前后半段一致性。三条全过才允许使能。"""
+    half = len(samples) // 2
+    # 前半段与后半段的均值差：仍在漂的数据会被这条拦下
+    drift = np.abs(samples[:half].mean(axis=0) - samples[half:].mean(axis=0))
+    ok_noise = np.all(noise &lt; noise_max)
+    ok_ratio = ratio &lt; ratio_max
+    ok_stable = np.all(drift &lt; halves_tol)
+    return bool(ok_noise and ok_ratio and ok_stable), (ok_noise, ok_ratio, ok_stable)</code></pre>
+    <p>解读：这段代码的每个选择都能回答"为什么"：<strong>（1）</strong>先用中位数"圈地"、再用均值算零点，兼顾抗差与无偏；<strong>（2）</strong><code>mad * 1.4826</code> 的系数来自正态分布下 MAD 与标准差的换算，写死这个系数是行业惯例；<strong>（3）</strong><code>1e-6</code> 的容差兜底防止"传感器完全无噪声（或卡死）时整行被误剔"；<strong>（4）</strong>异常样本按"整行"剔除，不逐轴处理；一次电磁干扰通常会同时污染多轴，逐轴剔除会破坏各轴零点之间的一致性。验收函数里 <code>ok_stable</code> 留了接口，实际工程中把采样窗口切成前后两半各算一次均值、比较差值即可。</p>
+
+    <p><strong>片段 2：运行时漂移跟踪（门控 + 慢泄漏）</strong></p>
+    <pre class="code"><code>class BiasTracker:
+    """运行时零点跟踪：只在'静止 + 力平稳 + 无接触'的窗口里慢速更新。"""
+    def __init__(self, bias, rate=0.03, quiet_time=0.5, v_eps=0.005, f_std_eps=0.15):
+        self.bias = np.asarray(bias, dtype=float)
+        self.rate = rate          # 泄漏速率 1/s：太大=吃接触力，太小=追不上温漂
+        self.quiet_time = quiet_time
+        self.v_eps, self.f_std_eps = v_eps, f_std_eps
+        self.quiet_acc = 0.0      # 连续静止时长累计
+        self.contact = False      # 由状态机/接触检测置位（第 096 章）
+
+    def update(self, f_meas, v_norm, f_std, dt):
+        # 门控三条件：速度小、力波动小、状态机确认无接触
+        quiet = (v_norm &lt; self.v_eps) and (f_std &lt; self.f_std_eps) and (not self.contact)
+        self.quiet_acc = self.quiet_acc + dt if quiet else 0.0
+        if self.quiet_acc &gt; self.quiet_time:
+            # 慢速泄漏：时间常数 1/rate ≈ 33 s，单次任务内的漂移被限在 0.1 N 级
+            self.bias += self.rate * (np.asarray(f_meas) - self.bias) * dt
+        return self.bias.copy()</code></pre>
+    <p>解读：<strong>（1）</strong>三个门控条件的物理含义各不相同：<code>v_norm</code> 排除运动（运动中的惯性/线缆耦合会干扰），<code>f_std</code> 排除接触抖动，<code>contact</code> 是状态机的硬性否决，三者是"与"关系。<strong>（2）</strong><code>quiet_acc</code> 需要<em>连续</em>安静 0.5 s 才开始更新：偶尔路过静止状态（比如轨迹拐点驻留）不足以触发，避免在可疑时刻学习。<strong>（3）</strong>更新用一阶泄漏，不用滑窗平均：滑窗平均在窗口滚动的瞬间会"跳变"，泄漏则是连续、可预测、可审计的。现场调试口诀：<em>宁可追得慢，不可学得错</em>。</p>
+
+    <p><strong>片段 3：从噪声到控制参数（跨章联动）</strong></p>
+    <pre class="code"><code>def derive_control_params(noise):
+    """把标定得到的每轴噪声 sigma 翻译成下游模块的参数。"""
+    sigma = np.asarray(noise)
+    params = {
+        "admittance_deadband": 3.0 * float(np.max(sigma[:3])),  # 第 083 章：力死区
+        "contact_threshold":   5.0 * float(np.max(sigma[:3])),  # 第 096 章：接触判定
+        "collision_threshold": 8.0 * float(np.max(sigma[:3])),  # 第 097 章：碰撞残差门限
+    }
+    for k, v in params.items():
+        print(f"{k:22s} = {v:5.2f} N")
+    return params
+
+# 典型腕部传感器：三力轴 sigma ≈ 0.06/0.07/0.09 N
+derive_control_params([0.06, 0.07, 0.09, 0.002, 0.002, 0.001])</code></pre>
+    <p>解读：这个工具函数展示了"校准不止是零点"的第二层价值，<strong>噪声统计是控制器的输入参数</strong>：死区取 3σ（噪声驱动参数漂移的概率极低）、接触阈值取 5σ（对 15 N 量级的接触力响应快而不误报）、碰撞阈值取 8σ（宁可晚 2 ms，不可天天误停机）。三者的"σ 倍数"为何递增？因为改善（灵敏度）与代价（误报）的权衡位置不同：死区误触发只是手感变差，碰撞误报会停机停产。<strong>把这张表放进设备验收文档，就等于把"传感器品质"与"控制行为"的关系写清了</strong>，换传感器时必须重新导出这些参数，旧值不再适用。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>在接触状态下零点跑偏</strong>：有人图省事在"机器人停住"时就清零，结果清掉了接触力，下一次动作直接压深。修复：状态机硬门控 + 连续静止计时 + 更新速率限制（本章片段 2）。</li>
+      <li><strong>用均值不做异常剔除</strong>：一次 10 N 的电磁尖峰能把 2 秒窗口的均值拉偏 0.05 N 以上。修复：中位数 + MAD 的稳健管道，并检查剔除比例。</li>
+      <li><strong>把工具重力当零点标</strong>：工具重力随姿态变化（同一姿态下是常数，换姿态就变了），用零点跟踪去"追"它会得到来回摆动的偏置，导纳控制表现为"机器人随手腕转动而漂移"。修复：先做第 092 章的解析重力补偿，再跟踪残余零点。</li>
+      <li><strong>忽略线缆与气管</strong>：走线拖拽力可达数牛、且随姿态与运动速度变化，标定和跟踪都拿它没办法。修复：属于机械布置问题，加拖链、给线缆留应力释放环、把线缆走向固定到远离腕部的位置。</li>
+      <li><strong>温漂速率不监控</strong>：传感器老化前兆（应变片脱胶、密封失效）表现为温漂速率上升。修复：把 b<sub>0</sub> 与温漂速率记进日志，设阈值告警，别等事故发生才发现。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>推导纯力跟踪结构（K<sub>d</sub> = 0）在自由空间里"偏置 → 爬行"的速度公式 ẋ = b/D<sub>d</sub>，并计算 b = 0.3 N、D<sub>d</sub> = 45 N·s/m 时的爬行速度；如果给导纳加一个 K<sub>d</sub> = 200 N/m 的虚拟弹簧，爬行会变成什么？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>K<sub>d</sub> &gt; 0 时稳态由弹簧平衡：偏移 = b/K<sub>d</sub>（b 被"吃掉"成静态位移），爬行消失但有 1.5 mm 的静态偏移，这正是"弹簧限制漂移"的用法。</div></details>
+      </li>
+      <li>构造一段含 3 个尖峰（幅度 8 N）的 2 秒采样数据，分别用"纯均值"与"片段 1 的稳健管道"求零点，比较偏差；再逐步提高尖峰数量到 10%，观察验收判据如何拦截坏数据。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>3 个尖峰在 2048 点里对均值的影响约 8×3/2048 ≈ 0.012 N，看起来小；但当尖峰数量上升或幅度增大，均值法会突破 0.1 N 容差，而中位数法稳如磐石。</div></details>
+      </li>
+      <li>把 BiasTracker 的 rate 从 0.03 改到 0.5，并人为让"接触标志"失效（模拟状态机故障），观察接触力被"学"进零点的过程与后果（用导纳仿真跑 60 s）。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>rate = 0.5 时时间常数 2 s，几十秒内 15 N 的接触力会被部分吸收成零点，机器人随后压得更深，这是"保护逻辑失效"最典型的连锁故障。结论：门控比更新速率更重要。</div></details>
+      </li>
+      <li>设计温漂实验：记录 1 小时内每 5 分钟的零点估计与温度，拟合 b(T) = b<sub>0</sub> + c(T−T<sub>0</sub>)，比较"温度模型前馈修正"与"运行时泄漏跟踪"两种方案的误差与时效性。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>温度模型响应快（温变即补）但依赖标定质量和温度测量位置；泄漏跟踪不依赖温度传感器但滞后 33 s 量级。工程上常两者并用：模型管快变、跟踪管残差。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>导纳控制里"力偏置 = 运动"：纯力跟踪结构的爬行速度 ẋ = b/D<sub>d</sub>，0.5 N 偏置在 D<sub>d</sub> = 30 时就是 17 mm/s，校准是安全底线。</li>
+      <li>四类校准分工：零点与温漂用统计方法（本章），标度用砝码验证，姿态相关力用解析重力补偿（第 092 章）。</li>
+      <li>静置标定三件套：中位数圈地 + MAD 抗差 + 均值定值；验收三条：噪声 &lt; 0.1 N、剔除率 &lt; 5%、前后半段一致。</li>
+      <li>运行时跟踪三条件门控（静止、力平稳、无接触）+ 0.03 s<sup>−1</sup> 慢泄漏；接触标志永远优先，宁慢勿错。</li>
+      <li>噪声是控制参数之源：死区 3σ、接触阈值 5σ、碰撞阈值 8σ；下一章处理校准之后最大的一块"姿态相关力"，<strong>工具重力补偿</strong>。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch090.html">← 第 090 章：阻抗控制中的无传感器力控制</a>
+    <a class="next" href="ch092.html">第 092 章：阻抗控制中的工具重力补偿 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.06 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:11.5px !important;letter-spacing:.06em !important;color:rgba(71,85,105,.45) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#7e8ba0 !important;font-size:11.5px !important;line-height:1.8 !important;text-align:center !important;padding:5px 12px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

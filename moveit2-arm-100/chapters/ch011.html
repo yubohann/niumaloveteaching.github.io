@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第011章 笛卡尔空间运动实现 | 机械臂规划学习课程 · ROS2 MoveIt2 运动规划与操作</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · 环境搭建与基础控制</span>
+    <span class="sep">/</span>
+    <span>第 011 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · 环境搭建与基础控制</div>
+    <h1>第 011 章：笛卡尔空间运动实现</h1>
+    <p class="lead">本章让末端沿指定轨迹运动：位姿目标的表达、直线段的离散化与逐点逆解，以及分数、步长、跳变阈值三个决定成败的参量。</p>
+    <ul class="meta">
+      <li>主题：运动实现 / 笛卡尔空间规划</li>
+      <li>关键机制：位姿目标与逆解、笛卡尔路径离散化、跳变阈值保护</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 010 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>掌握末端位姿目标的表达：位置、姿态四元数与参考坐标系。</li>
+      <li>理解笛卡尔路径的求解机制：直线离散化、逐点逆解、中途失败的分数回报。</li>
+      <li>掌握步长（eef_step）与跳变阈值（jump_threshold）的作用，能按任务选择取值。</li>
+      <li>会处理分数小于 1 的结果，能区分"拒绝执行"与"截断使用"两种策略的前提。</li>
+      <li>能把关节空间转移与笛卡尔空间工序组合成完整任务，并对每一段给出选择依据。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>有一类任务对末端的运动形状有硬性要求：沿桌面直线下降抓取、沿焊缝匀速推进、轴向插入装配。这类运动的共同特征是"路径形状即工艺要求"，关节空间的自由连线无法满足，必须在笛卡尔空间里把轨迹显式指定出来。</p>
+    <p>笛卡尔空间运动比关节空间多一层逆运动学转换，随之引入新的失败模式：目标位姿不可达、逆解在途中断裂、多解之间发生跳变。本章的核心是理解这些失败模式的表现形式并建立处理策略。<strong>由于路径逐点由逆解拼成，它的可靠性与目标的位姿设计直接相关；先看穿机制，再谈调参，顺序不能颠倒。</strong></p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p>本节解释笛卡尔路径的求解机制、三个关键量（步长、跳变阈值、分数）的数学含义，以及它与关节空间运动的分工。</p>
+
+    <h3>1. 位姿目标与逆运动学</h3>
+    <p>笛卡尔目标是一组末端位姿：三维位置加三维姿态，姿态通常用四元数表达以避免欧拉角的万向节问题。求解时，逆运动学在关节空间里寻找满足位姿约束的关节向量。数值求解器从种子状态出发迭代逼近，因此同一目标在不同种子下可能收敛到不同解，呈现肘部上下的构型差异。</p>
+    <div class="formula">
+      q<sub>goal</sub> = IK(T<sub>target</sub>, q<sub>seed</sub>)，目标可达且数值收敛时得到解
+      <span class="note">位置可达、姿态可达、连同限位约束共同构成解存在的条件</span>
+    </div>
+    <p>工作空间边界附近与奇异位形附近是求解的两个困难区：前者可能无解，后者附近关节角变化剧烈且对微小位姿扰动敏感。<strong>工程上把期望目标设在工况需要的位置上，同时借助种子状态引导到希望的构型分支，是位姿目标设计的基本思路。</strong>种子状态的选择会在第 052 章的求解器对比中进一步展开。</p>
+
+    <h3>2. 笛卡尔路径：直线离散化加逐点求解</h3>
+    <p>让末端沿直线运动并没有解析的关节表达式可用，标准实现是数值离散：在起点位姿与目标位姿之间按固定步长插入中间位姿，对每个中间位姿求逆解，把得到的关节向量串成关节空间路径。</p>
+    <ol>
+      <li>计算起点与目标的位姿差，按步长切分为若干采样位姿。</li>
+      <li>对每个采样位姿调用逆解，得到对应的关节向量。</li>
+      <li>检查相邻关节向量之间的距离，超过跳变阈值则判定为解跳变，中止。</li>
+      <li>返回已完成的采样比例，记为分数（Fraction）。</li>
+    </ol>
+    <p>分数是这套机制做出的核心承诺：<strong>分数为 1 表示整条路径全部求解成功；小于 1 表示在某个位置断裂，已完成部分保持连续。分数既是质量指标也是安全指标：默认策略是分数不足时拒绝执行，除非任务经过分析后确认部分路径本身可用。</strong></p>
+
+    <h3>3. 步长与跳变阈值</h3>
+    <p>步长决定离散密度。0.2 m 的直线在 0.01 m 步长下产生约 21 个采样点，在 0.05 m 步长下只有 5 个。步长偏大时，相邻采样点之间的直线近似误差变大，中间区段的碰撞检查粒度变粗；步长偏小时，逆解调用次数成比例上升，单条路径的求解耗时增加。</p>
+    <p>跳变阈值保护的是关节空间的连续性。逆解的多解分支之间可能存在突变：相邻两个采样位姿位置差异极小，求解结果却跳到另一分支，关节向量距离很大。若不设防，串出来的路径会出现瞬时的姿态跳变，执行侧表现为剧烈动作。阈值按相邻解在关节空间中的距离度量：</p>
+    <div class="formula">
+      d(q<sub>k</sub>, q<sub>k+1</sub>) = 各关节角差的加权范数；段距超过 jump_threshold × 平均段距时判为跳变
+      <span class="note">阈值取 0 表示禁用保护；启用时典型量级在 5 附近，以对应版本约定为准</span>
+    </div>
+    <p><strong>阈值的取向是"宁可误停、不可放行"：误停的代价是分数略降、调整种子重试；放行的代价是执行时的关节跳变，可能危及设备与工件。</strong>在确认目标位姿干净、求解稳定的工序中，把阈值禁用可以避免误停，但应在仿真中充分验证后再上真机。</p>
+
+    <h3>4. 与关节空间运动的分工</h3>
+    <p>两类空间构成互补分工，各司其职。典型任务结构是"转移加工序"：工位之间的移动用关节空间，速度快、成功率高；进入工序段后切换笛卡尔空间，只在需要形状约束的区间使用直线路径。</p>
+    <table>
+      <tr><th>维度</th><th>关节空间</th><th>笛卡尔空间</th></tr>
+      <tr><td>目标形式</td><td>关节角向量</td><td>末端位姿或位姿序列</td></tr>
+      <tr><td>路径形状</td><td>末端轨迹不可预测</td><td>末端沿指定直线运动</td></tr>
+      <tr><td>求解方式</td><td>构型空间搜索</td><td>离散加逐点逆解</td></tr>
+      <tr><td>主要失败源</td><td>限位与碰撞</td><td>逆解不存在、分支跳变、中途碰撞</td></tr>
+      <tr><td>典型任务</td><td>大范围转移、回零</td><td>下降抓取、焊接、插装</td></tr>
+    </table>
+    <p><strong>组合原则可以浓缩为一句：自由移动用关节空间，受约束段用笛卡尔空间，两段之间用关节空间路径衔接。</strong>衔接处若要求速度连续，需要在轨迹层做处理，第 015 章给出工具。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>笛卡尔运动的实现按"定位姿、设精度、算路径、查分数、再执行"五步推进。</p>
+
+    <ol>
+      <li><strong>确定参考坐标系</strong>：位姿在哪个坐标系下表达，决定"下降"等方向语义的正确性。</li>
+      <li><strong>构造目标位姿</strong>：位置与姿态分别设定；姿态优先用工具坐标系语义描述（如工具朝下）。</li>
+      <li><strong>选择精度参数</strong>：步长 0.01 m 起步；跳变阈值按工序稳定性启用或禁用。</li>
+      <li><strong>计算路径</strong>：调用笛卡尔路径接口，读取分数与错误信息。</li>
+      <li><strong>判定与执行</strong>：分数达标才执行；低于阈值时分析断裂原因后再调整。</li>
+    </ol>
+
+    <h3>参数表</h3>
+    <table>
+      <tr><th>参数</th><th>建议值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>步长 eef_step</td><td>0.01 m</td><td>离散密度</td><td>0.2 m 直线约 21 个采样点，逆解次数与精度平衡</td></tr>
+      <tr><td>跳变阈值</td><td>5.0（启用）或 0（禁用）</td><td>分支跳变保护</td><td>调试期启用防意外；验证稳定的工序可禁用</td></tr>
+      <tr><td>速度缩放</td><td>0.1 至 0.3</td><td>时间参数化系数</td><td>工序段精度要求高，节奏取保守</td></tr>
+      <tr><td>分数阈值</td><td>0.95</td><td>执行准入线</td><td>允许尾部极少量采样失败，仍要求路径基本完整</td></tr>
+      <tr><td>直线长度</td><td>0.05 至 0.3 m</td><td>工序段位移</td><td>下降抓取等典型工序的尺度</td></tr>
+    </table>
+
+    <div class="box key">
+      <span class="box-title">设计决策：为什么分数不足默认拒绝执行？</span>
+      <p>分数小于 1 的轨迹终点停在断裂前的采样位姿，它是一个"半程位置"：对抓取工序而言，半程下降可能落在工件正上方也可能停在干涉区内，语义上不可控。<strong>默认拒绝把不确定性挡在执行之前；确需使用部分路径时，应同时满足两个条件：断裂点之后无工序义务，且部分路径终点对后续动作安全。两个条件都写进任务逻辑并复验后，截断使用才成立。</strong></p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>本节给出三段片段：位姿目标设置、笛卡尔路径调用与分数处理、直线采样点的生成。</p>
+
+    <p><strong>片段 1：位姿目标的表达</strong></p>
+    <pre class="code"><code>// 位姿的语义由参考坐标系决定：先声明参考系，再给位置与姿态
+group.setPoseReferenceFrame("base_link");
+
+geometry_msgs::msg::Pose target;
+// 位置取当前末端位姿再沿 Z 下移 0.10 m：下降抓取的典型目标
+geometry_msgs::msg::PoseStamped current = group.getCurrentPose("flange");
+target.position.x = current.pose.position.x;
+target.position.y = current.pose.position.y;
+target.position.z = current.pose.position.z - 0.10;
+
+// 姿态用四元数表达：工具轴朝下为常见工序姿态，避免欧拉角歧义
+tf2::Quaternion q;
+// 绕 X 轴翻转 180 度：工具轴（法兰 +Z 约定）指向 base_link 的 -Z，即朝下
+q.setRPY(3.1416, 0.0, 0.0);   // 工具轴定义与法兰不一致时按实际模型换算
+target.orientation.x = q.x();
+target.orientation.y = q.y();
+target.orientation.z = q.z();
+target.orientation.w = q.w();
+
+// 位姿目标走逆解：容差分开设置，姿态容差过紧是常见失败源
+group.setGoalPositionTolerance(0.005);      // 5 mm
+group.setGoalOrientationTolerance(0.01);    // 约 0.6 度
+group.setPoseTarget(target, "flange");</code></pre>
+    <p>解读：位姿目标的三段信息缺一不可。<strong>（1）</strong>参考坐标系决定数值语义：同样的坐标分量在不同参考系下指向完全不同的方向，跨坐标系复用目标前必须换算。<strong>（2）</strong>从当前位姿派生目标（当前点向下偏移）是工序编程的稳健写法：无须绝对定位，工件或桌面轻微变更时目标自动跟随。<strong>（3）</strong>位置容差与姿态容差分开设置：姿态容差对逆解收敛的影响通常更大，数值上比位置容差更敏感，需要单独评估。</p>
+
+    <p><strong>片段 2：笛卡尔路径调用与分数处理</strong></p>
+    <pre class="code"><code>// 路点列表：单点列表表示"到该位姿的一条直线"，多点表示折线工序
+std::vector&lt;geometry_msgs::msg::Pose&gt; waypoints{target};
+
+const double eef_step = 0.01;          // 步长 1 cm：精度与逆解次数的平衡
+const double jump_threshold = 5.0;     // 启用分支跳变保护
+moveit_msgs::msg::RobotTrajectory trajectory;
+// 返回值是分数：1.0 表示整条路径求解成功
+double fraction = group.computeCartesianPath(
+    waypoints, eef_step, jump_threshold, trajectory, true);
+
+RCLCPP_INFO(node-&gt;get_logger(), "笛卡尔路径分数 %.3f", fraction);
+if (fraction &gt;= 0.95) {
+  // 分数达标：把轨迹包装进 Plan 后执行，接口与关节空间一致
+  moveit::planning_interface::MoveGroupInterface::Plan plan;
+  plan.trajectory_ = trajectory;
+  group.execute(plan);
+} else {
+  // 分数不足：不执行半程轨迹；先诊断断裂位置
+  RCLCPP_WARN(node-&gt;get_logger(),
+              "路径在约 %.0f%% 处断裂：检查可达性与跳变阈值", fraction * 100.0);
+}</code></pre>
+    <p>解读：这段代码体现"先算路、后判定、再执行"的工序纪律。<strong>（1）</strong>步长与阈值是求解参数，在调用时传入，与执行参数、规划参数分离。<strong>（2）</strong>第五个布尔参数开启碰撞检测：笛卡尔路径同样要经过场景校验，投产时不应关闭。<strong>（3）</strong>分数分支的输出给出断裂比例，把它与几何直觉对照（例如断裂恰在工作空间边缘）是定位问题的最快路径；同时注意笛卡尔路径返回的轨迹可能需要再经过时间参数化才能满足控制器的速度约束，第 015 章展开这一环节。</p>
+
+    <p><strong>片段 3：直线采样点生成</strong></p>
+    <pre class="code"><code>import numpy as np
+
+def line_waypoints(p_start, p_end, step=0.01):
+    """沿直线按步长离散位置点，返回包含两端点的列表。
+
+    step 控制离散密度：0.2 m 直线在 0.01 m 步长下约 21 个点；
+    点列将作为笛卡尔路径的输入，逐点需要逆解求关节向量。
+    """
+    p_start = np.array(p_start, dtype=float)
+    p_end = np.array(p_end, dtype=float)
+    length = float(np.linalg.norm(p_end - p_start))
+    # 段数向上取整：确保最后一段不超过步长，端点严格落在目标上
+    n = max(int(np.ceil(length / step)), 1)
+    return [p_start + (p_end - p_start) * (i / n) for i in range(n + 1)]
+
+# 自检：直线长度与采样密度是否符合工序预期
+pts = line_waypoints([0.30, 0.0, 0.35], [0.30, 0.0, 0.15], step=0.01)
+print(f"采样点数 {len(pts)}，首点 {pts[0]}，末点 {pts[-1]}")</code></pre>
+    <p>解读：采样点的生成逻辑与笛卡尔路径接口内部的离散步骤一致，先用脚本演练有助于建立参数直觉。<strong>（1）</strong>段数向上取整保证"每段不超过步长、端点严格命中"两个性质，与图元拼接的端点纪律一致。<strong>（2）</strong>生成的只是位置序列，完整路点还需要姿态序列；姿态的插值方式（球面插值）影响末端转角路径，在第 015 章与轨迹插值一并讨论。<strong>（3）</strong>把采样逻辑独立成函数，便于在任务层预估逆解调用次数，进而预估单条路径的求解耗时量级。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>忽略分数直接执行</strong>：半程轨迹终点落在不确定位置，后续工序全部失准。修复：分数低于阈值即拒绝执行并诊断断裂点。</li>
+      <li><strong>跳变阈值设置过小</strong>：正常的大步长解被误判为跳变，分数骤降到一半以下。修复：先禁用阈值排除误判，确认无误后恢复并逐步收紧。</li>
+      <li><strong>步长过粗</strong>：直线近似误差明显，工序精度不达标。修复：按工序精度要求选步长，0.01 m 步长适配毫米级工序。</li>
+      <li><strong>目标姿态超出可达姿态空间</strong>：位置可达但姿态无解，分数停在早期采样点。修复：把姿态向工具工作范围中心回退，或接入冗余构型重新选解。</li>
+      <li><strong>坐标系语义混淆</strong>：在世界坐标系下计算目标却按末端坐标系理解，位移方向偏离。修复：位姿构造的第一行显式声明参考系，与坐标系检查表对照。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>计算：0.30 m 的直线在 0.01 m 与 0.03 m 两种步长下各产生多少采样点？对照说明逆解调用次数与路径精度的变化。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>段数分别为 30 与 10，采样点为段数加一；调用次数按比例变化，精度误差在采样点之间达到峰值。</div></details>
+      </li>
+      <li>比较位姿目标与关节目标实现的两次规划，记录失败时的错误信息差异，并解释错误信息与求解方式的关系。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>位姿目标的失败信息可能来自逆解环节或规划环节，两类共存；关节目标只有规划环节的失败信息，定位更直接。</div></details>
+      </li>
+      <li>预测实验：同一直线路径，分别在跳变阈值 0 与 5.0 下计算，比较两次的分数与轨迹路点数。若某次分数明显更低，指出断裂位置的几何特征。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>阈值启用时，靠近奇异位形的采样点附近更容易触发中止；禁用时同一路径往往分数更高，但需要仿真确认真实连续性。</div></details>
+      </li>
+      <li>设计题：为一个"接近桌面、直线下降、抓取、直线提升"的工序设计运动方案：标出每个阶段使用的空间类型、关键参数与验收指标（分数、容差、速度缩放）。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>接近段用关节空间省时；下降与提升段用笛卡尔空间并设分数阈值 0.95、步长 0.01 m；抓取段涉及末端执行器，属于第四篇内容，此处留出接口即可。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>位姿目标由位置与四元数姿态构成，参考坐标系决定数值语义；逆解存在性与种子状态相关。</li>
+      <li>笛卡尔路径按步长离散、逐点逆解，分数记录完成比例，是质量与安全双重指标。</li>
+      <li>跳变阈值保护关节空间连续性，宁可误停不可放行；步长在精度与求解代价之间平衡。</li>
+      <li>组合原则：自由移动用关节空间，受约束工序段用笛卡尔空间，衔接由关节空间路径承担。</li>
+      <li>下一章把目标表达体系补全：<strong>关节目标状态与命名位姿的完整管理</strong>，包括容差细化与位姿库维护。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch010.html">← 第 010 章：关节空间运动实现</a>
+    <a class="next" href="ch012.html">第 012 章：设置关节目标状态与命名位姿 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.06 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:11.5px !important;letter-spacing:.06em !important;color:rgba(71,85,105,.45) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#7e8ba0 !important;font-size:11.5px !important;line-height:1.8 !important;text-align:center !important;padding:5px 12px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

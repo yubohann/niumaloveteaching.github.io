@@ -17,8 +17,8 @@
     python code/ch052.py           # 两种模式依次训练（CPU 约 5-8 分钟）
     python code/ch052.py --quick   # 快速跑通（约 1 分钟）
 
-预期：shaped 通常在一万步内出现首个成功、两三万步内稳定爬山；sparse 的
-首个成功要晚得多，个别种子在两万步内完全找不到成功轨迹。
+预期：shaped 通常在一万步内出现首个成功，但训练中途成功率有反复、50% 达标
+步数波动较大；sparse 的首次成功靠撞运气，很多种子三万步内达不到 50% 成功率。
 """
 import argparse
 import os
