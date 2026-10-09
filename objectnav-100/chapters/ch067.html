@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 067 讲｜VLFM I：语言价值图 | 目标物体导航课程 · ObjectNav 从探索到开放词汇</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第四篇 · 开放词汇与大模型</span>
+    <span class="sep">/</span>
+    <span>第 067 讲</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第四篇 · 开放词汇与大模型</div>
+    <h1>第 067 讲｜VLFM I：语言价值图</h1>
+    <p class="lead">VLFM（Yokoyama 等 2023，ObjectNav）的出发点是绕开“先检测物体、再转成文字、再让语言模型打分”的信息瓶颈：它用视觉语言模型（Vision-Language Model, VLM）直接计算当前 RGB 图像与目标文本提示的相似度，把相似度投影到俯视栅格上形成<b>语言引导价值图</b>，再用价值图给前沿排序。本讲拆价值图的构建与更新：视场锥形掩码、余弦平方置信度、双通道加权平均更新及其代数性质；给出前沿选择、PointNav 执行与主表、消融的实算差值；真机部署（Spot 办公室实验）留到第 068 讲。主来源为 arXiv:2312.03275。</p>
+    <ul class="meta">
+      <li>主题：视觉语言价值图 / 置信度加权 / 前沿排序 / 零样本 ObjectNav</li>
+      <li>关键公式：c(θ) = cos²( θ/(θ<sub>fov</sub>/2) · π/2 )；v<sub>new</sub> = (c<sub>curr</sub>v<sub>curr</sub> + c<sub>prev</sub>v<sub>prev</sub>) / (c<sub>curr</sub> + c<sub>prev</sub>)；c<sub>new</sub> = (c<sub>curr</sub>² + c<sub>prev</sub>²) / (c<sub>curr</sub> + c<sub>prev</sub>)</li>
+      <li>预计学时：80 分钟</li>
+      <li>前置章节：第 066 讲（NavGPT（跨课引用））</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>会说清价值图的定位：与占据地图、前沿图并列的第三张栅格，两个通道分别记录语义价值与置信度，作用是给前沿排序。</li>
+      <li>会推导：余弦平方置信度公式的端点与半功率点，双通道更新公式的两条不等式与三类不变量。</li>
+      <li>会实现：视场锥形掩码、遮挡剔除、首见赋值与重叠区加权平均，注意除零防护与初始化顺序。</li>
+      <li>会解读：主表三数据集结果与置信度消融的三组差值，说明加权平均相对替换式与未加权平均的增益量级。</li>
+      <li>会判断边界：单层限制与楼梯 episode 的失败占比、任务专用价值图、PointNav 训练成本的归属。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 065 讲的语言接口是前沿附近的物体清单：先把观测变成类别标签，再让语言模型对清单打分。第 066 讲的 NavGPT 把这种文本化扩展到整个导航循环，消融显示描述粒度与摘要策略都会带来可观的信息损失。VLFM 提出第三条路：不做物体清单，不做文本循环，直接用视觉语言模型在“图像与目标文本”之间计算相似度。相似度分数具有空间含义：它衡量当前相机视锥覆盖的地面区域“像不像能通向目标”，把分数投影到俯视地图，就得到一张可以逐帧更新的语义价值地图。前沿选择退化为在价值图上取最大值的简单操作，语言模型不生成任何文字，语言到空间的映射由相似度一次性完成。</p>
+    <p>这条设计带来三个问题，本讲逐一回答。第一，相似度分数怎样落到具体栅格上，视场边缘与遮挡区域如何处理。第二，同一块区域被多次看到时，新旧分数如何合并，置信度通道如何参与。第三，这种排序质量在标准基准上值多少，消融能给出多大归因。真机可部署性（波士顿动力 Spot 办公室实验）是第 068 讲的主题。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 系统三阶段与任务口径</h3>
+    <p>VLFM 在 ObjectNav 设定下工作：输入是自中心 RGB-D 与里程计（相对起始位姿的前向距离、水平距离与朝向），动作集为前进 0.25 m、左转与右转 30°、抬头与低头 30°、停止；成功判据是停止时距任意目标实例 ≤ 1 m，且 episode 不超过 500 步。系统分三阶段。初始化阶段：机器人在原地旋转一整圈，建立初始的占据地图与价值图。探索阶段：持续更新前沿图与价值图，选出价值最高的前沿作为航点并导航过去。目标导航阶段：一旦检测到目标实例，改为导航到目标上离机器人最近的点，进入成功半径后停止。若探索完整个环境仍无前沿且未检测到目标，episode 以失败终止。</p>
+
+    <h3>2. 占据地图与前沿生成</h3>
+    <p>占据地图是俯视二维栅格：深度图转点云，过滤“过矮或过高”的点（地面与天花板的干扰），变换到全局坐标后投影到栅格。已探索区域随机器人位置、朝向与视野内障碍更新；前沿定义为已探索区域与未探索区域的边界，取边界的中点作为候选前沿航点。工程上有两个细节：点云过滤的高度带要与机器人相机安装高度匹配；前沿中点要检查可通行性，落在障碍里的中点需要回退到边界上最近的可通行格。</p>
+
+    <h3>3. 价值图：从图像文本相似度到空间分数</h3>
+    <p>价值图与占据地图同尺寸，含两个通道：语义价值通道与置信度通道。语义价值的来源是 BLIP-2（Li 等 2023）图文相似度：对当前 RGB 图像与文本提示计算余弦相似度，提示模板为 “Seems like there is a &lt;target_object&gt; ahead.”，其中目标词替换为当前类别标签。分数投影到俯视栅格时，只有相机视场覆盖且未被障碍遮挡的区域获得新值：先按当前位姿生成锥形掩码，再用深度图把掩码中被障碍挡住的区域剔除。这个“投影加剔除”的步骤决定分数的空间归属，也是与纯图像分类器打分的关键差异。</p>
+
+    <h3>4. 置信度：余弦平方权重</h3>
+    <p>视场边缘的像素因畸变与截断，语义分数可靠性低于光轴附近，VLFM 用与光学轴夹角相关的权重刻画这一点：</p>
+    <div class="formula">
+      c(θ) = cos²( θ / (θ<sub>fov</sub>/2) · π/2 )
+      <span class="note">θ 为像素与光学轴的夹角，θ<sub>fov</sub> 为相机水平视场；θ = 0 时 c = 1，θ = ±θ<sub>fov</sub>/2 时 c = 0。</span>
+    </div>
+    <p>性质可以从公式直接读出：在光轴上是最大值 1，在视场左右边缘降到 0，中间单调递减。以 θ<sub>fov</sub> = 90° 实算：θ = 0° 时 c = 1；θ = 15° 时 c = 0.75；θ = 22.5°（即四分之一视场）时 c = cos²(45°) = 0.5；θ = 30° 时 c = 0.25；θ = 40° 时 c ≈ 0.030；θ = 45° 时 c = 0。半功率点落在四分之一视场处，这一位置关系比具体数值更值得记住。余弦平方的形状平滑，避免了硬截断带来的边界跳变。</p>
+
+    <h3>5. 双通道更新：重叠区如何合并</h3>
+    <p>机器人移动后，新视场与旧视场可能重叠。落在重叠区的栅格已经有历史分数，直接覆盖会丢掉历史证据，简单算术平均则低估高置信观测。VLFM 用置信度加权的平均来更新两个通道：</p>
+    <div class="formula">
+      v<sub>new</sub> = ( c<sub>curr</sub> v<sub>curr</sub> + c<sub>prev</sub> v<sub>prev</sub> ) / ( c<sub>curr</sub> + c<sub>prev</sub> )<br>
+      c<sub>new</sub> = ( c<sub>curr</sub>² + c<sub>prev</sub>² ) / ( c<sub>curr</sub> + c<sub>prev</sub> )
+      <span class="note">首见像素直接赋值，不参与加权；c<sub>curr</sub> + c<sub>prev</sub> = 0 时跳过更新。</span>
+    </div>
+    <p>两条性质可以手推。第一，置信度的新值不低于算术平均：</p>
+    <div class="formula">
+      c<sub>new</sub> − (c<sub>curr</sub> + c<sub>prev</sub>)/2 = (c<sub>curr</sub> − c<sub>prev</sub>)² / ( 2(c<sub>curr</sub> + c<sub>prev</sub>) ) ≥ 0
+      <span class="note">差值等于两者差平方除以两倍和，说明更新偏向高置信观测，差距越大偏置越强。</span>
+    </div>
+    <p>第二，置信度的新值不超过两者最大值：设 c<sub>curr</sub> ≥ c<sub>prev</sub>，则 c<sub>curr</sub>² + c<sub>prev</sub>² ≤ c<sub>curr</sub>² + c<sub>curr</sub>c<sub>prev</sub> = c<sub>curr</sub>(c<sub>curr</sub> + c<sub>prev</sub>)，两边同除 (c<sub>curr</sub> + c<sub>prev</sub>) 即得 c<sub>new</sub> ≤ c<sub>curr</sub> = max(c<sub>curr</sub>, c<sub>prev</sub>)。三类不变量同样可由公式验证：两者相等时 c<sub>new</sub> 保持不变；历史置信度为 0 时新置信度等于当前值，相当于首见保留；价值通道的新值始终位于两个旧值之间，是可信度加权的折中。实算示例：c<sub>curr</sub> = 0.8、c<sub>prev</sub> = 0.4 时 c<sub>new</sub> = (0.64 + 0.16) / 1.2 ≈ 0.667，高于算术平均 0.6、低于最大值 0.8；若价值为 v<sub>curr</sub> = 0.9、v<sub>prev</sub> = 0.3，则 v<sub>new</sub> = (0.72 + 0.12) / 1.2 = 0.7，离高置信观测 0.9 更近。若改用替换式，价值会从 0.3 直接跳到 0.9，历史证据全部丢失，下一小节的消融给出这 0.6 差异的性能代价。</p>
+
+    <h3>6. 前沿选择与执行</h3>
+    <p>探索阶段每次更新后，对每个候选前沿在价值图上取区域分数（实现细节按作者公开代码），选价值最高的前沿作为长期航点；航点由 PointNav 策略执行。该策略用可变经验回放（Variable Experience Rollout, VER；Wijmans 等 2022）在 HM3D 训练划分上训练：4 块 GPU、每块 64 个 worker，共 256 个并行环境，训练 25 亿步（2.5B），约 7 天。换算吞吐：2.5 × 10<sup>9</sup> / (7 × 86400) ≈ 4,134 步/秒，分摊到 256 个 worker 约 16.1 步/秒/worker。策略输入只有深度图与到航点的相对距离和朝向，不使用 RGB，因此与语义目标类别无关，是通用的几何导航组件。检测到目标后，YOLOv7 负责 COCO 类内目标，Grounding-DINO 负责开放词汇目标，Mobile-SAM 提取轮廓，取目标上离机器人最近的点作为目标航点。</p>
+
+    <h3>7. 主结果与实算差值</h3>
+    <p>评测在 Habitat 中进行，使用 Gibson（SemExp 划分：1,000 条 episode、5 个场景）、HM3D（2,000 条、20 个场景、6 类）与 MP3D（2,195 条、11 个场景、21 类）验证集。主表按 SPL 与成功率如下（Yokoyama 等 2023，表 I）。</p>
+    <table>
+      <tr><th>方法</th><th>语义导航训练</th><th>Gibson SPL / SR</th><th>HM3D SPL / SR</th><th>MP3D SPL / SR</th></tr>
+      <tr><td>PONI（Ramakrishnan 等 2022）</td><td>ObjectNav</td><td>41.0 / 73.6</td><td>未报告</td><td>12.1 / 31.8</td></tr>
+      <tr><td>PIRLNav（Ramrakhya 等 2023）</td><td>ObjectNav</td><td>未报告</td><td>27.1 / 64.1</td><td>未报告</td></tr>
+      <tr><td>SemExp（Chaplot 等 2020）</td><td>ObjectNav</td><td>33.9 / 65.7</td><td>未报告</td><td>未报告</td></tr>
+      <tr><td>ZSON（Majumdar 等 2022）</td><td>ImageNav</td><td>未报告</td><td>12.6 / 25.5</td><td>4.8 / 15.3</td></tr>
+      <tr><td>CoW（Gadre 等 2023）</td><td>无</td><td>未报告</td><td>未报告</td><td>3.7 / 7.4</td></tr>
+      <tr><td>ESC（Zhou 等 2023）</td><td>无</td><td>未报告</td><td>22.3 / 39.2</td><td>14.2 / 28.7</td></tr>
+      <tr><td>SemUtil（Chen 等 2023）</td><td>无</td><td>40.5 / 69.3</td><td>未报告</td><td>未报告</td></tr>
+      <tr><td><strong>VLFM（零样本）</strong></td><td><strong>无</strong></td><td><strong>52.2 / 84.0</strong></td><td><strong>30.4 / 52.5</strong></td><td><strong>17.5 / 36.4</strong></td></tr>
+    </table>
+    <p>差值实算：Gibson 上相对 SemUtil，SPL +11.7、成功率 +14.7 个百分点；HM3D 上相对 ESC，SPL +8.1、成功率 +13.3；MP3D 上相对 ESC，SPL +3.3、成功率 +7.7。相对有监督对照：Gibson 超过 SemExp 的 SPL +18.3、成功率 +18.3；MP3D 超过 PONI 的 SPL +5.4、成功率 +4.6；HM3D 相对 PIRLNav 成功率低 11.6 个百分点，SPL 却高 3.3，说明效率占优而终止准确率受楼梯与场景保真度拖累。相对此前零样本方法，HM3D 对 ZSON 的 SPL 提升 17.8、成功率提升 27.0（相对 +105.88%）；MP3D 对 CoW 的 SPL 提升 13.8、成功率提升 29.0。论文自述的增量口径是：Gibson 相对 SemUtil SPL +11.7 与成功率 +14.7，HM3D 相对 ESC +8.1 与 +13.3，MP3D 相对 ESC +3.3 与 +7.7。</p>
+
+    <h3>8. 消融：置信度加权值多少</h3>
+    <p>论文只做了一组消融，比较重叠区价值的三种合并方式：替换式（新值覆盖旧值）、未加权平均、置信度加权平均。结果如下（Yokoyama 等 2023，表 II）。</p>
+    <table>
+      <tr><th>更新方式</th><th>Gibson SPL / SR</th><th>HM3D SPL / SR</th><th>MP3D SPL / SR</th></tr>
+      <tr><td>替换式</td><td>48.0 / 76.1</td><td>26.5 / 44.5</td><td>16.6 / 31.7</td></tr>
+      <tr><td>未加权平均</td><td>50.9 / 83.0</td><td>30.0 / 51.8</td><td>17.1 / 35.0</td></tr>
+      <tr><td><strong>置信度加权平均</strong></td><td><strong>52.2 / 84.0</strong></td><td><strong>30.4 / 52.5</strong></td><td><strong>17.5 / 36.4</strong></td></tr>
+    </table>
+    <p>实算差值：加权相对未加权，SPL 为 +1.3 / +0.4 / +0.4，成功率为 +1.0 / +0.7 / +1.4；加权相对替换式，SPL 为 +4.2 / +3.9 / +0.9，成功率为 +7.9 / +8.0 / +4.7。三个数据集方向一致，替换式的损失最大，说明“把历史语义证据直接扔掉”比“合并策略不够精细”代价高得多。这组数字同时提醒：置信度公式本身的精细程度只值一个百分点的量级，而有无历史融合值四到八个百分点，工程实现时优先保证重叠区的正确处理。</p>
+
+    <h3>9. 边界与失效条件</h3>
+    <p>第一，单层限制：里程计没有高度通道，跨楼层时俯视地图无法重置，因此系统只支持单层 episode；论文报告 14.6%（HM3D）与 9.6%（MP3D）的 episode 因需要上下楼而失败，这也是 HM3D 上成功率输给 PIRLNav 的主因。第二，价值图任务专用：分数由“通向当前目标”的提示得到，不能直接用于换目标或后续任务，长程多目标任务需要重建或扩展价值图。第三，可见性假设：方法假设目标在机器人默认相机高度上可见，抽屉内或遮挡后的目标需要交互动作，论文将其列为未来工作。第四，检测器覆盖：COCO 类目标走 YOLOv7，其他类别走开放词汇检测器，长尾类别的检测失败会直接进入目标导航阶段之前就终结 episode。第五，VLM 提示敏感：提示模板固定，替换措辞会改变相似度分布；复现时应固定模板并把不同模板的排序一致性作为检查项。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>工程上维护三张同分辨率的俯视栅格：占据栅格（障碍与已探索）、前沿清单（边界中点与生命周期）、价值图（价值通道与置信度通道）。每帧的处理顺序固定：先更新占据与前沿，再投影价值，最后选择航点。顺序不能交换，因为价值投影需要占据信息做遮挡剔除，前沿选择需要最新的价值图。</p>
+    <h3>数据结构与更新频率</h3>
+    <table>
+      <tr><th>结构</th><th>内容</th><th>更新时机</th><th>接口</th></tr>
+      <tr><td>占据栅格</td><td>障碍、已探索、未知</td><td>每帧</td><td>投影深度点云，更新已探索掩码</td></tr>
+      <tr><td>前沿清单</td><td>边界簇中点、面积、时间戳</td><td>每帧或每 k 帧</td><td>连通聚类，剔除小簇，维护生命周期</td></tr>
+      <tr><td>价值图</td><td>语义价值通道、置信度通道</td><td>每帧（VLM 前向之后）</td><td>锥形掩码投影，重叠区加权平均</td></tr>
+      <tr><td>航点</td><td>前沿航点或目标航点</td><td>航点失效或到达时</td><td>前沿取价值最高；检测到目标切目标航点</td></tr>
+    </table>
+    <h3>参数与取值依据</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用</th><th>依据</th></tr>
+      <tr><td>置信度函数</td><td>cos²(θ/(θ<sub>fov</sub>/2)·π/2)</td><td>重叠区合并权重</td><td>论文设置；端点 0、轴心 1、四分之一视场处 0.5</td></tr>
+      <tr><td>价值提示</td><td>“Seems like there is a &lt;target_object&gt; ahead.”</td><td>生成语义相似度</td><td>论文设置；措辞敏感，需固定</td></tr>
+      <tr><td>VLM</td><td>BLIP-2</td><td>图像文本相似度</td><td>论文选择；可载入消费级笔记本推理</td></tr>
+      <tr><td>检测器</td><td>YOLOv7 与 Grounding-DINO</td><td>目标实例检测</td><td>COCO 类用前者，开放词汇用后者</td></tr>
+      <tr><td>分割</td><td>Mobile-SAM</td><td>目标轮廓与最近点</td><td>轻量，支持目标航点计算</td></tr>
+      <tr><td>PointNav</td><td>VER 训练 2.5B 步，4 卡 × 64 worker</td><td>航点执行</td><td>论文设置；输入只用深度与相对位姿</td></tr>
+      <tr><td>成功判据</td><td>≤ 1 m，≤ 500 步</td><td>任务口径</td><td>ObjectNav 标准协议</td></tr>
+    </table>
+    <h3>前沿排序方案对比</h3>
+    <table>
+      <tr><th>方案</th><th>排序信号</th><th>文本瓶颈</th><th>算力位置</th><th>判据</th></tr>
+      <tr><td>最近前沿</td><td>几何距离</td><td>无</td><td>本地</td><td>最省，搜索效率低</td></tr>
+      <tr><td>代价效用</td><td>几何效用与代价</td><td>无</td><td>本地</td><td>探索基本盘，无常识</td></tr>
+      <tr><td>文本语言模型打分</td><td>物体清单的句子概率</td><td>高（清单文本化）</td><td>本地或远端</td><td>可读性好，推理慢</td></tr>
+      <tr><td>VLM 价值图</td><td>图像文本相似度的空间投影</td><td>低（无需清单）</td><td>本地</td><td>主表 SPL 最高，需置信度融合</td></tr>
+    </table>
+    <h3>与第 065、066 讲的差异点</h3>
+    <p>第 065 讲的 L3MVN 把语言入口限制在前沿物体清单，仍要经过检测转文字；第 066 讲的 NavGPT 把全部观察文本化；VLFM 取消这两层转换，语言信号以相似度形式直接落到栅格。三者的公共骨架一致：语义来源、候选空间、排序器、执行器四段。差别只在排序器的输入形态，这也是阅读同代系统时最值得对照的一列。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>四段代码覆盖锥形掩码、双通道更新、前沿打分与主循环骨架；数组约定为俯视栅格，坐标系原点在地图中心。</p>
+
+    <p><strong>片段 1：视场锥形掩码与余弦平方置信度</strong></p>
+    <pre class="code"><code>import numpy as np
+
+def fov_confidence_mask(shape, pose, fov_deg, ray_steps=64):
+    """生成当前位姿下的锥形掩码；值域 [0,1]，未覆盖处为 -1。"""
+    h, w = shape
+    cy, cx = pose["row"], pose["col"]
+    conf = np.full((h, w), -1.0, dtype=np.float32)
+    half = np.deg2rad(fov_deg / 2.0)
+    for k in range(ray_steps + 1):              # 在视场内均匀取射线
+        ang = -half + 2 * half * k / ray_steps
+        theta = abs(ang)                        # 像素与光轴夹角
+        c = np.cos(theta / half * np.pi / 2.0) ** 2
+        for r in range(1, 40):                  # 每根射线走 40 格
+            y = int(round(cy + r * np.cos(pose["yaw"] + ang)))
+            x = int(round(cx + r * np.sin(pose["yaw"] + ang)))
+            if not (0 &lt;= y &lt; h and 0 &lt;= x &lt; w):
+                break
+            conf[y, x] = max(conf[y, x], c)     # 同一格取较大置信度
+    return conf</code></pre>
+    <p>解读：<strong>（1）</strong>掩码按射线扫描生成，同一格可能被多条射线覆盖，取较大置信度；光轴附近得 1，视场边缘得 0，与公式一致。<strong>（2）</strong>用 -1 标记未覆盖，是让后续更新区分“未见过”与“见过但置信度为 0”；若把未覆盖也记为 0，重叠判定会出错。<strong>（3）</strong>射线长度 40 格是示意；实际取值应覆盖相机有效深度范围，过长会浪费计算且穿越障碍。</p>
+
+    <p><strong>片段 2：双通道加权更新与遮挡剔除</strong></p>
+    <pre class="code"><code>def update_value_map(value, conf, new_value, new_conf, occluded):
+    """把当前帧的价值与置信度合并进地图；首见直接赋值。"""
+    prev_conf = conf
+    seen_prev = prev_conf &gt; 0.0                  # 历史置信度大于 0 才算旧观测
+    seen_now = (new_conf &gt;= 0.0) &amp; (~occluded)  # -1 表示本帧未覆盖
+    # 首见赋值（含置信度为 0 的边缘格，写入后不影响排序）
+    first = seen_now &amp; (~seen_prev)
+    value[first] = new_value[first]
+    conf[first] = new_conf[first]
+    # 重叠区：置信度加权平均，显式防除零
+    both = seen_now &amp; seen_prev
+    denom = (new_conf[both] + prev_conf[both])
+    valid = denom &gt; 0.0
+    v_num = new_conf[both] * new_value[both] + prev_conf[both] * value[both]
+    c_num = new_conf[both] ** 2 + prev_conf[both] ** 2
+    value[both] = np.where(valid, v_num / np.maximum(denom, 1e-8), value[both])
+    conf[both] = np.where(valid, c_num / np.maximum(denom, 1e-8), conf[both])
+    return value, conf</code></pre>
+    <p>解读：<strong>（1）</strong>三类分支与公式一一对应：首见赋值、重叠加权、遮挡跳过；遮挡格本帧不参与任何写入，历史值原样保留。<strong>（2）</strong>denom 用最大值防护在数学上保证非零；布尔掩码避免逐格循环；-1 与 0 的区分让逻辑能识别“本帧未覆盖”与“覆盖但置信度为 0”，前者不写入，后者写入但不参与排序。<strong>（3）</strong>注意 seen_prev 的判定标准是历史置信度大于 0；持久地图的置信度通道从 0 初始化，首帧覆盖格会正确进入首见分支，这一约定与片段 1 的 -1 标记配套使用。</p>
+
+    <p><strong>片段 3：价值图上的前沿打分</strong></p>
+    <pre class="code"><code>def select_frontier(frontiers, value, conf, min_conf=0.05):
+    """按前沿邻域内的置信度加权均值排序，返回得分最高的前沿。"""
+    best, best_score = None, -np.inf
+    for f in frontiers:
+        r, c, radius = f["row"], f["col"], f["radius"]
+        patch_v = value[max(0, r - radius):r + radius + 1,
+                        max(0, c - radius):c + radius + 1]
+        patch_c = conf[max(0, r - radius):r + radius + 1,
+                       max(0, c - radius):c + radius + 1]
+        mask = patch_c &gt;= min_conf              # 低置信度区域不参与
+        if not mask.any():
+            score = -np.inf                     # 未知区域：留给几何分数兜底
+        else:
+            score = float((patch_v[mask] * patch_c[mask]).sum()
+                          / patch_c[mask].sum())
+        if score &gt; best_score:
+            best, best_score = f, score
+    return best, best_score</code></pre>
+    <p>解读：<strong>（1）</strong>前沿得分取邻域内置信度加权均值，等价于“高置信度区域说话更响”；min_conf 把几乎不可信的边缘分数排除，取值应与置信度函数的下界行为匹配。<strong>（2）</strong>全部前沿都无高置信度覆盖时 best 保持为空，调用方应回退到几何分数（如代价效用），保证探索不中断。<strong>（3）</strong>邻域半径与地图分辨率、前沿间距相关；半径过大会把无关区域的同学价值平均进来，过小则单点噪声主导排序。</p>
+
+    <p><strong>片段 4：主循环骨架</strong></p>
+    <pre class="code"><code>def run_episode(env, target, model, detector, policy):
+    """初始化旋转一圈，随后探索直到检测目标或无前沿可用。"""
+    obs = env.reset()
+    spin_actions = ["turn_left"] * 12            # 12 x 30 度 = 一整圈
+    for act in spin_actions:
+        update_maps(obs, model, target)          # 建图与价值投影
+        obs, _, _, _ = env.step(act)
+    while env.steps &lt; 500:
+        det = detector(obs, target)
+        if det is not None:                      # 目标导航阶段
+            waypoint = nearest_point_on(det, obs)
+            if env.distance_to(waypoint) &lt;= 1.0:
+                return "success"
+        else:                                    # 探索阶段
+            frontier, score = select_frontier(get_frontiers(), value, conf)
+            if frontier is None and no_frontier_left():
+                return "failure"
+            waypoint = frontier
+        action = policy.act(obs, waypoint)       # PointNav：深度 + 相对位姿
+        obs, _, _, _ = env.step(action)
+        update_maps(obs, model, target)
+    return "failure"</code></pre>
+    <p>解读：<strong>（1）</strong>初始化旋转 12 步乘 30° 正好一圈，用最小地图完成第一版价值图，避免起步阶段盲目选择前沿。<strong>（2）</strong>检测优先于探索：一旦检测到目标就切换航点类型，停止由 1 m 距离判据触发；检测失败时保持前沿探索。<strong>（3）</strong>无前沿可用的分支对应“探索完毕”，按协议记失败；真实实现还应处理目标检测短暂丢失，例如保留上一次航点若干帧再回退。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>首见像素误入加权平均</strong>：症状是价值图早期分数偏低且更新迟缓。根因是把未见过区域当历史值 0 与当前值做平均。修复：用置信度 0 标记未见过，首见直接赋值；更新函数显式区分三类分支。</li>
+      <li><strong>用替换式合并重叠区</strong>：症状是同一区域分数随视角反复跳变，前沿排序震荡。根因是丢弃历史语义证据，消融显示替换式相对加权平均损失 0.9 到 4.2 个百分点 SPL、4.7 到 8.0 个百分点成功率。修复：实现置信度加权平均，并保留历史通道用于调试可视化。</li>
+      <li><strong>无视高度通道缺失</strong>：症状是多层场景中机器人在楼层之间迷失，价值图被错误重置或覆盖。根因是里程计不含 z 轴，俯视地图跨楼层语义冲突；论文报告 HM3D 14.6%、MP3D 9.6% 的 episode 因此失败。修复：限定单层评测，或引入外部楼层检测与地图分层管理。</li>
+      <li><strong>把 PointNav 训练算作零样本零成本</strong>：症状是复现预算与论文差一个量级。根因是“零样本”指不在 ObjectNav 上训练，而航点执行依赖 VER 在 HM3D 上训练 2.5B 步的 PointNav 策略。修复：复现清单单列通用组件成本，或换用现成 PointNav 检查点并核对输入口径。</li>
+      <li><strong>提示词与类别词表错配</strong>：症状是某些目标类别的价值图整体偏平，排序接近随机。根因是相似度对提示措辞与类别用词敏感，长尾类别还依赖开放词汇检测器。修复：固定提示模板做一致性检查；把类别词表、检测器分工与失败案例写进实验记录。</li>
+      <li><strong>把价值图当通用地图复用</strong>：症状是切换到第二个目标后排序失效。根因是价值图编码的是“通向当前目标”的语义，任务专用。修复：多目标任务重建价值图，或按第 078 讲的记忆机制另行扩展。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>取 θ<sub>fov</sub> = 90°，计算 θ 为 0°、15°、22.5°、30°、45° 的置信度，验证四分之一视场处恰为 0.5，并说明余弦平方优于线性衰减的一个理由。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>置信度为 1、0.75、0.5、0.25、0。余弦平方在光轴附近接近 1 且导数连续，边缘平滑收敛到 0，线性衰减在两端会产生折点，与真实相机的畸变与遮挡不确定性更不匹配。</div></details>
+      </li>
+      <li>推导并验证两条不等式：c<sub>new</sub> ≥ (c<sub>curr</sub>+c<sub>prev</sub>)/2 与 c<sub>new</sub> ≤ max(c<sub>curr</sub>, c<sub>prev</sub>)，再用 c<sub>curr</sub>=0.8、c<sub>prev</sub>=0.4 复算。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>差值恒等式为 (c<sub>curr</sub>−c<sub>prev</sub>)²/(2(c<sub>curr</sub>+c<sub>prev</sub>))，非负；上界通过 c<sub>curr</sub>²+c<sub>prev</sub>² ≤ c<sub>curr</sub>(c<sub>curr</sub>+c<sub>prev</sub>) 得到。实算 c<sub>new</sub>≈0.667，落在 0.6 与 0.8 之间。</div></details>
+      </li>
+      <li>解释消融中替换式相对加权平均损失最大的原因，并预测“未加权平均”在什么样的观测序列下会接近替换式的表现。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>替换式把累积的历史证据清零，观测越重复、越依赖记忆的场景损失越大。当每次观测的置信度都接近相等（例如始终在光轴附近短距离复看）时，未加权平均与加权平均趋同，但与替换式的差距仍然来自是否保留历史。</div></details>
+      </li>
+      <li>设计实验分离“价值图排序”与“前沿几何选择”的贡献：固定同一张地图与同一候选前沿集合，只替换打分函数，比较最近前沿、代价效用、VLM 价值图三种排序。给出指标、控制变量与两个风险。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>指标：固定步数预算的目标到达率、首次检测步数、排序与真实收益的秩相关、成功 episode 的 SPL。控制变量：同地图快照、同候选集、同 PointNav 检查点。风险一：价值图由在线观测构建，静态地图快照与在线质量存在差异，需要同时报告生成快照的探索轨迹；风险二：三种排序的平局处理与切换频率不同，需统一航点锁定规则。</div></details>
+      </li>
+      <li>目标只出现在已探索区域边缘时，价值图分数受置信度衰减影响偏小，前沿选择可能忽略该区域。分析这一失效模式，给出两种修复思路并比较代价。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>修复一：降低 min_conf 阈值并改用最大值下采样聚合，让边缘强响应不被均值稀释，代价是噪声敏感性上升；修复二：把近场已探索区域的目标检测结果直接写入价值图上对应栅格并置高置信度，代价是需要检测器与地图的精确配准，误检会污染地图。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>价值图是第三张俯视栅格：语义价值通道来自 BLIP-2 图文相似度，置信度通道来自视场位置，二者一起决定前沿排序；文本化只发生在提示模板处，物体清单环节被取消。</li>
+      <li>置信度公式 c(θ) = cos²(θ/(θ<sub>fov</sub>/2)·π/2)：轴心 1、边缘 0、四分之一视场 0.5；更新公式保证新置信度不低于算术平均、不超过两者最大值，等值时保持不变。</li>
+      <li>主表实算：VLFM 在 Gibson 52.2 / 84.0、HM3D 30.4 / 52.5、MP3D 17.5 / 36.4；相对 ESC，HM3D 成功率 +13.3、MP3D +7.7 个百分点；HM3D 成功率低于 PIRLNav 11.6 个百分点，SPL 高 3.3。</li>
+      <li>消融实算：加权平均相对替换式在三个数据集上成功率 +4.7 到 +8.0 个百分点，相对未加权平均 +0.7 到 +1.4；有没有历史融合比融合公式的精细度更重要。</li>
+      <li>边界：单层限制导致 14.6%（HM3D）与 9.6%（MP3D）的楼梯 episode 失败；价值图任务专用；目标需在默认相机高度可见；PointNav 的 2.5B 步训练属于通用组件成本。</li>
+      <li>下一讲 VLFM II：把同一套系统部署到波士顿动力 Spot，看在办公楼里零样本搜索目标物体的真机证据、感知替换与本体重建。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch066.html">← 第 066 讲：NavGPT（跨课引用）</a>
+    <a class="next" href="ch068.html">第 068 讲：VLFM II：Spot 真机零样本 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.06 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:11.5px !important;letter-spacing:.06em !important;color:rgba(71,85,105,.45) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#7e8ba0 !important;font-size:11.5px !important;line-height:1.8 !important;text-align:center !important;padding:5px 12px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

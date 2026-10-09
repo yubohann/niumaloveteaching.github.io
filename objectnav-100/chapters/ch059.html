@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 059 讲｜仿真吞吐与训练工程 | 目标物体导航课程 · ObjectNav 从探索到开放词汇</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第三篇 · 端到端与配方</span>
+    <span class="sep">/</span>
+    <span>第 059 讲</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第三篇 · 端到端与配方</div>
+    <h1>第 059 讲｜仿真吞吐与训练工程</h1>
+    <p class="lead">第 041 至 058 讲给出了端到端配方，但配方能否跑完由仿真吞吐决定。本讲以 Habitat 2.0（Szot 等，2021，arXiv:2106.14405v2）的基准数据为主线，建立三本账：SPS（每秒仿真步数）的口径账、单进程到八卡的扩展账、步数到墙钟的换算账；再拆解惰性仿真、流水线交错与简化复用三项提速工程，最后给出测量协议与瓶颈诊断流程。</p>
+    <ul class="meta">
+      <li>主题：仿真吞吐 / 并行扩展 / 训练墙钟 / 性能测量协议</li>
+      <li>关键公式：RTF = SPS / 30；W = N / SPS<sub>总</sub></li>
+      <li>预计学时：80 分钟</li>
+      <li>前置章节：第 058 讲 Sim 与真机落差量化</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>会算：由 SPS 求实时因子 RTF = SPS / 30，由步数预算与总吞吐求墙钟，并核算多进程与多卡相对单进程的扩展效率。</li>
+      <li>会测：按 Idle 与 Interact 双场景、10 次运行、95% 置信区间的协议测量 SPS，并区分纯仿真吞吐与端到端训练有效吞吐。</li>
+      <li>会判断：把训练循环拆成仿真、推理、优化三段，依据各段耗时与显存占用决定加进程、加卡，或改渲染与网络配置。</li>
+      <li>会读：Habitat 2.0 的三项提速工程（惰性仿真、渲染与物理交错、简化与复用）及其消融数字，界定 850× 实时因子声明的适用口径。</li>
+      <li>会设计：给定 48 小时训练窗口与步数预算，反推所需总吞吐、并行配置与回退方案，并写出验收指标。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 042 讲把 DD-PPO（Wijmans 等，2020）的 2.5B 步规模与 107 倍加速比讲成了算法与同步协议；第 007 讲介绍了 Habitat 2.0 的物理仿真与 HAB 任务。两者之间缺一本账：仿真器每秒能推进多少步、这些步数怎样随进程与 GPU 扩展、多少步能换成一小时训练。缺少这本账，配方表只是纸面数字。以第 049 讲的 PirlNav 为例，RL 微调 300M 步在 16 卡 DD-PPO 上完成；若单进程交互场景只有 510 SPS，仅采样就需要约 163 小时，等于约 6.8 天纯仿真时间，尚未计入策略推理与优化。</p>
+    <p>Habitat 2.0 给出的答案分两层。工程层，它把渲染与物理做成流水线，并用三项惰性化手段减少无谓计算，使单个 ReplicaCAD 场景内的 Fetch 交互基准从无优化时的 242 SPS 提到 1191 SPS（Idle 场景），八卡 64 进程达到 25,734 SPS。方法层，它把「仿真步」定义清楚：一步包含 1 次渲染与 4 次物理子步，合计 1/30 秒仿真时间，因此 30 SPS 恰好是实时，25,734 SPS 对应约 858 倍实时。<strong>吞吐不是孤立的性能数字，它由场景、传感器、物理负载与并行方式共同决定；报告口径不全会让复现结果相差一个数量级。</strong></p>
+    <p>本讲沿用第 007 讲的任务定义与平台描述，不再重复 HAB 的任务分解；关注点放在吞吐测量、扩展与换算。第 060 讲复盘时会把本讲的三本账与第 041 至 058 讲的配方并排，回答「什么配方在什么算力下可行」。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 仿真步、SPS 与实时因子</h3>
+    <p>Habitat 2.0 的基准配置中，每个仿真步包含 1 次渲染与 4 次物理子步，每个物理子步模拟 1/120 秒，合计 1/30 秒仿真时间。传感器为 Fetch 头部与臂部两台 128×128 RGB-D 相机，实验台配置为双路 Intel Xeon Gold 6226R（合计 32 核 64 线程）与 8 张 NVIDIA 2080 Ti。单卡基准将进程限制在 8 核 16 线程，多进程基准在单卡上启动 16 个进程，八卡基准启动 64 个进程（每卡 8 个）。</p>
+    <div class="formula">
+      RTF = SPS / 30
+      <span class="note">30 SPS 对应 1 倍实时；1191 SPS 对应 39.70 倍；25,734 SPS 对应 857.80 倍（论文概括为 850×）</span>
+    </div>
+    <p>基准分两个场景。<strong>Idle</strong>：机器人在客厅中央远离家具，执行随机动作，不与物体交互；<strong>Interact</strong>：机器人靠近冰箱，沿预计算轨迹执行有代表性的交互动作。两种场景的负载结构不同：Idle 主要是渲染与碰撞查询，Interact 增加抓取、抽屉与冰箱铰链等约束求解。下表把关键值换算成实时因子，其中论文报告的 <strong>850× 实时</strong>指八卡 Idle 场景，与八卡 Interact 的 256.63 倍不是同一负载。</p>
+    <table>
+      <tr><th>配置</th><th>Idle SPS</th><th>Idle 实时因子</th><th>Interact SPS</th><th>Interact 实时因子</th></tr>
+      <tr><td>单进程 / 单卡</td><td>1191 ± 36</td><td>39.70×</td><td>510 ± 6</td><td>17.00×</td></tr>
+      <tr><td>16 进程 / 单卡</td><td>8186 ± 47</td><td>272.87×</td><td>1660 ± 6</td><td>55.33×</td></tr>
+      <tr><td>64 进程 / 八卡</td><td>25734 ± 301</td><td>857.80×</td><td>7699 ± 177</td><td>256.63×</td></tr>
+      <tr><td>64 进程 / 八卡（去渲染优化）</td><td>18844 ± 285</td><td>628.13×</td><td>5517 ± 31</td><td>183.90×</td></tr>
+      <tr><td>64 进程 / 八卡（去物理优化）</td><td>7942 ± 50</td><td>264.73×</td><td>6119 ± 51</td><td>203.97×</td></tr>
+      <tr><td>64 进程 / 八卡（全部优化关闭）</td><td>7192 ± 55</td><td>239.73×</td><td>4829 ± 50</td><td>160.97×</td></tr>
+    </table>
+    <p>消融行给出优化的贡献结构。以单进程 Idle 为例：完整系统 1191 SPS，关闭渲染优化降到 781 SPS（降幅 34.42%），关闭物理优化降到 271 SPS（降幅 77.25%），全部关闭降到 242 SPS（降幅 79.68%）。单进程 Interact 的次序相反：完整 510 SPS，关闭渲染优化降到 282 SPS（降幅 44.71%），关闭物理优化降到 358 SPS（降幅 29.80%）。<strong>负载不同，瓶颈不同；任何单项优化的收益都必须绑定场景报告。</strong></p>
+
+    <h3>2. 并行扩展账</h3>
+    <p>把单进程成绩当基线，可算出各级扩展倍数与效率。单卡 16 进程在 Idle 下为 6.873 倍（理论线性 16 倍，效率 42.96%），Interact 下为 3.255 倍（效率 20.35%）；八卡 64 进程在 Idle 下为 21.607 倍（理论 64 倍，效率 33.76%），Interact 下为 15.096 倍（效率 23.59%）。若以「八个单进程」为八卡的对照基线，八卡聚合只提升到 2.701 倍（Idle）；Interact 为 1.887 倍。</p>
+    <table>
+      <tr><th>指标</th><th>Idle</th><th>Interact</th></tr>
+      <tr><td>16 进程 / 单卡 相对 1 进程</td><td>6.873×（效率 42.96%）</td><td>3.255×（效率 20.35%）</td></tr>
+      <tr><td>64 进程 / 八卡 相对 1 进程</td><td>21.607×（效率 33.76%）</td><td>15.096×（效率 23.59%）</td></tr>
+      <tr><td>每进程分摊 SPS（16 进程单卡）</td><td>511.6</td><td>103.8</td></tr>
+      <tr><td>每进程分摊 SPS（64 进程八卡）</td><td>402.1</td><td>120.3</td></tr>
+      <tr><td>八卡聚合 相对 八个单进程</td><td>2.701×</td><td>1.887×</td></tr>
+    </table>
+    <p>三条读数。第一，<strong>每进程分摊吞吐随并发上升而下降</strong>：Idle 从 1191 降到 402 SPS，说明单卡 GPU 时间片与 CPU 物理线程都被共享；聚合吞吐仍上升，直到核心资源饱和。第二，<strong>交互场景的并行收益更低</strong>：物理约束求解占用 CPU，单卡 16 进程只剩 20.35% 效率，瓶颈从 GPU 转向 CPU。第三，<strong>八卡不是单卡的 8 倍</strong>：2.701 倍是扣除 CPU 竞争与调度开销后的实测值。论文把每卡 8 进程定为八卡基准的默认配额，提示 8 核 16 线程是这台机器的经验折中点，核数更多的机器需要重新扫描。</p>
+
+    <h3>3. 从步数到墙钟</h3>
+    <p>训练墙钟由步数预算除以总吞吐得到，前提是仿真、推理与优化三段完全重叠。端到端训练循环的实际耗时模型为：</p>
+    <div class="formula">
+      W ≈ N / (SPS<sub>总</sub> · η)，其中 η ≈ t<sub>仿真</sub> / (t<sub>仿真</sub> + t<sub>推理</sub> + t<sub>优化摊销</sub>)
+      <span class="note">t 为单个环境步的三段平均耗时；η 为仿真段占比，也称训练有效利用率</span>
+    </div>
+    <p>下表用八卡 Interact 的 7699 SPS 与单进程 510 SPS 分别估算 300M 步与 2.5B 步的墙钟。300M 步是 PirlNav（Ramrakhya 等，2023）与 HM3D-OVON 开源基线（Yokoyama 等，2024）的微调量级，2.5B 步是 DD-PPO 的 PointNav 规模。</p>
+    <table>
+      <tr><th>步数预算</th><th>@ 510 SPS（单进程 Interact）</th><th>@ 7699 SPS（八卡 Interact）</th><th>@ 25734 SPS（八卡 Idle，仅供参考）</th></tr>
+      <tr><td>300M</td><td>163.4 小时（6.81 天）</td><td>10.82 小时</td><td>3.24 小时</td></tr>
+      <tr><td>2.5B</td><td>1361.7 小时（56.74 天）</td><td>90.2 小时（3.76 天）</td><td>27.0 小时（1.12 天）</td></tr>
+      <tr><td>单集 500 步（ObjectNav 上限）</td><td>0.98 秒</td><td>0.065 秒</td><td>0.019 秒</td></tr>
+      <tr><td>单集 5000 步（Tidy House 上限）</td><td>9.80 秒</td><td>0.649 秒</td><td>0.194 秒</td></tr>
+    </table>
+    <p>DD-PPO 的公开账目提供交叉校验：2.5B 步在 64 卡上不到 3 天完成，折算聚合吞吐约 9,645 步/秒，每卡约 150.7 步/秒；其「90% 峰值性能在 100M 步、8 卡不到 1 天」对应每卡约 144.7 步/秒。<strong>与 Habitat 2.0 纯仿真数字相差约两个数量级，原因是口径不同：DD-PPO 的每卡有效吞吐包含策略前向、梯度更新与通信，且观测分辨率与物理负载不同。</strong>把纯仿真 SPS 直接当作训练吞吐，是复现计划里最常见的估算错误。</p>
+    <p>三段耗时的占比可以量化。设单环境步的仿真段 2.0 毫秒、推理段 0.5 毫秒、优化摊销 0.5 毫秒，则单进程模型吞吐 1 / 0.003 = 333.3 步/秒，64 进程理想聚合 21,333 步/秒；仿真段占比 η = 2.0 / 3.0 = 66.7%。若推理段升到 2.5 毫秒（大骨干或高分辨率），单进程吞吐降到 200 步/秒，η 降到 40%。<strong>先测三段耗时再定并行规模，比照搬「每卡 8 进程」更可靠。</strong></p>
+
+    <h3>4. 三项提速工程</h3>
+    <p>Habitat 2.0 的设计原则是「速度优先于能力广度」，由此放弃非刚体动力学与触觉、音频等能力。提速由三项工程实现。</p>
+    <ul>
+      <li><strong>惰性仿真</strong>：只更新机器人当前交互所涉及的部件。机器人被视为唯一可施加非重力作用的主体，远处物体不重算物理；底盘沿导航网格运动学移动，不模拟轮地接触；物体进入物理休眠后复用场景图变换与视锥剔除结果；相对基座受约束的部件（如柜体侧板）按静态处理。</li>
+      <li><strong>渲染与物理交错</strong>：物理在 CPU、渲染在 GPU，串行执行时总有一侧空转。Habitat 2.0 把策略输入改为上一时刻的观测，即 π(a<sub>t</sub> | o<sub>t−1</sub>)，使状态转移 s<sub>t+1</sub> 与观测渲染 o<sub>t</sub> 并行。若渲染与物理耗时均衡，串行耗时 2T 可压到 T，上限 2 倍收益。一步观察延迟同时带来更接近真实传感器的时序，人类视觉系统延迟约 150 毫秒，已有研究显示在仿真中引入感知延迟有利于迁移到真机。</li>
+      <li><strong>简化与复用</strong>：纹理采用 Basis 超压缩格式，显存占用降低 4 至 6 倍；为物体生成凸分解碰撞代理，渲染资产与碰撞资产分离；资产预取并缓存，缩短场景切换的重置时间。这三项让单卡能容纳更多并发实例。</li>
+    </ul>
+    <p>与同类系统的量级对照可以校准期望。论文汇总表中，Habitat 1.0 为 3,000 SPS，AI2-THOR 为 30 至 60 SPS，ManipulaTHOR 为 30 至 40 SPS，ThreeDWorld 为 5 至 168 SPS，SAPIEN 为 200 至 400 SPS，RLBench 为 1 至 60 SPS，iGibson 为 100 SPS，Habitat 2.0 单实例表值为 1,400 SPS。iGibson 与 Habitat 2.0 同用 Bullet 物理引擎，前者经 PyBullet 封装、后者用 C++ 低层集成：单进程 Idle 下，Habitat 2.0 关闭全部优化为 242 SPS（iGibson 的 2.42 倍），开启优化为 1191 SPS（11.91 倍）。论文把这一量级概括为约 100 倍提速，对应实验周期从 6 个月压到 2 天以内（6 个月按 180 天折算，除以 100 得 1.8 天）。<strong>对照表注明各系统硬件与资产不同，只能读量级，不能读倍数排序。</strong></p>
+
+    <h3>5. 适用边界</h3>
+    <p>第一，<strong>场景与传感器绑定</strong>。上述数字来自 ReplicaCAD 公寓与 Fetch 双 128×128 相机；换成 HM3D 全屋扫描、640×480 观测或多相机配置，吞吐会显著变化，必须重测。第二，<strong>能力边界</strong>。Habitat 2.0 不支持可形变体、切割焊接等状态变换与音频触觉，涉及其中的任务不在该口径内。第三，<strong>实时因子的相对性</strong>。850× 指八卡 Idle；同一系统的八卡 Interact 只有 256.63×，单进程 Interact 只有 17×。第四，<strong>并行效率随硬件变化</strong>。8 核 16 线程的配额来自基准机，核心更多或更少的机器应重新扫描每卡进程数。第五，<strong>论文版本差异</strong>。本讲数字取 v2（2022 年 7 月修订版）；引用时标明版本与出处，保证数字可回溯。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>吞吐工程的落地分三步：先按统一口径测量，再做扩展扫描，最后按三段耗时诊断并配置训练循环。每一步都要求结果可复现，因此协议要写进实验记录。</p>
+    <h3>测量协议</h3>
+    <table>
+      <tr><th>字段</th><th>取值</th><th>作用</th><th>依据</th></tr>
+      <tr><td>场景</td><td>Idle 与 Interact 各测一组</td><td>覆盖轻载与交互负载</td><td>论文基准两场景</td></tr>
+      <tr><td>步定义</td><td>1 渲染 + 4 物理子步（1/30 秒仿真）</td><td>避免与物理步混淆</td><td>Habitat 2.0 基准配置</td></tr>
+      <tr><td>运行次数</td><td>10 次，报均值与 95% 置信区间</td><td>区分真实差异与波动</td><td>论文用标准误</td></tr>
+      <tr><td>进程配额</td><td>单卡进程限制在 8 核 16 线程</td><td>控制 CPU 资源公平性</td><td>基准机配置</td></tr>
+      <tr><td>每卡进程数</td><td>1、4、8、16 四点扫描</td><td>找聚合吞吐拐点</td><td>论文 16 进程单卡与 8 进程每卡</td></tr>
+      <tr><td>资产与相机</td><td>固定场景、固定分辨率与相机数</td><td>隔离变量</td><td>吞吐对二者敏感</td></tr>
+    </table>
+    <h3>训练循环配置表</h3>
+    <table>
+      <tr><th>参数</th><th>建议默认值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>每卡环境进程数</td><td>8</td><td>聚合吞吐与内存的折中</td><td>八卡基准每卡 8 进程</td></tr>
+      <tr><td>单 worker 环境数</td><td>8 至 16</td><td>提高采样并行度</td><td>与进程数配套扫描</td></tr>
+      <tr><td>推理批大小</td><td>覆盖单轮 rollout 的全部环境</td><td>摊薄前向开销</td><td>由三段耗时占比决定</td></tr>
+      <tr><td>策略输入延迟</td><td>1 步（π(a<sub>t</sub>|o<sub>t−1</sub>)）</td><td>启用渲染物理交错</td><td>Habitat 2.0 设计</td></tr>
+      <tr><td>检查点频率</td><td>每 10M 至 50M 步</td><td>长任务恢复与选点</td><td>百万步级墙钟为小时级</td></tr>
+      <tr><td>吞吐日志</td><td>每次报告同时记录 SPS 与三段耗时</td><td>支持事后瓶颈归因</td><td>本讲诊断流程</td></tr>
+    </table>
+    <h3>瓶颈诊断流程</h3>
+    <p>采集三段耗时后按占比决策。设 GPU 利用率、CPU 利用率与步进耗时同时记录：仿真段占比超过 70% 且 GPU 未饱和时，优先增加环境进程数与每卡进程数；仿真段占比高且 CPU 饱和时，检查物理负载、减少交互物体或改用更简碰撞代理；推理段占比超过 40% 时，先缩小视觉骨干或提高批大小，再考虑加卡；优化摊销占比高时，减少每轮 PPO 更新次数或降低更新频率。扩展扫描从每卡 4 进程起，到 16 进程止；若 16 进程相对 8 进程的聚合提升低于 10%，把 8 进程定为默认。</p>
+    <h3>设计决策与取舍</h3>
+    <table>
+      <tr><th>决策点</th><th>方案</th><th>代价</th><th>判据</th></tr>
+      <tr><td>精度与速度</td><td>128×128 相机、凸分解碰撞体</td><td>观测细节与碰撞保真下降</td><td>基准场景以速度优先</td></tr>
+      <tr><td>物理保真</td><td>导航网格运动学底盘</td><td>不模拟轮地接触</td><td>该简化已有迁移真机的证据</td></tr>
+      <tr><td>观测时序</td><td>策略延迟一步</td><td>控制回路多一步滞后</td><td>换取渲染物理并行与迁移收益</td></tr>
+      <tr><td>纹理资产</td><td>Basis 压缩，显存降 4 至 6 倍</td><td>解压开销与轻微质量损失</td><td>提高单卡并发实例数</td></tr>
+      <tr><td>并行粒度</td><td>每卡 8 进程</td><td>CPU 与调度开销</td><td>八卡聚合 2.701 倍于八个单进程</td></tr>
+    </table>
+    <p>与第 007 讲的衔接点在这里：HAB 的任务与技能定义不变，本讲提供的是复现这些任务所需的算力口径。第 042 讲的 DD-PPO 协议与第 057 讲的混合任务配比都应附上本节的三段耗时与 SPS 记录，才能判断实验规模是否现实。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>三段代码分别覆盖换算、测量与诊断。全部片段用本讲的公开数字验证，输出与正文表格对应。</p>
+
+    <p><strong>片段 1：墙钟与并行效率核算</strong></p>
+    <pre class="code"><code>def wallclock(steps, sps, utilization=1.0):
+    """由步数预算与总吞吐估算墙钟小时数；utilization 为仿真段占比。"""
+    effective = sps * utilization                  # 有效训练吞吐
+    return steps / effective / 3600.0
+
+def efficiency(agg, single, scale):
+    """聚合吞吐相对单实例线性扩展的效率。"""
+    return agg / (single * scale)
+
+print("300M @ 7699 SPS:", round(wallclock(300_000_000, 7699), 2), "h")
+print("2.5B @ 7699 SPS:", round(wallclock(2_500_000_000, 7699) / 24, 2), "天")
+print("idle 八卡效率:", round(efficiency(25734, 1191, 64), 4))
+print("interact 八卡效率:", round(efficiency(7699, 510, 64), 4))
+# 300M @ 7699 SPS: 10.82 h
+# 2.5B @ 7699 SPS: 3.76 天
+# idle 八卡效率: 0.3376
+# interact 八卡效率: 0.2359</code></pre>
+    <p>解读：<strong>（1）</strong>第一式把「纯仿真吞吐」与「训练有效吞吐」分开，utilization 缺失会把墙钟低估约 1.5 倍；<strong>（2）</strong>效率函数以单实例成绩为基线，scale 取理论并发数，33.76% 与 23.59% 直接暴露资源竞争；<strong>（3）</strong>输出保留四位小数，避免在报告里出现「差不多三成」这类无法追溯的表述；<strong>（4）</strong>实际规划时把结果向上取整并预留 20% 重跑余量，因为中断恢复与评测也占用同一批卡。</p>
+
+    <p><strong>片段 2：Idle / Interact 双场景 SPS 测量</strong></p>
+    <pre class="code"><code>import statistics, time
+
+def measure_sps(step_fn, interactions=False, warmup=20, runs=10, steps_per_run=200):
+    """按 10 次运行报均值与 95% 置信区间；warmup 排除首轮冷启动。"""
+    for _ in range(warmup):
+        step_fn(interactions)                      # 预热资产与着色器
+    samples = []
+    for _ in range(runs):
+        start = time.perf_counter()
+        for _ in range(steps_per_run):
+            step_fn(interactions)
+        elapsed = time.perf_counter() - start
+        samples.append(steps_per_run / elapsed)    # 单次运行 SPS
+    mean = statistics.mean(samples)
+    sem = statistics.stdev(samples) / len(samples) ** 0.5
+    ci95 = 1.96 * sem                              # 正态近似，样本量 10
+    return mean, ci95
+
+# 用法：scene.reset(); measure_sps(lambda i: scene.step(random_action(), interact=i))
+# 输出示例（论文单进程）：Idle 1191 ± 36；Interact 510 ± 6</code></pre>
+    <p>解读：<strong>（1）</strong>预热不可省，首轮加载纹理与编译着色器会把均值拉低一个数量级；<strong>（2）</strong>先跑 warmup 再计时，且每次运行独立计时后取统计量，避免把一次长跑切成十段造成伪独立性；<strong>（3）</strong>95% 置信区间用 1.96 倍标准误，样本量增至 30 时改查 t 分布表；<strong>（4）</strong>Interact 场景必须注入代表性动作序列，随机动作会退化成 Idle 负载；<strong>（5）</strong>报告时同时给出场景、进程数、卡数与分辨率，否则数字无法复现。</p>
+
+    <p><strong>片段 3：三段耗时诊断</strong></p>
+    <pre class="code"><code>def diagnose(t_sim_ms, t_infer_ms, t_sgd_ms, n_proc):
+    """输入单环境步的三段平均耗时（毫秒），输出吞吐与瓶颈建议。"""
+    t_total = t_sim_ms + t_infer_ms + t_sgd_ms
+    per_proc = 1000.0 / t_total                    # 单进程步/秒
+    agg = per_proc * n_proc                        # 理想聚合，未计竞争
+    share = {"仿真": t_sim_ms / t_total,
+             "推理": t_infer_ms / t_total,
+             "优化": t_sgd_ms / t_total}
+    bottleneck = max(share, key=share.get)
+    advice = {"仿真": "增加环境进程或简物理负载",
+              "推理": "缩小骨干或增大推理批",
+              "优化": "减少每轮 PPO 更新次数"}[bottleneck]
+    return per_proc, agg, share, advice
+
+print(diagnose(2.0, 0.5, 0.5, 64))
+# (333.33, 21333.3, {'仿真': 0.667, '推理': 0.167, '优化': 0.167}, '增加环境进程或简物理负载')
+print(diagnose(2.0, 2.5, 0.5, 64))
+# (200.0, 12800.0, {'仿真': 0.4, '推理': 0.5, '优化': 0.1}, '缩小骨干或增大推理批')</code></pre>
+    <p>解读：<strong>（1）</strong>三段耗时来自实际剖析数据，避免用估计值，仿真段用 SPS 倒数、推理段用前向计时、优化段用更新总时长除以两次更新之间的交互步数；<strong>（2）</strong>理想聚合未计资源竞争，落地时乘上片段 1 的扩展效率；<strong>（3）</strong>两组示例展示同一硬件改变骨干规模后瓶颈转移，说明诊断必须在目标配置上做；<strong>（4）</strong>瓶颈建议只给方向，具体参数由扫描实验决定，记录扫描表以便复现。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>用 Idle 数字申报训练吞吐</strong>：症状是复现者按 1191 SPS 排计划，实际交互训练只有 510 SPS，工期翻倍。根因是 Idle 不含抓取与铰链约束求解。修复：训练计划一律采用 Interact 口径；两个场景并列报告。</li>
+      <li><strong>把纯仿真 SPS 当端到端吞吐</strong>：症状是估算的训练时间比实测短一个数量级。根因是遗漏策略推理与梯度更新两段耗时。修复：用片段 3 测三段占比，按有效吞吐排期；参照 DD-PPO 每卡约 150 步/秒的有效量级做校准。</li>
+      <li><strong>进程数盲目加倍</strong>：症状是单卡从 8 进程加到 16 进程，聚合吞吐只涨不到一成，节点负载还更高。根因是 GPU 与 CPU 已饱和，资源竞争吞掉收益。修复：从每卡 4 进程起做 1、4、8、16 四点的扫描，以聚合吞吐的拐点定默认值。</li>
+      <li><strong>测量无置信区间或忽略预热</strong>：症状是同一配置两次测量差 20% 以上，无法判断优化是否有效。根因是首轮加载与单次采样。修复：预热后独立运行 10 次，报告均值与 95% 置信区间；置信区间重叠时不下结论。</li>
+      <li><strong>跨平台与跨版本横比</strong>：症状是用 1,400 SPS 对照 iGibson 的 100 SPS，得出 14 倍结论。根因是硬件、资材与能力集合不同，且论文单实例表值与基准表值口径有别。修复：跨系统只读量级并注明对照表性质；引用 Habitat 2.0 数字时标 v2 版本与场景。</li>
+      <li><strong>实时因子与仿真步定义脱节</strong>：症状是把 850× 直接套到交互场景或 60 Hz 控制任务上，得出错误预算。根因是 30 SPS 对应 1 倍实时的前提为 1/30 秒仿真步。修复：先确认步定义与传感器频率，再换算 RTF；换控制频率后重新计算。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>用八卡 Interact 的 7699 SPS 计算 300M 步墙钟；用单进程 Interact 的 510 SPS 计算 2.5B 步墙钟。若目标是 3 天内跑完 2.5B 步，单进程配置达标吗，八卡配置留有多少余量？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>300M / 7699 = 10.82 小时。2.5B / 510 = 56.74 天，远超标；八卡配置 2.5B / 7699 = 3.76 天，超出 3 天目标约 25%。若把 Interact 换成 7,699 的观测场景并追加一张卡或提高进程配额到 10，可留出重跑余量。</div></details>
+      </li>
+      <li>从 1191（单进程 Idle）到 8186（16 进程单卡）再到 25734（64 进程八卡），分别计算相对单进程的倍数与线性效率；解释为什么 Interact 的对应效率更低，并给出提高 Interact 效率的两条工程方向。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>倍数 6.873 与 21.607，效率 42.96% 与 33.76%；Interact 效率为 20.35% 与 23.59%。交互场景的约束求解占 CPU，进程竞争使物理线程饱和。方向：简化交互物体数量与碰撞代理、按物理负载单独分组调度进程。</div></details>
+      </li>
+      <li>设计一份跨仿真器吞吐对照实验协议：列出数据（三个仿真器、两种场景、两种相机分辨率）、控制变量（CPU 配额、进程数、运行次数）、报告字段（均值、置信区间、实时因子、每进程分摊）与判定规则，并说明哪些结论允许跨系统给出。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>控制变量固定每进程 CPU 配额与资产规模；判定规则要求置信区间不重叠且相对差超过 10% 才下结论。允许跨系统给出的只有同场景同分辨率的量级区间与瓶颈类型；绝对值与排序仅在硬件完全一致时成立。</div></details>
+      </li>
+      <li>训练预算规划：目标在 48 小时内完成 1B 步在线交互，单步三段耗时为仿真 2.0 毫秒、推理 0.5 毫秒、优化摊销 0.5 毫秒。请计算所需聚合吞吐、理想进程数与效率折减后的实际进程数、建议卡数；若只能压缩推理段，给出两种方案并估算新的进程需求。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>单进程 333.3 步/秒，48 小时需 5,787 步/秒聚合，理想 17.4 个进程。按八卡 Interact 效率 23.6% 折减需 73.6 个进程，按 Idle 效率 33.8% 折减需 51.4 个，取整后建议 7 至 10 张卡各 8 个进程并留 20% 重跑余量。压缩推理：缩小视觉骨干或增大推理批，推理段从 0.5 毫秒降到 0.25 毫秒时单进程升到 363.6 步/秒（提升 9.1%），进程需求下降约 8.3%。</div></details>
+      </li>
+      <li>解释 π(a<sub>t</sub> | o<sub>t−1</sub>) 的收益与代价：它为什么能让渲染与物理并行，为什么可能同时改善 sim2real 迁移，代价是什么；给出一个实验分辨「收益来自并行」与「收益来自延迟本身」。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>用上一步观测切断「动作依赖当前渲染」的串行链，使 CPU 物理与 GPU 渲染重叠，上限 2 倍；感知延迟与真实传感器时序接近，论文援引先前工作支持迁移收益。代价是多一步控制滞后。分辨实验：固定渲染物理是否并行，仅切换策略输入的观测滞后阶数（0 步对 1 步），比较真机成功率。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>SPS 口径：1 步 = 1 渲染 + 4 物理子步（1/30 秒仿真），实时因子 RTF = SPS / 30；Habitat 2.0 v2 单进程 Idle 1191、Interact 510，八卡 25,734 与 7,699，分别对应 857.80 与 256.63 倍实时。</li>
+      <li>扩展账：16 进程单卡相对单进程 6.873 倍（Idle），八卡 64 进程 21.607 倍，线性效率 33.76%；Interact 效率 20.35% 与 23.59%，瓶颈在 CPU 物理。</li>
+      <li>墙钟账：W = N / (SPS<sub>总</sub> · η)；300M 步在八卡 Interact 下 10.82 小时、单进程 163.4 小时；2.5B 步在八卡 Interact 下 3.76 天。DD-PPO 的有效吞吐每卡约 150 步/秒，与纯仿真数字不可直接互换。</li>
+      <li>三项提速工程：惰性仿真（局部物理、导航网格底盘、休眠复用）、渲染物理交错（策略延迟一步，上限 2 倍）、简化复用（纹理压缩 4 至 6 倍、凸分解、资产缓存）；单进程 Idle 从无优化 242 提到 1191 SPS。</li>
+      <li>工程纪律：Idle 与 Interact 双场景、10 次运行与 95% 置信区间、固定 CPU 配额与资产；先测三段耗时，再定进程与卡数；跨系统只读量级并标版本。</li>
+      <li>下一讲是第三篇复盘：把第 041 至 059 讲的端到端配方与第二篇的模块化结果放进同一张决策表，用可解释性、数据、算力、泛化四轴给出选型框架。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch058.html">← 第 058 讲：Sim 与真机落差量化</a>
+    <a class="next" href="ch060.html">第 060 讲：第三篇复盘：端到端 vs 模块化 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.06 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:11.5px !important;letter-spacing:.06em !important;color:rgba(71,85,105,.45) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#7e8ba0 !important;font-size:11.5px !important;line-height:1.8 !important;text-align:center !important;padding:5px 12px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

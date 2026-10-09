@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 053 讲｜OVRL-v2 I：ViT+压缩层 | 目标物体导航课程 · ObjectNav 从探索到开放词汇</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第三篇 · 端到端与配方</span>
+    <span class="sep">/</span>
+    <span>第 053 讲</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第三篇 · 端到端与配方</div>
+    <h1>第 053 讲｜OVRL-v2 I：ViT+压缩层</h1>
+    <p class="lead">第 049 至 052 讲的主线配方以 ResNet50 表征加 GRU 策略为核心。OVRL-v2（Yadav 等 2023，论文题名 OVRL-V2: A Simple State-of-art Baseline for ImageNav and ObjectNav）提出另一条路线：只用任务无关组件（ViT、卷积、LSTM）构成单一架构，在 ImageNav 上取得 82.0% 成功率与 58.7% SPL，在 ObjectNav 上与同期最好方法接近（64.0% 对 65.0%，HM3DSem v0.1 test-standard）。本讲拆解架构与参数账：vanilla ViT 为何输给 ResNet，压缩层如何用一次卷积修复空间结构，掩码自编码预训练的数据从哪来，以及各方案的参数代价。</p>
+    <ul class="meta">
+      <li>主题：通用架构 / ViT / 压缩层 / 自监督预训练</li>
+      <li>关键公式：Z = Flatten(ReLU(GroupNorm(Conv<sub>3×3</sub>(Reshape(P))))) ∈ ℝ<sup>B×N·L</sup>，N = round(2048 / L)</li>
+      <li>预计学时：80 分钟</li>
+      <li>前置章节：第 052 讲（失败模式工具箱）</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>会推导：patch 序列重排为二维网格再压缩的完整张量路径，说明 [CLS] 汇总与全局平均池化丢失空间结构的机制，写出输出维度公式并给出适用条件。</li>
+      <li>会算：给定 patch 数 L 与目标维度 2048，算出每 patch 通道数与实际输出维度，核算压缩层参数量及其在 agent 总参数量中的占比。</li>
+      <li>会实现：PatchReshape 与压缩层的 PyTorch 代码，正确处理批次维、方形网格假设与边界情形。</li>
+      <li>会判断：从零训练时 ViT 与 ResNet 的取舍、预训练开关对架构规模的否决作用、域内预训练数据与通用视觉语言模型的差别。</li>
+      <li>会读：ImageNav 与 ObjectNav 观察口径（分辨率、视场、动作集、GPS+Compass）对编码器设计的影响，并标出每条数字的协议来源。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>截至第 052 讲，本课程端到端主线的主力配置是 ResNet50 表征加循环策略：第 043 讲讲表征预训练，第 044 讲讲 CLIP 骨干，第 046 讲讲辅助任务与探索，第 049 讲讲行为克隆加强化学习微调。这套配方的性能已经很强（PirlNav 在 HM3D-Semantics v0.1 上 65.0% / 33.0%），但有两个悬而未决的问题。第一，卷积网络的配方成熟，容量扩展带来的收益有限，全宽 ResNet50 相对半宽只把 ImageNav 成功率从 59.9% 提到 60.0%（Yadav 等 2023，附录表 E）。第二，视觉社区的经验表明，自监督预训练的 ViT 可以随规模稳定获益，而在具身导航里这条规律尚未被观察到。</p>
+    <p>OVRL-v2 的出发点是把问题推到极限：若完全放弃目标检测、语义分割、建图与规划模块，只用任务无关的神经网络组件，能否在两个语义导航任务上同时达到最好水平。作者报告的直接障碍是，朴素地把 ResNet 换成 ViT 会显著退化：从零训练的 ViT-Small 在 ImageNav 上只有 36.1% 成功率，而半宽 ResNet50 有 59.9%，尽管前者的 agent 参数量是后者的约 2.37 倍。诊断结论是空间结构被破坏：分类任务惯用的 [CLS] 汇总与全局平均池化都把 patch 的二维排布压掉了，而导航恰恰需要知道线索在画面中的位置。</p>
+    <p>本讲聚焦架构与参数账，包括压缩层的张量路径、维度与参数实算、掩码自编码预训练的数据口径，以及奖励与训练配方的架构相关部分。双任务结果与 scaling 证据留到第 054 讲，适用边界与失效模式留到第 055 讲。三讲共用同一主来源（arXiv:2303.07798，v1，2023-03-14）。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p>本节先固定两个任务的观察口径，再讨论 ViT 表示的结构问题与压缩层的数学形式，最后给出从零训练与预训练的对照证据。所有指标均来自 Yadav 等（2023）的 ImageNav Gibson 验证集与 ObjectNav HM3DSem v0.1 协议，逐条标注。</p>
+
+    <h3>1. 两个任务的观察口径</h3>
+    <p>ImageNav 的目标由一张目标图像描述，ObjectNav 的目标由类别名描述。两者共用同一套编码器与策略骨架，差异集中在中层接口与传感器假设上。下表列出本讲涉及的全部口径，后文所有数字都绑定这张表。</p>
+    <table>
+      <tr><th>项目</th><th>ImageNav</th><th>ObjectNav</th></tr>
+      <tr><td>数据集（本讲）</td><td>Gibson：72 训练场景 / 14 验证场景，验证集 4,200 条 episode（每场景 300 条）</td><td>HM3DSem v0.1：80 训练 / 20 验证 / 20 测试场景，沿用 2022 挑战 split</td></tr>
+      <tr><td>观察</td><td>RGB 128×128，90° 视场</td><td>RGB 640×480，79° 水平视场</td></tr>
+      <tr><td>动作</td><td>前进 0.25 m、左转/右转 30°、停止</td><td>在 ImageNav 动作集上增加抬头/低头 30°</td></tr>
+      <tr><td>步数上限</td><td>1,000</td><td>500</td></tr>
+      <tr><td>目标表示</td><td>目标图像经同构编码器（论文说明架构相同）</td><td>6 类目标的嵌入层（chair、bed、plant、toilet、tv/monitor、sofa）</td></tr>
+      <tr><td>GPS+Compass</td><td>不使用</td><td>使用，作为姿态嵌入输入策略</td></tr>
+      <tr><td>成功判据</td><td>停止点距目标位置不超过 1 m</td><td>停止点距目标实例不超过 1 m 且目标可见（Batra 等 2020 协议）</td></tr>
+      <tr><td>智能体几何</td><td>圆柱体，高 1.5 m，半径 0.1 m，传感器高 1.25 m</td><td>LocoBot，高 0.88 m，半径 0.18 m，传感器位于头部</td></tr>
+    </table>
+    <p><strong>两端差异要在实验设计里显式对待：ImageNav 的 128×128 输入只有 64 个 patch，ObjectNav 的 640×480 输入若按 16×16 切块会得到 1,200 个 patch，压缩层的通道数分配随之变化；若上游统一缩放，则要在报告中写明缩放口径。</strong>本讲后续的维度算例以 128×128 输入为基准（L = 64），并以变量 L 给出通用公式。</p>
+
+    <h3>2. ViT 的 patch 表示与空间结构问题</h3>
+    <p>ViT（Vision Transformer）把图像切成不重叠的 16×16 patch，每个 patch 经线性投影成一个 token，再拼接一个 [CLS] token 送入 Transformer。128×128 输入得到 (128/16)² = 64 个 patch token，加 [CLS] 共 65 个 token。标准 ViT-Small 的 patch 嵌入维度 D = 384，ViT-Base 的 D = 768。分类任务通常用两种方式把 token 序列汇总成图像表示：取 [CLS] 的输出，或对所有 patch token 做全局平均池化（Global Average Pooling，GAP）。</p>
+    <p>这两种汇合都丢掉了 patch 的二维排布信息。设 patch 特征矩阵为 P ∈ ℝ<sup>L×D</sup>，[CLS] 读出的是整幅图的全局摘要，GAP 计算 (1/L)·Σ<sub>i</sub> P<sub>i</sub>，两者都把「哪一块 patch 长什么样」折叠掉了。对分类而言这种折叠是可接受的，类别信息在全局统计里依然保留；对导航而言，智能体需要判断目标线索在画面中的方位，并据此决定朝哪转、在哪停，位置信息直接进入控制回路。<strong>从零训练时，容量更大的 ViT 败给较小的 ResNet，说明瓶颈在表示结构，与参数容量无关。</strong></p>
+
+    <h3>3. 压缩层：保留空间结构的张量路径</h3>
+    <p>压缩层（compression layer）的做法是把 patch 序列还原成网格，用卷积在通道方向压缩，再展平。完整路径如下，设批次大小为 B，patch 数为 L，patch 维度为 D，且输入为方形图像，因此 H = W = √L：</p>
+    <div class="formula">
+      P ∈ ℝ<sup>B×L×D</sup> → Reshape → ℝ<sup>B×H×W×D</sup> → Permute → ℝ<sup>B×D×H×W</sup> → Conv<sub>3×3</sub> → ℝ<sup>B×N×H×W</sup> → Flatten → ℝ<sup>B×N·L</sup>
+      <span class="note">N = round(2048 / L)；卷积核 3×3、边界填充 1、无偏置，随后接单组 GroupNorm 与 ReLU</span>
+    </div>
+    <p>输出维度 N·L 被设计为接近 2,048。取 L = 64 时 N = 32，输出恰为 2,048；L = 196 时 N = 10，输出 1,960；L = 256 时 N = 8，输出 2,048。这样做的好处是下游 LSTM 的输入规模保持稳定，换用不同分辨率或不同 patch 数量的编码器时不需要重设策略网络的大部分接口。代价是当 L 不是 2,048 的近似因子时输出维度会略偏离目标，最大偏差在常用配置下约为 4.3%（L = 196 的情形）。</p>
+    <p>压缩层的参数量很小。3×3 卷积的参数量为 D·N·9：ViT-Small 的 D = 384、N = 32 时是 110,592，约 0.11M；ViT-Base 的 D = 768、N = 32 时是 221,184，约 0.22M。相对 agent 总参数 50.9M 与 179.2M，占比分别为约 0.217% 与 0.123%。<strong>它的作用在结构：用极小的参数代价换回二维邻接关系，让后续卷积能同时看到相邻 patch。</strong></p>
+
+    <h3>4. 从零训练的对照证据</h3>
+    <p>同一套训练配方（无预训练、校正后的奖励函数、数据增强），只改视觉表示方式，ImageNav 验证集结果如下。</p>
+    <table>
+      <tr><th>视觉编码（从零训练）</th><th>agent 参数量</th><th>SPL</th><th>SR</th><th>SR 相对半宽 ResNet50</th></tr>
+      <tr><td>半宽 ResNet50（基线）</td><td>21.5M</td><td>33.5%</td><td>59.9%</td><td>基准</td></tr>
+      <tr><td>ViT-Small，[CLS] 表示</td><td>50.9M</td><td>23.7%</td><td>36.1%</td><td>−23.8 点（相对 −39.73%）</td></tr>
+      <tr><td>ViT-Small，全局平均池化</td><td>50.9M</td><td>21.1%</td><td>35.0%</td><td>−24.9 点（相对 −41.57%）</td></tr>
+      <tr><td>ViT-Small，压缩层</td><td>50.9M</td><td>37.1%</td><td>67.4%</td><td>+7.5 点（相对 +12.52%）</td></tr>
+    </table>
+    <p>压缩层把 [CLS] 表示的 36.1% 拉到 67.4%，绝对提升 31.3 点（相对 +86.70%），SPL 从 23.7% 提到 37.1%（+13.4 点）。同一实验里 [CLS] 与 GAP 都低于半宽 ResNet50，说明问题与 ViT 本身无关，与汇总方式有关。到预训练阶段，差距方向不变但幅度改变：[CLS] 73.8% / 55.0%、GAP 76.9% / 59.3%、压缩层 82.0% / 58.7%（Yadav 等 2023，表 7b）。<strong>预训练后 GAP 的 SPL 甚至略高于压缩层 0.6 点，但成功率低 5.1 点；判据是停止位置的精确识别更依赖空间结构，成功率对这一点最敏感。</strong></p>
+
+    <h3>5. 掩码自编码预训练与数据口径</h3>
+    <p>MAE（Masked Autoencoder，掩码自编码器，He 等 2022）的流程是：把图像切成 patch，随机遮住 75% 的 patch，编码器只处理剩余 25%，小型解码器根据编码结果重建整幅图，预训练结束后丢弃解码器、保留编码器。高掩码率可行，依赖自然图像 patch 之间的冗余。OVRL-v2 对 ViT-Small 与 ViT-Base 都从零开始做 800 轮 MAE 预训练，编码器随后用于 ImageNav 与 ObjectNav 两个任务。</p>
+    <p>预训练数据名为 HGSP（HM3D-Gibson Shortest Path）：从 800 个 HM3D 训练场景与 72 个 Gibson 训练场景采集，共 872 个场景；让 oracle 智能体沿最短路径从随机起点走到随机终点，采集 1.45M 张 512×512、90° 视场的 RGB 图像。选 1.45M 这个规模有依据：上一代 OVRL（Yadav 等 2022）发现，用 Omnidata Starter Dataset（OSD，共 14.5M 张）的 10% 预训练即可达到与全量相同的下游性能，1.45M 恰为 14.5M 的 10%。<strong>与下游 128×128 的观察相比，预训练图像为 512×512，单幅面积是 16 倍；这提供了高分辨率的细节监督，而下游推理仍保持低分辨率以控制算力。</strong></p>
+    <p>对照实验回答了「域内数据还是通用表示」的问题。CLIP 权重冻结时 ImageNav 为 51.7% / 37.4%，可微调时 65.5% / 47.7%；MAE 域内预训练为 82.0% / 58.7%，比可微调 CLIP 高 16.5 点 SR（相对 +25.19%）。Data2Vec 预训练得到 81.0% / 59.3%，与 MAE 接近，SR 低 1.0 点、SPL 高 0.6 点。把预训练数据从 HGSP 换成 OSD，结果为 81.1% / 57.5%，与 HGSP 的 82.0% / 58.7% 接近。合起来看，关键因素是与下游域匹配的图像分布，数据来源的具体选择影响较小。</p>
+
+    <h3>6. 奖励修正与训练配方的架构相关部分</h3>
+    <p>ImageNav 用 DD-PPO 训练，奖励由三部分组成：稀疏成功项、到达目标的测地距离增量、每步松弛罚项。ZER（Al-Halah 等 2022）在此之上加了朝向角奖励，但该项可在目标半径内外反复进出以累积，训练回报上升而验证 SPL 与 SR 下降（奖励被钻空子，原文称 reward hacking）。OVRL-v2 的修正是把朝向角项改写成势函数差分：定义 θ̂<sub>t</sub> = θ<sub>t</sub>（当 d<sub>t</sub> &lt; r<sub>g</sub>），否则 θ̂<sub>t</sub> = π。于是该项在半径外恒为 0，进入半径时为正、退出时付回同等负值，形成零和路径。</p>
+    <div class="formula">
+      θ̂<sub>t</sub> = θ<sub>t</sub>，若 d<sub>t</sub> &lt; r<sub>g</sub>；θ̂<sub>t</sub> = π，若 d<sub>t</sub> ≥ r<sub>g</sub><br>
+      r<sub>t</sub> = c<sub>s</sub>·[d<sub>t</sub> &lt; r<sub>g</sub> ∧ a<sub>t</sub> = STOP] + c<sub>a</sub>·[θ<sub>t</sub> &lt; θ<sub>g</sub> ∧ a<sub>t</sub> = STOP] + (θ̂<sub>t−1</sub> − θ̂<sub>t</sub>) + (d<sub>t−1</sub> − d<sub>t</sub>) − γ
+      <span class="note">c<sub>s</sub> = 5.0，c<sub>a</sub> = 5.0，r<sub>g</sub> = 1.0 m，θ<sub>g</sub> = 25°，γ = 0.01（每步）</span>
+    </div>
+    <p>零和性质可以用一组角度算例验证：180° → 60° → 10° → 180° 对应奖励增量 +120 + 50 − 170 = 0。角度单位在实现中按弧度计算，此处用度数列出便于核对方向。注意每步罚项 γ = 0.01 与成功项 c<sub>s</sub> = 5.0 的量级关系：500 步无塑形轨迹的累计罚项为 5.0，恰好抵消一次成功奖励。这解释了奖励塑形的不可或缺：仅有稀疏成功与每步罚项时，长路径的成功样本回报接近零，优势估计难以区分好坏轨迹。</p>
+    <p>与架构直接相关的其余配方还有三点，细节在第 054 讲展开。其一是删除输入图像的预下采样（AvgPool）操作，ImageNav 成功率从 27.7% 升到 60.6%（+32.9 点），SPL 从 18.8% 升到 27.9%。其二是编码器使用独立的小学习率：ImageNav 主体学习率 2.5×10<sup>−4</sup>、编码器 1.5×10<sup>−6</sup>，相差约 166.7 倍；用错学习率（主体同值的 2.5×10<sup>−4</sup> 直接作用于编码器）时成功率为 51.0%，低于完全冻结编码器的 61.8%。其三是训练与测试阶段都施加颜色抖动与随机平移增强：ImageNav 用亮度/对比度/饱和度/色相 0.3 与 4 像素平移，ObjectNav 用 0.4 与 16 像素平移。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>实现重点是把「观察编码、目标编码、姿态编码、时序策略」四段拼成单一网络，并让观察编码器在两种输入分辨率下都能接到固定规模的策略输入。观察编码器与压缩层是任务无关组件，目标编码与姿态编码按任务开关。</p>
+    <h3>模块接口表</h3>
+    <table>
+      <tr><th>模块</th><th>输入</th><th>输出</th><th>任务专用</th><th>说明</th></tr>
+      <tr><td>ViT 观察编码器</td><td>RGB 图像</td><td>(B, L, D) patch 特征</td><td>否</td><td>从零训练或 MAE 初始化</td></tr>
+      <tr><td>压缩层 + 全连接</td><td>(B, L, D)</td><td>(B, N·L)，约 2,048 维</td><td>否</td><td>保留网格后卷积压缩</td></tr>
+      <tr><td>目标编码器</td><td>目标图像 / 类别编号</td><td>目标嵌入</td><td>是</td><td>ImageNav 复制视觉编码器；ObjectNav 用嵌入层</td></tr>
+      <tr><td>姿态编码器</td><td>GPS+Compass</td><td>姿态嵌入</td><td>是（仅 ObjectNav）</td><td>全连接映射</td></tr>
+      <tr><td>LSTM 策略</td><td>拼接后的特征</td><td>动作分布与价值</td><td>否</td><td>循环层承载短程记忆</td></tr>
+    </table>
+    <h3>架构相关超参表</h3>
+    <table>
+      <tr><th>参数</th><th>ImageNav</th><th>ObjectNav</th><th>取值依据</th></tr>
+      <tr><td>patch 大小</td><td>16×16</td><td>16×16</td><td>ViT 标准配置</td></tr>
+      <tr><td>MAE 掩码率</td><td>75%</td><td>75%</td><td>He 等 2022 的默认设置</td></tr>
+      <tr><td>预训练数据与轮数</td><td>HGSP 1.45M 张，800 轮</td><td>同左，双任务共用编码器</td><td>附录 A；沿用 OVRL 的 10% 结论</td></tr>
+      <tr><td>编码器学习率</td><td>1.5×10<sup>−6</sup></td><td>1.0×10<sup>−4</sup></td><td>附录 A；ImageNav 另有主体学习率 2.5×10<sup>−4</sup></td></tr>
+      <tr><td>主体学习率</td><td>2.5×10<sup>−4</sup></td><td>1.0×10<sup>−3</sup></td><td>附录 A</td></tr>
+      <tr><td>优化器</td><td>AdamW，权重衰减 10<sup>−6</sup></td><td>同左</td><td>附录 A</td></tr>
+      <tr><td>数据增强</td><td>颜色抖动 0.3，平移 4 像素</td><td>颜色抖动 0.4，平移 16 像素</td><td>训练与测试阶段同用</td></tr>
+      <tr><td>并行环境</td><td>320</td><td>512</td><td>附录 A</td></tr>
+      <tr><td>每环境采样帧数</td><td>64（每更新）</td><td>同配方口径（论文未逐项列出）</td><td>PPO 采样窗口</td></tr>
+      <tr><td>PPO 轮数 / 小批次</td><td>2 / 2</td><td>同左</td><td>附录 A</td></tr>
+      <tr><td>训练步数</td><td>5×10<sup>8</sup>（25k 次更新）</td><td>约 4×10<sup>8</sup>（25k 次更新）</td><td>附录 A</td></tr>
+    </table>
+    <p>数据流按前向顺序为：RGB → ViT → 压缩层 → 全连接（约 2,048 维）→ 与目标嵌入、姿态嵌入拼接 → LSTM → 动作头。ImageNav 的目标图像走一条同构的编码支路；ObjectNav 不复制编码器，用 6 类嵌入层替代。监督信号方面，ImageNav 用 DD-PPO 在线采样，ObjectNav 用 Habitat-Web 采集的 77k 条人类演示做分布式行为克隆（约 12.1M 步经验，平均每条约 159 步，80 个场景约每场景 950 条），与第 048、049 讲的演示来源一致。</p>
+    <h3>设计决策与取舍</h3>
+    <table>
+      <tr><th>决策点</th><th>选择</th><th>代价</th><th>判据</th></tr>
+      <tr><td>patch 汇总方式</td><td>压缩层保留网格</td><td>多一层卷积与一次重排</td><td>从零训练时相对 [CLS] 高 31.3 点 SR</td></tr>
+      <tr><td>输出维度</td><td>固定为接近 2,048</td><td>L 偏离因子时输出略有偏差</td><td>LSTM 输入规模稳定，接口简单</td></tr>
+      <tr><td>预训练开关</td><td>MAE 域内数据</td><td>1.45M 图像采集与 800 轮预训练</td><td>CLIP 冻结 51.7% 远低于 MAE 82.0%</td></tr>
+      <tr><td>编码器微调强度</td><td>小学习率（ImageNav 1.5×10<sup>−6</sup>）</td><td>多一个待调超参</td><td>坏学习率 51.0% 低于冻结 61.8%</td></tr>
+      <tr><td>目标编码</td><td>ImageNav 复制编码器；ObjectNav 嵌入层</td><td>两套任务接口</td><td>目标模态不同，共享主干即可</td></tr>
+      <tr><td>输入分辨率</td><td>ImageNav 128×128；ObjectNav 640×480</td><td>两套维度账</td><td>沿用各自基准的官方口径</td></tr>
+    </table>
+    <h3>参数账</h3>
+    <table>
+      <tr><th>模型</th><th>agent 参数量</th><th>相对半宽 ResNet50</th><th>备注</th></tr>
+      <tr><td>半宽 ResNet50</td><td>21.5M（附录表记 21.6M）</td><td>1.00×</td><td>第 043 至 049 讲主线表征</td></tr>
+      <tr><td>全宽 ResNet50</td><td>59.1M</td><td>2.75×</td><td>ImageNav SR 60.0% / SPL 38.0%</td></tr>
+      <tr><td>ViT-Small + 压缩层</td><td>50.9M</td><td>2.37×</td><td>ImageNav SR 67.4% / SPL 37.1%（从零）</td></tr>
+      <tr><td>ViT-Base + 压缩层</td><td>179.2M</td><td>8.33×</td><td>预训练后启用，见第 054 讲</td></tr>
+    </table>
+    <p>与本篇上一讲的差异点有三条。表示层从 ResNet50 换成 MAE 预训练的 ViT 加压缩层；目标编码从单一目标嵌入扩展到「图像支路或类别嵌入」的分支结构；训练监督从 BC 加 RL 的两阶段配方改为按任务分工，ImageNav 纯 RL、ObjectNav 纯行为克隆，二者的共性组件完全共享。<strong>这套设计的卖点是任务无关组件加共享预训练：换任务时只改目标编码与训练监督，主干、压缩层与策略骨架都复用。</strong></p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>两段代码覆盖压缩层本体与维度/参数核算。代码按论文附录 C 的算法结构重写，变量命名与注释为本课程所用，目的是把形状流转与参数公式落到可运行的检查上。</p>
+
+    <p><strong>片段 1：压缩层与网格重排</strong></p>
+    <pre class="code"><code>import torch
+import torch.nn as nn
+
+class PatchReshape(nn.Module):
+    """把 (B, L, D) 的 patch 序列还原为 (B, D, H, W) 网格。"""
+    def forward(self, x):
+        B, L, D = x.shape                 # 批大小、patch 数、patch 维度
+        H = W = int(L ** 0.5)             # 论文输入均为方形，网格为方阵
+        if H * W != L:
+            raise ValueError("patch 数必须为完全平方数")
+        x = x.reshape(B, H, W, D)         # 还原二维邻接关系
+        return x.permute(0, 3, 1, 2)      # 通道维前置，供卷积使用
+
+def create_compression_layer(patch_dim, num_patches, approx_output_size=2048):
+    """每个 patch 压成 N 个通道，展平后输出 N * num_patches 维。"""
+    num_channels = int(round(approx_output_size / num_patches))
+    layer = nn.Sequential(
+        PatchReshape(),
+        nn.Conv2d(patch_dim, num_channels, kernel_size=3, padding=1,
+                  bias=False),            # 3x3 邻域融合，参数 D*N*9
+        nn.GroupNorm(num_groups=1, num_channels=num_channels),
+        nn.ReLU(inplace=True),
+        nn.Flatten(),                     # 保留逐 patch 的独立特征
+    )
+    return layer, num_channels * num_patches</code></pre>
+    <p>解读：<strong>（1）</strong>重排把序列顺序还原为二维邻接，reshape 之后同一行的 patch 在内存中相邻，permute 只改视图不复制数据，代价是一次廉价的重排。<strong>（2）</strong>卷积用 padding=1、kernel=3，输出网格与输入同尺寸，空间分辨率不降，压缩只发生在通道方向；这与池化式降采样不同，patch 级的位置精度被完整保留。<strong>（3）</strong>无偏置卷积加单组 GroupNorm，归一化在通道维整组进行，避免小批次下 BatchNorm 统计不稳。<strong>（4）</strong>输出维度恰好为 N·L，调用方据此设置全连接维度；若 L 变化，只需保证上游能整除或近似整除 2,048。</p>
+
+    <p><strong>片段 2：维度与参数核算</strong></p>
+    <pre class="code"><code>def compression_dims(num_patches, patch_dim, approx_output_size=2048):
+    """返回 (每 patch 通道数, 输出维度, 相对 2048 的比, 卷积参数量)。"""
+    channels = int(round(approx_output_size / num_patches))
+    output = channels * num_patches
+    conv_params = patch_dim * channels * 3 * 3     # 无偏置
+    return channels, output, output / approx_output_size, conv_params
+
+for L in (64, 100, 196, 256):                      # 128x128、160x160 等输入
+    n, out, ratio, p = compression_dims(L, patch_dim=384)   # ViT-Small
+    print(f"L={L:3d}  channels={n:2d}  out={out:4d}  "
+          f"ratio={ratio:.3f}  conv={p / 1e3:.1f}K")
+# L= 64  channels=32  out=2048  ratio=1.000  conv=110.6K
+# L=100  channels=20  out=2000  ratio=0.977  conv= 69.1K
+# L=196  channels=10  out=1960  ratio=0.957  conv= 34.6K
+# L=256  channels= 8  out=2048  ratio=1.000  conv= 27.6K
+print("ViT-Base L=64:", compression_dims(64, patch_dim=768)[3] / 1e3, "K")
+# ViT-Base L=64: 221.2 K   (卷积参数随 patch 维度线性增长)</code></pre>
+    <p>解读：<strong>（1）</strong>输出维度围绕 2,048 上下浮动，L = 196 时最低到 1,960，偏差 4.3%；如果下游接口写死 2,048，这个偏差会在加载权重时暴露，核算脚本应作为单元测试的一部分。<strong>（2）</strong>卷积参数量只随 patch 维度与通道数增长，与输入分辨率无关；从 ViT-Small 换到 ViT-Base，参数从 110.6K 翻倍到 221.2K，仍不到 agent 总参数的 0.25%。<strong>（3）</strong>核算脚本独立于训练代码，用于在改分辨率或换编码器时快速确认新配置的输出维度，避免把形状错误拖到训练中途才暴露。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>[CLS] token 直接当观察特征</strong>：症状是 ViT 明明容量更大，训练损失降得动，验证成功率却掉到 36.1%（ImageNav，从零）。根因是 [CLS] 汇总丢掉了 patch 的二维排布，控制回路拿不到线索方位。修复：接入压缩层保留网格结构；同一实验里压缩层把成功率抬到 67.4%。</li>
+      <li><strong>看到预训练后 GAP 的 SPL 接近就断言两种汇总等价</strong>：症状是用 GAP 省事，SR 却比压缩层低 5.1 点（76.9% 对 82.0%）。根因是平均池化对停止位置的判别信息不足。修复：以 SR 为主排序量选择汇总方式，SPL 作为辅助；若部署更看重路径效率，再按业务代价权衡。</li>
+      <li><strong>压缩层输出维度按 floor 取整或不取整</strong>：症状是全连接层维度与期望不符，或 L 变化后训练中断。根因是 N = round(2048/L) 的取整规则与调用方约定不一致。修复：统一使用 round，把 compression_dims 作为单元测试；L = 196 时输出 1,960，接口需接受该值。</li>
+      <li><strong>用通用视觉语言预训练替代域内预训练</strong>：症状是冻结 CLIP 权重时 ImageNav 只有 51.7%，微调后也只到 65.5%，低于 MAE 的 82.0%。根因是域外数据与导航观察分布不匹配，冻结权重更无法适应。修复：优先采集与下游同域、同视场的图像做自监督预训练；若必须用通用模型，至少对其权重微调并在报告中标注口径。</li>
+      <li><strong>忽略两端观察口径直接迁移超参</strong>：症状是把 ImageNav 的编码器学习率、增强强度搬到 ObjectNav 后训练不稳或过拟合。根因是分辨率、视场、动作集与演示监督都不同（640×480 对 128×128，行为克隆对在线 RL）。修复：按下表口径逐项核对，编码器学习率在 ImageNav 取 1.5×10<sup>−6</sup>、ObjectNav 取 1.0×10<sup>−4</sup>，增强参数分别取 0.3/4 与 0.4/16。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>用 N = round(2048/L) 计算 L = 64、100、196、256 四组配置的通道数、输出维度与相对 2,048 的偏差，并指出哪一组在接入固定 2,048 维全连接层时需要填充或截断。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>输出依次为 2,048、2,000、1,960、2,048；偏差为 0%、−2.34%、−4.30%、0%。L = 100 与 196 两组需要接口侧处理，可改用 L 的近似因子（如 128 或 256）把偏差压到 0。</div></details>
+      </li>
+      <li>解释为什么空间结构对「成功率」的影响大于对「SPL」的影响。用表 7b 的 [CLS]、GAP、压缩层三行数据支撑论点，并设计一个能区分「位置信息」与「参数量差异」的解释性实验。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>成功率要求停在正确位置，位置判别依赖网格结构；SPL 主要由路径策略决定，汇总方式影响较小。对照实验可固定参数量：给 [CLS] 分支加同规模的无关全连接层，或把压缩层的 3×3 卷积换成 1×1 卷积（去掉邻域），比较网格结构有无的差异。</div></details>
+      </li>
+      <li>实现片段 1 的压缩层，补写输入形状检查：当 L = 49、L = 196 时各说明网格边长，并验证输出维度与 compression_dims 的返回值一致；再指出方形假设在非方形输入下应如何扩展。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>49 对应 7×7，196 对应 14×14；输出维度分别为 42×49 = 2,058 与 10×196 = 1,960。非方形输入需要把 H、W 作为参数传入，reshape 与 permute 相应改写，公式 N = round(2048/(H·W)) 不变。</div></details>
+      </li>
+      <li>设计一组固定预算的架构对照实验，回答「压缩层的收益有多少来自结构、多少来自预训练与训练配方」。候选配置至少四种，写明数据、步数、增强、学习率、随机种子与选择规则，并给出主指标与判定标准。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>候选可取 ViT-S 从零加压缩层、ViT-S 从零加 [CLS]、ViT-S 预训练加压缩层、半宽 ResNet50 从零。控制项包括同域数据、同训练步数、同增强、同选择规则（ImageNav 按验证 SR 选检查点）；主指标为 SR，辅以 SPL；判定标准为多种子下压缩层的 SR 增益方向一致且超过种子间波动区间。</div></details>
+      </li>
+      <li>阅读参数账表，计算 ViT-Base 相对 ViT-Small 的参数量倍数与相对半宽 ResNet50 的倍数，并解释为什么「参数更多」在从零训练时没有转化为更好的指标（结合表 2 与后续 scaling 的预告）。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>179.2/50.9 ≈ 3.52 倍，179.2/21.5 ≈ 8.33 倍。从零训练时 ViT-Base 的 ImageNav SR 为 65.0%，低于 ViT-Small 的 67.4%；容量只有在预训练提供良好初始化后才能兑现（第 054 讲给出预训练后 ViT-Base 82.0% 的证据）。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>OVRL-v2 用任务无关组件组成单一架构：ViT 观察编码器、压缩层、目标编码、GPS+Compass 姿态编码与 LSTM 策略；ImageNav 与 ObjectNav 共用预训练编码器，仅目标编码与训练监督不同。</li>
+      <li>从零训练时，[CLS] 与全局平均池化分别只有 36.1% 与 35.0% 成功率（ImageNav，128×128），压缩层为 67.4%；容量更大的 ViT 败给半宽 ResNet50 的 59.9%，瓶颈在空间结构。</li>
+      <li>压缩层把 patch 序列还原为 H×W 网格，经 3×3 卷积把每 patch 通道数压到 N = round(2048/L)，展平输出约 2,048 维；L = 64 时卷积参数约 0.11M（ViT-S），占 agent 总参数约 0.217%。</li>
+      <li>MAE 以 75% 掩码率在 HGSP（872 个场景、1.45M 张 512×512 图像，沿用 OVRL 的 10% OSD 结论）上预训练 800 轮；域内预训练是关键词，CLIP 冻结 51.7%、微调 65.5%，均低于 MAE 的 82.0%。</li>
+      <li>奖励侧用势函数差分修正朝向角塑形，进入与退出目标半径的奖励互相抵消；常数取 c<sub>s</sub> = 5.0、c<sub>a</sub> = 5.0、r<sub>g</sub> = 1.0 m、θ<sub>g</sub> = 25°、每步罚 0.01。</li>
+      <li>下一讲给出双任务完整结果与 scaling 证据：预训练把 ViT-Small 的 ImageNav 成功率从 67.4% 提到 80.5%，并让 ViT-Base 相对 ViT-Small 转为正向收益（82.0% 对 80.5%）。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch052.html">← 第 052 讲：失败模式工具箱</a>
+    <a class="next" href="ch054.html">第 054 讲：OVRL-v2 II：双任务 SOTA 与 scaling →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.06 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:11.5px !important;letter-spacing:.06em !important;color:rgba(71,85,105,.45) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#7e8ba0 !important;font-size:11.5px !important;line-height:1.8 !important;text-align:center !important;padding:5px 12px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

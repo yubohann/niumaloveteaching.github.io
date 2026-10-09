@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 075 讲｜NaVid 对接 | 目标物体导航课程 · ObjectNav 从探索到开放词汇</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第四篇 · 开放词汇与大模型</span>
+    <span class="sep">/</span>
+    <span>第 075 讲</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第四篇 · 开放词汇与大模型</div>
+    <h1>第 075 讲｜NaVid 对接</h1>
+    <p class="lead">第 074 讲的 VLMnav 用零样本提示把 VLM 直接变成策略，暴露了两个缺口：朴素拼接历史无增益，跨域与真机迁移缺少训练支撑。本讲拆 NaVid（Zhang 等 2024，RSS 2024，arXiv:2402.15852）：一个以单目 RGB 视频流为唯一观测的视频 VLM 导航智能体，不依赖地图、里程计与深度。它把每帧编码为 1 个指令查询 token 与若干指令无关 token（历史帧 4 个、当前帧 64 个），用特殊 token 分隔历史、观测与导航指令，让 Vicuna-7B 以语言形式输出带参数量（前进距离、旋转角度）的动作；训练混合 51 万条连续环境导航样本与 76.3 万条网页数据，单轮微调后在 R2R-CE 验证集取得 37.4% SR 与 35.9 SPL，跨数据集迁移到 RxR 取得 23.8% SR，真机 200 条指令成功约 66%。本讲的重点不在复述 VLN 结果，而在设计一套「VLN 视频 VLM 对接到 ObjectNav」的适配层：类别到指令的转换、连续参数到离散动作的映射、停止口径对齐、视频缓冲与评测口径迁移。</p>
+    <ul class="meta">
+      <li>主题：视频 VLM / 端到端导航 / 适配层设计 / 跨域与真机迁移</li>
+      <li>关键公式：视觉 token 预算 5(T−1) + 65（T 为帧数）；动作 = 类型 + 参数；SR 与 SPL 的 VLN-CE 口径</li>
+      <li>预计学时：75 分钟</li>
+      <li>前置章节：第 074 讲（VLMnav：VLM 即策略）</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>会拆架构：说清 EVA-CLIP 视觉编码、Q-Former 查询生成、Vicuna-7B 推理与两类视觉 token 的分工，会手算视频 token 预算。</li>
+      <li>会读配方：51 万条导航样本的三个来源（专家轨迹、非专家轨迹、指令推理）各自的作用，以及网页数据与导航数据的配比逻辑。</li>
+      <li>会解读结果：R2R-CE 表内 SR 与 SPL 的取舍（相对 WS-MGMap 的 SR 低 1.5、SPL 高 1.6）、RxR 跨数据集增益、四种历史表示对照与视觉 token 数量的收益曲线。</li>
+      <li>会设计适配层：把 VLN 式视频 VLM 对接到 ObjectNav 的类别目标、离散动作、1 m 停止判据与长程评测口径，列出每一处接口的转换规则。</li>
+      <li>会判断边界：停止阈值差异、动作参数到离散步的映射误差、视频缓冲的显存与延迟、真机部署的延迟预算。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 074 讲的 VLMnav 证明了「VLM 即策略」可行，但它的历史实验给出了否定结论：把最近 15 步观测拼进提示词，SR 反而比无历史低 6.4 个百分点。这说明通用 VLM 的提示接口无法承担「记住走过的路」这一职能，而导航恰恰需要历史：同一扇门走过与否，决定下一步该继续探索还是折返。与此同时，VLMnav 的真机可行性也被滑行消融打上问号。要补这两个缺口，方向有二：给 VLM 换上能利用历史的输入结构，以及用导航数据训练它。</p>
+    <p>NaVid 属于第二条路线的代表工作：把历史观测组织成视频流，用每帧少量视觉 token 压缩存储，并用连续环境的人类演示数据微调一个视频 VLM。它面向的是视觉语言导航（Vision-and-Language Navigation, VLN），任务是「按指令走」，与本课的「找目标物」并不相同。本讲的价值因此分两层。第一层是机制层：视频 token 的历史编码方式，是第 076 讲之后所有记忆设计的基础工具。第二层是对接层：如何把一台为指令跟随训练的视频 VLM，改造成 ObjectNav 智能体，需要补哪些接口、改哪些口径、防哪些坑。这一层是第 074 与 076 讲之间缺失的工程桥。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 任务形式化与动作接口</h3>
+    <p>NaVid 在连续环境视觉语言导航（Vision-and-Language Navigation in Continuous Environments, VLN-CE）口径下定义问题。t 时刻给定自然语言指令 ℐ（l 个词）与视频观测 𝒪<sub>t</sub> = {x<sub>0</sub>, …, x<sub>t</sub>}，智能体输出下一步低层动作 a<sub>t+1</sub> ∈ 𝒜，执行后收到新帧 x<sub>t+1</sub>。决策过程是一个 POMDP，观测空间为单目 RGB 视频，动作空间包含「类型 + 定量参数」两层：类型取自 {FORWARD, TURN-LEFT, TURN-RIGHT, STOP}，FORWARD 附带前进距离，TURN-LEFT 与 TURN-RIGHT 附带旋转角度。输出用正则表达式解析，论文报告在 R2R 验证集上有效动作解析率达到 100%。</p>
+    <p>与本课 ObjectNav 的动作口径对照：Habitat 离散动作每步固定前进 0.25 m 或旋转 30°，NaVid 输出的是带参数的动作，部署时需要一个映射层把「前进 1.2 m」展开为若干离散步，或把动作参数直接交给连续控制器。这个映射层是后文适配设计的第一块砖。评测指标沿用 VLN 标准：成功率（Success Rate, SR）、oracle 成功率（OS）、成功加权路径长度（SPL）、轨迹长度（TL）、导航误差（NE）。VLN-CE 的停止成功判据是距目标 3 m 内调用 STOP，真机实验用 1.5 m。注意这两个数值与 ObjectNav 的 1 m 判据都不同，跨口径比较会系统性高估。</p>
+
+    <h3>2. 观测编码：两类 token 与特殊分隔符</h3>
+    <p>NaVid 的骨架沿用 LLaMA-VID 视频 VLM：EVA-CLIP 视觉编码器、Q-Former 查询生成器、Vicuna-7B 语言模型、BERT 文本编码器，以及两个跨模态投影器。每帧图像经视觉编码得到 N<sub>x</sub> = 256 个 patch 特征 X<sub>t</sub> ∈ ℝ<sup>256×C</sup>，随后分成两类 token。第一类是指令查询 token：Q-Former 以指令文本为条件生成查询 Q<sub>t</sub>，再对图像特征做交叉注意力并池化，得到 1 个与当前指令最相关的视觉 token：</p>
+    <div class="formula">E<sup>Q</sup><sub>t</sub> = P<sub>Q</sub>( Pool( Softmax(Q<sub>t</sub> X<sub>t</sub><sup>T</sup>) X<sub>t</sub> ) ) ∈ ℝ<sup>1×C</sup></div>
+    <p>第二类是指令无关 token：对图像特征做网格池化再投影，得到 N<sub>v</sub> 个 token：E<sup>V</sup><sub>t</sub> = P<sub>V</sub>(GridPool(X<sub>t</sub>))。论文的关键设计是历史帧与当前帧使用不同的 token 数：当前帧 64 个，历史帧每帧 4 个。理由是当前帧承担动作参数的几何推理，需要保留更多空间信息；历史帧主要提供「走到过哪里」的上下文，粗粒度即可。作为对照，LLaMA-VID 每帧只用 2 个 token，适合高层问答，却不足以支撑动作参数的推理，这也是 NaVid 改用网格池化的原因。</p>
+    <p>三类信息用特殊 token 分隔：&lt;HIS&gt; 与 &lt;/HIS&gt; 包裹历史帧 token，&lt;OBS&gt; 与 &lt;/OBS&gt; 包裹当前帧 token，&lt;NAV&gt; 标记指令开始。输入格式为 &lt;HIS&gt;{历史帧}&lt;/HIS&gt;&lt;OBS&gt;{当前帧}&lt;/OBS&gt;&lt;NAV&gt;{指令}，输出为动作文本。按每帧 1 个查询 token、历史帧 4 个无关 token、当前帧 64 个无关 token 计算，T 帧的视觉 token 总数为 5(T−1) + 65。取 T = 50、100、300，预算分别为 310、560、1560 个 token。导航数据里绝大多数轨迹小于 300 帧，因此 1560 是该配方在训练时的实际上界；这个线性增长是后续记忆设计要对付的对象（第 076 讲给出两种有界替代方案）。</p>
+
+    <h3>3. 训练配方：混合数据与单轮微调</h3>
+    <p>训练数据分三块导航来源与一块网页来源。专家轨迹 32 万条步级样本，采集自 R2R-CE 的 61 个 MP3D 场景，含单目视频、指令与动作。非专家轨迹 18 万条：先用专家数据训练一个初始智能体，再把它放到环境中运行、收集它自己产生的轨迹。这一步模仿 DAgger 思路，让训练分布覆盖智能体的真实错误状态，缩小训练与推理的分布差。指令推理样本 1 万条：给一段视频轨迹，要求模型反推对应指令，作为环境理解与指令跟随的辅助任务。三块合计 51 万条。网页数据 76.3 万条视频问答样本用于共训，防止微调破坏预训练通用知识；导航与网页数据的配比约为 0.668 : 1。</p>
+    <p>训练配置：24 张 A100 约 28 小时，合计 672 GPU 小时，只训练 1 个 epoch，只优化 LLaMA 与文本编码器的可训练参数，EVA-CLIP、Q-Former、BERT 均加载预训练权重。按导航样本折算约 4.74 秒每样本，按全部样本折算约 1.90 秒每样本。视频问答数据按 1 FPS 抽帧去冗余，导航数据保留全部帧。推理侧，真机每步动作耗时约 1.2 至 1.5 秒，论文建议用量化等加速手段压缩。</p>
+
+    <h3>4. 仿真结果：R2R-CE 与 RxR</h3>
+    <p>主表在 R2R-CE 验证未见集（val-unseen）上比较（Zhang 等 2024，表 1）。需要特别说明口径：HAMT 行使用高层动作空间并额外使用 MP3D 之外的视觉数据，与本表的低层动作方法不可直接比。</p>
+    <table>
+      <tr><th>方法（R2R-CE val-unseen）</th><th>观测</th><th>SR</th><th>SPL</th><th>NE ↓</th><th>OS</th></tr>
+      <tr><td>WS-MGMap</td><td>RGB-D + 里程计</td><td>38.9</td><td>34.3</td><td>6.28</td><td>47.6</td></tr>
+      <tr><td><strong>NaVid</strong></td><td><strong>仅 RGB</strong></td><td><strong>37.4</strong></td><td><strong>35.9</strong></td><td><strong>5.47</strong></td><td><strong>49.1</strong></td></tr>
+      <tr><td>RGB-CMA</td><td>仅 RGB</td><td>5.0</td><td>4.43</td><td>9.55</td><td>10.8</td></tr>
+      <tr><td>RGB-Seq2Seq</td><td>仅 RGB</td><td>0.0</td><td>0.0</td><td>10.1</td><td>8.10</td></tr>
+    </table>
+    <p>读法与第 074 讲的表不同：NaVid 的 SR 比 WS-MGMap 低 1.5 个百分点，SPL 高 1.6，NE 低 0.81 m，OS 高 1.5 个百分点。论文的表述是「在 SPL、NE、OS 上达到最优，SR 相当」，这组取舍的机制是：NaVid 的轨迹更短、更少绕路（SPL 与 NE 受益），但少数难例上停不准或停不下来（SR 略低）。相对同观测口径的 RGB 基线，SR 从 5.0 提到 37.4（+32.4 个百分点，相对 648%），SPL 从 4.43 提到 35.9（相对 710%），说明能力来自训练数据与视频结构，不来自观测模态的堆叠。</p>
+    <p>跨数据集实验把 R2R 训练好的模型零样本搬到 RxR 验证未见集（Zhang 等 2024，表 2）：NaVid 23.8% SR / 21.2 SPL / NE 8.41，相对当时零样本最优的 A²Nav（16.8% / 6.3）SR 高 41.7%、SPL 高 236.5%。RxR 指令更细、轨迹更长、语言与视觉分布差更大，这组数字是「指令模板与动作接口可迁移」的直接证据，也是后文把类别目标包装成指令的依据。</p>
+    <p>四组辅助对照给出机制解释。第一，历史表示（表 4）：纯文本历史 0.0% SR，地图加文本 9.13%，自我视角加文本 23.5%，视频 37.4%。自我视角到视频的跨度为 +13.9 个百分点（相对 +59.1%），证明历史必须以视觉形式进入模型，转写成文字会丢失大部分信息。第二，与通用大模型对照（表 3，100 条 episode 子集）：GPT-4V 5.0% / 3.11，LLaVA-Nav 10.0% / 9.43，LLaMA-VID-Nav 29.0% / 27.5，NaVid 38.0% / 35.4；LLaMA-VID 微调后有效动作输出率从 0% 提到 91.3%，说明导航数据的作用首先是「把模型教会说可执行的动作」。第三，视觉 token 数量（表 8）：每帧 1 到 4 个 token，SR 提高 56.4%，时间增加 40.2%；4 到 16 个 token，SR 只再提高 1.60%，时间增加 122%。4 个是收益与成本的平衡点。第四，长程稳定性：指令所需步数 30 至 90 步（约 5 至 20 m）时性能保持稳定；训练集中 74.3% 的 episode 在 35 至 75 步，5.91% 超过 90 步。</p>
+
+    <h3>5. 真机迁移：四场景 200 条指令</h3>
+    <p>真机平台为 Turtlebot4 加 Kinect DK 相机，场景为会议室、办公室、实验室、休息室四类，每场景设计 25 条简单地标指令与 25 条复合指令，合计 200 条（Zhang 等 2024，表 6）。成功判据为 1.5 m。结果：NaVid 简单指令平均 85.0%，复合指令平均 47.0%，总体 66.0%；WS-MGMap 分别为 51.0%、22.0%、36.5%；Seq2Seq 约 0.5%，CMA 约 1.5%。总体差 29.5 个百分点，简单差 34，复合差 25。读法有三点：其一，复合指令的成功率折半，说明多步语言推理仍是瓶颈；其二，纯 RGB 输入在真机上没有出现深度或里程计误差导致的大幅退化，这是该路线最重要的迁移证据；其三，1.2 至 1.5 秒每步的延迟在慢速服务机器人上可用，在动态环境里需要压缩。</p>
+
+    <h3>6. 对接 ObjectNav 的适配层</h3>
+    <p>把 NaVid 用于 ObjectNav，需要改造五处接口。第一，目标接口：ObjectNav 给定类别词（chair、bed、plant、toilet、sofa、TV），VLN 给定完整指令。做法是用指令模板把类别包装成自然语言目标，例如「Find the chair in the room.」。跨数据集实验已证明模型对未见指令分布有迁移能力，模板差异在可接受范围内，但模板措辞仍需按验证集标定。</p>
+    <p>第二，动作接口：NaVid 输出带参数的动作，ObjectNav 环境通常提供离散动作。需要把前进距离除以步长并向上取整为若干前进步，把旋转角度除以每步转角展开为若干旋转步；展开会引入量化误差，最大半步步长。若环境支持连续控制，则把参数直接交给控制器，此时要另设速度与安全约束。</p>
+    <p>第三，停止接口：VLN-CE 的 3 m 判据不能直接用于 ObjectNav 的 1 m 判据。做法是保留 NaVid 的 STOP 输出作为「候选停止」，再叠加一层几何或检测门控：只有目标检测框存在、深度距离小于阈值时才接受停止。第 074 讲的提前停止问题与这里同源，双确认策略可复用。</p>
+    <p>第四，记忆接口：视频缓冲按帧存储，token 预算随帧数线性增长。ObjectNav 的 episode 可达数百步，直接照搬会把上下文撑满。可选的裁剪规则包括：按最近 T 帧滑窗、对历史帧降采样、或在检测到目标后只保留目标附近帧。第 076 讲的有界记忆设计可作为替代方案。</p>
+    <p>第五，评测接口：VLN 指标里的 OS 与 TL 在 ObjectNav 报告中通常不出现，SPL 的最短路径口径也不同（VLN 用专家轨迹，ObjectNav 用测地距离）。对接后报告结果时，必须同时声明数据集、成功阈值与最短路径来源，否则数字不可比。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>适配层可以落成三张表：接口转换表、设计决策表与两代 VLM 策略对照表。</p>
+    <h3>接口转换表</h3>
+    <table>
+      <tr><th>接口</th><th>VLN 原口径</th><th>ObjectNav 目标口径</th><th>转换规则</th><th>风险</th></tr>
+      <tr><td>目标</td><td>自由文本指令</td><td>类别词（6 类或开放词汇）</td><td>模板包装：Find the {category}.</td><td>模板措辞影响成功率，需标定</td></tr>
+      <tr><td>观测</td><td>单目 RGB 视频</td><td>RGB-D（可用时）</td><td>只用 RGB 通道，保持输入一致</td><td>放弃深度可能损失可导航性</td></tr>
+      <tr><td>动作</td><td>类型 + 参数</td><td>离散动作（0.25 m / 30°）</td><td>参数除法取整展开</td><td>量化误差最大半步</td></tr>
+      <tr><td>停止</td><td>3 m（仿真）/ 1.5 m（真机）</td><td>1 m + 可见性</td><td>STOP 候选 + 检测与距离门控</td><td>门控误拒或误收</td></tr>
+      <tr><td>记忆</td><td>全帧视频 token</td><td>长程 episode</td><td>滑窗或降采样，控制 token 预算</td><td>裁剪过狠会丢关键历史</td></tr>
+      <tr><td>评测</td><td>SR / OS / SPL / TL / NE</td><td>SR / SPL / DTG</td><td>SPL 换用测地最短路径口径</td><td>口径混用导致数字不可比</td></tr>
+    </table>
+    <h3>设计决策表</h3>
+    <table>
+      <tr><th>决策点</th><th>建议选择</th><th>替代方案与代价</th><th>判据</th></tr>
+      <tr><td>历史帧 token 数</td><td>每帧 4</td><td>1：SR 低 56.4%；16：SR 仅 +1.60%，时间 +122%</td><td>收益成本平衡点在 4</td></tr>
+      <tr><td>当前帧 token 数</td><td>64</td><td>降低会伤动作参数推理</td><td>几何信息支撑定量参数</td></tr>
+      <tr><td>导航数据配比</td><td>专家 + 非专家 + 指令推理</td><td>只用专家：推理分布不匹配</td><td>非专家样本覆盖错误状态</td></tr>
+      <tr><td>共训数据</td><td>保留网页视频问答</td><td>去掉共训：论文消融 SR 从 37.4% 降到 24.7%</td><td>共训样本维持通用能力与动作合法率</td></tr>
+      <tr><td>微调范围</td><td>只训 LLaMA 与文本编码器</td><td>全量微调：显存与过拟合风险上升</td><td>1 epoch 已够收敛</td></tr>
+      <tr><td>停止门控</td><td>STOP + 检测几何门控</td><td>仅 STOP：1 m 口径下误停多</td><td>VLN 3 m 判据不可迁移</td></tr>
+    </table>
+    <h3>与 VLMnav 的对照</h3>
+    <table>
+      <tr><th>维度</th><th>VLMnav（第 074 讲）</th><th>NaVid（本讲）</th></tr>
+      <tr><td>训练</td><td>零样本，不训练</td><td>51 万导航样本 + 76.3 万网页数据单轮微调</td></tr>
+      <tr><td>动作表示</td><td>图上编号的极坐标选项</td><td>语言输出的类型 + 参数</td></tr>
+      <tr><td>历史建模</td><td>朴素拼接无效</td><td>视频 token 有效（37.4 对文本 0.0）</td></tr>
+      <tr><td>可导航性</td><td>深度掩码显式过滤</td><td>依赖模型从视频中隐式学习</td></tr>
+      <tr><td>停止</td><td>独立调用 + 双确认</td><td>动作空间内输出 STOP，需外加门控</td></tr>
+      <tr><td>迁移证据</td><td>GOAT 与 ObjectNav 零样本</td><td>R2R 到 RxR 跨数据集，真机 66%</td></tr>
+      <tr><td>主要风险</td><td>滑行依赖、历史无效</td><td>训练成本、停止口径、token 预算</td></tr>
+    </table>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>四段代码覆盖视频缓冲与 token 组装、动作解析与执行映射、ObjectNav 适配包装器、数据收集循环。代码为教学重写。</p>
+
+    <p><strong>片段 1：视频缓冲与特殊 token 组装</strong></p>
+    <pre class="code"><code>class VideoBuffer:
+    def __init__(self, max_frames=300, hist_tokens=4, curr_tokens=64):
+        self.frames, self.max_frames = [], max_frames
+        self.hist_tokens, self.curr_tokens = hist_tokens, curr_tokens
+
+    def push(self, frame):
+        self.frames.append(frame)
+        if len(self.frames) &gt; self.max_frames:      # 滑窗：丢最旧帧
+            self.frames.pop(0)
+
+    def encode(self, encoder, instruction):
+        """历史帧 4 个无关 token，当前帧 64 个，另有每帧 1 个查询 token。"""
+        hist = self.frames[:-1]
+        hist_tok = [encoder.grid_pool(f, self.hist_tokens) for f in hist]
+        curr_tok = encoder.grid_pool(self.frames[-1], self.curr_tokens)
+        query_tok = encoder.query(self.frames[-1], instruction)
+        seq = ([encoder.special("&lt;HIS&gt;")] + sum(hist_tok, [])
+               + [encoder.special("&lt;/HIS&gt;"), encoder.special("&lt;OBS&gt;")]
+               + curr_tok + [encoder.special("&lt;/OBS&gt;"),
+                             encoder.special("&lt;NAV&gt;")])
+        return seq + query_tok</code></pre>
+    <p>解读：<strong>（1）</strong>token 预算随帧数线性增长（5(T−1) + 65），max_frames 是显存与延迟的第一道闸门。<strong>（2）</strong>历史帧与当前帧的 token 数分开配置，是论文消融支持的关键设计。<strong>（3）</strong>特殊 token 让模型区分「历史、当前、指令」三段，去掉后性能明显下降（论文架构消融）。<strong>（4）</strong>查询 token 以指令为条件，实现「看指令相关的视觉内容」。</p>
+
+    <p><strong>片段 2：动作解析与离散执行映射</strong></p>
+    <pre class="code"><code>import re
+
+ACTION_RE = re.compile(
+    r"(FORWARD|TURN-LEFT|TURN-RIGHT|STOP)"
+    r"(?:\s*[\(\[]?\s*([0-9]+(?:\.[0-9]+)?)\s*(m|deg|°)?\s*[\)\]]?)?")
+
+def parse_action(text):
+    """解析语言动作；解析失败返回 None，由调用方降级。"""
+    m = ACTION_RE.search(text.upper())
+    if not m:
+        return None
+    kind, value, unit = m.group(1), m.group(2), m.group(3)
+    return kind, float(value) if value else None
+
+def to_habitat_steps(action, step_len=0.25, step_deg=30.0):
+    """把带参数动作展开为离散动作序列。"""
+    kind, value = action
+    if kind == "STOP":
+        return ["STOP"]
+    if kind == "FORWARD":
+        n = max(1, round((value or step_len) / step_len))
+        return ["MOVE_FORWARD"] * n
+    n = max(1, round((value or step_deg) / step_deg))
+    name = "TURN_LEFT" if kind == "TURN-LEFT" else "TURN_RIGHT"
+    return [name] * n</code></pre>
+    <p>解读：<strong>（1）</strong>正则解析是部署的硬前提，论文报告 val-unseen 上 100% 有效，但真实文本仍要准备 None 分支。<strong>（2）</strong>展开取整的量化误差最大半步，长距离前进会累积；对精度敏感时可改用连续控制。<strong>（3）</strong>STOP 单独成一步，交给上层门控决定是否真正终止。<strong>（4）</strong>把解析与执行分开，便于在 ObjectNav 适配层替换映射规则。</p>
+
+    <p><strong>片段 3：ObjectNav 适配包装器</strong></p>
+    <pre class="code"><code>class ObjectNavAdapter:
+    TEMPLATE = "Find the {category} in the room."
+
+    def __init__(self, policy, detector, stop_distance=1.0):
+        self.policy, self.detector = policy, detector
+        self.stop_distance = stop_distance
+
+    def act(self, category, obs, video_buffer, depth=None):
+        instruction = self.TEMPLATE.format(category=category)
+        action = self.policy.predict(video_buffer, instruction)
+        if action is None:                              # 解析失败降级
+            return "TURN_LEFT"
+        kind, value = action
+        if kind == "STOP":
+            det = self.detector(obs, category)          # 停止门控
+            dist = det.distance if det else float("inf")
+            if det is not None and dist &lt;= self.stop_distance:
+                return "STOP"
+            return "MOVE_FORWARD"                       # 拒绝停止，继续接近
+        return to_habitat_steps(action)</code></pre>
+    <p>解读：<strong>（1）</strong>类别到指令的模板是适配层最便宜也最敏感的一环，模板措辞要按验证集标定。<strong>（2）</strong>停止门控把 VLN 的 3 m 判据收紧到 ObjectNav 的 1 m，并叠加目标检测，避免模型在语义相似物体前误停。<strong>（3）</strong>门控拒绝停止后强制前进一步，保证不会原地反复询问。<strong>（4）</strong>解析失败降级为旋转，比随机动作更安全，也让 episode 有机会恢复。</p>
+
+    <p><strong>片段 4：专家与非专家轨迹收集</strong></p>
+    <pre class="code"><code>def collect_oracle(env, episodes, policy=None):
+    """收集专家轨迹：视频帧、指令、动作三元组。"""
+    samples = []
+    for ep in episodes:
+        obs = env.reset(ep)
+        video, actions = [], []
+        for step in ep.oracle_actions:                  # 最短路径动作序列
+            video.append(obs.rgb)
+            actions.append(step)
+            obs = env.step(step)
+        samples.append({"video": video, "instruction": ep.instruction,
+                        "actions": actions})
+    return samples
+
+def collect_non_oracle(env, episodes, policy):
+    """用已训练策略跑环境，收集它自己的轨迹（DAgger 思路）。"""
+    samples = []
+    for ep in episodes:
+        obs, video, actions = env.reset(ep), [], []
+        done = False
+        while not done:
+            act = policy.predict(video, ep.instruction)
+            video.append(obs.rgb)
+            actions.append(act)
+            obs, done, _ = env.step(act)
+        samples.append({"video": video, "instruction": ep.instruction,
+                        "actions": actions})
+    return samples</code></pre>
+    <p>解读：<strong>（1）</strong>专家轨迹给「正确做法」，非专家轨迹给「错误恢复」，两者共同覆盖推理时的状态分布。<strong>（2）</strong>非专家收集需要先有一个可用策略，因此训练分两阶段：先专家数据训初始模型，再收集、合并、重训。<strong>（3）</strong>数据格式统一为视频、指令、动作三元组，指令推理辅助任务只需交换输入输出字段。<strong>（4）</strong>采集成本是大头，复现时应先估算场景数与步级样本量的关系。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>停止阈值直接照搬</strong>：症状是仿真成功率虚高、复现偏低。根因是 VLN-CE 用 3 m、真机用 1.5 m、ObjectNav 用 1 m。修复：停止做成「模型输出 + 几何门控」两级，评测时把阈值写进结果表。</li>
+      <li><strong>token 预算失控</strong>：症状是长 episode 显存溢出或延迟飙升。根因是视觉 token 随帧数线性增长（300 帧约 1560 个）。修复：滑窗或降采样历史帧；按 4 个 token 每历史帧配置，避免盲目加到 16（时间 +122%，SR 仅 +1.60%）。</li>
+      <li><strong>只用专家轨迹训练</strong>：症状是仿真尚可、闭环运行迅速偏离。根因是训练分布没有覆盖智能体自己的错误状态。修复：按 DAgger 思路收集非专家轨迹，与专家样本混合训练。</li>
+      <li><strong>去掉共训数据</strong>：症状是模型输出大量不可执行文本，动作合法率骤降。根因是微调破坏了预训练通用能力，LLaMA-VID 的有效动作率从 0% 到 91.3% 正是共训加导航数据的组合结果。修复：保留网页视频问答共训，并在训练日志里单独监控动作合法率。</li>
+      <li><strong>动作参数直接截断</strong>：症状是转向不足或前进不够，轨迹系统性偏短。根因是把带参数动作展开为离散步时向下取整或限制步数。修复：用四舍五入并检查最大展开步数；对长距离动作优先走连续控制通道。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>按每帧 1 个查询 token、历史帧 4 个、当前帧 64 个的配置，计算 T = 20、80、200 帧时的视觉 token 总数，并说明该预算在 8k 上下文模型中的占比风险。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>公式为 5(T−1) + 65：T=20 得 160，T=80 得 460，T=200 得 1060。占比分别为约 2.0%、5.6%、12.9%（按 8k 计）。风险随 episode 变长线性上升，且与指令、输出 token 竞争预算。</div></details>
+      </li>
+      <li>解释为什么「自我视角加文本」只有 23.5% SR，而视频达到 37.4%，并设计一个实验区分「帧数增加」与「视觉编码」两个因素。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>文本历史丢失空间布局与地标细节，视频保留连续视角变化。实验：固定帧数，对照「视频 token」与「同帧转文字描述」两种编码；再固定编码，对照不同帧数。若视频优势在固定帧数下仍存在，则编码形式是主因。</div></details>
+      </li>
+      <li>为 ObjectNav 设计完整的适配层测试方案：类别模板、动作映射、停止门控三个模块各自的单元测试与端到端测试，给出指标与通过标准。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>模板：同义改写下的成功率方差；动作映射：给定参数时的展开步数与误差上界（≤ 半步长）；停止门控：误停率、拒停率与最终 SR。端到端：在 HM3D 验证集固定 episode 集合上对照原始 VLN 口径与 ObjectNav 口径两套报告。</div></details>
+      </li>
+      <li>设计「视频 token 预算 × 性能」的完整实验：帧数取 50、100、200、300，历史 token 数取 1、4、8、16，给出预算公式、评测指标与预期曲线，并说明如何在显存约束下选择配置。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>预算 = 5(T−1) + 65 但历史 token 数变化时改为 (h+1)(T−1) + 65。指标：SR、SPL、每步延迟、峰值显存。预期：SR 随 token 数先快后慢，延迟近似线性；论文的 1 到 4 与 4 到 16 两段斜率可作为先验。选择规则：在显存与延迟硬约束下取边际收益转折点，默认每历史帧 4。</div></details>
+      </li>
+      <li>真机实验里复合指令成功率（47%）不到简单指令（85%）的一半。给出两个可检验的原因假设，并为每个假设设计最小对照实验。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>假设一：多步语言推理错误累积，实验为把复合指令拆成顺序子指令逐条执行，比较 SR；假设二：复合任务轨迹更长、视频 token 预算与视觉漂移放大，实验为固定任务复杂度、只改变轨迹长度，观察 SR 随长度衰减。两个假设可叠加，需交叉设计。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>机制：单目 RGB 视频是唯一观测；每帧 1 个指令查询 token 加若干指令无关 token（历史 4、当前 64）；特殊 token 分隔三段信息；动作以语言输出类型与参数。</li>
+      <li>配方：32 万专家 + 18 万非专家 + 1 万指令推理 = 51 万导航样本，配 76.3 万网页样本共训；24 张 A100 约 28 小时、672 GPU 小时、单轮微调。</li>
+      <li>结果：R2R-CE 37.4% SR / 35.9 SPL，相对 WS-MGMap 的 SR 低 1.5、SPL 高 1.6、NE 低 0.81；RxR 零样本 23.8% SR，相对 A²Nav 高 41.7%；真机总体 66.0%，简单 85.0%、复合 47.0%。</li>
+      <li>机制证据：历史表示从文本 0.0 到视频 37.4；视觉 token 1 到 4 的边际收益最大，4 到 16 只再涨 1.60% 而时间涨 122%。</li>
+      <li>对接：五处接口（目标、动作、停止、记忆、评测）各有转换规则与风险，停止门控与 token 预算是 ObjectNav 场景下最需要加固的两处。</li>
+      <li>下一讲进入 2026 快照 I：SkillNav 用技能注册替代提示词膨胀，LANav 用线性注意力重构策略状态更新，快慢 ReAct 用有界记忆与事件触发重构「何时思考」。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch074.html">← 第 074 讲：VLMnav：VLM 即策略</a>
+    <a class="next" href="ch076.html">第 076 讲：2026 快照 I：技能与状态 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.06 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:11.5px !important;letter-spacing:.06em !important;color:rgba(71,85,105,.45) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#7e8ba0 !important;font-size:11.5px !important;line-height:1.8 !important;text-align:center !important;padding:5px 12px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

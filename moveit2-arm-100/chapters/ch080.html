@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第080章 Action Servers 与 Service Servers 架构 | 机械臂规划学习课程 · ROS2 MoveIt2 运动规划与操作</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第五篇 · 组件详解与系统集成</span>
+    <span class="sep">/</span>
+    <span>第 080 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第五篇 · 组件详解与系统集成</div>
+    <h1>第 080 章：Action Servers 与 Service Servers 架构</h1>
+    <p class="lead">move_group 是由能力插件拼装的服务端：action 与 service 的分工原则、能力插件的加载机制、执行管线的服务端结构，以及终态与并发边界的管理。</p>
+    <ul class="meta">
+      <li>主题：组件详解 / 服务端架构（Server Architecture）</li>
+      <li>关键机制：能力插件（Capability Plugin）/ 接口分工与终态 / 执行管线</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 079 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>掌握 move_group 承载的 action 与 service 清单，能按"长时任务、即时查询、高频数据"三原则为接口选型。</li>
+      <li>理解能力插件机制：capabilities 参数、pluginlib 动态加载、能力与接口的注册关系。</li>
+      <li>掌握执行管线的服务端结构：从 MoveGroup 目标到控制器执行的完整链路与各环节职责。</li>
+      <li>理解 action 终态语义（成功、中止、取消）与客户端的配套处理，掌握并发调用的边界。</li>
+      <li>会查询接口清单、裁剪能力集，并诊断"服务器缺失、接口不匹配、终态不一致"三类故障。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>前面章节从客户端视角调用规划、场景与抓取接口；本章转向服务端：这些接口由谁提供、如何组织、边界在哪里。<strong>move_group 进程本身只是框架，规划、执行、场景与运动学接口由一组能力插件动态装配</strong>，这解释了三个常见现象：为什么接口清单随配置变化、为什么某些接口"理论上应该有"却找不到、为什么同一接口在不同发行版上行为有别。</p>
+    <p>理解服务端结构的直接收益是排障路径：接口调不通时，问题可能在客户端名称、能力配置、插件加载或执行链路，四个层次对应四类证据；理解终态与并发边界则能避免"取消后立即发新目标""并发规划互相排队超时"这类时序故障。</p>
+    <p>本章与上一章的衔接：能力清单与接口行为都由参数决定（第 079 章）；与下一章的衔接：第 081 章讨论客户端调用模式，本章给出的服务端语义正是客户端重试与取消策略的依据。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. action 与 service 的分工</h3>
+    <table>
+      <tr><th>接口</th><th>类型</th><th>职责</th><th>特征</th></tr>
+      <tr><td>MoveGroup（<code>/move_action</code>）</td><td>action</td><td>规划并按选项执行</td><td>长时、可取消、带结果</td></tr>
+      <tr><td>ExecuteTrajectory（<code>/execute_trajectory</code>）</td><td>action</td><td>执行已给定轨迹</td><td>长时、可取消</td></tr>
+      <tr><td><code>/compute_ik</code>、<code>/compute_fk</code></td><td>service</td><td>逆解与正解查询</td><td>即时响应</td></tr>
+      <tr><td><code>/apply_planning_scene</code>、<code>/get_planning_scene</code></td><td>service</td><td>场景写入与读取</td><td>即时响应、有副作用（写入）</td></tr>
+      <tr><td><code>/check_state_validity</code> 类</td><td>service</td><td>状态有效性判定</td><td>即时查询</td></tr>
+      <tr><td><code>/clear_octomap</code></td><td>service</td><td>清空占据地图</td><td>即时、有副作用</td></tr>
+      <tr><td><code>/get_planner_params</code>、<code>/set_planner_params</code></td><td>service</td><td>规划器参数读写</td><td>即时响应</td></tr>
+    </table>
+    <p>选型原则：<strong>有执行时长、需要进度与取消的用 action；即时完成、语义是查询或原子写入的用 service；高频小数据流的用话题</strong>。接口的具体名称与命名空间随部署方式变化（节点是否在命名空间下），核对时以运行中的接口清单为准，记忆固定名称容易产生误判。</p>
+
+    <h3>2. 能力插件机制</h3>
+    <p>move_group 通过 capabilities 参数列出能力插件，插件由 pluginlib 在启动时加载：</p>
+    <div class="formula">
+      capabilities 列表 → pluginlib 查找与实例化 → 各能力注册其 action 与 service
+      <span class="note">每个能力对应一组接口；裁剪列表即裁剪接口面，新增自定义能力可为系统增加新接口而不修改 move_group 本身</span>
+    </div>
+    <p>能力插件化的三个后果：<strong>其一，部署裁剪成为可能</strong>：生产环境移除调试类与不需要的接口，减少暴露面；<strong>其二，接口可用性由配置决定</strong>：服务找不到时先核对能力列表，无须怀疑客户端；<strong>其三，跨版本行为差异有了明确的定位层</strong>：接口存在但行为变化，通常来自能力插件实现的演进。<strong>需要特别记住一点：抓取作业化的 Pickup 与 Place action 定义保留在消息包中，但 MoveIt2 默认能力集不包含对应的作业服务器（第 063 章），"接口在消息库中存在"与"服务端提供该接口"是两件事。</strong></p>
+
+    <h3>3. 执行管线的服务端结构</h3>
+    <p>一次 MoveGroup 目标的服务器端处理链为：</p>
+    <ol>
+      <li><strong>目标校验</strong>：请求合法性、目标约束与初始状态的一致性检查（起点容差在此起作用）。</li>
+      <li><strong>规划</strong>：调用规划管线（插件与适配器组合），在时间预算内搜索轨迹。</li>
+      <li><strong>结果返回</strong>：只规划模式到此结束；执行模式下进入下一步。</li>
+      <li><strong>执行管理</strong>：按控制器映射把轨迹交给控制器管理器，监听控制器状态与轨迹完成事件。</li>
+      <li><strong>执行监控</strong>：时长监控、起点容差、完成确认（第 077 章的参数在此生效），异常触发中止。</li>
+      <li><strong>终态清理</strong>：停止指令发送、释放执行占用、返回终态与错误码。</li>
+    </ol>
+    <p><strong>执行管理与规划层分离是结构上的关键：规划只产出轨迹，执行管理独立负责"把轨迹送出去并确认结果"，因此同一条已规划的轨迹可以直接通过执行 action 重放（第 059 章），无须重新规划</strong>。控制器管理器的实现可以是简单控制器管理器（面向动作接口的控制器）或基于 ros2_control 的路径，二者对上层接口一致，差别在配置与反馈能力。</p>
+
+    <h3>4. 终态与并发边界</h3>
+    <table>
+      <tr><th>终态</th><th>触发原因</th><th>客户端应做的处理</th></tr>
+      <tr><td>成功（SUCCEEDED）</td><td>规划加执行按预期完成</td><td>校验结果字段，进入下一阶段</td></tr>
+      <tr><td>中止（ABORTED）</td><td>规划失败或执行监控触发</td><td>读取错误码分流处置（重规划、换目标、上报）</td></tr>
+      <tr><td>取消（CANCELED）</td><td>客户端请求取消或超时保护触发</td><td>确认取消已生效，恢复场景与手爪状态后重发</td></tr>
+    </table>
+    <p>并发边界由服务器资源决定：<strong>规划与执行占用机械臂的"作业权"，同类请求在服务器内部串行；无副作用的查询类服务可以并发处理。客户端侧的正确姿势是串行化有状态调用，并对"取消"与"新目标"之间保持一次终态确认</strong>：取消请求是异步的，取消被接受不等于执行已停止，直接发送新目标会与旧目标的活动残留竞争资源。终态与错误码的组合（第 063 章）构成完整的失败语义：终态回答"哪一类结束"，错误码回答"具体原因"。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>服务端使用与裁剪的实施步骤：</p>
+    <ol>
+      <li><strong>接口需求清单</strong>：按任务链路列出客户端将调用的 action 与 service，标注用途与频率。</li>
+      <li><strong>能力配置</strong>：核对 capabilities 列表覆盖清单，移除明确不需要的能力。</li>
+      <li><strong>启动自检</strong>：等待关键 action 与 service 在线，缺席即失败快退（片段 1）。</li>
+      <li><strong>客户端纪律</strong>：有状态调用串行化，超时保护走取消路径，终态确认后才发下一个目标。</li>
+      <li><strong>监控</strong>：观察接口占用与排队情况，长时间占用说明规划或执行参数需要调整。</li>
+    </ol>
+    <h3>服务端配置与核对表</h3>
+    <table>
+      <tr><th>项目</th><th>典型值或内容</th><th>作用</th><th>依据</th></tr>
+      <tr><td>capabilities 列表</td><td>按需裁剪的能力集合</td><td>决定暴露的接口面</td><td>生产环境最小化原则</td></tr>
+      <tr><td>接口在线自检超时</td><td>5 s</td><td>启动门禁</td><td>覆盖服务发现时间</td></tr>
+      <tr><td>规划请求超时</td><td>规划预算加 20%</td><td>客户端保护</td><td>防止无限等待</td></tr>
+      <tr><td>执行请求超时</td><td>计划时长乘缩放加余量</td><td>客户端保护</td><td>与执行监控参数一致（第 077 章）</td></tr>
+      <tr><td>并发策略</td><td>有状态串行、查询并发</td><td>资源边界</td><td>机械臂作业权唯一</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：为什么能力插件化比内置全部接口更优？</span>
+      <p>接口面即风险面：每个常驻的 action 或 service 都是潜在资源占用与行为耦合点。插件化让"系统提供什么"由部署配置决定：调试环境加载全套能力便于排查，生产环境只保留任务所需；能力之间通过框架提供的节点句柄协作，升级单个能力不牵动其他部分。代价是配置不完整会导致接口静默缺失，这正是启动自检不可省略的原因。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：启动期接口自检</strong></p>
+    <pre class="code"><code>import rclpy
+from rclpy.node import Node
+from rclpy.action import ActionClient
+from moveit_msgs.action import MoveGroup, ExecuteTrajectory
+from moveit_msgs.srv import GetPositionIK, ApplyPlanningScene
+
+class InterfaceCheck(Node):
+    """启动自检：关键 action 与 service 是否在线。"""
+    def __init__(self):
+        super().__init__("interface_check")
+        # 接口名称与部署命名空间相关：以运行中的清单为准
+        self.move = ActionClient(self, MoveGroup, "/move_action")
+        self.exec_ = ActionClient(self, ExecuteTrajectory, "/execute_trajectory")
+        self.clients = {
+            "/compute_ik": self.create_client(GetPositionIK, "/compute_ik"),
+            "/apply_planning_scene": self.create_client(
+                ApplyPlanningScene, "/apply_planning_scene"),
+        }
+
+    def verify(self, timeout=5.0):
+        missing = []
+        for name, client in self.clients.items():
+            if not client.wait_for_service(timeout_sec=timeout):
+                missing.append(name)          # 服务缺席：能力未加载或名称不符
+        if not self.move.wait_for_server(timeout_sec=timeout):
+            missing.append("/move_action")
+        if not self.exec_.wait_for_server(timeout_sec=timeout):
+            missing.append("/execute_trajectory")
+        return missing</code></pre>
+    <p>解读：<strong>（1）</strong>自检覆盖两类接口：action 用等待服务器的方法，service 用等待服务的方法，两者接口风格不同但语义一致。<strong>（2）</strong>超时 5 s 覆盖服务发现时间；函数返回缺失清单，由调用方决定是终止启动还是降级运行（例如缺少场景写入服务时禁用感知模块）。<strong>（3）</strong>接口名称集中定义在构造函数一处，部署到命名空间时只改这一处；把自检放在启动流程的靠前位置，让"配置缺失"与"运行失败"在日志上可区分。</p>
+
+    <p><strong>片段 2：MoveGroup 目标构造</strong></p>
+    <pre class="code"><code>from moveit_msgs.action import MoveGroup
+from moveit_msgs.msg import MotionPlanRequest
+
+def make_move_goal(group_name, target_constraints, plan_only=False):
+    """构造 MoveGroup 目标：规划请求与执行选项分离。"""
+    goal = MoveGroup.Goal()
+    req = MotionPlanRequest()
+    req.group_name = group_name
+    req.goal_constraints = [target_constraints]
+    req.allowed_planning_time = 2.0          # 单次规划预算（秒）
+    req.num_planning_attempts = 10           # 采样尝试次数
+    req.max_velocity_scaling_factor = 0.3    # 调试期保守缩放（第 077 章）
+    req.max_acceleration_scaling_factor = 0.3
+    goal.request = req
+    goal.planning_options.plan_only = plan_only    # 只规划：先验证再执行
+    goal.planning_options.planning_scene_diff.is_diff = True
+    return goal</code></pre>
+    <p>解读：<strong>（1）</strong>目标由"规划请求"与"执行选项"两部分组成，规划参数（组名、约束、预算、缩放）全部落在请求里，执行与否由选项决定，这一分离让"先规划后决定"成为接口级能力。<strong>（2）</strong>调试期把缩放设到 0.3，与第 077 章的分阶段放量策略一致；这两个字段是客户端最常用的在线调整点。<strong>（3）</strong><code>is_diff</code> 为真表示重启场景以差量方式合并，适合只带局部改动（例如临时放行接触）的目标；全量场景请走场景服务，避免把大对象塞进动作目标。</p>
+
+    <p><strong>片段 3：客户端终态处理</strong></p>
+    <pre class="code"><code>import rclpy
+
+def run_move(node, client, goal, timeout_s=10.0):
+    """发送目标并处理三类终态：成功、中止、取消。"""
+    send = client.send_goal_async(goal)
+    rclpy.spin_until_future_complete(node, send, timeout_sec=timeout_s)
+    handle = send.result()
+    if handle is None or not handle.accepted:
+        return "REJECTED"                    # 目标被拒：服务器忙或请求非法
+    res = handle.get_result_async()
+    rclpy.spin_until_future_complete(node, res, timeout_sec=timeout_s)
+    if not res.done():
+        handle.cancel_goal_async()           # 超时：主动取消，等待终态
+        return "TIMEOUT"
+    status = res.result().status             # 终态码：GoalStatus 常量
+    return {4: "SUCCEEDED", 5: "CANCELED", 6: "ABORTED"}.get(status, "UNKNOWN")</code></pre>
+    <p>解读：<strong>（1）</strong>函数把 action 的三段结构（发送、结果、终态）压缩为单一返回值，调用方按返回值分支即可，避免各处重复实现等待逻辑。<strong>（2）</strong>目标被拒与超时是两类不同的客户端侧问题：前者检查请求合法性与服务器忙状态，后者检查超时设置与规划预算是否匹配。<strong>（3）</strong>超时路径先取消再返回：取消是异步请求，返回前应等待终态确认（生产实现中等待取消结果），否则下一个目标可能与旧目标的活动竞争资源。终态码与错误码配合使用（第 063 章），才能完整定位失败原因。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>接口名称与部署命名空间不匹配</strong>：客户端等待超时，日志显示"服务器不存在"。修复：以运行中的 action 与 service 清单为准核对名称，节点部署到命名空间时统一前缀。</li>
+      <li><strong>能力插件未加载导致接口缺失</strong>：调用的服务不存在，但相关消息类型与文档都表明"应该有"。修复：核对 capabilities 列表与插件安装，用启动自检把缺失在启动期暴露。</li>
+      <li><strong>把消息包中的定义当作服务端能力</strong>：例如按消息库存在 Pickup 定义就调用抓取作业接口（第 063 章）。修复：区分"接口定义存在"与"服务器已提供"，以自检结果为准。</li>
+      <li><strong>取消后立即发送新目标</strong>：旧目标的活动尚未终止，新目标与残留执行竞争，出现轨迹交错或执行拒绝。修复：取消后等待终态确认，再清理并重发。</li>
+      <li><strong>并发调用有状态接口</strong>：多个客户端同时请求规划与执行，服务器内部排队，客户端超时误判为失败。修复：客户端侧串行化，或在接入层实现队列与公平调度。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>为下列操作选择接口形态（action、service 或话题）并说明理由：逆解查询、场景物体写入、轨迹执行、关节状态广播、抓取作业、占据地图清空。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>逆解查询与场景写入、地图清空用 service；轨迹执行与抓取作业用 action；关节状态用话题。判据是时长、可取消性与数据流形态。</div></details>
+      </li>
+      <li>生产环境裁剪 capabilities 列表：列出两个可以移除的能力及收益，两个不建议移除的能力及原因。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>可移除调试类与不使用的规划器接口，收益是暴露面与资源占用下降；不建议移除执行类与场景写入类能力，它们位于任务主链路上，缺失会让任务直接不可用。</div></details>
+      </li>
+      <li>说明 action 三种终态各自的触发条件与客户端配套处理，并给出一条"取消未确认就重发"导致的具体故障序列。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>成功进入下一阶段、中止按错误码分流、取消先确认再恢复；故障序列为：取消请求发出、旧执行仍在减速、新目标被接受并发出轨迹，两条轨迹在控制器处交错或执行被拒绝。</div></details>
+      </li>
+      <li>设计一个自定义能力插件的注册与验证方案：说明它在启动时注册什么接口、如何被 capabilities 参数加载、如何用自检脚本验证，以及裁剪它时的影响面。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>插件实现能力基类并在初始化中注册服务或动作；名称写入 capabilities 列表；验证用片段 1 的自检脚本扩展该接口；影响面分析从客户端调用链出发，确认没有调用方依赖该接口。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>move_group 的接口按三原则分工：长时任务用 action、即时查询用 service、高频数据用话题。</li>
+      <li>接口由能力插件经 pluginlib 动态装配，capabilities 列表决定暴露面，消息定义存在不等于服务端提供接口。</li>
+      <li>执行管线的服务端链路为校验、规划、执行管理与监控、终态清理，规划与执行分离支持轨迹重放。</li>
+      <li>action 三终态配合错误码构成完整失败语义；取消是异步的，重发目标前必须等待终态确认。</li>
+      <li>启动自检覆盖关键接口，缺席即失败快退；下一章转向客户端调用模式，讨论封装层级与调用纪律。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch079.html">← 第 079 章：使用 MoveIt2 的 ROS2 参数体系</a>
+    <a class="next" href="ch081.html">第 081 章：客户端调用模式：Client 接口 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.06 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:11.5px !important;letter-spacing:.06em !important;color:rgba(71,85,105,.45) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#7e8ba0 !important;font-size:11.5px !important;line-height:1.8 !important;text-align:center !important;padding:5px 12px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

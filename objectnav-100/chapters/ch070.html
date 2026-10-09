@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 070 讲｜SG-Nav II：re-perception 纠错 | 目标物体导航课程 · ObjectNav 从探索到开放词汇</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第四篇 · 开放词汇与大模型</span>
+    <span class="sep">/</span>
+    <span>第 070 讲</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第四篇 · 开放词汇与大模型</div>
+    <h1>第 070 讲｜SG-Nav II：re-perception 纠错</h1>
+    <p class="lead">第 069 讲建立了分层 3D 场景图与分层链式推理，也留下一个贯穿所有检测式导航流水线的问题：检测器报出目标类别的假阳性时，传统流水线会停止探索并直接走向该物体，错误不可逆。SG-Nav 的图基重感知机制（graph-based re-perception，Yin 等 2024，arXiv:2410.08189）把纠错写成一条可计算的规则：检测到候选目标后继续接近并从多个视角观察，用检测置信度 C<sub>k</sub> 与场景图子图先验的乘积逐步累积可信度 S<sub>k</sub> = C<sub>k</sub> · Σ<sub>j</sub> P<sub>j</sub><sup>sub</sup> / D<sub>j</sub>，累积和首次越过阈值 S<sub>thres</sub> = 0.8 则接受并导航，超过步数上限 N<sub>max</sub> = 10 仍未越过则放弃并恢复探索。消融显示，加入重感知后三个数据集成功率再提升 3.6、4.3、5.4 个百分点（MP3D、HM3D、RoboTHOR），路径效率则小幅下降，验证过程本身有代价。本讲推导可信度与停止规则、分析阈值的语义与尺度依赖、用实算表格给出跨越步数，并给出投放新环境时的标定流程与失效清单。</p>
+    <ul class="meta">
+      <li>主题：假阳性纠错 / 可信度累积 / 停止规则 / 验证预算</li>
+      <li>关键公式：S<sub>k</sub> = C<sub>k</sub> · Σ<sub>j=1..M</sub> P<sub>j</sub><sup>sub</sup> / D<sub>j</sub>；Σ<sub>i=1..N−1</sub> S<sub>i</sub> &lt; S<sub>thres</sub> ≤ Σ<sub>i=1..N</sub> S<sub>i</sub></li>
+      <li>预计学时：80 分钟</li>
+      <li>前置章节：第 069 讲（SG-Nav I：3D 场景图 + 分层 CoT）</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>会描述：目标检测假阳性的三种来源与“提交即不可逆”的失败链，以及为什么所有检测式 ObjectNav 流水线共享这一问题。</li>
+      <li>会推导：可信度分数 S<sub>k</sub> 的各项含义、量纲与数值边界；停止规则成立的前提（各项非负、累积和单调）与唯一性。</li>
+      <li>会算：给定每步可信度求跨越阈值的步数；验证开销占 500 步预算的比例；论文消融的 SR 增量折算成 episode 数。</li>
+      <li>会读：重感知在三个数据集上的 SR、SPL 与 SoftSPL 增量，效率权衡的方向，以及与场景图联合消融的分账结果。</li>
+      <li>会设计：新环境中的阈值标定流程、参数扫描方案、植入干扰物的验证实验，以及漏检与假阳性两条不同修复路径的分工。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>检测式 ObjectNav 流水线的共同结构是：感知模块输出候选目标，决策模块提交导航目标，执行模块走向它。缺省实现把“首次检测”当作“确认”，这在检测器有假阳性时会带来不可逆的后果：机器人可能横穿整个场景走向一个类别判断错误的物体，消耗数十到数百步，等发现错误时预算已经耗尽；如果停止动作发生在错误物体旁，episode 直接失败。论文的引言指出，此前框架在检测到目标类别的假阳性后不再探索或感知环境，直接导航过去（Yin 等 2024，3.3 节）。这个问题与具体方法无关：CoW 用最近前沿加检测，ESC 与 L3MVN 用 LLM 排序前沿，VLFM 用价值图选前沿，只要检测器参与目标确认，就都可能被假阳性截断探索。</p>
+    <p>SG-Nav 的答案是重感知：场景图已经记录了物体之间的关系与房间上下文，这些结构可用于判断“这个候选目标出现的位置是否合理”；机器人在接近候选目标的过程中本来就移动了视角，多帧观测天然提供复核机会。本讲回答四个问题。第一，可信度怎么算：检测置信度与图先验如何相乘、每个量的量纲与取值范围。第二，什么时候接受或放弃：阈值与步数上限的联合规则，以及规则成立的数学前提。第三，代价是多少：多视角接近使 SR 上升、SPL 效率下降的权衡如何量化。第四，什么修不了：漏检、系统性类别混淆与预算挤压这些边界。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 假阳性的来源与不可逆提交</h3>
+    <p>目标类别的假阳性主要来自三种情形。第一，类别混淆：外观相近的物体被检测成目标类别，论文可视化中把货架（shelf）误判为柜子（cabinet）是典型例子（Yin 等 2024，图 10）。第二，视角不完整：单帧只看到物体的局部，纹理或形状证据不足以区分目标与相似物。第三，干扰物：场景中存在与目标共现概率高但类别不同的物体，检测器在弱光或遮挡下出错。这三种情形的共同点是，多走几步、换几个视角之后，检测置信度与空间合理性都会变化，因此“延迟提交并复核”在信息上是划算的；代价是复核本身占用步数。缺省流水线的问题在于把提交时机固定在第一次检测，放弃了复核信息。</p>
+    <p>重感知的设计目标可以写成一句话：在接近候选目标的过程中持续观察，用一个可累积、可比较、可终止的分数决定接受或放弃。分数要满足三个条件：随证据增加而单调不减，便于定义唯一的一次跨越；对检测器噪声不敏感，单帧波动不应立即翻转结论；能利用场景图已有的结构先验，否则与简单多数投票无异。</p>
+
+    <h3>2. 可信度分数</h3>
+    <p>检测到候选目标后，智能体向它接近并多视角观察。设第 k 次观测时目标检测的置信度为 C<sub>k</sub>，场景图被切成 M 个子图，第 j 个子图到该候选目标的距离为 D<sub>j</sub>，则本次观测的可信度为：</p>
+    <div class="formula">
+      S<sub>k</sub> = C<sub>k</sub> · Σ<sub>j=1..M</sub> P<sub>j</sub><sup>sub</sup> / D<sub>j</sub>
+      <span class="note">C<sub>k</sub> 为该次观测的目标检测置信度；P<sub>j</sub><sup>sub</sup> 为第 j 个子图与目标同现的子图概率；D<sub>j</sub> 为第 j 个子图中心物体与候选目标之间的距离（Yin 等 2024，式 3）</span>
+    </div>
+    <p>三个因子各司其职。C<sub>k</sub> 是感知证据：同一候选目标在不同视角下的检测置信度会变化，若某视角下物体特征与目标类别不符，置信度下降，本次观测的说服力随之下降。图先验 Σ P<sub>j</sub><sup>sub</sup> / D<sub>j</sub> 是空间语义证据：若候选目标位于与目标类别语义相关的子图附近，例如目标为“马桶”而候选出现在浴室子图附近，先验给出正支持；若候选出现在语义不相关的区域，先验的分母与距离结构会压低分数。两个因子的乘积把“看得像”和“放得对”两类证据结合，这是重感知区别于单纯多帧投票的关键。</p>
+    <p>量纲上要看清：C<sub>k</sub> 无量纲，取自检测器；P<sub>j</sub><sup>sub</sup> 是 LLM 输出距离的倒数，量纲 1/m；除以 D<sub>j</sub>（m）后每项量纲 1/m²，求和后 S<sub>k</sub> 的量纲为 m<sup>−2</sup>（本讲实算）。这直接说明阈值 0.8 不是概率，它依赖子图概率的定义方式与场景尺度。用一个算例体会数值：设三类子图先验项分别为 0.5 / 2 = 0.25、0.3 / 4 = 0.075、0.2 / 8 = 0.025，先验和为 0.35；当 C<sub>k</sub> = 0.9 时 S<sub>k</sub> = 0.315，C<sub>k</sub> = 0.5 时为 0.175，C<sub>k</sub> = 0.2 时为 0.07（本讲实算）。检测置信度从 0.9 掉到 0.2，单步可信度降到原来的 22%，多帧累积后差异会被放大。</p>
+
+    <h3>3. 停止规则与单调性</h3>
+    <p>累积规则写作：设 N<sub>stop</sub> 为首次使累积和越过阈值的观测序号，</p>
+    <div class="formula">
+      N<sub>stop</sub> = N，s.t. Σ<sub>i=1..N−1</sub> S<sub>i</sub> &lt; S<sub>thres</sub> ≤ Σ<sub>i=1..N</sub> S<sub>i</sub>，且要求 N<sub>stop</sub> &lt; N<sub>max</sub>
+      <span class="note">论文取值 N<sub>max</sub> = 10，S<sub>thres</sub> = 0.8（Yin 等 2024，式 4 与 4.1 节）；若在 10 次观测内未越过阈值，则放弃该候选目标并恢复探索</span>
+    </div>
+    <p>规则成立的前提是每一项非负：C<sub>k</sub> 取自 [0, 1]，P<sub>j</sub><sup>sub</sup> 取正距离的倒数，D<sub>j</sub> 为正距离，因此 S<sub>k</sub> ≥ 0，累积和随观测非递减。非递减保证“首次越过”的时刻唯一且良定义；否则累积和可能上下穿越，接受判断会出现歧义。为保证非负性，实现上需要两道防护：距离做下界夹取以防除零；LLM 输出的距离做正数解析，非法值回退中性值。这两道防护在片段 2 中给出。</p>
+    <p>阈值算术给出一张可直接用于调参的表。若每次观测的可信度近似为常数 s，接受发生在累积和首次达到 0.8 时，所需步数为 ceil(0.8 / s)；s = 0.4 需 2 步，s = 0.2 需 4 步，s = 0.16 需 5 步，s = 0.1 需 8 步，s = 0.08 恰好 10 步，s = 0.05 在 10 步内无法越过（本讲实算）。等价表述是：规则接受平均每步可信度不低于 0.08 的候选，拒绝持续低于该水平的候选；10 步上限把验证开销限制在 10 / 500 = 2% 的步数预算以内。10 步在动作空间里最多对应 2.5 m 前进或 300° 旋转，实际多视角观察通常是两种动作的混合。</p>
+    <p>为了直观理解阈值在“接受 / 拒绝”边界附近的判别力，可以用一个教学用概率模型做模拟（以下数字为本课程构造的示例，取自参考文献之外，不可当作论文数据）。设单步可信度服从 Beta 分布：真实目标为 Beta(2, 5)（均值 0.286），假阳性分别取 Beta(1, 16)（均值 0.059）、Beta(1, 12)（均值 0.077）、Beta(1, 8)（均值 0.111）。按 10 步累积、阈值 0.8 的规则各模拟 300,000 次，接受率为：真实目标接近 100%（30 万次模拟未出现拒绝），三类假阳性分别为 11.94%、41.32%、84.02%（本讲实算）。这组模拟说明两点：均值远低于 0.08 的候选基本被拒（11.94%），均值略高于 0.08 的候选有一半左右被接受（41.32%），均值更高的候选多数通过（84.02%）。阈值是一个有效的粗筛，但在边界附近并不锐利，实际系统的判别力取决于检测置信度的校准质量与图先验的信息量。</p>
+
+    <h3>4. 实验证据：三个数据集的增量</h3>
+    <p>重感知的消融在多数据集上进行：对比“无重感知但保留场景图”与“完整版”，三个数据集的 SR / SPL / SoftSPL 如下表（Yin 等 2024，表 2）。</p>
+    <table>
+      <tr><th>数据集</th><th>配置</th><th>SR</th><th>SPL</th><th>SoftSPL</th></tr>
+      <tr><td rowspan="2">MP3D</td><td>无重感知（保留场景图）</td><td>36.5</td><td>15.0</td><td>23.9</td></tr>
+      <tr><td><strong>完整版</strong></td><td><strong>40.1</strong></td><td><strong>16.0</strong></td><td><strong>24.9</strong></td></tr>
+      <tr><td rowspan="2">HM3D</td><td>无重感知（保留场景图）</td><td>49.6</td><td>23.6</td><td>33.0</td></tr>
+      <tr><td><strong>完整版</strong></td><td><strong>53.9</strong></td><td><strong>24.8</strong></td><td><strong>33.8</strong></td></tr>
+      <tr><td rowspan="2">RoboTHOR</td><td>无重感知（保留场景图）</td><td>41.9</td><td>22.6</td><td>未报告</td></tr>
+      <tr><td><strong>完整版</strong></td><td><strong>47.3</strong></td><td><strong>23.7</strong></td><td>未报告</td></tr>
+    </table>
+    <p>增量为：MP3D 的 SR +3.6（相对 +9.9%）、SPL +1.0、SoftSPL +1.0；HM3D 的 SR +4.3（相对 +8.7%）、SPL +1.2、SoftSPL +0.8；RoboTHOR 的 SR +5.4（相对 +12.9%）、SPL +1.1（本讲实算）。折算成 episode 数，三个数据集分别约有 79.0、86.0、97.2 条 episode 的聚合差异（2,195 × 3.6%、2,000 × 4.3%、1,800 × 5.4%），这是同一评测集上的聚合差，只能用于量级描述，不能逐条归因。</p>
+    <p>成功率的增量明显大于 SPL 的增量，论文给出的机制解释是：重感知让智能体放弃假阳性目标，直接提升成功率；但验证过程需要先接近目标再多视角观察，路径变长，因此 SPL 的增益被部分抵消（Yin 等 2024，4.2 节）。用效率反推可以直接看到这个权衡：无重感知与完整版的 SPL / SR 分别为 MP3D 41.10% 与 39.90%、HM3D 47.58% 与 46.01%、RoboTHOR 53.94% 与 50.11%，即效率分别下降 1.20、1.57、3.83 个百分点（本讲实算）。RoboTHOR 的下降最大，一种合理解释是场景尺度较小、验证绕行占比更高。读表时要把这两列一起看：重感知用路径效率换成功率，若任务对时间敏感而对成功率要求宽松，则需要重新权衡是否启用。</p>
+
+    <h3>5. 与场景图的联合分账</h3>
+    <p>表 2 的三行配置同时给出两组组件的分账。完整版相对“场景图与重感知都没有”（退化为随机前沿探索）的总增量是 MP3D +14.4、HM3D +15.3、RoboTHOR +12.4；拆开看，场景图单独贡献 MP3D +10.8、HM3D +11.0、RoboTHOR +7.0，重感知在场景图之上再贡献 +3.6、+4.3、+5.4（本讲实算）。两个组件的作用机制不同：场景图改善“去哪里找”的先验质量，重感知改善“看到假的怎么办”的判定流程；前者是收益主体，后者是鲁棒性补丁。这个分账也提示复现顺序：先把图建对，再引入重感知；图质量不达标时，重感知的输入先验本身不可靠，增量会缩水。</p>
+
+    <h3>6. 边界与失效条件</h3>
+    <p>第一，漏检修不了。重感知只处理“检测器报了但报错了”的情形；目标始终未被检测到时，流水线不会进入验证阶段，需要的是提高检测召回、主动查看或更换检测器，两条修复路径不同。第二，系统性类别混淆可能仍然通过。若检测器在多视角下持续把柜子认成目标类别且置信度稳定偏高，图先验也恰好支持该位置（例如目标与柜子经常共现），累积和会越过阈值，错误被接受；论文的失败案例中确有此类情形。第三，LLM 先验可能误导：桥接推理距离时模型也可能给出错误的位置预期，论文把“附近有沙发与电视时高估椅子出现可能”列为失败案例（Yin 等 2024，图 10），这类错误发生在探索阶段，重感知缓解不了。第四，预算挤压：验证消耗的步数计入 episode 的 500 步总预算；目标越晚被检测到，验证与随后的导航越可能耗尽预算，尤其当接受后仍需要长距离行走时。第五，尺度依赖：S<sub>k</sub> 的量纲为 m<sup>−2</sup>，阈值 0.8 与子图概率的定义、场景尺度绑定；把系统迁移到尺度差异大的环境（例如更大户型或换用厘米单位）时必须重新标定，直接沿用会系统性偏松或偏严。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>把重感知落成模块，需要固定四件事：触发条件、评分接口、停止规则参数、放弃后的恢复策略。触发条件是目标类检测首次出现；评分接口需要两路输入，检测置信度与图先验查询；停止规则用累积和与阈值、步数上限三参数；恢复策略包括把被拒绝的目标加入黑名单、恢复前沿探索、保留已走路径的地图信息。</p>
+    <h3>纠错机制对比</h3>
+    <table>
+      <tr><th>机制</th><th>决策依据</th><th>额外代价</th><th>失效模式</th><th>适用条件</th></tr>
+      <tr><td>直接提交（无验证）</td><td>首次检测</td><td>无</td><td>假阳性不可逆</td><td>检测器精度极高或容忍度高</td></tr>
+      <tr><td>固定 N 步多视角投票</td><td>N 帧类别多数</td><td>固定 N 步</td><td>不利用空间先验；N 难自适应</td><td>无场景图可用的流水线</td></tr>
+      <tr><td><strong>可信度累积阈值（论文）</strong></td><td>检测置信度 × 图先验的累积和</td><td>至多 N<sub>max</sub> 步</td><td>阈值尺度依赖；系统性混淆仍可通过</td><td>有场景图且可多视角接近</td></tr>
+      <tr><td>检测器集成</td><td>多检测器投票</td><td>显存与延迟</td><td>共同盲区与共同偏差</td><td>计算资源充足</td></tr>
+      <tr><td>视觉问答复核</td><td>裁剪图像与 VLM 问答</td><td>调用开销</td><td>问答错误传播</td><td>目标外观可语言描述</td></tr>
+    </table>
+    <h3>参数与防护</h3>
+    <table>
+      <tr><th>参数</th><th>论文取值</th><th>作用</th><th>依据与调整方向</th></tr>
+      <tr><td>阈值 S<sub>thres</sub></td><td>0.8</td><td>接受判定</td><td>论文 4.1 节；量纲 m<sup>−2</sup>，换环境先标定</td></tr>
+      <tr><td>步数上限 N<sub>max</sub></td><td>10</td><td>验证预算封顶</td><td>论文 4.1 节；对应 2% 步数预算，调小需同步降阈值或提高单步可信度</td></tr>
+      <tr><td>置信度来源 C<sub>k</sub></td><td>检测器输出</td><td>感知证据</td><td>跨检测器尺度不同，需分别校准或归一化</td></tr>
+      <tr><td>距离下界</td><td>论文未写明</td><td>防除零</td><td>课程实现取 1e-3 m；物理上重合意味着强证据</td></tr>
+      <tr><td>拒绝后策略</td><td>恢复探索</td><td>避免重复验证</td><td>同一候选加入黑名单；保留地图与图结构</td></tr>
+    </table>
+    <h3>植入干扰物的验证实验</h3>
+    <p>验证重感知的净效果，建议用可控干扰物实验补充标准基准：选 20 个场景，每个场景在目标附近与远处各植入一个与目标类别相近的干扰物（例如目标为椅子的场景植入小桌或长凳）；固定出生点，分别跑“无重感知”与“完整版”两组；主指标为成功率与验证开销占比，辅指标为误停率（停在干扰物 1 m 内的比例）与放弃后的恢复成功率。判据是：完整版的成功率增量超过重复实验的波动范围，且误停率显著下降；若成功率不升而验证开销上升，说明阈值在该场景尺度过高或先验不可靠。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>三段代码对应可信度累积与停止判定、图先验的数值防护、候选目标处置与预算记账。接口名为本课程定义的参考实现。</p>
+
+    <p><strong>片段 1：可信度累积与停止规则</strong></p>
+    <pre class="code"><code>def verify_goal_object(graph, robot, target_det, target_text,
+                       s_thres=0.8, n_max=10):
+    """图基重感知：接近候选目标并多视角观察，累积可信度后判定。"""
+    cumulative, n = 0.0, 0
+    while n &lt; n_max and robot.distance_to(target_det.goal_xy) &gt; 1.0:
+        rgb, depth, pose = robot.get_observations()
+        det = detect_target_single(rgb, target_text)   # 本帧目标类检测
+        if det is not None:
+            prior = subgraph_prior(graph, target_det.center)
+            cumulative += det.score * prior            # 式 (3)：C_k 乘图先验
+            n += 1
+            if cumulative &gt;= s_thres:                  # 式 (4)：跨越阈值
+                return True, cumulative, n
+        robot.step_toward(target_det.goal_xy)          # 多视角接近
+    return False, cumulative, n                        # 放弃，回到探索</code></pre>
+    <p>解读：<strong>（1）</strong>循环条件同时包含步数上限与距离条件：到达目标附近仍被拒时循环也退出，避免在目标旁空转；接受判定只在检测到的帧上累加，未检测到的帧不产生可信度。<strong>（2）</strong>prior 对每个候选目标查询一次图先验，若候选位置固定可缓存；若观测过程中候选坐标修正，应重新查询，否则先验与位置脱节。<strong>（3）</strong>返回值带累积和与步数，供上层记账与复盘；没有这两个量，失败分析无法区分“分数不够”与“预算耗尽”。</p>
+
+    <p><strong>片段 2：图先验与数值防护</strong></p>
+    <pre class="code"><code>def parse_probability(distance_text, fallback=0.5):
+    """把 LLM 输出的距离转成子图概率；非法值回退中性值并记录。"""
+    try:
+        dist = float(distance_text)
+        if not math.isfinite(dist) or dist &lt;= 0.0:
+            raise ValueError("non-positive distance")
+        return 1.0 / dist
+    except (TypeError, ValueError):
+        log_bad_llm_output(distance_text)      # 统计解析失败率
+        return fallback                        # 课程约定：按 2 m 中性回退
+
+def subgraph_prior(graph, candidate_center, dist_floor=1e-3):
+    """Σ_j P_sub(j) / D_j：子图概率按到候选目标的反距离加权求和。"""
+    total = 0.0
+    for sub in graph.subgraphs:
+        p_sub = parse_probability(sub.distance_text)
+        dist = euclidean(sub.center, candidate_center)
+        total += p_sub / max(dist, dist_floor)     # 下界防除零
+    return total</code></pre>
+    <p>解读：<strong>（1）</strong>解析函数把“距离转概率”的全部风险集中在一处：非数、零、负数、无穷都在这里拦截，主流程拿到的 P<sub>sub</sub> 始终是正有限值。<strong>（2）</strong>fallback 取 0.5 表示按 2 m 的中性距离处理，这是课程约定的工程回退，论文未给出该细节；换用其他回退值时需在实验记录中注明，因为它直接影响阈值标定。<strong>（3）</strong>距离下界既防除零，也在物理上给出合理极限：候选目标与子图中心重合时，语义证据最强，对应的项取最大值 1 / dist_floor。</p>
+
+    <p><strong>片段 3：候选处置与预算记账</strong></p>
+    <pre class="code"><code>def handle_candidate(robot, state, graph, det, target_text):
+    """候选目标的完整处置：验证、接受则导航，放弃则恢复探索并记账。"""
+    accepted, score, steps = verify_goal_object(
+        graph, robot, det, target_text)
+    state.verify_steps += steps                  # 验证步数计入 episode 预算
+    state.candidates += 1
+    if accepted:
+        navigate_to_detected(robot, det)         # 目标导航阶段
+        return True
+    state.rejected.add(det.track_id)             # 同一目标不再重复验证
+    state.num_rejected += 1
+    state.resume_exploration()                   # 恢复前沿探索
+    return False
+
+def budget_ok(state, travel_distance, max_steps=500):
+    """接受后还需行走距离时的预算检查；步长按 0.25 m 估算。"""
+    remaining = max_steps - state.step_count - state.verify_steps
+    return remaining &gt;= math.ceil(travel_distance / 0.25)</code></pre>
+    <p>解读：<strong>（1）</strong>把验证步数显式记入 state，避免“预算只剩少量步数时仍然开启完整验证”的隐性超支；这是重感知与 episode 步数上限之间最容易忽略的耦合。<strong>（2）</strong>被拒绝的候选进入黑名单，防止检测器再次报出同一物体时反复验证；黑名单按轨迹标识维护，跨 episode 清空。<strong>（3）</strong>budget_ok 是保守下界估算：只计算前进步数，转向与避障另需步数，因此实际阈值应留出余量；把它作为“是否继续验证”的前置检查，可避免接受后走不到的尴尬情形。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>把 0.8 当成校准概率沿用</strong>：症状是换环境后要么大量误接受、要么全部拒绝。根因是 S<sub>k</sub> 量纲为 m<sup>−2</sup>，阈值与子图概率定义、场景尺度、距离单位绑定。修复：新环境先跑标定集，按接受 / 拒绝的错误率重扫阈值；若统一到米制与固定子图概率口径，可减小漂移但不可免除标定。</li>
+      <li><strong>数值防护缺失</strong>：症状是偶发除零、负距离或解析崩溃。根因是 LLM 输出未经校验直接取倒数，或子图中心与候选目标重合。修复：解析层拦截非正与非有限值，计算层加距离下界；本讲片段 2 给出两层防护的参考实现。</li>
+      <li><strong>验证步数不计入预算</strong>：症状是系统看起来更准了，但超时失败增加。根因是 500 步上限包含探索、验证与最终导航全部步数，验证最多占 10 步，但在目标发现较晚时占比激增。修复：在状态机中显式记账，接受前做剩余预算检查；把验证预算与检测时机一起纳入失败分析。</li>
+      <li><strong>把漏检当假阳性处理</strong>：症状是重感知开启后成功率提升有限，漏检场景毫无改善。根因是重感知只在检测发生后才启动，漏检根本不进入验证流程。修复：漏检与假阳性分开统计与修复，前者提高检测召回、调整感知距离与视角策略，后者才用本讲的累积规则。</li>
+      <li><strong>混用两处距离记号</strong>：症状是图先验算出来的数量级与预期不符。根因是式 (2) 的 D<sub>ij</sub> 指前沿中心到子图中心的距离，式 (3) 的 D<sub>j</sub> 指子图中心到候选目标的距离，两者服务不同查询。修复：接口命名区分 frontier_distance 与 candidate_distance，并在单元测试中固定两组基准值。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>按常数可信度模型计算接受所需步数：s 取 0.6、0.3、0.15、0.08、0.05，阈值 0.8、步数上限 10；再把上限改成 5，说明哪些情形会从“晚接受”变为“放弃”。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>ceil(0.8 / s) 分别为 2、3、6、10、16（其中 16 超过上限，判定放弃）。上限降为 5 时，s = 0.15 的候选需要 6 步，无法在预算内接受，会被错误放弃；这等价于把有效接受门槛从均值 0.08 提高到 0.16。</div></details>
+      </li>
+      <li>某场景的三类子图先验项为 0.5 / 2、0.3 / 4、0.2 / 8，先复算先验和；取 C<sub>k</sub> = 0.8 并假设各帧恒定，计算累积接受所需帧数；若换用错误的子图中心使各距离翻倍，帧数如何变化？<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>先验和 0.35，C = 0.8 时单帧 S = 0.28，0.8 / 0.28 = 2.86，需 3 帧（0.84 ≥ 0.8）。距离翻倍使每项 P / D 减半，先验和 0.175，单帧 S = 0.14，需 ceil(0.8 / 0.14) = 6 帧；说明先验查询的位置正确性直接影响验证开销。</div></details>
+      </li>
+      <li>设计植入干扰物的对照实验并给出判定标准：说明干扰物类型、重复次数、主辅指标，以及如何区分“重感知带来增益”与“评测波动”。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>干扰物取与目标外观相近的类别各一（近端、远端）；20 场景 × 固定出生点 × 3 次；主指标为成功率与验证开销占比，辅指标为误停率与放弃后恢复成功率；判定标准为完整版的成功率增量超过重复实验波动范围且误停率下降。若增量全部来自某一场景，需要单列敏感性分析。</div></details>
+      </li>
+      <li>预算核算：某 episode 在第 200 步首次检测到候选目标，距目标 6 m；验证用了 8 步后被接受；按 0.25 m 步长估算，剩余步数是否足够走到目标附近（只算前进，不含转向与避障）？若不够，给出两种处置策略。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>剩余步数 = 500 − 200 − 8 = 292；前进下界为 ceil(6 / 0.25) = 24 步，余量充足。把距离改成 60 m、检测推迟到第 450 步：剩余 42 步，前进下界 240 步，必然超时；策略一，放弃该候选继续探索低风险前沿；策略二，提前在预算检查中拒绝开启验证并直接导航，赌检测正确性，两者都需要用失败率数据评估。</div></details>
+      </li>
+      <li>为一个新环境设计完整的阈值标定与验收流程：说明初始取值、标定集构造、扫描范围、验收指标与报告格式，并包含一个检验尺度依赖性的实验。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>初始值沿用 S<sub>thres</sub> = 0.8、N<sub>max</sub> = 10；标定集为 20 至 30 个已知真值位置的候选目标（含真假阳性）；扫描阈值 0.4 至 1.6、上限 5 至 15；验收指标为假阳性接受率、真阳性接受率与验证开销占比；报告记录每次运行的阈值、上限与两类错误率。尺度检验：把同一场景的距离单位从米改为分米并在解析层统一换算，若阈值含义不变则数值应随单位平方缩放，验证实现与公式一致。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>问题：检测式流水线把首次检测当作确认，假阳性导致不可逆提交；三种来源为类别混淆、视角不完整与弱光遮挡下的干扰物，多视角复核在信息上划算，代价是步数。</li>
+      <li>可信度：S<sub>k</sub> = C<sub>k</sub> · Σ<sub>j</sub> P<sub>j</sub><sup>sub</sup> / D<sub>j</sub>，检测证据与图先验相乘；量纲 m<sup>−2</sup>，数值示例中先验和 0.35、C = 0.9 时 S = 0.315。</li>
+      <li>停止规则：累积和首次达到 S<sub>thres</sub> = 0.8 则接受，10 次观测内未达到则放弃；各项非负保证累积和单调，跨越时刻唯一；等价门槛为平均每步不低于 0.08，验证开销封顶 2% 步数预算。</li>
+      <li>证据：重感知使 SR 提升 MP3D +3.6、HM3D +4.3、RoboTHOR +5.4 个百分点（相对 +9.9% / +8.7% / +12.9%），SPL 提升 +1.0 / +1.2 / +1.1；效率下降 1.20 / 1.57 / 3.83 个百分点，体现“成功率换路径”的权衡。</li>
+      <li>分账：与场景图联合消融的总增量为 +14.4 / +15.3 / +12.4，其中场景图贡献 +10.8 / +11.0 / +7.0，重感知在其上贡献 +3.6 / +4.3 / +5.4；先建对图，再加纠错。</li>
+      <li>边界：漏检与系统性类别混淆修不了，LLM 先验错误发生在探索阶段，验证与导航共享 500 步预算，阈值随尺度漂移需要重新标定。下一讲进入 ConceptGraphs，把开放词汇 3D 场景图做成通用基建，并讨论语言规划如何消费图结构。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch069.html">← 第 069 讲：SG-Nav I：3D 场景图 + 分层 CoT</a>
+    <a class="next" href="ch071.html">第 071 讲：ConceptGraphs：开放词汇 3D 图 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.06 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:11.5px !important;letter-spacing:.06em !important;color:rgba(71,85,105,.45) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#7e8ba0 !important;font-size:11.5px !important;line-height:1.8 !important;text-align:center !important;padding:5px 12px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

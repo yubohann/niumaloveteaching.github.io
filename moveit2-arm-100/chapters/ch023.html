@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第023章 移除与更新碰撞物体 | 机械臂规划学习课程 · ROS2 MoveIt2 运动规划与操作</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 规划场景与碰撞管理</span>
+    <span class="sep">/</span>
+    <span>第 023 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 规划场景与碰撞管理</div>
+    <h1>第 023 章：移除与更新碰撞物体</h1>
+    <p class="lead">场景内容是活的：工件被取走、托盘被搬移、工位重新布局。本章讲移除（REMOVE）、移动（MOVE）、追加（APPEND）的操作语义，两种更新策略的取舍，差分传播路径，以及避免"幽灵物体"堆积的一致性维护方法。</p>
+    <ul class="meta">
+      <li>主题：规划场景生命周期 / 物体更新与清理</li>
+      <li>关键机制：操作语义、场景差分（Diff）传播、批量写入与对账清理</li>
+      <li>预计学时：45 分钟</li>
+      <li>前置章节：第 022 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>掌握碰撞物体的四种操作语义：添加（ADD）、移除（REMOVE）、移动（MOVE）、追加（APPEND），明确每种操作的输入要求与边界。</li>
+      <li>能对比"移除再添加"与"原地移动"两种更新策略的代价与语义差异，并按物体变化频率做出选择。</li>
+      <li>理解场景差分（Planning Scene Diff）的传播机制，知道更新为什么必须确认、确认什么。</li>
+      <li>会设计场景内容的一致性维护（对账）流程，用固定标识集合防止失效物体堆积。</li>
+      <li>能诊断"移除未生效""更新后规划仍按旧几何"两类典型故障。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 022 章把碰撞物体写入规划场景，那只是生命周期的开始。真实工位上的物体不断变化：料箱被取空、工件被取走、托盘在传送带上移动、工装被重新摆放。规划场景中的几何若停留在旧状态，会产生两类后果。第一类是"幽灵障碍"：物体实际已经不在了，规划器仍然绕行它，路径质量下降甚至完全无解；第二类是"过期几何"：物体已经移动或变形，规划器按旧形状计算，生成的轨迹在真机上发生碰撞。</p>
+    <p><strong>场景内容的正确性依赖两条纪律：更新要及时，移除要确认。</strong>本章把碰撞物体当作受生命周期约束的场景资源来讲解：先理清四种操作的语义边界，再讨论两种更新策略在代价上的差异，最后给出防堆积的一致性维护方法。第 024 章将继续下沉一层，解剖 CollisionObject 消息本身的字段设计。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 四种操作的语义边界</h3>
+    <p>对场景的每次写入都带一个操作字段，取值为 ADD、REMOVE、MOVE、APPEND 四者之一。它们的分工如下表：</p>
+    <table>
+      <tr><th>操作</th><th>取值</th><th>需要的输入</th><th>语义</th></tr>
+      <tr><td>ADD</td><td>0</td><td>id、参考系、几何、位姿</td><td>把物体加入世界；对已存在的同名物体，几何数据如何合并属于实现细节，工程上不应依赖</td></tr>
+      <tr><td>REMOVE</td><td>1</td><td>id（几何可缺省）</td><td>从世界移除同名物体，移除后该标识空闲可复用</td></tr>
+      <tr><td>APPEND</td><td>2</td><td>id、几何、位姿</td><td>向已存在的物体追加几何形状，用于多形状组合</td></tr>
+      <tr><td>MOVE</td><td>3</td><td>id、参考系、位姿（几何可缺省）</td><td>只更新已存在物体的位姿，几何保持不变</td></tr>
+    </table>
+    <p>这张表里有三个容易被忽视的事实。<strong>（1）</strong>REMOVE 与 MOVE 只需要标识定位，几何数据不参与定位；给它们附带几何会被忽略，正确性取决于 id 是否与场景中的既有项一致。<strong>（2）</strong>APPEND 与 ADD 的区别在"合并还是新建"：需要在一个标识下表达多块几何（比如一张带四角支柱的工作台）时，APPEND 让改动指哪打哪，也避免重传既有几何。<strong>（3）</strong>重复 ADD 的行为在不同实现版本间存在差异，把它当作"覆盖写入"使用会在升级时埋下行为变化，显式使用 REMOVE 加 ADD 或 MOVE 才能让意图稳定。</p>
+
+    <h3>2. 更新策略：移除再添加与原地移动</h3>
+    <p>几何或位姿发生变化时，有两种标准更新路径，代价差别来自"几何是否需要重建"：</p>
+    <div class="formula">
+      策略 A（通用）：REMOVE(id) 然后 ADD(id, 新几何, 新位姿)，几何与位姿都可变，代价含一次几何构建
+      <br>
+      策略 B（轻量）：MOVE(id, 新位姿)，只更新变换矩阵，代价不含几何重建
+    </div>
+    <p>策略 A 的表达力完整：几何尺寸变了、换成另一种形状，都能通过这一条路径完成。策略 B 只对"刚性物体改变位置"有效，它的写入代价在上表中最低，因为碰撞世界内部只需要更新该物体的空间包围体，不必重建三角形与包围盒层次。<strong>选择准则是物体几何是否变化：几何不变而位置频繁变化（传送带、动态托盘、协作区人体占位盒），用 MOVE；几何本身变化（工件被切削、料箱被取空），用 REMOVE 加 ADD。</strong>对于每秒数十次的跟踪类更新，MOVE 通常是唯一现实的方案；对于每分钟几次的状态切换，策略 A 的清晰语义优先。</p>
+
+    <h3>3. 差分传播：广播的是变化量</h3>
+    <p>场景更新在系统内部的传递单位是差分（Diff）：一次写入产生一条"某个 id 发生了什么操作"的记录，通过场景话题与监视场景话题传播给订阅方。规划场景监视器把差分合并进本地场景副本，RViz 用它驱动显示。差分机制带来两个推论：</p>
+    <ul>
+      <li><strong>更新与可见性之间存在时序间隙。</strong>写入接口返回成功，表示差分已经进入系统并被目标场景确认；其它订阅方的本地副本按各自的订阅节奏刷新，短暂的观察差异属于正常现象。</li>
+      <li><strong>差分可能被节流。</strong>监视场景话题常带发布频率限制，调试时用一次性订阅抓到的快照可能是旧内容。核对场景状态应优先走查询服务，或让程序查询物体清单，避免依赖对话题的肉眼观察。</li>
+    </ul>
+    <p>这解释了一个常见困惑："代码明明执行了移除，规划还是绕行"：规划用的是规划场景监视器本地副本，若移除差分因路径故障未能送达，两者从此刻起永久分叉。<strong>写后确认是防止分叉的唯一手段。</strong></p>
+
+    <h3>4. 一致性维护：对账清理</h3>
+    <p>长期运行的系统里，场景物体清单会缓慢偏离预期：任务被中断导致移除没执行、测试脚本留下了临时物体、感知节点反复用时间戳生成新标识。清理的通用方法是把场景内容当作集合来对账：</p>
+    <div class="formula">
+      G = S<sub>now</sub> - S<sub>expected</sub>
+      <span class="note">S<sub>now</sub> 为场景中当前全部 id 的集合，S<sub>expected</sub> 为本程序负责维护的 id 集合，G 为垃圾集合，逐项移除</span>
+    </div>
+    <p>执行对账的前提是程序始终使用固定、可枚举的标识集合，并在程序内部记录"我添加过哪些 id"。动态感知产生的物体走独立命名前缀（第 034 章展开），与任务物体的标识域分开维护，避免对账时误删其它来源的物体。<strong>标识域划分与固定集合，是场景长期稳定运行的两个支点。</strong></p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>把更新与移除工程化的六个步骤：</p>
+    <ol>
+      <li><strong>建立标识台账</strong>：程序内部维护"用途到 id"的固定映射，所有写入与移除都通过台账取值，消除散落的字符串字面量。</li>
+      <li><strong>按变化频率选策略</strong>：几何不变的高频跟随用 MOVE；几何或形状变化用 REMOVE 加 ADD；批量场景切换用批量接口一次提交。</li>
+      <li><strong>成对操作减少瞬态</strong>：同一 id 的替换尽量放进一次场景差分（多条操作一次提交），让订阅方看不到"缺项"的中间状态。</li>
+      <li><strong>写后确认</strong>：每次批量更新后查询物体清单，核对标识集合与预期一致。</li>
+      <li><strong>周期对账</strong>：按任务节拍执行垃圾集合计算与清理，清理动作同样走确认路径。</li>
+      <li><strong>失败处理</strong>：移除不存在的 id 属于可容忍错误（记录并继续）；计划内物体缺失属于致命错误（中止任务并上报）。两类结果的判定依据来自清单查询。</li>
+    </ol>
+    <h3>更新策略选择表</h3>
+    <table>
+      <tr><th>场景</th><th>变化内容</th><th>推荐策略</th><th>理由</th></tr>
+      <tr><td>传送带上的托盘</td><td>高频位姿</td><td>MOVE</td><td>几何不变，代价最低，频率可到数十赫兹</td></tr>
+      <tr><td>料箱内工件被取走</td><td>几何变化</td><td>REMOVE 加 ADD</td><td>内容改变必须重建几何</td></tr>
+      <tr><td>整工位切换</td><td>批量增删</td><td>批量接口一次提交</td><td>减少与场景服务的往返次数</td></tr>
+      <tr><td>临时调试物体</td><td>一次性</td><td>固定前缀加对账清理</td><td>防止遗留物变成幽灵障碍</td></tr>
+    </table>
+    <p><strong>与上一章的差异点</strong>：第 022 章只讨论"把物体放进去"这一个动作；本章把视角扩展到操作集合与生命周期，重点从消息构造转向时序与一致性。下一章将回到消息本身，逐字段解剖 CollisionObject 的数据组织。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：C++ 单个移除、批量移除与替换模式</strong>（接口以对应 ROS2 发行版与 MoveIt2 版本的官方文档为准）</p>
+    <pre class="code"><code>// 单个移除：只需要 id 与参考系，几何数据不参与定位
+moveit_msgs::msg::CollisionObject gone;
+gone.header.frame_id = "world";
+gone.id = "part_a";
+gone.operation = moveit_msgs::msg::CollisionObject::REMOVE;
+psi.applyCollisionObject(gone);   // 同步接口：提交差分并等待场景确认，返回后可查询
+
+// 批量移除：一次往返处理一组标识，适合工位切换与测试收尾
+std::vector&lt;std::string&gt; stale_ids = { "fixture_left", "bin_upper", "debris_1" };
+psi.removeCollisionObjects(stale_ids);
+
+// 几何变化的替换模式：REMOVE 与 ADD 之间场景短暂缺项
+// 若执行体恰好在中间窗口读取快照，会看到"物体暂不存在"的瞬态
+psi.removeCollisionObjects({ "part_a" });
+// 随后按第 022 章的方式写入新几何的同名物体
+// 需要原子替换时改用一次场景差分携带两条操作（见片段 3）</code></pre>
+    <p>解读：<strong>（1）</strong>REMOVE 消息体是"轻"的，正确性完全落在 id 与参考系两个字段上：id 写错会移除失败或误伤同名单词，参考系字段保持与添加时一致是排错时的第一检查点。<strong>（2）</strong>批量接口减少与场景服务的往返次数，十个物体的清理从十次往返压缩为一次，在紧周期任务里有实际收益。<strong>（3）</strong>替换模式的两步之间存在瞬态窗口，注释点明了它的存在与规避方向：把两条操作放进同一次差分，是并发读取场景时的正确做法。</p>
+
+    <p><strong>片段 2：Python 用 MOVE 跟踪动态托盘</strong></p>
+    <pre class="code"><code>def follow_pallet(self, x, y, z):
+    """让场景中的托盘位姿跟随上位系统给出的实时位置。
+
+    高频更新场景中只发 MOVE：几何数据保持不变，
+    碰撞世界内部只更新该物体的包围体，避免每周期重传与重建网格。
+    """
+    obj = CollisionObject()
+    obj.header.frame_id = "world"
+    obj.id = "pallet_1"                # 必须与场景中已有物体完全一致
+    obj.pose.position.x = x
+    obj.pose.position.y = y
+    obj.pose.position.z = z
+    obj.pose.orientation.w = 1.0       # 单位旋转，托盘保持水平
+    # 操作字段选择 MOVE；若误用 ADD，语义退化为未定义的合并行为
+    obj.operation = CollisionObject.MOVE
+    self.pub.publish(obj)</code></pre>
+    <p>解读：<strong>（1）</strong>MOVE 的代价优势来自它跳过了几何构建：网格物体的三角形与包围盒层次保持原样，只替换变换。对 10 Hz 以上的跟踪更新，这一差异从"可用"变成"不可用"的分界线。<strong>（2）</strong>注释特意标注"不能误用 ADD"：ADD 遇到已存在 id 的合并行为属于实现细节，用它承载高频更新会在版本升级时出现不可预期行为。<strong>（3）</strong>位姿中的位置分量来自上位系统的实时数据，写入前应做量程与突变检查（例如单周期位移超过 0.3 m 时拒绝该帧），防止上游数据异常把障碍物写到错误位置。</p>
+
+    <p><strong>片段 3：Python 用一次场景差分完成原子替换</strong></p>
+    <pre class="code"><code>import rclpy
+from rclpy.node import Node
+from moveit_msgs.msg import CollisionObject
+from moveit_msgs.srv import ApplyPlanningScene
+
+class SceneUpdater(Node):
+    """用一次场景差分原子地完成"移除旧件 + 添加新件"。"""
+
+    def __init__(self):
+        super().__init__("scene_updater")
+        # 同步服务路径：返回结果可判成败，适合替换这类关键写入
+        self.cli = self.create_client(ApplyPlanningScene, "apply_planning_scene")
+        while not self.cli.wait_for_service(timeout_sec=1.0):
+            self.get_logger().info("等待场景服务可用")
+
+    def replace(self, old_id, new_obj):
+        req = ApplyPlanningScene.Request()
+        remove = CollisionObject()
+        remove.header.frame_id = "world"
+        remove.id = old_id
+        remove.operation = CollisionObject.REMOVE
+        # 差分的多条操作在同一次场景更新中处理
+        # 订阅方只会看到"旧的已去、新的已来"这一个结果状态
+        req.scene.world.collision_objects = [remove, new_obj]
+        future = self.cli.call_async(req)
+        rclpy.spin_until_future_complete(self, future, timeout_sec=2.0)
+        result = future.result()
+        return result is not None and result.success</code></pre>
+    <p>解读：<strong>（1）</strong>场景差分的处理是批量的：同一份 PlanningScene 消息里的操作序列在一次更新中生效，这为"替换"提供了原子性的实现手段，消除了片段 1 中两步替换的瞬态窗口。<strong>（2）</strong>服务调用带超时并检查 success，把"写失败"变成了可编程的返回值；主控流程据此决定重试或中止，避免盲目继续规划。<strong>（3）</strong>wait_for_service 放在构造阶段，替换逻辑保持纯粹；若放到每次调用里，服务重启会带来重复等待，拖长任务节拍。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>把重复 ADD 当覆盖写</strong>：加载两个版本的场景脚本，第二个脚本对同名物体用 ADD，期望覆盖第一个。不同实现版本对几何合并的处理存在差异，升级后行为变化。修复是替换一律走 REMOVE 加 ADD 或 MOVE。</li>
+      <li><strong>移除无确认</strong>：话题路径发送 REMOVE 后直接进入下一次规划，差分未送达时规划仍按旧几何运行。症状是"偶然绕行消失的物体"。修复是主控流程改用完整服务路径并核对返回结果。</li>
+      <li><strong>MOVE 承载了几何变化</strong>：工件被切削后尺寸改变，更新代码只发 MOVE。症状是新几何从未生效、检测仍按旧尺寸。修复是几何变化一律 REMOVE 加 ADD，MOVE 只用于刚性移动。</li>
+      <li><strong>标识域混用</strong>：任务物体与感知物体共用普通命名，对账清理时把感知生成的物体一并移除。症状是视觉噪音物体不断被删又不断重建。修复是给不同来源划分命名前缀（任务用 task_、感知用 sensed_），对账只处理自己的区域。</li>
+      <li><strong>垃圾堆积拖慢规划</strong>：每次任务生成带序号的新 id 却从不清除，场景物体数量随运行时长增长，包围体层次更新与碰撞检测候选对数量随之增加。修复是固定 id 集合加周期对账，把物体数量控制在常数级。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>操作选择：一台传送带以 2 m 每分钟的速度搬运料箱，需让规划场景中的障碍物跟随真实料箱。应使用哪种操作？如果料箱中途被取走半箱物料导致几何变化，更新路径变成什么？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>位置跟随用 MOVE；几何变化必须 REMOVE 加 ADD。两者可以共存：同一物体在稳定阶段高频 MOVE，内容变化时做一次替换。</div></details>
+      </li>
+      <li>参数预测：某个动态障碍以 20 Hz 更新。分别估算使用 MOVE 与使用 REMOVE 加 ADD 时，每秒的几何重建次数（网格约含 5000 个三角形）。这个差异对规划节拍意味着什么？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>MOVE 方案每秒重建 0 次；REMOVE 加 ADD 方案每秒重建 20 次，即每秒重新处理约 10 万个三角形构成的空间结构。高频跟踪场景下前者通常是唯一可行的选择。</div></details>
+      </li>
+      <li>设计题：为一条多工位流水线设计场景对账流程，要求写出垃圾集合的判定规则、清理时机与失败处理，并说明如何与感知物体的命名域隔离。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>判定规则用本章公式 G = S<sub>now</sub> - S<sub>expected</sub>；清理时机放在工位切换或任务收尾；失败处理区分"移除不存在"（可容忍）与"计划内物体缺失"（致命）。命名隔离用统一前缀。</div></details>
+      </li>
+      <li>诊断题：代码发送了 REMOVE，RViz 中物体消失，但规划仍绕行该区域。列出至少三种原因与验证方法。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>候选原因：规划场景监视器未收到差分（查询物体清单确认两端状态）；存在同名的第二个物体或附加物体仍在场景中（检查清单与附加物体列表）；规划使用了缓存的旧场景或旧目标（重发规划请求复测）。</div></details>
+      </li>
+      <li>分析题：从订阅方视角分析"REMOVE 与 ADD 分成两次写入"与"一次差分携带两条操作"的差异，说明原子替换在什么场景下是必要的，并给出一个不使用差分也能规避瞬态的替代方案。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>两次写入之间存在中间态，若此时有执行体读取场景快照做碰撞判断，可能误判物体缺失；一次差分让所有订阅方只看到结果态。替代方案：先 ADD 新 id、确认生效后再 REMOVE 旧 id，用"双标识并存"的短暂重叠换取无缺项窗口，代价是两物体短时共存。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>四种操作各有边界：ADD 建立、REMOVE 清除、MOVE 只改位姿、APPEND 追加几何；工程代码不应依赖重复 ADD 的合并行为。</li>
+      <li>更新策略按几何是否变化选择：刚性移动用 MOVE，内容变化用 REMOVE 加 ADD，批量切换用批量接口。</li>
+      <li>场景以差分传播，写入成功与订阅方可见之间存在时序间隙，写后确认是防止场景分叉的唯一手段。</li>
+      <li>一致性维护用对账：固定标识台账加垃圾集合清理，标识域按来源划分。</li>
+      <li>下一章深入消息本身：<strong>CollisionObject 的字段组织</strong>，理解每一层数据结构的设计意图。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch022.html">← 第 022 章：添加碰撞物体</a>
+    <a class="next" href="ch024.html">第 024 章：碰撞物体表示：CollisionObject 消息结构 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.06 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:11.5px !important;letter-spacing:.06em !important;color:rgba(71,85,105,.45) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#7e8ba0 !important;font-size:11.5px !important;line-height:1.8 !important;text-align:center !important;padding:5px 12px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

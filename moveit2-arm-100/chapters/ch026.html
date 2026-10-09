@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第026章 分离附加物体：AttachedCollisionObject | 机械臂规划学习课程 · ROS2 MoveIt2 运动规划与操作</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 规划场景与碰撞管理</span>
+    <span class="sep">/</span>
+    <span>第 026 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 规划场景与碰撞管理</div>
+    <h1>第 026 章：分离附加物体：AttachedCollisionObject</h1>
+    <p class="lead">放下之后物体属于环境：本章讲分离（Detach）动作的语义、分离物去哪里、分离时刻的世界位姿推算、与放置动作的时序配合，以及分离后撤离规划为什么经常在起点"莫名碰撞"。</p>
+    <ul class="meta">
+      <li>主题：抓取场景管理 / 分离与放置</li>
+      <li>关键机制：分离操作、世界位姿推算、标识身份转换、撤离起点校核</li>
+      <li>预计学时：45 分钟</li>
+      <li>前置章节：第 025 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>掌握分离操作的语义边界：分离消息消费哪些字段、附加体如何离开机器人状态、几何是否保留。</li>
+      <li>能推算分离时刻工件的世界位姿，并按需要把它转换为世界物体的位姿写回场景。</li>
+      <li>理解"放置-释放-分离-写回"的时序要求，能说明每种顺序在物理现实与场景表示之间的一致性问题。</li>
+      <li>会识别分离后撤离规划的起点校核问题，并用退让路径或允许碰撞矩阵条目解决。</li>
+      <li>能设计再抓取（Re-grasp）流程中的分离与再附加切换。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 025 章把工件从世界迁入机器人状态，本章处理反向迁移。分离动作本身很简单：一条消息把附加体从机器人状态里移出。真正需要讲清楚的是动作之后的"归属安排"：工件此刻在哪里、以什么身份继续存在于规划场景、后续规划该把它当障碍还是当载荷。这些问题回答错误，会出现一组典型的故障：放置完成后工件从场景中消失，撤离路径直接穿过刚刚放下的工件；或者工件既不在机器人身上也不在世界里，下一轮抓取时规划器对它的存在一无所知。</p>
+    <p>分离还是抓取任务闭环的枢纽：搬运任务以分离收尾，再抓取任务以分离开头。<strong>附加与分离成对出现，两者共同定义载荷在"机器人部件"与"环境物体"两个身份之间的切换点，切换时刻的场景状态必须与物理状态对齐。</strong>本章先讲分离本身的机制，再讲时序、位姿与撤离规划三件事，最后给出再抓取流程的设计方法。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 分离动作：消息字段与执行结果</h3>
+    <p>分离复用附加消息（AttachedCollisionObject），操作字段取移除（REMOVE）。加载对象只需要两个信息：附加体的标识，以及触发动作的操作字段。挂载连杆、接触集合、几何数据在分离时都不参与运算，它们的作用域随附加体一起结束。</p>
+    <p>执行结果有三条需要精确记住。<strong>（1）附加体从机器人状态中消失</strong>，之后的状态快照不再包含它，碰撞检测也不再把它算作机器人部件。<strong>（2）它与 touch_links 的允许碰撞条目同时失效</strong>，接触集合是为附加体建立的临时豁免，分离即撤销。<strong>（3）标识被释放</strong>，该 id 不再指向任何对象，可以在后续写入中重新使用。分离动作到此为止，它不会把物体"顺手放回世界"：物体去向由应用层决定。</p>
+
+    <h3>2. 分离物去向：三种标准安排</h3>
+    <p>分离之后的工件有三种归宿，对应三类任务：</p>
+    <table>
+      <tr><th>去向</th><th>操作</th><th>适用任务</th></tr>
+      <tr><td>回归世界</td><td>按当前世界位姿写回为普通碰撞物体</td><td>放置、装配完成件、缓存摆放</td></tr>
+      <tr><td>再附加</td><td>修改相对位姿或接触集合后重新附加</td><td>换位夹持、翻面、双臂交接</td></tr>
+      <tr><td>清除</td><td>不再写入任何场景数据</td><td>工件移出工作空间（人工取走、落料）</td></tr>
+    </table>
+    <p>三种去向里，"回归世界"承载了大多数工序，它的位姿推算与第 025 章的换算方向相反。分离前，工件世界位姿由运动学链推导：</p>
+    <div class="formula">
+      T<sub>world,payload</sub> = T<sub>world,link</sub>(q<sub>now</sub>) &middot; T<sub>link,payload</sub>
+      <span class="note">分离前在场景只读锁内读取一次，作为写回世界的位姿依据</span>
+    </div>
+    <p>写回时有一个身份设计的选择：沿用原标识，或启用新标识表达新身份（例如 part_a 变为 part_a_placed）。<strong>新标识让"此工件已被放置"这一事实在场景数据中显式存在，便于对账清理与感知去重；沿用原标识则让下游脚本对同一工件连续追踪更容易。</strong>两种策略都成立，关键在于全流程统一，避免同一工件在不同阶段被两套命名同时引用。</p>
+
+    <h3>3. 时序一致性：放置动作与场景切换的配合</h3>
+    <p>物理世界里，工件在夹爪张开的那一刻从"被夹持"转为"被支撑面承载"。场景表示应尽量与这一刻对齐，两种常见时序的取舍如下：</p>
+    <ul>
+      <li><strong>先释放、后分离再写回</strong>：释放确认后做分离与写回，场景短暂保持"工件仍随机器人"的状态，它与物理现实的偏差仅存在于释放与写回之间的短窗口内，且工件通常已由支撑面承托，位姿不再变化，偏差无害。这是放置到台面、料架这类"支撑放置"场景的推荐顺序。</li>
+      <li><strong>先分离与写回、后释放</strong>：适合工件在松手瞬间仍由夹具定位的工序（贴装、插接）的收尾：先把工件的目标位姿写进世界，再松开夹具，场景在全程与真实状态一致。若工件在释放后会因重力下落而场景并未更新，顺序反过来会造成"场景中的工件悬空"。</li>
+    </ul>
+    <p>时序决策的判据只有一条：<strong>任何时刻，场景中的工件位姿若与真实工件相差超过工装公差，就属于状态失配，需要调整顺序。</strong>这条判据也适用于更复杂的工序，例如先轻微退让再写回的操作。</p>
+
+    <h3>4. 撤离规划与起点校核</h3>
+    <p>分离完成后，机械臂还要从放置点撤离。这一步常被当作"空载回位"而草率处理，实际上场景刚刚发生两次身份切换（工件脱离机器人、以新位姿进入世界），撤离规划的起点校核最容易在这里失败。典型现象是：写回世界后立即规划撤离，规划器报告起点自碰撞。原因在于手指仍停在放置位置，与刚写回的工件几何互相接触，而接触集合随分离失效，之前被豁免的手指与工件碰撞对被重新纳入检查。</p>
+    <p>解决方法有三种，按代价从小到大：<strong>（1）</strong>撤离规划前先允许手指连杆与放置物体的碰撞对（在允许碰撞矩阵中为具体连杆与物体标识建立条目），把物理上真实的接触显式豁免；<strong>（2）</strong>把撤离的起点改到"释放后就已微抬"的状态，让手指与工件脱离接触后再规划；<strong>（3）</strong>撤离采用固定小位移的直线退让（不经过采样规划）先离开接触区，再切回正常规划去往下一目标。选择依据是工位对节拍与安全的要求，涉及节拍敏感的场景时第三种最常用。</p>
+
+    <h3>5. 再抓取：分离与再附加的衔接</h3>
+    <p>换位夹持、翻面、双臂交接这类流程，在一个任务内多次跨越身份边界：放下（分离、写回）→ 调整姿态 → 再次接近 → 夹紧（附加）。衔接处有三个纪律：<strong>标识改名或复用要前后一致</strong>，避免写回后的工件与再附加后的工件被两套命名同时引用；<strong>每次再附加都要重新计算相对位姿</strong>，工件相对新挂载连杆的位姿与上一轮无关；<strong>接触集合按新夹持面重新配置</strong>，旧集合随前一次分离失效，沿用旧集合会造成假碰撞或漏检。对可动部件（抽屉、柜门这类带关节的物体），附加体可以携带关节构型，分离消息中的分离姿态字段用于指定部件回到的构型，属于该机制的延伸用法。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>放置收尾的标准流程，每一步都给出确认点：</p>
+    <ol>
+      <li><strong>记录世界位姿</strong>：在场景只读锁内，按世界位姿公式读出待放置工件的当前位置，作为写回依据。</li>
+      <li><strong>释放夹具</strong>：发出夹具打开指令并等待到位反馈，确认工件已由支撑面承载。</li>
+      <li><strong>执行分离</strong>：发送操作字段为 REMOVE 的附加消息，把工件移出机器人状态。</li>
+      <li><strong>写回世界</strong>：以记录的世界位姿新建世界物体，选定标识策略（新标识或复用）。</li>
+      <li><strong>完整性检查</strong>：确认附加体已消失、世界物体已存在，两个条件同时成立。</li>
+      <li><strong>撤离规划</strong>：按第 4 小节的方法处理手指与工件的接触豁免或退让起点，规划并执行撤离。</li>
+    </ol>
+    <h3>分离流程配置要点</h3>
+    <table>
+      <tr><th>环节</th><th>关键动作</th><th>确认手段</th><th>失败处置</th></tr>
+      <tr><td>位姿记录</td><td>只读锁内读取连杆位姿与固定变换</td><td>位姿数值合理性检查（量程、突变）</td><td>放弃写回，保持附加状态并上报</td></tr>
+      <tr><td>释放夹具</td><td>打开指令加到位反馈</td><td>夹具状态通道或时序协议</td><td>重试一次，仍失败则中止收尾</td></tr>
+      <tr><td>分离动作</td><td>REMOVE 消息</td><td>状态快照中附加体消失</td><td>重复分离动作并检验</td></tr>
+      <tr><td>写回世界</td><td>新标识的世界物体</td><td>物体清单中出现新标识</td><td>重发写入并核对位姿</td></tr>
+      <tr><td>撤离规划</td><td>接触豁免或退让起点</td><td>规划成功且路径校验通过</td><td>改用退让策略（方法 3）</td></tr>
+    </table>
+    <p><strong>与上一章的差异点</strong>：第 025 章把世界位姿换算为连杆相对位姿（附加方向）；本章把连杆相对位姿推回世界位姿（写回方向），并新增了时序一致性与撤离起点两类工程问题。两章合起来形成载荷身份的完整切换环。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：C++ 记录世界位姿、分离、写回世界</strong>（接口以对应 ROS2 发行版与 MoveIt2 版本的官方文档为准）</p>
+    <pre class="code"><code>// 第一步：分离前在只读锁内推出工件当前世界位姿
+Eigen::Isometry3d T_world_part = Eigen::Isometry3d::Identity();
+{
+  planning_scene_monitor::LockedPlanningSceneRO scene(planning_scene_monitor);
+  const moveit::core::RobotState&amp; rs = scene-&gt;getCurrentState();
+  const moveit::core::AttachedBody* body = rs.getAttachedBody("part_a");
+  if (body != nullptr)
+  {
+    // T_{world,payload} = T_{world,link} * T_{link,payload}
+    T_world_part = rs.getGlobalLinkTransform(body-&gt;getAttachedLinkName())
+                   * body-&gt;getFixedTransform();
+  }
+}
+
+// 第二步：分离。消息只需标识与操作字段，几何与接触集合随之失效
+moveit_msgs::msg::AttachedCollisionObject detach;
+detach.object.id = "part_a";
+detach.object.operation = moveit_msgs::msg::CollisionObject::REMOVE;
+psi.applyAttachedCollisionObject(detach);
+
+// 第三步：写回世界。位姿来自第一步的记录，标识采用新身份
+moveit_msgs::msg::CollisionObject placed;
+placed.header.frame_id = "world";
+placed.id = "part_a_placed";        // 新标识显式表达"已放置"状态
+placed.primitives.resize(1);
+placed.primitives[0].type = shape_msgs::msg::SolidPrimitive::CYLINDER;
+placed.primitives[0].dimensions = { 0.02, 0.1 };
+placed.primitive_poses.resize(1);
+Eigen::Quaterniond q(T_world_part.rotation());
+placed.pose.position.x = T_world_part.translation().x();
+placed.pose.position.y = T_world_part.translation().y();
+placed.pose.position.z = T_world_part.translation().z();
+placed.pose.orientation.x = q.x();
+placed.pose.orientation.y = q.y();
+placed.pose.orientation.z = q.z();
+placed.pose.orientation.w = q.w();
+psi.applyCollisionObject(placed);</code></pre>
+    <p>解读：<strong>（1）</strong>位姿读取必须在分离之前完成：附加体一经移除，状态里再无这份数据；把读取放进只读锁保证读到的连杆位姿与固定变换出自同一时刻，避免两半数据拼接出错误变换。<strong>（2）</strong>getFixedTransform 返回的正是附加时写入的相对变换，用它乘连杆世界位姿得到世界位姿，这是第 025 章换算公式的逆向使用。<strong>（3）</strong>写回用新标识，让后续对账与感知去重能区分"台上这个工件"与"历史标识"；几何与附加时保持一致，任何修改都应在两处同步并进入评审。</p>
+
+    <p><strong>片段 2：Python 放置收尾的时序编排</strong></p>
+    <pre class="code"><code>def place_and_release(self, place_pose, object_world_pose, part_id):
+    """放置收尾：先释放再分离，最后把物体写回世界。"""
+    # 1) 带载移动到放置位姿并确认到位
+    if not self.move_to(place_pose):
+        return False
+    # 2) 打开夹具并等待到位反馈：确认工件已由支撑面承载
+    self.gripper.open()
+    if not self.gripper.wait_until_open(timeout=2.0):
+        return False        # 未能释放：保持附加状态，交由上层处理
+    # 3) 分离：把附加体移出机器人状态
+    detach = AttachedCollisionObject()
+    detach.object.id = part_id
+    detach.object.operation = CollisionObject.REMOVE   # 分离动作
+    self.attach_pub.publish(detach)
+    # 4) 写回世界：位姿使用规划阶段已知的目标位姿
+    #    直接采用目标值，避免依赖分离瞬间的读数刷新时序
+    world_obj = CollisionObject()
+    world_obj.header.frame_id = "world"
+    world_obj.id = part_id + "_placed"
+    world_obj.pose = object_world_pose     # 放置动作的目标位姿
+    world_obj.operation = CollisionObject.ADD
+    self.world_pub.publish(world_obj)
+    return True</code></pre>
+    <p>解读：<strong>（1）</strong>释放反馈是分离的前置条件：夹具没有真正张开就分离，场景里工件从机器人身上消失，物理上却还夹在爪中，后续规划对它的位置判断全部失真。<strong>（2）</strong>写回位姿使用规划阶段已知的目标值，这份值在下降动作开始前就已核对，用它比读"分离瞬间的当前状态"更可控，也避开了话题路径的刷新时序差异。<strong>（3）</strong>函数以返回值表达收尾成败，失败时保持附加状态、报告上层，把"部分完成"这个危险中间态显式化。</p>
+
+    <p><strong>片段 3：C++ 完整性检查与撤离门禁</strong></p>
+    <pre class="code"><code>// 分离与写回都完成后，才允许规划撤离
+{
+  planning_scene_monitor::LockedPlanningSceneRO scene(planning_scene_monitor);
+  bool still_attached = scene-&gt;getCurrentState().hasAttachedBody("part_a");
+  bool in_world = scene-&gt;getWorld()-&gt;hasObject("part_a_placed");
+  if (still_attached || !in_world)
+  {
+    RCLCPP_ERROR(node-&gt;get_logger(),
+                 "分离或写回未完成（附加=%d，世界=%d），暂缓撤离",
+                 still_attached, in_world);
+    return false;
+  }
+}
+
+// 起点校核失败（手指与刚放置的物体接触）时，为该接触对建立豁免：
+// 仅允许两根手指与这一个物体的碰撞对，范围最小化
+// 按"物体标识与连杆名"的配对置位，替代随分离失效的 touch_links
+acm-&gt;setEntry("part_a_placed", "finger_left", true);
+acm-&gt;setEntry("part_a_placed", "finger_right", true);</code></pre>
+    <p>解读：<strong>（1）</strong>两个条件表达分离收尾的两个半程：附加体消失与物体出现，任一缺失都说明收尾只完成了一半，此时规划撤离去向未定义。<strong>（2）</strong>退出路径选择"暂缓撤离并上报"，因为这属于可以重试修复的状态（重发分离或写回），不值得直接废弃任务。<strong>（3）</strong>接触豁免的粒度是"物体标识与具体连杆"的配对，范围收窄到两根手指，替代附加期间失效的 touch_links；豁免条目的建立与撤销应成对管理，任务收尾时删除，避免长期留存扩大豁免范围。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>只分离不写回</strong>：工件从场景中彻底消失，撤离与后续规划把它当空气，路径直接穿过刚放下的工件。症状是"肉眼可见的碰撞路径被判定为无碰撞"。修复是把写回作为分离流程的必要步骤，并用完整性检查守门。</li>
+      <li><strong>写回位姿取自分离后的读数</strong>：附加体已移除，读取失败或读到默认值，工件被写到原点附近。修复是分离前在锁内记录位姿，或直接采用规划阶段的目标位姿。</li>
+      <li><strong>撤离起点未做校核</strong>：手指仍与放置物接触，接触豁免随分离失效，规划器报告起点自碰撞。修复是按第 4 小节的三种方法处理，优先选退让起点或最小范围豁免。</li>
+      <li><strong>再附加沿用旧接触集合</strong>：换位夹持后触指更换，旧集合不再覆盖新接触面，首次带载检查报假碰撞。修复是每次附加都按当前夹持面重新配置 touch_links。</li>
+      <li><strong>标识引用两套命名共存</strong>：写回用了新标识，下游脚本仍按旧标识查询物体，得到"物体不存在"的判断并重复补写，场景中出现两个重叠工件。修复是制定标识在生命周期各阶段的对照表，全流程单点维护。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>推算练习：分离前测得挂载连杆世界位姿为位置 (0.45, 0.10, 0.25)（单位旋转），固定变换 T<sub>link,payload</sub> 的平移为 (0.0, 0.0, 0.12)。写出写回世界时物体位姿的平移部分，并说明姿态不同方向的差异会额外引入什么计算。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>平移部分为 (0.45, 0.10, 0.37)。若固定变换带旋转，末端的平移要经连杆姿态旋转后再叠加，直接用数值相加只在两种姿态都为单位旋转时成立。</div></details>
+      </li>
+      <li>结果预测：放置流程漏掉了写回步骤，机械臂从放置点撤离并前往下一个目标。分别描述撤离段与下一段规划出现的行为，并指出哪一个更容易被忽视。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>撤离段若远离物体或许侥幸通过；下一段若需经过放置点附近，路径会从物体中穿过被判为无碰撞。后者因为在规划结果中"看起来正常"而更难察觉，需要靠场景内容核对发现。</div></details>
+      </li>
+      <li>设计题：为"贴装-释放-撤离"工序设计时序与失败分支，给出释放确认超时、分离验证失败两种情况下的处置动作，并说明为什么这套工序适合"先写回、后释放"的顺序。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>贴装时工件由夹具定位，先按目标位姿写回世界再松开夹具，场景全程与真实一致；失败分支中释放超时回退到保持附加并重试，写回失败则重发写入并核对物体清单。</div></details>
+      </li>
+      <li>诊断题：分离并写回后，撤离规划报"起点状态自碰撞"。给出至少两种原因与对应的修复手段，并说明为什么该现象在放置到台面后会突然出现。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>原因是手指与刚写回的物体接触、且随分离失效的豁免不再生效；修复可选最小范围 ACM 条目、微抬后的退让起点、直线退让段。放置到台面后工件位姿恰在手指附近，这种现象几乎必然出现。</div></details>
+      </li>
+      <li>分析题：再抓取流程中，"分离-写回-接近-再附加"与"分离-再附加"（不写回世界）两种设计各适合什么场景？从碰撞检测覆盖面、标识管理与故障恢复三个角度比较。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>不写回世界的方案要求中间过渡动作短暂且不经规划；写回方案让物件在接近阶段参与碰撞检测，更安全但引入标识切换。故障恢复上，写回方案状态可查、易对账，再附加方案中间态隐蔽、失败后难判断物体归属。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>分离动作把附加体移出机器人状态，接触集合豁免同时失效，标识被释放；物体去向由应用层决定。</li>
+      <li>分离物有三种归宿：回归世界、再附加、清除；回归世界需要按运动学链推算出世界位姿。</li>
+      <li>放置时序遵循一条判据：场景中工件位姿与真实工件的一致性不得超过工装公差；支撑放置用"先释放后写回"，定位放置用"先写回后释放"。</li>
+      <li>撤离规划前做起点校核，手指与放置物的接触用最小范围豁免或退让起点处理。</li>
+      <li>下一章进入碰撞信息的深水区：<strong>距离场与碰撞距离查询</strong>，从"碰不碰"升级到"离多远、最近在哪"。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch025.html">← 第 025 章：附加物体到机械臂</a>
+    <a class="next" href="ch027.html">第 027 章：距离场与碰撞距离查询 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.06 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:11.5px !important;letter-spacing:.06em !important;color:rgba(71,85,105,.45) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#7e8ba0 !important;font-size:11.5px !important;line-height:1.8 !important;text-align:center !important;padding:5px 12px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

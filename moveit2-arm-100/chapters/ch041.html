@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第041章 规划时间与尝试次数设置 | 机械臂规划学习课程 · ROS2 MoveIt2 运动规划与操作</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第三篇 · 规划算法与求解器</span>
+    <span class="sep">/</span>
+    <span>第 041 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第三篇 · 规划算法与求解器</div>
+    <h1>第 041 章：规划时间与尝试次数设置</h1>
+    <p class="lead">规划器选定之后，调用侧最关键的两个预算参数是允许规划时间（allowed planning time）与尝试次数（number of planning attempts）：本章讲清它们的语义、相互约束关系，以及如何用少量实验定出合理取值。</p>
+    <ul class="meta">
+      <li>主题：规划请求参数 / 时间与次数预算</li>
+      <li>关键机制：终止条件、多起点重启、成功率统计</li>
+      <li>预计学时：45 分钟</li>
+      <li>前置章节：第 040 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解规划调用的终止条件体系：时间上限、尝试次数、规划器内部终止判据三者的关系。</li>
+      <li>掌握 <code>allowed_planning_time</code> 与 <code>num_planning_attempts</code> 在请求层、接口层、配置层的设置位置与默认语义。</li>
+      <li>会用成功率公式 1−(1−p)<sup>N</sup> 估算尝试次数的边际收益，并识别"加次数无效"的情形。</li>
+      <li>会区分规划耗时与执行耗时，理解缩放因子（scaling factor）只影响执行段。</li>
+      <li>能设计一个重复测量实验，标定任务的成功率、时间中位数与尾部行为，据此给出参数取值。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 039、040 章解决了"管线怎么搭、规划器怎么选"的问题；接下来落到调用侧最直接的两个旋钮：给规划器多少时间、允许它重启多少次。这两个参数的取值直接决定规划成功率与响应时间，工程上却常被随手复制模板数值，导致两类典型后果：<strong>把偶发失败误判为无法规划，或者把时间上限调得过大，掩盖了本应换算法的结构性问题。</strong></p>
+    <p>采样规划器（sampling-based planner）带随机性，单次求解的成败本身是随机事件。理解终止条件与重启机制，才能把"能不能规划"从运气问题变成可量化的工程问题。本章结论会直接服务于第 047 章的基准测试与第 060 章的选型调优。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 终止条件体系：三层约束共同生效</h3>
+    <p>一次规划调用的结束条件由三层约束叠加决定。任一层触发，求解即返回：</p>
+    <table>
+      <tr><th>层</th><th>约束</th><th>来源</th><th>触发后果</th></tr>
+      <tr><td>调用层</td><td>允许规划时间（allowed planning time）</td><td>运动规划请求字段</td><td>到点即停，返回失败或已有解</td></tr>
+      <tr><td>调用层</td><td>尝试次数（num planning attempts）</td><td>运动规划请求字段</td><td>次数用尽即停，即使时间还有富余</td></tr>
+      <tr><td>规划器层</td><td>内部终止判据（采样数、迭代数、单次求解时限）</td><td>规划器插件参数</td><td>单次尝试提前结束，管线进入下一次尝试</td></tr>
+    </table>
+    <p><strong>时间预算覆盖整个规划调用，包含请求适配器（request adapter）的执行、规划器求解与后处理。</strong>规划器只看到扣掉前序开销后的剩余时间，因此适配器里昂贵的起点消解（start state collision resolution）会直接侵占规划器的时间份额，这一点在第 042、048 章继续展开。</p>
+
+    <h3>2. 尝试次数：带新随机种子的重启</h3>
+    <p>管线把同一请求交给规划器执行 <code>num_planning_attempts</code> 次；每次尝试使用独立的随机种子（random seed），等价于从不同随机起点重新搜索。对带有自由空间瓶颈的问题，这是提高成功率的直接手段。若单次尝试成功率为 p，独立重复 N 次的联合成功率为：</p>
+    <div class="formula">
+      P(成功) = 1 − (1 − p)<sup>N</sup>
+      <span class="note">p = 0.4、N = 8 时约 98.3%；p = 0.05 时 N = 8 仅约 33.7%，重启收益依赖于单次成功率本身</span>
+    </div>
+    <p><strong>结论：尝试次数只有在单次成功率不低时才有效。</strong>如果 p 低到 0.05 量级，说明瓶颈的结构（窄通道、约束冲突、起点碰撞）需要优先处理，加次数属低效路径。</p>
+
+    <h3>3. 时间投入与解的质量：区分三类规划器</h3>
+    <p>时间预算对不同类型的规划器含义不同：</p>
+    <ul>
+      <li><strong>首解型</strong>（如 RRTConnect）：找到第一条可行路径立即返回，追加时间不改善解，只服务"这一次没找到"的重试。</li>
+      <li><strong>渐近最优型</strong>（如 RRTstar）：解随时间持续改善，时间越长代价（路径长度、平滑度）越低，属于任意时间（anytime）算法。</li>
+      <li><strong>优化型</strong>（如 CHOMP、TrajOpt）：在给定初值上迭代降低代价函数，时间上限决定迭代轮数，解质量与时间近似单调相关。</li>
+    </ul>
+    <p>采样求解时间呈重尾分布（heavy-tailed）：多数问题在数百毫秒内解决，少数需要数秒。这种分布下，<strong>用一次测量的耗时描述规划器性能没有意义，必须看分布的分位数</strong>，如中位数与 P90。</p>
+
+    <h3>4. 规划时间与执行时间：两套时钟</h3>
+    <p>规划时间度量求解器的工作量；执行时间由轨迹的时长决定，受速度缩放与加速度缩放影响。两者没有换算关系：一条耗时 2 s 规划出的轨迹可能执行 8 s，也可能只需要 1.5 s。<strong>调优时先问清优化目标是"响应延迟"还是"节拍时间"，两者的参数旋钮不同。</strong>响应延迟看规划侧预算与成功率；节拍看执行侧缩放因子与轨迹平滑度。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>合理取值的流程是：先建立基线（baseline），再做边际实验，最后固定参数。步骤清单如下：</p>
+    <ol>
+      <li><strong>定义问题集</strong>：选 5 到 10 个有代表性的规划请求（自由空间、近障、窄通道各数条），记录起点、目标与场景版本。</li>
+      <li><strong>测量基线</strong>：每条请求重复 30 到 50 次，统计成功率、时间中位数、P90 与最大值。</li>
+      <li><strong>参数扫描</strong>：把时间从 0.5 s 起按 0.5 s 阶梯升到 3 s，尝试次数取 1、5、10、20，观察成功率曲线何时进入平台段。</li>
+      <li><strong>定位瓶颈</strong>：若平台期成功率仍低，检查起点合法性、约束冲突与 IK 可用性（进入第 049 章流程）。</li>
+      <li><strong>固定参数</strong>：取平台期的下限值，给响应时间留出余量。</li>
+    </ol>
+    <h3>参数总览</h3>
+    <table>
+      <tr><th>参数</th><th>典型默认</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td><code>allowed_planning_time</code></td><td>5.0 s（接口默认，随版本不同）</td><td>整个规划调用的时间上限</td><td>按成功率平台期设定，自由空间 0.5 到 1.5 s，复杂场景 2 到 5 s</td></tr>
+      <tr><td><code>num_planning_attempts</code></td><td>不同接口默认 1 或 10</td><td>规划器重启次数</td><td>单次成功率 0.3 到 0.8 时取 5 到 10</td></tr>
+      <tr><td><code>max_velocity_scaling_factor</code></td><td>0.1（模板常见值）</td><td>执行速度缩放</td><td>影响执行时长，不影响规划耗时</td></tr>
+      <tr><td><code>max_acceleration_scaling_factor</code></td><td>0.1（模板常见值）</td><td>执行加速度缩放</td><td>与速度缩放共同决定时间参数化结果</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：默认值为什么不能照抄</span>
+      <p>各类模板给出的默认值面向"能跑通"，不面向"响应时间与成功率的平衡"。自由空间任务若保留 5 s 上限，失败请求会把响应延迟拖到 5 s 量级；窄通道任务若沿用 0.5 s 上限，成功率可能长期停在 60%。<strong>取值应由本任务的成功率曲线决定并显式写入配置，不依赖默认值。</strong></p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：Python 侧设置预算并测量分布（moveit_commander 风格）</strong></p>
+    <pre class="code"><code>import time
+import statistics
+import rclpy
+from moveit_commander import MoveGroupCommander  # 接口随发行版演进，以官方文档为准
+
+rclpy.init()
+arm = MoveGroupCommander("arm_group")
+
+# 显式写出两个预算参数，避免继承接口默认值带来的不可复现行为
+arm.set_planning_time(1.5)         # 时间上限：覆盖适配器、规划器与后处理的总墙钟
+arm.set_num_planning_attempts(8)   # 每次尝试带独立随机种子，等价于 8 次重启
+
+arm.set_joint_value_target([0.4, -0.6, 0.8, -0.5, 0.6, 0.0])
+
+# 重复 30 次测量：采样求解呈重尾分布，单次耗时无法代表性能
+wall = []
+ok = 0
+for _ in range(30):
+    t0 = time.perf_counter()
+    success = arm.go()             # 真实项目中先 plan 再 execute，这里聚焦规划耗时
+    wall.append(time.perf_counter() - t0)
+    ok += 1 if success else 0
+print(f"成功率 {ok / 30:.2f}，中位数 {statistics.median(wall):.3f} s")</code></pre>
+    <p>解读：两个 <code>set</code> 调用对应请求层的两个字段，先显式设定再测量，保证结论可复现。<strong>循环里统计的是墙钟时间；响应字段 planning_time 只记录规划器内部耗时，两者差值即适配器与后处理开销</strong>，这在第 048 章会作为分项诊断量使用。第 6 行的目标只给关节值，是为了把瓶颈限定在规划侧；若使用位姿目标，IK 失败会混入统计，需要先单独验证可达性。</p>
+
+    <p><strong>片段 2：C++ 侧按剩余预算递减规划，构成服务级降级策略</strong></p>
+    <pre class="code"><code>#include &lt;moveit/planning_interface/planning_interface.h&gt;
+#include &lt;chrono&gt;
+
+  // 上层服务要求"总响应不超过 2 s"：按预算降级，避免单次调用拖满时间
+bool plan_with_budget(moveit::planning_interface::MoveGroupInterface&amp; mg,
+                      moveit::planning_interface::MoveGroupInterface::Plan&amp; plan)
+{
+  const double total_budget = 2.0;      // 服务允许的总时间（秒）
+  double spent = 0.0;
+  double attempt_budget[3] = {0.5, 0.7, 1.0};   // 三次尝试分配的时间单价
+
+  for (double t : attempt_budget)
+  {
+    if (spent + t &gt; total_budget)       // 剩余预算不足则提前结束，保证响应承诺
+      break;
+    auto t0 = std::chrono::steady_clock::now();
+    mg.setPlanningTime(t);              // 本次尝试的时间上限
+    mg.setNumPlanningAttempts(1);       // 外层循环自行掌握重启次数
+    bool ok = (mg.plan(plan) == moveit::core::MoveItErrorCode::SUCCESS);
+    spent += std::chrono::duration&lt;double&gt;(std::chrono::steady_clock::now() - t0).count();
+    if (ok)
+      return true;                      // 首解即返回：薄延迟优先场景的常用策略
+  }
+  return false;
+}</code></pre>
+    <p>解读：把总时间预算放在服务层掌握、逐次尝试递增时间，是响应敏感场景的常见模式。数组形式便于按经验裁剪上限。<strong>每次循环把尝试次数重置为 1</strong>：重启由外层循环承担，语义与请求层多尝试等价，单次耗时可控可测；代价是失去管线内部的尝试汇总，取舍取决于是否需要逐次日志。</p>
+
+    <p><strong>片段 3：规划器配置文件中的时间与次数</strong></p>
+    <pre class="code"><code># ompl_planning.yaml（随发行版差异，字段以官方模板为准）
+planning_plugins:
+  - ompl_interface/OMPLPlanner
+request_adapters: &gt;-
+  default_planner_request_adapters/AddTimeParameterization
+  default_planner_request_adapters/FixWorkspaceBounds
+  default_planner_request_adapters/FixStartStateBounds
+  default_planner_request_adapters/FixStartStateCollision
+  default_planner_request_adapters/FixStartStatePathConstraints
+planner_configs:
+  RRTConnect:
+    type: geometric::RRTConnect
+    range: 0.0          # 0 表示由 OMPL 依据状态空间范围自动选择扩展步长
+  RRTstar:
+    type: geometric::RRTstar
+    range: 0.0          # 渐近最优：时间越长解越好，与首解型规划器语义不同
+    goal_bias: 0.05
+arm_group:
+  default_planner_config: RRTConnect
+  planner_configs:
+    - RRTConnect
+    - RRTstar</code></pre>
+    <p>解读：配置文件负责"能力清单"，请求字段负责"本次预算"，两者分工明确。<code>range: 0.0</code> 让扩展步长随状态空间自动缩放，比硬编码数值更稳健；<code>goal_bias</code> 提高朝目标方向的采样概率。此处列出 RRTstar 用于对照第 3 节的结论：<strong>渐近最优型规划器的解随时间改善，首解型不会；选参数前先明确要低延迟还是高质量。</strong></p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>尝试次数大而时间上限小</strong>：每次尝试被截断在很小的份额内，成功率反而低于"少次数、每次给足时间"。症状是失败日志里每次尝试都在极短时间内报错。修复：按 <code>时间上限 / 尝试次数</code> 核算单次份额，保证不低于 0.2 s。</li>
+      <li><strong>把适配器耗时当规划器耗时</strong>：起点处于碰撞时，FixStartStateCollision 会消耗大量预算，规划器实际可用时间远低于设定值。修复：先修正起点状态，或按下章方式调整适配器链。</li>
+      <li><strong>用执行返回时间评价规划性能</strong>：<code>go()</code> 类接口把规划与执行串联，返回耗时包含运动执行。修复：性能实验一律使用 plan-only 路径或响应中的 <code>planning_time</code> 字段。</li>
+      <li><strong>调大时间上限掩盖结构性问题</strong>：目标位姿不可达、约束互相冲突时，时间上限再大也只会稳定超时。修复：先用状态有效性与 IK 检查（第 049 章）区分"难"与"不可能"。</li>
+      <li><strong>同一实验混用不同随机序列</strong>：只测少数几次就对比两个配置，结论由随机波动主导。修复：每条配置重复 30 次以上，比较中位数与成功率，单次耗时不足为据。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>单次尝试成功率 p = 0.25，尝试次数 N 取多少时联合成功率首次超过 95%？写出计算过程。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>解 1−0.75<sup>N</sup> ≥ 0.95，即 0.75<sup>N</sup> ≤ 0.05。N = 11 时约 95.8%，N = 10 时约 94.4%。结论是 11 次，同时要核算总时间预算是否覆盖 11 次尝试。</div></details>
+      </li>
+      <li>把某任务的时间上限从 1 s 提到 3 s，成功率从 72% 升到 74%，中位数从 0.35 s 升到 0.8 s。预测继续提到 6 s 的收益，并给出最终取值建议。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>成功率已进入平台段，边际收益约为 1 到 2 个百分点，而中位数随上限线性恶化。建议取 1 到 1.5 s，并把改善成功率的手段转向尝试次数或规划器选择。</div></details>
+      </li>
+      <li>写一个参数扫描脚本：固定场景集，扫描时间上限 {0.5, 1.0, 2.0, 3.0} 与尝试次数 {1, 5, 10}，输出成功率-时间二维表。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>外层循环遍历组合，内层对每条请求重复 30 次；记录成功率、中位数、P90。注意每组开始前重建规划场景，避免上一次规划残留的状态污染统计。</div></details>
+      </li>
+      <li>设计一个实验，区分"规划慢"的三个来源：适配器开销、碰撞检测开销、采样搜索开销。写出测量量与判据。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>测量墙钟时间与响应中 planning_time 的差值（适配器与后处理）；用状态有效性检查单独计时（碰撞检测）；再用不同复杂度场景对比同一规划器的求解时间变化（采样搜索）。三项对照即可定位主因，细节见第 048 章。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>规划调用受三层终止条件约束：调用层时间上限、调用层尝试次数、规划器内部判据；任一触发即返回。</li>
+      <li>时间预算覆盖整个规划调用，适配器开销先占用预算，规划器只见到剩余量。</li>
+      <li>尝试次数等价于带新随机种子的重启，收益由 1−(1−p)<sup>N</sup> 决定；单次成功率低时应先解决结构问题。</li>
+      <li>首解型、渐近最优型、优化型规划器对时间的响应不同，调参前先明确目标：低延迟还是高质量。</li>
+      <li>性能结论必须基于分布：中位数与 P90，样本量不少于 30，规划耗时与执行耗时分开统计。</li>
+      <li>下一章进入请求进入规划器之前的处理链：<strong>规划请求适配器</strong>，理解起点修复、约束解析与时间参数化各由谁完成。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch040.html">← 第 040 章：规划器选择：OMPL 规划算法族</a>
+    <a class="next" href="ch042.html">第 042 章：规划请求适配器 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.06 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:11.5px !important;letter-spacing:.06em !important;color:rgba(71,85,105,.45) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#7e8ba0 !important;font-size:11.5px !important;line-height:1.8 !important;text-align:center !important;padding:5px 12px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

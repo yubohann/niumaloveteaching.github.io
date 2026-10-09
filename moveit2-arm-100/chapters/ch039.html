@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第039章 规划管线 Planning Pipeline 结构解析 | 机械臂规划学习课程 · ROS2 MoveIt2 运动规划与操作</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第三篇 · 规划算法与求解器</span>
+    <span class="sep">/</span>
+    <span>第 039 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第三篇 · 规划算法与求解器</div>
+    <h1>第 039 章：规划管线 Planning Pipeline 结构解析</h1>
+    <p class="lead">打开规划请求处理的黑盒：请求从接口进入到轨迹从接口返回，中间经过规划器选择与两组适配器链。本章解析这条管线的结构、各环节职责与参数化方式。</p>
+    <ul class="meta">
+      <li>主题：规划管线架构 / 适配器机制</li>
+      <li>关键机制：请求适配器预处理、规划器插件接口、响应适配器后处理</li>
+      <li>预计学时：50 分钟</li>
+      <li>前置章节：第 038 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解规划管线（Planning Pipeline）在 MoveIt2 架构中的位置：它连接用户接口与规划器插件，是请求的预处理与结果后处理的中枢。</li>
+      <li>掌握请求适配器链（Request Adapters）的成员与职责：起点修正、工作空间补齐、约束参考系解析等，理解链式处理的顺序语义。</li>
+      <li>掌握响应适配器链（Response Adapters）的职责，明确时间参数化为什么位于响应的处理阶段。</li>
+      <li>理解规划器插件的加载与选择：管线、规划器标识与规划配置三个层次的关系。</li>
+      <li>会读取管线配置并独立使用规划管线接口完成一次生成计划调用。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第二篇的规划调用以"提交请求、收到轨迹"的抽象形式出现，这段黑盒内部其实有一条明确的流水线：请求先经过一组预处理适配器修正，再交给具体规划器求解，结果经过一组后处理适配器修饰后返回。理解这条流水线是排障与选型的分界线：规划无解时，问题可能出在请求被适配器改写（起点被修正、工作空间被补齐）、可能出在规划器本身（算法与参数），也可能出在后处理（时间参数化失败或平滑越界）。没有管线视图，这三类原因混在一起无从区分。</p>
+    <p>从本章起进入第三篇"规划算法与求解器"。建议的阅读顺序正是管线的数据流方向：先看请求如何被修正（本章与第 041、042 章），再看规划器算法族（第 040、043 至 046 章），然后看结果如何被参数化与验证（第 043 章之后的轨迹处理），最后看整体基准与调优（第 047 至 049 章）。<strong>管线是第三篇的地图，后续每一章都在为这张地图上的某个节点填细节。</strong></p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 管线的三段结构</h3>
+    <p>规划管线把一次规划请求的处理固定为三段：请求适配器链、规划器求解、响应适配器链。请求适配器在进入规划前逐项检查并修正请求，规划器按算法在场景上搜索路径，响应适配器对结果做统一的修饰。三段串行执行，任何一段失败都会返回结构化错误码与说明：</p>
+    <div class="formula">
+      MotionPlanRequest &rarr; [请求适配器链] &rarr; [规划器插件] &rarr; [响应适配器链] &rarr; MotionPlanResponse
+      <span class="note">适配器链按配置顺序串行调用；规划器来自插件，按规划器标识选择</span>
+    </div>
+    <p>三段结构的工程意义是把"公共修正"从规划器内部剥离。<strong>起点修复、参考系解析这类逻辑与算法无关，放在适配器里实现一次，所有规划器共享；时间参数化与平滑同理，放在响应侧统一执行。</strong>规划器因此专注于搜索本身，插件接口保持窄而稳定。</p>
+
+    <h3>2. 请求适配器链：把请求修正到可求解状态</h3>
+    <p>请求适配器的共同目标是把"用户表达的请求"变成"规划器能可靠求解的请求"。常见成员的职责如下表：</p>
+    <table>
+      <tr><th>适配器</th><th>职责</th><th>触发条件</th><th>副作用</th></tr>
+      <tr><td>FixStartStateBounds</td><td>把越界的关节值夹回允许范围</td><td>起点超出关节限位</td><td>起点被微小修改，与真实状态产生偏差</td></tr>
+      <tr><td>FixWorkspaceBounds</td><td>为工作空间包围盒补齐缺省值</td><td>请求未给出工作空间范围</td><td>默认范围可能小于实际活动范围</td></tr>
+      <tr><td>FixStartStateCollision</td><td>起点碰撞时在小邻域内搜索可行状态</td><td>起点与场景碰撞</td><td>起点被替换，规划与实际状态脱节</td></tr>
+      <tr><td>FixStartStatePathConstraints</td><td>起点不满足路径约束时搜索满足约束的状态</td><td>起点违反路径约束</td><td>同上，且修正难度更高</td></tr>
+      <tr><td>ResolveConstraintFrames</td><td>把约束的参考系解析转换到模型参考系</td><td>约束使用外部参考系</td><td>变换一次的静态代价</td></tr>
+      <tr><td>ValidateWorkspaceBounds</td><td>校验工作空间包围盒有效</td><td>常与补齐配对使用</td><td>无效时直接拒绝请求</td></tr>
+    </table>
+    <p>链式处理有两种需要明确的语义。<strong>（1）顺序敏感：</strong>修正类适配器会改写请求，后续适配器看到的是改写后的版本；把"起点修正"放在"约束检查"之后会让约束检查对未修正的起点做判定，产生不一致的结论，因此修正类适配器通常排在检查类之前。<strong>（2）修正的代价：</strong>适配器把"失败"变成"带偏差的继续"，起点被替换后规划轨迹从修正后的状态出发，与实际状态之间的偏差由执行层的起点容忍度兜底（第 014 章）。修正幅度应当被监控，频繁触发说明状态来源或场景存在问题，属于上游信号，不应记作管线自身的功劳。</p>
+
+    <h3>3. 规划器插件：管线内的算法选择</h3>
+    <p>段内求解由一个规划器插件承担，插件按规划器标识选择。三个层次的关系要分清：<strong>管线（Pipeline）</strong>是一套适配器链加插件类型的配置组合（如 OMPL 管线、工业运动管线）；<strong>规划器标识（Planner ID）</strong>是具体算法或配置的名字（如 RRTConnect、RRTstar）；<strong>规划配置（Planner Config）</strong>是某个标识背后的参数集合（如延伸步长、目标偏置）。选择逻辑通常是"请求携带规划器标识，管线把标识解析到本管线加载的规划器实例"。标识不属于本管线时请求返回错误，这类错误提示"planner not found"，与"找不到解"是两类不同的失败，排障方向也不同。</p>
+    <p>一个系统可以配置多条管线并存（例如 OMPL 与工业运动规划管线），按任务类型切换：自由空间绕行任务用采样管线，直线与圆弧等工艺动作走工业运动管线（第 046 章）。<strong>管线之间的差异在适配器链与算法族，不在接口：请求与响应的消息结构保持一致，上层任务代码的改动仅限于选择标识。</strong></p>
+
+    <h3>4. 响应适配器链：把几何路径变成可执行轨迹</h3>
+    <p>采样规划器输出的本质是一条几何路径：路点序列描述了"经过哪些构型"，没有时间信息。响应适配器链补上执行所需的一切：</p>
+    <ul>
+      <li><strong>时间参数化（Time Parameterization）：</strong>为每个路点计算时间戳、速度与加速度，受关节速度加速度限制约束。它把几何路径提升为可执行轨迹，是响应链上最关键的成员。</li>
+      <li><strong>轨迹平滑（Smoothing）：</strong>对采样痕迹明显的路径做修形（迭代样条或平滑器等实现），保持可行性的前提下改善速度连续性与机械表现。</li>
+      <li><strong>校验与截断：</strong>部分实现附带可行性复核与超限截断，作为对时间参数化结果的最后检查。</li>
+    </ul>
+    <p>时间参数化放在响应侧是语义决定的：几何搜索先于时间分配，速度约束不应影响搜索树生长（否则会把运动学的非线性引入采样过程）。<strong>各发行版在这条链上的组织经历过迁移：较早版本把时间参数化列为请求适配器，较新版本将其归入响应适配器；做配置移植时以目标版本的模板为准。</strong></p>
+
+    <h3>5. 管线参数化与可观测性</h3>
+    <p>管线的行为完全由参数决定：加载哪些插件、适配器链的内容与顺序、各规划器的配置参数。这些参数挂在移动组节点的命名空间下，按管线分组组织。可观测性的最小要求有三项：<strong>启动日志确认插件与适配器加载成功；运行日志记录每次请求所用管线与规划器标识；参数查询能读出当前生效的完整配置。</strong>三项缺失任何一项，行为差异都会变成"玄学问题"：明明换了配置，系统行为不变；或者行为变了，却说不清哪项参数在起作用。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>配置与使用规划管线的步骤：</p>
+    <ol>
+      <li><strong>确定管线集合</strong>：按任务类型列出需要的管线（采样避障、工艺动作、优化类），每类一条。</li>
+      <li><strong>装配适配器链</strong>：从模板出发裁剪请求与响应链，确认顺序（修正类在前、检查类在后），核对每个适配器的参数项。</li>
+      <li><strong>配置规划器</strong>：为每条管线的各组注册规划器标识与配置参数，指定默认项（第 040、041 章展开）。</li>
+      <li><strong>启动自检</strong>：在启动流程中校验插件加载与适配器数量，把失败拦截在任务之前。</li>
+      <li><strong>请求路径</strong>：任务代码按管线标识加规划器标识提交请求；两种标识的含义分开维护（管线管"哪条流水线"，标识管"哪个算法"）。</li>
+      <li><strong>观测与回归</strong>：记录每次规划的管线、标识、耗时与结果码；配置变更后回归同一批任务对照。</li>
+    </ol>
+    <h3>管线配置要点</h3>
+    <table>
+      <tr><th>配置项</th><th>示例取值</th><th>作用</th><th>注意点</th></tr>
+      <tr><td>planning_plugins</td><td>["ompl_interface/OMPLPlanner"]</td><td>管线加载的插件类型</td><td>字符串与插件注册名一致</td></tr>
+      <tr><td>request_adapters</td><td>修正、解析、校验诸项</td><td>请求预处理链</td><td>顺序敏感；修正类在前</td></tr>
+      <tr><td>response_adapters</td><td>时间参数化、平滑</td><td>响应后处理链</td><td>命名与归属随版本迁移</td></tr>
+      <tr><td>默认规划器标识</td><td>RRTConnect</td><td>请求未指定时的选择</td><td>与默认管线配套设置</td></tr>
+      <tr><td>开始状态边界容差</td><td>0.1 rad</td><td>起点修正的可接受范围</td><td>对应修正类适配器的参数</td></tr>
+    </table>
+    <p><strong>与上一章的差异点</strong>：第 038 章把规划当作闭环中的一个环节使用；本章打开该环节的内部结构。对任务代码而言接口不变，对配置与排障而言多了一个"请求被谁改写过"的观测维度。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：规划管线配置（请求链与响应链）</strong>（参数组织与适配器名称以所用发行版模板为准）</p>
+    <pre class="code"><code># 移动组节点下的 OMPL 管线配置：插件、适配器链与规划器注册
+move_group:
+  ros__parameters:
+    planning_pipelines:
+      pipeline_names: ["ompl", "pilz_industrial_motion_planner"]
+    default_planning_pipeline: "ompl"
+    ompl:
+      planning_plugins: ["ompl_interface/OMPLPlanner"]
+      # 请求适配器链：修正类在前，解析与校验类在后
+      request_adapters:
+        - default_planner_request_adapters/ResolveConstraintFrames
+        - default_planner_request_adapters/FixWorkspaceBounds
+        - default_planner_request_adapters/FixStartStateBounds
+        - default_planner_request_adapters/FixStartStateCollision
+        - default_planner_request_adapters/FixStartStatePathConstraints
+        - default_planner_request_adapters/ValidateWorkspaceBounds
+      # 响应适配器链：几何路径在这里获得时间维与平滑处理
+      response_adapters:
+        - default_planning_response_adapters/AddTimeParameterization
+      # 部分较早版本把时间参数化放在 request_adapters 中；移植配置时
+      # 以目标版本的官方模板为准，两个位置同时出现会导致重复处理</code></pre>
+    <p>解读：<strong>（1）</strong>两条链的表达方式一致（有序列表），顺序就是执行次序；修正类适配器位于判定类之前，保证后续检查面对的是修正过的请求。<strong>（2）</strong>pipeline_names 声明并存管线，default_planning_pipeline 给出未指定时的选择；上层任务代码切换管线只需改请求标识，消息结构不变。<strong>（3）</strong>注释记录了版本迁移这个真实陷阱：时间参数化在两个链上的归属变化，以及"两处同时配置"会造成的重复处理，配置移植时必须逐行对照目标版本模板。</p>
+
+    <p><strong>片段 2：C++ 独立使用规划管线生成计划</strong>（接口以对应 ROS2 发行版与 MoveIt2 版本的官方文档为准）</p>
+    <pre class="code"><code>#include &lt;moveit/planning_pipeline/planning_pipeline.hpp&gt;
+
+// 构造管线：绑定节点、参数命名空间与规划插件名
+// 参数命名空间对应配置文件中管线段落的层级
+planning_pipeline::PlanningPipeline pipeline(
+    node, "ompl", "ompl_interface/OMPLPlanner");
+
+moveit_msgs::msg::MotionPlanResponse response;
+// generatePlan 内部依次执行：请求适配器链、规划器求解、响应适配器链
+bool ok = pipeline.generatePlan(planning_scene, request, response);
+
+if (!ok)
+{
+  // 结果码区分两类失败：planning_failed（找不到解）
+  // 与 invalid_planner / invalid_pipeline（标识或配置问题）
+  RCLCPP_WARN(node-&gt;get_logger(), "管线未生成计划，结果码 %d",
+              response.error_code.val);
+  // 排障顺序：确认适配器是否改写过请求，再确认规划器预算
+}
+else
+{
+  // response.trajectory 已由响应适配器补齐时间维
+  RCLCPP_INFO(node-&gt;get_logger(), "计划路点数 %zu，规划耗时 %.2f s",
+              response.trajectory.joint_trajectory.points.size(),
+              response.planning_time);
+}</code></pre>
+    <p>解读：<strong>（1）</strong>独立使用管线适合不需要移动组能力的场景：自定义节点直接持有管线对象，参数从自身命名空间读取，规划在进程内完成。<strong>（2）</strong>generatePlan 的返回值与响应中的结果码组合使用：返回值表达成败，结果码细分原因，"找不到解"与"标识错误"在排障上是两个方向。<strong>（3）</strong>响应里的规划时间与轨迹点数是管线层面的可观测数据：前者用于对比规划器与预算配置，后者用于估算执行时长与后处理负担。</p>
+
+    <p><strong>片段 3：只读诊断命令，核对生效配置</strong></p>
+    <pre class="sh"><code># 查看默认管线与适配器配置（只读诊断；参数路径以实际参数树为准）
+ros2 param get /move_group default_planning_pipeline
+ros2 param get /move_group ompl.request_adapters
+ros2 param get /move_group ompl.response_adapters
+
+# 列出与适配器相关的参数，核对是否有期望之外的配置项残留
+ros2 param list /move_group | grep adapter</code></pre>
+    <p>解读：<strong>（1）</strong>三条查询回答三个问题：当前默认管线是哪条、请求链上装了什么、响应链上装了什么；这三点是"我改的配置生效了吗"的最小证据集。<strong>（2）</strong>参数列表配合过滤用于发现配置残留：不同来源的配置文件叠加时，"不该出现的适配器"会静默改变行为。<strong>（3）</strong>把这三条命令放进变更流程的核对清单，配置修改与行为变化之间就有了可追溯的链条；参数路径因发行版组织方式不同会有差异，查询失败时以参数列表的输出为准。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>适配器顺序颠倒</strong>：把判定类适配器放在修正类之前，判定基于未修正的请求，返回矛盾的错误。修复是恢复"修正在前、判定在后"的模板顺序并核对依赖关系。</li>
+      <li><strong>起点修正被当作正常现象</strong>：FixStartStateCollision 频繁触发而无人关注，轨迹总从修正过的起点出发，实际起点偏差累积。修复是把修正触发计入监测指标，频繁出现时回查状态源与场景。</li>
+      <li><strong>时间参数化双重配置</strong>：请求链与响应链同时配置时间参数化，轨迹被处理两次，速度曲线异常或耗时翻倍。修复是按目标版本模板归位到唯一位置。</li>
+      <li><strong>插件名与注册名不一致</strong>：planning_plugins 字符串拼写错误，启动阶段静默降级或任务时返回插件错误。修复是把插件加载自检写进启动流程，失败即终止。</li>
+      <li><strong>把"规划器未找到"归因为"无解"</strong>：标识错误与搜索失败在日志中容易混淆，反复加大时间预算却无效果。修复是按结果码区分失败类别，标识类错误优先核对请求与配置的字符串。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>结构题：画出一次规划请求经过的三段结构，标注每段中至少两个成员，并说明"起点碰撞时请求被谁改写、改写信息在响应中如何体现"。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>请求适配器链中的 FixStartStateCollision 在小邻域搜索可行起点并改写请求；响应轨迹的起点与真实状态存在偏差，执行层用起点容忍度校核，监测上体现为修正触发计数。</div></details>
+      </li>
+      <li>结果预测：把 FixStartStateCollision 从链中移除，起点偶发碰撞的请求将出现什么行为？规划成功率与失败信息分别如何变化？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>起点碰撞的请求直接失败（结果码指向起始状态），成功率下降但失败信息更"干净"；保留适配器则请求被修正后继续，成功率上升但起点偏差需要执行层兜底。</div></details>
+      </li>
+      <li>设计题：为"自由空间避障加少量工艺直线动作"的系统设计管线集合：列出两条管线的插件、适配器差异与默认标识，并说明上层如何选择。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>OMPL 管线负责避障（采样算法、时间参数化响应链）；工业运动管线负责直线圆弧（其规划器原生处理时间参数化，适配器链按模板配置）；上层按任务类型设置管线标识与规划器标识。</div></details>
+      </li>
+      <li>诊断题：同一目标位姿，昨天规划成功今天失败，期间只改过配置文件。给出三步定位法：如何确认生效配置、如何确认请求是否被改写、如何区分"找解失败"与"标识错误"。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>第一步用片段 3 的命令读出生效配置并与预期对照；第二步查日志中适配器修正记录（起点是否被改写）；第三步看结果码类别，标识类错误伴随"planner not found"字样，与搜索失败区分开。</div></details>
+      </li>
+      <li>分析题：论证"时间参数化放在响应侧"的设计合理性，并讨论如果把速度上限作为请求适配器提前校验，会带来哪些复杂化与收益。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>几何搜索与时间分配分离让算法与运动学解耦，响应侧统一处理保证所有规划器行为一致。提前校验可在搜索前拦截超限请求、节省预算，但需要在适配器内引入轨迹时间模型，与搜索结构重叠且容易因版本变化失配。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>规划管线由请求适配器链、规划器求解、响应适配器链三段串行组成，公共修正从算法中剥离。</li>
+      <li>请求适配器把请求修正到可求解状态；修正类在前、判定类在后，修正触发应被监测。</li>
+      <li>规划器由插件提供，管线、规划器标识、规划配置是三个层次；标识错误与无解是两类失败。</li>
+      <li>响应适配器为几何路径补上时间维与平滑处理；版本间适配器归属有过迁移，配置移植需对照模板。</li>
+      <li>下一章深入管线中的算法选择：<strong>规划器选择：OMPL 规划算法族</strong>，讲采样算法的家族谱系与选型依据。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch038.html">← 第 038 章：阶段实践：感知驱动的避障规划</a>
+    <a class="next" href="ch040.html">第 040 章：规划器选择：OMPL 规划算法族 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.06 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:11.5px !important;letter-spacing:.06em !important;color:rgba(71,85,105,.45) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#7e8ba0 !important;font-size:11.5px !important;line-height:1.8 !important;text-align:center !important;padding:5px 12px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

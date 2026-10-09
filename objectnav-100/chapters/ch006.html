@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 006 讲｜Habitat-Sim 架构与性能常识 | 目标物体导航课程 · ObjectNav 从探索到开放词汇</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · 任务、仿真与评测地基</span>
+    <span class="sep">/</span>
+    <span>第 006 讲</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · 任务、仿真与评测地基</div>
+    <h1>第 006 讲｜Habitat-Sim 架构与性能常识</h1>
+    <p class="lead">前五讲的任务定义、成功判据与指标都要在仿真器里产生。本讲以 Savva 等（2019，ICCV，Habitat: A Platform for Embodied AI Research）为来源，拆开 Habitat 的三层软件栈与 Habitat-Sim 的渲染管线，并用论文表 1 的实测数据实算一套性能常识：帧率、步速、分辨率与进程数的换算关系，以及训练规模对仿真吞吐的真实需求。</p>
+    <ul class="meta">
+      <li>主题：仿真架构 / 场景图 / 渲染管线 / 吞吐量估算</li>
+      <li>关键公式：端到端步速 = 总步数 / 墙钟时间；带缩放系数 = 单进程帧率 × 进程数 × 缩放效率</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 005 讲（SoftSPL 与 DTG）</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>能画出 Habitat 的三层软件栈（数据、仿真器、任务），并逐层说出 2019 论文列出的设计需求与对应实现。</li>
+      <li>掌握 Habitat-Sim 的三条渲染与场景组织要点：统一场景图、单趟多附件渲染、传感器插件式扩展。</li>
+      <li>会解读帧率数据：给定硬件、场景、分辨率、传感器组合、并发进程数五个条件，判断一组 fps 报告是否可比。</li>
+      <li>会算吞吐：用论文表 1 的数字换算单条 episode 墙钟、任意步数的训练时长，并与单卡网络训练速度对照，理解瓶颈位置。</li>
+      <li>能区分 2019 论文的实验协议与 2020 年之后的挑战协议（阈值、动作、定位、碰撞），避免跨版本引用数字。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 004 讲与第 005 讲建立了 SPL、SoftSPL、DTG 的口径：这些数字的方差、榜单的两位小数、失败分析里「差 0.02 是否显著」的讨论，全都以数千条 episode 的评测为前提。更靠前的训练阶段更依赖规模：第 001 讲的共识文档要求评测在未见场景进行，意味着策略必须在成千上万个场景实例上训练。仿真器的吞吐决定了实验是几小时还是几个月。</p>
+    <p>Habitat 就是为吞吐设计的。Savva 等（2019，ICCV）提出一个三层软件栈：3D 数据集提供带语义的资产，Habitat-Sim 负责渲染与运动模拟，Habitat-API（后续版本称 Habitat-Lab）把任务、episode 与评测指标组装成可训练、可复现的实验。论文给出的量级很直接：在 Matterport3D 场景上单线程每秒数千帧，单卡多进程超过每秒一万帧，比同期仿真器快出一到两个数量级。本讲把这些工程选择拆成可迁移的性能常识。</p>
+    <p>本讲解决三个问题：架构上，讲清一次观察从场景资产到策略输入经过哪些层；性能上，给出分辨率、传感器、进程数三个变量的缩放实算，以及训练规模的吞吐账；工程上，给出一份性能报告的最低口径清单。第 007 讲把物理引擎加入这幅图，展开 Habitat 2.0 与家庭助手基准（HAB）。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 三层软件栈与设计需求</h3>
+    <p>Habitat 的定位是「具身智能的公共底座」。2019 论文把软件栈分成三层：<strong>数据集层</strong>提供三维场景网格与语义标注；<strong>仿真器层</strong>把资产加载为统一表示，按智能体动作推进状态，并渲染传感器观察；<strong>任务层</strong>定义 episode、观察空间、动作空间、终止条件与评测指标。训练框架通过任务层的接口拿环境，不需要关心底层资产格式。</p>
+    <p>论文为该栈列出九条设计需求，其中与性能直接相关的有四条：高效渲染引擎要同时产出 RGB、深度、语义实例掩码等多路信息，并支持多个智能体并发；数据集接入接口要让平台与具体资产格式解耦；传感器套件要能挂载任意数量的参数化传感器；实现采用 C++ 后端加 Python 接口，兼顾性能与生态。其余五条覆盖智能体参数化、任务可移植、容器化、人类作为智能体、环境状态可编程修改。后两条对应两类研究用法：采集人类演示、做受控的环境扰动实验。</p>
+
+    <h3>2. Habitat-Sim：场景图、渲染与传感器</h3>
+    <p><strong>统一场景图。</strong>Habitat-Sim 把每种支持的数据集（论文时代内置 Matterport3D、Gibson、Replica）加载成层级场景图。场景图节点携带几何、材质与语义信息，平台据此把「真实扫描」与「程序合成」两类环境放在同一套接口之下。程序化生成、编辑与环境状态控制都以场景图为操作对象，这为后来 Habitat 2.0 接入物理引擎留出了接口。</p>
+    <p><strong>单趟多附件渲染。</strong>渲染后端为 C++ 实现，借助 Magnum 图形中间件跨平台部署。视觉传感器的核心优化是「多附件 uber-shader」：把彩色相机、深度、语义掩码的输出合并到同一次渲染通道，传感器参数一致时共享同一趟光栅化，避免为每路输出重复遍历场景。论文展示的传感器包括彩色相机、深度、语义实例掩码、表面法线、光流；导航类传感器包括 GPS、罗盘与接触。LIDAR 与 IMU 等以插件形式扩展。</p>
+    <p><strong>智能体与运动。</strong>论文实验中的智能体是圆柱体，直径 0.2 m、高 1.5 m，动作空间为左转 10°、右转 10°、前进 0.25 m、停止四个动作；状态空间连续，前进碰到障碍时允许沿障碍滑动。这套参数属于 2019 论文的 PointGoal 实验协议，与 2020 年之后的挑战协议存在版本差异，第 7 小节专门整理对照。</p>
+
+    <h3>3. 任务层：Episode、Environment 与接口边界</h3>
+    <p>任务层的三个核心对象可以这样理解。<strong>Episode</strong> 描述一条任务的实例：场景标识、起点位姿、目标，可选携带最短路径；<strong>Task</strong> 在仿真器的观察与动作空间之上追加任务专属部分，并持有终止条件与成功判据；<strong>Environment</strong> 是面向训练代码的门面，把仿真器、任务与 episode 数据集粘合起来。训练循环只接触 Environment：reset 返回初始观察，step 接收动作并返回观察、奖励与结束标志。</p>
+    <p>这一分层对 ObjectNav 的意义在于：目标类别、成功半径、可见性、SoftSPL 与 DTG 都在任务层实现，仿真器层只提供几何与渲染。更换数据集时仿真器层工作不变，更换指标时任务层改动可控。第 009 讲会给出 Habitat-Lab 的实际安装与配置；本讲只保留结构与性能两条线索。</p>
+
+    <h3>4. 性能口径：五个必须写明的条件</h3>
+    <p>「每秒多少帧」离开条件就没有意义。阅读或撰写性能数字时，至少要固定五个条件：<strong>（1）硬件</strong>，CPU 型号与 GPU 型号；<strong>（2）场景与资产</strong>，同一台机器在不同场景上的帧率可以相差数倍；<strong>（3）观察配置</strong>，分辨率与传感器组合决定每步要渲染多少像素与多少路输出；<strong>（4）并发结构</strong>，单进程、单卡多进程、多机多卡的缩放行为不同；<strong>（5）测量边界</strong>，纯渲染帧率与包含策略前向、环境重置的端到端步速不是一个量。</p>
+    <p>论文表 1 给出了一个完整的示例。测量对象为 Matterport3D 的一个场景（编号 17DRP5sb8fy），硬件为 Intel Xeon E5-2690 v4 CPU 与 Nvidia Titan Xp GPU，分别测 1 个与 5 个并发仿真进程、RGB 与 RGB 加深度两种观察、128、256、512 三种分辨率。表格转写如下（单位：帧/秒）。</p>
+    <table>
+      <tr><th>观察</th><th>进程数</th><th>128 × 128</th><th>256 × 256</th><th>512 × 512</th></tr>
+      <tr><td>RGB</td><td>1</td><td>4093</td><td>1987</td><td>848</td></tr>
+      <tr><td>RGB</td><td>5</td><td>10592</td><td>3574</td><td>2629</td></tr>
+      <tr><td>RGB + 深度</td><td>1</td><td>2050</td><td>1042</td><td>423</td></tr>
+      <tr><td>RGB + 深度</td><td>5</td><td>5223</td><td>1774</td><td>1348</td></tr>
+    </table>
+
+    <h3>5. 数值算例一：三个缩放规律</h3>
+    <p><strong>分辨率缩放是次线性的。</strong>从 128 × 128 到 512 × 512，像素数变为 16 倍，RGB 单进程帧率从 4093 降到 848，只降为 4.83 分之一；从 256 × 256 到 512 × 512 像素 4 倍，帧率降为 2.34 分之一。原因是渲染开销中有一部分（场景遍历、状态管理、光栅化以外的固定成本）不随像素数增长。</p>
+    <p><strong>加一路深度的代价约等于帧率减半。</strong>同分辨率、同进程数下，RGB 加深度相对纯 RGB 的帧率比在 0.49 至 0.52 之间：单进程 128 像素为 0.501，256 像素为 0.524，512 像素为 0.499；5 进程时为 0.493、0.496、0.513。多渲染一路输出意味着多一次场景遍历与写回，实测代价与「帧率除以二」一致。</p>
+    <p><strong>多进程共享单卡存在争用。</strong>以 RGB 观察为例，5 个进程相对单进程的加速比：128 像素为 2.59 倍，256 像素为 1.80 倍，512 像素为 3.10 倍。折算到每进程有效帧率与单进程之比，依次为 51.8%、36.0%、62.0%，不单调。<strong>不要假设并发数乘帧率就是总吞吐</strong>；显存、调度与带宽的争用使缩放效率依赖具体配置。工程上应实测目标配置的缩放系数，不宜套用「乘进程数」的估算。</p>
+
+    <h3>6. 数值算例二：75M 步的机时账</h3>
+    <p>论文的 PointGoal 实验训练到 7500 万步，报告的四组 GPU 机时为：无视觉输入的盲智能体 320 GPU 小时，RGB 566 GPU 小时，仅深度 475 GPU 小时，RGB 加深度 906 GPU 小时，合计 2267 GPU 小时。把步数除以机时可得到端到端步速（含策略前向、反向传播与仿真，仅作量级参考）：</p>
+    <table>
+      <tr><th>观察配置</th><th>GPU 机时</th><th>端到端步速（步/秒/卡）</th><th>相对 256 像素纯渲染 1987 帧/秒</th></tr>
+      <tr><td>盲（无视觉）</td><td>320</td><td>65.10</td><td>3.28%</td></tr>
+      <tr><td>RGB</td><td>566</td><td>36.81</td><td>1.85%</td></tr>
+      <tr><td>深度</td><td>475</td><td>43.86</td><td>2.21%</td></tr>
+      <tr><td>RGB + 深度</td><td>906</td><td>22.99</td><td>1.16%</td></tr>
+    </table>
+    <p>表中第三列由 75 × 10<sup>6</sup> 步除以 GPU 小时换算；第四列以 256 × 256 单进程纯渲染 1987 帧/秒为参照。RGB 配置的端到端步速只有纯渲染能力的 1.85%，<strong>瓶颈已经从仿真器转移到网络优化与数据搬运</strong>，这正是论文所说的「10,000 帧每秒把瓶颈从仿真移到优化」。论文还给出一个直观现象：用 Habitat 现场渲染图像，常常比从磁盘读取同样数量的图像更快。用一张 256 × 256 × 3 字节的 RGB 帧估算：单帧 196,608 字节，7500 万步若全部物化落盘为 14.7456 TB（约 13.411 TiB）。现场渲染省掉的不只是读写时间，还有这份存储。</p>
+    <p>单条 episode 的墙钟时间同样可以换算。以 500 步上限为例：单进程 128 像素纯渲染 0.1222 秒，256 像素 0.2516 秒；5 进程 256 像素时整组 0.1399 秒，每个工作进程 0.6995 秒；换成 RGB 加深度则每组 0.2818 秒、每进程 1.4092 秒。注意这些数字只统计渲染，端到端墙钟要按前文端到端与纯渲染的比值放大（以 RGB 配置为例，1987 / 36.81 ≈ 54 倍）。</p>
+
+    <h3>7. 数值算例三：规模需求反推</h3>
+    <p>性能估算更常用的方向是反推：给定训练计划，需要多少步速。把目标步数除以可用墙钟时间即可：</p>
+    <ul>
+      <li>7500 万步在 24 小时内完成，需要 868.1 步/秒；</li>
+      <li>1 亿步在 24 小时内完成，需要 1157.4 步/秒；</li>
+      <li>25 亿步（第 017 讲 DD-PPO 的量级）在 24 小时内完成，需要 28,935.2 步/秒。</li>
+    </ul>
+    <p>对照本讲的表：5 进程 256 像素 RGB 加深度为 1774 帧/秒，即使端到端按纯渲染的一半效率折算也只有约 887 步/秒，不足以独力支撑 1 亿步日训练。25 亿步的日训练若只看纯渲染上限，需要约 16 个上述配置并行；按端到端对半折算则接近 33 个，或依赖第 007 讲的多卡物理仿真吞吐。反推的数字还提醒一件事：<strong>训练规模与仿真配置必须联合设计</strong>，先决定「多长时间内跑多少步」，再选择分辨率、传感器与并发结构；反过来先买硬件再想规模，容易在端到端效率上损失数倍。</p>
+
+    <h3>8. 版本口径与可比边界</h3>
+    <p>论文文字同时给出两个方向的量级对比：Habitat-Sim 单线程每秒数千帧、单卡多进程超过一万帧；同期室内仿真器通常在每秒数十到数百帧（AI2-THOR 与 CHALET 为数十帧，MINOS 与 Gibson 约一百帧，House3D 约三百帧）。以 128 像素单进程 RGB 的 4093 帧/秒折算，相对 30、100、300 帧/秒分别是 136.4 倍、40.9 倍、13.6 倍。这些倍数用于说明数量级，不用于证明某一算法平台更优：各家的硬件、资产与测量边界都不同。</p>
+    <p>版本差异必须记清。2019 论文的实验协议为：前进 0.25 m、转向 10°、停止，共四动作；成功判据为停止点到目标坐标的测地距离不超过 0.2 m；智能体配备理想化 GPS 与罗盘；允许沿墙滑动。2020 年之后的挑战协议调整为：转向 30°、成功阈值 0.36 m（两倍本体半径）、取消 GPS 与罗盘、关闭滑动。两份协议的任务名都叫 PointGoal，数字直接互引会出错。本课程涉及 ObjectNav 的章节一律以对应年份挑战页为准；本讲引用 2019 数据时明确标注为论文口径。</p>
+    <div class="box key">
+      <span class="box-title">性能记录的最低清单</span>
+      <p>任何写入论文或实验报告的吞吐数字，至少记录：仿真器版本与构建方式、场景标识、硬件（CPU、GPU、显存）、分辨率与传感器组合、并发结构（进程数、卡数）、测量时长与是否包含策略前向。缺一项，数字就无法与自己的下一版实验对照，更无法与他人对照。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>把上面的架构与性能知识落成工程实践，本讲给出三件东西：一份环境配置的分层数据模型、一张吞吐估算表、一套基准测试流程。</p>
+    <h3>分层配置模型</h3>
+    <table>
+      <tr><th>层</th><th>配置对象</th><th>关键字段</th><th>变化频率</th></tr>
+      <tr><td>数据集层</td><td>SceneSpec</td><td>场景路径、资产格式、语义标注版本、导航网格</td><td>换数据集时</td></tr>
+      <tr><td>仿真器层</td><td>SimSpec</td><td>分辨率、传感器列表、是否 GPU 渲染、线程/进程数</td><td>换观察配置时</td></tr>
+      <tr><td>智能体层</td><td>AgentSpec</td><td>本体几何、动作集与步长、碰撞与滑动开关</td><td>换任务版本时</td></tr>
+      <tr><td>任务层</td><td>TaskSpec</td><td>成功判据、指标列表、episode 过滤</td><td>换评测口径时</td></tr>
+    </table>
+    <p>四层显式分离的直接收益是实验日志可以自动记录完整口径，另一个收益是性能问题可以分定位：帧率下降时先看 SimSpec 是否改动，再查 AgentSpec 的几何复杂度，最后才怀疑任务层代码。</p>
+    <h3>吞吐估算表</h3>
+    <table>
+      <tr><th>使用场景</th><th>目标步速</th><th>按本讲表可参考的配置</th><th>余量判断</th></tr>
+      <tr><td>算法原型、单场景调试</td><td>100 至 500 步/秒</td><td>单进程 256 像素 RGB</td><td>纯渲染 1987 帧/秒，余量充足</td></tr>
+      <tr><td>消融实验、小规模训练</td><td>1000 至 2000 步/秒</td><td>5 进程 256 像素纯 RGB</td><td>纯渲染 3574 帧/秒，端到端对半折算约 1787 步/秒</td></tr>
+      <tr><td>大规模训练（千万步级）</td><td>8000 步/秒以上</td><td>单卡多进程加多卡，见第 007 讲表 2</td><td>需端到端基准实测</td></tr>
+      <tr><td>挑战赛评测（千条 episode）</td><td>不限，受时限约束</td><td>与训练同配置，单独锁版本</td><td>评测时间计入 48 小时预算（2021/2022 挑战页）</td></tr>
+    </table>
+    <h3>基准测试流程</h3>
+    <ol>
+      <li><strong>固定场景与 episode。</strong>选一个代表性场景与固定起点，关闭随机重置，消除场景间方差。</li>
+      <li><strong>先测纯渲染。</strong>用固定动作序列推进，只统计渲染帧率，得到配置的物理上限。</li>
+      <li><strong>再测端到端。</strong>挂上目标策略与指标计算，用同样的 episode 数测步速，得到两口径的比值。</li>
+      <li><strong>扫并发数。</strong>从 1 到目标进程数逐点测量，画出缩放曲线，找效率拐点。</li>
+      <li><strong>记录四份数字。</strong>纯渲染帧率、端到端步速、缩放效率、资源占用（显存、CPU 利用率），一并写入实验配置。</li>
+    </ol>
+    <h3>超参数与取值依据</h3>
+    <table>
+      <tr><th>参数</th><th>常用值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>观察分辨率</td><td>128 × 128（大规模训练）或 256 × 256（研究与评测）</td><td>控制渲染成本与感知信息量</td><td>像素 16 倍对应帧率约 4.8 分之一，按信息需求取舍</td></tr>
+      <tr><td>传感器组合</td><td>RGB 或 RGB 加深度</td><td>决定渲染趟数与输入通道</td><td>加深度约使帧率减半；ObjectNav 的评测口径以 RGB-D 为主</td></tr>
+      <tr><td>并发进程数</td><td>每卡 4 至 8 个（按实测缩放曲线调整）</td><td>提高 GPU 利用率</td><td>5 进程实测效率 36% 至 62%，不宜盲目加压</td></tr>
+      <tr><td>episode 步数上限</td><td>500（论文 PointGoal 口径）</td><td>限制单条轨迹长度</td><td>论文为实验协议参数；挑战口径以各年份页面为准</td></tr>
+      <tr><td>碰撞滑动</td><td>2019 论文开启，2020 挑战关闭</td><td>影响可通行性与穿墙行为</td><td>版本敏感项，写入配置与报告</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：把「渲染上限」与「训练吞吐」分开报告</span>
+      <p>两个口径回答不同问题。纯渲染帧率用于容量规划与版本回归；端到端步速用于训练时间预算。论文的 1.85% 比值说明二者可以相差两个数量级，只报其中一个都会误导读者。工程流水线应把两者都纳入持续基准测试。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>三段代码分别覆盖：从表 1 数据出发的缩放与训练时长换算、episode 循环的端到端基准骨架、帧存储估算。Python 3 标准库即可运行。</p>
+
+    <p><strong>片段 1：缩放效率与训练时长换算</strong></p>
+    <pre class="code"><code>TABLE_1 = {
+    # (sensors, processes): {resolution: fps}
+    ("RGB", 1):  {128: 4093, 256: 1987, 512: 848},
+    ("RGB", 5):  {128: 10592, 256: 3574, 512: 2629},
+    ("RGBD", 1): {128: 2050, 256: 1042, 512: 423},
+    ("RGBD", 5): {128: 5223, 256: 1774, 512: 1348},
+}
+
+def scale_efficiency(sensors, res, processes):
+    """每进程有效帧率与单进程之比；1.0 表示理想线性缩放。"""
+    single = TABLE_1[(sensors, 1)][res]
+    multi = TABLE_1[(sensors, processes)][res]
+    return multi / (single * processes)
+
+def fit_days(total_steps, sensors, res, processes):
+    """仅按仿真侧吞吐估算天数，不含策略前向与反向传播。"""
+    fps = TABLE_1[(sensors, processes)][res]
+    return total_steps / fps / 86400
+
+print(round(scale_efficiency("RGB", 128, 5), 3),   # 0.518
+      round(scale_efficiency("RGB", 256, 5), 3),   # 0.360
+      round(scale_efficiency("RGB", 512, 5), 3))   # 0.620
+print(round(fit_days(75_000_000, "RGBD", 256, 5), 3))  # 0.489 天（纯渲染侧）</code></pre>
+    <p>解读：<strong>（1）</strong>表 1 的四个组合以元组键索引，分辨率作为内层字典，方便按配置查询。<code>scale_efficiency</code> 返回实测值相对理想线性缩放的比值，36% 到 62% 的区间说明并发收益必须实测。<strong>（2）</strong><code>fit_days</code> 只除以仿真帧率，得到的是纯渲染下限：7500 万步在 5 进程 256 像素 RGB 加深度下约 0.489 天（约 11.7 小时）。论文报告 RGB 的 7500 万步端到端合计 566 GPU 小时，折算每 GPU 小时约 13.25 万步，即平均每卡 36.81 步/秒，说明真实训练的时间主要花在网络前向与反向传播上，纯渲染下限与端到端之间相差数十倍。<strong>（3）</strong>换算方向反过来更有用：先定训练墙钟，再求所需步速。</p>
+
+    <p><strong>片段 2：episode 循环的端到端基准骨架</strong></p>
+    <pre class="code"><code>import time
+
+def run_episode(env, policy, max_steps=500):
+    """单条 episode：reset 返回初始观察，step 返回观察与结束标志。"""
+    obs = env.reset()                        # 含场景重置与资产加载
+    for t in range(max_steps):
+        action = policy(obs)                 # 策略前向，通常与渲染异步
+        obs, done = env.step(action)         # 渲染、运动学与指标更新
+        if done:
+            return t + 1
+    return max_steps
+
+def benchmark(env, policy, episodes=20, warmup=2):
+    for _ in range(warmup):                  # 预热：激活显存与缓存
+        run_episode(env, policy)
+    steps, t0 = 0, time.perf_counter()
+    for _ in range(episodes):
+        steps += run_episode(env, policy)
+    wall = time.perf_counter() - t0
+    return steps / wall                      # 端到端步速（步/秒）</code></pre>
+    <p>解读：<strong>（1）</strong>循环里没有帧率打印，端到端步速按「总步数除以墙钟」计算，把渲染、策略前向与重置全部计入，这才是训练时间预算该用的数。<strong>（2）</strong>预热两步是为显存分配与资产缓存留出稳定期，否则前几条 episode 会严重偏慢。<strong>（3）</strong>若要与纯渲染帧率对照，把 <code>policy</code> 换成固定动作函数并单独统计即可，两个口径共用同一循环结构，保证可比。</p>
+
+    <p><strong>片段 3：帧存储量估算</strong></p>
+    <pre class="code"><code>def raw_frame_storage(steps, height=256, width=256,
+                      channels=3, dtype_bytes=1):
+    """把每一步的 RGB 帧物化保存所需的原始容量。"""
+    per_step = height * width * channels * dtype_bytes
+    total = steps * per_step
+    return per_step, total / 1e12, total / 2 ** 40
+
+per_step, tb, tib = raw_frame_storage(75_000_000)
+print(per_step, round(tb, 4), round(tib, 3))
+# 196608 14.7456 13.411</code></pre>
+    <p>解读：<strong>（1）</strong>256 × 256 × 3 字节的单帧为 196,608 字节，7500 万步对应 14.7456 TB。<strong>（2）</strong>论文「现场渲染常快于磁盘读取」的判断正来自这类对比：省掉的不只是 14.7 TB 存储，还有每次采样的读写延迟。<strong>（3）</strong>若传感器包含深度或语义，按通道数重算；语义掩码常以整型存储，单帧字节数会翻倍。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>把峰值帧率当训练吞吐</strong>：症状是训练时间预算低估一个数量级以上。根因是纯渲染帧率不含策略前向与反向传播；论文中 RGB 端到端步速只有 256 像素纯渲染的 1.85%。修复：所有时间预算以端到端基准为准，纯渲染数字只用于容量规划。</li>
+      <li><strong>报告帧率不写分辨率与传感器组合</strong>：症状是两组数字相差数倍却都自称「Habitat 速度」。根因是分辨率 16 倍对应帧率约 4.8 倍差异，加深度约再减半。修复：按第 4 小节五条件写全口径；跨配置比较一律先归一到相同条件。</li>
+      <li><strong>假设多进程线性缩放</strong>：症状是按「单进程帧率 × 进程数」估算的吞吐无法兑现，5 进程实测每进程效率只有 36% 至 62%。根因是显存、调度与带宽争用。修复：按第 6 小节的流程实测缩放曲线，在效率拐点处停止加进程。</li>
+      <li><strong>跨硬件跨场景比较 SPS</strong>：症状是复现论文吞吐时对不上。根因是场景几何复杂度、资产规模与 GPU 型号都影响帧率；论文的对比本身也被注明为定性量级。修复：只在同一机器、同一场景、同一配置内做纵向比较，横向比较只引用数量级。</li>
+      <li><strong>混用 2019 论文协议与挑战协议</strong>：症状是复现备注里出现 0.2 m 成功阈值、10° 转向或「有 GPS」的配置，与 2020 之后的榜单数字对不上。根因是两份协议的任务名相同。修复：按年份标注协议来源，把阈值、动作、定位与滑动开关写进配置审计清单。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>用表 1 的数字计算：512 像素相对 128 像素的像素倍数与帧率倍数；RGB 加深度相对纯 RGB 的帧率比；5 进程相对单进程在 256 像素上的加速比。 <span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>像素 16 倍，帧率比为 4093 / 848 = 4.83；深度比在 0.49 至 0.52 之间；256 像素 RGB 的 5 进程加速比为 3574 / 1987 = 1.80，折算每进程效率 36.0%。</div></details>
+      </li>
+      <li>把观察改为「128 像素 RGB 加深度、5 进程」，重算每进程缩放效率与 7500 万步的纯渲染天数，并说明与 256 像素配置的差异来源。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>效率为 5223 / (2050 × 5) = 0.510；纯渲染天数为 75e6 / 5223 / 86400 ≈ 0.166 天（约 4.0 小时）；分辨率减半降低单帧成本，但 128 像素处缩放效率 51.0%，低于同观察 512 像素的 63.7%（1348 / (423 × 5)）。</div></details>
+      </li>
+      <li>推导：给定目标「1 亿步在 2 天内完成」，需要多少步/秒；对照本讲表 1，单机哪种配置能达到，需要几台机器（按端到端为纯渲染 50% 折算）。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>需要 1e8 / 172800 ≈ 578.7 步/秒。5 进程 256 像素 RGB 加深度的端到端折算约 887 步/秒，单机即可；若用单进程 256 像素 RGB 端到端约 993 步/秒，同样够用，余量需要实测确认。</div></details>
+      </li>
+      <li>设计一份可复现的仿真基准测试协议：列出五个必填条件、预热与采样策略、两次运行之间的允许偏差，并说明如何验证「缩放效率拐点」的存在。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>五个条件见第 4 小节；预热两步以上，采样取多轮中位数；同配置重复运行偏差建议控制在 5% 以内。拐点验证：并发数从 1 增加到 2 倍、4 倍、8 倍，画吞吐曲线，找每进程效率跌破 50% 的点。</div></details>
+      </li>
+      <li>把训练配置从「5 进程、256 像素、RGB 加深度」改为「8 进程、512 像素、纯 RGB」，预测纯渲染吞吐的增减方向与大致倍数，写出你的估算公式；再设计一个实验验证预测，并说明若结果与预测相反，最可能的原因是什么。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>先按像素成本折算：512 像素单进程 RGB 848 帧/秒，约是 256 像素 RGB 加深度 1042 帧/秒的 0.81 倍；再把进程数从 5 提到 8，若缩放效率从 36% 附近继续下滑，总量可能不升反降。验证实验固定场景与动作序列，测 5 进程与 8 进程各自的端到端步速。结果相反时优先怀疑显存不足、进程调度或资产加载被放大。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>Habitat 由三层构成：数据集提供带语义的三维资产，Habitat-Sim 统一加载为场景图并渲染，Habitat-API（后续称 Habitat-Lab）定义任务、episode 与指标；2019 论文的设计需求覆盖性能、解耦、可扩展与容器化。</li>
+      <li>Habitat-Sim 的关键工程选择：统一场景图、多附件 uber-shader 单趟渲染 RGB 与深度与语义、传感器插件化；2019 实验协议为 0.2 m 阈值、10° 转向、0.25 m 前进、允许滑动。</li>
+      <li>表 1 实测：128 像素 RGB 单进程 4093 帧/秒；像素增 16 倍帧率降为 4.83 分之一；加深度约减半；5 进程每进程效率 36% 至 62%，不满足线性缩放。</li>
+      <li>75M 步训练机时 320 至 906 GPU 小时（合计 2267）；RGB 端到端步速 36.81 步/秒/卡，仅为 256 像素纯渲染帧率的 1.85%，瓶颈在网络优化。</li>
+      <li>规模反推：1 亿步日训练需 1157.4 步/秒，25 亿步日训练需 28,935.2 步/秒；训练规模与仿真配置必须联合设计。</li>
+      <li>下一讲在渲染与运动学之上加入物理引擎：Habitat 2.0、ReplicaCAD 与家庭助手基准（HAB），并把 idle 与 interact 场景的吞吐差异、优化消融与移动操作任务规格一并展开。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch005.html">← 第 005 讲：SoftSPL 与 DTG</a>
+    <a class="next" href="ch007.html">第 007 讲：Habitat 2.0：物理仿真与 HAB →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.06 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:11.5px !important;letter-spacing:.06em !important;color:rgba(71,85,105,.45) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#7e8ba0 !important;font-size:11.5px !important;line-height:1.8 !important;text-align:center !important;padding:5px 12px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

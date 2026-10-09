@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 071 讲｜ConceptGraphs：开放词汇 3D 图 | 目标物体导航课程 · ObjectNav 从探索到开放词汇</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第四篇 · 开放词汇与大模型</span>
+    <span class="sep">/</span>
+    <span>第 071 讲</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第四篇 · 开放词汇与大模型</div>
+    <h1>第 071 讲｜ConceptGraphs：开放词汇 3D 图</h1>
+    <p class="lead">第 069 至 070 讲的 SG-Nav 在仿真里维护在线 3D 场景图做分层推理，但检测类别与节点描述仍受预设集合约束。本讲读 ConceptGraphs（Gu 等 2023，arXiv:2309.16650）：用类无关分割（Class-Agnostic Segmentation，SAM）、CLIP 特征、LLaVA 描述与 GPT-4 关系推理，从 RGB-D 序列增量构建开放词汇 3D 场景图；物体是带点云与语义特征的节点，空间关系是边。在 Replica 的 7 个场景上，人工评测给出节点描述精度 0.71、边关系精度 0.88；开放词汇分割 mAcc 40.63；文本检索覆盖描述、可供性与否定三类查询；真机实验含 Jackal 轮式平台与 Spot 机械臂。本讲聚焦图结构设计与 LLM 规划消费方式，为第 072 至 073 讲的实例记忆与终身基准打底。</p>
+    <ul class="meta">
+      <li>主题：开放词汇 3D 场景图 / 对象级建图 / LLM 任务规划</li>
+      <li>关键公式：φ(i,j) = φ<sub>sem</sub>(i,j) + φ<sub>geo</sub>(i,j)；f ← (n·f + f<sub>new</sub>) / (n + 1)</li>
+      <li>预计学时：75 分钟</li>
+      <li>前置章节：第 070 讲（SG-Nav II：re-perception 纠错）</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>会推导：对象关联分数 φ 的两项构成、取值范围［0, 2］与阈值 δ<sub>sim</sub> = 1.1 的判定含义，能对给定 φ<sub>sem</sub> 与 φ<sub>geo</sub> 算出是否关联。</li>
+      <li>会实现：增量式对象建图的核心循环（分割、投影、关联、融合、描述、建边），理解贪心关联与滑动平均融合的代价与收益。</li>
+      <li>会算：稠密逐点特征与节点级特征的存储量级差，生成树剪枝前后的边数，以及文本检索三项指标的增量。</li>
+      <li>会判断：人工评测的节点精度、边精度与自动分割指标的口径区别；LLM 检索在描述、可供性、否定三类查询上的强弱分布。</li>
+      <li>会设计：把场景图序列化成 LLM 可消费的结构（节点 JSON、边关系标签），并处理上下文长度上限与动态更新需求。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 067 至 068 讲的 VLFM 用语言价值图给前沿打分，第 069 至 070 讲的 SG-Nav 用在线场景图加分层推理纠错，两者都依赖闭集检测与预设的语义类别。一旦任务换成“找那本放在咖啡桌上的白皮书”这类需要实例分辨与开放词汇的查询，闭集表示立刻失效。另一条路线是把视觉语言大模型的特征逐点投射到 3D 地图，形成稠密特征场；这类表示语义丰富，但每个点都存一份特征，内存随场景与时长线性增长，并且点与点之间没有结构，物体移动或消失时无法做局部更新，也不便于任务规划。</p>
+    <p>ConceptGraphs 的回答是对象级结构化：把场景压缩成物体节点与关系边，语义特征挂在节点上，关系用语言模型推断。这样既能处理训练时未见的类别，又能在下游把图序列化为文本交给大语言模型（Large Language Model，LLM）做查询与规划。对 ObjectNav 而言，这条路线回答了三个问题：开放词汇的场景表示长什么样、如何在线维护、下游导航与操作如何消费它。第 072 与 073 讲的 GOAT 系统与 GOAT-Bench 用的实例级记忆，正是这种对象化思路在真机与基准上的延续。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 表示：为什么把地图换成图</h3>
+    <p>设机器人收到一系列带位姿的 RGB-D 观测 I = {I<sub>1</sub>, …, I<sub>t</sub>}。概念图定义为 M<sub>t</sub> = ⟨O<sub>t</sub>, E<sub>t</sub>⟩，其中 O<sub>t</sub> = {o<sub>j</sub>}<sub>j=1…J</sub> 是物体节点集合，E<sub>t</sub> = {e<sub>k</sub>} 是关系边集合。每个节点 o<sub>j</sub> 由两部分描述：3D 点云 p<sub>j</sub>（几何）与单位化的语义特征向量 f<sub>j</sub>（视觉语言嵌入，取 CLIP 图像编码器）。边 e<sub>k</sub> 连接两个节点并携带关系标签，例如“a 在 b 上”“b 在 a 内”。</p>
+    <p>与逐点特征表示相比，节点级特征的存储量可以缩小到万分之一量级。取单位置编码 512 维、半精度（2 字节）的算例：一百万个点各存一份特征需要 1,024 × 1,024 × 512 × 2 = 1,073,741,824 字节，恰为 1.00 GiB；若同一场景压缩成 100 个节点，则只需 100 × 512 × 2 = 102,400 字节，即 100 KiB，两者相差 10,485.76 倍。这条量级差决定了 3D 语义表示能否扩展到“长时间、多房间”的场景：稠密表示的内存随观测帧数累加，节点表示的内存随物体数增长，而室内场景的物体数量远小于像素与体素数量。</p>
+    <div class="formula">D<sub>dense</sub> / D<sub>graph</sub> = (N · d · b) / (J · d · b) = N / J = 1,048,576 / 100 = 10,485.76</div>
+    <p>结构化的第二个收益是关系。稠密特征场只能回答“这个点像什么”，回答不了“杯子和桌子是什么关系”；而任务的规划层往往需要关系，例如“把水杯放到厨房台面上”。第三是局部更新：节点与边可以增删改，物体被移动时只需重投影受影响的节点；稠密特征场则要做整段重映射。代价是引入分割、关联、描述多个模块，每个模块的错误都会向下游传播，这一点在边界一节展开。</p>
+
+    <h3>2. 建图管线：六步流水线</h3>
+    <p>对每一帧 I<sub>t</sub>，管线执行以下步骤（Gu 等 2023，第 II 节）：</p>
+    <table>
+      <tr><th>步骤</th><th>输入</th><th>处理</th><th>默认配置</th><th>输出</th></tr>
+      <tr><td>类无关分割</td><td>RGB 图</td><td>分割一切模型（Segment Anything Model，SAM）产生候选掩码</td><td>SAM；无类别标签</td><td>掩码集合 {m<sub>t,i</sub>}</td></tr>
+      <tr><td>特征提取</td><td>RGB 图与掩码</td><td>CLIP 图像编码器对掩码区域提特征</td><td>CLIP；单位化</td><td>视觉描述子 f<sub>t,i</sub></td></tr>
+      <tr><td>投影与去噪</td><td>掩码、深度、位姿</td><td>反投影到点云，DBSCAN 去离群点，变换到地图系</td><td>DBSCAN</td><td>点云 p<sub>t,i</sub></td></tr>
+      <tr><td>多视图关联</td><td>新检测与已有节点</td><td>几何相似度加语义相似度，贪心取最高分，低于阈值则新建</td><td>δ<sub>nn</sub> = 2.5 cm，δ<sub>sim</sub> = 1.1</td><td>匹配结果或无匹配</td></tr>
+      <tr><td>节点融合</td><td>匹配到的节点与新检测</td><td>特征滑动平均，点云并集后体素下采样</td><td>体素 2.5 cm</td><td>更新后的节点</td></tr>
+      <tr><td>描述与建边</td><td>全部节点与视图</td><td>LLaVA 生成描述，GPT-4 汇总；IoU 矩阵做生成树剪枝，LLM 标注关系</td><td>每节点最多 10 个视图</td><td>图 M<sub>T</sub></td></tr>
+    </table>
+    <p>论文另给一个检测器变体 ConceptGraphs-Detector（CG-D）：用 RAM 标注图像中的类别集合，用 Grounding DINO 出框，替代 SAM 的类无关分割。两条路线共享后续的关联、融合与建边逻辑，区别只在候选物体的产生方式，这一设计让系统可以按算力与场景调整前端。</p>
+
+    <h3>3. 关联评分：几何相似度与语义相似度相加</h3>
+    <p>新检测 ⟨p<sub>t,i</sub>, f<sub>t,i</sub>⟩ 与已有节点 ⟨p<sub>o_j</sub>, f<sub>o_j</sub>⟩ 的几何相似度定义为近邻比例：新点云中能在旧点云 δ<sub>nn</sub> 距离内找到最近邻的点所占比例。语义相似度把余弦相似度归一化到［0, 1］：</p>
+    <div class="formula">φ<sub>geo</sub>(i,j) = nnratio(p<sub>t,i</sub>, p<sub>o_j</sub>; δ<sub>nn</sub>)，δ<sub>nn</sub> = 2.5 cm</div>
+    <div class="formula">φ<sub>sem</sub>(i,j) = f<sub>t,i</sub><sup>T</sup> f<sub>o_j</sub> / 2 + 1/2 ∈ ［0, 1］</div>
+    <div class="formula">φ(i,j) = φ<sub>sem</sub>(i,j) + φ<sub>geo</sub>(i,j) ∈ ［0, 2］；当且仅当 max<sub>j</sub> φ(i,j) ≥ δ<sub>sim</sub> = 1.1 时接受关联</div>
+    <p>对每个新检测，只在空间上有部分重叠的已有节点里搜索，取 φ 最大的节点；若最高分低于 1.1，则实例化新节点。贪心策略是论文的工程选择：他们比较过匈牙利算法等最优分配，结论是更慢而提升极小。阈值 1.1 的直观含义是“两项都要及格”：只靠语义（φ<sub>sem</sub> = 1.0）只得到 1.0，低于阈值；只靠几何重叠（φ<sub>geo</sub> = 1.0）同样不够。下表给出四组算例。</p>
+    <table>
+      <tr><th>φ<sub>sem</sub></th><th>φ<sub>geo</sub></th><th>φ 总和</th><th>是否关联</th><th>与阈值之差</th><th>情形解释</th></tr>
+      <tr><td>0.85</td><td>0.30</td><td>1.15</td><td>是</td><td>+0.05</td><td>语义相近且几何有重叠，常见于同一物体的新视角</td></tr>
+      <tr><td>0.90</td><td>0.21</td><td>1.11</td><td>是</td><td>+0.01</td><td>语义很强、重叠较少，边界附近，检查特征质量</td></tr>
+      <tr><td>0.60</td><td>0.35</td><td>0.95</td><td>否</td><td>−0.15</td><td>邻近的同类不同实例，应新建节点</td></tr>
+      <tr><td>0.55</td><td>0.50</td><td>1.05</td><td>否</td><td>−0.05</td><td>几何重叠较多但语义不符，检查是否遮挡或错误分割</td></tr>
+    </table>
+    <p>算例中 φ<sub>sem</sub> = 0.85 对应余弦相似度 0.70（由 0.85 × 2 − 1 反推），φ<sub>sem</sub> = 0.90 对应余弦 0.80。读数时把两项分开记录，否则阈值调参无从下手。</p>
+
+    <h3>4. 节点融合：滑动平均与点云合并</h3>
+    <p>关联成功后，节点特征按已关联检测数 n 做滑动平均，点云取并集后体素下采样：</p>
+    <div class="formula">f<sub>o_j</sub> ← (n<sub>o_j</sub> · f<sub>o_j</sub> + f<sub>t,i</sub>) / (n<sub>o_j</sub> + 1)；p<sub>o_j</sub> ← downsample(p<sub>o_j</sub> ∪ p<sub>t,i</sub>)</div>
+    <p>滑动平均意味着单个新检测对旧特征的权重是 1 / (n + 1)。n = 4 时新检测权重 0.200，n = 9 时降到 0.100：观察越充分的物体，外观特征越稳定，单个噪声视图的影响越小。这一性质对遮挡与运动模糊尤其重要；反过来，若物体外观随时间真实变化（例如台面被清空），旧特征权重过高会拖慢适应，这一项要靠检测与关联环节的更新来处理，特征融合本身不会自适应。</p>
+
+    <h3>5. 描述与建边：语言模型负责“说不清”的部分</h3>
+    <p>建图完成后，每个节点取贡献有效点最多的最多 10 个视图，用 LLaVA-7B 逐视图生成描述，提示词固定为“描述图像中央的物体”；再把 10 条初始描述交给 GPT-4 汇总成一个连贯的对象标签与一句话描述，GPT-4 还可以把疑似错误检测标为无效。这一步把“同类实例”升级为可区分的语言标签，例如“带白色花纹的花瓶”。</p>
+    <p>边由两步生成。先对节点两两计算 3D 包围盒交并比（Intersection over Union，IoU），得到稠密相似度矩阵；再对该矩阵做生成树剪枝，只保留 J − 1 条边（J 为节点数），其余边删除。剪枝力度可用算例看清：某场景 54 个有效物体对应 54 × 53 / 2 = 1,431 个节点对，生成树只保留 53 条边，保留率 3.70%，剪掉 96.30%；把节点数放大到 110 的算例中，5,995 个节点对只保留 109 条边，保留率 1.82%。然后对生成树的每条边，把两个节点的描述与 3D 位置交给 LLM，让它输出关系标签及理由，例如“a on b”“b in a”，也可以给出“背包可能收纳在衣柜里”这类开放词汇关系。</p>
+
+    <h3>6. 规划消费：把图变成 LLM 的输入</h3>
+    <p>下游任务的接口非常直接：把每个节点序列化为 JSON 项，含 id、包围盒尺寸 bbox_extent、包围盒中心 bbox_center、对象标签 object_tag、一句话描述 caption；把整张列表与用户查询一起交给 GPT-4（实验用 gpt-4-0613，上下文 8K token），要求返回结构化字段 inferred_query、relevant_objects、query_achievable、final_relevant_objects 与 explanation。论文同时验证了更长上下文的 Claude-2（32K token）可用。拿到 final_relevant_objects 后，取出节点的 3D 位姿，交给抓取或导航流水线执行。</p>
+    <p>三类查询的对比最能说明“图 + LLM”的消费特征。下表为 Replica 与 REAL Lab 场景上的 top-1 检索率（R@1，Gu 等 2023，表 III）：</p>
+    <table>
+      <tr><th>数据集</th><th>查询类型</th><th>样本数</th><th>CLIP 检索 R@1</th><th>LLM 检索 R@1</th><th>差值</th></tr>
+      <tr><td>Replica</td><td>描述（如“盆栽”）</td><td>20</td><td>0.59</td><td>0.61</td><td>+0.02（相对 +3.4%）</td></tr>
+      <tr><td>Replica</td><td>可供性（如“临时固定坏拉链的东西”）</td><td>5</td><td>0.43</td><td>0.57</td><td>+0.14（相对 +32.6%）</td></tr>
+      <tr><td>Replica</td><td>否定（如“除汽水外的饮料”）</td><td>5</td><td>0.26</td><td>0.80</td><td>+0.54（相对 +207.7%，即 3.08 倍）</td></tr>
+      <tr><td>REAL Lab</td><td>描述</td><td>10</td><td>1.00</td><td>1.00</td><td>0</td></tr>
+      <tr><td>REAL Lab</td><td>可供性</td><td>10</td><td>0.40</td><td>1.00</td><td>+0.60</td></tr>
+      <tr><td>REAL Lab</td><td>否定</td><td>10</td><td>0.00</td><td>1.00</td><td>+1.00</td></tr>
+    </table>
+    <p>模式很清楚：直接描述查询上 CLIP 与 LLM 接近（0.59 对 0.61），因为查询词与节点特征可以直接对齐；涉及常识推理的可供性与否定查询上，LLM 依赖节点描述做语言推理，优势显著，否定查询从 0.26 提到 0.80。样本量栏必须随表引用：5 条与 10 条的评测集只能作为趋势证据，不能当作稳定的排行榜数字。LLM 的短板同样来自节点描述：描述错了，推理越强错得越自信。</p>
+
+    <h3>7. 实验读数与失效模式</h3>
+    <p>图质量在 Replica 的 7 个场景（room0 至 room2、office0 至 office3）上由人工评测给出。节点精度定义为“节点描述被三名评测者中至少两人判为正确”的比例，CG 平均 0.71，CG-D 平均 0.61；边精度即空间关系判对的平均比例，CG 为 0.88，CG-D 为 0.91；有效物体数每场景 23 到 60 个，重复检测 0 到 5 个（Gu 等 2023，表 I）。两个变体的对位成绩值得玩味：检测器变体的边更准，但节点描述更差，说明瓶颈主要在描述来源与候选质量的不同组合，不取决于单一模块的绝对优劣。</p>
+    <table>
+      <tr><th>评测项</th><th>口径</th><th>ConceptGraphs</th><th>对照</th><th>差值</th></tr>
+      <tr><td>节点描述精度</td><td>7 场景人工评测平均</td><td>0.71</td><td>CG-D 0.61</td><td>+0.10</td></tr>
+      <tr><td>边关系精度</td><td>7 场景人工评测平均</td><td>0.88</td><td>CG-D 0.91</td><td>−0.03</td></tr>
+      <tr><td>开放词汇分割 mAcc</td><td>Replica，按 ConceptFusion 协议</td><td>40.63</td><td>ConceptFusion+SAM 31.53</td><td>+9.10（相对 +28.9%）</td></tr>
+      <tr><td>开放词汇分割 F-mIoU</td><td>同上</td><td>35.95</td><td>ConceptFusion+SAM 38.70</td><td>−2.75（相对 −7.1%）</td></tr>
+      <tr><td>否定查询 R@1</td><td>Replica，5 条查询</td><td>0.80（LLM）</td><td>0.26（CLIP）</td><td>+0.54</td></tr>
+    </table>
+    <p>分割两项指标的差异要放在协议里读：mAcc 对类别正确率更敏感，F-mIoU 对区域边界更敏感，CG 在类别判别上更强、在边界贴合上略逊，说明对象级表示没有牺牲类别能力，但点云归属仍带分割噪声。真机侧，论文在 REAL Lab 用 Clearpath Jackal 轮式平台（VLP-16 激光雷达加 RealSense D435i）做语言查询导航与可通行性判断，用 Spot Arm 做“cuddly quacker”这类模糊指代的开词汇抓放，还在 AI2-THOR 里用粒子滤波做基于图的定位与地图更新演示。</p>
+    <p>失效模式有四类：其一，LLaVA 描述错误直接拉低节点精度，节点误差率约 0.29；其二，细小或薄片物体漏检与重复检测，重复数每场景 0 到 5 个，关键物体被漏掉会直接导致规划失败；其三，建图与查询都要调用 LVLM 与专有 LLM，推理成本可观，论文把它列为系统局限；其四，图默认静态，未内建时序推理，物体移动后依赖下游的定位与重映射实验来补救。引用这些数字时，必须同时给出评测方式（人工或自动）、数据集与其版本。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>把系统拆成可替换的模块后，每个设计点都能给出选择判据。下表汇总论文的选择与替代方案：</p>
+    <table>
+      <tr><th>决策点</th><th>论文选择</th><th>替代方案与代价</th><th>判据</th></tr>
+      <tr><td>候选物体来源</td><td>SAM 类无关分割（CG）</td><td>RAM 加 Grounding DINO（CG-D）：边精度略升，节点精度下降</td><td>要跨类别泛化用 CG；要扩到属性框用 CG-D</td></tr>
+      <tr><td>语义特征</td><td>CLIP 图像编码器</td><td>DINO 等自监督特征：语义弱、几何强</td><td>查询以语言驱动时保留 CLIP</td></tr>
+      <tr><td>关联分配</td><td>贪心取最高分</td><td>匈牙利最优分配：更慢，提升极小</td><td>在线场景优先吞吐</td></tr>
+      <tr><td>关联阈值</td><td>δ<sub>sim</sub> = 1.1（两项和）</td><td>调高减少错误合并、增加重复节点；调低相反</td><td>按重复检测与漏检的代价权衡</td></tr>
+      <tr><td>视图预算</td><td>每节点最多 10 个视图送描述</td><td>增加视图提描述鲁棒性，推理成本线性增长</td><td>描述精度与 LLM 调用成本的折中</td></tr>
+      <tr><td>规划器</td><td>GPT-4（8K token）</td><td>Claude-2（32K）验证可用；本地模型省成本</td><td>场景图文本长度决定上下文需求</td></tr>
+    </table>
+    <p>接口层面，节点对下游只暴露五元组：唯一 id、包围盒尺寸、包围盒中心、对象标签、一句话描述。这五元组是感知与规划之间的稳定契约：感知侧可以替换分割与描述模型，规划侧可以替换 LLM，只要契约不变，导航与抓取流水线不用改。与第 069 至 070 讲的 SG-Nav 相比，本讲的差异有三点：类别来源从闭集检测改为类无关掩码加 CLIP，节点语义从类别标签改为多视图语言描述，规划从分层链式推理改为整图序列化后交给通用 LLM。</p>
+    <p>在线维护的工程边界也要写清楚。稠密特征场更新是“重投影加平均”，图更新的粒度是节点：关联失败会新建重复节点，关联错误会把两个物体合并。两个错误方向不对称：重复节点让 LLM 看到冗余信息，通常不致命；错误合并会让两个物体的点云与特征混合，污染描述并误导规划。因此工程上宁可阈值略高、保留部分重复节点，也不要让不同实例过早合并。论文补充材料也指出，探索阶段用固定阈值匹配容易漏真、后探索阶段改用最高分选择，成功率更高。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>三段代码对应建图管线的三个关键环节：多视图关联与融合、生成树建边、LLM 消费接口。代码为示意实现，模块接口与论文口径一致。</p>
+
+    <p><strong>片段 1：关联评分与节点融合</strong></p>
+    <pre class="code"><code>import numpy as np
+
+def nn_ratio(p_new, p_old, delta=0.025):
+    """几何相似度：新点云在旧点云 delta 内有最近邻的点占比。"""
+    if len(p_new) == 0 or len(p_old) == 0:
+        return 0.0
+    d2 = ((p_new[:, None, :] - p_old[None, :, :]) ** 2).sum(-1)
+    return float((d2.min(axis=1) &lt;= delta ** 2).mean())
+
+def associate(det_cloud, det_feat, objects, delta_sim=1.1, delta_nn=0.025):
+    """为单帧新检测选匹配节点；无匹配返回 None，由调用方新建节点。"""
+    best_id, best_phi = None, -1.0
+    for obj in objects:
+        if not overlaps(obj.points, det_cloud):
+            continue                                # 无空间重叠直接跳过
+        phi_geo = nn_ratio(det_cloud, obj.points, delta_nn)
+        phi_sem = float(det_feat @ obj.feat) / 2.0 + 0.5
+        phi = phi_sem + phi_geo                     # 两项之和，范围 [0, 2]
+        if phi &gt; best_phi:
+            best_id, best_phi = obj.obj_id, phi
+    if best_phi &lt; delta_sim:
+        return None
+    return best_id
+
+def fuse(obj, det_cloud, det_feat, voxel=0.025):
+    """融合：特征滑动平均，点云并集后体素下采样。"""
+    n = obj.n_views
+    obj.feat = (n * obj.feat + det_feat) / (n + 1.0)
+    merged = np.concatenate([obj.points, det_cloud], axis=0)
+    obj.points = voxel_downsample(merged, size=voxel)
+    obj.n_views = n + 1
+    return obj</code></pre>
+    <p>解读：<strong>（1）</strong>先做重叠预筛再算精确相似度，避免对全场景节点做点云最近邻，这是在线可用的关键；<strong>（2）</strong>φ<sub>sem</sub> 的“除以 2 加 1/2”把余弦从［−1, 1］映射到［0, 1］，与 φ<sub>geo</sub> 同量纲后才能直接相加；<strong>（3）</strong>阈值判断放在全部候选比较之后，贪心且与遍历顺序无关；<strong>（4）</strong>融合用已关联次数 n 做滑动平均，新检测权重为 1/(n+1)，后续第 072 讲的实例记忆同样遵循“越看越稳”的更新哲学。</p>
+
+    <p><strong>片段 2：从节点集合到生成树边集</strong></p>
+    <pre class="code"><code>import itertools
+
+def bbox_iou(a, b):
+    """两个轴对齐包围盒的 3D 交并比，作为连边权重。"""
+    lo = np.maximum(a.min(axis=0), b.min(axis=0))
+    hi = np.minimum(a.max(axis=0), b.max(axis=0))
+    inter = float(np.prod(np.clip(hi - lo, 0.0, None)))
+    va = float(np.prod(a.max(axis=0) - a.min(axis=0)))
+    vb = float(np.prod(b.max(axis=0) - b.min(axis=0)))
+    return inter / max(va + vb - inter, 1e-9)
+
+def spanning_tree_edges(objects):
+    """Kruskal 最大生成树：密图边数为 J(J-1)/2，剪枝后只剩 J-1 条。"""
+    edges = []
+    for i, j in itertools.combinations(range(len(objects)), 2):
+        w = bbox_iou(objects[i].bbox, objects[j].bbox)
+        if w &gt; 0.0:
+            edges.append((w, i, j))
+    edges.sort(reverse=True)
+    parent = list(range(len(objects)))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    mst = []
+    for w, i, j in edges:
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[ri] = rj
+            mst.append((i, j, w))
+    return mst
+
+def label_edges(objects, mst, call_llm):
+    """对生成树每条边询问关系标签，输出开放词汇的边集合。"""
+    labeled = []
+    for i, j, _ in mst:
+        prompt = "物体 A：%s；物体 B：%s。给出二者的空间关系标签与理由。" % (
+            objects[i].caption, objects[j].caption)
+        labeled.append((i, j, call_llm(prompt)))
+    return labeled</code></pre>
+    <p>解读：<strong>（1）</strong>IoU 密图是全连接近似，J 增大时边数按平方增长，生成树把它压到 J − 1 条，54 个节点时保留率 3.70%，110 个节点时 1.82%，这是图表示可扩展性的来源；<strong>（2）</strong>相似度高于 0 才进入候选，实际实现中可加下限过滤明显不相邻的物体对；<strong>（3）</strong>关系标签交给 LLM 生成，跳过闭集分类器，因此可以产出“可能收纳在”这类训练时未见的关系词，代价是每条边一次推理调用；<strong>（4）</strong>边集剪枝只保证连通与稀疏，不保证语义上最重要，工程上可对 LLM 输出做人工抽查。</p>
+
+    <p><strong>片段 3：场景图序列化与 LLM 查询接口</strong></p>
+    <pre class="code"><code>import json
+
+def serialize_scene(objects):
+    """节点序列化为 JSON 列表：五字段契约，控制字符预算。"""
+    rows = []
+    for obj in objects:
+        rows.append({
+            "id": obj.obj_id,
+            "bbox_extent": [round(float(v), 2) for v in obj.bbox_size],
+            "bbox_center": [round(float(v), 2) for v in obj.bbox_center],
+            "object_tag": obj.tag,
+            "caption": obj.caption,
+        })
+    return rows
+
+PLANNER_SYS = (
+    "输入是一个 3D 场景的 JSON 列表，每项含 id、bbox_extent、bbox_center、"
+    "object_tag 与 caption。按用户查询返回 JSON：inferred_query、"
+    "relevant_objects、query_achievable、final_relevant_objects、explanation。"
+)
+
+def plan(scene_rows, query, call_llm, char_budget=24000):
+    """字符预算不足时按空间分块查询，再按候选分数全局重排。"""
+    text = json.dumps(scene_rows, ensure_ascii=False)
+    if len(text) &lt;= char_budget:
+        return call_llm(PLANNER_SYS, text, query)
+    chunks = spatial_chunk(scene_rows, limit=char_budget // 2)
+    hits = [call_llm(PLANNER_SYS, json.dumps(c, ensure_ascii=False), query)
+            for c in chunks]
+    return rerank_by_scores(query, hits)</code></pre>
+    <p>解读：<strong>（1）</strong>五字段契约把感知输出与规划输入解耦，序列化时保留小数位控制文本长度；<strong>（2）</strong>论文用 8K token 上下文，本示意用字符预算近似，上线前应按实际模型的分词器换算；<strong>（3）</strong>大场景必需分块与重排，否则列表被截断，LLM 只在残缺场景上推理；<strong>（4）</strong>查询返回 final_relevant_objects 的 id 列表，调用方据此取 3D 位姿执行导航或抓取，语言推理与几何执行在此分界。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>把 δ<sub>sim</sub> = 1.1 当作余弦阈值</strong>：症状是阈值怎么调都效果异常，新节点大量产生或物体被错误合并。根因是 φ 为两项之和，取值范围［0, 2］，1.1 与余弦相似度不同量纲。修复：分别记录 φ<sub>sem</sub> 与 φ<sub>geo</sub> 的分布，按两项各自的物理含义调参。</li>
+      <li><strong>按点存特征</strong>：症状是长场景下内存或显存线性上涨。根因是把 CLIP 特征逐点投射进地图。修复：使用节点级特征与关系边；确需稠密特征时做降维与量化，并把它当作另一条技术路线评测，不要在对象图上混用。</li>
+      <li><strong>节点描述错误向下游传播</strong>：症状是 LLM 规划自信地选错物体。根因是 LLaVA 的视图描述不稳定，汇总后的节点描述精度约 0.71。修复：每节点取多视图描述并做 LLM 汇总，关键任务前用当前观测图像做一次验证，必要时提供候选重排，避免只给单点答案。</li>
+      <li><strong>把人工评测精度与自动指标混谈</strong>：症状是用节点 0.71 与分割 mAcc 40.63 直接比较不同系统。根因是评测协议不同：前者是三名评测者多数表决的语义正确率，后者是点级类别指标。修复：引用时标注评测方式、场景集合与人数；跨论文比较只选同协议数字。</li>
+      <li><strong>图建好就冻结</strong>：症状是物体被移动后机器人反复导航到旧位置。根因是系统默认静态建图，没有时序更新机制。修复：对近期观察节点做重投影更新，物体消失时删除节点，物体移动时以新位置重建节点；论文的粒子滤波定位与重映射实验给出了一个可参考的更新回路。</li>
+      <li><strong>忽略 LLM 调用的成本与上下文上限</strong>：症状是评测单场景耗时远超预期，或大场景文本被截断后规划质量骤降。根因是建图描述与查询都依赖大模型，且 GPT-4 上下文为 8K token。修复：统计每场景的 LLM 调用次数与 token 数，设置分块与缓存策略，把成本列为部署约束的一部分。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>给定两组分数：φ<sub>sem</sub> = 0.82、φ<sub>geo</sub> = 0.24；φ<sub>sem</sub> = 0.58、φ<sub>geo</sub> = 0.55。判断是否关联，并说明各自对应什么样的观测情形。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>第一组 1.06 低于阈值 1.1，不关联，两视图很可能属于同类不同实例；第二组 1.13 高于阈值，关联，属于语义一般但几何重叠充分的同一物体新视角。两组都在阈值附近，提醒检查 CLIP 特征质量与点云配准误差。</div></details>
+      </li>
+      <li>实现片段 1 的 <code>associate</code> 与 <code>fuse</code>，用合成点云做一个 3 次观测的小实验：第一次建节点，第二、三次应关联；输出关联次数 n 与特征更新时间的新旧权重。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>n = 0 建节点；n = 1 时新检测权重 0.5；n = 2 时权重 0.333；若加入一次特征相反的噪声观测，观察滑动平均的抑制效果。把 φ 的两项分别打印，验证阈值 1.1 的行为。</div></details>
+      </li>
+      <li>解释检索表中否定查询的差距最大（CLIP 0.26 对 LLM 0.80），而描述查询几乎无差（0.59 对 0.61）。设计一组 20 条以上的新查询在 Replica 上验证你的解释。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>CLIP 只对查询文本与节点特征做相似度，没有“排除”与“常识替代”的运算；LLM 可以读节点描述做集合运算与常识推理。设计对照：同一目标物体分别用正向描述、可供性、否定三类查询各问一次，控制查询长度与稀有词比例，比较两类检索器的命中率。</div></details>
+      </li>
+      <li>为 500 m² 的办公楼层设计一份有界内存的建图方案：给出节点数上限、边数上限、每节点视图预算、存储估算与更新策略，并说明当节点数超限时你会牺牲什么。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>可按房间分区限额，例如每房间 60 节点、全层 600 节点；边按生成树 J − 1 加少量语义边控制；每节点 10 视图、每视图仅存缩略图与特征。存储估算：600 节点乘 512 维乘 2 字节约 600 KiB 特征，点云按体素下采样控制。超限时优先合并低置信节点、丢弃长期未重访的家具类节点，保留任务相关节点与关系边。</div></details>
+      </li>
+      <li>论文把图更新留给下游定位实验。请设计一个动态场景测试：物体在两次访问之间被移动 2 m，验证基于节点的删除加重建策略能否在第二次查询时导航到新位置。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>协议：第一次建图并记录物体节点；移动物体后重新观测；比较三种更新方式（冻结旧节点、删除后新建、按置信度衰减）在第二次查询上的导航成功率与到目标距离。判定标准包括旧节点是否被及时清除、新节点是否与原节点错误合并。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>表示：概念图 M = ⟨O, E⟩，节点为带点云与 CLIP 特征的物体，边为开放词汇空间关系；相比逐点特征，100 个节点的语义特征（100 KiB）比百万点的逐点特征（1.00 GiB）小 10,485.76 倍。</li>
+      <li>建图：SAM 类无关分割、CLIP 特征、2.5 cm 体素去噪、φ = φ<sub>sem</sub> + φ<sub>geo</sub> 匹配（δ<sub>sim</sub> = 1.1）、按已关联次数滑动平均融合。</li>
+      <li>语言层：每节点最多 10 视图经 LLaVA-7B 描述、GPT-4 汇总；IoU 密图经生成树剪枝到 J − 1 条边（54 节点时保留 3.70%），再由 LLM 标注开放词汇关系。</li>
+      <li>消费：节点序列化为五字段 JSON 送 LLM；Replica 上描述查询 R@1 从 0.59 到 0.61，可供性从 0.43 到 0.57，否定从 0.26 到 0.80（样本 5 至 20 条，只作趋势证据）。</li>
+      <li>读数与边界：Replica 7 场景节点精度 0.71、边精度 0.88，分割 mAcc 40.63；失效来源包括描述错误、细薄物体漏检、重复节点、LLM 成本与静态图更新。</li>
+      <li>衔接：下一讲进入 GOAT 系统，看对象化记忆如何演化成实例感知的终身记忆，并在 9 个真实家庭的 90 小时实验中接受检验。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch070.html">← 第 070 讲：SG-Nav II：re-perception 纠错</a>
+    <a class="next" href="ch072.html">第 072 讲：GOAT I：多模态终身导航 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.06 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:11.5px !important;letter-spacing:.06em !important;color:rgba(71,85,105,.45) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#7e8ba0 !important;font-size:11.5px !important;line-height:1.8 !important;text-align:center !important;padding:5px 12px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

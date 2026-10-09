@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 091 讲｜spot-sim2real 基础设施 | 目标物体导航课程 · ObjectNav 从探索到开放词汇</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第五篇 · 真机、Sim2Real 与系统集成</span>
+    <span class="sep">/</span>
+    <span>第 091 讲</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第五篇 · 真机、Sim2Real 与系统集成</div>
+    <h1>第 091 讲｜spot-sim2real 基础设施</h1>
+    <p class="lead">089 与 090 讲围绕 Stretch 平台展开，本讲换到四足机器人 Spot，读一份可运行的基础设施：facebookresearch/spot-sim2real（GitHub，MIT 许可，本讲按 2026 年 10 月 1 日抓取的 README 与仓库页面整理，上游会持续变化）。仓库定位为 Spot 具身任务的模块化库：配置机器人、控制感知运动技能、协调大语言模型，支撑自适应技能协调（Adaptive Skill Coordination, ASC；Yokoyama 等，2023，arXiv:2304.00410）与语言引导技能协调（Language-guided Skill Coordination, LSC；Yang 等，2023）两项演示。它把 ROS 服务与话题、工作站侧技能、航点配置、位姿估计微服务、目标跟踪与数据记录器组织成一套依赖关系清晰的系统。本讲只讲基础设施的组织方式：进程如何启动、技能如何被非阻塞调用、感知模型如何以微服务接入、数据如何记录与回放；技能协调机制本身留给第 092 讲。</p>
+    <ul class="meta">
+      <li>主题：四足机器人栈 / ROS 服务与话题 / 技能接口 / 微服务集成（FoundationPose、SAM2）/ 数据记录</li>
+      <li>关键公式：技能请求 = 「时间戳,技能名,参数」；主导航话题约 10 Hz，日志为异步逐帧记录</li>
+      <li>预计学时：75 分钟</li>
+      <li>前置章节：第 090 讲（OVMM 复盘：0.8%→10.8%）</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解：说清 spot-sim2real 的分层结构，包括机器人端服务、ROS 通信、工作站技能与可选感知微服务各自的职责。</li>
+      <li>会分析：读懂技能请求「时间戳,技能名,参数」的投递与去重机制，说明非阻塞调用相对直接函数调用的工程收益。</li>
+      <li>会算：依据相机话题频率与记录字段，估算一次数据记录会话的存储规模与回放可行性。</li>
+      <li>会设计：为一个新感知模型写接入清单，覆盖启动顺序、接口协议、失败回退与评测方法。</li>
+      <li>会判断：识别里程计漂移、进程启动竞态、环境隔离三类基础设施级失效，并给出对应修复。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 090 讲的复盘留下三个需求：错误恢复要有可靠的传感器信号，感知要与决策深度整合，评测要能跨实验室复现。换一个平台之后，同样的需求会以不同的工程形态出现。Spot 自带成熟的控制接口与传感器生态，缺少的是把技能、语言、感知模型组织起来的中间层。spot-sim2real 提供的正是这一层：机器人端只保留低层必要服务，工作站侧运行策略与感知，技能以可组合的模块暴露，感知模型以独立微服务接入。</p>
+    <p>本讲与相邻讲的分工：087 讲曾讨论过 Stretch 与连续动作，091 讲讨论四足平台的同类问题；092 讲拆 ASC 与 LSC 的协调机制，093 讲 VLFM 在该平台上的部署，094 讲多机与多楼层。本讲的价值在于把「可复现的机器人系统」拆成进程、接口、数据三类对象，读者据此可以判断接入成本与失败位置。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 组件全景与分层</h3>
+    <p>仓库目录可以直接映射到系统分层。底层封装在 <strong>bd_spot_wrapper</strong>，负责与 Spot 的控制接口通信；<strong>spot_rl_experiments</strong> 存放技能、环境与配置，是策略运行的主体；<strong>perception_and_utils_root</strong> 汇集感知工具；<strong>ros_tcp</strong> 提供外部进程接入 ROS 的桥接；<strong>intel_realsense_payload_for_spotsim2real</strong> 对应机身搭载的 RealSense 相机载荷；<strong>aria_data_loaders</strong> 支持 Spot 与 Aria 眼镜数据的情景记忆演示；<strong>installation</strong>、<strong>scripts</strong>、<strong>tests/hardware_tests</strong> 与 <strong>third_party</strong> 分别承担安装、运维脚本、硬件测试与外部依赖。根目录的依赖管理与检查配置（.pre-commit-config.yaml、.flake8）说明这是一个按长期维护组织的代码库。</p>
+    <p>运行形态分两端。机器人经网络接收控制命令并回传传感数据；工作站作为开发主机，由本地启动脚本创建 4 个会话，承载 ROS 主节点、图像发布、本体感知与语音合成，技能策略与感知也在本机运行。仓库按抓取时的页面统计为 146 次提交、103 个星标、7 个复刻、30 个未关闭议题与 47 个待合并请求，属于活跃但仍在演进的项目，接口可能变化，本讲引用的一切都以抓取日期为准。</p>
+
+    <h3>2. 启动、进程与话题</h3>
+    <p>机器人连接支持三种网络模式：有线以太网（速度最好）、接入点模式（机器人自建热点，适合远距离遥操作）、客户端模式（机器人加入外部无线网络，仓库推荐日常使用）。配置完成后把机器人地址写入环境变量，并用连通性测试确认。演示运行分步执行：本地启动脚本 <code>spot_rl_launch_local</code> 在工作站上创建 4 个终端复用会话，分别承载 ROS 主节点、图像发布、本体感知与语音合成；README 要求这些会话保持存活至少 70 秒，若在 70 秒内退出则应整体重跑，并建议重试 2 至 3 次，因为 ROS 主节点冷启动偶尔较慢会拖垮其他节点。随后用话题列表核对环境，正常输出包含手部与头部深度、手部彩色图、检测与可视化、机器人状态以及语音等约 11 个话题。</p>
+    <p>安全与遥操作是前置步骤：由于该配置没有物理急停按钮，必须常驻运行软件急停节点，异常时按特定按键立即停止机器人；键盘遥操作用于把机器人移动到目标附近。启动之后还有两项调试工具：图像可视化脚本会打印各话题频率，若检测可视化话题的频率长期恒定不变，说明检测器尚未完成初始化，需等待其变为动态输出；可视化界面同时显示机器人视角与感知结果，是排查「机器人在看什么」的第一入口。</p>
+
+    <h3>3. 技能接口：航点与消息</h3>
+    <p>技能依赖预先记录的航点。航点存放在配置文件 <code>waypoints.yaml</code> 中，相对固定的起始位置（home 位姿）定义，分两类：<strong>clutter 类</strong>只需要目标容器的平面位姿 (x, y, theta)；<strong>place 类</strong>在平面位姿之外还需要落点 (x, y, z)，即物体放下的精确位置。录制用命令行工具完成，clutter 与 place 分别记录；录制前机器人应停在家中位置并执行复位命令。README 特别强调：里程计在移动过程中会漂移，因此每次新回合开始前都必须把机器人带回起始位置并复位 home，未复位直接运行会以错误的坐标基准执行技能。</p>
+    <p>技能调用采用非阻塞消息，不把技能函数直接嵌进调用方进程。工作站上常驻一个技能执行器进程，监听 ROS 参数；任何具备 ROS 客户端的环境只要写入参数值即可请求技能。消息格式为「时间戳,技能名,参数」，例如导航到桌子的请求会附带自制的桌面名称作为参数。执行器以固定频率轮询，用时间戳对请求去重，收到新请求后分派给对应技能。非阻塞设计的收益有三点：调用方不必等待长时动作结束；请求来源可以跨进程、跨语言；同一套执行器可以服务脚本、语言前端与其他程序。</p>
+    <div class="formula">
+      请求 = 时间戳 + "," + 技能名 + "," + 参数；执行器按时间戳严格递增过滤重复请求
+    </div>
+
+    <h3>4. 感知集成：两个微服务的模式</h3>
+    <p>仓库给出两个感知模型接入范例，模式可以直接迁移到其他模型。<strong>FoundationPose 位姿估计</strong>：作为第三方子模块安装，以微服务形式运行，通过进程间消息套接字与技能通信；启动脚本会一并拉起该服务，无需单独启动。目前只支持办公室茶水间的三类物体（瓶子、企鹅玩偶、纸杯）；新物体需要按官方流程用 360 度视频重建网格。抓取技能可以打开位姿估计与位姿校正两个开关；位姿估计用于告知抓取接口从顶部还是侧面接近，位姿校正会让机器人先摆正物体再放置。可选的方向求解能让物体正面朝向相机，但会额外消耗一次抓取尝试，默认关闭。<strong>SAM2 目标跟踪</strong>：由于依赖较新的 Python 版本，单独建环境安装，并对上游实现做了修改，使其接受原始 RGB 图像，不再要求视频路径；跟踪服务独立启动，开启与关闭技能通过 ROS 参数切换，用于支持需要持续目标状态的开合类操作。</p>
+    <p>两个范例共同定义了微服务接入的四个要素：<strong>独立环境</strong>（避免依赖冲突）、<strong>独立进程</strong>（避免阻塞技能循环）、<strong>明确协议</strong>（套接字消息或 ROS 参数）、<strong>能力边界</strong>（支持对象集与失败回退）。设计一节的接入清单将把四要素展开为可执行步骤。</p>
+
+    <h3>5. 数据记录与回放</h3>
+    <p>记录器把每个时间戳打包为一条日志，字段覆盖相机数据（每台相机的来源名称、原始图像、3×3 内参矩阵、相机相对机体坐标系的 4×4 外参矩阵）、机体相对视觉坐标系的变换、相对 home 的平面位姿 (x, y, yaw)、六关节机械臂状态（按 sh0、sh1、el0、el1、wr0、wr1 排列）、夹爪是否持有物体、夹爪开合百分比与手部坐标系下的末端受力估计。记录以异步方式逐帧进行，存储为按时间命名的二进制文件，支持完整回放。README 用显式警告说明两个局限：运动过程中记录会造成图像模糊；当前不支持先录制后巡游的采集协议。这两点决定了日志适合离线复盘与调试，不适合直接当作训练数据的唯一来源。</p>
+    <p>部署侧还有一个实用细节：仓库提供把策略权重转换为推理脚本格式的流程，转换后可以在不依赖完整训练框架的环境中执行策略；此外还有跨环境技能调用与 Spot-Aria 情景记忆演示的相关说明，后者把机器人与眼镜相机数据结合，用于取物示范。</p>
+
+    <h3>6. 与 HomeRobot 的对照</h3>
+    <p>两套基础设施解决同一类问题（把感知、技能与机器人拼装成可复现系统），但工程重心不同。HomeRobot 用 Docker 封装评测，同一镜像在仿真与真机间迁移，重点是评测可比性；spot-sim2real 用 Conda 环境、ROS 服务与终端复用会话组织运行时，重点是实机开发与技能组合。HomeRobot 的统一接口覆盖仿真与真机；spot-sim2real 面向真机部署，策略在外部训练后以权重转换方式接入。两者的共同经验是：<strong>把可替换部分放进独立进程与独立环境，把不可替换部分固定为清晰接口</strong>。对照表放在设计一节。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>基础设施的可用性取决于三张表：组件职责、服务生命周期、参数与依据。以下表格按仓库 README 与目录结构整理，标注替换成本的判断依据。</p>
+
+    <h3>组件职责与替换成本</h3>
+    <table>
+      <tr><th>组件</th><th>职责</th><th>接口 / 依赖</th><th>替换成本</th></tr>
+      <tr><td>bd_spot_wrapper</td><td>Spot 控制接口封装</td><td>机器人网络与厂商接口</td><td>高：与硬件强绑定</td></tr>
+      <tr><td>spot_rl_experiments</td><td>技能、环境与配置主体</td><td>ROS、策略权重、航点文件</td><td>中：技能可替换，环境契约需保持</td></tr>
+      <tr><td>perception_and_utils_root</td><td>感知工具集合</td><td>Python 环境、模型权重</td><td>低：多为独立模块</td></tr>
+      <tr><td>ros_tcp</td><td>外部进程接入 ROS 的桥接</td><td>TCP 与 ROS 话题</td><td>中：涉及消息序列化格式</td></tr>
+      <tr><td>intel_realsense_payload</td><td>相机载荷支持</td><td>USB / 网络、标定参数</td><td>中：换载荷需重新标定</td></tr>
+      <tr><td>aria_data_loaders</td><td>Spot 与 Aria 数据加载</td><td>离线数据文件</td><td>低：离线工具</td></tr>
+      <tr><td>third_party</td><td>外部子模块（位姿估计等）</td><td>子模块版本</td><td>低到中：随上游变化</td></tr>
+      <tr><td>tests/hardware_tests</td><td>硬件自检</td><td>机器人在线</td><td>低：测试代码</td></tr>
+    </table>
+
+    <h3>服务生命周期表</h3>
+    <table>
+      <tr><th>服务 / 进程</th><th>所在端</th><th>启动方式</th><th>失败症状</th><th>处置</th></tr>
+      <tr><td>ROS 主节点</td><td>工作站（本机）</td><td>启动脚本创建的会话之一</td><td>其他会话在 70 秒内陆续退出</td><td>整体重跑，通常重试 2 至 3 次</td></tr>
+      <tr><td>图像发布</td><td>工作站（本机）</td><td>同上</td><td>图像话题无数据，可视化空白</td><td>检查话题列表与网络模式</td></tr>
+      <tr><td>本体感知</td><td>工作站（本机）</td><td>同上</td><td>关节状态缺失，技能无法闭环</td><td>重启会话并核对机器人状态话题</td></tr>
+      <tr><td>语音合成</td><td>工作站（本机）</td><td>同上</td><td>语言演示无语音输出</td><td>非关键路径，可单独排查</td></tr>
+      <tr><td>软件急停</td><td>工作站</td><td>独立常驻</td><td>无法立即终止动作</td><td>必须常驻，异常时按键停止</td></tr>
+      <tr><td>技能执行器</td><td>工作站</td><td>独立进程监听参数</td><td>技能请求被写入但无动作</td><td>确认执行器存活与参数名一致</td></tr>
+      <tr><td>位姿估计微服务</td><td>工作站</td><td>随启动脚本拉起，套接字通信</td><td>抓取退化为默认接近方向</td><td>确认服务就绪与物体类型受支持</td></tr>
+      <tr><td>SAM2 跟踪服务</td><td>工作站（独立环境）</td><td>独立进程，参数开关</td><td>依赖跟踪的技能无状态更新</td><td>确认独立环境完好与服务已启动</td></tr>
+    </table>
+
+    <h3>参数与依据</h3>
+    <table>
+      <tr><th>参数 / 配置</th><th>默认或取值</th><th>作用</th><th>依据</th></tr>
+      <tr><td>连接模式</td><td>客户端模式（推荐）</td><td>机器人加入外部网络</td><td>速度次优但部署方便</td></tr>
+      <tr><td>启动确认窗口</td><td>70 秒</td><td>判断会话是否健康</td><td>ROS 主节点冷启动时间</td></tr>
+      <tr><td>技能消息</td><td>时间戳,技能名,参数</td><td>非阻塞请求与去重</td><td>参数通道轮询实现</td></tr>
+      <tr><td>航点类型</td><td>clutter (x, y, theta)；place 另加 (x, y, z)</td><td>导航目标与落点分离</td><td>抓取与放置的几何需求不同</td></tr>
+      <tr><td>home 复位</td><td>每次新回合前</td><td>消除里程计漂移</td><td>README 显式要求</td></tr>
+      <tr><td>位姿校正开关</td><td>默认关闭</td><td>避免额外抓取尝试</td><td>方向求解需要多一次尝试</td></tr>
+      <tr><td>日志字段</td><td>位姿、关节、夹爪、图像与内外参</td><td>离线复盘与回放</td><td>记录器键定义</td></tr>
+    </table>
+
+    <h3>微服务接入清单（以新感知模型为例）</h3>
+    <p>第一步明确能力边界：支持哪些类别、精度与延迟是多少、输入是原始图像还是裁剪区域。第二步选择环境策略：依赖与主环境冲突时建独立环境，参考 SAM2 的做法。第三步定义接口：与技能主循环异步通信，套接字消息或 ROS 参数都可，但必须版本化消息格式；第四步处理启动顺序：服务未就绪时技能应降级以避免阻塞，参考位姿估计的默认关闭策略；第五步设计回退：服务不可用时回到基线行为，并在日志中记录降级事件；第六步确定评测：在固定场景与固定回合数下比较接入前后的成功率、延迟与降级频率。与 090 讲的容器化评测对照，这里的「接入清单」相当于运行时的依赖治理。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>三段代码对应技能调用、航点与复位、跟踪服务开关，均为按 README 流程重写的教学实现，函数名与参数名非仓库原始接口名。</p>
+
+    <p><strong>片段 1：非阻塞技能请求与执行器去重</strong></p>
+    <pre class="code"><code>import time
+import rospy
+
+VALID_SKILLS = {"Navigate", "Pick", "Place", "Open", "Close"}
+
+def call_skill_nonblocking(name, arg=""):
+    """调用方只写 ROS 参数，不等待技能结束。"""
+    if name not in VALID_SKILLS:
+        raise ValueError("未知技能: " + name)
+    payload = f"{time.time():.6f},{name},{arg}"    # 时间戳,技能名,参数
+    rospy.set_param("skill_name_input", payload)
+    return payload
+
+class SkillExecutor:
+    """常驻进程：轮询参数通道，按时间戳去重后分派技能。"""
+    def __init__(self):
+        self.last_stamp = 0.0
+
+    def parse(self, raw):
+        parts = str(raw).split(",")
+        if len(parts) &lt; 2:
+            return 0.0, "", ""
+        return float(parts[0]), parts[1], parts[2] if len(parts) &gt; 2 else ""
+
+    def spin(self):
+        rate = rospy.Rate(10)                      # 10 Hz 轮询已足够低延迟
+        while not rospy.is_shutdown():
+            stamp, name, arg = self.parse(
+                rospy.get_param("skill_name_input", ""))
+            if stamp &gt; self.last_stamp:            # 旧消息不重复执行
+                self.last_stamp = stamp
+                self.dispatch(name, arg)
+            rate.sleep()
+</code></pre>
+    <p>解读：<strong>（1）</strong>消息带时间戳解决了参数通道没有队列语义的问题：写入即覆盖，消费方靠时间戳判断新旧。<strong>（2）</strong>调用方与执行方完全解耦，脚本、语言前端或另一台工作站都能用同一条通道请求技能。<strong>（3）</strong>10 Hz 轮询是延迟与负载的折中；对长时技能，请求延迟的感知上限约为 0.1 秒，远小于技能本身耗时。<strong>（4）</strong>该模式的代价是丢请求风险：两次写入间隔小于轮询周期时，先写入的请求会被覆盖，调用方需要确认机制或串行化请求。</p>
+
+    <p><strong>片段 2：航点校验与 home 复位</strong></p>
+    <pre class="code"><code>import yaml
+
+def load_waypoints(path):
+    """clutter 只需平面位姿；place 还需要落点高度与位置。"""
+    with open(path, encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+    for name, w in data.items():
+        if w["type"] == "place":
+            need = ("x", "y", "theta", "drop_x", "drop_y", "drop_z")
+        else:
+            need = ("x", "y", "theta")
+        missing = [k for k in need if k not in w]
+        if missing:
+            raise ValueError(f"航点 {name} 缺少字段 {missing}")
+    return data
+
+def run_with_home_reset(env, reset_home):
+    """里程计漂移使航点基准失效，每个新回合前先复位 home。"""
+    reset_home()                       # 对应仓库的复位命令
+    return env.reset()                 # 之后才允许执行导航或抓放
+</code></pre>
+    <p>解读：<strong>（1）</strong>严格校验字段可以避免「录制时是 place、加载时按 clutter 使用」的静默错误，这种错误在真机上表现为放置点偏差，排查成本高。<strong>（2）</strong>复位放在回合开始时，不等到出问题时，把漂移从「异常处理」变成「例行流程」。<strong>（3）</strong>航点依赖 home 坐标系，任何移动机器人本体的操作（包括人工搬动）后都要重新复位，否则坐标基准整体偏移。</p>
+
+    <p><strong>片段 3：跟踪服务的参数开关</strong></p>
+    <pre class="code"><code>import rospy
+
+def set_tracking(service, enabled, timeout=30.0):
+    """SAM2 跟踪在独立环境与独立进程中运行，技能侧只切换参数。"""
+    rospy.set_param("enable_tracking", bool(enabled))
+    if not enabled:
+        return True
+    # 服务由另一个进程启动；未就绪时向上层报告降级，避免阻塞
+    ready = service.wait_ready(timeout=timeout)
+    if not ready:
+        rospy.logwarn("跟踪服务未就绪，相关技能退回无跟踪模式")
+        rospy.set_param("enable_tracking", False)
+        return False
+    return True
+</code></pre>
+    <p>解读：<strong>（1）</strong>把开关与就绪检查绑定，避免「参数开了但服务没起」造成的隐性失败。<strong>（2）</strong>超时后自动降级并记录告警，与位姿校正默认关闭的保守策略一致：可选能力缺失时系统仍能运行。<strong>（3）</strong>独立进程与环境隔离意味着跟踪服务崩溃不会拖垮技能进程，代价是状态同步需要参数或消息协议，调试时要同时观察两侧日志。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>不复位 home 就运行</strong>：症状是航点执行偏差随回合数累积，短回合尚可、长回合明显。根因是里程计漂移，航点却以 home 为基准。修复：把复位写进回合启动脚本；人工移动机器人后强制复位；把位姿偏差纳入日志监控。</li>
+      <li><strong>启动竞态误判为硬件故障</strong>：症状是 4 个会话在 70 秒内陆续退出，反复检查机器人与网络无果。根因是 ROS 主节点冷启动慢，其他进程先于主节点崩溃。修复：整体重跑 2 至 3 次；用话题列表核对 11 个话题是否齐全；参照仓库的故障排查文档逐项定位。</li>
+      <li><strong>把跟踪服务装进主环境</strong>：症状是安装依赖后主环境损坏或技能无法启动。根因是 SAM2 需要更高版本的 Python，与机器人栈的运行时冲突。修复：维持独立环境与独立进程；用参数开关代替导入调用；升级主环境前先确认与机器人接口的兼容性。</li>
+      <li><strong>运动中记录日志</strong>：症状是回放图像模糊，位姿与图像对齐误差增大。根因是异步记录在机器人移动时抓取帧，仓库明确提示该限制且不支持先录制后巡游。修复：把训练数据采集安排在停顿点；复盘时以位姿与关节字段为主，图像作为辅助证据。</li>
+      <li><strong>依赖微服务启动顺序</strong>：症状是抓取偶发退化，日志中位姿估计结果缺失。根因是位姿服务未就绪时被直接调用，且只支持少数物体类型。修复：调用前检查就绪状态；不支持的对象走默认接近方向；位姿校正保持默认关闭，确认收益后再开启。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>复述启动检查流程：4 个会话分别做什么、70 秒窗口为何存在、话题列表应包含哪些类别；说明哪一步最容易被跳过。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>会话为 ROS 主节点、图像发布、本体感知、语音合成；70 秒用于确认主节点就绪后其他进程不再退出；话题涵盖深度、彩色图、检测结果、机器人状态与语音。最容易被跳过的是复位 home 与检测器初始化等待。</div></details>
+      </li>
+      <li>依据日志字段与约 10 Hz 的话题频率，设计一次 10 分钟记录的存储估算方案：列出需要实测的量（图像分辨率、编码方式、实际帧率），给出计算公式与验证方法。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>总量 = 帧率 × 时长 × 每帧字节数（多相机求和）加上位姿与关节等小字段。每帧字节数需按实际分辨率与编码实测。验证：记录 1 分钟后读取文件大小，与预测比对，误差大时检查是否有丢帧或压缩。</div></details>
+      </li>
+      <li>把导航技能替换为另一实现（如同场景的另一策略），设计不改变上层调用的接入方案与对照实验：列出接口约束、对照变量与通过标准。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>约束：输入为航点或目标名、输出动作序列、经技能执行器分派。对照：固定航点集与起始位姿，各 10 次，记录到达成功率、耗时、急停次数。通过标准预先注册，例如耗时增幅不超过 20% 且无新增安全事件。</div></details>
+      </li>
+      <li>为新感知微服务写接入清单：从环境、进程、协议、启动顺序、回退、评测六方面设计，并指出哪一项最容易被忽略、忽略后的现场症状。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>六项中启动顺序与回退最易被忽略，症状是「大部分时间正常、偶发退化且难复现」。设计时把就绪检查与自动降级写成强制前置，并要求降级事件带时间戳写日志；评测时统计降级频率作为一阶指标。</div></details>
+      </li>
+      <li>假设里程计漂移为每 10 分钟约 0.1 m（量级假设），估算连续 5 个回合不复位时航点基准偏差的分布，并给出复位频率建议。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>若漂移近似独立累积，5 回合后偏差量级约 0.5 m，足以让放置落点脱离容器边缘安全区。建议每回合复位；若漂移速率实测更小，可放宽为每 N 回合，并以落点偏差监控触发复位。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>spot-sim2real 是面向 Spot 的模块化基础设施（MIT 许可；本讲按 2026 年 10 月 1 日抓取信息整理），支撑 ASC 与 LSC 演示；组件覆盖控制封装、技能与配置、感知工具、ROS 桥接、相机载荷与数据加载。</li>
+      <li>运行形态分两端：机器人端承载图像、本体感知与语音等低层服务，工作站端运行技能与感知；启动脚本创建 4 个会话，以 70 秒窗口与话题列表确认健康状态，软件急停必须常驻。</li>
+      <li>技能通过「时间戳,技能名,参数」的非阻塞消息调用，执行器轮询参数通道并去重；航点分 clutter 与 place 两类，均以 home 为基准，每次新回合前必须复位以消除里程计漂移。</li>
+      <li>感知模型以独立环境、独立进程、明确协议、受限能力边界四要素接入：FoundationPose 经套接字提供位姿估计与校正且默认保守，SAM2 跟踪在独立环境运行并由参数开关控制，未就绪时降级。</li>
+      <li>数据记录器异步记录相机内外参、位姿、关节与夹爪状态并支持回放，局限是运动模糊与不支持先录制后巡游；策略权重可转换为独立推理格式部署。</li>
+      <li>下一讲进入 ASC 与 LSC 的技能协调机制：看这些基础设施上如何组织感知运动技能与语言指令，完成开放词汇的取放任务。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch090.html">← 第 090 讲：OVMM 复盘：0.8%→10.8%</a>
+    <a class="next" href="ch092.html">第 092 讲：ASC / LSC 技能协调 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.06 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:11.5px !important;letter-spacing:.06em !important;color:rgba(71,85,105,.45) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#7e8ba0 !important;font-size:11.5px !important;line-height:1.8 !important;text-align:center !important;padding:5px 12px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

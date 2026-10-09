@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 042 讲｜DD-PPO 分布式 RL 训练 | 目标物体导航课程 · ObjectNav 从探索到开放词汇</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第三篇 · 端到端与配方</span>
+    <span class="sep">/</span>
+    <span>第 042 讲</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第三篇 · 端到端与配方</div>
+    <h1>第 042 讲｜DD-PPO 分布式 RL 训练</h1>
+    <p class="lead">上一讲的配方建立在数亿帧采样之上，本讲回答这些样本怎样高效生产。以 Wijmans 等（2020）的 DD-PPO 为样本：从数据并行公式推导同步去中心化架构，拆解预占阈值对尾部延迟的处理，用 107 倍与 196 倍两组加速比核算扩展效率，并给出 2.5B 步训练的全套工程账目。</p>
+    <ul class="meta">
+      <li>主题：同步分布式 RL / 去中心化梯度归约 / 预占阈值 / 扩展效率</li>
+      <li>关键公式：θ<sub>n</sub><sup>k+1</sup> = ParamUpdate( θ<sub>n</sub><sup>k</sup>, (1/N) Σ ∂θ<sub>i</sub><sup>k</sup> )</li>
+      <li>预计学时：70 分钟</li>
+      <li>前置章节：第 041 讲（端到端起点与样本低效）</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <p>本讲的目标是把「大规模 RL 怎么跑」拆成协议、工程与账目三层，每层都可独立复现与检验。</p>
+    <ul>
+      <li>理解：说清异步参数服务器与同步数据并行两种范式的差别，以及「无陈旧梯度」对 on-policy 算法的意义。</li>
+      <li>会推导：从数据并行更新式写出 DD-PPO 的 worker 更新式，说明有效批大小与梯度归约对策略优化噪声的作用。</li>
+      <li>会算：按 64 worker、4 环境、128 步核算单次更新的经验量与更新次数；按 107x/128、196x/256、7.3x/8 核算扩展效率。</li>
+      <li>会设计：解释预占阈值 p 的作用，量化尾部延迟与截断损失之间的交换，给出阈值选择的实验方案。</li>
+      <li>会判断：读懂同构与异构两种负载下的扩展曲线，识别策略网络中必须替换批归一化、去掉优势归一化等工程判据。</li>
+      <li>能定位边界：知道该套件解决 PointNav（有 GPS+Compass），无 GPS+Compass 设定训练到 2.5B 步仍属未解问题，纯 RGB 可解但效率存在差距。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 041 讲算过一笔账：端到端 ObjectNav 配方约用 192 GPU 小时、125M 帧，PointNav 的近满分导航器则用 2.5B 步、约 180 GPU 天。把这笔账落到工程上，问题立刻分成两半：一半是算法需要多少样本，另一半是每单位时间能产出多少样本。前者由配方决定，后者由训练系统决定。本讲处理后半部分。</p>
+    <p>3D 仿真环境与 Atari 一类的轻量环境有本质差别：环境步进依赖 GPU 渲染，单个 worker 能并行的环境数只有 2 到 4 个；策略网络是 ResNet 级的大网络，梯度计算本身也吃算力。传统的异步参数服务器范式为数千个 CPU worker 设计，在这里不匹配：参数服务器会成为单点瓶颈，异步产生的数据又带有陈旧性，与 PPO 这类 on-policy 算法要求的「数据来自当前策略」相冲突（PPO 的裁剪目标假设行为策略与当前策略同一）。</p>
+    <p>Wijmans 等（2020，DD-PPO，PointNav）给出的答案是把监督学习里的同步数据并行直接搬到 RL：每个 worker 独占一块 GPU，交替做采样与优化，用一次梯度归约取代参数服务器。这套系统在 128 块 GPU 上取得 107 倍加速，在 64 块 GPU 上把 2.5B 步训练压缩到 2.75 天。第 041 讲的 ObjectNav 配方与后续所有大规模 RL 结果，都建立在这类同步基础设施之上，因此本讲是第三篇的工程地基。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p>本节从两种分布式范式的对比出发，推导同步更新式，再展开预占协议、扩展性实测与算力账目，最后给出结果与边界。</p>
+
+    <h3>1. 两种范式：异步参数服务器与同步数据并行</h3>
+    <p>异步范式由两类角色组成：若干 rollout worker 持续采集经验并送入队列，一个参数服务器异步消费经验并更新参数。优点是吞吐弹性大；缺点有三处：若要求全体同步，参数服务器必须等待最慢的 worker，规模越大等待开销越重；worker 拿到的参数版本可能落后多个更新，数据陈旧；两个角色通常需要分开的程序与运维。陈旧性对监督学习影响有限，对 on-policy 策略梯度是实质问题：PPO 的信任域裁剪以行为策略与当前策略的比值为基础，样本越旧，比值越偏离 1，裁剪就越频繁地截断梯度。</p>
+    <p><strong>同步数据并行把每个 worker 变成「采样加优化」的完整单元，没有中心服务器，用一次集合通信归约梯度替代服务器。</strong>在监督学习中，该范式写作：第 k 步，worker n 持有参数 θ<sub>n</sub><sup>k</sup>，计算梯度 ∂θ<sub>n</sub><sup>k</sup>，归约后更新：</p>
+    <div class="formula">
+      θ<sub>n</sub><sup>k+1</sup> = ParamUpdate( θ<sub>n</sub><sup>k</sup>, (1/N) Σ<sub>i=1</sub><sup>N</sup> ∂θ<sub>i</sub><sup>k</sup> )
+      <span class="note">AllReduce 对所有副本求均值并把结果返还给每个 worker；N 为 worker 数</span>
+    </div>
+    <p>把它适配到 on-policy RL：worker n 用当前参数采样一条 rollout，按 PPO 计算参数梯度，归约梯度后更新模型：</p>
+    <div class="formula">
+      θ<sub>n</sub><sup>k+1</sup> = ParamUpdate( θ<sub>n</sub><sup>k</sup>, AllReduce( ∇<sub>θ</sub>J<sub>PPO</sub>(θ<sub>1</sub><sup>k</sup>), …, ∇<sub>θ</sub>J<sub>PPO</sub>(θ<sub>N</sub><sup>k</sup>) ) )
+      <span class="note">更新完成后所有 worker 参数逐位相同；第 k 轮数据全部来自 θ<sup>k</sup>，不存在版本落后</span>
+    </div>
+    <p>两条性质由此成立。<strong>性质一：零陈旧。</strong>第 k 轮的所有梯度都对应同一份参数 θ<sup>k</sup>，每个 worker 更新后参数逐位相同，下一轮采样依旧 on-policy。<strong>性质二：有效批倍增。</strong>单 worker 一轮采样 B 帧，N 个 worker 合计 N·B 帧进入同一次更新；在梯度近似独立同分布的假设下，更新噪声的方差约按 1/N 缩小，这解释了为什么同步归约能在不调学习率的前提下拉住训练稳定性。</p>
+    <p>代价同样清楚：同步等最慢的 worker。在异构场景下，个别大场景的单步模拟时间可以比普通场景高一个数量级，一次同步迭代的时长由它决定，其余 GPU 空转。这是下一小节要处理的尾部延迟问题。</p>
+
+    <h3>2. 预占协议：用截断换扩展性</h3>
+    <p>DD-PPO 的解法是预占阈值（preemption threshold）：采样阶段一旦达到比例 p 的 worker 完成，尚未完成的 worker 被强制提前结束采样，所有 worker 随即进入优化阶段。论文给出三条实施细节：阈值取 60% 效果良好；每个 worker 的贡献在损失中权重相同；预占前的最少步数设为上限的 1/4，保证每个环境都有样本进入训练。</p>
+    <p>用一组设例把这个机制量化。设 8 个 worker 的采样时长（秒）排序为 1.00、1.00、1.00、1.00、1.05、1.10、1.20、8.00，前七个近似同构，最后一个遇到大场景成为拖尾。</p>
+    <table>
+      <tr><th>策略</th><th>等待的完成者</th><th>迭代时长</th><th>相对无预占加速</th><th>样本量（上限 1024 帧）</th></tr>
+      <tr><td>无预占（p = 100%）</td><td>全部 8 个</td><td>8.00 s</td><td>1.00x</td><td>1024 帧</td></tr>
+      <tr><td>p = 50%</td><td>第 4 个</td><td>1.00 s</td><td>8.00x</td><td>拖尾截断到最少步数</td></tr>
+      <tr><td>p = 60%</td><td>第 5 个</td><td>1.05 s</td><td>7.62x</td><td>928 帧（90.6%）</td></tr>
+      <tr><td>p = 75%</td><td>第 6 个</td><td>1.10 s</td><td>7.27x</td><td>拖尾稍多，仍低于上限</td></tr>
+    </table>
+    <p>表中「928 帧」按拖尾恰好截断到最少步数 32 步、其余 7 个 worker 完成 128 步计算：7 × 128 + 32 = 928，占理论上限 1024 的 90.6%。<strong>交换关系可以一句话概括：预占越低，迭代越快，被丢掉的尾部样本越多；因为所有 worker 权重相同，截断 worker 的梯度按更少的步数做平均，相当于局部批更小。</strong>论文的实测是：同构负载在 p 大于 50% 时接近线性扩展；异构负载在 p = 100% 时扩展严重退化（拖尾效应），把 p 降到 80% 或 60% 后，扩展曲线与同构负载几乎重合，且未见模型性能退化。第 041 讲配方在 MP3D 大场景上同样依赖这一协议。</p>
+
+    <h3>3. PPO 目标与超参</h3>
+    <p>worker 内的优化器沿用 PPO 的裁剪目标。记优势估计 Â<sub>t</sub>，概率比 r<sub>t</sub>(θ) = π<sub>θ</sub>(a<sub>t</sub> | o<sub>t</sub>) / π<sub>θ_old</sub>(a<sub>t</sub> | o<sub>t</sub>)，则：</p>
+    <div class="formula">
+      J<sub>PPO</sub>(θ) = E<sub>t</sub>[ min( r<sub>t</sub>(θ) Â<sub>t</sub>, clip(r<sub>t</sub>(θ), 1 − ϵ, 1 + ϵ) Â<sub>t</sub> ) ]
+      <span class="note">裁剪把比值限制在信任域内，允许同一批数据做多个 epoch 的更新</span>
+    </div>
+    <p>优势用广义优势估计（GAE）计算：δ<sub>t</sub> = r<sub>t</sub> + γV(s<sub>t+1</sub>) − V(s<sub>t</sub>)，Â<sub>t</sub> = Σ<sub>l≥0</sub> (γλ)<sup>l</sup> δ<sub>t+l</sub>。Wijmans 等（2020）取折扣因子 γ = 0.99、GAE 参数 λ = 0.95，优化器用 Adam、学习率 2.5 × 10<sup>−4</sup>；每个 worker 连接 4 个并行环境，每环境至多收集 128 步，随后做 2 个 PPO epoch、每个 epoch 2 个 minibatch。论文明确不用优势归一化，理由是实验中发现归一化会导致不稳定；网络中的批归一化（BatchNorm）也全部替换为组归一化（GroupNorm），原因是在线策略采集的数据高度相关，批统计不适合作为归一化依据。</p>
+    <p>按「每环境 128 步」口径核算每轮更新的经验量与更新次数：单 worker 4 × 128 = 512 帧，64 个 worker 合计 32768 帧；minibatch 为 32768 / 2 = 16384 帧，每轮 2 个 epoch × 2 个 minibatch = 4 个梯度步；2.5B 步除以 32768 约 76,293 轮更新。若论文原意按「每 worker 共 128 帧」理解，上述数字整体除以 4：每轮 8192 帧、minibatch 4096、约 305,175 轮。两种口径的差异属于引用时的换算问题，报告批大小时应连同口径说明。</p>
+
+    <h3>4. 扩展性实测</h3>
+    <p>论文用「相对单 GPU 的经验吞吐倍率」刻画扩展性，在两套负载上测试。同构负载用 Gibson 场景（模拟时长接近），异构负载混合 Gibson 与 MP3D（最大场景 8 GB、最小 135 MB，模拟时长相差数量级）。</p>
+    <table>
+      <tr><th>负载与配置</th><th>规模</th><th>加速比</th><th>扩展效率（加速比 / 规模）</th></tr>
+      <tr><td>同构，p &gt; 50%</td><td>8 GPU</td><td>7.3x</td><td>91.25%</td></tr>
+      <tr><td>同构，p &gt; 50%</td><td>128 GPU</td><td>107x</td><td>83.59%</td></tr>
+      <tr><td>同构，p &gt; 50%</td><td>256 GPU</td><td>196x</td><td>76.56%</td></tr>
+      <tr><td>异构，p = 100%</td><td>任意规模</td><td>显著低于线性</td><td>拖尾主导，随规模恶化</td></tr>
+      <tr><td>异构，p = 60% 或 80%</td><td>与同构对照</td><td>接近同构曲线</td><td>未见性能退化</td></tr>
+    </table>
+    <p>读表注意三点：<strong>（1）</strong>107x 与 196x 来自不同规模的实验，107x 对应论文摘要中 128 GPU 的结果，196x 对应 256 GPU 的同构实测，引用时须标注规模；<strong>（2）</strong>扩展效率随规模缓慢下降属于集合通信与同步开销的正常表现，91% 到 76% 的区间对该类系统仍属近线性；<strong>（3）</strong>异构负载的结论改变了工程实践：真实训练集混合不同规模场景时，预占不是可选项，而 p = 100% 等价于关闭预占，其扩展退化不是通信问题，全部来自尾部等待。</p>
+
+    <h3>5. 算力账与性能曲线</h3>
+    <p>论文的训练账目如下：用 64 块 V100 训练 2.5B 步，耗时 2.75 天，折合 176 GPU 天，与论文写作的「约 180 GPU 天、6 个月 GPU 时间」一致；按 1 秒/步折算，2.5B 步相当于 79.22 年人类经验。单 GPU 吞吐可由比例反推：2.5 × 10<sup>9</sup> / (64 × 2.75 × 86400) = 164.4 步/秒。<strong>误差随算力呈幂律式下降，90% 的峰值性能在 100M 步处即可获得，占总步数的 4.0%；该点用 64 GPU 约 2.6 小时、用 8 GPU 约 21.1 小时可达（论文写作 0.1 天与 1 天）。</strong>这一条对复现预算最有价值：先用 100M 步量级判断配方方向，再决定是否投入 2.5B 步级资源。</p>
+    <p>最终结果是近满分导航：最佳智能体（SE-ResNeXt101 加 1024 维 LSTM，Gibson-2+ 训练）在验证集取得 SPL 0.969、成功率 0.997，在 test-std 取得 SPL 0.948、成功率 0.980；论文报告平均每 1000 幕验证失败不到 1 幕，与最短路径 oracle 的差距为 3% 到 5%。数据与容量的边际收益呈递减：加入 MP3D 场景使验证 SPL 从 0.922 升到 0.956（+0.034）；换成 SE-ResNeXt50 只多 0.003；再加大编码器与 LSTM 容量多 0.010。</p>
+    <table>
+      <tr><th>训练数据与网络（RGB-D + GPS+Compass）</th><th>验证 SPL</th><th>test-std SPL</th><th>验证成功率</th><th>test-std 成功率</th></tr>
+      <tr><td>Gibson-4+，ResNet50</td><td>0.922</td><td>0.917</td><td>0.967</td><td>0.970</td></tr>
+      <tr><td>Gibson-4+ 加 MP3D，ResNet50</td><td>0.956</td><td>0.941</td><td>0.996</td><td>0.996</td></tr>
+      <tr><td>Gibson-2+，ResNet50</td><td>0.956</td><td>0.944</td><td>0.994</td><td>0.982</td></tr>
+      <tr><td>Gibson-2+，SE-ResNeXt50</td><td>0.959</td><td>0.943</td><td>0.999</td><td>0.988</td></tr>
+      <tr><td>Gibson-2+，SE-ResNeXt101 + 1024 维 LSTM</td><td>0.969</td><td>0.948</td><td>0.997</td><td>0.980</td></tr>
+    </table>
+    <p>一个反直觉的读数是第一行与第三行：把质量评级较低的重建场景（Gibson 评分 2 到 3）加入训练，验证 SPL 从 0.922 升到 0.956，test-std 从 0.917 升到 0.944。论文的猜测是，低质量场景提供了重建噪声与几何畸变的多样性，使表征更鲁棒。<strong>数据质量与数据多样性在小规模训练里常做单目标优化，大规模训练里两者可以同向。</strong></p>
+    <p>奖励与成功口径需要单独交代。该论文的成功判定为停止点距目标 0.2 m 以内，属于 2019 挑战口径；第 002 讲记录的 2020 起 PointNav 口径为 0.36 m。跨年份引用 SPL 与成功率时必须标注判据版本。奖励设计为终止奖励 2.5 × SPL 加每步形奖励 r<sub>t</sub> = −Δgeo_dist − 0.01，其中 Δgeo_dist 为本步测地距离变化，密集项提供梯度方向，终止项直接对齐评测指标。</p>
+
+    <h3>6. 边界与失效模式</h3>
+    <ul>
+      <li><strong>无 GPS+Compass 未解。</strong>同一架构在 100M 步时 SPL 为 0，训练到 2.5B 步也只到 0.15；论文明确把该设定列为公开前沿。</li>
+      <li><strong>纯 RGB 可解但有差距。</strong>去掉深度通道后，需要混合 Gibson-2+ 与 MP3D 并做通道归一化，验证 SPL 0.929、成功率 0.991；成功率与 RGB-D 接近，SPL 低约 0.030。</li>
+      <li><strong>预占阈值存在下界。</strong>最少步数取上限 1/4 是硬约束，p 过小会让大量 worker 长期只贡献四分之一步数的片段，局部批过小，梯度噪声上升。</li>
+      <li><strong>同步协议要求错误处理完善。</strong>任一 worker 掉队或崩溃，整轮同步等待都会失败重来；工程上需要检查点与弹性重启配套。</li>
+      <li><strong>异构场景比例改变最优 p。</strong>论文的 60% 与 80% 在混合场景上表现接近，真实数据集的规模分布若更极端，应重新扫描阈值。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>本节把同步协议落成系统结构、参数表与工程检查项，并与异步方案逐项对比。</p>
+
+    <h3>1. 系统结构</h3>
+    <p>一个 worker 对应一张 GPU、一个进程、4 个并行环境实例与一份模型副本。每轮分两个阶段：采样阶段，worker 并行推进 4 个环境至多 128 步，缓存观测、动作、奖励与终止标志；优化阶段，先做 2 个 PPO epoch、每个 epoch 切 2 个 minibatch，每个 minibatch 反传后调用集合通信归约梯度，随后优化器更新。跨 worker 的状态只有一个：预占计数器，记录已结束采样的 worker 数；论文用分布式键值存储实现（TCPStore），达到阈值 p 后其余 worker 的采样提前结束。检查点由 rank 0 统一落盘，其余 worker 在下一个同步点恢复。</p>
+
+    <h3>2. 参数与依据</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用</th><th>取值依据（Wijmans 等 2020）</th></tr>
+      <tr><td>worker 数</td><td>64（亦可 8–256）</td><td>并行度</td><td>主实验 64 GPU；扩展性实验至 256</td></tr>
+      <tr><td>环境数 / worker</td><td>4</td><td>采样吞吐</td><td>资源敏感环境的可行上限为 2–4 个</td></tr>
+      <tr><td>采样步数 / 环境</td><td>至多 128</td><td>rollout 长度</td><td>论文口径；预占可截断</td></tr>
+      <tr><td>PPO epoch / minibatch</td><td>2 / 2</td><td>数据复用</td><td>论文配置，即每轮 4 个梯度步</td></tr>
+      <tr><td>预占阈值 p</td><td>60%</td><td>裁剪尾部等待</td><td>异构负载实测 60% 与 80% 接近同构扩展</td></tr>
+      <tr><td>最少步数</td><td>上限的 1/4（32 步）</td><td>保证样本贡献</td><td>论文硬约束；配合等权重损失</td></tr>
+      <tr><td>折扣 γ / GAE λ</td><td>0.99 / 0.95</td><td>回报与优势估计</td><td>论文配置</td></tr>
+      <tr><td>学习率</td><td>2.5 × 10<sup>−4</sup>（Adam）</td><td>更新步长</td><td>论文配置；不做优势归一化</td></tr>
+      <tr><td>归一化层</td><td>GroupNorm 替换 BatchNorm</td><td>稳定在线数据统计</td><td>论文替换原因：on-policy 数据相关性强</td></tr>
+      <tr><td>视觉前端</td><td>2 × 2 平均池化起始层</td><td>降分辨率加速</td><td>论文：不影响性能且训练更快</td></tr>
+      <tr><td>LSTM 宽度</td><td>512（可选 1024）</td><td>记忆容量</td><td>论文对照实验；1024 维多约 0.010 SPL</td></tr>
+      <tr><td>终止奖励</td><td>2.5 × SPL</td><td>对齐评测指标</td><td>论文奖励式</td></tr>
+      <tr><td>形奖励</td><td>−Δgeo_dist − 0.01 / 步</td><td>密集引导</td><td>论文奖励式；测地距离变化</td></tr>
+    </table>
+
+    <h3>3. 同步与异步的判据对比</h3>
+    <table>
+      <tr><th>维度</th><th>DD-PPO（同步去中心化）</th><th>异步参数服务器</th></tr>
+      <tr><td>中心组件</td><td>无，集合通信归约</td><td>参数服务器为单点</td></tr>
+      <tr><td>数据陈旧性</td><td>零陈旧，全部数据来自 θ<sup>k</sup></td><td>worker 落后若干版本</td></tr>
+      <tr><td>与 PPO 裁剪的兼容</td><td>匹配，比值基于同一策略</td><td>需重要性修正或容忍偏差</td></tr>
+      <tr><td>扩展瓶颈</td><td>尾部延迟与集合通信</td><td>服务器吞吐与队列积压</td></tr>
+      <tr><td>实现复杂度</td><td>单程序多进程，逻辑简单</td><td>两类角色、两套运维</td></tr>
+      <tr><td>适用环境</td><td>GPU 加速仿真，2–4 环境 / worker</td><td>CPU 可仿真、成千 worker</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：批大小随预占浮动</span>
+      <p>预占会让每轮的实际经验量在 N ×（1/4 到 1）× 128 × 4 之间浮动，损失按各 worker 的实际步数归一后再等权平均。这一副作用把「变批大小」从一个超参问题变成协议的自然结果，代价是两轮之间的梯度尺度略有波动。对复现实验的影响是：报告训练曲线时横轴宜用总步数或墙钟时间，用更新轮数会让曲线在预占比例变化处出现伪台阶。</p>
+    </div>
+
+    <h3>4. 与上一讲的差异点</h3>
+    <p>第 041 讲站在配方层回答「学什么」，本讲站在执行层回答「怎么把采样跑满」。两讲的数字互相支撑：ObjectNav 配方的 192 GPU 小时之所以可行，正是因为 125M 帧在同步系统上属于轻量任务；而 PointNav 的 2.5B 步属于只有同步扩展才能承担的规模。下一讲转入表征层：既然大规模训练能够「顺便」学到通用场景理解，这份表征能否像 ImageNet 预训练那样迁移到新任务，以及迁移实验怎样设计。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>三段代码分别覆盖同步 worker 循环、预占控制器与优势估计，接口按 PyTorch 分布式与标准 PPO 组件书写。</p>
+
+    <p><strong>片段 1：同步 worker 循环</strong></p>
+    <pre class="code"><code>import torch
+import torch.distributed as dist
+
+def mean_gradients(model, world_size):
+    """集合通信归约：所有 worker 的梯度先求和再除以规模，得到全局平均。"""
+    for p in model.parameters():
+        if p.grad is not None:
+            dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+            p.grad /= world_size
+
+def worker_loop(rank, world_size, envs, agent, optimizer, total_steps):
+    """每个 worker 一张 GPU：采样与优化交替，更新后参数逐位一致。"""
+    collected = 0
+    while collected &lt; total_steps:
+        batch = collect_rollout(envs, agent, max_steps=128)   # 4 个环境并行采样
+        for epoch in range(2):                                # 论文：2 个 PPO epoch
+            for mb in split_minibatches(batch, parts=2):      # 每 epoch 2 个 minibatch
+                loss = ppo_loss(agent, mb)                    # 含裁剪目标与价值损失
+                optimizer.zero_grad()
+                loss.backward()
+                mean_gradients(agent, world_size)             # 关键：反传后、更新前归约
+                optimizer.step()
+        collected += len(batch) * len(envs) * world_size        # 全局经验量 = 步数 × 环境数 × worker 数</code></pre>
+    <p>解读：<strong>（1）</strong>归约点在反传之后、优化器更新之前，保证所有 worker 由同一平均梯度出发，更新后参数逐位相同，零陈旧由此成立。<strong>（2）</strong>环境数限定为 4，是因为每个环境实例都要存放在 GPU 上，资源敏感仿真的可行并行数有限。<strong>（3）</strong>损失按各 worker 实际步数归一后再平均，对应论文「所有 worker 权重相同」的约定，避免采样多的环境按样本数放大影响。<strong>（4）</strong>采样与优化在同一进程交替，省去参数服务器与数据传输队列，调试时只需看一份日志。</p>
+
+    <p><strong>片段 2：预占控制器</strong></p>
+    <pre class="code"><code>class PreemptionController:
+    """预占控制器：完成比例达到阈值时截断慢 worker 的采样（论文阈值 60%）。"""
+    def __init__(self, world_size, threshold=0.6, max_steps=128):
+        self.world_size = world_size
+        self.threshold = threshold
+        self.max_steps = max_steps
+        self.min_steps = max_steps // 4     # 论文：最少步数为上限的四分之一
+        self.finished = 0                   # 生产实现用分布式键值存储同步此计数
+
+    def mark_finished(self):
+        self.finished += 1
+
+    def should_stop(self, step):
+        if step &lt; self.min_steps:
+            return False                    # 最短步数内不允许预占，保证样本贡献
+        return self.finished &gt;= self.threshold * self.world_size
+
+def collect_rollout(envs, agent, max_steps, controller):
+    """采样循环：每个环境逐步推进，满足预占条件即提前结束。"""
+    batch = []
+    for step in range(max_steps):
+        obs = [env.observation for env in envs]
+        actions, values, logps = agent.act(obs)          # 向量化推理，批量前向
+        batch.append((obs, actions, values, logps))
+        for env, action in zip(envs, actions):
+            env.step(action)                             # 环境步进走 GPU 仿真
+        if controller.should_stop(step + 1):
+            break                                        # 慢 worker 被截断，进入优化阶段
+    controller.mark_finished()
+    return batch</code></pre>
+    <p>解读：<strong>（1）</strong>预占判断放在采样循环内，不等到轮次边界，这正是缩短尾部等待的关键：一旦阈值达成，慢 worker 立即停止，无须等它走完 128 步。<strong>（2）</strong>最少步数约束防止频繁截断造成的样本碎片化，论文固定为上限的 1/4。<strong>（3）</strong>计数器在真实系统里跨进程共享（论文用 TCPStore 类键值存储），片段用普通整数展示协议逻辑；实现时必须保证读写原子性，否则会读到过时计数。<strong>（4）</strong>截断后每个 worker 的轨迹长度可能不同，后续损失归一化与批拼接要按实际长度处理。</p>
+
+    <p><strong>片段 3：优势估计与 minibatch 切分</strong></p>
+    <pre class="code"><code>import torch
+
+def compute_gae(rewards, values, dones, gamma=0.99, lam=0.95):
+    """广义优势估计：反向递推，终止步切断跨幕传递。"""
+    advantages = torch.zeros_like(rewards)
+    running = 0.0
+    next_value = 0.0
+    for t in reversed(range(len(rewards))):
+        mask = 1.0 - dones[t].float()           # 终止步之后不再累加后续回报
+        delta = rewards[t] + gamma * next_value * mask - values[t]
+        running = delta + gamma * lam * mask * running
+        advantages[t] = running
+        next_value = values[t]
+    returns = advantages + values               # 价值头回归目标
+    return advantages, returns
+
+def split_minibatches(batch, parts=2):
+    """把本地 rollout 切成 2 份，供每个 PPO epoch 遍历一次。"""
+    size = len(batch) // parts
+    return [batch[i * size:(i + 1) * size] for i in range(parts)]
+
+def shaped_reward(delta_geodesic, success):
+    """奖励合成：终止奖励对齐 SPL，密集项提供每一步方向。"""
+    if success:
+        return 2.5 + (-delta_geodesic) - 0.01
+    return -delta_geodesic - 0.01</code></pre>
+    <p>解读：<strong>（1）</strong>mask 项处理终止状态，防止回报跨幕泄漏；这是 GAE 实现最常见的错误来源。<strong>（2）</strong>优势与回报一次算出，评论家头回归 returns，策略头使用 advantages；组合方式与论文的 PPO 目标一致。<strong>（3）</strong>minibatch 在本地数据上切分，与跨 worker 的梯度归约是两层不同的并行：层内复用数据，层间平均梯度。<strong>（4）</strong>终止奖励按 2.5 × SPL 的思想写成成功即得 2.5 加路径项，课程式展示省略了 oracle 路径计算接口，实际实现由评测环境提供。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>把异步实现当作 DD-PPO 复现。</strong>症状：训练曲线抖动大，PPO 裁剪比率频繁触及边界。根因：异步 worker 使用了过时参数采集的数据，与当前策略比值偏离 1。修复：用同步归约替换参数服务器；若必须异步，给旧数据降权或丢弃，并单独核对比值分布。</li>
+      <li><strong>预占阈值设成 100%。</strong>症状：异构场景训练时迭代时间被个别大场景拖到数倍，GPU 利用率曲线呈锯齿。根因：等待全体完成，尾部延迟占据主导。修复：从 p = 60% 起步扫描 50% 到 90%；同时监控实际经验量占理论上限的比例，低于约 85% 时检查最少步数是否过小。</li>
+      <li><strong>沿用 BatchNorm。</strong>症状：策略损失尖峰、成功率骤降，换种子后症状漂移。根因：on-policy 数据高度相关，批统计不稳定。修复：替换为 GroupNorm 或 LayerNorm；对 RGB 输入做通道级归一化；在配置中禁止归一化层统计跨 worker 共享。</li>
+      <li><strong>做优势归一化。</strong>症状：早期训练不稳定，长轨迹梯度被压平。根因：论文实测归一化在结构化回报下引入不稳定，尤其终止奖励与密集项的尺度差异大。修复：不做优势归一化；改用奖励尺度与折扣参数控制梯度量级，并固定随机种子复测。</li>
+      <li><strong>在同构负载上调参后直接上异构数据。</strong>症状：扩展到数百 GPU 后吞吐不随规模上升。根因：场景时长分布改变，最优预占阈值与最少步数约束需要重新验证。修复：按场景规模分层采样评测点，分别报告扩展曲线；上线前在混合数据上做一次 8 到 64 GPU 的扩展检查。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>按 64 worker、4 环境、每环境 128 步，核算每轮更新的经验量、minibatch 大小与 2.5B 步对应的更新次数；再把口径换成「每 worker 共 128 帧」重做一遍，说明报告批大小时为什么必须标注口径。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>每环境口径：64 × 4 × 128 = 32768 帧，minibatch 16384，更新约 76,293 次。每 worker 口径：64 × 128 = 8192 帧，minibatch 4096，更新约 305,175 次。两者相差 4 倍，跨工作比较批大小时不留口径就会得出错误的等效学习率结论。</div></details>
+      </li>
+      <li>计算三组加速比的扩展效率：7.3x / 8、107x / 128、196x / 256，并用「理想线性减去通信与同步开销」的语言描述效率随规模下降的形态。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>依次为 91.25%、83.59%、76.56%。效率下降反映固定开销占比随规模上升：集合通信的树形归约深度、同步点的等待方差、检查点与日志 I/O；曲线形态接近线性减常数项，未见指数衰减特征。</div></details>
+      </li>
+      <li>推导同步与异步的陈旧度差异。设异步 worker 完成一轮采样需要 w 时间，参数服务器每 u 时间做一次更新，写出数据版本落后的期望上界；再说明 PPO 的裁剪项在陈旧数据上何时完全失效。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>设 worker 完成一轮采样需要 w 时间、参数服务器每 u 时间做一次更新，则数据在被消费时落后的版本数量上界约为 w / u；当落后版本使 r<sub>t</sub>(θ) 超出 [1 − ϵ, 1 + ϵ] 区间时，裁剪项把该样本的梯度截断为常数项，优势方向不再反映当前策略，样本对更新的贡献退化为零或反向。</div></details>
+      </li>
+      <li>用本讲的设例（8 个 worker 时长 1.00、1.00、1.00、1.00、1.05、1.10、1.20、8.00 秒）计算 p = 50%、60%、75% 三档的迭代时长、加速比与截断后的样本量（拖尾按最少步数 32、其余 128 计）。画出「加速比随 p 下降」与「样本保留率随 p 下降」两条曲线，指出拐点位置。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>p = 50%：等待第 4 个，1.00 s，8.00x；p = 60%：等待第 5 个，1.05 s，7.62x，样本 928 / 1024 = 90.6%；p = 75%：等待第 6 个，1.10 s，7.27x。加速比曲线在 50% 到 60% 区间下降最缓（8.00x 降到 7.62x），样本保留率也在这一区间最高；本例拖尾用时 8.00 s，与第 6 名 1.10 s 差距大，p 只要不大于 87.5% 就不会等到拖尾，故实际拐点由数据集时长分布决定。</div></details>
+      </li>
+      <li>★★★ 设计一套扩展性实验，在 8 到 64 GPU 范围内区分「通信开销主导」与「尾部延迟主导」两种扩展退化。要求给出两组负载构造方法、每组的对照变量、测量指标、判定规则，并说明如何据此选择预占阈值与最少步数。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>负载 A 用时长分布集中的场景（同构），负载 B 混入少数特大场景（异构）。对照变量：预占阈值 p 取 50%、60%、80%、100%，最少步数取 1/4 与 1/2 两档。测量指标：每秒经验步数、每轮迭代时长的方差、实际经验量占上限比例、GPU 利用率。判定规则：若同构下效率随规模稳定下降（约 90% 到 77%），属于通信与同步开销；若异构 p = 100% 的效率显著低于同构而同 p 值接近，属于尾部延迟，选择使两者曲线重合的最大 p（通常 60% 到 80%）。最少步数取 1/4 为默认，若样本保留率长期低于 85% 再上调。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>DD-PPO 的定位是把同步数据并行搬到 RL：无中心服务器、零陈旧梯度、每个 worker 采样与优化交替，适合 GPU 加速仿真。</li>
+      <li>更新式对 worker 梯度取平均；有效批为 N·B，更新噪声约按 1/N 缩小；同步点要求所有 worker 参数逐位一致。</li>
+      <li>预占阈值解决尾部延迟：p = 60% 为推荐起点，最少步数取上限的 1/4；实测同构 8/128/256 GPU 的扩展效率为 91.25%、83.59%、76.56%，异构关闭预占则严重退化。</li>
+      <li>训练账目：64 GPU、2.75 天完成 2.5B 步（约 180 GPU 天、79.22 年人类经验）；90% 峰值在 100M 步（4% 步数）取得，对应 64 GPU 约 2.6 小时。</li>
+      <li>工程要点：GroupNorm 替换 BatchNorm、不做优势归一化、2 × 2 平均池化减算力、终止奖励 2.5 × SPL 与测地距离形奖励；成功判据为 2019 口径 0.2 m，引用时标注年份。</li>
+      <li>下一讲处理这套大规模训练留下的副产品：学到的场景理解与导航策略能否迁移到新任务，以及迁移实验如何按样本效率与受控变量设计。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch041.html">← 第 041 讲：端到端起点与样本低效</a>
+    <a class="next" href="ch043.html">第 043 讲：导航表征预训练 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.06 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:11.5px !important;letter-spacing:.06em !important;color:rgba(71,85,105,.45) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#7e8ba0 !important;font-size:11.5px !important;line-height:1.8 !important;text-align:center !important;padding:5px 12px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第088章 任务编排：从规划到自主执行 | 机械臂规划学习课程 · ROS2 MoveIt2 运动规划与操作</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第五篇 · 组件详解与系统集成</span>
+    <span class="sep">/</span>
+    <span>第 088 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第五篇 · 组件详解与系统集成</div>
+    <h1>第 088 章：任务编排：从规划到自主执行</h1>
+    <p class="lead">把单次规划扩展为可持续运行的任务流：以状态机组织"同步、规划、执行、验证、恢复"循环，用任务契约约束每个原子技能，并给出组合式任务规划的适用边界。</p>
+    <ul class="meta">
+      <li>主题：系统集成 / 任务编排</li>
+      <li>关键机制：任务状态机、技能契约、重试与抢占、组合式任务规划（MTC）</li>
+      <li>预计学时：55 分钟</li>
+      <li>前置章节：第 087 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解任务编排的三个层次：顺序脚本、事件驱动状态机、组合式任务规划，及其适用边界。</li>
+      <li>掌握任务状态机的状态划分与转移设计：同步、规划、执行、验证、恢复、终止。</li>
+      <li>会为原子技能定义契约：前置断言、动作、后置断言、超时与恢复挂钩。</li>
+      <li>理解并发约束与抢占策略：互斥、队列、优先级，以及执行中抢占的代价。</li>
+      <li>能按任务阶段数与依赖关系选择状态机或组合式任务规划，并解释理由。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>单个规划请求只是原子操作，真实任务由多段动作串联：接近、抓取、抬升、搬运、放置、退回，段与段之间存在状态依赖与失败可能。<strong>编排负责回答"下一步做什么、失败了怎么退、并发怎么管"，它决定系统能否在无人干预下持续运行。</strong></p>
+    <p>常见的反例是把任务写成顺序脚本：中间某段失败则整个脚本异常退出，场景残留上一次的附着物体，下次启动从错误状态继续。编排设计的价值在于让失败以状态转移的形式被处理，流程不因一次异常而中断；状态恢复则成为编排器的固定职责。</p>
+    <p>上一章从源码层理解了接口行为，本章用这些接口组装可循环运行的任务流，并为第 094 章的恢复策略预先留出接口。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 三个编排层次</h3>
+    <p>编排能力按复杂度递增分为三层，选择依据是任务阶段数、阶段间依赖与失败代价。<strong>三个层次各有适用范围，没有优劣之分；阶段少且线性时，低层次方案更可控。</strong></p>
+    <table>
+      <tr><th>层次</th><th>结构</th><th>适用</th><th>弱点</th></tr>
+      <tr><td>顺序脚本</td><td>逐步调用，异常中断</td><td>阶段不超过五段、调试期原型</td><td>失败恢复需重跑，状态残留风险高</td></tr>
+      <tr><td>事件驱动状态机</td><td>状态集合加转移函数</td><td>需要重试、恢复、并发管理的任务</td><td>阶段间耦合复杂时状态数膨胀</td></tr>
+      <tr><td>组合式任务规划</td><td>阶段作为可搜索的构件组合</td><td>阶段多、依赖强、需要整体取舍的任务</td><td>学习成本高，构件库需要积累</td></tr>
+    </table>
+
+    <h3>2. 任务状态机</h3>
+    <p>状态机的核心是"每个状态只做一件事，转移条件用可判定的谓词表达"。<strong>把超时建模为转移边，系统在超时后仍处于确定的已知状态。</strong>典型状态集合如下：</p>
+    <table>
+      <tr><th>状态</th><th>职责</th><th>离开条件</th></tr>
+      <tr><td>空闲</td><td>等待任务或新目标</td><td>收到任务</td></tr>
+      <tr><td>同步</td><td>刷新状态与场景，校验前置断言</td><td>前置成立或前置失败</td></tr>
+      <tr><td>规划</td><td>提交规划请求并等待结果</td><td>成功、失败、超时</td></tr>
+      <tr><td>执行</td><td>下发轨迹并监视进度</td><td>完成、失败、取消确认</td></tr>
+      <tr><td>验证</td><td>核对后置断言（位姿、夹持状态）</td><td>成立或不成立</td></tr>
+      <tr><td>恢复</td><td>执行恢复动作并回到合适状态</td><td>恢复成功或次数耗尽</td></tr>
+      <tr><td>终止</td><td>任务完成或不可恢复，清理资源</td><td>回到空闲</td></tr>
+    </table>
+    <div class="formula">
+      P<sub>任务</sub> = Π<sub>i</sub> p<sub>i</sub>（独立阶段串联）；带重试后 p′<sub>i</sub> = 1 − (1 − p<sub>i</sub>)<sup>r</sup>
+      <span class="note">每段成功率 0.97、共 8 段时整体约 0.78；若每段允许 3 次重试（单次 0.97），整体可回到 0.99 以上，说明重试预算比提高单段成功率更划算</span>
+    </div>
+
+    <h3>3. 技能契约</h3>
+    <p>把每段动作封装为技能（Skill），并给技能定义四要素契约：前置断言描述执行条件；动作描述接口调用序列；后置断言描述可检验的完成标志；超时与恢复描述失败边界。<strong>契约让编排器与技能实现解耦：编排器只依赖断言，不依赖具体动作顺序。</strong></p>
+    <p>后置断言必须可检验，例如"末端位姿误差小于阈值""附着物体已更新为目标物体"，不可检验的断言等价于没有断言。恢复动作要求幂等：重复执行至少不产生更坏的结果，这是自动重试成立的前提。</p>
+
+    <h3>4. 并发与抢占</h3>
+    <p>单臂在同一时刻只能有一个规划目标在执行，并发请求必须排队或互斥。<strong>抢占设计需要回答两个问题：执行中的轨迹是否允许中止、中止后如何回到安全状态。</strong>规划阶段的抢占代价低，执行阶段的中止需要控制器支持停止与复位，代价与控制频率和减速距离相关。抢占策略按优先级分为：高优先级抢占、先到先服务、拒绝新请求。</p>
+
+    <h3>5. 组合式任务规划的位置</h3>
+    <p>任务构造器（MoveIt Task Constructor, MTC）把任务表达为阶段（Stage）的层级：叶子阶段产生候选解（当前状态、移动到、相对移动、逆解计算、场景修改），容器阶段组织顺序、并行与包装（监控、代价）。规划器在阶段图上搜索可行解组合。<strong>它解决"阶段顺序本身存在选择"的问题，与状态机互补：状态机管运行期流程与恢复，任务构造器管规划期的组合搜索。</strong></p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>编排设计从任务分解开始，到契约表、状态图、并发策略，依次落地。<strong>每个产物都可以独立评审：分解是否无遗漏、契约是否可检验、状态图是否无死锁、并发是否无竞争。</strong></p>
+
+    <h3>1. 任务分解与契约表</h3>
+    <p>以桌面取放为例，分解为：移动到观察位、抓取、抬升、移动到放置位、放置、退回。每段填写契约表：</p>
+    <table>
+      <tr><th>技能</th><th>前置断言</th><th>后置断言</th><th>恢复方向</th></tr>
+      <tr><td>移动到观察位</td><td>场景已同步，观察位无碰撞</td><td>末端位姿误差小于 5 mm</td><td>重规划、换观察位</td></tr>
+      <tr><td>抓取</td><td>目标物体已入场景且位姿可靠</td><td>附着物体更新为目标物体</td><td>复核感知、重试抓取</td></tr>
+      <tr><td>放置</td><td>放置位无遮挡</td><td>附着物体已分离且位于放置区</td><td>清理放置区、重试</td></tr>
+    </table>
+
+    <h3>2. 状态机实现要点</h3>
+    <ol>
+      <li><strong>单一职责</strong>：每个状态内不做多件事，例如同步状态只负责刷新与断言检查。</li>
+      <li><strong>显式超时</strong>：所有等待转移都带截止时间，超时进入恢复状态，不会无限挂起。</li>
+      <li><strong>状态可观测</strong>：当前状态与最近一次转移原因对外发布，编排器自身可被诊断。</li>
+      <li><strong>恢复有界</strong>：每类失败的重试次数上限写入配置，耗尽后进入终止并给出原因。</li>
+    </ol>
+
+    <h3>3. 并发策略</h3>
+    <p>默认策略取"单任务互斥加队列"：新任务入队，完成后出队；紧急停止作为最高优先级抢占，直接触发执行中止与状态复位。<strong>多机械臂场景把互斥粒度从系统级细化为资源级：每条臂一把锁，共享区域一把场景锁。</strong></p>
+
+    <p>与上一章的差异点：第 087 章回答"某个接口内部如何实现"，本章回答"多个接口如何按时序与失败语义组织成自主流程"，视角从代码层上移到行为层。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：技能契约与执行封装</strong></p>
+    <pre class="code"><code>from dataclasses import dataclass, field
+
+
+@dataclass
+class Skill:
+    """原子技能的四要素契约：断言、动作、超时、恢复。"""
+    name: str
+    pre: str                      # 前置断言的可读描述（对应检查函数键）
+    post: str                     # 后置断言的可读描述（对应检查函数键）
+    timeout_s: float              # 单次执行的时间上限（秒）
+    max_retries: int = 2          # 重试上限：有界恢复是自动化的前提
+    recoveries: list = field(default_factory=list)
+
+
+def run_skill(skill, ctx, checks):
+    """执行技能：前置检查、动作、后置检查、有界重试。"""
+    # 前置断言失败属于"条件问题"，重试无意义，直接返回失败供编排器决策
+    if not checks[skill.pre](ctx):
+        return False, f"前置不满足: {skill.pre}"
+    for attempt in range(skill.max_retries + 1):
+        # 动作函数自行负责接口调用；超时由其内部截止时间控制
+        ok = ctx.call(skill.name, timeout_s=skill.timeout_s)
+        # 后置断言把"接口返回成功"升级为"任务语义成功"
+        if ok and checks[skill.post](ctx):
+            return True, "ok"
+        # 每次失败后执行恢复动作，恢复失败则放弃本轮
+        if attempt &lt; skill.max_retries:
+            ctx.log(f"{skill.name} 第 {attempt + 1} 次失败，进入恢复")
+            for rec in skill.recoveries:
+                if not ctx.call(rec, timeout_s=skill.timeout_s):
+                    break
+    return False, f"重试耗尽: {skill.name}"</code></pre>
+    <p>解读：这段代码把契约从文档变成执行结构。<strong>设计要点：（1）</strong>前置与后置断言通过函数键间接引用，技能定义与检查实现解耦，检查函数可以替换为更严格的版本；<strong>（2）</strong>接口成功与任务成功分离，后置断言承担语义判定，这是"通信成功不等于业务成功"在编排层的延续；<strong>（3）</strong>恢复动作插在重试之间，让下一次尝试从修正后的状态出发。替代方案是把重试写进每个技能内部，代价是策略分散、无法统一限界。</p>
+
+    <p><strong>片段 2：事件驱动任务状态机</strong></p>
+    <pre class="code"><code>from enum import Enum, auto
+class State(Enum):
+    SYNC = auto()        # 同步：刷新状态与场景，检查前置断言
+    PLAN = auto(); EXECUTE = auto(); VERIFY = auto()  # 规划、执行、核对
+    RECOVER = auto(); DONE = auto()                   # 恢复与终止
+class Orchestrator:
+    """任务状态机：失败即转移，恢复有界，终止可观测。"""
+    def __init__(self, program, skills, max_global_retries=3):
+        self.state = State.SYNC          # 从同步开始：规划前必须刷新状态
+        self.step = 0                    # 当前技能序号
+        self.program = program           # 技能序列：任务分解的产物
+        self.skills = skills
+        self.retries_left = max_global_retries
+        self.last_reason = ""
+    def tick(self, ctx, checks):
+        # 单步推进：每步只处理一个状态，同步状态负责刷新状态与场景
+        if self.state is State.SYNC:
+            self.last_reason = ctx.refresh_scene_and_state()
+            skill = self.skills[self.program[self.step]]
+            self.state = State.PLAN if checks[skill.pre](ctx) else State.RECOVER
+        elif self.state is State.PLAN:
+            ok, self.last_reason = ctx.plan(self.program[self.step])
+            self.state = State.EXECUTE if ok else State.RECOVER
+        elif self.state is State.EXECUTE:
+            ok, self.last_reason = ctx.execute(timeout_s=ctx.step_timeout)
+            self.state = State.VERIFY if ok else State.RECOVER
+        elif self.state is State.VERIFY:
+            skill = self.skills[self.program[self.step]]
+            if checks[skill.post](ctx):
+                self.step += 1           # 本技能完成：推进到下一技能
+                self.state = State.SYNC if self.step &lt; len(self.program) else State.DONE
+            else:
+                self.state = State.RECOVER
+        elif self.state is State.RECOVER:
+            if self.retries_left &gt; 0 and ctx.recover(self.last_reason):
+                self.retries_left -= 1
+                self.state = State.SYNC  # 恢复后回到同步，重新校验前置
+            else:
+                self.state = State.DONE  # 有界重试耗尽，终止并保留原因
+        return self.state</code></pre>
+    <p>解读：状态机把"失败"化为确定的转移路径。<strong>关键行为：（1）</strong>每次循环只推进一个状态，超时与观测点有统一的插入位置；<strong>（2）</strong>恢复后回到同步状态，重新校验前置断言，再决定是否重试规划；<strong>（3）</strong>全局重试预算与技能内重试分层，防止嵌套重试导致的次数爆炸；<strong>（4）</strong>终止状态保留最近失败原因，供上层记录与告警。设计上刻意不引入线程：状态机由外部节拍驱动，并发控制交给队列与锁，逻辑保持可测试。</p>
+
+    <p><strong>片段 3：组合式任务规划的骨架（C++）</strong></p>
+    <pre class="code"><code>#include &lt;moveit/task_constructor/task.h&gt;
+#include &lt;moveit/task_constructor/stages/current_state.h&gt;
+#include &lt;moveit/task_constructor/stages/move_to.h&gt;
+
+using namespace moveit::task_constructor;
+
+void build_task(const rclcpp::Node::SharedPtr&amp; node) {
+  Task task;
+  task.stages()-&gt;setName("pick_demo");
+  // 加载模型与规划管线：任务构造器内部组织阶段搜索
+  task.loadRobotModel(node);
+
+  // 当前状态阶段：把运行期状态接入阶段图，作为搜索起点
+  task.add(std::make_unique&lt;stages::CurrentState&gt;("current"));
+
+  // 顺序容器表达阶段依赖：前一阶段的出口成为后一阶段的入口
+  auto move = std::make_unique&lt;stages::MoveTo&gt;("move to ready", "ompl");
+  move-&gt;setGroup("arm");
+  move-&gt;setGoal("ready");          // 命名状态来自 SRDF
+  task.add(std::move(move));
+
+  // 规划解：阶段图整体搜索可行组合，失败时报告最早断裂的阶段
+  if (task.plan(5)) {              // 最多保留 5 组候选解
+    task.introspection().publishSolution(*task.solutions().front());
+  }
+}</code></pre>
+    <p>解读：组合式任务规划把顺序脚本变成可搜索的阶段图。<strong>设计要点：（1）</strong>起始阶段接入运行期当前状态，搜索结果从真实状态出发；<strong>（2）</strong>阶段持有规划管线标识与组名，配置语义（第 085 章）在此复用；<strong>（3）</strong>解集可以多组候选，按代价排序后取用，后续阶段可以并行展开（抓取方向、放置位置的选择）。适用边界是"阶段组合存在选择空间"的任务；线性任务用状态机即可，避免过度设计。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>规划前不同步状态与场景</strong>：上一段执行后机器人已移动、附着物体已变化，仍按旧状态规划，成功即偏离。修复：把同步作为每次规划前的固定状态，并用前置断言强制检查。</li>
+      <li><strong>重试无界或嵌套重试</strong>：技能内重试与全局重试叠加，故障时循环时间不可控。修复：重试预算集中在编排层，技能内重试次数固定且较小，总次数可计算。</li>
+      <li><strong>恢复动作不幂等</strong>：恢复动作自身失败后状态更差，例如重复打开夹爪导致物体跌落。修复：恢复动作设计为幂等操作，或在执行前检查当前状态决定是否跳过。</li>
+      <li><strong>执行中抢占无复位路径</strong>：取消后直接下发新目标，控制器仍处于减速过程，新轨迹起点不匹配被拒绝。修复：取消后等待控制器确认停止，再同步状态并发新目标。</li>
+      <li><strong>状态机状态过多</strong>：把每个技能展开为多个状态，转移数量平方级增长。修复：状态按职责划分，技能粒度通过技能序列表达，状态机保持固定小集合。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>为"取放"任务画出状态机转移图，标注每条边的条件与超时，并说明恢复状态的两个入口来源。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>恢复入口来自前置断言失败与规划执行失败两类；每条等待边都带截止时间，超时与失败同样进入恢复。</div></details>
+      </li>
+      <li>计算：六个串联阶段，单段成功率 0.95，任务整体成功率是多少？若每段允许两次重试（单次仍为 0.95），整体成功率提升到多少？<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>0.95⁶ ≈ 0.735；单段含两次重试后约 0.9999，整体约 0.999；重试对整体成功率的贡献远大于单段微调。</div></details>
+      </li>
+      <li>为"抓取"技能设计前后置断言的具体判据，要求全部可程序检验，并说明每个判据的数据来源。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>前置：目标物体在场景中、位姿置信度达标、夹爪开口大于物体宽度；后置：附着物体列表中为目标物体、末端位姿误差在阈值内。</div></details>
+      </li>
+      <li>比较状态机与组合式任务规划在"三个阶段、每个阶段两条可行路径"的任务上的差异，给出选择建议与理由。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>路径组合共 8 种，需要整体取舍（例如某组合总路径最短）时用组合规划；若各阶段可按固定优先级独立选择，状态机足够。</div></details>
+      </li>
+      <li>设计抢占路径：高优先级紧急任务到达时，系统如何从执行状态安全回到空闲，列出所需的每一步确认信号与超时。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>发出取消、等待取消确认、等待控制器停止确认、同步状态、校验无附着残留、进入空闲；每步都有独立超时与失败分支。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>编排三层：顺序脚本、事件驱动状态机、组合式任务规划，按阶段数与依赖强度选择。</li>
+      <li>状态机把失败建模为转移，超时是转移边，恢复有界且可观测。</li>
+      <li>技能契约四要素：前置断言、动作、后置断言、超时与恢复；断言必须可检验、恢复必须幂等。</li>
+      <li>并发默认"单任务互斥加队列"，抢占需要回答中止与复位两个问题。</li>
+      <li>任务构造器适合阶段组合存在选择空间的任务，与状态机在规划期与运行期分工互补。</li>
+      <li>下一章处理多臂与多机场景：<strong>多机器人场景中的 MoveIt2 部署</strong>，把互斥与命名空间扩展到系统级。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch087.html">← 第 087 章：C++ 接口源码导读</a>
+    <a class="next" href="ch089.html">第 089 章：多机器人场景中的 MoveIt2 部署 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.06 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:11.5px !important;letter-spacing:.06em !important;color:rgba(71,85,105,.45) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#7e8ba0 !important;font-size:11.5px !important;line-height:1.8 !important;text-align:center !important;padding:5px 12px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

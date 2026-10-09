@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第064章 Place Action 接口 | 机械臂规划学习课程 · ROS2 MoveIt2 运动规划与操作</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第四篇 · 抓取与操作任务</span>
+    <span class="sep">/</span>
+    <span>第 064 章</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第四篇 · 抓取与操作任务</div>
+    <h1>第 064 章：Place Action 接口</h1>
+    <p class="lead">放置侧接口与抓取侧对称，目标却不同：Place 的阶段组织、PlaceLocation 多候选语义、放置精度的误差分层与接触检测驱动的轻放策略。</p>
+    <ul class="meta">
+      <li>主题：任务接口 / Place Action（Place Action）</li>
+      <li>关键机制：多放置位姿候选 / 误差合成 / 接触检测与轻放</li>
+      <li>预计学时：50 分钟</li>
+      <li>前置章节：第 063 章</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>掌握 PlaceGoal 与 PlaceLocation 的字段组成，理解多放置位姿候选（Place Location Candidates）的顺序尝试语义。</li>
+      <li>能画出 Pick 与 Place 的阶段对称映射，并说明两阶段在"释放控制"与"接触检测"上的本质差异。</li>
+      <li>掌握放置精度的误差分层方法，能用平方和开方（RSS）与代数和两种方式做误差预算。</li>
+      <li>会实现接触检测驱动的减速下降与轻放逻辑，并设计释放扰动的抑制策略。</li>
+      <li>能诊断偏移放置、压靠过载、场景未还原三类常见放置故障。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>抓取控制的是"夹紧"，放置控制的是"松开"。看似对称的两个动作，工程难点分布完全不同：抓取时物体被手爪约束，误差由夹持力与摩擦吸收；放置时物体与支撑面接触，误差直接表现为放置位置偏差，且释放瞬间的反力可能推倒或滚动物体。<strong>放置是整条流水线中精度要求最高、接触状态变化最多的一段</strong>，因此需要独立的接口语义与专门的轻放策略。</p>
+    <p>Place action 在消息层与 Pickup 对称：目标携带放置位置候选列表、支撑面信息与可接触连杆列表，反馈报告阶段推进，结果返回错误码。二者的区别集中在 PlaceLocation 的字段设计与执行层策略上，本章按"接口语义 → 误差理论 → 轻放实现"展开。</p>
+    <p>本章是第 063 章的对称补充，并为第 070 章的装配对位、第 071 章的力控柔顺做概念铺垫：放置中的接触检测与力阈值控制正是力控思想的起步形态。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 阶段对称性与释放控制差异</h3>
+    <table>
+      <tr><th>Pick 阶段</th><th>Place 对应阶段</th><th>共同点</th><th>差异点</th></tr>
+      <tr><td>预抓取（Pre-Grasp）</td><td>预放置（Pre-Place）</td><td>沿接近方向退距的中间位姿</td><td>预放置位姿还需容纳手爪与物体的总高度</td></tr>
+      <tr><td>接近（Approach）</td><td>下降（Descend）</td><td>直线段进入最终位姿</td><td>下降段末端存在接触，需减速与检测</td></tr>
+      <tr><td>夹紧（Close）</td><td>释放（Release）</td><td>一次手爪动作</td><td>张开产生反力，可能扰动已就位物体</td></tr>
+      <tr><td>回退（Retreat）</td><td>撤离（Retreat）</td><td>直线退出</td><td>撤离时物体已脱离手爪，需避开物体边界</td></tr>
+    </table>
+    <p><strong>释放控制的关键差异在于力的方向性：夹紧时反力由物体承担，释放时反力传给支撑面，方向不利时表现为物体翻转或滚动。</strong>因此释放阶段保留轻微下压、降低张开速度、张开完成后先抬升再侧向移动，是最小化放置扰动的通行策略。</p>
+
+    <h3>2. PlaceLocation 与多候选语义</h3>
+    <p>PlaceGoal 携带一个放置位置候选数组（PlaceLocation[]），每个候选包含：放置位姿（place_pose，含 frame）、放置前手爪姿态（pre_place_posture）、接近参数（approach）与撤离参数（retreat），以及可选的标识（id）。</p>
+    <p>多候选服务于两类场景：<strong>同一物体的多个可放置位置</strong>（料框的不同格位、传送带的不同区段），以及<strong>同一位置的多组接近方向</strong>（从上方、从侧向摆放）。服务器按顺序或按优先级尝试，直到某个候选完成或全部失败，语义与第 063 章抓取候选列表一致。</p>
+    <div class="box key">
+      <span class="box-title">设计决策：多候选选择顺序由谁决定？</span>
+      <p>服务器逐候选尝试的默认顺序是数组顺序，因此把"最希望放置的位置"排在前面是客户端的职责。若希望按空间可行性排序，可由客户端先做可放置性初筛（格位空间余量、与相邻物体的间隙），把通过初筛且余量大的候选排在前面。接口层不承担排序逻辑，保持目标语义的纯粹性。</p>
+    </div>
+
+    <h3>3. 放置精度的误差分层</h3>
+    <p>放置偏差由若干独立来源叠加，误差预算按来源分层：</p>
+    <table>
+      <tr><th>误差来源</th><th>典型量级</th><th>性质</th><th>抑制手段</th></tr>
+      <tr><td>机械臂绝对定位误差</td><td>0.2–1 mm（标定后）</td><td>系统性，可标定</td><td>运动学标定、TCP 标定</td></tr>
+      <tr><td>抓取瞬间物体相对手爪偏移</td><td>1–3 mm</td><td>随机，接触决定</td><td>抓取后视觉复检、夹紧定心</td></tr>
+      <tr><td>搬运过程中的滑移</td><td>0–1 mm</td><td>随机，与加速度相关</td><td>限制搬运加速度、提高夹持力</td></tr>
+      <tr><td>支撑面倾斜与不平</td><td>0.2–1 mm 等效</td><td>系统性，可测量</td><td>标定支撑面平面度，补偿高度</td></tr>
+      <tr><td>释放扰动</td><td>0.5–2 mm</td><td>随机，方向相关</td><td>轻压下释放、慢速张开</td></tr>
+    </table>
+    <p>独立误差按平方和开方（Root Sum Square, RSS）合成，最坏情形按代数和估计：</p>
+    <div class="formula">
+      e<sub>RSS</sub> = √(Σ e<sub>i</sub><sup>2</sup>)，e<sub>worst</sub> = Σ e<sub>i</sub>
+      <span class="note">0.5 mm、1.5 mm、0.5 mm 三项合成：RSS ≈ 1.66 mm，最坏 2.5 mm</span>
+    </div>
+    <p><strong>误差预算的作用是定位主导项：RSS 与代数和相差越远，说明各来源量级接近且相互独立；若某一项明显主导，投入应集中在该项的抑制手段上。</strong>上式示例中抓取抓偏项（1.5 mm）主导，优先方案是抓取后的视觉复检或定心机构；继续提高机械臂标定精度对抓偏项的收益有限。</p>
+
+    <h3>4. 接触检测与轻放</h3>
+    <p>下降段末端需要感知"何时接触"，可用手段按获得难度递增排列：</p>
+    <ul>
+      <li><strong>位置偏差检测</strong>：位置控制下观察实际关节位置与指令位置的偏差累积，接触产生等效刚度突变。无需额外传感器，灵敏度低。</li>
+      <li><strong>关节电流突变</strong>：接触使关节负载增大，电流上升超过阈值判定接触。常用阈值对应 5–15 N 的等效接触力，无需力传感器。</li>
+      <li><strong>腕部力/力矩传感</strong>：直接测量六维力，可分辨接触方向与大小，适合第 071 章的力控闭环。</li>
+    </ul>
+    <p>轻放策略分为五步：<strong>快速下降到名义高度上方 5–10 mm，低速下降到接触检测触发，触发后停止下降，保持轻压并慢速张开手爪，张开完成后直线抬升。</strong>下压余量（0.5–2 mm）是为支撑面不平与位置误差预留的行程，太小会出现"未接触就释放"导致物体坠落，太大则压靠力过大。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>放置流水线的实现步骤：</p>
+    <ol>
+      <li><strong>目标解析</strong>：读取候选数组，校验 place_pose 的 frame、手爪姿态与接近参数完整性。</li>
+      <li><strong>预放置位姿派生</strong>：由放置位姿沿接近方向后退，退距需容纳物体与手爪总高。</li>
+      <li><strong>阶段推进</strong>：预放置（关节或笛卡尔）→ 下降（分快速与低速两段）→ 接触检测 → 释放 → 撤离。</li>
+      <li><strong>场景还原</strong>：释放完成后分离物体并按当前位姿放回场景，确保后续目标看到的世界模型正确。</li>
+      <li><strong>失败处理</strong>：接触未触发时按到达名义高度处理并告警；候选失败切换下一个放置位置。</li>
+    </ol>
+    <h3>放置参数表</h3>
+    <table>
+      <tr><th>参数</th><th>典型值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>预放置高度</td><td>0.05–0.10 m</td><td>下降段起点高度</td><td>容纳物体加手爪总高并留余量</td></tr>
+      <tr><td>快速下降速度</td><td>0.05–0.1 m/s</td><td>接近段主速度</td><td>空旷段提速，缩短周期</td></tr>
+      <tr><td>低速下降速度</td><td>0.01–0.03 m/s</td><td>接触前速度</td><td>降低冲击与超调</td></tr>
+      <tr><td>接触力阈值</td><td>5–15 N</td><td>判定接触的等效力</td><td>大于空载摩擦、小于物体承压上限</td></tr>
+      <tr><td>下压余量</td><td>0.5–2 mm</td><td>接触检测的行程预算</td><td>覆盖位置误差与支撑面不平</td></tr>
+      <tr><td>释放保持时间</td><td>0.3–0.5 s</td><td>张开完成后的稳定等待</td><td>让物体落稳后再抬升</td></tr>
+      <tr><td>放置位置容差</td><td>1–2 mm</td><td>验收判据</td><td>由第 3 节误差预算反推</td></tr>
+    </table>
+    <p>与上一章的差异：Pick 的失败判据集中在"是否夹住"，Place 的失败判据分散在"是否接触、是否放正、是否扰动"，因此 Place 的执行层需要更细的分段与检测点。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+
+    <p><strong>片段 1：PlaceGoal 与 PlaceLocation 构造</strong></p>
+    <pre class="code"><code>from moveit_msgs.action import Place
+from moveit_msgs.msg import PlaceLocation
+
+def make_place_goal(target_name, locations, d_approach, d_retreat, group="arm"):
+    """封装放置目标：候选顺序即尝试顺序，接近与撤离参数逐个候选携带。"""
+    goal = Place.Goal()
+    goal.group_name = group            # 规划组名：与抓取侧保持同一执行链
+    goal.target_name = target_name     # 已附着物体名：放置完成后转回场景物体
+    built = []
+    for i, pose in enumerate(locations):
+        loc = PlaceLocation()
+        loc.id = f"slot_{i}"           # 标识用于反馈中报告使用了哪个候选
+        loc.place_pose = pose          # 含 frame 的放置位姿：须与支撑面标定一致
+        # 接近与撤离方向按位姿法向给出：竖直放置时方向取支撑面法向
+        loc.approach.direction.header.frame_id = pose.header.frame_id
+        loc.approach.direction.vector.z = -1.0
+        loc.approach.desired_distance = d_approach
+        loc.approach.min_distance = 0.01
+        loc.retreat.direction = loc.approach.direction
+        loc.retreat.desired_distance = d_retreat
+        built.append(loc)
+    goal.place_locations = built       # 数组顺序即尝试顺序：期望位置排前面
+    goal.support_surface_name = "table"
+    return goal</code></pre>
+    <p>解读：<strong>（1）</strong><code>loc.id</code> 设计为格位标识，配合反馈可以知道实际落在哪个候选上，便于对多格位料框做统计。<strong>（2）</strong>接近方向在候选内部单独携带，不同放置位姿可拥有不同的接近方向（侧向码垛与竖直摆放并存），这是把方向字段放在 PlaceLocation 层携带、目标层不携带方向的直接原因。<strong>（3）</strong>数组顺序即尝试顺序，把期望位置排在前面属于客户端的排序职责。<strong>（4）</strong>放置位姿的 frame 必须与支撑面的标定参考一致，否则高度方向的系统偏差会整体平移。</p>
+
+    <p><strong>片段 2：接触检测驱动的减速下降</strong></p>
+    <pre class="code"><code>import time
+
+def descend_until_contact(servo, force_reader, z_target, force_limit,
+                          step=0.0005, poll=0.02):
+    """按固定步长下降并在接触时立即停止；接触力超限前终止下降。"""
+    z = servo.current_z()                      # 当前末端高度（笛卡尔伺服接口）
+    while z &gt; z_target:
+        if force_reader.contact_force() &gt; force_limit:
+            servo.stop()
+            return "CONTACT"                   # 触发了接触检测：进入释放流程
+        z -= step                              # 步长 0.5 mm：决定检测粒度
+        servo.move_to_z(z)
+        time.sleep(poll)                       # 轮询 20 ms：决定最大运动超调
+    servo.stop()
+    return "REACHED"                           # 到达名义高度仍无接触：按到位处理并告警</code></pre>
+    <p>解读：<strong>（1）</strong>步长与轮询间隔共同决定接触时刻的过冲量：过冲 ≈ 下降速度 × 轮询间隔，0.02 m/s 与 20 ms 组合的过冲约 0.4 mm，与下压余量同量级。<strong>（2）</strong>两个返回值的语义不同：<code>CONTACT</code> 表示检测成功，<code>REACHED</code> 表示未接触但到达名义高度，后者可能源于位置误差或空抓，需要上层判别。<strong>（3）</strong>该函数用位置步进加力检查的组合实现轻放，替代方案是把下降段交给力控或柔顺控制，把接触力作为闭环目标（第 071 章展开）。</p>
+
+    <p><strong>片段 3：放置误差预算</strong></p>
+    <pre class="code"><code>import math
+
+def error_budget(terms):
+    """误差预算：独立来源按 RSS 合成，给出最坏界用于容差校核。"""
+    rss = math.sqrt(sum(e * e for e in terms))
+    worst = sum(abs(e) for e in terms)
+    return rss, worst
+
+# 典型分解：定位 0.5 mm、抓取抓偏 1.5 mm、支撑面倾斜等效 0.5 mm
+rss, worst = error_budget([0.5e-3, 1.5e-3, 0.5e-3])
+print(f"合成误差 {rss * 1000:.2f} mm，最坏 {worst * 1000:.2f} mm")
+print("对照容差 1.0 mm：主导项为抓取抓偏，优先加装抓后复检")</code></pre>
+    <p>解读：<strong>（1）</strong>RSS 用于常规情形评估，最坏界用于安全相关的下压余量设计：下压余量需大于最坏界，否则存在未接触即释放的风险。<strong>（2）</strong>输出同时给出主导项提示，把误差预算从"算术练习"变成"改进方向的选择依据"。<strong>（3）</strong>该估算应在系统设计阶段完成，并以实测数据（重复放置测试的分布）迭代更新各分项。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>放置位姿 frame 与支撑面不一致</strong>：place_pose 表达在物体坐标系或手爪坐标系，直接按规划坐标系使用导致高度与水平方向系统性偏差。修复：目标构造时统一变换到规划坐标系，并在接口文档中固定约定。</li>
+      <li><strong>预放置高度不足</strong>：下降段起点离支撑面过近，直线段在起始处已接近碰撞，姿态调整余地小。修复：预放置高度按物体与手爪总高加 5–10 mm 余量设定。</li>
+      <li><strong>下压余量过大或过小</strong>：过大时接触后仍继续下压，压靠力上升甚至触发碰撞停止；过小时未接触就释放，物体坠落。修复：按下压余量大于误差最坏界、小于物体允许压缩量的区间取值，典型 0.5–2 mm。</li>
+      <li><strong>释放扰动未抑制</strong>：手爪张开速度过快，物体被推偏或被带倒。修复：张开前保留轻压下压，张开速度取行程的 20%–30%，张开完成后等待 0.3–0.5 s 再抬升。</li>
+      <li><strong>放置完成未还原场景</strong>：物体仍以附着状态存在，后续规划把物体当作手爪的一部分，出现"物体悬空跟随"。修复：分离后按当前实际位姿重新加入场景，完成场景一致性检查。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>给定误差分项：定位 0.6 mm、抓取抓偏 2.0 mm、释放扰动 1.0 mm。分别计算 RSS 合成值与最坏界，并指出优先改进项。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>RSS = √(0.36 + 4.0 + 1.0) ≈ 2.32 mm；最坏界 3.6 mm。抓取抓偏为主导项，优先加装抓取后复检或定心结构。</div></details>
+      </li>
+      <li>把接触检测的轮询间隔从 20 ms 缩短到 5 ms，预测过冲量与对关节电流采样率、通信周期的新要求。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>过冲按比例降至约 0.1 mm，但要求电流或力信号的采样与传输周期同步缩短；若驱动器状态上报周期大于轮询间隔，缩短轮询没有实际收益。</div></details>
+      </li>
+      <li>为"把圆柱杯放入直径大 6 mm 的杯托"设计放置阶段表，标出每个阶段的速度、检测点与失败回退动作，并估算允许的位置误差上限。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>间隙 3 mm 意味着位置误差需小于 3 mm 才能落座，倒角过渡可放宽到接近 5 mm；下降末端速度取 0.01 m/s，接触检测后轻压释放。</div></details>
+      </li>
+      <li>设计对比实验：同一放置任务分别在"位置控制固定下压 1 mm"与"接触检测触发停止"两种策略下重复 30 次，给出评价指标与预期差异。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>指标包括落座位置分布、接触力峰值、失败次数、动作时长；固定下压策略的位置一致性依赖标定精度，接触检测策略的力峰值更低，但引入轮询延迟带来的过冲。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>Place 与 Pick 在阶段结构上对称，差异集中在下降末端的接触检测与释放扰动抑制。</li>
+      <li>PlaceLocation 数组承载多放置位置与方向候选，数组顺序即尝试顺序，排序职责在客户端。</li>
+      <li>放置精度按来源分层，独立误差用 RSS 合成、下压余量按最坏界设计，主导项的判别决定改进方向。</li>
+      <li>轻放策略为"快速下降、低速接触、检测停止、轻压释放、稳定抬升"五步，接触力阈值典型 5–15 N。</li>
+      <li>接口语义与执行策略分离：消息定义候选与支撑面，具体检测与速度策略在执行层配置，下一章逐字段剖析 Grasp 与 PlaceLocation 消息。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch063.html">← 第 063 章：Pick Action 接口</a>
+    <a class="next" href="ch065.html">第 065 章：Grasp 消息与 PlaceLocation 消息 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.06 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:11.5px !important;letter-spacing:.06em !important;color:rgba(71,85,105,.45) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#7e8ba0 !important;font-size:11.5px !important;line-height:1.8 !important;text-align:center !important;padding:5px 12px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

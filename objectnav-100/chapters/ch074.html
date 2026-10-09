@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 074 讲｜VLMnav：VLM 即策略 | 目标物体导航课程 · ObjectNav 从探索到开放词汇</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第四篇 · 开放词汇与大模型</span>
+    <span class="sep">/</span>
+    <span>第 074 讲</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第四篇 · 开放词汇与大模型</div>
+    <h1>第 074 讲｜VLMnav：VLM 即策略</h1>
+    <p class="lead">第 073 讲读完 GOAT II 的基准与记忆协议后，第四篇进入「大模型直接当策略」的路线。本讲拆 VLMnav（Goetting 等 2024，arXiv:2411.05755）：不做感知、建图、规划、控制的分层拆分，把导航改写成一个「看图选编号」的问答问题。系统由四个部件组成：可导航性模块用深度图算每个朝向的最远无碰撞距离；动作提议器把候选动作按探索状态筛选、加间距约束、截断距离；投影模块把动作编号画到 RGB 图上；提示词模块给出系统、任务、图像三段提示，并单独调用一次 VLM 判断是否停止。整套系统零样本运行，不微调、不训练导航数据。在 HM3D 的 ObjectNav 评测上（成功阈值 1.2 m）达到 50.4% SR 与 0.210 SPL；在 GOAT 基准上达到 16.3% SR；设计消融给出三个可复现的结论：视场越宽越好，朴素拼接观测历史没有收益，深度感知可以退化为语义分割但仍需可导航性判断。</p>
+    <ul class="meta">
+      <li>主题：端到端 VLM 策略 / 提示词协议 / 动作提议 / 零样本评测</li>
+      <li>关键公式：a* ~ P<sub>vlm</sub>(a | Î, T)；r<sub>i</sub> ← min(2/3 · r<sub>i</sub>, r<sub>max</sub>)；e = SPL / SR</li>
+      <li>预计学时：75 分钟</li>
+      <li>前置章节：第 073 讲（GOAT II / GOAT-Bench）</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>会推导：从深度图到可导航掩码、从掩码到极坐标候选动作、再到带探索偏好的最终动作集，每一步的输入输出与边界条件说清楚。</li>
+      <li>会算：ObjectNav 与 GOAT 两张结果表内各方法的 SR、SPL 差值与条件路径效率 e = SPL / SR，理解 SR 与 SPL 各自回答的问题。</li>
+      <li>会判断：三个设计消融（视场、历史长度、深度来源）各自的方向与量级，能预测改动超参后的性能走向。</li>
+      <li>会设计：一套「VLM 即策略」的提示词协议与终止策略，包括视觉标注、链式思考引导、双确认停止与失速脱困。</li>
+      <li>会识别：该范式的边界与失效模式，包括滑行依赖、提前停止、无回溯动作、与专才系统的差距及其口径原因。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 061 至 073 讲的主线是模块化与开放词汇接口：语义地图负责空间记忆，CLIP 或 VLM 负责语义匹配，前沿排序或场景图负责规划，低层策略负责执行。这条路线可解释、可调试，代价是系统复杂：每一环都有自己的接口、超参与失效模式，误差逐环传播。第 074 讲转向另一条路线：既然视觉语言模型（Vision-Language Model, VLM）擅长回答「这张图里有什么、该往哪走」这类问题，能否把导航直接改写成问答，让一个现成的 VLM 每一步选一个动作？</p>
+    <p>这个想法面临三个具体障碍。第一，VLM 对连续坐标的推理能力弱，直接输出「前进 2.3 米、左转 41 度」不可靠。第二，VLM 看不出哪里能走、哪里会撞，需要把可通行性变成它看得懂的视觉标注。第三，VLM 不知道何时该停，而导航的成功判据恰恰取决于停止位置。VLMnav 的全部设计都在回答这三问：把动作离散化为图上编号、把可通行位置画成箭头、把停止拆成独立调用。本讲按「形式化、四部件、两张结果表、三组消融、边界条件」的顺序展开，这套读法也适用于后续任何「VLM 即策略」的工作。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 任务形式化与接口</h3>
+    <p>VLMnav 沿用 ObjectNav 的部分可观测马尔可夫决策过程（Partially Observable Markov Decision Process, POMDP）口径。目标 𝒢 用语言或图像给出；每一步输入 RGB-D 图像 I 与位姿 ξ，输出一个动作 a。动作空间限定为机器人本体系内的偏航旋转与前向位移，因此任意动作都可用极坐标 (θ, r) 表示：θ 为相对当前朝向的转角，r 为前进距离。这一限定把连续控制问题压成了「在一组离散选项里选一个」，与 VLM 的能力边界对齐。</p>
+    <p>选择规则写作 a* ~ P<sub>vlm</sub>(a | Î, T)，其中 Î 是叠加了动作标注的图像，T 是文本提示，a* 属于最终动作集 A<sub>final</sub>。注意三个接口约定：动作一旦选出就直接执行，不经过任何低层避障策略；图像标注与文本提示共同构成「选项说明书」；停止动作不在 A<sub>final</sub> 内，由独立的终止模块决定。这三条约定决定了后面所有设计。</p>
+
+    <h3>2. 可导航性：从深度图到候选动作</h3>
+    <p>可导航性（Navigability）模块只做一件事：用深度图判断「沿某个朝向直走，最远能到哪里」。设深度图分辨率为 H×W，相机水平视场为 FOV，像素列 u 对应的方位角为</p>
+    <div class="formula">θ(u) = (u − W/2) / W · FOV</div>
+    <p>对每个候选朝向 θ ∈ FOV，取该朝向附近像素列的有效深度最小值，得到无碰撞直线距离 r(θ)。有效性的判定包含三项：深度有限、处于合理量程（常见实现取 0.1 至 10 m）、且该像素属于地面或近地面区域。所有 r(θ) 大于最小阈值的朝向构成初始动作集 A<sub>initial</sub> = {(θ<sub>i</sub>, r<sub>i</sub>)}。同时，系统用深度与位姿维护一张俯视体素地图，把距智能体 2 m 以内的可观测区域标记为已探索，2 m 以外的可观测区域标记为未探索。这张地图是动作提议器判断探索状态的唯一依据。</p>
+    <p>需要强调 r(θ) 的几何含义：它是最远无碰撞距离，沿该方向直走不会撞墙，但路线上是否存在窄缝、家具腿或低矮障碍，深度图分辨率与相机俯角决定其可见性。论文把相机下俯 25° 安装，正是为了让近处地面与障碍根部进入视野，提高可导航性判断的稳定性。</p>
+
+    <h3>3. 动作提议器与探索偏好</h3>
+    <p>初始动作集直接交给 VLM 有两个问题：朝向过密时箭头互相遮挡，且动作不含任何探索激励，智能体会反复走已探索区域。动作提议器（Action Proposer）按三步把 A<sub>initial</sub> 精炼为 A<sub>final</sub>。第一步定义探索指示变量</p>
+    <div class="formula">e<sub>i</sub> = 1，若区域 (θ<sub>i</sub>, r<sub>i</sub>) 未探索；e<sub>i</sub> = 0，若已探索</div>
+    <p>第二步按角度间距筛选：未探索动作以较小间距 θ<sub>δ</sub> 加入 A<sub>final</sub>，保证探索方向优先且视觉上可分辨；已探索动作再以更大间距 θ<sub>Δ</sub>（θ<sub>Δ</sub> &gt; θ<sub>δ</sub>）补充，保证全方向仍有覆盖。第三步做距离截断</p>
+    <div class="formula">r<sub>i</sub> ← min(2/3 · r<sub>i</sub>, r<sub>max</sub>)，对全部 (θ<sub>i</sub>, r<sub>i</sub>) ∈ A<sub>final</sub></div>
+    <p>截断系数 2/3 的作用是留出安全余量：深度估计有噪声，执行有滑移，直接走到最远处容易贴墙。论文同时给出一个特例处理：当 A<sub>initial</sub> 为空（典型情形是智能体卡在角落），追加特殊动作 (π, 0)，即原地转身 180°。这个动作同时承担「快速退出房间」的功能。最终 A<sub>final</sub> 满足三条性质：动作对应无碰撞路径、动作之间有足够视觉间距、探索方向被系统性放大。论文把第三条称为探索偏好（explore bias）。</p>
+
+    <h3>4. 视觉标注与提示词协议</h3>
+    <p>投影（Projection）模块把 A<sub>final</sub> 中每个动作编号，并画成从图像中心指向落点的箭头，编号写在箭头端点。特殊动作 0 表示转身，画在图像侧边并标注 Turn Around。这一步是整套方法的关键：论文的对照实验显示，把动作只写在文本里（Prompt Only）会让 SPL 从 0.210 降到 0.107，路径效率损失接近一半，说明视觉标注承担了空间落地功能，文本描述无法替代。</p>
+    <p>提示词 T 分三段。系统段描述本体形态与传感器配置；任务段给出目标、动作选项与输出格式；图像段即标注图 Î。任务段还显式要求模型先描述空间布局、再给出高层计划、最后输出动作编号，这一链式思考（Chain-of-Thought）引导用于提升推理质量。图像目标的任务里，目标图像与 Î、T 一同送入模型。VLM 的输出被解析为编号，映射回 (θ, r) 后直接执行。论文使用 Gemini Flash 作为 VLM，理由是成本低、响应质量稳定；模型不训练、不微调，全部能力来自预训练。</p>
+
+    <h3>5. 终止判断：独立调用与双确认</h3>
+    <p>终止是这套设计里最容易被低估的部件。模块化系统通常把「停止」交给目标坐标与距离阈值，VLMnav 没有显式目标坐标，必须让 VLM 自己判断。论文把停止做成独立调用，理由有两条：标注箭头会遮挡与干扰图像，混在动作选择里会降低判断质量；导航与停止是两种任务，分开调用避免任务干扰。停止提示词只问一件事：当前视角是否已经足够接近目标、可以停止。</p>
+    <p>为压低误停概率，系统采用双确认：VLM 连续两次调用都回答停止，才真正终止。第一次回答停止后，可导航性与探索偏好被关闭，智能体只能小幅靠近目标，避免「停了一下又走远」。双确认的代价是可能多走一两步，收益是减少提前停止。论文报告仍有 13.9% 的运行在距目标 1.0 至 1.5 m 处提前停止，这些运行按基准的 1 m 判据记为失败；同时超过 30% 的运行能把目标逼近到近处，说明模型具备接近能力，缺的是细粒度距离感知。</p>
+
+    <h3>6. ObjectNav 与 GOAT 结果</h3>
+    <p>论文在 Habitat 的 HM3D 场景上评测 ObjectNav 与 GOAT 两个基准。ObjectNav 用六类目标、成功阈值 1.2 m（Goetting 等 2024，表 1）；GOAT 每个 episode 含 5 至 10 个子任务，目标模态分物体名、图像、细粒度文本三种（Goetting 等 2024，表 2，val unseen）。</p>
+    <table>
+      <tr><th>方法（ObjectNav）</th><th>SR</th><th>SPL</th><th>条件效率 e = SPL / SR</th></tr>
+      <tr><td><strong>VLMnav</strong></td><td><strong>50.4%</strong></td><td><strong>0.210</strong></td><td>41.7%</td></tr>
+      <tr><td>VLMnav 去可导航性与动作提议</td><td>33.2%</td><td>0.136</td><td>41.0%</td></tr>
+      <tr><td>仅提示词（无视觉标注）</td><td>29.8%</td><td>0.107</td><td>35.9%</td></tr>
+      <tr><td>PIVOT</td><td>24.6%</td><td>0.106</td><td>43.1%</td></tr>
+      <tr><td>VLMnav 关闭滑行（allow_slide=false）</td><td>12.9%</td><td>0.063</td><td>48.8%</td></tr>
+    </table>
+    <p>先读与 PIVOT 的对照。PIVOT 用高斯分布采样箭头、迭代询问 VLM 收敛到动作，一次动作选择需要多次调用；VLMnav 相对它的成功率提高 25.8 个百分点（相对 +104.9%），SPL 提高到 1.98 倍。论文把差距归为两点：PIVOT 的动作空间表达力不足，无法执行大角度旋转与完全转身，容易卡在角落；PIVOT 不用深度判断动作可达性，效率低。再看内部消融：去掉可导航性与动作提议（候选动作改为均匀分布、不参考可通行性），SR 掉 17.2 个百分点（从 50.4% 到 33.2%，相对降幅 34.1%），说明「候选动作质量」对结果的影响大于「VLM 的推理」；仅提示词（无标注）的 SR 再降，SPL 降幅尤其明显。条件效率 e 的反推值得注意：PIVOT 的 e = 43.1% 高于 VLMnav 的 41.7%，即 PIVOT 少数成功轨迹的路径相对直接，但它成功次数少得多，绝对 SPL 仍低。读表时以 SR 与 SPL 为准，e 只作辅助解释。</p>
+    <p>GOAT 的结果方向一致（Goetting 等 2024，表 2）：VLMnav 总体 16.3% SR / 0.066 SPL；按模态拆分为图像 14.3%、物体名 20.5%、文本描述 13.4%；去掉导航模块为 11.8% / 0.054，仅提示词为 11.3% / 0.037，PIVOT 为 8.3% / 0.038。图像目标的成功率接近 PIVOT 的两倍（14.3% / 7.0% = 2.04 倍），说明视觉提示协议对图像目标模态的迁移最明显。表 3 给出与专才系统的对照（关闭滑行）：SenseAct-NN 29.5% / 0.113，Modular GOAT 24.9% / 0.172，VLMnav 6.9% / 0.049。论文明确承认专才系统更强，并把差距部分归因于对照设置不同（对方使用更窄视场、更低分辨率与不同动作空间）。这组数字是第 074 讲最重要的冷静剂：零样本通用接口在 GOAT 这类长程多目标任务上，与专门训练的系统仍有明显距离。</p>
+
+    <h3>7. 三组设计消融</h3>
+    <p>第一组是视场（Field of View, FOV）。论文评测 82°、100°、115°、131° 四档（Goetting 等 2024，图 6），SR 与 SPL 随视场加宽单调上升。机制解释：视场决定单帧可见的可导航方向数量与探索线索密度，窄视场下可导航性模块能提议的方向变少，智能体需要更多旋转步才能获得同等信息。131° 对应手机 0.5 倍镜头的视场，是论文的默认配置。</p>
+    <p>第二组是观测历史。论文把最近 K 步的观测与动作朴素拼接进提示词，K 取 0、5、10、15；为单独考察历史的作用，这组实验关闭探索偏好（Goetting 等 2024，表 4）。结果：无历史 46.8% / 0.193，5 步 42.7% / 0.180，10 步 45.4% / 0.196，15 步 40.4% / 0.170。历史增加后 SR 没有上升，15 步反而比无历史低 6.4 个百分点。结论是：朴素文本或图像拼接无法让该提示协议有效利用长上下文，观测历史既稀释了当前帧的注意力，也超出模型的利用能力。这个否定结论与第 075 讲 NaVid 的视频 token 方案形成直接对照。</p>
+    <p>第三组是深度来源。仿真深度 50.4% / 0.210；用 Segformer 分割地面区域替代深度、以像素数估算距离，47.2% / 0.183（SR −3.2 个百分点，相对 −6.3%）；用 ZoeDepth 单目估计深度，39.1% / 0.161（SR −11.3 个百分点，相对 −22.4%）。读法：可导航性判断需要的是「地面在哪、障碍边界在哪」，语义分割能较稳地给出这两类边界，度量深度的绝对误差反而不重要；单目深度估计的噪声会系统性污染 r(θ)，导致候选动作频繁指向不可达位置。该消融支持「最小传感」部署：只有 RGB 时，分割路线可行，深度估计路线风险高。</p>
+
+    <h3>8. 边界与失效条件</h3>
+    <p>引用与复现这套结果前要过五道检查。第一，成功阈值口径：ObjectNav 表用 1.2 m，GOAT 用 1 m，两个表不可混谈；跨论文比较时必须逐表确认阈值与可见性要求。第二，滑行依赖：开启 allow_slide 时智能体可以贴着障碍滑行，关闭后 SR 从 50.4% 掉到 12.9%（相对 −74.4%），说明系统会碰撞、会卡死，缺少显式回溯动作，真机部署前需要补低层安全层。第三，提前停止：13.9% 的运行停在 1.0 至 1.5 m，根因是 VLM 缺少细粒度距离感知；把阈值放宽到 1.5 m 只能把这些问题「改判」为成功，不能提高真实接近能力。第四，专才系统差距：GOAT 上与 SenseAct-NN 差 22.6 个百分点（关闭滑行口径），零样本路线的优势在开放性与免训练，不在绝对性能。第五，提示词与标注耦合：SR 与 SPL 对标注、提示措辞、VLM 版本都敏感，论文的消融在同一提示框架内进行，跨框架的绝对数字不具备可比性。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>把 VLMnav 复现为一套可运行系统，需要三张表：部件接口表、超参表与方案取舍表。三张表对应「数据怎么流、参数怎么定、决策怎么做」。</p>
+    <h3>部件接口表</h3>
+    <table>
+      <tr><th>部件</th><th>输入</th><th>输出</th><th>频率</th><th>关键约定</th></tr>
+      <tr><td>可导航性</td><td>深度图、相机内参</td><td>可导航掩码、A<sub>initial</sub></td><td>每步</td><td>像素列到方位角的映射必须与相机模型一致</td></tr>
+      <tr><td>动作提议器</td><td>A<sub>initial</sub>、体素地图</td><td>A<sub>final</sub>（编号）</td><td>每步</td><td>探索状态取地图标记，2 m 分界</td></tr>
+      <tr><td>投影</td><td>RGB、A<sub>final</sub></td><td>标注图 Î</td><td>每步</td><td>编号与提示词一一对应</td></tr>
+      <tr><td>动作 VLM</td><td>Î、提示词 T</td><td>动作编号</td><td>每步</td><td>链式思考先布局后计划再编号</td></tr>
+      <tr><td>终止 VLM</td><td>原始 RGB、目标</td><td>停止/继续</td><td>每步</td><td>连续两次停止才终止</td></tr>
+    </table>
+    <h3>超参表</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>水平视场 FOV</td><td>131°</td><td>单帧可见方向数与探索线索密度</td><td>消融显示 82° 至 131° 单调上升（图 6）</td></tr>
+      <tr><td>相机俯角</td><td>25°</td><td>让地面与障碍根部入镜</td><td>可导航性依赖近处地面像素</td></tr>
+      <tr><td>RGB-D 分辨率</td><td>1080 × 1920</td><td>深度细节与标注可读性</td><td>论文默认配置</td></tr>
+      <tr><td>已探索半径</td><td>2 m</td><td>划分探索与未探索区域</td><td>与局部规划范围匹配</td></tr>
+      <tr><td>距离截断系数</td><td>2/3</td><td>留安全余量，防贴墙</td><td>深度噪声与执行滑移的经验值</td></tr>
+      <tr><td>未探索间距 θ<sub>δ</sub></td><td>小于 θ<sub>Δ</sub></td><td>加密探索方向</td><td>探索优先且箭头可分辨</td></tr>
+      <tr><td>已探索间距 θ<sub>Δ</sub></td><td>大于 θ<sub>δ</sub></td><td>保证全向覆盖</td><td>控制箭头总数与遮挡</td></tr>
+      <tr><td>停止确认次数</td><td>2</td><td>压低误停</td><td>单次停止误报率高</td></tr>
+      <tr><td>本体尺寸</td><td>半径 0.17 m / 高 1.5 m</td><td>碰撞口径</td><td>圆柱体近似，与仿真一致</td></tr>
+    </table>
+    <h3>方案取舍表</h3>
+    <table>
+      <tr><th>决策点</th><th>VLMnav 选择</th><th>替代方案与代价</th><th>判据</th></tr>
+      <tr><td>动作表示</td><td>图上编号 + 极坐标参数</td><td>文本描述动作：SPL 0.107；连续坐标：VLM 不可靠</td><td>视觉标注的路径效率接近翻倍</td></tr>
+      <tr><td>候选动作来源</td><td>深度可导航性 + 探索偏好</td><td>均匀分布：SR 掉 17.2 个百分点</td><td>候选质量是第一贡献源</td></tr>
+      <tr><td>历史建模</td><td>不拼接历史</td><td>朴素拼接：无增益且 15 步时下降 6.4</td><td>当前帧提示协议已足够</td></tr>
+      <tr><td>深度来源</td><td>仿真深度（默认）</td><td>Segformer −3.2；ZoeDepth −11.3</td><td>无深度时优先分割路线</td></tr>
+      <tr><td>终止策略</td><td>独立调用 + 双确认</td><td>动作调用内判断：标注干扰；单次确认：误停多</td><td>提前停止率 13.9% 已属偏高</td></tr>
+    </table>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>四段代码对应可导航性、动作提议、标注与提示、终止与主循环。代码为教学重写，接口与论文描述一致。</p>
+
+    <p><strong>片段 1：可导航性掩码与极坐标候选动作</strong></p>
+    <pre class="code"><code>import numpy as np
+
+def navigable_actions(depth, fov_rad, n_headings=61, min_r=0.25):
+    """从深度图提取候选动作：每个朝向取最远无碰撞距离。"""
+    h, w = depth.shape
+    ys, xs = np.mgrid[0:h, 0:w]
+    angles = (xs - w / 2.0) / w * fov_rad            # 像素列到方位角
+    valid = np.isfinite(depth) &amp; (depth &gt; 0.1) &amp; (depth &lt; 10.0)
+    grid = np.linspace(-fov_rad / 2.0, fov_rad / 2.0, n_headings)
+    actions = []
+    for theta in grid:
+        col = np.abs(angles - theta) &lt; (fov_rad / w)  # 朝向对应像素列
+        d = depth[valid &amp; col]
+        r = float(d.min()) if d.size else 0.0        # 最远可直行距离
+        if r &gt; min_r:                                # 过滤退化动作
+            actions.append((float(theta), r))
+    return actions</code></pre>
+    <p>解读：<strong>（1）</strong>像素列到方位角的映射必须与相机内参一致，错位会让箭头系统性地指向错误方向。<strong>（2）</strong>取「最近深度」，不用平均深度，保证 r(θ) 是无碰撞距离的下界；min_r 过滤掉指向极近障碍的动作。<strong>（3）</strong>有效深度量程同时排除过近与过远，避免深度图空洞被当作远距离可通行区域。</p>
+
+    <p><strong>片段 2：动作提议器（探索偏好与截断）</strong></p>
+    <pre class="code"><code>def propose_actions(actions, is_explored, theta_delta=0.20, theta_big=0.45,
+                    r_max=0.5, clip=2.0 / 3.0):
+    """未探索动作小间距优先，已探索动作大间距补充，最后截断距离。"""
+    final = []
+    for theta, r in sorted(actions, key=lambda a: -a[1]):      # 远动作优先
+        if is_explored(theta, r):
+            continue
+        if all(abs(theta - t) &gt;= theta_delta for t, _ in final):
+            final.append((theta, r))
+    for theta, r in sorted(actions, key=lambda a: -a[1]):
+        if not is_explored(theta, r):
+            continue
+        if all(abs(theta - t) &gt;= theta_big for t, _ in final):
+            final.append((theta, r))
+    return [(t, min(clip * r, r_max)) for t, r in final]</code></pre>
+    <p>解读：<strong>（1）</strong>两轮筛选对应 θ<sub>δ</sub> 与 θ<sub>Δ</sub> 两档间距，未探索方向先占位，已探索方向补空，探索偏好由此产生。<strong>（2）</strong>按距离降序排序，让远动作优先占位，避免近处动作把远处探索方向挤出。<strong>（3）</strong>截断在最后统一做，min(2/3·r, r_max) 同时限制贴墙与单步跨度过大。<strong>（4）</strong>若返回空列表，调用方应追加 (π, 0) 转身动作。</p>
+
+    <p><strong>片段 3：视觉标注与提示词组装</strong></p>
+    <pre class="code"><code>PROMPT = (
+    "You are a navigation robot with an RGB-D camera. "
+    "Goal: {goal}. The image shows numbered arrows; "
+    "each number is one executable action. "
+    "First describe the spatial layout of the scene, "
+    "then give a short plan, then answer with the single "
+    "number of the best action."
+)
+
+def annotate(image, actions, camera):
+    """把动作编号与箭头画到 RGB 图上，形成可被 VLM 引用的标注。"""
+    out = image.copy()
+    for idx, (theta, r) in enumerate(actions, start=1):
+        u, v = project_to_image(theta, r, camera)   # 由相机模型投影
+        draw_arrow(out, center=image_center(image),
+                   tip=(u, v), color=ARROW_COLOR)
+        draw_label(out, text=str(idx), at=(u, v))
+    return out</code></pre>
+    <p>解读：<strong>（1）</strong>提示词三段式：系统身份、任务与输出格式、链式思考要求；编号与图上标注一一对应，缺一不可。<strong>（2）</strong>投影使用与可导航性相同的相机模型，保证箭头落点与真实方向一致。<strong>（3）</strong>特殊动作 0 不画箭头，画在图像侧边并标注 Turn Around，让转身动作的视觉显著性与其它动作对齐。<strong>（4）</strong>提示词是评测的一部分：换措辞、换 VLM 版本都要重新标定数字。</p>
+
+    <p><strong>片段 4：终止双确认与主循环</strong></p>
+    <pre class="code"><code>class VLMnavAgent:
+    def __init__(self, vlm, env):
+        self.vlm, self.env = vlm, env
+        self.stop_votes = 0
+
+    def act(self, goal, obs):
+        actions = propose_actions(
+            navigable_actions(obs.depth, FOV), self.map.is_explored)
+        if not actions:                                  # 角落脱困
+            actions = [(math.pi, 0.0)]
+        if self.vlm.ask_stop(obs.rgb, goal):             # 独立终止调用
+            self.stop_votes += 1
+            if self.stop_votes &gt;= 2:                      # 连续两次才停止
+                return STOP
+            actions = self.limit_to_current_view(actions)  # 关闭探索偏好
+        else:
+            self.stop_votes = 0
+        annotated = annotate(obs.rgb, actions, CAMERA)
+        idx = self.vlm.choose(annotated, PROMPT.format(goal=goal))
+        return actions[idx - 1]</code></pre>
+    <p>解读：<strong>（1）</strong>停止调用与动作调用使用不同的输入图像：停止看原始 RGB，动作看标注图，避免箭头干扰停止判断。<strong>（2）</strong>第一次停止后限制动作范围并关闭探索偏好，防止「停了又走远」。<strong>（3）</strong>stop_votes 在非停止时清零，保证「连续两次」语义严格。<strong>（4）</strong>主循环不含任何低层避障：候选动作已经过可导航性过滤，执行层只做动作回放。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>成功阈值混谈</strong>：症状是复现的 SR 比论文低一大截。根因是 ObjectNav 表用 1.2 m、GOAT 用 1 m，Habitat 挑战口径又可能是别的值。修复：评测脚本把阈值作为显式参数记录，报告时写明「数据集 + 阈值 + 可见性要求」。</li>
+      <li><strong>忽略滑行假设</strong>：症状是仿真正常、真机频繁卡死。根因是 50.4% 的结果依赖 allow_slide，关闭后只有 12.9%。修复：部署前补低层碰撞规避与回溯动作，并把仿真评测的滑行开关写进复现清单。</li>
+      <li><strong>朴素拼接长历史</strong>：症状是上下文越长结果越差。根因是该提示协议无法利用拼接历史，15 步时 SR 比无历史低 6.4 个百分点。修复：默认不拼历史；确有需要时改用视频 token 或结构化记忆（见第 075、076 讲）。</li>
+      <li><strong>把单次 stop 当终止信号</strong>：症状是提前停止率升高、SR 虚低。根因是 VLM 距离感知粗，13.9% 的运行停在 1.0 至 1.5 m。修复：双确认停止；必要时叠加检测框几何或深度距离门控。</li>
+      <li><strong>用单目深度直接替换仿真深度</strong>：症状是候选动作频繁指向不可达位置。根因是 ZoeDepth 路线 SR 掉 11.3 个百分点，绝对深度噪声污染 r(θ)。修复：无深度时优先语义分割路线（SR 仅掉 3.2 个百分点），并保留 min_r 过滤。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>根据 ObjectNav 表计算 VLMnav 相对 PIVOT、去导航版本、仅提示词版本的 SR 与 SPL 差值，并解释 PIVOT 条件效率 e 更高但 SPL 更低的原因。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>SR 差分别为 +25.8、+17.2、+20.6 个百分点；SPL 差为 +0.104、+0.074、+0.103。e = SPL / SR：PIVOT 43.1% 高于 VLMnav 41.7%，说明其少数成功轨迹路径较直接，但成功次数少，绝对 SPL 由 SR 主导。</div></details>
+      </li>
+      <li>给定候选动作 {(0.0, 0.9), (0.15, 0.5), (0.4, 0.7), (0.6, 0.3), (−0.2, 0.6)}（单位：弧度、米），未探索标记为 {0.15, 0.6}，取 θ<sub>δ</sub>=0.2、θ<sub>Δ</sub>=0.45、r_max=0.5、截断 2/3，手算 A<sub>final</sub>。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>第一轮按距离降序：0.0（0.9）、0.4（0.7）、−0.2（0.6）均为已探索跳过；0.15（0.5）与 0.6（0.3）为未探索，两者间距 0.45 不小于 θ<sub>δ</sub>，收下。第二轮补已探索：0.0 与 0.15 间距 0.15、0.4 与 0.15 间距 0.25、−0.2 与 0.15 间距 0.35，均小于 θ<sub>Δ</sub>，全部跳过。最终动作 (0.15, 0.5) 与 (0.6, 0.3)，截断后为 (0.15, 0.333) 与 (0.6, 0.2)。</div></details>
+      </li>
+      <li>设计三组终止策略的对照实验：单次 stop、双确认 stop、双确认加几何门控（深度距离小于阈值才接受）。给出指标、对照变量与预期结果。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>指标用 SR、提前停止率（停在 1.0 至 1.5 m 的比例）、平均多走步数。对照变量为确认次数与几何门控开关，其余不变。预期：双确认降低提前停止但增加步数；几何门控进一步降低误停，代价是门控阈值附近可能拒绝正确停止。</div></details>
+      </li>
+      <li>论文显示「仅提示词」的 SPL 只有 0.107，而带视觉标注为 0.210。设计一个完整消融，分离标注格式（箭头编号、仅编号、无标注）与提示措辞（含链式思考、无链式思考）的贡献，并给出判定标准与混杂控制。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>2 × 3 矩阵，共 6 格，每格固定同一 VLM、同一评测集、同一随机性处理，主指标 SR 与 SPL，辅以动作合法率与平均决策延迟。判定标准：标注格式的主效应在 SPL 上显著、链式思考的主效应在 SR 上显著、交互项可解释。混杂控制包括同一候选动作集、同一编号映射、提示词长度匹配（用等长占位文本补足）。</div></details>
+      </li>
+      <li>把视场从 131° 降到 82°，预测 SR 与 SPL 的变化方向与量级，并从可导航性候选数量与旋转步数两个角度说明机制。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>方向为下降，论文图 6 显示四档单调关系。机制：视场变窄使单帧可提议方向变少、探索线索密度下降，智能体需要更多旋转步获得同等信息，SPL 对路径浪费更敏感。量级取决于场景开阔程度，窄走廊的损失小于开放客厅。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>范式：把导航改写成「在图上编号里选一个」的问答问题，动作提议、视觉标注、链式思考提示、独立终止四件套支撑零样本 VLM 直接当策略。</li>
+      <li>动作提议：深度图给每个朝向的最远无碰撞距离，探索指示变量与两档间距实现探索偏好，2/3 截断留安全余量，角落追加 180° 转身。</li>
+      <li>结果：HM3D ObjectNav（阈值 1.2 m）50.4% SR / 0.210 SPL，相对 PIVOT 的 SR +25.8 个百分点；GOAT 16.3% / 0.066，图像目标成功率为 PIVOT 的 2.04 倍；关闭滑行降到 12.9%，暴露碰撞与回溯缺口。</li>
+      <li>消融：视场 82° 至 131° 单调上升；朴素历史无增益（15 步时 −6.4 个百分点）；Segformer 替代深度仅 −3.2，ZoeDepth −11.3。</li>
+      <li>边界：成功阈值、滑行开关、提前停止率（13.9%）与专才系统差距（GOAT 关闭滑行差 22.6 个百分点）是引用这套数字前必须声明的四件事。</li>
+      <li>下一讲进入 NaVid：看视频 VLM 如何用训练数据与视频 token 解决本讲暴露的两个缺口，即历史利用与跨域迁移，并讨论把 VLN 机制对接到 ObjectNav 的适配层设计。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch073.html">← 第 073 讲：GOAT II / GOAT-Bench</a>
+    <a class="next" href="ch075.html">第 075 讲：NaVid 对接 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.06 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:11.5px !important;letter-spacing:.06em !important;color:rgba(71,85,105,.45) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#7e8ba0 !important;font-size:11.5px !important;line-height:1.8 !important;text-align:center !important;padding:5px 12px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

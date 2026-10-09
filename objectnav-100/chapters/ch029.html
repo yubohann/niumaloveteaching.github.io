@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 029 讲｜语义地图噪声传播 | 目标物体导航课程 · ObjectNav 从探索到开放词汇</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 模块化：地图·探索·常识</span>
+    <span class="sep">/</span>
+    <span>第 029 讲</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 模块化：地图·探索·常识</div>
+    <h1>第 029 讲｜语义地图噪声传播</h1>
+    <p class="lead">检测器的每一次误报与漏报都会写进语义地图，而探索模块把地图当作环境真相读取，误差由此沿流水线放大。本讲以 MOPA（Raychaudhuri 等，2023）的 OracleSem 与 PredSem 对照、ESC（Zhou 等，2023）的误差分解为量化证据，推导误检累积、漏检漏记与投影偏移三类传播算例，并整理置信度门限、时序投票、聚类质心与重采样保护等鲁棒手段。</p>
+    <ul class="meta">
+      <li>主题：模块化流水线 / 语义地图 / 误差传播</li>
+      <li>关键公式：P(误标) = 1 − (1 − α)<sup>T</sup></li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 028 讲</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>能画出从检测到动作的误差传播链，并区分误检、漏检、定位偏移、标签混淆四类误差在地图上的表现形式。</li>
+      <li>能用误检累积公式与漏检公式计算单格污染概率与物体入图概率，说明单帧低误报率在长 episode 中不可忽略的原因。</li>
+      <li>能复述 MOPA 的三档对照设计（OracleMap / OracleSem / PredSem），解读检测噪声对 MultiON 与 ObjectNav 的 SR、SPL 带来的量化损失。</li>
+      <li>能实现带置信度门限与时序投票的语义地图更新片段，并按物体尺寸与观测节奏给出门限与投票窗口的依据。</li>
+      <li>能设计把检测误差与探索策略解耦的消融实验，把失败正确归因到感知环节或探索环节。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 022 讲把模块化流水线拆成四段：检测、建图、探索、规划。这个拆法的价值在于每段可以独立评测与替换，第 023 至 028 讲的方法分别改进了其中的某一段。但四段接口上流动的已是感知模块加工过的世界表示：检测器输出标签与框，建图模块把标签投影到栅格，探索模块再从栅格上读「哪里有目标、哪里值得去」。这条链上只要第一段有误差，后面的决策就在错误的世界模型上做优化，链路越长，放大越明显。</p>
+    <p>量化这条链并不容易，因为公开结果只报告最终 SR 与 SPL，感知损失与探索损失混在一起。MOPA（Raychaudhuri 等，2023，Modular ObjectNav with PointGoal Agents）提供了一个干净的对照：同一套建图、探索与导航模块，分别接入地图真值、语义真值与预测检测，得到 OracleMap、OracleSem、PredSem 三档结果，差额即感知误差的净贡献。ESC（Zhou 等，2023，Exploration with Soft Commonsense Constraints）则从失败侧给出分解，在 HM3D 上检测类错误占约四成，即使换用开放词汇 grounding 仍是最大失败来源。</p>
+    <p>本讲解决三个问题：误差以什么形式进入地图；各类误差在时间维度上如何累积；哪些工程手段能把损失压回去。第 030 讲将转向用预训练模型的常识替代训练先验，但检测瓶颈依旧存在，本讲给出的口径与工具在那里继续使用。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 传播链与四类误差</h3>
+    <p>模块化 ObjectNav 的完整信息流为：RGB-D 帧进入检测或分割网络，得到类别、置信度与二维框；框结合深度与相机位姿反投影到三维，再落到俯视栅格，形成语义地图（Semantic Map）；探索模块在栅格上查询目标簇或前沿（Frontier），产生长期目标；规划与控制模块执行动作。误差可以在四个环节第一次产生：</p>
+    <ul>
+      <li><strong>误检（False Positive, FP）</strong>：环境里不存在的物体被写进地图，形成幽灵簇。幽灵簇会主动吸引探索与导航，这是四类误差里破坏性最强的一类，因为它制造了一个永远到不了的目标。</li>
+      <li><strong>漏检（False Negative, FN）</strong>：真实物体从未写入地图。智能体即使从旁边经过，地图上也查不到它；对 episode 来说这等于目标不存在，搜索必须依赖再次路过。</li>
+      <li><strong>定位偏移（Localization Error）</strong>：检测正确，但框中心、深度值或位姿有偏差，标签落到相邻格子。物体仍在图上，位置错了，重访与停止都可能失败。</li>
+      <li><strong>标签混淆（Label Confusion）</strong>：把 A 类判成 B 类。对目标类别查询表现为漏检，同时给 B 类查询制造误检，误差在两个查询方向上同时生效。</li>
+    </ul>
+    <p>MOPA 的地图口径便于讨论这四类误差：栅格单元边长 0.2 m，每格保存最近一次预测的语义标签，物体一旦入图便在整个 episode 内保留；检测置信度门限设 0.95；由于逐帧投影，同一物体常在地图上形成碎片状的多簇，文中称为标签飞溅。规划模块取每个标签簇的质心作为候选目标位置，实测优于从簇中随机取格。</p>
+
+    <h3>2. 误检累积：单格污染概率</h3>
+    <p>先看 FP 的时间累积。设某格真实为自由空间，检测器对该格的单帧误报概率为 α，各帧独立。观测 T 帧后，该格至少被误标一次的概率为：</p>
+    <div class="formula">
+      P<sub>误标</sub>(T) = 1 − (1 − α)<sup>T</sup>
+      <span class="note">α 为单帧误报概率；T 为该格被观测到的帧数；独立性假设给出量级估计，真实检测器的误报有相关性，结果会偏移</span>
+    </div>
+    <p>该式与第 001 讲的「至少一次」结构相同，直觉是补事件更容易计算：T 帧全部不误报的概率为 (1 − α)<sup>T</sup>。代入若干组参数：</p>
+    <table>
+      <tr><th>单帧误报 α</th><th>T = 10</th><th>T = 30</th><th>T = 50</th><th>T = 100</th></tr>
+      <tr><td>0.005</td><td>4.89%</td><td>13.96%</td><td>22.17%</td><td>39.42%</td></tr>
+      <tr><td>0.010</td><td>9.56%</td><td>26.03%</td><td>39.50%</td><td>63.40%</td></tr>
+      <tr><td>0.020</td><td>18.29%</td><td>45.45%</td><td>63.58%</td><td>86.74%</td></tr>
+      <tr><td>0.050</td><td>40.13%</td><td>78.54%</td><td>92.31%</td><td>99.41%</td></tr>
+    </table>
+    <p>表中数字说明：单帧 1% 的误报率听起来很小，但一个格被反复观测 50 帧后，至少误标一次的概率接近 40%。MOPA 把门限拉到 0.95，正是为了把 α 压到很低的量级，代价是召回同时下降，进入下一小节的漏检讨论。再看总量：0.2 m 单元下，一个 10 m × 10 m 的公寓是 2500 格；若 episode 累计 10000 次格级观测（100 帧、每帧平均 100 个有效投影格），α = 0.02 时约产生 200 次误投。这些误投若不做时序过滤，会在地图上留下数十个幽灵簇，把探索目标持续拉向空区域。</p>
+
+    <h3>3. 漏检与「至少入图一次」</h3>
+    <p>FN 的概率结构相反，但同样由重复观测决定。设目标出现在视野中的帧数为 T，单帧对该类物体的召回为 r，则物体至少被记录一次的概率为：</p>
+    <div class="formula">
+      P<sub>入图</sub>(T) = 1 − (1 − r)<sup>T</sup>
+      <span class="note">r 为单帧召回；只有入图的物体才能被地图查询到，漏检即缺席</span>
+    </div>
+    <table>
+      <tr><th>单帧召回 r</th><th>T = 1</th><th>T = 3</th><th>T = 5</th><th>T = 10</th></tr>
+      <tr><td>0.1</td><td>10.00%</td><td>27.10%</td><td>40.95%</td><td>65.13%</td></tr>
+      <tr><td>0.3</td><td>30.00%</td><td>65.70%</td><td>83.19%</td><td>97.18%</td></tr>
+      <tr><td>0.5</td><td>50.00%</td><td>87.50%</td><td>96.88%</td><td>99.90%</td></tr>
+      <tr><td>0.7</td><td>70.00%</td><td>97.30%</td><td>99.76%</td><td>100.00%</td></tr>
+    </table>
+    <p>读法与小节 2 相反：这里希望概率接近 1。若某类物体单帧召回只有 0.3，而智能体路线恰好从它侧后方经过一次，物体入图概率仅 30%，七成可能被整条轨迹错过。MOPA 的失败分解证实了这一后果：在其 3ON 圆柱集 PredSem 智能体的 50% 失败里，40% 的超步 episode 中有 29% 属于「始终没发现目标」，这正对应探索接缝处的漏检。提高召回的方向包括低门限、多尺度检测、全景扫描与主动重访，代价是误检与算力上升，门限两侧的取舍是模块化系统的核心工程变量之一。</p>
+
+    <h3>4. 定位偏移：一像素值多少米</h3>
+    <p>定位误差从框中心与深度而来，量级可以用相机几何直接估计。水平视场 θ<sub>h</sub>、图像宽 W 像素时，深度 d 处单个像素对应的横向距离约为：</p>
+    <div class="formula">
+      Δx ≈ Δu · 2 d tan(θ<sub>h</sub>/2) / W
+      <span class="note">Δu 为框中心的像素误差；θ<sub>h</sub> = 79°、W = 640 与 2020 挑战口径一致</span>
+    </div>
+    <p>代入 θ<sub>h</sub> = 79°、W = 640，得每像素当量：d = 1 m 时 2.58 mm，d = 3 m 时 7.73 mm，d = 6 m 时 15.46 mm。框中心抖动 20 像素时，3 m 处的横向偏差约 15.5 cm，接近一个 0.2 m 栅格；6 m 处约 30.9 cm，跨过一到两格。远处检测的同一个框误差被深度线性放大，这是深度裁剪上限 6 m 附近误差跳变的来源之一。对照物体在图像中的张角：0.5 m 宽的物体在 3 m 处约 64.7 像素，在 5 m 处约 38.8 像素。小目标在远处只占几十像素，框中心的几像素系统偏差就能让标签落到错误格，这也解释了为什么 FP 常发生在远距离视野边缘：低分辨率区域更容易出现低置信度的错误框。</p>
+
+    <h3>5. 三档对照：MOPA 的量化证据</h3>
+    <p>MOPA 在三档感知配置上运行同一套探索与导航，得到检测噪声的净影响。三档定义为：OracleMap 直接使用仿真器的真值物体位置建图；OracleSem 使用真值语义标签但经深度投影建图；PredSem 使用预测检测器建图。实验口径为 HM3D 场景、MultiON 2.0 测试集（自然物体 8 类，含干扰物），动作空间为前向 25 cm、转 30° 与 found，最长 2500 步，每个配置 5 个随机种子。</p>
+    <table>
+      <tr><th>感知档位</th><th>物体类型</th><th>Success</th><th>Progress</th><th>SPL</th><th>PPL</th></tr>
+      <tr><td>OracleMap</td><td>圆柱 / 自然</td><td>81 ± 2</td><td>85 ± 2</td><td>36 ± 1</td><td>39 ± 1</td></tr>
+      <tr><td>OracleSem</td><td>圆柱 / 自然</td><td>81 ± 2</td><td>87 ± 2</td><td>37 ± 1</td><td>39 ± 1</td></tr>
+      <tr><td>PredSem</td><td>圆柱（CYL）</td><td>52 ± 2</td><td>66 ± 2</td><td>21 ± 1</td><td>27 ± 2</td></tr>
+      <tr><td>PredSem</td><td>自然（NAT）</td><td>29 ± 2</td><td>45 ± 2</td><td>11 ± 1</td><td>17 ± 1</td></tr>
+    </table>
+    <p>三点读法：其一，OracleMap 与 OracleSem 几乎无差（81 对 81），说明在标签正确的前提下，深度投影建图几乎没有额外损失，误差主要来自标签本身；其二，圆柱集的检测缺口为 81 → 52，绝对 29 个点、相对 35.8%，自然物体集为 81 → 29，绝对 52 个点、相对 64.2%，自然物体由于形状、纹理、颜色多样，单帧召回更低，相对降幅是圆柱的 1.79 倍；其三，SPL 的降幅比 Success 更大（圆柱 37 → 21），说明带噪声的感知不仅让智能体找不到目标，还让它把路径浪费在幽灵簇与错误重访上。ObjectNav 单目标设定下的结论一致：同一论文在 HM3D ObjectNav 2022 验证集（6 类、2000 条 episode、500 步上限）上报告 OracleSem 为 64.0 SR / 32.0 SPL，PredSem（Detic 零样本检测器）为 30.0 / 14.0，SR 下降 34 个点、相对 53.1%，SPL 下降 18 个点、相对 56.2%。</p>
+    <p>ESC（Zhou 等，2023）从失败类型侧给出交叉验证。在 HM3D 上对同一框架比较无常识的 GoW 与完整 ESC，检测类错误率分别为 40.6% 与 40.8%，始终是最大的单一失败来源；探索类错误从 14.3% 降到 10.6%（相对下降 25.9%），规划类从 12.1% 降到 9.5%（相对下降 21.5%）。常识推理能改善探索与规划，但无法改变检测错误的主导地位。两篇工作从不同方向得到同一结论：在模块化流水线里，感知入口占据误差预算的最大份额，任何下游策略的改进都应先扣掉感知损失再比较。</p>
+
+    <h3>6. 鲁棒手段：门限、投票与聚类</h3>
+    <p>抑制传播的手段可以按管线的位置分层。检测层：提高置信度门限、增加数据增广与困难负样本、使用开放词汇模型时构造更完整的提示词表。建图层：时序投票、簇尺寸过滤、质心定位、标签衰减。控制层：重采样保护与主动重访。其中时序投票的效果可以用二项分布精确计算。若要求最近 n 帧中出现至少 k 次检测才把该格判为有效，则有效召回为：</p>
+    <div class="formula">
+      P<sub>k/n</sub> = Σ<sub>i=k</sub><sup>n</sup> C(n, i) p<sup>i</sup> (1 − p)<sup>n−i</sup>
+      <span class="note">p 为单帧检测概率，r 与 α 均代入同一公式；k 越大过滤越严，召回与误报同时下降</span>
+    </div>
+    <table>
+      <tr><th>规则</th><th>召回 r = 0.3</th><th>召回 r = 0.5</th><th>召回 r = 0.9</th><th>误报 α = 0.01</th><th>误报 α = 0.02</th><th>误报 α = 0.05</th></tr>
+      <tr><td>单帧（1/1）</td><td>30.00%</td><td>50.00%</td><td>90.00%</td><td>1.00%</td><td>2.00%</td><td>5.00%</td></tr>
+      <tr><td>2/3</td><td>21.60%</td><td>50.00%</td><td>97.20%</td><td>0.0298%</td><td>0.1184%</td><td>0.7250%</td></tr>
+      <tr><td>3/5</td><td>16.31%</td><td>50.00%</td><td>99.14%</td><td>0.0010%</td><td>0.0078%</td><td>0.1158%</td></tr>
+    </table>
+    <p>表中最有意思的一列是 r = 0.5：2/3 与 3/5 规则下的召回恰好仍是 50%，而误报被压低约 7 倍到 1000 倍。对称分布在高召回区间收益更大：r = 0.9 时 3/5 规则把召回从 90% 提到 99.14%。这说明投票窗口对「接近抛硬币」的检测器最友好，对高召回检测器也几乎无代价，主要风险在低召回情形（r = 0.3 时召回降到 21.6%，会加重漏检）。因此门限与投票必须与漏检公式联立评估，不能只看误报侧。MOPA 的重采样保护是控制层的补充：探索目标若 50 步内不可达（α<sub>exp</sub> = 50，全前向折合 12.5 m 路径预算），就重采样新目标；这一机制对幽灵簇同样有效，避免智能体把时间预算耗在一个空区域。实证上 MOPA 还发现：均匀采样探索配合重采样保护，最终优于更复杂的前沿与学习式探索（第 039 讲展开），感知噪声越大的系统，策略越需要这种「不恋战」的保护。</p>
+
+    <h3>7. 数值算例：污染如何翻转前沿选择</h3>
+    <p>下面用一个构造例说明传播链的最后一段。目标类别为 bed，地图上有四个候选簇，字段为（标签, 单帧最高置信度, 最近 5 帧命中次数）：A（bed, 0.96, 1/5）、B（bed, 0.93, 4/5）、C（sofa, 0.91, 3/5）、D（bed, 0.99, 2/5）。前沿打分器采用教学简化的置信度乘距离衰减 s = c · exp(−d/5)。</p>
+    <table>
+      <tr><th>格</th><th>标签</th><th>置信度</th><th>命中</th><th>单帧门限 ≥0.95</th><th>投票门限 ≥2/5</th><th>组合</th></tr>
+      <tr><td>A</td><td>bed</td><td>0.96</td><td>1/5</td><td>通过</td><td>不通过</td><td>不通过</td></tr>
+      <tr><td>B</td><td>bed</td><td>0.93</td><td>4/5</td><td>不通过</td><td>通过</td><td>通过（门限放宽到 0.5 时）</td></tr>
+      <tr><td>C</td><td>sofa</td><td>0.91</td><td>3/5</td><td>不通过</td><td>通过</td><td>通过（非目标类）</td></tr>
+      <tr><td>D</td><td>bed</td><td>0.99</td><td>2/5</td><td>通过</td><td>通过</td><td>通过</td></tr>
+    </table>
+    <p>设真实 bed 簇在 B 方向 5 m 处，A 是一次性误检形成的幽灵簇，位于 3 m 处。原始地图上，前沿 A 的打分为 0.96 · e<sup>−0.6</sup> ≈ 0.527，前沿 B 为 0.93 · e<sup>−1.0</sup> ≈ 0.342，探索目标被幽灵簇 A 夺走；加入「置信度 ≥ 0.5 且命中 ≥ 2/5」的时序过滤后，A 被剔除，B 胜出，选择翻转到正确方向。D 展示门限策略的另一种组合：高置信且满足投票，但位置尚未在本例中比较距离，实际排序需连同距离一起计算。这个例子把第 2 至 6 节的机制串成一条链：单帧高置信误检、累积为簇、以距离优势压制真目标、由时序投票纠正。</p>
+
+    <h3>8. 边界与失效模式</h3>
+    <p>本节的手段都有适用范围。第一，独立性假设是近似：同一纹理、同一背景会重复触发同类误报，误报在时间上正相关，实际污染率可能高于公式估计；反过来，连续帧的同一物体会被重复计数，投票窗口的去相关需要视角与位移支持，原地不动连拍的投票信息量远低于移动观测。第二，门限并不能替代召回评估：在低召回区间，任何投票规则都会放大漏检，必须同时读第 3 节的公式。第三，MOPA 与 ESC 的结论都建立在无噪声传感器假设上（无致动噪声、GPS+Compass 无噪声），真机上还要叠加里程计漂移、深度空洞与光照变化，第 032 讲的真机实验用激光雷达辅助定位来补这部分。第四，数据集口径不同时不能直接搬用数字：MultiON 2.0 的干扰物使随机撞见目标的概率被压得很低，这类设置会放大感知误差的后果，与无干扰物设定不可混谈。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>把传播分析落到工程，需要三件产出物：一份可复现的误差预算表、一份带滤波的车载地图接口、一份把感知与探索解耦的实验设计。先看误差预算表的结构，它沿用 MOPA 的三档思路，把每一档的差额登记为感知损失。</p>
+    <table>
+      <tr><th>档位</th><th>检测输入</th><th>建图输入</th><th>用途</th><th>读法</th></tr>
+      <tr><td>OracleMap</td><td>真值物体</td><td>真值位置</td><td>探索与导航的性能上界</td><td>与 OracleSem 差额＝投影与建图损失</td></tr>
+      <tr><td>OracleSem</td><td>真值标签</td><td>深度投影</td><td>解耦检测器</td><td>与 PredSem 差额＝检测损失</td></tr>
+      <tr><td>PredSem</td><td>预测检测</td><td>深度投影</td><td>系统真实配置</td><td>与 OracleSem 差额用于感知归因</td></tr>
+    </table>
+    <p>语义地图的最小可用接口如下，字段与 MOPA 口径对齐：</p>
+    <table>
+      <tr><th>接口</th><th>输入</th><th>输出</th><th>要点</th></tr>
+      <tr><td>project</td><td>检测框、深度、位姿、相机内参</td><td>格坐标列表与置信度</td><td>保留框内采样点，降低单点抖动</td></tr>
+      <tr><td>update</td><td>格、标签、置信度、时刻</td><td>更新后的地图</td><td>置信度门限、滚动投票窗口、最近标签</td></tr>
+      <tr><td>clusters</td><td>地图、目标类别</td><td>质心与置信度</td><td>连通域去小簇，取质心</td></tr>
+      <tr><td>nearest_target</td><td>智能体位姿、目标类别</td><td>可达候选与距离</td><td>查询结果只作为长期目标，交由导航模块执行</td></tr>
+    </table>
+    <p>参数取值的依据集中在两处：检测侧与建图侧。下表给出建议默认值与来源。</p>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用</th><th>依据</th></tr>
+      <tr><td>栅格单元</td><td>0.2 m</td><td>地图与探索共享分辨率</td><td>MOPA 实现口径</td></tr>
+      <tr><td>检测置信度门限</td><td>0.95</td><td>抑制误报，压住 α</td><td>MOPA 实现口径，需与召回联调</td></tr>
+      <tr><td>投票窗口 k/n</td><td>2/3 或 2/5</td><td>时序去伪，兼防幽灵簇</td><td>本讲第 6 节算例：兼顾召回与误报</td></tr>
+      <tr><td>簇最小格数</td><td>2</td><td>丢弃孤立碎片</td><td>与栅格尺寸、物体尺寸联调</td></tr>
+      <tr><td>目标选取</td><td>簇质心</td><td>稳定长期目标</td><td>MOPA 实测优于随机格</td></tr>
+      <tr><td>重采样步数 α<sub>exp</sub></td><td>50 步</td><td>限制追逐不可达目标</td><td>MOPA 实现口径，全前向折合 12.5 m</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：把感知档位写进实验配置</span>
+      <p>感知档位决定数字如何被解释，应作为实验配置的固定项。同一批 episode 上，OracleSem 与 PredSem 的 SR 差距可达 34 个点（HM3D ObjectNav 2022 验证集，MOPA）。报告里只给 PredSem 数字时，读者无法判断瓶颈在检测器还是在探索策略；报告里给出三档差额，改进行动才有方向。</p>
+    </div>
+    <div class="box key">
+      <span class="box-title">设计决策：投票窗口与观测节奏绑定</span>
+      <p>k/n 不能独立于运动学选择。前向 25 cm、转 30° 的动作口径下，同一物体相邻两次入镜的视角变化明显，帧间信息近似去相关，2/3 窗口有效；若用原地连续拍帧，相邻帧高度相关，投票近似重复计数，n 需要按视角变化量换算。实现上以观测时刻或视角差作为窗口条件，比固定帧数更稳。</p>
+    </div>
+    <div class="box warn">
+      <span class="box-title">重采样保护不是万能的</span>
+      <p>α<sub>exp</sub> = 50 步会周期性放弃当前探索目标。对幽灵簇有效，对真实但绕路的目标也会误伤，尤其在窄通道场景。建议把重采样记录进日志，统计「放弃后是否在别处找到目标」，再调步数；单看最终 SR 无法区分保护生效与目标被遗弃。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>以下片段实现带门限与时序投票的语义地图、前沿打分与误检累积的蒙特卡洛校验，接口按教学简化，数量口径与本节表格一致。</p>
+
+    <p><strong>片段 1：带滚动投票窗口的语义地图</strong></p>
+    <pre class="code"><code>import numpy as np
+
+class SemanticMap:
+    def __init__(self, size_m=12.0, cell_m=0.2, window=5, k_votes=2, conf_min=0.5):
+        self.n = int(size_m / cell_m)            # 0.2m 单元，12m 地图为 60 x 60 格
+        self.label = np.zeros((self.n, self.n), dtype=np.int8)
+        self.conf = np.zeros((self.n, self.n), dtype=np.float32)
+        self.hist = np.zeros((self.n, self.n, window), dtype=np.int32)
+        self.window, self.k, self.conf_min = window, k_votes, conf_min
+
+    def update(self, cells, labels, confs, tick):
+        slot = tick % self.window                # 滚动窗口：每帧只覆盖一个时间片
+        self.hist[:, :, slot] = 0                # 本片清零，窗口自动只含最近 window 帧
+        for (r, c), lab, cf in zip(cells, labels, confs):
+            if cf &lt; self.conf_min:               # 低置信检测不投票，直接丢弃
+                continue
+            self.hist[r, c, slot] = 1
+            if cf &gt;= self.conf[r, c]:            # 高置信覆盖低置信，保留最近一次
+                self.conf[r, c], self.label[r, c] = cf, lab
+
+    def query(self, category):
+        votes = self.hist.sum(axis=2)            # 最近 window 帧内的命中次数
+        mask = (self.label == category) &amp; (votes &gt;= self.k)
+        ys, xs = np.nonzero(mask)
+        return None if len(ys) == 0 else (float(ys.mean()), float(xs.mean()))
+</code></pre>
+    <p>解读：<strong>（1）</strong>hist 的三个维度是行、列、时间片，tick 取模实现环形缓冲，窗口长度不随 episode 增长，内存恒定。<strong>（2）</strong>conf_min 与 k 两道门分工不同：conf_min 过滤单帧低置信检测，k 过滤一致性不足的检测；表中 cell B（0.93, 4/5）只有靠放宽 conf_min 到 0.5 才能过关，说明两道门的参数需要联调。<strong>（3）</strong>query 返回簇质心，不取单格，与 MOPA 的策略一致；返回 None 时调用方必须写日志，否则漏检造成的「无目标」会被误读为探索失败。<strong>（4）</strong>最近标签覆盖的策略对移动物体有风险，室内场景以静态物体为主，这一简化与 MOPA 一致。</p>
+
+    <p><strong>片段 2：前沿打分与幽灵簇剔除</strong></p>
+    <pre class="code"><code>import math
+
+def frontier_scores(frontiers, query_fn, goal, decay=5.0):
+    """按目标簇对各前沿打分：置信度乘距离衰减，教学用简化打分器。"""
+    ranked = []
+    for f in frontiers:
+        best, best_d = 0.0, None
+        for category, conf, dist in query_fn(f.center):   # 查询前沿邻域内的语义簇
+            if category != goal:                          # 非目标类别不参与打分
+                continue
+            s = conf * math.exp(-dist / decay)            # 距前沿越远，吸引力越弱
+            if s &gt; best:
+                best, best_d = s, dist
+        ranked.append((best, best_d, f))
+    ranked.sort(key=lambda x: -x[0])                      # 得分从高到低
+    return ranked
+</code></pre>
+    <p>解读：<strong>（1）</strong>query_fn 是一个闭包，内部读取片段 1 的 votes 与 label，删除幽灵簇的逻辑集中在建图层，打分器只消费过滤后的结果，职责单一。<strong>（2）</strong>decay = 5 m 是教学取值，作用是让同一类别下近处簇优先；真实系统可用探索效用函数替换，第 031 讲的 cost-utility 是同类做法。<strong>（3）</strong>返回 best_d 便于失败分析：当最高分低于阈值时打印「无候选」，与感知漏检、探索覆盖不足两类原因对照定位。<strong>（4）</strong>排序结果取第一名作为长期目标，交由局部规划执行；若第一名在 α<sub>exp</sub> 步内不可达，调用方重采样并记录，这就是重采样保护。</p>
+
+    <p><strong>片段 3：误检累积的模拟校验</strong></p>
+    <pre class="code"><code>import random
+
+def pollution_rate(alpha, ticks, trials=20000, seed=0):
+    rng = random.Random(seed)
+    hit = 0
+    for _ in range(trials):
+        flagged = False
+        for _ in range(ticks):
+            if rng.random() &lt; alpha:      # 每帧独立伯努利误报
+                flagged = True
+                break
+        hit += int(flagged)
+    return hit / trials
+
+theory = 1 - (1 - 0.02) ** 50            # 解析值 0.6358
+sim = pollution_rate(0.02, 50)           # 模拟值应与 0.6358 接近
+print(round(theory, 4), round(sim, 4))
+</code></pre>
+    <p>解读：<strong>（1）</strong>该片段用于验证第 2 节公式在独立假设下的正确性，α = 0.02、T = 50 时模拟值应收敛到 0.6358；若把 rng.random() 换成有时间相关性的生成过程，模拟值会背离解析值，偏差幅度就是独立性假设的误差。<strong>（2）</strong>试验数 20000 时标准误约 0.34%，足以检查量级。<strong>（3）</strong>工程上把该函数接入真实检测器的离线日志，用实测的帧间相关性替换独立采样，得到的就是系统的污染率上界估计。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>用 PredSem 数字给探索策略排名</strong>：症状是探索策略 A 在预测检测下略胜 B，换一组检测器后排名反转。根因是两条策略对误检的敏感度不同，感知损失未拆出，策略差额被噪声淹没。修复：至少跑 OracleSem 与 PredSem 两档，先看 OracleSem 下的策略差额，再在 PredSem 下复验。</li>
+      <li><strong>置信度门限单点取值</strong>：症状是门限从 0.95 调到 0.90 后 SR 先升后降，结果不可复现。根因是门限同时压低误报与召回，两侧斜率不同，最优点附近曲线平坦且受场景影响。修复：画出门限-召回-误报三联曲线，固定随机种子扫描 3 至 4 个档位，报告最优区间，避开单点结论。</li>
+      <li><strong>地图「见过即永久」</strong>：症状是智能体反复走回同一个空角落。根因是幽灵簇在整个 episode 内不被清除，重采样保护只换了目标却没清地图。修复：给簇加时效字段，窗口内无新票的簇降权或删除，并统计「历史簇被重访」的比例。</li>
+      <li><strong>把投影误差算进检测误差</strong>：症状是更换相机内参后检测损失看起来变大，检测器本身未变。根因是反投影使用错误的视场或深度标定，标签偏移被记到检测器头上。修复：用真值标签跑一次 OracleSem，确认其成功率与官方口径一致，再比较 PredSem。</li>
+      <li><strong>投票窗口与运动模式不符</strong>：症状是原地扫描时投票容易通过，移动观测时频繁丢簇。根因是相邻帧视角变化小，投票近似重复计数，真正的去相关观测数不足。修复：以视角差或位移量触发投票采样，窗口条件写成「视角变化超过 20° 的观测」，与动作口径对齐。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>设单帧误报率 α = 0.01，某格分别在 T = 10、30、100 帧中被观测。计算至少一次误标的概率，并解释为什么长 episode 对感知噪声更敏感。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>用 1 − (1 − α)<sup>T</sup>，三个值分别为 9.56%、26.03%、63.40%；episode 越长，同一格累积的观测帧越多。</div></details>
+      </li>
+      <li>某类小物体单帧召回 r = 0.3。若智能体路线只在它正面经过 1 次、3 次、5 次，分别计算入图概率；再说明要让它大概率入图，检测侧与探索侧各应做什么。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>1 − (1 − r)<sup>T</sup>：30%、65.70%、83.19%。检测侧提召回或降门限，探索侧增加对同一区域的多次覆盖。</div></details>
+      </li>
+      <li>用 2/3 投票规则重算上一题：假设单帧召回 0.3、误报 0.02，分别给出投票后的有效召回与有效误报，并与单帧规则比较，说明该规则在这组参数下是否划算。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>有效召回 21.60%，有效误报 0.1184%；误报降了 16.9 倍，召回从 30% 降到 21.6%，属于用召回换精确率，是否划算取决于下游对漏检的敏感度。</div></details>
+      </li>
+      <li>某检测框中心在 4 m 处有 15 像素横向误差。用 Δx ≈ Δu · 2d tan(θ<sub>h</sub>/2)/W（θ<sub>h</sub> = 79°、W = 640）计算实际偏移，并判断它是否会让标签落入相邻 0.2 m 栅格。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>4 m 处每像素约 10.3 mm，15 像素约 0.155 m，接近但略小于一格；再算 20 像素即为 0.206 m，此时跨格。</div></details>
+      </li>
+      <li>设计一个把检测误差与探索策略解耦的消融实验：固定 HM3D 场景与 episode 集合，比较两种探索策略在有噪声与无噪声感知下的排名。列出至少六个必须固定的控制变量，给出预测的排名变化方向，并说明如何用该实验判断某策略是否值得在真机部署。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>控制变量可含：场景与 episode 集、检测器与置信度门限、投票窗口、动作空间与步数上限、随机种子、导航模块。预测：感知噪声会拉大或反转依赖地图精度的策略差距，对均匀探索等不依赖地图细节的策略影响小。若某策略在 PredSem 下的优势消失，真机（噪声更大）上大概率也不成立。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>检测误差经「检测 → 建图 → 探索 → 规划」链路传播，分为误检、漏检、定位偏移、标签混淆四类，前两类在时间上累积，后两类在空间上偏移。</li>
+      <li>误检累积为 P = 1 − (1 − α)<sup>T</sup>，漏检入图概率为 P = 1 − (1 − r)<sup>T</sup>；单帧 1% 的误报在 50 帧后接近 40%，单帧 0.3 的召回只路过一次时七成漏记。</li>
+      <li>MOPA 的三档对照给出净损失：MultiON 2.0 测试集上 OracleSem 81 对 PredSem 圆柱 52、自然 29；HM3D ObjectNav 2022 验证集上 64.0/32.0 对 30.0/14.0。标签正确时建图几乎无额外损失，误差主要来自标签本身。</li>
+      <li>鲁棒手段分层：检测层的置信度门限、建图层的时序投票与簇质心、控制层的重采样保护；2/3 或 3/5 投票在召回 0.5 附近既不伤召回又把误报压低约 7 倍至 1000 倍。</li>
+      <li>所有鲁棒参数都要与漏检公式联立评估，且不可脱离数据集口径比较；无噪声传感器假设是真机部署前必须补齐的缺口。</li>
+      <li>下一讲转向 ESC：用预训练视觉语言模型做开放世界接地，用语言模型的常识推理给前沿挂上软约束，在零导航训练的前提下把探索导向更可能的房间。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch028.html">← 第 028 讲：PONI II：成本优势与局限</a>
+    <a class="next" href="ch030.html">第 030 讲：ESC：常识谓词 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.06 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:11.5px !important;letter-spacing:.06em !important;color:rgba(71,85,105,.45) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#7e8ba0 !important;font-size:11.5px !important;line-height:1.8 !important;text-align:center !important;padding:5px 12px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

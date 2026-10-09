@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 017 讲｜训练规模常识：DD-PPO | 目标物体导航课程 · ObjectNav 从探索到开放词汇</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · 任务、仿真与评测地基</span>
+    <span class="sep">/</span>
+    <span>第 017 讲</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · 任务、仿真与评测地基</div>
+    <h1>第 017 讲｜训练规模常识：DD-PPO</h1>
+    <p class="lead">上一讲把观察与动作口径固定下来，本讲估算这套接口背后的训练代价。Wijmans 等（2019）的 DD-PPO 在 PointGoal 导航上把训练推到 25 亿步：64 块 V100 用 2.75 天完成约 180 GPU-天的工作量，128 块 GPU 上相对单卡的加速比为 107 倍，全部训练成本约 3.8 千美元。这组数字是全书后续训练配方的对照尺，也界定了规模能解决什么、不能解决什么。</p>
+    <ul class="meta">
+      <li>主题：训练规模 / 同步分布式 RL / 算力与成本预算</li>
+      <li>关键公式：T<sub>total</sub> = N<sub>GPU</sub> × t<sub>wall</sub> × q</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 016 讲（观察与动作空间）</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>会算：由步数、GPU 数与墙钟三个量互推吞吐，复算 2.5×10<sup>9</sup> 步、64 GPU、2.75 天对应的聚合吞吐约 1.05×10<sup>4</sup> 步/秒与单卡 160.8 至 164.4 步/秒，并能把 GPU-天与墙钟两种口径分开记账。</li>
+      <li>会读：区分论文中 128 GPU 的扩展性基准与 64 GPU 的主训练，理解抢占阈值（preemption threshold）在同步分布式 RL 中处理滞留者（straggler）的作用。</li>
+      <li>会估：利用「100M 步拿到 90% 峰值」这一收益形状，为小预算实验估算可达到的性能上限、墙钟与硬件需求。</li>
+      <li>会判断：说清 DD-PPO 结论的任务边界（2019 口径的 PointGoal 导航），以及同一套配方外推到 ObjectNav 时 6.2% 成功率的含义。</li>
+      <li>能设计：为给定的金额与墙钟限制写出训练规模方案，列出至少三项需要实测校准的吞吐参数与两项风险处置。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 016 讲把观察与动作口径固定在 RGB-D、GPS+Compass 与离散动作上。口径解决「学什么」，规模解决「学多久、学多少」。具身导航的样本量比静态视觉任务高出数个量级：同一张图可以反复用于分类训练，而导航的每一步都要仿真器重新渲染场景、更新位姿，样本的获取本身要花算力。Habitat 的价值正是把这一步做得足够快，快到让「十亿步量级」的训练在数天内完成。</p>
+    <p>DD-PPO（Decentralized Distributed Proximal Policy Optimization，去中心化分布式近端策略优化）是这条路线最具代表性的工程成果。Wijmans 等（2019）用它把 PointGoal 导航训练到接近最优：在带 GPS+Compass 的设定下，验证集成功率 99.7%、SPL 0.969，与最短路径 oracle 的差距在 3% 以内。这个结果给出两个可以复用的常数：完成一次大规模训练需要多少步、多少卡、多少时间与多少钱。它们不随算法细节改变，是后续所有配方做预算时的锚点。</p>
+    <p>本讲回答三个问题：规模从哪里来（同步数据并行与抢占机制）、规模值多少（吞吐、GPU-天与成本三本账）、规模换到什么（收益形状与任务边界）。第 042 讲会拆开 DD-PPO 的同步协议与梯度通信细节，本讲只保留做预算所需的常识层。第 018 讲起进入挑战赛史，看这组规模常数在两届竞赛中换来的实际名次。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 规模恒等式与两种口径</h3>
+    <p>任何训练账都源自一个恒等式。设总训练步数为 S，GPU 数为 N，墙钟时间为 t（秒），单卡吞吐为 q（步/秒），则：</p>
+    <div class="formula">
+      S = N · q · t，&nbsp; 等价地 &nbsp; q = S / (N · t)，&nbsp; t = S / (N · q)
+      <span class="note">S 为环境步总数；q 为单个 GPU 每秒推进的环境步数，含仿真与策略前向的开销</span>
+    </div>
+    <p>由恒等式派生两种记账口径，用途不同：</p>
+    <ul>
+      <li><strong>墙钟时间</strong>：从启动到收敛的日历时间，决定项目节奏，单位是天或小时。</li>
+      <li><strong>GPU-天</strong>：N × t / 86400，衡量占用的资源总量，决定成本与排队，与并行度无关。同一份 S 可以压缩墙钟（加卡），资源量不变。</li>
+    </ul>
+    <p>两个口径经常在论文里同时出现，读数时必须对应。Wijmans 等（2019）的主训练写「2.75 天、64 块 V100」，同时写「约 180 GPU-天」。按恒等式，64 × 2.75 = 176 GPU-天，与 180 的差额来自取整与中途评估开销。两种口径下降到单卡吞吐分别是 164.4 与 160.8 步/秒，差 2.2%，都在同一量级。<strong>报告规模时必须把 S、N、t 三个量同时写全</strong>，缺一项就无法复算。</p>
+
+    <h3>2. 规模从哪里来：同步数据并行与抢占</h3>
+    <p>传统深度强化学习的分布式方案以异步为主：若干 rollout worker 收集经验，单独的参数服务器异步更新模型。异步方案在资源密集的 3D 仿真上遇到两个障碍：仿真与策略前向都无法放在无 GPU 的进程里，而单一参数服务器又无法承载像素输入的大网络。DD-PPO 换成监督学习里成熟的同步数据并行：每个 worker 持有一份参数副本，各自收集一段 rollout、计算梯度，用 AllReduce 求平均后一起更新。没有中心服务器，任何时刻的计算不过期。</p>
+    <p>同步方案的新问题是等待最慢的 worker。场景复杂度差异会造成滞留者效应：MP3D 里最大的场景有 8 GB 数据，最小的只有 135 MB，同样的步数耗时相差一个数量级。所有 worker 等到最慢者结束，并行度越高浪费越大。DD-PPO 的处置是抢占阈值：当 p% 的其他 worker 完成本轮 rollout 时，强制结束仍在收集的 worker，带着不完整 rollout 进入更新；论文发现 p = 60% 工作良好，异构场景下的扩展性恢复到与同构场景接近的水平。主训练配置正是 64 个 worker、每 worker 4 个并行环境、每次 rollout 最多 128 帧。</p>
+
+    <h3>3. 实算一：主训练账</h3>
+    <p>把恒等式代入主训练数字，得到下表。所有数值由本讲配套脚本复算。</p>
+    <table>
+      <tr><th>量</th><th>取值</th><th>算法 / 说明</th></tr>
+      <tr><td>总步数 S</td><td>2.5 × 10<sup>9</sup></td><td>论文训练至 25 亿步，其中 10 亿步前未饱和</td></tr>
+      <tr><td>GPU 数 N</td><td>64（Tesla V100）</td><td>主训练用的是 64 卡，128 卡是扩展性实验</td></tr>
+      <tr><td>墙钟 t</td><td>2.75 天 = 237,600 s</td><td>论文正文取 2.75 天</td></tr>
+      <tr><td>聚合吞吐 N·q</td><td>10,522 步/秒</td><td>S / t</td></tr>
+      <tr><td>单卡吞吐 q</td><td>164.4 步/秒</td><td>S / (N·t)；按 180 GPU-天口径为 160.8</td></tr>
+      <tr><td>资源量</td><td>176 GPU-天（论文写约 180）</td><td>N · t / 86400</td></tr>
+      <tr><td>等价人类经验</td><td>约 79 年</td><td>按 1 步/秒折算，2.5×10<sup>9</sup> / (86400 × 365.25)</td></tr>
+      <tr><td>每 worker 步数</td><td>3.91 × 10<sup>7</sup></td><td>S / 64</td></tr>
+      <tr><td>每 worker 迭代数</td><td>约 3.05 × 10<sup>5</sup> 次 rollout</td><td>每 worker 步数 / 128 帧</td></tr>
+    </table>
+    <p>这张表同时给出一个直觉校准：25 亿步听起来庞大，折算成单卡墙钟是 176 天，折算成 64 卡是 2.75 天，折算成人类在环境中逐步操作是 79 年。规模的三个投影各不相同，讨论时先问「说的是哪个投影」。</p>
+
+    <h3>4. 实算二：收益形状与 100M 步</h3>
+    <p>论文报告的收益曲线近似幂律：性能随步数上升，后期增益放缓。两个可操作的坐标点是：</p>
+    <ul>
+      <li><strong>100M 步拿到 90% 的峰值性能</strong>，占全部步数的 4.0%，64 卡约 0.11 天（论文写 0.1 天），8 卡 1 天以内，成本约 170 美元。</li>
+      <li>性能在 10 亿步前没有饱和迹象，说明百万步量级的早期研究系统性低估了可达上限一到两个数量级。</li>
+    </ul>
+    <p>用吞吐一致性交叉核验：8 卡一天跑完 100M 步要求单卡吞吐不低于 100×10<sup>6</sup> / (8 × 86400) = 144.7 步/秒，相当于主训练单卡吞吐的 88.0%（按 164.4 口径）至 90.0%（按 160.8 口径）。小规模实验与大规模训练的单卡吞吐在同一量级，收益曲线的横轴可以互相换算。若峰值验证集 SPL 取最优模型的 0.969，90% 峰值即 SPL 约 0.872，这就是先导实验的合理预期区间上限。</p>
+    <p>规模观的演进有一段清晰的历史，三个坐标点解释了本讲为何值得单独成章：</p>
+    <table>
+      <tr><th>训练规模</th><th>来源</th><th>当时结论</th></tr>
+      <tr><td>500 万步</td><td>Mishkin 等（2019）的对照</td><td>经典建图加规划方法优于学习法</td></tr>
+      <tr><td>7,500 万步</td><td>Savva 等（2019）的 Habitat 平台实验</td><td>趋势反转，学习法在未见环境中反超，但尚未饱和</td></tr>
+      <tr><td>25 亿步</td><td>Wijmans 等（2019）的 DD-PPO</td><td>带 GPS+Compass 的 PointGoal 近似解决，val SR 99.7%</td></tr>
+    </table>
+    <p>同一任务、同一评测口径下，方法学结论随训练规模从 5M 到 2.5B 翻了两次面。这提示两点：第一，小规模实验的排名不能外推到大预算；第二，任何「某类方法不行」的结论都要标注训练步数。</p>
+
+    <h3>5. 实算三：扩展效率与外部对照</h3>
+    <p>论文的扩展性基准以单卡吞吐为 1：8 卡加速 7.3 倍（效率 91.25%），128 卡加速 107 倍（效率 83.59%），256 卡加速 196 倍（效率 76.56%）。效率随卡数缓慢下降，来源是 AllReduce 通信与滞留者残余。对预算的含义是：<strong>不是卡越多越省时间，达到同样步数所需的 GPU-天会随卡数小幅上升</strong>，选择并行度要在墙钟与资源成本之间取平衡。</p>
+    <p>外部对照来自 Savva 等（2019）的 75M 步实验：2 块 GPU、2.5 天，单卡吞吐 173.6 步/秒，与 DD-PPO 的 160.8 至 164.4 相差不到 8%，说明吞吐量主要由仿真器与网络规模决定，与某一次特定实现的关系不大。把 75M 放大到 2.5B 是 33.33 倍的规模，按同等速率需要 83.3 天墙钟。规模从「月」压缩到「天」正是并行度的贡献。</p>
+    <p>大规模训练还产出第三类资产：可迁移表征。DD-PPO 论文把训练好的智能体迁移到 Flee（远离起点）与 Exploration（最大化访问格子数）两个新任务，分为全随机初始化、ImageNet 编码器、PointGoal 编码器、微调策略与可微控制器五种设置。结论是 PointGoal 预训练的视觉编码器明显优于 ImageNet 预训练编码器，微调策略的学习速度也快于从零开始，论文把它类比为具身智能的「ImageNet 预训练加微调」。第 043 讲会专门讨论这条路线。对预算的含义是：一次昂贵训练的成本可以摊到多个下游任务上，先导实验之外还应预留微调开销。</p>
+
+    <h3>6. 实算四：三档预算与成本</h3>
+    <p>成本按论文脚注的单价换算：一块 8 卡机（p2.8xlarge）每小时 7.2 美元，即单卡时 0.9 美元。结合单卡 164.4 步/秒，三档训练的账如下：</p>
+    <table>
+      <tr><th>档位</th><th>步数</th><th>64 卡墙钟</th><th>GPU-天</th><th>机器租金</th><th>用途</th></tr>
+      <tr><td>先导</td><td>100M</td><td>0.110 天</td><td>7.0</td><td>约 152 美元（8 卡 1 天约 173）</td><td>验证配方与收益形状，拿 90% 峰值</td></tr>
+      <tr><td>中等</td><td>1B</td><td>1.100 天</td><td>70.4</td><td>约 1521 美元</td><td>缩放律实验的中间点</td></tr>
+      <tr><td>全量</td><td>2.5B</td><td>2.750 天</td><td>176（论文约 180）</td><td>约 3802 美元（180 口径约 3888）</td><td>论文主结果与表征预训练</td></tr>
+    </table>
+    <p>反向问题同样可算：固定金额能买多少步。按单卡 164.4 步/秒只计 GPU 租金，1000 美元约 1111 GPU-时，折合约 6.6×10<sup>8</sup> 步（0.26 个全量训练）；10000 美元约 11111 GPU-时，折合约 6.6×10<sup>9</sup> 步（2.6 个全量训练）。若自建集群，用折旧与电费替换租金，恒等式的其余部分不变。</p>
+
+    <h3>7. 边界与失效</h3>
+    <ul>
+      <li><strong>任务口径</strong>：上述数字全部来自 2019 年挑战赛口径的 PointGoal 导航：Gibson 与 MP3D 场景、RGB-D 或 RGB 输入、带 GPS+Compass、四动作（前向 0.25 m、左右转 10°、停止）、成功判据为距目标 0.2 m。换任务或换传感器假设，数字不可直接搬用。</li>
+      <li><strong>外推到 ObjectNav</strong>：把同一套大规模端到端训练直接用于 ObjectNav，测试集成绩只有 6.2% SR / 2.1% SPL（Ye 等，2021，test-std 口径）。导航目标从坐标换成类别词后，探索与语义搜索成为瓶颈，规模不能自动补齐。</li>
+      <li><strong>无定位设定仍是开放问题</strong>：去掉 GPS+Compass 的 PointGoal 导航，100M 步时 SPL 为 0，训练到 2.5B 步才到 0.15，与带定位的 0.969 相差极远。</li>
+      <li><strong>吞吐依赖实现</strong>：160.8 至 164.4 步/秒是 V100 与当时 Habitat-Sim 版本的结果，换硬件、换渲染参数、换分辨率都会改变 q。预算表必须用本地实测的 q 重算，不能照抄。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>把本讲的知识落成工程，需要三件东西：一个可以替换参数重算的预算估算器、一张记录训练配置的卡片、一套先导到全量的决策流程。</p>
+    <h3>训练配置卡片</h3>
+    <p>下表为 DD-PPO 主训练的关键超参，全部来自论文正文，后续任何复现实验偏离其中一项都应记录在案。</p>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>每 worker 并行环境数</td><td>4</td><td>批内增强，摊薄 GPU 开销</td><td>资源密集仿真的经验上限 2 至 4 个</td></tr>
+      <tr><td>rollout 长度</td><td>最多 128 帧</td><td>一个更新周期的经验量</td><td>论文主配置；短 rollout 对应更频繁同步</td></tr>
+      <tr><td>PPO 轮数与批数</td><td>2 epochs × 2 minibatches</td><td>信任域重用的强度</td><td>论文主配置</td></tr>
+      <tr><td>优化器与学习率</td><td>Adam，2.5 × 10<sup>-4</sup></td><td>参数更新步长</td><td>论文主配置；优势不做归一化以避免不稳定</td></tr>
+      <tr><td>折扣因子 γ / GAE τ</td><td>0.99 / 0.95</td><td>回报视野与优势估计偏差</td><td>导航任务的常规口径</td></tr>
+      <tr><td>终局奖励</td><td>r<sub>T</sub> = 2.5 · SPL</td><td>把效率直接编入成功奖励</td><td>论文奖励设计</td></tr>
+      <tr><td>成形奖励</td><td>r<sub>t</sub> = −Δ测地距离 − 0.01</td><td>提供稠密进展信号与步长惩罚</td><td>论文奖励设计</td></tr>
+      <tr><td>抢占阈值</td><td>60%</td><td>限制滞留者等待</td><td>异构场景下 60% 与 80% 均接近同构扩展</td></tr>
+    </table>
+    <h3>数据与编码器的边际收益</h3>
+    <p>DD-PPO 论文在同一预算下比较了训练数据与编码器，验证集与测试集结果如下（PointNav，带 GPS+Compass）：</p>
+    <table>
+      <tr><th>训练数据</th><th>编码器</th><th>val SPL</th><th>val SR</th><th>test SPL</th><th>test SR</th></tr>
+      <tr><td>Gibson-4+</td><td>ResNet50</td><td>0.922</td><td>0.967</td><td>0.917</td><td>0.970</td></tr>
+      <tr><td>Gibson-4+ 加 MP3D</td><td>ResNet50</td><td>0.956</td><td>0.996</td><td>0.941</td><td>0.996</td></tr>
+      <tr><td>Gibson-2+</td><td>ResNet50</td><td>0.956</td><td>0.994</td><td>0.944</td><td>0.982</td></tr>
+      <tr><td>Gibson-2+</td><td>SE-ResNeXt50</td><td>0.959</td><td>0.999</td><td>0.943</td><td>0.988</td></tr>
+      <tr><td>Gibson-2+</td><td>SE-ResNeXt101 加 1024 维 LSTM</td><td>0.969</td><td>0.997</td><td>0.948</td><td>0.980</td></tr>
+    </table>
+    <p>读数方式：把质量更低的 Gibson-2+ 场景加入训练，val SPL 从 0.922 升到 0.956，说明数据多样性比单场景质量更重要；换更强编码器只加 0.003 SPL，加容量再加 0.010 SPL，模型的边际收益已经很小。规模曲线尾部变平与这张表互相印证：达到 0.92 之后，每一分性能都在变贵。</p>
+    <div class="box key">
+      <span class="box-title">设计决策：先导实验按 100M 步设上限</span>
+      <p>100M 步占全量预算的 4%，却对应 90% 的峰值性能。对配方设计与数据管线的验证，先导实验的边际信息量最大。流程上一律先跑 100M 步、固定随机种子与评测协议，确认曲线形状与吞吐后再决定是否加码；直接上全量会把管线错误放大 25 倍成本。</p>
+    </div>
+    <div class="box key">
+      <span class="box-title">设计决策：GPU-天与墙钟分栏记账</span>
+      <p>加卡缩短墙钟不减少 GPU-天，甚至在效率下降时增加资源量。项目排期关注墙钟，预算审批关注 GPU-天，两栏都写进训练卡片，避免「用 128 卡复现了 2.5B 训练」这类把并行度与工作量混为一谈的表述。</p>
+    </div>
+    <div class="box warn">
+      <span class="box-title">规模不解决口径</span>
+      <p>本讲的近满分结论以 GPS+Compass、四动作、0.2 m 成功判据为前提。把它当作 ObjectNav 的性能预期会严重高估：同一配方在 ObjectNav 测试集只有 6.2% SR。预算表开写之前，先核对任务口径与评测协议。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>三段代码分别处理三本账：规模与成本、扩展效率、抢占阈值。它们不依赖仿真器，可在本地直接复算本讲所有表格。</p>
+
+    <p><strong>片段 1：训练预算估算器</strong></p>
+    <pre class="code"><code>GPU_HOUR_USD = 7.2 / 8          # 8 卡机每小时 7.2 美元，折到单卡
+
+def train_budget(total_steps, num_gpus, steps_per_sec_per_gpu):
+    """把步数预算翻译成墙钟、GPU-天与费用。
+    steps_per_sec_per_gpu 必须用同任务的本地实测值。"""
+    wall_s = total_steps / (num_gpus * steps_per_sec_per_gpu)
+    gpu_hours = wall_s * num_gpus / 3600.0
+    return {
+        "gpu_days": gpu_hours / 24.0,
+        "wall_days": wall_s / 86400.0,
+        "cost_usd": gpu_hours * GPU_HOUR_USD,
+    }
+
+# 复算 DD-PPO 主训练：2.5e9 步、64 卡、单卡 164.4 步/秒
+print(train_budget(2.5e9, 64, 164.4))
+# {'gpu_days': 176.0, 'wall_days': 2.75, 'cost_usd': 3801.6}</code></pre>
+    <p>解读：<strong>（1）</strong>三个输出共享同一个恒等式，改任何一个输入都会同步刷新，适合做敏感性分析。<strong>（2）</strong>q 是任务与硬件相关的实测参数，代码把它显式暴露，防止照抄别人的数字。<strong>（3）</strong>单价按机时折算到单卡再乘 GPU-小时，与云厂商按实例计费的口径一致；自建集群换成折旧与电费即可。<strong>（4）</strong>输出的 176 GPU-天与论文的约 180 相差 2.2%，属于取整与评估开销，凡报告两套口径的场合都应注明来源。</p>
+
+    <p><strong>片段 2：扩展效率报告</strong></p>
+    <pre class="code"><code>def scaling_report(base_tput, measurements):
+    """base_tput: 单卡实测吞吐（步/秒）。
+    measurements: {GPU 数: 该配置的实测吞吐（步/秒）}。"""
+    report = []
+    for n, tput in sorted(measurements.items()):
+        speedup = tput / base_tput
+        report.append((n, round(speedup, 1), round(100.0 * speedup / n, 1)))
+    return report
+
+# 以论文报告值为例：单卡归一为 1，8/128/256 卡的加速比分别为 7.3/107/196
+base = 1.0
+for row in scaling_report(base, {8: 7.3, 128: 107.0, 256: 196.0}):
+    print("GPU=%3d  加速=%.1fx  效率=%.1f%%" % row)
+# GPU=  8  加速=7.3x  效率=91.2%
+# GPU=128  加速=107.0x  效率=83.6%
+# GPU=256  加速=196.0x  效率=76.6%</code></pre>
+    <p>解读：<strong>（1）</strong>效率定义为加速比除以卡数，是判断并行方案是否值得加卡的唯一指标。<strong>（2）</strong>效率下降的代价可以直接回代片段 1：同样步数需要的 GPU-天变多，成本上升。<strong>（3）</strong>论文报告的是两种负载下的曲线，异构负载必须开抢占才能接近这些数字，60% 阈值下 256 卡级别的扩展仍接近同构。</p>
+
+    <p><strong>片段 3：抢占阈值合成演示</strong></p>
+    <pre class="code"><code>import math
+
+def preempted_steps(durations, p):
+    """durations: 每个 worker 本轮预计耗时（秒），步速按 1 步/秒。
+    p: 抢占阈值比例；0 至 1，1 表示不抢占。
+    返回（批次时长，保留步数占比）。"""
+    finish = sorted(durations)
+    k = max(1, math.ceil(p * len(finish)))    # 第 k 个完成者触发抢占
+    cutoff = finish[k - 1]                    # 未完成者在此刻被强制收尾
+    kept = sum(min(d, cutoff) for d in durations)
+    return cutoff, kept / sum(durations)
+
+durs = [12, 13, 13, 14, 14, 15, 15, 16, 18, 40]   # 最后一个是滞留者
+for p in (1.0, 0.8, 0.6):
+    print(p, preempted_steps(durs, p))
+# 1.0 -> (40, 1.000)   2.50 倍墙钟差全等滞留者
+# 0.8 -> (16, 0.847)
+# 0.6 -> (15, 0.829)</code></pre>
+    <p>解读：<strong>（1）</strong>合成数据里滞留者耗时 40 秒，其余 12 至 18 秒；不抢占时批次时长被 40 秒锁定。<strong>（2）</strong>阈值 60% 把批次压到 15 秒，墙钟加速 2.67 倍，保留 82.9% 的样本量；80% 阈值保留 84.7% 样本，加速 2.50 倍。收益来自截去滞留者的长尾，代价是样本量小幅缩水。<strong>（3）</strong>论文报告 60% 与 80% 性能无退化，本演示只解释机制，真实选择应以任务曲线为准。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>把 128 卡的扩展实验写成训练配置</strong>：症状是复现材料写「128 卡、107 倍加速完成 2.5B 训练」，与实际不符。根因是混淆了扩展性基准（128 卡，相对单卡 107 倍）与主训练配置（64 卡 V100，2.75 天）。修复：报告规模时同时写卡数、型号与墙钟，并注明两套数字各自出处。</li>
+      <li><strong>把环境步数当作 episode 数</strong>：症状是用「2.5B 步」类比「2.5B 次导航」。根因是环境步、agent 步、episode 是三种计数，2.5B 是环境步，按每 episode 数百步折算，episode 数量低两到三个数量级。修复：在表格里显式标注计数类型与折算口径。</li>
+      <li><strong>把「90% 峰值在 100M 步」读成「100M 步就够用」</strong>：症状是拿先导实验的 SPL 当作最终预期。根因是幂律曲线尾部仍缓慢上升，最后 10% 的性能占用 96% 的步数。修复：报告完整曲线与多点数据，并给出与预算匹配的停点判据。</li>
+      <li><strong>把 PointNav 的规模结论外推到 ObjectNav</strong>：症状是给 ObjectNav 配方安排 2.5B 步预算并期望近满分。根因是目标模态改变后瓶颈从定位转到语义搜索，同一配方的测试集成绩只有 6.2% SR。修复：先做任务口径对照，再用 018 讲的两届挑战数据校准预期。</li>
+      <li><strong>GPU-天与墙钟混算</strong>：症状是成本估算与论文差 2% 至 5%，或加卡后资源量被低估。根因是 176 与 180、2.75 天与实际使用时长的口径差异。修复：训练卡片分列「墙钟」「GPU-天」「单价口径」三栏，先定口径再算钱。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>复算主训练账：2.5×10<sup>9</sup> 步、64 卡、2.75 天，求聚合吞吐、单卡吞吐与 GPU-天；再按论文的 180 GPU-天口径复算单卡吞吐，解释两组数值 2.2% 的差额来源。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>聚合吞吐 = 2.5×10<sup>9</sup>/237,600 ≈ 10,522 步/秒；单卡 164.4 与 160.8 步/秒；差额来自 176 与 180 的取整以及中途评估开销。</div></details>
+      </li>
+      <li>某集群 8 卡、单卡实测 144.7 步/秒。计算跑到 100M 步所需墙钟；若想从 90% 峰值买到 100% 峰值，估算步数倍数与墙钟倍数，并说明这笔交易在什么条件下值得做。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>100M 步需 1.00 天；到 2.5B 步是 25 倍墙钟（约 25 天），性能只多 10 个百分点。条件包括：下游指标对最后 10% 敏感、预算允许、且没有更便宜的感知或算法改进。</div></details>
+      </li>
+      <li>按 7.3x/8、107x/128、196x/256 计算扩展效率；解释效率随卡数下降的两类成因，并说明为什么论文强调抢占阈值对异构场景尤其关键。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>效率 91.25%、83.59%、76.56%；成因是 AllReduce 通信开销与滞留者等待。异构场景中滞留者效应显著，不抢占时扩展曲线明显变差，60% 阈值可恢复到接近同构水平。</div></details>
+      </li>
+      <li>用单卡 160.8 步/秒与 7.2 美元/机·时，估算 1000、5000、10000 美元三种预算可购买的步数（只计 GPU 租金），并为每种预算给出一个合理的训练目标。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>约 6.4×10<sup>8</sup>、3.2×10<sup>9</sup>、6.4×10<sup>9</sup> 步，即 0.26、1.3、2.6 个全量训练。1000 美元档做先导与消融，5000 美元档做完整配方复现，10000 美元档做表征预训练加微调。</div></details>
+      </li>
+      <li>为你的课题写一份「规模-收益-成本」决策记录：预算 10000 美元，目标是在 ObjectNav 的 HM3D 口径上复现一个端到端配方。给出先导实验设计、全量训练的步数与卡数、抢占总阈值、预期 SR 区间与两条失败预案，并引用本讲至少三组数字支撑你的选择。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>组织方式：先导按 100M 步（约 173 美元、8 卡机 1 天）验证吞吐与曲线形状；全量按预算上限折算步数（约 6.4×10<sup>9</sup> 步的资源量，可裁到 2.5B 步、约 3800 美元，留出评测与重跑余量）；预期 SR 必须先参考任务口径，不能沿用 PointNav 的近满分结论，ObjectNav 的端到端基线只有 6.2% SR（test-std）。失败预案包括吞吐低于假设时缩减步数、曲线不升时回到先导配置排查数据管线。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>规模恒等式 T<sub>total</sub> = N<sub>GPU</sub> × t<sub>wall</sub> × q 是全部预算讨论的起点；报告规模必须同时给出步数、卡数、墙钟三个量。</li>
+      <li>DD-PPO 主训练：2.5×10<sup>9</sup> 步、64 块 V100、2.75 天，聚合吞吐约 1.05×10<sup>4</sup> 步/秒，单卡 160.8 至 164.4 步/秒，资源量约 180 GPU-天，成本约 3.8 千美元。</li>
+      <li>收益近似幂律：100M 步（4% 预算）拿到 90% 峰值，8 卡 1 天内可达；10 亿步前没有饱和。</li>
+      <li>扩展效率随卡数下降（8 卡 91.25%、128 卡 83.59%、256 卡 76.56%），抢占阈值 60% 是异构场景保持扩展性的关键工程手段。</li>
+      <li>边界：近满分结论属于带 GPS+Compass 的 PointGoal 口径；同配方用于 ObjectNav 的测试集成绩只有 6.2% SR / 2.1% SPL，无定位的 PointNav 也只到 0.15 SPL。</li>
+      <li>下一讲进入挑战赛史：看 2020 与 2021 两届 Habitat ObjectNav 挑战中，语义地图与端到端 RL 两套路线如何交换冠军位置，以及它们的训练规模与榜单数字怎样互相对照。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch016.html">← 第 016 讲：观察与动作空间</a>
+    <a class="next" href="ch018.html">第 018 讲：挑战赛史 I：2020–2021 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.06 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:11.5px !important;letter-spacing:.06em !important;color:rgba(71,85,105,.45) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#7e8ba0 !important;font-size:11.5px !important;line-height:1.8 !important;text-align:center !important;padding:5px 12px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

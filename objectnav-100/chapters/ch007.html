@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 007 讲｜Habitat 2.0：物理仿真与 HAB | 目标物体导航课程 · ObjectNav 从探索到开放词汇</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第一篇 · 任务、仿真与评测地基</span>
+    <span class="sep">/</span>
+    <span>第 007 讲</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第一篇 · 任务、仿真与评测地基</div>
+    <h1>第 007 讲｜Habitat 2.0：物理仿真与 HAB</h1>
+    <p class="lead">第 006 讲的仿真器只处理运动学与渲染：智能体穿过场景，物体不动。本讲加入物理引擎，展开 Szot 等（2021，NeurIPS，Habitat 2.0: Training Home Assistants to Rearrange their Habitat）的三件贡献：可交互公寓数据集 ReplicaCAD、支持刚体与关节物体的高性能仿真器 H2.0、家庭助手基准 HAB。性能主线是每秒 25,000 步以上的物理仿真吞吐与实时倍数，任务主线是长程移动操作中「单体策略、分层技能、传统流水线」三条路线的实测结论。</p>
+    <ul class="meta">
+      <li>主题：物理仿真 / ReplicaCAD / 移动操作 / HAB 基准</li>
+      <li>关键公式：实时倍数 = 步速 / 30；领取任务时间 = 步数 / 步速（实时基准 30 步/秒）</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置章节：第 006 讲（Habitat-Sim 架构与性能常识）</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>能说清物理仿真相对纯导航仿真的状态与能力扩展：刚体、关节物体、接触力、移动操作，以及 H2.0 有意不支持的能力边界。</li>
+      <li>能复述 ReplicaCAD 的三层结构（艺术品资产、人工布局、程序化杂物）与关键规格，并说明它为何适合研究泛化。</li>
+      <li>掌握「惰性仿真器」的三条设计原则：局部化物理与渲染、物理与渲染交错、简化与复用；能解释延迟一步策略如何打破顺序依赖。</li>
+      <li>会算：SPS 与实时倍数、idle 与 interact 的开销比、优化消融的贡献，以及任意实验规模的墙钟时间。</li>
+      <li>能读 HAB 三任务的规格与 Pick 泛化表，理解单体 RL、分层技能、sense-plan-act 三条路线的适用边界。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 006 讲解释了 ObjectNav 为什么能在每秒数千帧的仿真里大规模训练。这条路线覆盖的是「找到物体并停在旁边」的能力，物理状态被刻意剥离：扫描场景里的家具静止，智能体是沿导航网格滑动的圆柱。第 001 讲引用共识文档时给出了目标判据的动机：找到物体是与物体交互的第一步。第一步之后的打开抽屉、抓取水杯、把物品放回架子，全部需要物理。</p>
+    <p>Habitat 2.0 是为这一步设计的。它把渲染与刚体物理深度集成，给出三条工程结论：移动操作可以在每秒万步量级上仿真；速度来自有意的能力取舍；长程任务的策略结构比单项技能更难。这些结论对 ObjectNav 研究同样重要：开放词汇导航、家庭服务、真机部署三条线索都会在某个点遇到操作与物理。本课程把 H2.0 放在仿真地基的收尾位置，为第 5 篇的 OVMM 与真机系统做基建铺垫；第 088 至 090 讲会回到同一平台的任务层。</p>
+    <p>本讲解决三个问题：架构上，讲清 H2.0 相对第 006 讲的仿真器增加了什么、放弃了什么；性能上，实算 idle 与 interact 两种场景的吞吐、优化消融与实验规模；任务上，拆开 HAB 的任务规格与三条方法路线的实测结果。所有数字来自论文 v2 的文字与表格，Python 复算在关键代码一节给出。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 从传感器仿真到物理仿真：能力账</h3>
+    <p>纯导航仿真（Habitat 1.0 口径）的世界状态由智能体位姿与静态场景几何构成，物体是渲染资产，不参与动力学。H2.0 把状态扩展为：每个刚体的位姿与速度、每个关节物体的关节角与限位、质量与摩擦与恢复系数等物理参数、机器人本体各连杆状态与接触力。相应地，动作空间从「前进与转向」扩展为末端位移、基座速度与夹爪的连续控制，任务从导航扩展到落点重排。</p>
+    <p>论文明确划出了不做的部分：不支持非刚体动力学（布料、绳索、流体、薄膜）、不支持物理状态变换（切割、钻孔、焊接、熔化）、不支持声音与触觉传感。这条取舍线可以用一句话概括：<strong>把速度置于能力广度之上</strong>。模拟器覆盖家庭重排所需的最小能力集合，把每个未实现的物理特性从性能预算中移除。研究者选择平台时应反向检查：任务若依赖布料或流体，H2.0 不是合适载体；任务若由刚体与关节物体构成，它给出了当时最高的吞吐。</p>
+
+    <h3>2. ReplicaCAD：可交互公寓数据集</h3>
+    <p>ReplicaCAD 是 Replica 数据集中 FRL 公寓空间的艺术化重建。论文给出的构成分三层。第一层是资产：3D 艺术家逐件建模约 92 个物体，覆盖 6 个房间的家具、厨具、书籍等，并配套地板与墙面的静态背景；每个物体附带质量、摩擦、恢复系数、碰撞代理与语义标注。<strong>关节物体</strong>（冰箱门、橱柜、抽屉）通过子部件切分与 URDF 关节配置获得可开关的自由度；大型家具标注了支撑面与容纳空间，供程序化放置小物体。</p>
+    <p>第二层是人工布局：艺术家在资产之上编排 5 个语义合理的宏大变化（macro variation），每个再经过 20 个微小扰动（micro variation），例如同尺寸桌子互换位置、沙发与两把椅子对调，合计 105 个场景布局（论文引言处写作 111，正文第 3 节的计数为 105，引用时需要标明版本口径）。第三层是程序化杂物：在标注好的支撑面与容纳空间上，从 ReplicaCAD 或 YCB 数据集的厨房与食物类别中采样物体实例，离线计算物理稳定摆放后动态装入场景，每个容器可放多件杂物。</p>
+    <p>这套结构服务于泛化研究：布局变化测试空间泛化，物体替换测试外观泛化，容器开合测试交互泛化。数据集以 CC-BY-NC 许可发布，创作投入超过 900 人时，并注明艺术家知情同意与报酬；仿真器代码以 MIT 许可开源。</p>
+
+    <h3>3. 惰性仿真器：三条设计原则</h3>
+    <p>H2.0 的自我定位是「惰性」（lazy）：只计算当前交互绝对需要的物理。论文用三条原则落实它。</p>
+    <p><strong>原则一，局部化物理与渲染。</strong>假设机器人是唯一能施加非重力作用的主体，远离机器人的物体不重新计算物理；基座沿导航网格做运动学移动，不模拟轮地接触；利用物体的物理休眠状态缓存场景图变换矩阵与视锥剔除结果；相对其父部件固定的子部件（例如柜体框架）按静态物体处理。这一原则的代价是并行运动的场景（例如两个物体同时受外力）超出表达能力。</p>
+    <p><strong>原则二，物理与渲染交错。</strong>物理在 CPU（Bullet），渲染在 GPU（Magnum），初始优化后两者耗时接近；顺序执行时总有一侧空闲。打破串行的办法是改变策略的依赖：把 π(a<sub>t</sub> | o<sub>t</sub>) 改为 π(a<sub>t</sub> | o<sub>t−1</sub>)，动作基于上一步观察预测，于是 CPU 计算状态转移的同时 GPU 渲染当前观察，两侧并行。论文给出两个附带收益：与生物视觉约 150 ms 的感知延迟更接近；引入延迟的仿真被既有工作证明有利于 sim2real 迁移。代价是策略永远在「一步之前」的世界里决策，对低延迟控制任务是精度损失。</p>
+    <p><strong>原则三，简化与复用。</strong>全部资产使用 Basis 超压缩纹理，显存占用降低 4 至 6 倍；物体资产预取并在内存缓存，场景切换时快速实例化，降低重置成本；碰撞使用与视觉资产分离的凸分解网格，支持按部件或整体生成简化碰撞体。论文还在消融中量化了这些优化的贡献，见第 5 小节。</p>
+
+    <h3>4. HAB：任务规格与本体的控制接口</h3>
+    <p>家庭助手基准（Home Assistant Benchmark, HAB）由三个长程重排任务组成，任务以几何目标（GeometricGoal）规范给出：每个待移动物体给定初始与目标的三维质心位置。成功判据为全部目标物体落在目标位置 15 cm 内（不计朝向），执行中累计接触力超过阈值即判失败。智能体只能使用本体传感器（头部与手臂两台 128 × 128、视场 90° 的 RGB-D 相机，关节位置与基座自运动传感器），不得读取物体质量、摩擦、关节状态等特权信息。</p>
+    <table>
+      <tr><th>任务</th><th>物体与容器</th><th>起始状态</th><th>步数预算</th><th>难度来源</th></tr>
+      <tr><td>Tidy House</td><td>5 件物体，起点分布在 6 类支撑面</td><td>容器均不参与，无开合</td><td>5000</td><td>多段搬运的技能串联</td></tr>
+      <tr><td>Prepare Groceries</td><td>冰箱取 2 件、台面取 1 件放回冰箱</td><td>冰箱全开，无需开合</td><td>4000</td><td>狭窄容器内的感知与操作</td></tr>
+      <tr><td>Set Table</td><td>抽屉取碗、冰箱取水果，水果放入碗</td><td>冰箱与抽屉均关闭</td><td>4500</td><td>开合容器加多步依赖</td></tr>
+    </table>
+    <p>本体的控制接口按 30 Hz 定义：每步输出末端执行器的期望位移增量（单步上限 1.5 cm），经逆运动学与 PD 控制落到关节；基座输出线速度与角速度；夹爪输出一个标量，当末端距物体 15 cm 内且标量为正时，把最近物体吸附进平行夹爪。吸附是任务级简化，论文注明仿真器本身完整支持刚体抓取，简化可按需关闭。注意两个 15 cm 的含义不同：一个是抓取生效范围，一个是成功判定阈值。</p>
+    <p>控制链的换算可以直接做：30 Hz 乘上单步 1.5 cm，末端最大线速度约 0.45 m/s；5000 步预算按真实时间对应 166.7 秒，4500 步对应 150 秒。这些数字用于判断任务时长是否匹配真机节奏：抓一件物体平均耗时几十秒量级，符合家庭场景的合理预期。</p>
+
+    <h3>5. 数值算例一：吞吐、实时倍数与开销</h3>
+    <p>论文的基准测试对象为 Fetch 机器人，场景为 ReplicaCAD，每步包含 1 次渲染通道与 4 个 1/120 秒的物理子步，合计对应 1/30 秒的真实时间。因此 <strong>30 步/秒即实时</strong>。两种场景：<strong>Idle</strong> 随机动作、不与家具交互；<strong>Interact</strong> 沿预计算轨迹与物体发生代表性交互。硬件为双路 Xeon Gold 6226R（32 核 64 线程）与 8 张 2080 Ti。结果如下（步/秒，10 次运行均值）。</p>
+    <table>
+      <tr><th>并发结构</th><th>Idle</th><th>实时倍数</th><th>Interact</th><th>实时倍数</th><th>Interact/Idle</th></tr>
+      <tr><td>单进程（8 核 16 线程）</td><td>1191</td><td>39.7 倍</td><td>510</td><td>17.0 倍</td><td>42.8%</td></tr>
+      <tr><td>单卡 16 进程</td><td>8186</td><td>272.9 倍</td><td>1660</td><td>55.3 倍</td><td>20.3%</td></tr>
+      <tr><td>8 卡 64 进程</td><td>25734</td><td>857.8 倍</td><td>7699</td><td>256.6 倍</td><td>29.9%</td></tr>
+    </table>
+    <p>论文的摘要口径为「8 卡节点超过每秒 25,000 步，850 倍实时」，与表中 25,734 与 857.8 对应，取整方式不同。三个实算观察。<strong>第一，交互的代价是数倍。</strong>单进程从 1191 降到 510，耗时变为 2.34 倍；单卡降到 20.3%，即 4.93 倍；8 卡为 3.34 倍。用 Idle 数字预测真实任务的墙钟会系统性乐观。<strong>第二，多卡扩展仍有可观余量。</strong>8 卡 Idle 是单进程的 21.6 倍（64 进程），折算每进程效率约 33.8%，说明节点内仍存在争用。<strong>第三，实时倍数依赖于实时定义。</strong>若把实时基准换成 90 Hz 的遥操作或 15 步/秒的低速控制，同一 25,734 步/秒的数字会得到 285.9 倍或 1715.6 倍；引用时永远要写出基准。</p>
+
+    <h3>6. 数值算例二：优化消融与同类对照</h3>
+    <p>论文给出四组消融：完整系统、关闭渲染优化、关闭物理优化、全部关闭。单进程下的贡献差异很大。</p>
+    <table>
+      <tr><th>配置</th><th>Idle（步/秒）</th><th>占完整系统</th><th>Interact（步/秒）</th><th>占完整系统</th></tr>
+      <tr><td>完整</td><td>1191</td><td>100.0%</td><td>510</td><td>100.0%</td></tr>
+      <tr><td>关闭渲染优化</td><td>781</td><td>65.6%</td><td>282</td><td>55.3%</td></tr>
+      <tr><td>关闭物理优化</td><td>271</td><td>22.8%</td><td>358</td><td>70.2%</td></tr>
+      <tr><td>全部关闭</td><td>242</td><td>20.3%</td><td>224</td><td>43.9%</td></tr>
+    </table>
+    <p>读法要分场景。Idle 下物理优化贡献最大：关闭物理优化后只剩 271，与完整系统 1191 相差 4.39 倍；渲染优化在 Idle 的增量相对有限（关闭渲染优化为 781，约完整的 65.6%），因为随机动作很少与物体发生交互。Interact 下两侧都重要：关闭物理优化降到 358（约完整的 70.2%），关闭渲染优化降到 282（约完整的 55.3%）；全部关闭只有 224。这组数字说明<strong>优化收益与负载形态强相关，压测必须包含真实交互轨迹</strong>。</p>
+    <p>横向对照要谨慎。论文表 1 的单实例量级中，H2.0 为每秒约 1400 步，前代 Habitat（纯导航）为约 3000 步，iGibson 为 100 步。单看数字，纯导航的 H1 比带物理的 H2.0 快一倍以上，原因是两者每步的工作量完全不同：H2.0 每步含 4 个物理子步。真正可比的是同任务同配置的纵向数字。论文同时给出 iGibson 对照：iGibson 报告 100 步/秒，H2.0 完整优化 1191 步/秒为其 11.91 倍；全部优化关闭后的 242 步/秒仍是其 2.42 倍。论文摘要所说的「相对既有工作 100 倍加速」，对照的是当时物理仿真器每秒 10 至 400 步的常见区间；若以 100 步为参照，25,734 步是 257 倍。</p>
+
+    <h3>7. 数值算例三：实验规模的墙钟</h3>
+    <p>把吞吐换成实验规模。以一个常见的万级 episode 实验为例：10000 条 episode、每条 5000 步，合计 5000 万步。按 30 步/秒的真实时间需要 462.96 小时（19.3 天）；按 8 卡节点的 25,734 步/秒需要 32.4 分钟，倍率 857.8。论文用「6 个月缩短到 2 天以内」描述量级压缩，对应约 90 倍；本讲算例的 857.8 倍来自 Idle 场景的最优配置，与论文口径的差别主要在负载形态与是否含重置开销。</p>
+    <p>赛前预算可以反过来做：要求「10 万条 episode 的评测在 24 小时内完成」，即 5 亿步在 86,400 秒内，需要 5787 步/秒。单卡 16 进程 Idle 的 8186 步/秒已经满足，但若负载是 Interact，单卡只有 1660 步/秒，需要 3.5 个单卡节点，或一个 8 卡节点（7699 步/秒）留 1.33 倍余量。论文在结论部分提醒了另一层成本：整体训练回路的瓶颈常在环境同步与 episode 重置时的资产重载，而不在单步物理；估算应给重置与同步留系数，本讲代码示例暂取 15%。</p>
+
+    <h3>8. 方法结论与边界：单体、分层、流水线</h3>
+    <p>H2.0 的价值一半在引擎，一半在用它得到的方法学结论。论文在 Pick 基元任务与 HAB 长程任务上比较了三条路线：单体 RL（端到端传感器到动作）、任务规划加技能 RL（STRIPS 规划器把任务拆成 Navigate、Pick、Place、开合冰箱与抽屉等技能，每个技能单独训练）、传统感知-规划-执行流水线（SPA）及其特权版本。Pick 任务的系统性泛化结果如下（成功率，600 条 episode）。</p>
+    <table>
+      <tr><th>方法</th><th>训练分布</th><th>未见布局</th><th>未见物体</th><th>未见容器</th></tr>
+      <tr><td>单体 RL</td><td>91.7%</td><td>86.3%</td><td>74.7%</td><td>52.7%</td></tr>
+      <tr><td>SPA</td><td>70.2%</td><td>72.7%</td><td>72.7%</td><td>60.3%</td></tr>
+      <tr><td>SPA 特权版</td><td>77.0%</td><td>80.0%</td><td>79.2%</td><td>60.7%</td></tr>
+    </table>
+    <p>单体 RL 在训练分布上大幅领先，布局泛化也不错，但未见物体掉到 74.7%，未见容器掉到 52.7%；SPA 在未见容器上反而更高，且对训练分布的依赖弱。这组对照说明<strong>「哪个方法更强」依赖评测分布</strong>：追求分布内峰值选单体 RL，追求对容器几何的稳健选带感知的流水线，两者都不能单独覆盖全部诉求。论文另有一个反直觉发现：仅用本体感知的盲策略在未知布局的 Pick 上达到 78% 成功率，它靠放慢动作、用接触力「摸」向目标；代价是超过力阈值次数是视觉策略的 2 倍，抓错物体次数是 3 倍。</p>
+    <p>长程任务上三条路线的结论更尖锐。单体 RL 能学会单项技能，但论文未能用联合奖励函数让它稳定串起技能，完整 HAB 任务的可用性不足；加入完美 STRIPS 规划器的分层方法显著更强，但暴露了<strong>交接问题（hand-off problem）</strong>：前一个技能不为后一个技能创造条件，例如把基座停在不利于操作的位置、抽屉只开一半、把后续需要的物体碰出手臂范围。SPA 在简单场景与分层方案相当，在杂物与狭窄容器的感知挑战下明显更脆：在 Prepare Groceries 中找不到有效目标配置与规划超时的比例都是 Tidy House 的 3 倍。由于开合未知关节容器在 SPA 框架下尚无成熟方案，论文对 Set Table 未报告 SPA。</p>
+    <p>最后划清本讲与 ObjectNav 的关系。HAB 的成功判据是「物体放到 15 cm 内」，动作是连续末端控制，目标规范是三维坐标，与 ObjectNav 的类别词目标、离散导航动作、1 m 加可见性判据属于不同任务族。H2.0 是基础设施与性能常识的来源，不是 ObjectNav 的评测场；把 HAB 数字写进 ObjectNav 对比表属于跨任务口径混用。第 088 讲的 OVMM 才是开放词汇移动操作的主线，其软件栈与 H2.0 同源，届时再回接本讲。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>工程上接入 H2.0 分三步：选平台、配资产、定测量。每一步的判断都可以用本讲的数据支撑。</p>
+    <h3>平台选择对照</h3>
+    <table>
+      <tr><th>研究需求</th><th>建议平台</th><th>判据</th></tr>
+      <tr><td>纯导航、语义探索、开放词汇</td><td>H1 口径（第 006 讲）</td><td>状态简单、吞吐最高、与 ObjectNav 榜单同源</td></tr>
+      <tr><td>刚体移动操作、关节容器、重排</td><td>H2.0</td><td>需要物理与接触力；接受每步多物理子步的成本</td></tr>
+      <tr><td>布料、流体、切割等非刚体现象</td><td>其他物理仿真器</td><td>H2.0 明确不支持这类动力学</td></tr>
+      <tr><td>真机部署前的技能验证</td><td>H2.0 加本体噪声与延迟模型</td><td>接口与 OVMM 软件栈一致，迁移成本低</td></tr>
+    </table>
+    <h3>任务与技能接口</h3>
+    <p>HAB 的分层方案把任务拆成参数化技能集合：Navigate、Pick、Place、Open 与 Close（冰箱、抽屉各一套）。每个技能的输入是一个三维位置（物体质心的初始或目标位置），输出是控制序列。规划器侧使用 PDDL 风格领域文件，谓词覆盖「物体在容器内」「容器已打开」「机械臂持有物体」等状态；论文为每个任务求解一次最小长度计划，作为评测时的技能序列。自研系统可以采用同样的接口划分：<strong>把「导航到可操作位置」与「操作物体」严格分开</strong>，因为导航目标位置不是唯一的，这既是分层方案的优点，也是交接问题的来源。</p>
+    <h3>工程接入检查清单</h3>
+    <ul>
+      <li><strong>资产层：</strong>纹理压缩与显存预算；凸分解碰撞体与视觉资产分离；关节物体的 URDF 限位与质量参数校验。</li>
+      <li><strong>场景层：</strong>导航网格与物理场景一致；休眠物体的渲染缓存；程序化杂物的物理稳定性离线预计算。</li>
+      <li><strong>控制层：</strong>固定 30 Hz 控制频率；末端位移限幅；夹爪吸附范围与成功阈值分离配置；接触力阈值与失败判据联动。</li>
+      <li><strong>评测层：</strong>Idle 与 Interact 两套基准；记录缩放曲线；把重置与同步开销纳入端到端估算。</li>
+    </ul>
+    <h3>超参数与取值依据</h3>
+    <table>
+      <tr><th>参数</th><th>论文取值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>控制频率</td><td>30 Hz</td><td>策略步与真实时间对应</td><td>1 次渲染 + 4 个 1/120 秒物理子步；30 步/秒即实时</td></tr>
+      <tr><td>末端单步位移上限</td><td>1.5 cm</td><td>限制动作幅度</td><td>30 Hz 下对应约 0.45 m/s 末端速度</td></tr>
+      <tr><td>抓取吸附半径</td><td>15 cm</td><td>吸附式抓取生效范围</td><td>任务级简化，可按需关闭；与成功阈值数值相同含义不同</td></tr>
+      <tr><td>成功阈值</td><td>15 cm（不计朝向）</td><td>重排成功判据</td><td>HAB 各任务统一口径</td></tr>
+      <tr><td>接触力失败阈值</td><td>累计超阈值即失败（Pick 中为 5k N）</td><td>保护机器人本体与环境</td><td>论文实验设置；不同任务按本体与场景标定</td></tr>
+      <tr><td>评测场景</td><td>Idle 与 Interact 两套</td><td>吞吐基准与真实负载</td><td>Interact 为预计算交互轨迹，更接近任务负载</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：延迟一步策略的取舍</span>
+      <p>π(a<sub>t</sub> | o<sub>t−1</sub>) 让物理与渲染并行，是 H2.0 吞吐的关键机制，同时把「感知延迟」写进了策略接口。对重排这类慢节奏任务，一步延迟（33 ms）可以忽略；对高速抓取或飞行任务，这个模型会成为瓶颈。接入时把延迟作为显式配置项，真机迁移时与传感器实际延迟对齐。</p>
+    </div>
+    <div class="box warn">
+      <span class="box-title">惰性物理的失效条件</span>
+      <p>「只模拟机器人附近」的前提是机器人独享非重力作用。若实验涉及多个独立运动的物体、外力推动或需要全局同步的接触链，惰性策略会漏算状态转移。这类实验应主动关闭对应的局部化优化，接受吞吐下降，并在报告中说明配置。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>三段代码覆盖：吞吐与实时倍数换算、控制步的数值检查、实验规模预算。均为教学实现，接口按论文公开的任务与控制规格书写。</p>
+
+    <p><strong>片段 1：实时倍数与墙钟换算</strong></p>
+    <pre class="code"><code>SPS = {
+    # 并发结构: (Idle 步/秒, Interact 步/秒)
+    "1 进程": (1191, 510),
+    "1 卡 16 进程": (8186, 1660),
+    "8 卡 64 进程": (25734, 7699),
+}
+REAL_TIME_SPS = 30          # 每步 1 次渲染 + 4 个 1/120 秒物理子步，合计 1/30 秒
+
+def realtime_factor(sps, base=REAL_TIME_SPS):
+    return sps / base
+
+def wall_hours(steps, sps):
+    return steps / sps / 3600.0
+
+for name, (idle, inter) in SPS.items():
+    print(f"{name}: Idle {realtime_factor(idle):.1f}x  "
+          f"Interact {realtime_factor(inter):.1f}x")
+
+total = 10_000 * 5000       # 1 万条 episode，每条 5000 步
+print(round(wall_hours(total, REAL_TIME_SPS), 2),        # 462.96 小时
+      round(wall_hours(total, SPS["8 卡 64 进程"][0]), 2))  # 0.54 小时</code></pre>
+    <p>解读：<strong>（1）</strong>实时倍数由步速除以基准直接得到，基准写死在常量里并作为函数默认参数，避免正文与代码口径漂移。<strong>（2）</strong>Idle 与 Interact 分行展示，三个并发结构下的实时倍数依次从 17.0 倍到 857.8 倍，提醒读者引用时注明负载形态。<strong>（3）</strong>墙钟换算只除以步速，未含重置与同步开销；工程预算应再乘经验系数（示例见片段 3）。</p>
+
+    <p><strong>片段 2：控制步的数值检查</strong></p>
+    <pre class="code"><code>import math
+
+MAX_EE_STEP_M = 0.015       # 末端单步位移上限 1.5 cm
+GRASP_RADIUS_M = 0.15       # 吸附式抓取生效半径
+STOP_EPS = 1e-3             # 基座线速度与角速度的停止阈值
+
+def sanitize_action(action):
+    """把策略输出规范化：限幅末端位移，判定停止请求。"""
+    delta = action["ee_delta"]
+    norm = math.sqrt(sum(v * v for v in delta))
+    if norm &gt; MAX_EE_STEP_M:
+        scale = MAX_EE_STEP_M / norm
+        delta = tuple(v * scale for v in delta)      # 等比缩放到上限
+    lin, ang = action["base_velocity"]
+    stopped = abs(lin) &lt; STOP_EPS and abs(ang) &lt; STOP_EPS
+    return delta, (0.0, 0.0) if stopped else (lin, ang), stopped
+
+def can_grasp(ee_position, object_position):
+    """吸附判定：末端在半径内且夹爪动作为正时生效。"""
+    return math.dist(ee_position, object_position) &lt;= GRASP_RADIUS_M</code></pre>
+    <p>解读：<strong>（1）</strong>限幅按向量范数等比缩放，保持动作方向不变，避免只截断单轴造成方向偏转。<strong>（2）</strong>停止是「线速度与角速度同时低于阈值」，与论文的基座控制实现一致；两个阈值分开配置，方便对应不同本体的运动能力。<strong>（3）</strong>抓取判定用欧氏距离，半径与成功阈值虽然同为 15 cm，但作用阶段完全不同，代码里独立命名防止互相误用。</p>
+
+    <p><strong>片段 3：实验规模预算</strong></p>
+    <pre class="code"><code>def experiment_hours(episodes, steps_per_episode, sps,
+                     reset_overhead=0.15, nodes=1):
+    """总墙钟估算：仿真时间乘重置与同步系数，再除以节点数。"""
+    total_steps = episodes * steps_per_episode
+    sim_hours = total_steps / sps / 3600.0
+    return total_steps, sim_hours * (1.0 + reset_overhead) / nodes
+
+steps, hours = experiment_hours(100_000, 5000, 7699, nodes=1)
+print(int(steps), round(hours, 2))     # 500000000 20.75
+steps, hours = experiment_hours(100_000, 5000, 1660, nodes=4)
+print(int(steps), round(hours, 2))     # 500000000 24.05</code></pre>
+    <p>解读：<strong>（1）</strong>交互场景 7699 步/秒下，10 万条 episode 的仿真墙钟约 20.75 小时（含 15% 重置系数），单个 8 卡节点可在一天内完成十万级评测。<strong>（2）</strong>单卡 Interact 1660 步/秒配置需要 4 个节点，结果为 24.05 小时，刚好压线；节点更多时可按比例缩短。<strong>（3）</strong>重置系数 15% 是教学假设，论文结论指出真实回路瓶颈包含环境同步与资产重载，实际项目应按自己的场景切换频率实测该系数。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>用 Idle 吞吐预测交互任务墙钟</strong>：症状是实验时间低估 2 至 5 倍。根因是物体交互触发更多物理计算，单进程 Interact 仅为 Idle 的 42.8%，单卡仅 20.3%。修复：所有预算以 Interact 或真实任务负载的实测步速为准。</li>
+      <li><strong>把 H2.0 步速与前代帧率直接比较</strong>：症状是得出「H2.0 比 H1 慢」的结论。根因是两者的步定义不同，H2.0 每步包含 4 个物理子步与一次渲染，H1 的步只有运动学与渲染。修复：同任务同配置纵向比较；横向引用只允许数量级描述并注明测量条件。</li>
+      <li><strong>把 HAB 当 ObjectNav 基准</strong>：症状是论文表格里出现 15 cm 成功阈值、连续末端动作与类别词目标混排。根因是两者任务族不同：目标规范、动作空间、判据三项全异。修复：跨任务引用只保留「基础设施与性能」层面的数字；任务指标回到对应基准自己的协议。</li>
+      <li><strong>忽略重置与同步成本</strong>：症状是按单步步速估算的墙钟比实际短一截，训练回路越接近真实负载偏差越大。根因是资产重载、环境同步与场景切换不包含在单步测量里；论文结论明确将回路瓶颈归因于这两类开销。修复：端到端基准必须包含完整 episode 循环与重置，并在报告中单列重置占比。</li>
+      <li><strong>把吸附式抓取的结论外推到真机</strong>：症状是仿真里抓取成功率很高，真机夹爪因位姿误差抓空。根因是 15 cm 吸附是任务级简化，仿真器本身支持刚体抓取而实验默认未启用。修复：真机迁移实验关闭吸附，改用接触与摩擦计算，并重测技能成功率。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>用论文的三个并发结构数字计算实时倍数，并说明「850 倍实时」对应表中的哪一行与哪种负载。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>单进程 1191 / 30 = 39.7 倍，单卡 8186 / 30 = 272.9 倍，8 卡 25734 / 30 = 857.8 倍；850 倍口径对应 8 卡 Idle 的取整。Interact 下同一配置只有 256.6 倍。</div></details>
+      </li>
+      <li>解释 Interact 相对 Idle 的步速损失，并说明为什么单卡（20.3%）比单进程（42.8%）损失更大。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>交互轨迹持续触发物体物理与接触计算；多进程共享单卡时，物理计算与显存带宽争用叠加，使交互负载下的扩展效率进一步下降。8 卡为 29.9%，介于两者之间。</div></details>
+      </li>
+      <li>根据消融表判断：若实验以真实交互轨迹为主，关闭物理优化与关闭渲染优化各损失多少比例；据此写出两句实验配置建议。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>Interact 下关闭物理优化为 358/510 = 70.2%，损失 29.8%；关闭渲染优化为 282/510 = 55.3%，损失 44.7%。建议优先保留渲染侧优化，交互负载下再补齐物理优化；两套基准都跑。</div></details>
+      </li>
+      <li>某评测计划要求在 24 小时内完成 20 万条 Tidy House episode（每条 5000 步）。计算需要的步速，并给出至少两种达到该步速的配置组合（可用 Interact 步速线性叠加节点）。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>总步数 10 亿，需要 1e9 / 86400 ≈ 11,574 步/秒。方案一：8 卡节点 Interact 7699 步/秒，两台并联约 15,398 步/秒；方案二：单卡 Interact 1660 步/秒，7 台并联约 11,620 步/秒，余量较小。</div></details>
+      </li>
+      <li>设计一个对照实验：验证「延迟一步策略」对某技能训练的影响。要求写出自变量与因变量的操作化定义、需要固定的变量、预测两条曲线的形状差异，并说明若延迟版本在真机上反而更好，应如何解释。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>自变量为策略观测延迟（0 步与 1 步），因变量为分布内成功率与未知布局成功率，固定随机种子、技能、训练步数与评测场景。预测：0 延迟版本分布内收敛更快，1 延迟版本分布内略低但迁移差距更小（感知延迟与执行延迟对齐）。真机更好的解释方向：真机本身存在传感与控制延迟，训练时引入的延迟使策略对时序误差更稳健，属于 sim2real 的正则化效应。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>Habitat 2.0 把仿真从运动学与渲染扩展到刚体与关节物体动力学，明确放弃非刚体、状态变换与声触觉能力，以速度换取能力广度。</li>
+      <li>ReplicaCAD 提供 92 件艺术资产、6 个房间与 105 个布局（引言写作 111），叠加 YCB 程序化杂物；以 CC-BY-NC 发布，仿真器代码以 MIT 发布。</li>
+      <li>惰性仿真器三原则：局部化物理与渲染、物理与渲染交错（策略改为 π(a<sub>t</sub> | o<sub>t−1</sub>)）、简化与复用（纹理压缩 4 至 6 倍、资产缓存、凸分解碰撞）。</li>
+      <li>吞吐实算：30 步/秒为实时；单进程 Idle 1191、Interact 510；8 卡 25734 与 7699 步/秒，对应 857.8 倍与 256.6 倍实时；Interact 相对 Idle 损失 2.34 至 4.93 倍。</li>
+      <li>优化消融按负载分层：Idle 下物理优化贡献最大（关闭后只剩 22.8%），Interact 下渲染优化缺口更大（关闭后剩 55.3%）；iGibson 的 100 步/秒对照下，完整优化为 11.91 倍。</li>
+      <li>方法结论：单项技能可学，长程串联困难；分层加规划器更强但存在交接问题；SPA 在杂物与容器感知下更脆。HAB 与 ObjectNav 属不同任务族，数字不得混排。</li>
+      <li>下一篇从第 008 讲开始：Habitat 3.0 的人机共居与社交导航，随后进入数据集、观察动作空间与挑战赛史的完整梳理。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch006.html">← 第 006 讲：Habitat-Sim 架构与性能常识</a>
+    <a class="next" href="ch008.html">第 008 讲：Habitat 3.0：HITL 与社交导航 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.06 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:11.5px !important;letter-spacing:.06em !important;color:rgba(71,85,105,.45) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#7e8ba0 !important;font-size:11.5px !important;line-height:1.8 !important;text-align:center !important;padding:5px 12px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>
