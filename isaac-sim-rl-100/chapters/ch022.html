@@ -42,7 +42,7 @@
 
   <section class="sec" id="why">
     <h2>背景与动机</h2>
-    <p>先算一笔账。<strong>单环境、实时速度下，一秒只能采 60 个决策步</strong>；PPO 训练一个灵巧操作策略通常需要 5000 万到 2 亿个决策步，照这个速度要跑 10 到 40 天。而 Isaac Sim 在一张 RTX 4090 上把 4096 个环境并行推进，一秒能采 20 万步以上，同样的训练量压缩到几小时。</p>
+    <p>先做一次核算。<strong>单环境、实时速度下，一秒只能采 60 个决策步</strong>；PPO 训练一个灵巧操作策略通常需要 5000 万到 2 亿个决策步，照这个速度要跑 10 到 40 天。而 Isaac Sim 在一张 RTX 4090 上把 4096 个环境并行推进，一秒能采 20 万步以上，同样的训练量压缩到几小时。</p>
     <p>并行不只是"快"。它同时解决了强化学习的两个隐痛：其一，on-policy 算法要求一个 batch 内的数据足够新鲜且多样，N 越大，单次更新覆盖的状态分布越广，梯度方差越低；其二，强化学习的瓶颈经常不在算法而在数据管线，GPU 算物理只要几毫秒，CPU 却还在用 Python 循环逐个环境读写状态。<strong>多环境并行训练的本质，是把"逐环境循环"整个消灭掉。</strong>本章之后的所有训练章节都以这套并行机制为底座。</p>
   </section>
   <section class="sec" id="theory">
@@ -116,7 +116,7 @@
     <p><strong>整体路线是"模板化 → 克隆 → 张量化 → 批量步进 → 对接学习器"五步。</strong>每一步都围绕同一个目标：让"环境数"成为张量的一个维度，同时消灭代码里的逐环境循环。</p>
     <ol>
       <li><strong>搭模板环境</strong>：先在 <code>/World/envs/env_0</code> 下把一个完整环境（地面、机器人、物体、传感器）搭好。模板只搭一次，避免 N 份场景手工拼装。</li>
-      <li><strong>克隆 N 份</strong>：用 <code>Cloner</code> 沿网格布局复制。<code>replicate_physics=True</code> 的作用是同时在 PhysX 侧注册 N 套物理表示；若只复制 USD 外观而漏掉物理副本，会出现"看得见但碰不到"的幽灵环境。</li>
+      <li><strong>克隆 N 份</strong>：用 <code>Cloner</code> 沿网格布局复制。<code>replicate_physics=True</code> 的作用是同时在 PhysX 侧注册 N 套物理表示；若只复制 USD 外观而漏掉物理副本，会出现"看得见但碰不到"的空转环境。</li>
       <li><strong>建张量视图</strong>：对机器人建 <code>Articulation</code>，对物体建 <code>RigidPrim</code>，路径用正则 <code>env_.*/Robot</code> 一把抓。</li>
       <li><strong>写批量 step</strong>：每个控制步 = 策略推理一次 + 物理推 decimation 次 + 奖励/终止向量化计算 + autoreset。</li>
       <li><strong>对接学习器</strong>：把批量环境包成 SB3 的 <code>VecEnv</code>（<code>step_async</code> / <code>step_wait</code>），学习器就把 N 当成它的 batch 维。</li>
@@ -148,7 +148,7 @@ cloner.clone(
     source_prim_path="/World/envs/env_0",  # 模板：地面、机器人、物体都已摆好在 env_0 里
     prim_paths=env_paths,
     replicate_physics=True,                # 关键开关：PhysX 侧同样复制 N 份物理表示
-)                                          # 漏掉它会出现"看得见、碰不到"的幽灵环境
+)                                          # 漏掉它会出现"看得见、碰不到"的空转环境
 
 from isaacsim.core.prims import Articulation  # 新版类名为 Articulation（老版本为 omni.isaac.core.articulations.ArticulationView）
 robots = Articulation(prim_paths_expr="/World/envs/env_.*/Robot", name="robots")
@@ -157,6 +157,7 @@ robots.initialize()                        # 建立 (N, n_joints) 张量后端�
 
     <p><strong>片段 2：批量步进与 autoreset 核心循环</strong></p>
     <pre class="code"><code>obs = build_obs(robots)                      # (N, obs_dim)：一次拷贝取回全部环境的观测
+episode_step = torch.zeros(obs.shape[0], dtype=torch.long, device=obs.device)
 for t in range(horizon):                     # horizon=16：每个 update 收集 N×16 条 transition
     actions = policy(obs)                    # 批量推理：(N, obs_dim) 进，(N, act_dim) 出
     robots.set_joint_position_targets(actions)
@@ -166,7 +167,8 @@ for t in range(horizon):                     # horizon=16：每个 update 收集
 
     next_obs = build_obs(robots)             # 先读新观测，再判断终止：顺序不能反
     rew, fail = compute_reward(robots)       # (N,) 与 (N,)，全部向量化，无逐环境分支
-    timeout = (t % episode_len) == 0         # 超时截断与真失败在引导时处理不同
+    episode_step += 1                        # 每个环境独立累计回合步数
+    timeout = episode_step &gt;= episode_len    # 超时只看本环境自己的计数
     done = fail | timeout
 
     buffer.add(obs, actions, rew, done, next_obs)   # 旧回合的最后一条 transition 原样入库
@@ -176,6 +178,7 @@ for t in range(horizon):                     # horizon=16：每个 update 收集
         fresh = reset_sampler.sample(done_ids.numel())
         robots.set_joint_positions(fresh, indices=done_ids)      # 原地重置（autoreset）
         robots.set_joint_velocities(torch.zeros_like(fresh), indices=done_ids)
+        episode_step[done_ids] = 0           # 只清零已重置环境
 
     obs = next_obs                           # 指针交换：新观测成为下一步的输入</code></pre>
     <p>解读：循环里有<b>两处顺序问题最容易被写反</b>。第一处是"先读 next_obs 再算 done"：如果先重置再读观测，入库的 next_obs 就已经是重置后的新状态，值函数会学到"失败后突然出现在随机位置"的虚假转移。第二处是 <code>done</code> 的语义拆分：<code>fail</code> 用于把回报截断为 0（真失败没有未来价值），<code>timeout</code> 只截断不归零（后续仍有价值），混合使用会让 PPO 的 GAE 在长回合任务上系统性低估价值。另外注意 <code>set_joint_positions(..., indices=done_ids)</code> 的 <code>indices</code> 参数，张量视图都支持按行索引写入，<strong>autoreset 的"只动一部分环境"靠的就是它，整个场景无需重建</strong>。</p>
@@ -211,9 +214,9 @@ class IsaacVecEnv(VecEnv):
   </section>
 
   <section class="sec" id="pitfalls">
-    <h2>常见坑</h2>
+    <h2>常见误区</h2>
     <ul>
-      <li><strong>只复制 USD 没复制物理</strong>：<code>replicate_physics=False</code>（或漏设）时，N 个环境里只有一个是真刚体，其余"悬浮幽灵"。症状：训练能跑但奖励永远是初始值附近。修复：克隆时打开物理复制，或核对 <code>robots.num</code> 是否等于 N。</li>
+      <li><strong>只复制 USD 没复制物理</strong>：<code>replicate_physics=False</code>（或漏设）时，N 个环境里只有一个是真刚体，其余"悬浮虚假"。症状：训练能跑但奖励永远是初始值附近。修复：克隆时打开物理复制，或核对 <code>robots.num</code> 是否等于 N。</li>
       <li><strong>环境间距太近</strong>：机器人手臂伸出 0.8 m，间距却只给了 1 m，相邻环境互相碰撞。症状：某几个固定编号的环境奖励显著异常。修复：间距取臂展两倍以上，或在克隆后用碰撞过滤组隔离环境。</li>
       <li><strong>在物理子步里读观测</strong>：把 <code>build_obs</code> 写进了 decimation 内层循环，CPU-GPU 同步从每控制步 1 次变成 4 次，吞吐直接掉一半以上。修复：观测与奖励只在控制步边界计算。</li>
       <li><strong>reset 用错语义</strong>：用 <code>world.reset()</code> 做 autoreset，会把全部 N 个环境状态清零。症状：随机环境的成绩永远学不上去。修复：对 View 按 <code>indices</code> 原地重置。</li>
@@ -229,7 +232,7 @@ class IsaacVecEnv(VecEnv):
       <li>把 <code>NUM_ENVS</code> 从 256 逐步提高到 4096，记录每秒采样步数（steps/s）与每步墙钟耗时，画出吞吐随 N 的变化。在哪个 N 上边际收益开始明显下降？<span class="lv">★★</span>
         <details class="hint"><summary>提示</summary><div>吞吐 = N / 单步时间。前段单步时间近似不变，吞吐随 N 线性上升；后段单步时间开始爬升（物理饱和、显存带宽、Python 开销），两条曲线相交处就是性价比拐点。</div></details>
       </li>
-      <li>故意把 <code>replicate_physics</code> 设为 <code>False</code>，训练 100 个 update。描述你观察到的奖励曲线特征，并解释为什么"幽灵环境"对 PPO 的梯度是灾难。<span class="lv">★</span>
+      <li>故意把 <code>replicate_physics</code> 设为 <code>False</code>，训练 100 个 update。描述你观察到的奖励曲线特征，并解释为什么"空转环境"对 PPO 的梯度是灾难。<span class="lv">★</span>
         <details class="hint"><summary>提示</summary><div>只有一部分环境有真实物理，另外一些永远停在初始状态，batch 里混入大量无效轨迹，优势估计被系统性稀释。</div></details>
       </li>
       <li>写一个最小实验：对比"每控制步读一次观测"与"代入 decimation 内层循环读观测"的吞吐，给出一条量化结论。<span class="lv">★★</span>
@@ -250,7 +253,7 @@ class IsaacVecEnv(VecEnv):
     <h2>小结</h2>
     <ul class="summary">
       <li>并行策略的吞吐公式：Throughput ≈ N /（物理 + 推理 + CPU 开销）；GPU 物理与批量推理让前两项近似与 N 无关。<strong>提高 N 是目前最有效的提速手段。</strong></li>
-      <li>环境搭建三件套：模板 prim（env_0）、<code>Cloner</code> 克隆（网格排布 + <code>replicate_physics</code>）、张量视图（一次性 (N, dim) 读写）。</li>
+      <li>环境搭建三要素：模板 prim（env_0）、<code>Cloner</code> 克隆（网格排布 + <code>replicate_physics</code>）、张量视图（一次性 (N, dim) 读写）。</li>
       <li>autoreset 的核心是"按 indices 原地重置"；终止帧要先入库再加 reset，超时与失败在引导时区别对待。</li>
       <li>N 的推荐起点：状态观测 4096、像素观测 512；batch 设计以 N 为基准取整倍关系。</li>
       <li>下一章：这套批量环境的接口正好是 RL-Games 的训练入口，你会看到 NVIDIA 官方训练库如何以极高吞吐消费这些 (N, dim) 张量。</li>
