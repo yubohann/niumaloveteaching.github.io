@@ -55,7 +55,7 @@
     <p>VLA 策略是观测与语言到动作的映射，世界模型是观测与动作到未来观测的映射，<strong>动作是二者唯一需要的耦合变量</strong>。</p>
     <div class="formula">
       π<sub>θ</sub>(a<sub>t:t+H-1</sub> | o<sub>t-k:t</sub>, l)
-      <span class="note">θ 为策略参数；o 为视觉观测，l 为语言指令；k 为上下文帧数（1–2），H 为动作块长度（8–16）</span>
+      <span class="note">θ 为策略参数；o 为视觉观测，l 为语言指令；k 为上下文帧数（1–2），o<sub>t-k:t</sub> 为半开区间、共 k 帧；H 为动作块长度（8–16）</span>
     </div>
     <div class="formula">
       p<sub>ϕ</sub>(o<sub>t+1:t+m</sub> | o<sub>≤t</sub>, a<sub>≤t</sub>)
@@ -187,10 +187,11 @@ class VLAWorldModel(nn.Module):
         self.action_queries = nn.Embedding(chunk, d_model)
         self.action_head = nn.Linear(d_model, action_dim)
         # 世界模型头：把融合表征投影到下一时刻潜变量，供 rollout 使用
-        self.world_head = nn.Sequential(nn.Linear(d_model, d_model), nn.GELU(),
+        self.action_embed = nn.Linear(action_dim, d_model)
+        self.world_head = nn.Sequential(nn.Linear(2 * d_model, d_model), nn.GELU(),
                                         nn.Linear(d_model, latent_dim))
 
-    def forward(self, image, text_ids, proprio):
+    def forward(self, image, text_ids, proprio, action_gt=None):
         # 图像 (B,3,224,224) 经卷积与展平得到 (B,L,d_model) 的视觉 token
         vis = self.patch(image).flatten(2).transpose(1, 2)
         txt = self.text_embed(text_ids)                 # (B,T,d_model)
@@ -202,7 +203,9 @@ class VLAWorldModel(nn.Module):
         # 动作查询加摘要广播：一次矩阵广播生成整块动作 (B,chunk,action_dim)
         q = self.action_queries.weight.unsqueeze(0)
         action = self.action_head(q + pooled.unsqueeze(1))
-        z_next = self.world_head(pooled)                # 预测下一时刻潜变量
+        a_in = action_gt if action_gt is not None else action
+        a_feat = self.action_embed(a_in).mean(dim=1)
+        z_next = self.world_head(torch.cat([pooled, a_feat], dim=-1))
         return action, z_next</code></pre>
     <p>解读：<strong>（1）</strong>模块划分遵循“前端独立、主干共享”，避免早期梯度互扰。<strong>（2）</strong>视觉前端用 6×6 大步长卷积代替标准分块嵌入，是缩放算力的常用手段。<strong>（3）</strong>动作查询与场景摘要相加后广播，等价于同一场景下并行生成 H 个动作槽位；真实系统常用解码器注意力读取视觉 token，004 章给该变体。<strong>（4）</strong>forward 同时返回动作与潜变量，共享主干只前向一次，两路损失复用同一份计算。</p>
 
@@ -213,7 +216,7 @@ class VLAWorldModel(nn.Module):
     l_pol = nn.functional.huber_loss(action_pred, action_gt, reduction="none")
     if valid_mask is not None:
         # 变长 episode 尾部用掩码剔除，避免补零动作污染训练信号
-        l_pol = (l_pol * valid_mask.unsqueeze(-1)).sum() / valid_mask.sum().clamp(min=1)
+        l_pol = (l_pol * valid_mask.unsqueeze(-1)).sum() / (valid_mask.sum() * action_pred.shape[-1]).clamp(min=1)
     else:
         l_pol = l_pol.mean()
     # 世界模型损失用余弦相似度：潜变量只约束方向与结构，不强制绝对尺度对齐
