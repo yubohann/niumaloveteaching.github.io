@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 089 讲｜Uni-NaVid：统一导航 VLA | 视觉语言导航课程 · VLN-100</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第五篇 · 基础模型与 2026 前沿</span>
+    <span class="sep">/</span>
+    <span>第 089 讲</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第五篇 · 基础模型与 2026 前沿</div>
+    <h1>第 089 讲｜Uni-NaVid：统一导航 VLA</h1>
+    <p class="lead">本讲以 Zhang 等 2024 的 Uni-NaVid（arXiv:2412.06224v2）为主线：一个视频视觉-语言-动作（Vision-Language-Action, VLA）模型把 VLN、物体目标导航、具身问答、人物跟随四类任务统一到同一输入输出格式，用 3.6M 条导航样本联合训练，并用在线视觉 token 合并把推理压到 0.2 秒一次、整机 5 Hz。学完能设计统一格式、核算 token 预算、判断多任务协同与效率取舍。</p>
+    <ul class="meta">
+      <li>主题：统一导航 VLA / 多任务数据配方 / 在线视觉 token 合并 / 动作块预测</li>
+      <li>关键数字：导航样本 3.6M、推理 5 Hz、R2R-CE val-unseen SR 47.0、RxR-CE val-unseen SR 48.7</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置讲：第 088 讲（NaVid：视频 VLM 端到端）</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>会算：在线 token 合并的预算。单帧 256 个 patch token 在三档池化下变为 64 / 4 / 1，短期缓冲 64 帧；T=100 时合并上界 356 个 token，相对未合并的 25,600 个压缩 71.91 倍，T=500 时压缩 169.31 倍。</li>
+      <li>会解释：四类任务如何改写为同一格式（指令加自我中心 RGB 视频输入，4 个低层动作输出），以及动作块（action chunk）预测如何支持异步执行并达成 5 Hz。</li>
+      <li>会实现：在线视觉 token 合并、统一样本装配、动作块解码与异步循环三段示意代码。</li>
+      <li>会判断：多任务联合训练的协同来自哪里（VLN、ObjectNav、EQA 收益明显，人物跟随收益小），RGB-only 数字与使用深度、里程计、全景、路点预测器的方法如何分组比较。</li>
+      <li>会设计：为一个新导航任务写出统一格式、样本配比与最小消融方案，并用 token 预算核算推理代价。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 088 讲介绍了 NaVid：把 VLN 写成视频视觉语言模型的逐动作生成，只用 RGB 视频流输入。该路线证明了两件事：视觉语言模型（Vision-Language Model, VLM）可以直接消费在线视频并输出导航决策；视频历史越长，token 数量线性增长，单次推理落到 1 至 2 秒量级，实时性受威胁。同时，它的任务面只有 VLN 一类。</p>
+    <p>现实中的导航需求不止一类。拿一个家庭机器人举例：用户可能说「去厨房把电视关掉」（指令跟随），也可能只说「找一下我的杯子」（物体目标导航），可能在路上问「这个房间是干什么的」（具身问答），还可能要求「跟着穿蓝衣服的人」（人物跟随）。四类任务的观测格式、成功判定、停止条件都不一样，各自训练一个专用模型意味着四份数据管线、四份部署维护成本。</p>
+    <p>Uni-NaVid 的思路有两步。第一步做任务统一：把四类任务全部改写为「自然语言指令加单目 RGB 视频进，4 个低层动作出」的格式，动作集合为前进 25 厘米、左转 30 度、右转 30 度、停止，并在数据侧收集 3.6M 条统一格式样本。第二步做效率：把每帧 256 个视觉 token 按当前、短期、长期三档池化，短期缓冲 64 帧，长期用相似度合并成滑动平均，token 总数从线性增长压到几百量级，单次推理 0.2 秒，模型以 5 Hz 连续输出 4 个动作的预测块。本讲按「统一接口、token 预算、训练配方、结果与消融、边界」五段展开。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p>本节先把四类任务写成同一形式，再推导 token 预算与合并更新，最后给出动作块预测与训练配方。公式中的任务设定与数字均来自 Zhang 等 2024（Uni-NaVid，arXiv:2412.06224v2）。</p>
+
+    <h3>1. 任务统一：同一接口覆盖四类任务</h3>
+    <p>设时刻 T 收到自然语言指令 I 与自我中心 RGB 视频 O<sub>T</sub> = {x<sub>1</sub>, …, x<sub>T</sub>}，智能体输出未来 k 个动作：</p>
+    <div class="formula">
+      a<sub>T</sub>, …, a<sub>T+k−1</sub> = π(I, O<sub>T</sub>)，a ∈ {FORWARD, TURN-LEFT, TURN-RIGHT, STOP}
+      <span class="note">k=4；前进 25 厘米，转向 30 度；动作集合与 VLN-CE、HM3D ObjectNav、MP3D-EQA 的基准动作一致</span>
+    </div>
+    <p>统一的关键在数据侧：四类任务被改写为同一格式：</p>
+    <table>
+      <tr><th>任务</th><th>指令来源</th><th>成功判定（各自基准口径）</th><th>停止条件</th></tr>
+      <tr><td>VLN</td><td>基准自带逐词指令（R2R-CE、RxR-CE）</td><td>距目标 3 米以内（R2R-CE val-unseen）</td><td>模型调用停止</td></tr>
+      <tr><td>ObjectNav</td><td>目标类别改写为「Search for the X」</td><td>HM3D ObjectNav val，距目标物体 1 米以内</td><td>找到即停</td></tr>
+      <tr><td>EQA</td><td>基准自带问题（MP3D-EQA）</td><td>答案正确率（ACC）</td><td>先导航到相关区域，停下后作答</td></tr>
+      <tr><td>人物跟随</td><td>外观描述改写为「Follow the X」</td><td>自建基准的跟随成功率（SR）</td><td>跟到终点</td></tr>
+    </table>
+    <p>为区分「导航」与「回答」，输入序列里插入一个任务指示 token &lt;NAV&gt;：训练与推理时它提示当前该输出动作；EQA 的第二阶段把它移除，模型改为输出答案。<strong>统一格式的价值在于把「任务差异」收敛为「指令文本差异」，让同一套权重共享视觉历史编码与动作解码。</strong></p>
+
+    <h3>2. 在线视觉 token 合并</h3>
+    <p>单帧经 EVA-CLIP 编码得到 N<sub>x</sub>=256 个 patch token，记为 X<sub>t</sub> ∈ R<sup>256×C</sup>。全部保留时，T 帧共 256T 个 token，历史越长推理越慢。合并策略按时间远近分三档，用不同倍率 α 做网格池化（grid pooling）：</p>
+    <div class="formula">
+      X<sub>curr</sub> = Pool(X<sub>T</sub>, α<sub>c</sub>=2) ∈ R<sup>64×C</sup>；X<sub>short</sub> = Pool(X<sub>t</sub>, α<sub>s</sub>=8) ∈ R<sup>4×C</sup>；X<sub>long</sub> = Pool(X<sub>t</sub>, α<sub>l</sub>=16) ∈ R<sup>1×C</sup>
+      <span class="note">255 个 patch 的位置网格用 16×16 表示；倍率 2/8/16 分别把单帧压到 64/4/1 个 token</span>
+    </div>
+    <p>运行时只对边界帧做池化，复用历史结果。设短期缓冲长度 B=64，最新帧进入短期时把当前帧按倍率比 α<sub>s</sub>/α<sub>c</sub>=4 降级，短期最旧帧按 α<sub>l</sub>/α<sub>s</sub>=2 沉入长期；长期记忆用余弦相似度合并，阈值 τ=0.95：</p>
+    <div class="formula">
+      X<sub>long</sub> ← (K·X<sub>long</sub> + X<sub>short→long</sub>) / (K+1)，当 cos(X<sub>long</sub>, X<sub>short→long</sub>) &gt; τ
+      <span class="note">K 为该长期 token 已合并的帧数；相似度不足则新建长期 token，K 重置为 1</span>
+    </div>
+    <p>这是对历史帧的滑动平均：场景变化缓慢的走廊里长期 token 数量 M 远小于经过的帧数，遇到新区域时才新增。把各 T 的 token 上界（长期按不合并计算，故为上界）与未合并数量对比：</p>
+    <table>
+      <tr><th>帧数 T</th><th>当前档</th><th>短期档</th><th>长期档（上界）</th><th>合计</th><th>未合并</th><th>压缩比</th></tr>
+      <tr><td>16</td><td>64</td><td>64</td><td>0</td><td>128</td><td>4,096</td><td>32.00×</td></tr>
+      <tr><td>64</td><td>64</td><td>256</td><td>0</td><td>320</td><td>16,384</td><td>51.20×</td></tr>
+      <tr><td>100</td><td>64</td><td>256</td><td>36</td><td>356</td><td>25,600</td><td>71.91×</td></tr>
+      <tr><td>500</td><td>64</td><td>256</td><td>436</td><td>756</td><td>128,000</td><td>169.31×</td></tr>
+    </table>
+    <p><strong>计数口径（±1 帧）：</strong>表中短期档按含当前帧的 64 帧计（当前帧同时保留 64 token 的当前档表示与 4 token 的短期档表示），长期档覆盖 T−64 帧；若实现改为当前帧不占短期缓冲名额（当前帧仅保留高分辨率表示，短期档只存历史帧），长期档少一帧，合计少 1 个 token（T=100 为 355、T=500 为 755）。表格与练习数字均按前者口径。</p>
+    <p>T=100 时三档占比为 18.0% / 71.9% / 10.1%：短期档撑起主要预算，当前档保证即时感知精度，长期档记录路径历史。<strong>合并的收益随轨迹变长而放大，这正是长程导航最需要的性质；其代价是远期帧的空间细节被平均掉，路线级信息保留、像素级细节丢失。</strong></p>
+
+    <h3>3. 动作块预测与 5 Hz 闭环</h3>
+    <p>语言模型一次前向输出 4 个动作 token，对应未来 4 步动作块。论文报告 k=4 时综合表现最优：k 太小需要高频推理，k 太大对当前观测的依赖被稀释。动作块允许异步执行：机器人在执行当前块的同时，后台计算下一个块，单次推理 0.2 秒，换算 5 Hz；若只输出 1 个动作，5 Hz 意味着每秒 5 个决策，而 4 动作块在同样推理频率下每秒可覆盖 20 个动作槽，执行侧不再被推理节流。</p>
+
+    <h3>4. 训练配方</h3>
+    <p>数据来自四类任务共 3.6M 条导航样本，外加 2.3M 条真实视频问答与视频描述样本。样本构成：</p>
+    <table>
+      <tr><th>来源</th><th>规模</th><th>占比</th><th>作用</th></tr>
+      <tr><td>VLN（R2R-CE + RxR-CE 训练集）</td><td>2.400M</td><td>65.27%</td><td>逐词指令对齐、地标识别、停止</td></tr>
+      <tr><td>人物跟随（Habitat 3.0 扩展）</td><td>0.544M</td><td>14.79%</td><td>移动目标、动态避人</td></tr>
+      <tr><td>ObjectNav（HM3D）</td><td>0.483M</td><td>13.14%</td><td>开放类别搜索、覆盖式探索</td></tr>
+      <tr><td>EQA（MP3D-EQA）</td><td>0.250M</td><td>6.80%</td><td>导航后作答、空间问答</td></tr>
+      <tr><td>合计（按论文口径约 3.6M）</td><td>3.677M</td><td>100%</td><td>再加 2.3M 真实数据后总计约 5.9M</td></tr>
+    </table>
+    <p>训练分两阶段：第一阶段只用模态对齐数据训练投影器；第二阶段解冻投影器与语言模型，用 2.3M 真实视频数据加 3.6M 导航样本联合微调，只跑 1 个 epoch。基础设施为 40 张 H800 训练约 35 小时，合计约 1400 GPU 小时；按 3.6M 导航样本折算约 2,571 条/GPU 小时（1.400 秒/条），按 5.9M 总量折算约 4,214 条/GPU 小时（0.854 秒/条）。视频按 1 FPS 抽帧以去除相邻帧冗余。VLN 部分另有约 1.69M 条 DAgger 采样与 70k 条低层指令增广数据；论文报告指令增广带来 VLN +2.31%、ObjectNav +3.7% 的 SR 提升。</p>
+
+    <h3>5. 关键结果与协议</h3>
+    <p>先看 VLN-CE 两个 val-unseen split（成功判定 3 米，动作粒度 25 厘米/30 度）：</p>
+    <table>
+      <tr><th>方法</th><th>观测</th><th>R2R-CE SR / SPL / NE</th><th>RxR-CE SR / SPL / NE</th></tr>
+      <tr><td>NaVid（第 088 讲，复引值）</td><td>单目 RGB</td><td>37.4 / 35.9 / 5.47</td><td>23.8* / 21.2* / 8.41*</td></tr>
+      <tr><td>Uni-NaVid</td><td>单目 RGB</td><td>47.0 / 42.7 / 5.58</td><td>48.7 / 40.9 / 6.24</td></tr>
+    </table>
+    <p>带 * 的 RxR 数字来自仅在 R2R 上训练的模型。Uni-NaVid 相对 NaVid：R2R-CE SR 从 37.4 到 47.0，绝对 +9.6 个百分点，相对 +25.67%（论文表述为 +25.7%）；RxR-CE 从 23.8 到 48.7，相对 +104.62%。作为同表参照，ETPNav 以全景、深度、里程计加仿真预训练路点预测器在 R2R-CE 取得 SR 57.0 / SPL 49.0 / NE 4.71（同一论文表 II 复引），观测与动作条件都不同，比较时应分组，不能与 RGB-only 组直接排名。<strong>同一 NaVid 在 Uni-NaVid 表 II 记为 SR 37.4，在 NaVILA 表 I 记为 37.0，复引值存在 0.4 个百分点的出入，跨论文引用时要回到原文并标注采用的口径。</strong></p>
+    <p>其余三类任务：</p>
+    <table>
+      <tr><th>任务与协议</th><th>指标</th><th>Uni-NaVid</th><th>对照</th></tr>
+      <tr><td>HM3D ObjectNav val</td><td>SR / SPL</td><td>73.7 / 37.1</td><td>PIRLNav-IL-RL 70.4 / 34.1（带深度与里程计）</td></tr>
+      <tr><td>HM3D-OVON 零样本</td><td>SR / SPL（seen，synonyms，unseen）</td><td>41.3 / 21.1；43.9 / 21.8；39.5 / 19.8</td><td>超过微调方法 DAgRL+OD 的 seen 与 unseen</td></tr>
+      <tr><td>MP3D-EQA</td><td>ACC（无 GT 轨迹 / 有 GT 轨迹）</td><td>47.3 / 54.4</td><td>NaviLLM 44.5（离散）与 47.4</td></tr>
+      <tr><td>人物跟随自建基准</td><td>SR / FR / CR</td><td>61.21 / 71.93 / 2.07</td><td>IBVS（真值框）50.58 / 68.89 / 0.80</td></tr>
+    </table>
+    <p>相对提升：ObjectNav SR +4.69%、SPL +8.80%（论文表述 +4.7% 与 +8.8%）；人物跟随 SR +21.02%、FR +4.41%。这些数字说明统一模型在四类任务上都达到或接近专用方法的水平，且 ObjectNav 与人物跟随均未使用里程计、深度与目标框。</p>
+
+    <h3>6. 消融：协同与记忆</h3>
+    <p>论文表 X 对每个配置重训全模型，四个任务共用同一套评测。VLN 列的数字与 RxR-CE val-unseen 全模型 SR 48.7 对齐：</p>
+    <table>
+      <tr><th>配置</th><th>VLN SR</th><th>ObjectNav SR</th><th>EQA ACC</th><th>Follow SR</th></tr>
+      <tr><td>完整模型</td><td>48.7</td><td>73.7</td><td>47.3</td><td>61.2</td></tr>
+      <tr><td>仅当前帧（去视觉记忆）</td><td>9.61</td><td>44.3</td><td>32.5</td><td>56.3</td></tr>
+      <tr><td>当前 + 短期</td><td>39.7</td><td>67.8</td><td>44.1</td><td>59.7</td></tr>
+      <tr><td>去掉 &lt;NAV&gt; 指示</td><td>35.2</td><td>69.1</td><td>20.4</td><td>55.1</td></tr>
+      <tr><td>去掉 2.3M 真实 VQA 数据</td><td>40.5</td><td>50.6</td><td>1.19</td><td>58.8</td></tr>
+    </table>
+    <p>三种现象值得记住。其一，视觉记忆对 VLN 贡献最大：去掉后 SR 从 48.7 掉到 9.61，相对下降 80.27%；对人物跟随只降 8.01%，因为跟随主要靠近期帧。其二，&lt;NAV&gt; 指示对 EQA 最关键：ACC 从 47.3 掉到 20.4，模型难以分清该动作还是该回答。其三，去掉真实视频问答数据后 EQA ACC 塌缩到 1.19，说明纯导航数据微调会带来灾难性遗忘。<strong>多任务协同成立的条件是：任务共享视觉-语言对齐能力，同时用指示 token 与辅助数据保住各自所需的输出模式。</strong>数据规模方面，3M 到 6M 样本的继续增加收益递减，作者归因于仿真数据多样性有限。</p>
+
+    <h3>7. 边界与失效模式</h3>
+    <ul>
+      <li><strong>动作空间离散且短视</strong>：每次只预测 4 个 25 厘米/30 度动作，论文把连续平滑轨迹列为未来工作；急停、贴墙窄缝等场景需要低层避障补足。</li>
+      <li><strong>机器人尺寸假设</strong>：训练按标准尺寸（高度 0.88 至 1.25 米、半径 0.1 至 0.6 米）采集，超大或超小平台需要尺寸先验或重采集。</li>
+      <li><strong>任务面固定</strong>：只覆盖四类任务，未见过的导航形态（如对话导航、空中导航）需要重新定义统一格式。</li>
+      <li><strong>评测组不可混排</strong>：Uni-NaVid 的数字是单目 RGB 单模型口径；与全景、深度、里程计、路点预测器方法同表时，必须按观测与动作空间分组陈述。</li>
+      <li><strong>真实部署样本有限</strong>：真机实验展示零样本泛化，但覆盖的环境与指令数量远小于仿真评测，结论强度应低于基准数字。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>把 Uni-NaVid 落成工程需要三张表与一条流水线：统一格式表、token 配置表、数据配比表，以及「采集、打包、训练、异步推理」的闭环。</p>
+
+    <h3>关键设计决策</h3>
+    <ol>
+      <li>输入输出先统一，网络后统一：四类任务全部改写为指令 + RGB 视频 → 4 动作块，避免为每类任务设计专用头。</li>
+      <li>三档记忆按「近细远粗」分配 token：当前帧 64 个保精度，短期每帧 4 个保近程历史，长期每帧 1 个并做相似度合并保路径记忆。</li>
+      <li>推理与执行解耦：动作块预测加异步提交，把 0.2 秒单次推理摊到多步执行上。</li>
+      <li>辅助数据与任务指示不可省：VQA 数据维持开放世界理解，&lt;NAV&gt; 维持输出模式切换。</li>
+    </ol>
+    <div class="box key">
+      <span class="box-title">设计决策：令牌预算与数据配比是同一件事的两面</span>
+      <p>统一格式决定了数据可以混合，混合比例决定了各任务的梯度权重；token 预算决定了模型能看到多长的历史，历史长度又决定了哪些任务受益。人物跟随收益最小（+8% 记忆消融落差），正因为它不依赖长历史。<strong>为多任务模型调参时，先定格式与配比，再定记忆预算，最后才动优化器超参。</strong></p>
+    </div>
+
+    <h3>Token 配置与数据配比</h3>
+    <table>
+      <tr><th>配置项</th><th>取值</th><th>作用</th><th>依据</th></tr>
+      <tr><td>当前档倍率 α<sub>c</sub></td><td>2</td><td>单帧 256 → 64 token</td><td>保留即时避障与停止所需的细节</td></tr>
+      <tr><td>短期档倍率 α<sub>s</sub></td><td>8</td><td>单帧 → 4 token</td><td>覆盖最近 64 帧（B=64）的走廊级记忆</td></tr>
+      <tr><td>长期档倍率 α<sub>l</sub></td><td>16</td><td>单帧 → 1 token</td><td>路径级历史，配合合并阈值控制长度</td></tr>
+      <tr><td>合并阈值 τ</td><td>0.95</td><td>决定新建还是并入长期 token</td><td>论文经验值；过高会不断新建，过低会抹掉转折点</td></tr>
+      <tr><td>动作块 k</td><td>4</td><td>一次输出 4 个动作</td><td>论文报告 k=4 综合最优，兼顾高频与观测新鲜度</td></tr>
+      <tr><td>抽帧率</td><td>1 FPS</td><td>训练视频采样</td><td>去除相邻帧冗余，控制序列长度</td></tr>
+    </table>
+    <p>与第 088 讲 NaVid 的差异可以概括为三点：任务面从一类扩到四类；历史表示从逐帧 token 改为三档合并；训练目标从单任务交叉熵扩展为「导航动作加辅助问答」的联合目标。代价是多了格式转换与配比调参两个管理面，收益是单模型多任务与长历史实时推理。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>三段示意代码分别给出 token 合并、统一样本打包、动作块异步推理。接口名按通用写法给出，可接入任意视频编码器与自回归语言模型。</p>
+
+    <p><strong>片段 1：在线视觉 token 合并</strong></p>
+    <pre class="code"><code>import torch
+import torch.nn.functional as F
+
+def grid_pool(x, ratio):
+    # x: (1, C, 16, 16)，包含 256 个 patch；ratio 为池化边长倍率
+    return x if ratio == 1 else F.avg_pool2d(x, kernel_size=ratio, stride=ratio)
+
+class OnlineTokenMerge:
+    """三档视觉记忆：池化倍率 2/8/16，短期缓冲 B 帧，长期按相似度合并。"""
+    def __init__(self, ratios=(2, 8, 16), buffer=64, tau=0.95):
+        self.rc, self.rs, self.rl = ratios
+        self.B, self.tau = buffer, tau
+        self.curr, self.short, self.long, self.K = None, [], [], 0
+
+    def step(self, frame):
+        if self.curr is not None:                     # 上一帧降入短期档
+            self.short.append(grid_pool(self.curr, self.rs // self.rc))
+            if len(self.short) &gt; self.B:              # 缓冲溢出则沉入长期档
+                cand = grid_pool(self.short.pop(0), self.rl // self.rs)
+                last = self.long[-1] if self.long else None
+                if last is not None and F.cosine_similarity(
+                        last.flatten(), cand.flatten(), dim=0) &gt; self.tau:
+                    self.long[-1] = (self.K * last + cand) / (self.K + 1)
+                    self.K += 1                       # 滑动平均的已合并帧数
+                else:
+                    self.long.append(cand)
+                    self.K = 1
+        self.curr = grid_pool(frame, self.rc)         # 新帧成为当前档
+        return self.curr, self.short, self.long
+# 运行一次 step 只池化两个边界帧；历史 token 全部复用，代价与 T 无关</code></pre>
+    <p>解读：<strong>（1）</strong>倍率要用「比值」口径，写成绝对值会出错：当前帧已是 2 倍池化结果，降入短期时只能再乘以 4（8/2），直接再乘 8 会过度压缩。<strong>（2）</strong>相似度合并是带计数的滑动平均，K 记录已并入帧数，保证长期 token 保存的是该场景特征的均值，不会退化成最新一帧。<strong>（3）</strong>每步只处理两个边界帧，计算量与历史长度解耦，这是在线部署可用的关键。</p>
+
+    <p><strong>片段 2：四类任务的统一样本打包</strong></p>
+    <pre class="code"><code>import torch
+
+TASK_TEMPLATES = {
+    "vln":    lambda x: x,                          # 数据集自带指令
+    "objnav": lambda x: f"Search for the {x}",      # 类别包装为指令
+    "eqa":    lambda x: f"Find the place to answer: {x}",
+    "follow": lambda x: f"Follow the {x}",          # 外观描述包装为指令
+}
+
+def build_sample(task, frames, prompt, actions, fps=1):
+    """统一格式：抽帧序列 + 指令 + 未来 4 个动作，四类任务共用打包。"""
+    step = max(1, int(round(1 / fps)))
+    keep = [frames[0]] + frames[step::step]          # 1 FPS 采样，首帧必留
+    pad = 4 - len(actions[:4])
+    chunk = actions[:4] + [STOP_IDX] * pad           # 不足 4 个用停止补齐
+    return {"task": task,                            # 由 &lt;NAV&gt; 指示区分模式
+            "video": torch.stack(keep),              # (T, 3, H, W) 自我中心 RGB
+            "text": TASK_TEMPLATES[task](prompt),
+            "labels": torch.tensor(chunk)}           # 4 个动作的类别编号</code></pre>
+    <p>解读：<strong>（1）</strong>任务差异全部收敛到模板函数与指示 token，网络侧只有一套输入输出。<strong>（2）</strong>1 FPS 采样加首帧保留是对齐三条数据源时间尺度的最小约定；采样过密会把 token 预算耗在冗余帧上。<strong>（3）</strong>动作块尾部补停止，让模型在接近目标时学会调用停止，同时统一变长轨迹的标签形状。</p>
+
+    <p><strong>片段 3：动作块解码与异步执行</strong></p>
+    <pre class="code"><code>ACTION_VOCAB = ["forward", "turn_left", "turn_right", "stop"]
+
+@torch.no_grad()
+def act_chunk(model, merged_tokens, text_tokens):
+    logits = model(merged_tokens, text_tokens)       # (4, 4)：每个动作位一个分类分布
+    return logits.argmax(-1).tolist()                # 一次给出未来 4 个动作
+
+def run_navigation(env, model, merger, instruction):
+    future, pending = None, []
+    while not env.done():
+        frame = env.observe()
+        curr, short, long_ = merger.step(frame)
+        if future is None:                           # 后台线程推理，主循环继续执行
+            future = infer_async(model, (long_, short, curr), instruction)
+        if not pending:
+            pending = list(future.result()); future = None
+        action = pending.pop(0)
+        env.step(action)
+        if action == ACTION_VOCAB.index("stop"):
+            break
+    return env.trajectory</code></pre>
+    <p>解读：<strong>（1）</strong>动作块把「推理一步」变成「推理一块」，异步提交后推理延迟隐藏在上一块的执行时间里，这是 5 Hz 的来源。<strong>（2）</strong>块边界是重新规划点：轨迹突变或指令更新时应在块边界前提前触发新一轮推理，避免盲目走完剩余动作。<strong>（3）</strong>停止动作立即终止循环，不使用「走完当前块再看」的延迟停止策略。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>池化倍率错配</strong>：对已池化的张量继续用绝对倍率，导致当前帧只剩 16 个 token，走廊细节与门牌识别丢失，或长期档几乎不压缩。根因是倍率按「原始分辨率」写死。修复：统一改为比值参数，降档时用 α<sub>s</sub>/α<sub>c</sub>、α<sub>l</sub>/α<sub>s</sub>；用单元测试断言各档 token 数为 64/4/1。</li>
+      <li><strong>长期记忆无界增长</strong>：τ 设得过低或场景光照变化大，长期 token 每帧新建，token 数重新线性增长，延迟随轨迹爬升。根因是相似度判据未校准。修复：以 τ=0.95 为基线网格搜索；监控 M 的增长率；超限时提高池化倍率或对长期档再做一次合并。</li>
+      <li><strong>动作块盲目执行</strong>：预测 4 步后一路执行到块尾，遇到动态障碍或指令变更时反应迟钝。根因是块内不重规划。修复：块边界重叠触发（执行 2 步即预取下一块），停止动作立即生效，动态场景缩短 k 或加低层避障。</li>
+      <li><strong>去掉 &lt;NAV&gt; 或辅助数据</strong>：去掉指示后 EQA ACC 从 47.3 掉到 20.4；去掉 2.3M 真实 VQA 后 EQA ACC 从 47.3 塌缩到 1.19。根因是高强度导航微调淹没输出模式与开放世界知识。修复：保留指示 token；辅助数据与导航数据联合训练；用「导航步数 / 问答步数」配比作为可调旋钮。</li>
+      <li><strong>跨方法直接排名</strong>：把 RGB-only 的 47.0 与全景加深度加路点预测器的 57.0 放进同一张排名表，得出「落后 10 个点」的结论。根因是观测与动作空间不同组。修复：按观测（RGB / 全景 / 深度 / 里程计）与是否依赖仿真预训练路点预测器分组；引用 NaVid 时注明 37.4 与 37.0 的复引差异。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>Token 预算核算：(a) 按 α=(2,8,16)、B=64 计算 T=100 与 T=500 的三档 token 数与压缩比；(b) 若把缓冲缩到 B=32，两个 T 的结果变为多少；(c) 说明 B 变小对长程寻路的直觉影响。 <span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>(a) T=100：64 + 256 + 36 = 356，压缩 71.91 倍；T=500：64 + 256 + 436 = 756，压缩 169.31 倍。(b) B=32 时短期 128，T=100：64 + 128 + 68 = 260（压缩 98.46 倍）；T=500：64 + 128 + 468 = 660（压缩 193.94 倍）。(c) 缓冲变短，进入长期档的帧更早、细节更少，路径转折点的记忆变模糊，长程寻路更依赖长期均值。</div></details>
+      </li>
+      <li>绝对量与相对量：给出 (a) R2R-CE SR 47.0 对 37.4 的绝对差与相对差；(b) ObjectNav SR 73.7 对 70.4、SPL 37.1 对 34.1 的两种差值；(c) 若某文只写「提升 25.7%」，指出它可能省略的协议信息。 <span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>(a) +9.6 个百分点，相对 +25.67%。(b) SR +3.3 点，相对 +4.69%；SPL +3.0 点，相对 +8.80%。注意论文中的 +4.7% 与 +8.8% 是相对值。(c) 缺 split（val-unseen）、基准版本、观测口径（RGB-only）、对照方法复引值，以及相对值的分母是 37.4 还是 37.0。</div></details>
+      </li>
+      <li>改超参预测：把三档倍率改为 (2,4,8)、B=32、τ=0.90，其余不变。(a) 预测 token 预算与压缩比变化；(b) 预测哪些任务受益、哪些受损；(c) 设计一个能区分「受益来自更细的短期记忆」与「受益来自更省的计算」的对照实验。 <span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>(a) 单帧变 64/16/4，T=100 上界 64 + 512 + 272 = 848，压缩 30.19 倍，预算反而变大；τ 降低会增加长期合并、减小 M。(b) 短期更细有利于 VLN 与 EQA，计算更省有利于整体吞吐，但 0.90 的阈值可能抹掉转折点、损伤长程。(c) 固定计算预算与固定 token 预算两组对照：前者对齐每秒浮点运算量，后者对齐总 token 数，分别看 SR 变化。</div></details>
+      </li>
+      <li>设计题：为「对话导航」（用户中途改口）写一份统一格式补充方案。要求给出 (a) 指令槽与历史槽的打包方式；(b) 指示 token 设计（区分导航、追问、改口）；(c) 训练样本从现有四个数据源扩增的两条途径；(d) 一条防止新旧指令混淆的消融。 <span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>(a) 把对话轮次按时间拼进文本槽，观测视频保持单一时间轴。(b) 新增 &lt;ASK&gt; 与 &lt;REVISE&gt; 两个指示，EQA 的 &lt;NAV&gt; 流程不变。(c) 用已有轨迹合成改口（截断原指令加新目标），或对 RxR 历史指令做重排。(d) 消融「保留旧指令 / 覆盖旧指令 / 双槽拼接」三种方案，看改口后的 SR 与停止位置误差。</div></details>
+      </li>
+      <li>复现设计（★★★）：在单卡 24 GB 显存上做最小可行验证。要求 (a) 选择数据子集与任务配比，使四类任务都有信号；(b) 给出三档 token 与缓冲的降级配置及其预期压缩比；(c) 设计「多任务协同」的最小对照（单任务训练对联合训练，至少两个任务）；(d) 列出三条最可能先失败的环节与检出指标。 <span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>(a) 建议 VLN 与 ObjectNav 各半，EQA 与跟随各占 5% 至 10%，先保证两个主任务有梯度。(b) 例如 (4,16,32)、B=32，T=100 时 16 + 32 + 68 = 116 token，压缩 220.69 倍；显存不够时先降分辨率再降帧率。(c) 以 VLN 单任务为基线，逐步加入 ObjectNav、EQA；观察 VLN SR 是否随任务增加而上升，验证协同。(d) 常见失败：指示 token 未生效（EQA ACC 崩塌到个位数）、长期档不合并（延迟随步数上升）、停止类样本失衡（超调不停止）；分别用 ACC、每步延迟、停止召回监控。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>Uni-NaVid 用统一格式覆盖四类导航任务：指令加单目 RGB 视频输入，4 个低层动作块输出，3.6M 导航样本加 2.3M 真实视频数据联合训练。</li>
+      <li>在线 token 合并按当前、短期、长期三档池化（倍率 2/8/16，缓冲 64 帧，阈值 0.95），T=100 时 356 个 token，压缩 71.91 倍；T=500 时压缩 169.31 倍，单次推理 0.2 秒。</li>
+      <li>结果（各自 val-unseen 或 val 协议）：R2R-CE SR 47.0 / SPL 42.7，RxR-CE SR 48.7 / SPL 40.9，HM3D ObjectNav SR 73.7 / SPL 37.1，MP3D-EQA ACC 47.3（有 GT 轨迹 54.4），人物跟随 SR 61.21。</li>
+      <li>消融显示协同与依赖并存：去视觉记忆 VLN SR 相对下降 80.27%，人物跟随只降 8.01%；去 &lt;NAV&gt; 使 EQA 跌到 20.4；去真实 VQA 数据使 EQA 跌到 1.19。</li>
+      <li>下一讲把「语言接口」再推进一层：NaVILA 让视觉语言模型输出带空间量的语言中层动作（如 move forward 75cm），再交给腿足运动策略执行，两级结构同时解决四足机器人的平衡与跨平台迁移。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch088.html">← 第 088 讲：NaVid：视频 VLM 端到端</a>
+    <a class="next" href="ch090.html">第 090 讲：NaVILA：足式两级 VLA →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.06 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:11.5px !important;letter-spacing:.06em !important;color:rgba(71,85,105,.45) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#7e8ba0 !important;font-size:11.5px !important;line-height:1.8 !important;text-align:center !important;padding:5px 12px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

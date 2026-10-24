@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 065 讲｜数据增广的边界与风险 | 视觉语言导航课程 · VLN-100</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第四篇 · 规模、记忆与泛化方法论</span>
+    <span class="sep">/</span>
+    <span>第 065 讲</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第四篇 · 规模、记忆与泛化方法论</div>
+    <h1>第 065 讲｜数据增广的边界与风险</h1>
+    <p class="lead">本讲把两种经典增广放进同一套边界分析：Speaker-Follower 的合成指令增广（Fried 等 2018）在 25% 剂量上拿到 2.9 个点，后 75% 剂量只补 1.8 个点，单位效率相差 4.83 倍；EnvDrop 的回译与环境丢弃（Tan 等 2019）在训练环境内只值 1.7 个点，换到真实未见环境却值 15.4 个点。收益递减、分布漂移、泄漏是三条边界线，本讲给出各自的度量方式、增广决策表与停止判据。</p>
+    <ul class="meta">
+      <li>主题：数据增广 / 剂量-响应 / 分布漂移 / 泄漏审计</li>
+      <li>关键数字：增广 +4.7 点（SF，val unseen）、边际效率比 4.83、掩码绑定差 3.2 点、低质数据 −0.26 点</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置讲：第 064 讲（数据工程再谈（承 033））</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>会算：由剂量-响应曲线算出分段边际效率、每千条合成样本的增量与饱和拟合参数，并据此写出停止判据。</li>
+      <li>会解释：增广产生收益的三个条件（覆盖扩张、语义一致、环境或分布真正新增），以及收益转为零或负值的信号。</li>
+      <li>会实现：剂量-响应汇总、泄漏审计（场景与路线标识交集、近重复检索）、指令漂移度量三段代码。</li>
+      <li>会判断：对一个候选增广方案给出继续、限幅或放弃的结论，并写出增广决策表的一行。</li>
+      <li>会设计：为新任务设计含剂量梯度、对照与协议标注的增广消融，明确主终点与停止规则。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 064 讲把数据工程立成「合法、可复现、可审计」的底线；增广是数据工程的另一半。第 061 与 062 讲给出的规模路线用 1,291 个真实场景合成约 494 万条指令轨迹对，把 R2R test unseen 推到 80%；但同一篇工作的消融也显示，未修复的 Gibson 数据在增加 61% 数据量后，val unseen SR 从 76.59 掉到 76.33。<strong>规模本身不保证收益，质量与分布才是约束。</strong></p>
+    <p>增广的历史比规模化更早。第 022 讲的 Speaker-Follower 在 61 个训练场景内采样 178,000 条新路线，用说话者模型生成指令，单独使用时把 val unseen SR 从 19.9% 提到 24.6%；第 028 讲的 EnvDrop 用回译加环境丢弃，在 R2R val unseen 上从混合训练的 46.5% 提到 52.2%。两篇论文都报告了正收益，也都在附录里留下边界：合成指令有模板风格，环境丢弃掩码必须绑定，未见环境回译属于预探索协议。</p>
+    <p>本讲把这两条线与第 062 讲的低质数据反例放在一起，回答三个问题：收益在什么剂量后停止增长；分布漂移怎样被度量与控制；泄漏从哪三个通道进入实验。产出是一张增广决策表、一套停止判据与一段泄漏审计代码，为第 066 讲转入记忆预算讨论做数据侧收尾。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p>本讲按「共同结构、收益递减、环境瓶颈、分布漂移、泄漏通道、何时有害、决策表、失效模式」八步展开；全部数字标注来源与协议，实算脚本单独放置，正文只引用结果。</p>
+
+    <h3>1. 增广的共同结构</h3>
+    <p>把增广写成变换 T：(x, y) → (x′, y′)，其中 x 为输入（观测、环境、路线），y 为监督（指令、动作、目标）。按扩张对象分两类：<strong>分布内扩张</strong>把同一分布内的样本补密，<strong>分布外扩张</strong>把数据推到训练分布之外。Speaker-Follower 采样新路线并生成指令，属于训练场景内的密度扩张；EnvDrop 的虚拟环境让说话者与跟随者看到被一致遮蔽的房间，属于受控的分布外扩张；第 062 讲的合成管线用真实新扫描扩环境，属于真实的分布外扩张。三类的作用上限不同，混淆三者会把「覆盖收益」误读为「泛化收益」。</p>
+    <table>
+      <tr><th>维度</th><th>SF 合成指令（Fried 等 2018，NeurIPS 2018）</th><th>EnvDrop 回译加环境丢弃（Tan 等 2019，NAACL 2019）</th></tr>
+      <tr><td>扩张对象</td><td>训练场景内的候选路线</td><td>环境外观的受控扰动</td></tr>
+      <tr><td>需要模型</td><td>说话者（路线到指令）</td><td>说话者加环境丢弃掩码</td></tr>
+      <tr><td>新增环境</td><td>无</td><td>无（虚拟环境仍来自训练场景）</td></tr>
+      <tr><td>训练位置</td><td>混合训练后用人工数据微调 20,000 次</td><td>第二阶段半监督微调</td></tr>
+      <tr><td>单独增广收益</td><td>val unseen SR 19.9% → 24.6%（+4.7 点）</td><td>相对混合训练 46.5% → 52.2%（+5.7 点，含掩码绑定）</td></tr>
+      <tr><td>主要风险</td><td>模板化措辞、边际递减</td><td>掩码不绑定、协议越界</td></tr>
+    </table>
+    <p>读表先记住两个量级：SF 的增广与推理组件相比是最小项（务实重排 +14.6 点、全景动作 +11.3 点、增广 +4.7 点，val unseen，同一论文表 1 口径）；EnvDrop 的增广收益集中在环境丢弃的绑定版本。两个结果都指向同一件事：增广的价值取决于它新增了什么约束，补密度排在补分布之后。</p>
+
+    <h3>2. 收益递减：SF 的剂量-响应</h3>
+    <p>SF 论文报告了训练数据中合成指令占比的两个锚点：25% 时 val unseen SR 为 22.8%，100% 时为 24.6%（基线 19.9%，无增广）。把数据比例记作 f，分段边际效率定义为 η = ΔSR / Δf。实算（Python）：第一段 f 从 0 到 0.25 拿到 +2.9 点，η₁ = 11.60；第二段 f 从 0.25 到 1.00 拿到 +1.8 点，η₂ = 2.40；两段效率比 4.83。换算到样本：前 44,500 条合成指令每千条贡献 0.0652 个点，后 133,500 条每千条贡献 0.0135 个点。</p>
+    <div class="formula">
+      η(Δf) = ΔSR / Δf；效率比 = η<sub>前段</sub> / η<sub>后段</sub> = 11.60 / 2.40 = 4.83
+      <span class="note">停止判据：当下一档剂量的 ΔSR 低于 0.5 个点，或低于两次独立运行的标准误时，停止加码</span>
+    </div>
+    <p>用两点数据做描述性拟合可得 g(f) = G(1 − exp(−k f))，解出 G ≈ 4.82 点、k ≈ 3.68；该拟合在 25% 处覆盖饱和上界的 60.15%，在 100% 处覆盖 97.48%。<strong>注意这是两点定参的描述模型，没有第三个剂量点做独立验证，只能用于解释递减趋势，不能当作预测结论。</strong>论文把全量配置视为性能与计算开销的平衡点，并把 20,000 次人工数据微调放在 50,000 次增广训练之后；微调与增广训练步数比 0.40，充当风格校准段。</p>
+    <p>递减的机制来自覆盖：合成路线在训练场景内按同一最短路规则采样，早期样本覆盖新的起始点与转向组合，后期样本与既有轨迹高度重叠。第 028 讲用另一个口径给出同一结论：R2R 训练环境约 14K 条人工路线，候选最短路约 190K 条，标注覆盖率 7.368%；在训练环境内把回译铺满，验证未见集只从 46.5% 升到 48.2%。</p>
+
+    <h3>3. 环境多样性是主瓶颈</h3>
+    <p>EnvDrop 论文把「更多环境」与「更多数据」做了直接对照：在数据量相同的条件下，增加环境数量的曲线增长率高于在全部环境中随机选数据的曲线。回译放在训练环境上只值 1.7 个点；放在未见验证环境上，成功率从 46.5% 跳到 61.9%，再加环境丢弃到 64.5%。实算：第一跳 +15.4 点，相对提升 33.12%；第二跳只有 +2.6 点。前者的量级远超任何训练环境内的增广配方。</p>
+    <div class="box warn">
+      <span class="box-title">协议提醒</span>
+      <p>61.9% 与 64.5% 两个数字都来自 pre-exploration 协议：未见环境在评测前参与了回译训练。它们描述的是「机器人先熟悉全屋再执行指令」的场景，与标准零样本榜单不可直接比较。引用时必须同时标注协议与环境参与方式，否则会把泄漏包装成泛化。</p>
+    </div>
+    <p>规模化路线把环境瓶颈推得更远，也把质量门槛立了起来。第 062 讲的消融显示：HM3D 加未修复 Gibson 数据（数据量增加 61%）时 val unseen SR 为 76.33%，略低于不加的 76.59%；换成修复后的 Gibson 数据，SR 升到 78.08%。实算：修复带来的同规模增益 1.49 个点，低质扩张带来 −0.26 个点。<strong>环境是增长轴，质量是闸门：闸门不打开，扩张方向上的边际收益可能为负。</strong></p>
+
+    <h3>4. 分布漂移：语义一致与风格校准</h3>
+    <p>合成指令的分布与人工指令存在系统差距，来源有三：说话者只在最短路与人工描述上训练，模板化措辞占比高；生成过程按贪心解码，多样性低于人工改写；路线采样规则一致，导致「起点描述加转向加地标」的句式重复出现。SF 论文的对策是把人工微调放在训练末段，让策略在人类措辞分布上收尾。EnvDrop 论文给出了更锐利的证据：环境丢弃的收益几乎全部来自掩码绑定。</p>
+    <table>
+      <tr><th>配置（R2R val unseen，单次执行）</th><th>SR</th><th>相对上一行</th></tr>
+      <tr><td>IL + RL 混合训练</td><td>46.5</td><td>增广前基线</td></tr>
+      <tr><td>加回译（无环境丢弃）</td><td>48.2</td><td>+1.7</td></tr>
+      <tr><td>加特征丢弃</td><td>48.4</td><td>+0.2</td></tr>
+      <tr><td>加环境丢弃（掩码不绑定）</td><td>49.0</td><td>+0.6</td></tr>
+      <tr><td>加环境丢弃（掩码绑定）</td><td>52.2</td><td>+3.2</td></tr>
+    </table>
+    <p>绑定的含义是说话者与跟随者共用同一张环境掩码，保证「没有椅子的房间」在两侧是同一个房间。实算：绑定相对不绑定提升 3.2 个点，相对提升 6.53%；不绑定版本相对纯回译只多 0.8 个点。特征丢弃为什么几乎无效：逐元素独立掩码下，p = 0.4、同一环境 36 个视角时，某个维度在所有视角保持状态一致的概率为 0.6<sup>36</sup> + 0.4<sup>36</sup> ≈ 1.03×10<sup>−8</sup>，跨视角语义一致性几乎处处被破坏。漂移的度量应至少覆盖三项：合成与人工指令的 n-gram 重叠率、平均长度、句式模板占比；把合成比例写进数据卡片的已知偏差字段（第 064 讲）。</p>
+
+    <h3>5. 泄漏的三条通道</h3>
+    <p>增广数据在生成时若接触到评测信息，指标就不再是泛化证据。泄漏有三条通道，检查方法各不相同。</p>
+    <ul>
+      <li><strong>场景级泄漏</strong>：在评测场景上生成指令或回译。EnvDrop 的 61.9% / 64.5% 属于此类（预探索协议）。检查：增广场景标识集合与评测场景标识集合的交集必须为空。</li>
+      <li><strong>监督级泄漏</strong>：增广直接使用评测路径、评测指令或评测标注作为生成条件，哪怕场景不同。检查：路线标识与指令标识交集；生成脚本的输入依赖清单。</li>
+      <li><strong>近重复泄漏</strong>：同一场景内的相邻视角图像在增广前后进入不同集合，视觉内容高度相似。检查：跨集合感知相似度检索，阈值参照第 064 讲的 0.95 口径。</li>
+    </ul>
+    <p>三条通道的共同修复方式是把「评测集冻结 + 生成脚本隔离」写进流程：生成器只允许读取训练侧的清单与缓存，评测清单在发布后冻结并记校验值。这条纪律与第 064 讲的审计条目 11 是同一件事，本讲把它执行到增广环节。</p>
+
+    <h3>6. 何时有害：三个条件与三种表现</h3>
+    <p>把负面结果归成三个条件。<strong>条件一：扩张方向已饱和</strong>，继续加码只贡献重叠样本与模板句子（SF 后 75% 剂量）。<strong>条件二：新增数据与目标分布的距离超过模型可消化的范围</strong>，低质 Gibson 扩张带来 −0.26 个点。<strong>条件三：生成条件与训练条件不一致</strong>，掩码不绑定时指令与观测互相矛盾，收益从 3.2 点降到 0.6 点。</p>
+    <p>三个条件同时说明，「有害」很少表现为指标暴跌，更多表现为三种形态：增量趋零而成本照付；混合比例上升后验证曲线波动放大；某一分项（如 SPL）下降而 SR 不动。诊断方法是在同一配方下做剂量梯度，并同时报告训练成本。</p>
+
+    <h3>7. 增广决策表</h3>
+    <p>决策表把「什么时候用、用到什么程度、何时停」压缩成一行一行的判据，作为数据卡片的附件。</p>
+    <table>
+      <tr><th>增广类型</th><th>扩张对象</th><th>生效条件</th><th>主要风险</th><th>停止判据</th><th>证据锚点</th></tr>
+      <tr><td>合成指令（训练场景内）</td><td>状态与路线覆盖</td><td>目标域路线稀、场景固定</td><td>模板漂移、递减</td><td>下一剂量的 ΔSR 低于 0.5 点</td><td>19.9 → 24.6（+4.7）</td></tr>
+      <tr><td>回译加环境丢弃</td><td>外观扰动下的对齐</td><td>掩码绑定、图像特征级扰动</td><td>跨视角不一致</td><td>绑定消融增益低于 1 点</td><td>49.0 对 52.2（+3.2）</td></tr>
+      <tr><td>环境级数据合成</td><td>真实新场景</td><td>资产质量过关、生成指令保真</td><td>低质扩张、许可</td><td>质量分层的收益差转负</td><td>未修复 −0.26 对修复 +1.49</td></tr>
+      <tr><td>图像修复与增强</td><td>渲染质量</td><td>缺陷比例高、有配对监督</td><td>过度平滑、域内过拟合</td><td>val unseen SR 连降两档</td><td>76.59 对 76.33 对 78.08</td></tr>
+      <tr><td>特征级扰动</td><td>特征元素</td><td>同环境共享掩码</td><td>语义不一致</td><td>一致性概率低于工程阈值</td><td>独立掩码 1.03×10<sup>−8</sup></td></tr>
+    </table>
+
+    <h3>8. 适用边界与失效模式</h3>
+    <ul>
+      <li><strong>增广替代不了环境</strong>：训练环境内铺满回译值 1.7 个点，真实新环境回译值 15.4 个点；把预算投在增广前先核对环境清单。</li>
+      <li><strong>剂量点太少无法定操作点</strong>：只有 0 与 100% 两个点时，任何「加满最好」的结论都缺少中间证据。</li>
+      <li><strong>风格漂移会在长训练中积累</strong>：SF 用末段人工微调收尾，缺这一步时措辞分布持续偏向合成侧。</li>
+      <li><strong>协议越界的数字不能进主表</strong>：预探索数字可以报告，必须与零样本数字分表。</li>
+      <li><strong>合成数据缺少动作性监督</strong>：指令可覆盖路线，低层动作与可通行性没有保障；增广数据用于动作监督时需要额外校验（第 033 讲边界）。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>把边界分析落成流程需要三件东西：剂量-响应实验协议、增广超参的默认值与依据、以及一张方案对照表。所有判据以 val unseen SR 为主终点，SPL 与 NE 为副终点。</p>
+
+    <h3>剂量-响应实验协议</h3>
+    <table>
+      <tr><th>要素</th><th>设定</th><th>依据</th></tr>
+      <tr><td>剂量梯度</td><td>合成比例取 0 / 25% / 50% / 75% / 100%</td><td>五个点可同时估斜率与拐点；SF 的 25% 与 100% 两档来自论文</td></tr>
+      <tr><td>控制变量</td><td>训练配方、随机种子、评测脚本、步数上限固定</td><td>只有剂量变化，差值才能归因到增广</td></tr>
+      <tr><td>主终点</td><td>val unseen SR</td><td>seen 含环境记忆贡献，不能作为泛化主张</td></tr>
+      <tr><td>次终点</td><td>SPL、NE、训练成本（步数与显存）</td><td>剂量增加的成本必须与收益同表</td></tr>
+      <tr><td>分层报告</td><td>场景类型或指令长度分层</td><td>均值可能掩盖某一层的负增益</td></tr>
+      <tr><td>协议标签</td><td>零样本 / 预探索 / 快照选择来源</td><td>第 028 讲的协议提醒</td></tr>
+    </table>
+
+    <h3>增广超参与默认值</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>合成比例</td><td>25% 起步，按剂量曲线上调</td><td>控制覆盖扩张与漂移的平衡</td><td>SF 在 25% 拿到 2.9 点，后 75% 只有 1.8 点</td></tr>
+      <tr><td>人工微调步数</td><td>增广训练步数的 40%</td><td>风格校准</td><td>SF 为 20,000 / 50,000</td></tr>
+      <tr><td>环境丢弃率 p</td><td>0.4</td><td>控制虚拟环境距离</td><td>EnvDrop 附录 A.1；网络内 dropout 另取 0.5，两者不混用</td></tr>
+      <tr><td>掩码绑定</td><td>开启</td><td>保证指令与观测语义一致</td><td>关闭会损失 3.2 个点</td></tr>
+      <tr><td>质量闸门</td><td>修复后进行分层验收</td><td>防止低质扩张抵消规模</td><td>未修复 Gibson 扩张 −0.26 点</td></tr>
+    </table>
+
+    <h3>三类增广方案对照</h3>
+    <table>
+      <tr><th>方案</th><th>代表性工作</th><th>增量证据（val unseen）</th><th>计算成本</th><th>适用判据</th></tr>
+      <tr><td>合成指令</td><td>Speaker-Follower（2018）</td><td>+4.7 SR，前 25% 剂量效率 4.83 倍</td><td>说话者一次生成加一次混合训练</td><td>路线覆盖不足、场景清单固定</td></tr>
+      <tr><td>回译加环境丢弃</td><td>EnvDrop（2019）</td><td>+5.7 SR（含绑定）</td><td>每迭代重采样掩码，存储零增长</td><td>有可靠说话者、可接受特征级扰动</td></tr>
+      <tr><td>环境级合成</td><td>ScaleVLN（2023，第 061 至 062 讲）</td><td>+2.51 SR（微调段 76.59 → 79.10）</td><td>预训练约 72 GPU 小时、微调约 48 GPU 小时（2 张 A100 口径），生成成本另计</td><td>资产与许可靠得住、有质量验收</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：先覆盖，再一致，最后规模</span>
+      <p>增广引入顺序按收益与风险排序：先用剂量曲线确认覆盖扩张还有多少空间；再解决语义一致（掩码绑定、人工微调）；最后才把预算投向环境级合成与质量修复。判据是每单位成本的 val unseen 增量：增量低于停止阈值时把预算移到环境侧，停止在加密同一批场景上加码。</p>
+    </div>
+    <p>与相邻讲的分工：第 022 与 028 讲解释两种增广的机制与主结果；第 062 讲给出规模化管线的质量证据；本讲把三者合并成边界分析与决策表。第 066 讲转入记忆范式的预算推导，那里处理的是「模型记什么、花多少内存」的另一半方法论。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>三段代码分别给出剂量-响应汇总、泄漏审计与漂移度量。数字与正文一致，可直接作为实验记录脚本的骨架。</p>
+
+    <p><strong>片段 1：剂量-响应与停止判据</strong></p>
+    <pre class="code"><code>def dose_response(fracs, sr):
+    """输入增广剂量比例与对应 val-unseen SR，输出分段边际效率。"""
+    rows = []
+    for i in range(1, len(fracs)):
+        d_f = fracs[i] - fracs[i - 1]          # 本段新增的数据比例
+        d_s = sr[i] - sr[i - 1]                # 本段带来的 SR 增量（百分点）
+        rows.append({
+            "range": (fracs[i - 1], fracs[i]),
+            "delta_sr": round(d_s, 2),
+            "per_frac": round(d_s / d_f, 2),   # 每单位比例的增量
+            "per_1k": round(d_s / (178000 * d_f / 1000), 4),  # 每千条合成指令
+        })
+    first, last = rows[0]["per_frac"], rows[-1]["per_frac"]
+    stop = rows[-1]["delta_sr"] &lt; 0.5          # 停止判据：末段增量低于 0.5 点
+    return rows, round(first / last, 2), stop
+
+# Speaker-Follower 口径（Fried 等 2018）：19.9 / 22.8 / 24.6
+rows, ratio, stop = dose_response([0.0, 0.25, 1.0], [19.9, 22.8, 24.6])
+# 末段效率比 4.83，末段增量 1.8 点：未触发停止，但已进入低效区</code></pre>
+    <p>解读：<strong>（1）</strong>分段效率把「值不值得继续加」变成可比较的数，效率比大于 3 时优先检查覆盖是否饱和；<strong>（2）</strong>停止判据写成显式布尔量，便于多方案批量比较；阈值 0.5 点应结合两次运行的标准误调整；<strong>（3）</strong>每千条口径让不同规模的增广方案可比，避免用绝对数据量掩盖效率差异。</p>
+
+    <p><strong>片段 2：泄漏审计</strong></p>
+    <pre class="code"><code>def leakage_audit(aug_index, eval_index, threshold=0.95):
+    """审计增广数据与评测集的场景、路线与视觉近重复。"""
+    scene_hit = set(aug_index["scenes"]) &amp; set(eval_index["scenes"])
+    route_hit = set(aug_index["routes"]) &amp; set(eval_index["routes"])
+    dup = []
+    for key, feat in aug_index["images"].items():
+        m = eval_index["search"](feat, top_k=1)
+        if m and m[0]["scene"] in eval_index["scenes"] and m[0]["score"] &gt;= threshold:
+            dup.append((key, m[0]["scene"], round(m[0]["score"], 4)))
+    report = {
+        "scene_leak": sorted(scene_hit),        # 非空表示环境级泄漏
+        "route_leak": sorted(route_hit),        # 非空表示监督级泄漏
+        "near_dup": dup[:10],                   # 视觉近重复抽样
+    }
+    assert not scene_hit and not route_hit, report
+    return report
+
+# 审计通过后，增广集与评测集的生成脚本仍需隔离：
+# 评测清单冻结并记录校验值，生成器只读取训练侧缓存</code></pre>
+    <p>解读：<strong>（1）</strong>两级检查从粗到细：标识集合交集处理场景与监督泄漏，相似度检索处理近重复；<strong>（2）</strong>断言让审计失败直接中断流程，防止带病数据进入训练；<strong>（3）</strong>报告字段与数据卡片的「已知偏差」对齐，审计结果随数据版本一起冻结。</p>
+
+    <p><strong>片段 3：指令漂移与掩码绑定检查</strong></p>
+    <pre class="code"><code>def instruction_drift(synth, human, n=4):
+    """度量合成指令相对人工指令的 n-gram 重叠与长度分布。"""
+    def grams(texts):
+        out = set()
+        for t in texts:
+            w = t.split()
+            out.update(tuple(w[i:i + n]) for i in range(len(w) - n + 1))
+        return out
+    s_g, h_g = grams(synth), grams(human)
+    overlap = len(s_g &amp; h_g) / max(len(s_g), 1)   # 合成侧被人工侧覆盖的比例
+    mlen = [sum(len(t.split()) for t in x) / len(x) for x in (synth, human)]
+    return {"gram_overlap": round(overlap, 3),
+            "len_synth": round(mlen[0], 2),
+            "len_human": round(mlen[1], 2)}
+
+def binding_ok(speaker_mask, follower_mask):
+    """EnvDrop 掩码绑定检查：同一三元组两侧掩码逐元素相同。"""
+    same = bool((speaker_mask == follower_mask).all())
+    # 论文口径：绑定 52.2 对不绑定 49.0，差 3.2 点；不通过不得进入训练
+    return same</code></pre>
+    <p>解读：<strong>（1）</strong>重叠率揭示模板化程度：数值过高说明合成指令在复用少量句式，应提高真实改写比例或降低合成剂量；<strong>（2）</strong>长度分布是第二个漂移信号，合成与人工的均值差超过一个词就要检查采样器；<strong>（3）</strong>绑定检查放在数据装载层，任何一次采样失误都会在训练前暴露，避免用 3.2 个点的代价做事后归因。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>在评测环境上生成增广数据并当零样本结果报告</strong>：指标大涨，结论无法复用。根因是把预探索协议与标准零样本混表。修复：生成脚本只读训练侧清单；预探索数字单独成表并醒目标注协议。</li>
+      <li><strong>只报总增益不报剂量曲线</strong>：加满合成数据后发现收益低于预期，无法定位是覆盖饱和还是漂移。根因是实验只设 0 与 100% 两个点。修复：设 25% 步长的剂量梯度，输出分段效率表；把停止判据写进实验计划。</li>
+      <li><strong>图像级扰动破坏跨视角一致性</strong>：特征丢弃只值 0.2 个点，还引入互相矛盾的画面。根因是掩码按元素独立采样，跨视角一致概率约 1.03×10<sup>−8</sup>。修复：掩码按环境采样并由说话者与跟随者共用，保留朝向与空间结构。</li>
+      <li><strong>把增广当环境多样性的替代</strong>：训练环境内铺满数据也换不到新场景的泛化。根因是覆盖收益存在上界（训练环境内回译仅 +1.7 点）。修复：先核对环境清单与质量闸门，再决定增广预算；把环境扩张与数据扩张的成本并列比较。</li>
+      <li><strong>低质数据直接进预训练</strong>：数据量增加 61% 而指标微降。根因是质量分层缺失，渲染缺陷被当作多样性。修复：按缺陷比例分层验收，先修复再合并；修复前后各跑一次同配方对照。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>完成 SF 剂量账：基线 19.9%、25% 合成 22.8%、全量 24.6%（val unseen）。计算 (a) 两段增量与相对提升；(b) 分段效率比；(c) 每千条合成指令的增量（178,000 条全量口径）。 <span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>(a) 前段 +2.9 点（相对 14.57%），后段 +1.8 点（相对 25% 档 7.89%）。(b) η₁ = 2.9/0.25 = 11.60，η₂ = 1.8/0.75 = 2.40，比值 4.83。(c) 前 44,500 条每千条 0.0652 点，后 133,500 条每千条 0.0135 点。</div></details>
+      </li>
+      <li>改超参并预测：把 EnvDrop 的环境丢弃率从 p = 0.4 提到 p = 0.7，保持其他设定不变。预测 (a) 某维度跨 36 视角一致保留的概率变化；(b) val unseen SR 的方向；(c) 一个可证伪的观测指标。 <span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>(a) 一致保留概率为 (1−p)<sup>36</sup>：p = 0.4 时 0.6<sup>36</sup> ≈ 1.03×10<sup>−8</sup>，p = 0.7 时 0.3<sup>36</sup> ≈ 1.50×10<sup>−19</sup>，保留语义的维度几乎消失；完全遮蔽的概率升到 0.7<sup>36</sup> ≈ 2.65×10<sup>−6</sup>，跨视角可见模式稀疏且不一致。(b) 预测下降：每个维度在大多数视角被遮蔽，虚拟环境与真实环境的距离拉大，说话者的指令与跟随者看到的画面偏差扩大。(c) 观测指标：跨整条 episode 从未被保留的语义维度比例，或遮蔽条件下说话者指令相对路线的 BLEU 变化。</div></details>
+      </li>
+      <li>泄漏审计设计：某团队在 R2R val unseen 的 11 个场景上做回译扩增，声称零样本 62%。列出 (a) 判定泄漏的证据清单；(b) 修复后的可比较数字应该怎样生成；(c) 报告中必须标注的三项协议信息。 <span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>(a) 场景标识交集非空；生成脚本读取了 val 清单；数字与 EnvDrop 预探索档 61.9% 量级一致。(b) 只在 61 个训练场景回译，重跑同配方，val unseen 数字重新评测。(c) split 全名、环境是否参与训练（预探索标记）、快照选择来源。</div></details>
+      </li>
+      <li>推导与度量：给定 36 视角全景、掩码保留率 0.6。要求 (a) 写出某特征维度跨视角状态一致的精确表达式；(b) 计算 p = 0.4 与 p = 0.7 的数值；(c) 解释掩码共享把该概率提升到 1 的原因与代价。 <span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>(a) (1−p)<sup>36</sup> + p<sup>36</sup>。(b) p = 0.4 时 1.03×10<sup>−8</sup>；p = 0.7 时 1.50×10<sup>−19</sup> + 2.65×10<sup>−6</sup> ≈ 2.65×10<sup>−6</sup>，主导项从「一致保留」翻转为「一致丢弃」。(c) 共享让同一环境所有视角用同一张掩码，一致性为 1；代价是扰动粒度变粗，同一环境内无法区分「局部遮挡」与「物体整体缺失」，只能模拟后者。</div></details>
+      </li>
+      <li>完整设计：为空中导航任务（第 052 至 054 讲）写一份增广方案，要求 (a) 从合成指令、环境丢弃、环境级合成三类中按递减判据排序并说明理由；(b) 设计含剂量梯度与主终点的实验表；(c) 设置泄漏审计、质量闸门与停止判据各一条；(d) 给出一个预期为负的组合并说明识别方法。 <span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>(a) 空中任务高度与视角变化多，优先环境级合成与视角扰动，合成指令次之；需要先核对飞控与高度先验，增广不能替代高度监督。(b) 剂量 0/25/50/75/100%，主终点 val unseen SR，副终点 NE 与到达高度误差。(c) 泄漏审计：场景与任务标识交集；质量闸门：按高度带分层验收；停止判据：末段增量低于 0.5 点。(d) 预期为负的组合：同时施加掩码不绑定与高剂量模板指令，识别方法是看 SPL 与指令-观测一致性分项同步下降。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>增广收益按剂量递减：SF 前 25% 剂量拿 2.9 点、效率 11.60，后 75% 只补 1.8 点、效率 2.40，比值 4.83；描述性饱和拟合上界约 4.82 点。</li>
+      <li>环境多样性是主瓶颈：训练环境内回译只值 +1.7 点，真实新环境回译值 +15.4 点；后者属于预探索协议，必须单独标注。</li>
+      <li>分布漂移的核心是语义一致：掩码绑定相对不绑定值 3.2 点（52.2 对 49.0）；独立特征掩码的跨视角一致概率约 1.03×10<sup>−8</sup>，几乎必然自相矛盾。</li>
+      <li>泄漏有三条通道（场景级、监督级、近重复），审计手段依次是标识交集、依赖清单与相似度检索；评测集冻结与生成脚本隔离是共同修复。</li>
+      <li>质量闸门决定扩张方向的正负：未修复 Gibson 数据增加 61% 时 −0.26 点，修复后同规模 +1.49 点。</li>
+      <li>增广决策表以「下一剂量增量低于 0.5 点」为停止判据，投入顺序为覆盖、一致、规模。下一讲转入记忆范式总览：把四类记忆载体的内存、延迟、精度三笔账推导成训练预算表（第 066 讲）。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch064.html">← 第 064 讲：数据工程再谈（承 033）</a>
+    <a class="next" href="ch066.html">第 066 讲：记忆范式总览（承 039） →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.06 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:11.5px !important;letter-spacing:.06em !important;color:rgba(71,85,105,.45) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#7e8ba0 !important;font-size:11.5px !important;line-height:1.8 !important;text-align:center !important;padding:5px 12px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

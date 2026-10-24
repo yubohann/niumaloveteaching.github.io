@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 021 讲｜Seq2Seq 基线全解剖 | 视觉语言导航课程 · VLN-100</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 离散方法谱系：从模块到预训练</span>
+    <span class="sep">/</span>
+    <span>第 021 讲</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 离散方法谱系：从模块到预训练</div>
+    <h1>第 021 讲｜Seq2Seq 基线全解剖</h1>
+    <p class="lead">本讲把 R2R 原论文的序列到序列基线逐层拆开：指令编码（词嵌入 256、LSTM 512、语序反转）、观测与动作嵌入、Luong 注意力、动作分布与交叉熵损失；讲清训练标签按当前位置重规划这一关键机制，并用一个小 batch 实算逐步损失与梯度；最后解释 20.4%（test）为何是必须跨过的性能下限。</p>
+    <ul class="meta">
+      <li>主题：Seq2Seq 基线 / 注意力解码 / 行为克隆损失 / 训练体制</li>
+      <li>关键公式：h<sub>i</sub> = LSTM<sub>enc</sub>(x<sub>i</sub>, h<sub>i−1</sub>)；π<sub>t</sub> = softmax(W<sub>o</sub>·tanh(W<sub>c</sub>[c<sub>t</sub>; h′<sub>t</sub>]))</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置讲：第 020 讲（第一篇复盘：任务-数据-评测公共语言）</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>会写：给出基线模型的信息流公式链，从指令词到动作分布逐段写清符号与张量形状（Anderson 等 2018，R2R）。</li>
+      <li>会算：对一个小 batch 实算逐步交叉熵、token 均值与 episode 均值，并写出 softmax 加交叉熵的梯度 p − y。</li>
+      <li>会判断：区分 teacher-forcing 与 student-forcing 的输入分布与标签来源，说明标签按当前位置重规划为何是 student-forcing 可训练的前提。</li>
+      <li>会实现：写出带掩码的行为克隆损失、注意力解码与贪心评测循环三个核心片段。</li>
+      <li>会评估：把 val-seen 38.6%、val-unseen 21.8%、test 20.4% 当作复现验收锚点，并解释 seen 与 unseen 落差 16.8 点的结构成因。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第二篇讲离散方法谱系，起点是原论文自带的那个最小完整系统。020 讲建立的公共语言告诉我们：R2R 离散协议下的第一条性能底线由 Anderson 等 2018 的序列到序列（sequence-to-sequence，Seq2Seq）基线给出，student-forcing 训练在 val-seen 38.6%、val-unseen 21.8%，test 20.4%；人类在 test 为 86.4%。此后第二篇的每条方法线，都可视为对这套基线的某一处做替换或增强：022 换动作空间与数据、025 换匹配目标、030 之后换表征与预训练。</p>
+    <p>基线值得全解剖的理由有三条。<strong>第一，它是复现的标尺</strong>：特征口径、词表过滤、掩码与停止处理任何一处写错，数字都会明显低于 21.8%，而错误原因通常藏在实现细节里。<strong>第二，它把问题结构暴露得最清楚</strong>：观测只有前向 60° 视场，动作只有 6 个，历史完全由单个解码器循环状态承载，语言只经注意力读取一次；后续方法的每一次改进都针对其中一个约束。<strong>第三，它的失败模式定义了之后数年的研究议程</strong>：seen 与 unseen 的落差、提前停止、模态偏差都在该系统上首次变成可量化现象。</p>
+    <p>本讲要解决三件事：把前向与损失写成不跳步的公式链；用一个小 batch 实算损失与梯度，把「行为克隆」从口号变成可核对数字；把 teacher-forcing 与 student-forcing 的差异落到标签重规划这一实现机制上。022 讲将立即展示，替换动作空间并加入合成数据，同一底座可以发生多大的变化。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 条件策略的 Seq2Seq 分解</h3>
+    <p>VLN 策略写作 π(a<sub>t</sub> | o<sub>≤t</sub>, ℓ)：给定截至 t 的观测历史和固定指令 ℓ，输出动作分布。原论文用一个带注意力机制的 LSTM 编码器与解码器实现它：编码器把指令压成隐藏状态序列，解码器在每一步读取当前图像特征与上一步动作嵌入，经注意力读取指令后输出 6 个动作的概率。</p>
+    <div class="formula">
+      h<sub>i</sub> = LSTM<sub>enc</sub>(x<sub>i</sub>, h<sub>i−1</sub>)，h̄ = {h<sub>1</sub>, …, h<sub>L</sub>}
+      <span class="note">x<sub>i</sub> 为第 i 个词的词嵌入（256 维）；L 为指令长度；h̄ 是注意力的上下文集合；编码器与解码器隐藏维度均为 512</span>
+    </div>
+    <p>两个被论文明确采用的工程选择写在编码侧。<strong>其一，语序反转</strong>：把 ⟨x<sub>1</sub>, …, x<sub>L</sub>⟩ 反转后送入编码器，借鉴 Sutskever 等在机器翻译中的做法，缩短句中首词与解码端最相关词之间的路径长度。<strong>其二，词表过滤</strong>：全部指令小写化，按空白分词，出现少于 5 次的词被过滤；R2R 词表约 3.1k 词，其中约 1.2k 个出现 5 次及以上，其余约 61.3%（实算）为长尾词。长尾里多是人名与偶然地标，这解释了后续方法为何反复回到词表泛化问题。</p>
+
+    <h3>2. 观测与动作嵌入：解码器的输入拼接</h3>
+    <p>解码器每一步的输入由两部分拼接：当前视角的图像特征与上一步动作的学习嵌入。图像特征用 ImageNet 预训练的 ResNet-152 做均值池化，得到 2048 维向量，训练全程冻结；动作嵌入维度 32，与词嵌入一样从随机初始化学习。</p>
+    <div class="formula">
+      q<sub>t</sub> = [ f<sub>CNN</sub>(o<sub>t</sub>) ; e(a<sub>t−1</sub>) ]，h′<sub>t</sub> = LSTM<sub>dec</sub>(q<sub>t</sub>, h′<sub>t−1</sub>)
+      <span class="note">f<sub>CNN</sub> ∈ ℝ<sup>2048</sup>，e(a<sub>t−1</sub>) ∈ ℝ<sup>32</sup>，q<sub>t</sub> ∈ ℝ<sup>2080</sup>；解码器循环状态承载全部历史，这是部分可观测条件下的记忆机制</span>
+    </div>
+    <p>论文对观测的规定是 640×480 分辨率、垂直视场 60° 的第一人称 RGB 图像。注意这是一个前向局部视图：智能体看不到身后与两侧，若指令要求左转，它必须先用 up/down/left/right 四个转镜动作找到目标方向再前进。动作空间限定为 6 个：左、右、上、下各转 30°，前进到视场中心最近的可达视点，以及停止。前进动作的定义把「看向哪里」与「走到哪里」绑定，动作序列因此既包含相机控制也包含位置移动。</p>
+    <p>训练加速的工程口径需要单独记住：由于转向与俯仰被离散成 30° 增量，官方仓库预先把每个全景切成 36 个视角（12 个水平朝向 × 3 个俯仰档），每视角缓存 2048 维 ResNet-152 特征；基线按当前朝向选取对应视角。全库 379,080 行、float32 下约 2.89 GiB；单帧特征 12 × 2048 × 4 字节 = 96 KiB，换原始像素则为每帧约 10.55 MiB，是特征表示的 112.5 倍（承 001、004 讲口径）。</p>
+
+    <h3>3. 注意力与动作分布</h3>
+    <p>解码每一步先用 Luong 等 2015 的一般对齐打分在指令编码序列上计算权重，再加权求和得到指令上下文 c<sub>t</sub>，最后与解码状态拼接经过一次变换得到动作 logits。</p>
+    <div class="formula">
+      score(h′<sub>t</sub>, h<sub>i</sub>) = h′<sub>t</sub><sup>⊤</sup> W<sub>a</sub> h<sub>i</sub>，α<sub>t,i</sub> = exp(score<sub>t,i</sub>) / Σ<sub>j</sub> exp(score<sub>t,j</sub>)
+      <span class="note">W<sub>a</sub> ∈ ℝ<sup>512×512</sup> 为可学习参数；填充位置的 score 置为负极大值后再归一化</span>
+    </div>
+    <div class="formula">
+      c<sub>t</sub> = Σ<sub>i</sub> α<sub>t,i</sub> h<sub>i</sub>，h̃<sub>t</sub> = tanh( W<sub>c</sub> [c<sub>t</sub> ; h′<sub>t</sub>] )，π<sub>t</sub> = softmax( W<sub>o</sub> h̃<sub>t</sub> )
+      <span class="note">论文写作 a<sub>t</sub> = softmax(h̃<sub>t</sub>)，本课程按实现口径补出输出线性层 W<sub>o</sub> ∈ ℝ<sup>6×512</sup>；π<sub>t</sub> ∈ Δ<sup>5</sup> 为 6 维动作分布</span>
+    </div>
+    <p>公式的适用条件有两条。<strong>指令固定</strong>：ℓ 在整个 episode 内不变，注意力每步在同一组 h̄ 上重新加权，模型学会在不同阶段读取指令的不同片段。<strong>视觉注意力缺位</strong>：论文明确不引入图像注意力，单帧特征直接进入解码器。这个缺失正是 022 讲全景动作空间与后续历史编码工作的起点。</p>
+
+    <h3>4. 标签重规划：两种训练体制的真正区别</h3>
+    <p>两种体制都在每一步用交叉熵最大化目标动作的似然，关键差别在「上一步输入什么」与「标签从哪里来」。论文把目标动作 a<sub>t</sub>* 定义为：<strong>从智能体当前位姿 s<sub>t</sub> 出发到目标 v* 的最短路径上的下一个动作</strong>。这个定义对任意偏离状态都成立，是 student-forcing 能够训练的核心。</p>
+    <table>
+      <tr><th>体制</th><th>上一步输入</th><th>标签来源</th><th>状态分布</th><th>主要代价</th></tr>
+      <tr><td>teacher-forcing</td><td>真值动作（训练时强制）</td><td>当前位姿到目标的最短路首动作</td><td>只落在真值轨迹上</td><td>训练与测试输入分布不一致</td></tr>
+      <tr><td>student-forcing</td><td>模型采样动作</td><td>同上，对偏离后的位姿重新规划</td><td>覆盖偏离状态</td><td>训练更慢；采样方差</td></tr>
+      <tr><td>计划采样（scheduled sampling，论文未采用）</td><td>按概率混合真值与采样</td><td>同上</td><td>介于两者之间</td><td>论文实测差于全部采样</td></tr>
+    </table>
+    <p>需要强调三个细节。<strong>第一</strong>，免费获得任意状态标签的前提是导航图已知且确定：仿真器可以随时算出当前节点到目标的最短路。真实机器人上这一点不成立，所以 student-forcing 属于仿真内可用的强监督手段。<strong>第二</strong>，student-forcing 等价于在线版本的 DAgger，把「策略访问到的状态」与「该状态下的专家动作」配对，缓解输入分布错位。<strong>第三</strong>，论文脚注说明计划采样表现更差，直接采用全部采样，这与很多任务的经验相反，原因在标签随处可得且动作空间小。</p>
+
+    <h3>5. 小 batch 损失实算</h3>
+    <p>设一个 batch 含两条 episode A、B，动作空间 6 个，按时间顺序给出逐步概率如下表。目标动作来自重规划标签：A 为前进、左转、前进，B 为前进、右转、上升、停止。每行六个概率之和为 1。</p>
+    <table>
+      <tr><th>episode</th><th>步</th><th>左</th><th>右</th><th>上</th><th>下</th><th>前进</th><th>停止</th><th>目标</th><th>目标概率</th><th>损失</th></tr>
+      <tr><td>A</td><td>1</td><td>0.05</td><td>0.05</td><td>0.02</td><td>0.03</td><td>0.80</td><td>0.05</td><td>前进</td><td>0.80</td><td>0.2231</td></tr>
+      <tr><td>A</td><td>2</td><td>0.60</td><td>0.10</td><td>0.05</td><td>0.05</td><td>0.15</td><td>0.05</td><td>左转</td><td>0.60</td><td>0.5108</td></tr>
+      <tr><td>A</td><td>3</td><td>0.05</td><td>0.05</td><td>0.02</td><td>0.03</td><td>0.75</td><td>0.10</td><td>前进</td><td>0.75</td><td>0.2877</td></tr>
+      <tr><td>B</td><td>1</td><td>0.02</td><td>0.03</td><td>0.05</td><td>0.05</td><td>0.80</td><td>0.05</td><td>前进</td><td>0.80</td><td>0.2231</td></tr>
+      <tr><td>B</td><td>2</td><td>0.05</td><td>0.70</td><td>0.05</td><td>0.05</td><td>0.10</td><td>0.05</td><td>右转</td><td>0.70</td><td>0.3567</td></tr>
+      <tr><td>B</td><td>3</td><td>0.05</td><td>0.10</td><td>0.60</td><td>0.10</td><td>0.10</td><td>0.05</td><td>上升</td><td>0.60</td><td>0.5108</td></tr>
+      <tr><td>B</td><td>4</td><td>0.02</td><td>0.02</td><td>0.03</td><td>0.03</td><td>0.10</td><td>0.80</td><td>停止</td><td>0.80</td><td>0.2231</td></tr>
+    </table>
+    <p>Python 实算结果：A 的逐步损失之和 1.0217，步均值 0.3406；B 之和 1.3138，步均值 0.3284。整个 batch 共 7 个有效步，损失总和 2.3354；按 token 平均（除以 7）得 0.3336，按 episode 平均（除以 2）得 1.1677。三种口径回答不同问题：token 均值衡量每步决策质量，episode 均值在长轨迹任务里会被步数放大，步均值消除长度影响。<strong>报告与对比损失前必须写明用哪种平均口径</strong>，否则两条长度不同的曲线无法比较。</p>
+    <p>梯度同样可以手算。若某步目标为「前进」，则对 logits 的梯度为 ∂L/∂z<sub>j</sub> = p<sub>j</sub> − 1[j = 前进]：目标维为 0.80 − 1 = −0.20，其余五维为各自的概率 0.05、0.05、0.02、0.03、0.05（合计 0.20，与目标维的负值相抵）。这个 p − y 结构是所有 softmax 加交叉熵实现共享的形式，也是判断「损失实现是否有误」的最快检查点。</p>
+
+    <h3>6. 训练配置与官方超参</h3>
+    <table>
+      <tr><th>参数</th><th>论文取值</th><th>作用与依据</th></tr>
+      <tr><td>LSTM 隐藏维度</td><td>512（编码器与解码器）</td><td>容量与批大小的折中；本讲估算总参数量约 8.47M（见代码片段解读）</td></tr>
+      <tr><td>词嵌入维度</td><td>256</td><td>词表约 3.1k，256 维足以覆盖，随机初始化</td></tr>
+      <tr><td>动作嵌入维度</td><td>32</td><td>仅 6 个动作，低维嵌入即可区分</td></tr>
+      <tr><td>丢弃率</td><td>0.5</td><td>施加于词嵌入、CNN 特征与注意力内部，缓解过拟合</td></tr>
+      <tr><td>优化器与批量</td><td>Adam 加权重衰减，批 100</td><td>论文配置；固定迭代步数训练</td></tr>
+      <tr><td>评测解码</td><td>贪心（greedy）</td><td>评测为单次 rollout；榜单提交模型在 train 加 val 数据上重训</td></tr>
+    </table>
+
+    <h3>7. 性能下限的意义：三张锚点表</h3>
+    <p>教师强制与学生强制在验证集上的对照（离散 R2R，CVPR 2018 口径）：</p>
+    <table>
+      <tr><th>方法</th><th>val-seen SR</th><th>val-seen NE</th><th>val-seen OSR</th><th>val-unseen SR</th><th>val-unseen NE</th><th>val-unseen OSR</th></tr>
+      <tr><td>teacher-forcing</td><td>27.1%</td><td>8.01 m</td><td>36.7%</td><td>19.6%</td><td>8.61 m</td><td>29.1%</td></tr>
+      <tr><td>student-forcing</td><td>38.6%</td><td>6.01 m</td><td>52.9%</td><td>21.8%</td><td>7.81 m</td><td>28.4%</td></tr>
+    </table>
+    <p>学生强制相对教师强制：val-seen 成功率提高 11.5 点（相对 42.4%），val-unseen 仅提高 2.2 点（相对 11.2%）；NE 分别改善 2.00 m（25.0%）与 0.80 m（9.3%）。<strong>探索带来的收益几乎全部落在见过的环境里，未见环境提升有限</strong>，这是后续所有泛化方法要面对的第一事实。</p>
+    <p>测试集锚点（同一论文，test 18 个未见场景，目标位置不公开）：</p>
+    <table>
+      <tr><th>方法</th><th>SR</th><th>NE</th><th>OSR</th><th>TL</th></tr>
+      <tr><td>随机（随机转向后走 5 步）</td><td>13.2%</td><td>9.77 m</td><td>18.3%</td><td>9.93 m</td></tr>
+      <tr><td>student-forcing</td><td>20.4%</td><td>7.85 m</td><td>26.6%</td><td>8.13 m</td></tr>
+      <tr><td>人类</td><td>86.4%</td><td>1.61 m</td><td>90.2%</td><td>11.90 m</td></tr>
+    </table>
+    <p>三条读数决定本课程之后的方法叙事。<strong>第一，20.4% 是复现验收锚点</strong>：标准协议下管线正确时，student-forcing 应落在 val-unseen 约 21.8%、test 约 20.4% 附近；显著低于该值通常意味着特征、词表、掩码或停止处理有实现错误。<strong>第二，模型的轨迹长度反常</strong>：test 上模型 TL 8.13 m，短于最短路参照 9.93 m 的 0.819 倍，说明它频繁提前停止；提前停止与真正失败的区分需要轨迹长度与 SR、NE 联合解读。<strong>第三，与人类的差距是 4.235 倍</strong>（86.4% 对 20.4%），人类轨迹长度 11.90 m 略长于最短路，说明人类会绕行确认地标，效率与可靠性的权衡与模型相反。</p>
+
+    <h3>8. 适用边界与失效模式</h3>
+    <ul>
+      <li><strong>前向视野假设</strong>：观测只有 60° 垂直视场的前向图像，转弯必须消耗动作步。任何需要侧向或回望的任务在这个接口下先天吃亏，022 讲的全景动作空间直接消除该限制。</li>
+      <li><strong>历史压缩到单一循环状态</strong>：全部观测与动作历史压进 512 维解码状态，长 episode 下早期视觉证据会衰减。034 讲之后的层级历史编码是对该瓶颈的回应。</li>
+      <li><strong>视觉主干冻结</strong>：ResNet-152 特征不参与更新，接地能力受限于 ImageNet 语义，表征偏差问题在 010、011 讲已有量化证据。</li>
+      <li><strong>稀疏奖励不作为训练信号</strong>：基线只用行为克隆，任务奖励只在评测出现；029 讲的两阶段训练把强化学习接在同一底座上。</li>
+      <li><strong>标签重规划依赖完美定位与已知拓扑</strong>：student-forcing 的标签来自仿真器最短路，跨到连续环境（041 讲）后该机制需要重写。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>把基线落成可复现工程，需要四件交付物：模块接口表、训练体制取舍表、特征缓存设计与超参表。四者的数值口径与论文一致，工程细节按公开仓库的通行做法补全。</p>
+
+    <h3>产出 1：模块接口表</h3>
+    <table>
+      <tr><th>模块</th><th>输入</th><th>输出与形状约定</th><th>设计要点</th></tr>
+      <tr><td>指令编码器</td><td>词 id 序列（反转后）</td><td>h̄（L × 512）</td><td>词表过滤阈值 5；填充掩码保留到注意力阶段</td></tr>
+      <tr><td>观测编码</td><td>当前视角 RGB</td><td>2048 维均值池化特征</td><td>ResNet-152 冻结；预缓存 36 视角</td></tr>
+      <tr><td>解码器</td><td>q<sub>t</sub>（2080 维）、上一步循环状态</td><td>h′<sub>t</sub>（512）</td><td>循环状态即全部历史记忆</td></tr>
+      <tr><td>注意力</td><td>h′<sub>t</sub>、h̄、指令掩码</td><td>c<sub>t</sub>（512）</td><td>一般对齐打分；掩码置负极大值</td></tr>
+      <tr><td>动作头</td><td>[c<sub>t</sub>; h′<sub>t</sub>]（1024）</td><td>6 维 logits</td><td>tanh 后线性映射；softmax 只在损失与采样时施加</td></tr>
+    </table>
+
+    <h3>产出 2：训练体制取舍</h3>
+    <table>
+      <tr><th>判据</th><th>teacher-forcing</th><th>student-forcing</th></tr>
+      <tr><td>收敛速度</td><td>快</td><td>慢（探索更多状态）</td></tr>
+      <tr><td>val-seen 表现</td><td>27.1%</td><td>38.6%</td></tr>
+      <tr><td>val-unseen 表现</td><td>19.6%</td><td>21.8%</td></tr>
+      <tr><td>实现复杂度</td><td>低（标签与输入同源）</td><td>中（需要按位姿重规划标签）</td></tr>
+      <tr><td>选择判据</td><td>仅作为消融对照与快速冒烟测试</td><td>基线与后续方法的标准配置</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：标签在训练循环内重规划，不预计算</span>
+      <p>若在数据侧按起点预计算一次最短路标签，student-forcing 一旦偏离，标签就与状态不匹配，损失最优化的是错误目标。正确做法是在每个训练步内，用当前位姿查询最短路并取首动作，使标签与策略访问的状态同步演化。输入侧决定访问哪些状态，标签侧保证每个访问状态都有正确的监督，两者合起来才是完整的 student-forcing 实现。</p>
+    </div>
+
+    <h3>产出 3：特征缓存与显存预算</h3>
+    <p>官方仓库把全景特征预计算成 36 视角 × 2048 维，训练时按当前相机朝向索引，推理侧无需在线跑 CNN。汇总预算：全库 379,080 行、float32 约 2.89 GiB；单帧 96 KiB；若改用在线像素编码，单帧原始 RGB 约 10.55 MiB，放大 112.5 倍，训练吞吐将下降一个量级以上。批量 100、解码器 512 维条件下，显存瓶颈通常落在特征与激活上，参数量本身规模很小，第 018 讲的吞吐核算方法在此同样适用。</p>
+
+    <h3>产出 4：复现验收清单</h3>
+    <table>
+      <tr><th>检查点</th><th>通过判据</th><th>失败时的优先排查</th></tr>
+      <tr><td>数据侧</td><td>各 split 指令数 14,025 / 1,020 / 2,349 / 4,173 闭合</td><td>文件名与 split 字段（004 讲）</td></tr>
+      <tr><td>损失侧</td><td>小 batch 手算与代码输出一致（0.3336 一档）</td><td>填充掩码、平均口径</td></tr>
+      <tr><td>训练侧</td><td>val-unseen 应收敛到 21.8% 附近</td><td>标签重规划、语序反转、停止动作处理</td></tr>
+      <tr><td>评测侧</td><td>test 无本地评分，用 val-unseen 出结论</td><td>目标位置泄漏检查</td></tr>
+    </table>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>三段代码覆盖模型前向、带掩码与重规划标签的损失、贪心评测循环。代码按 PyTorch 风格编写，以公开实现的设计为参照，接口随版本演进。</p>
+
+    <p><strong>片段 1：指令编码器加注意力解码器</strong></p>
+    <pre class="code"><code>import torch
+import torch.nn as nn
+
+class Seq2SeqPolicy(nn.Module):
+    """R2R 原论文基线核心：指令编码器 + 注意力解码器。"""
+    def __init__(self, vocab_size, hidden=512, word_dim=256, action_dim=32,
+                 feature_dim=2048, n_actions=6):
+        super().__init__()
+        self.word_embed = nn.Embedding(vocab_size, word_dim)   # 词嵌入 256 维
+        self.act_embed = nn.Embedding(n_actions, action_dim)   # 动作嵌入 32 维
+        self.encoder = nn.LSTM(word_dim, hidden, batch_first=True)
+        self.decoder = nn.LSTM(feature_dim + action_dim, hidden, batch_first=True)
+        self.attn_w = nn.Linear(hidden, hidden, bias=False)    # Luong general 的 W_a
+        self.combine = nn.Linear(2 * hidden, hidden)           # W_c 的 [c_t; h'_t] 部分
+        self.head = nn.Linear(hidden, n_actions)               # 输出 6 个动作 logits
+
+    def forward(self, words, feats, prev_actions, word_mask):
+        """words: (B,L)；feats: (B,T,2048)；prev_actions: (B,T)；word_mask: (B,L)。"""
+        enc_out, (h, c) = self.encoder(self.word_embed(words)) # 语序反转在数据侧完成
+        logits = []
+        for t in range(feats.size(1)):
+            q = torch.cat([feats[:, t],
+                           self.act_embed(prev_actions[:, t])], dim=-1)
+            _, (h, c) = self.decoder(q.unsqueeze(1), (h, c))
+            h_t = h.squeeze(0)                                  # (B,H)
+            score = torch.bmm(self.attn_w(h_t).unsqueeze(1),
+                              enc_out.transpose(1, 2))          # (B,1,L)
+            score = score.masked_fill(~word_mask.unsqueeze(1), -1e9)
+            alpha = torch.softmax(score, dim=-1)                # 注意力权重
+            ctx = torch.bmm(alpha, enc_out).squeeze(1)          # (B,H)
+            h_tilde = torch.tanh(self.combine(
+                torch.cat([ctx, h_t], dim=-1)))                 # tanh(W_c[c_t; h'_t])
+            logits.append(self.head(h_tilde))                   # (B,6)
+        return torch.stack(logits, dim=1)                       # (B,T,6)</code></pre>
+    <p>解读：<strong>（1）</strong>编码器输出保留整条序列作为注意力上下文；解码器初始状态直接沿用编码器末状态，这是本实现的选择，论文未展开该细节，替换为零初始化通常不影响主要结论，但应在实验记录中注明。<strong>（2）</strong>掩码在打分之后、softmax 之前施加，填充词的分数被置为负极大值，避免注意力把概率分配给无意义位置。<strong>（3）</strong>动作头输出 logits，softmax 与交叉熵合并计算以利用数值稳定的实现；采样时再单独做 softmax。参数量估算按该结构：词嵌入 793,600、编码器 1,574,912、解码器 5,310,464、注意力打分投影 262,144、组合层 524,800、动作头 3,078、动作嵌入 192，合计约 8.47M（逐步计算见练习 4）；ResNet-152 约 60M 参数在外部冻结，不计入策略参数。</p>
+
+    <p><strong>片段 2：带掩码与标签重规划的行为克隆损失</strong></p>
+    <pre class="code"><code>import torch
+import torch.nn.functional as F
+
+def batch_bc_loss(policy, batch, shortest_first_action):
+    """行为克隆损失：每一步标签由当前位置到目标的最短路重新生成。
+    shortest_first_action(state, goal) 返回该状态下应执行的动作 id。"""
+    words = batch["words"]                    # (B,L)
+    feats = batch["feats"]                    # (B,T,2048)
+    prev_actions = batch["prev_actions"]      # (B,T)，第 0 步为占位
+    states = batch["states"]                  # (B,T)，每步的位姿
+    goals = batch["goals"]                    # (B,)
+    lengths = batch["lengths"]                # (B,)
+    word_mask = words != 0
+
+    logits = policy(words, feats, prev_actions, word_mask)     # (B,T,6)
+    labels = torch.zeros_like(prev_actions)
+    for b in range(words.size(0)):
+        for t in range(int(lengths[b])):
+            labels[b, t] = shortest_first_action(states[b, t], goals[b])
+
+    step_loss = F.cross_entropy(
+        logits.reshape(-1, logits.size(-1)), labels.reshape(-1),
+        reduction="none").view(labels.shape)
+    mask = torch.arange(logits.size(1))[None, :] &lt; lengths[:, None]
+    token_mean = (step_loss * mask).sum() / mask.sum()         # 只对有效步取平均
+    return token_mean</code></pre>
+    <p>解读：<strong>（1）</strong>标签循环在训练步内执行，保证每一次前向的监督目标与策略当前访问的位姿一致，这是 student-forcing 的必要条件；若把该函数换成按 episode 起点预计算的静态标签，偏离状态会得到错误梯度。<strong>（2）</strong>掩码同时服务两个目的：长度不同的 episode 组成 batch 时屏蔽填充步，并让分母恰为有效步数；本讲算例的全 batch token 均值为 2.3354 / 7 = 0.3336。<strong>（3）</strong>若改用 episode 平均，只需把分母换成 batch 内 episode 数；两种口径的训练动力学不同，切换口径必须同步调整学习率与报告格式。</p>
+
+    <p><strong>片段 3：贪心评测循环</strong></p>
+    <pre class="code"><code>import torch
+
+@torch.no_grad()
+def greedy_decode(policy, env, max_steps=50):
+    """评测用贪心解码：每步取概率最大的动作，直到停止或达到步数上限。
+    为便于与训练逻辑对照，这里对前缀重算前向；产线实现应缓存循环状态。"""
+    states, feats, prev_actions = [], [], []
+    action = 0                                  # 起始动作占位
+    for _ in range(max_steps):
+        states.append(env.state())              # 先记录本步状态
+        feats.append(env.observe_feature())     # 当前视角 2048 维特征
+        prev_actions.append(action)
+        words = torch.tensor([env.token_ids()]) # 指令固定，可预计算一次
+        logits = policy(words,
+                        torch.stack(feats).unsqueeze(0),
+                        torch.tensor([prev_actions]),
+                        words != 0)
+        action = int(logits[0, -1].argmax())    # 贪心选择本轮新动作
+        if action == env.STOP_ID:
+            break                               # 预测停止：不调用 env.step
+        env.step(action)                        # 执行后位姿与观测更新
+    return states</code></pre>
+    <p>解读：<strong>（1）</strong>评测代码里没有任何真值调用，目标只在循环结束后由评测器使用，这是防止未来信息泄漏的接口纪律。<strong>（2）</strong>停止动作先于环境步进判断：预测停止即结束，不再调用 <code>env.step</code>；把停止处理写错（例如停止后仍推进一步）会系统性改变 NE 与成功率。<strong>（3）</strong>前缀重算带来 O(T²) 前向开销，仅用于讲解与调试；正式评测缓存 LSTM 状态与注意力上下文，单步前向即可。贪心是论文的评测口径，beam search 属于额外搜索预算，报告时必须注明。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>语序反转与截断顺序写反</strong>：症状是长指令表现异常，模型对句首描述不敏感。根因是官方仓库对反转后的序列做截断，且分词器默认长度 20，直接调用默认值会丢掉句首内容（004 讲有同源提示）。修复：显式传入编码长度（基线训练配置为 80），或先按原序截断再反转，并用手工样例断言首词仍被保留。</li>
+      <li><strong>标签未按当前位置重规划</strong>：症状是 student-forcing 训练损失正常下降，但评测成功率远低于 21.8%。根因是按 episode 起点预计算了静态标签，策略偏离后监督目标错误。修复：在训练循环内用当前位姿查询最短路，取首动作作为标签，并断言标签与状态同步更新。</li>
+      <li><strong>填充掩码遗漏</strong>：症状是损失数值随 batch 内最长序列波动，梯度被填充步稀释。根因是交叉熵对填充位置一并求平均。修复：按本讲片段 2 的方式同时屏蔽损失与注意力打分，并把分母固定为有效步数。</li>
+      <li><strong>停止动作处理不一致</strong>：症状是 NE 明显偏低但 SR 明显低于锚点，或轨迹长度恰好等于步数上限。根因通常是停止后仍执行一步、或把超步数当成功处理。修复：预测停止立即结束；超步数与超时统一计为失败并单列统计。</li>
+      <li><strong>用损失绝对值横向比较实现</strong>：症状是「损失更低所以模型更好」的误判。根因是平均口径、词表大小与掩码方式不同，损失尺度不可跨实现比较。修复：固定口径后再比；优先用 SR、NE、SPL 等任务指标做模型比较，损失只做训练健康度监控。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>给定一步 6 动作分布 (0.10, 0.05, 0.05, 0.05, 0.65, 0.10)，目标为前进：(a) 计算该步交叉熵；(b) 写出对 logits 的梯度向量；(c) 说明把目标概率从 0.65 提高到 0.90 时损失下降的幅度。 <span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>(a) −ln 0.65 = 0.4308。(b) 前进维 0.65 − 1 = −0.35，其余五维为 0.10、0.05、0.05、0.05、0.10（即各自的概率）。(c) −ln 0.90 = 0.1054，下降 0.3254。</div></details>
+      </li>
+      <li>teacher-forcing 与 student-forcing 各自在什么条件下更合适？写出各自的标签构造伪代码，并说明为什么论文脚注报告计划采样差于全部采样。 <span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>冒烟测试与对照用 teacher-forcing，主训练用 student-forcing。标签构造：取当前位姿到目标的最短路首动作，两种体制相同，差别在输入状态从何而来。计划采样在标签随处可得、动作空间小的设定下引入额外混合噪声，实测更差。</div></details>
+      </li>
+      <li>模型走到偏离路径的节点 s，s 到目标需要 3 跳：先左转、再前进、再停止。写出该步的监督标签，并说明若沿用从起点预计算的标签会发生什么错误。 <span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>该步标签为左转（最短路的首动作）。静态标签多半是前进或另一方向，模型会在错误方向上被继续强化；偏离越远、episode 越长，错误监督越多，最终表现为 unseen 成功率崩塌。</div></details>
+      </li>
+      <li>按论文超参估算策略参数量：词表 3,100、词嵌入 256、编码器与解码器隐藏 512、动作嵌入 32、图像特征 2,048、动作数 6。写出各模块参数公式与合计值，并说明为何该估算不含 ResNet-152。 <span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>词嵌入 3,100 × 256 = 793,600；编码器 LSTM 4 × (256×512 + 512×512 + 512) = 1,574,912；解码器 LSTM 4 × (2,080×512 + 512×512 + 512) = 5,310,464；注意力打分投影 512×512 = 262,144 与组合层 1,024×512 + 512 = 524,800；动作头 512×6 + 6 = 3,078；动作嵌入 6×32 = 192；合计 8,469,190，约 8.47M。ResNet-152 被冻结，不参与策略更新，也不计入策略容量。</div></details>
+      </li>
+      <li>设计一次「基线复现验收」实验：要求 (a) 列出从数据加载到评测的五个检查点与断言；(b) 给出两个用于判定管线正确的最小对照（一个数据侧、一个模型侧）；(c) 预测把隐藏维度从 512 降到 256 后 val-seen 与 val-unseen 的变化方向，并说明理由；(d) 指出该验收无法覆盖的一类风险。 <span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>(a) 切分闭合、小批量损失手算一致、损失随训练下降、val-seen 与 val-unseen 双曲线分离、停止分布合理。(b) 数据侧用 21,567 / 7,189 闭合断言；模型侧用片段 2 的 0.3336 算例回归。(c) 容量下降，val-seen 与 val-unseen 都下降，seen 降幅通常更大，因为记忆容量先受损。(d) 无法覆盖特征质量与数值精度造成的偏差，需要固定特征版本并抽查相似度。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>基线实现条件策略 π(a<sub>t</sub> | o<sub>≤t</sub>, ℓ)：指令经 256 维词嵌入与 512 维 LSTM 编码并在数据侧反转词序；解码器输入图像特征（ResNet-152 均值池化 2048 维，冻结）与 32 维动作嵌入；Luong 注意力读取指令后经 tanh 与线性层输出 6 动作分布。</li>
+      <li>损失为逐步交叉熵；标签定义为当前位置到目标最短路的首动作。标签在训练循环内重规划是 student-forcing 可训练的前提，等价于在线 DAgger；论文实测计划采样更差。</li>
+      <li>小 batch 实算：7 个有效步损失总和 2.3354，token 均值 0.3336，episode 均值 1.1677；softmax 加交叉熵梯度为 p − y（目标 forward 时 −0.20，其余五维为各维概率）；策略参数量约 8.47M。</li>
+      <li>性能锚点（离散 R2R，CVPR 2018）：student-forcing val-seen 38.6%、val-unseen 21.8%、test 20.4%（NE 7.85 m），人类 test 86.4%（NE 1.61 m）；落差 16.8 点（相对 43.52%），模型轨迹 8.13 m 短于最短路，存在提前停止。</li>
+      <li>复现纪律：显式编码长度、有效步掩码、停止先于步进、评测不触真值、损失口径写清；特征缓存 36 视角、全库约 2.89 GiB。</li>
+      <li>下一讲引入 speaker 模型：用合成指令把训练数据扩到 178,000 条路径规模，用务实重排在推理期选择解释力最强的路线，并顺带把动作空间升级为全景 36 视角。同一底座在 022 讲将被推到 val-unseen 54.6% 的新高度。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch020.html">← 第 020 讲：第一篇复盘：任务-数据-评测公共语言</a>
+    <a class="next" href="ch022.html">第 022 讲：Speaker-Follower：合成指令与增广 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.06 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:11.5px !important;letter-spacing:.06em !important;color:rgba(71,85,105,.45) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#7e8ba0 !important;font-size:11.5px !important;line-height:1.8 !important;text-align:center !important;padding:5px 12px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

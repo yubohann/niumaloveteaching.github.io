@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 026 讲｜SIL：自监督模仿学习 | 视觉语言导航课程 · VLN-100</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 离散方法谱系：从模块到预训练</span>
+    <span class="sep">/</span>
+    <span>第 026 讲</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 离散方法谱系：从模块到预训练</div>
+    <h1>第 026 讲｜SIL：自监督模仿学习</h1>
+    <p class="lead">在没有演示轨迹、没有目标位置的未见环境里，智能体用匹配评论家（matching critic）给自己的多条候选轨迹打分，挑出最好的一条当作伪标签（pseudo-label）再模仿更新。本讲拆解 SIL（Self-Supervised Imitation Learning，自监督模仿学习）的目标函数、伪轨迹生成流程与选择偏差，并核对 R2R 上的收益与协议边界。</p>
+    <ul class="meta">
+      <li>主题：离散方法 / 自监督模仿 / 伪标签 / 探索</li>
+      <li>关键公式：L<sub>sil</sub> = −R<sub>intr</sub> log π<sub>θ</sub>(a<sub>t</sub>|s<sub>t</sub>)，τ̂ = argmax<sub>τ</sub> V<sub>β</sub>(X, τ)</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置讲：第 025 讲（RCM：强化跨模态匹配）</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>说清 SIL 的问题定位：在无标注、无目标位置的未见环境里，用评论家分数从自身多条 rollout 中选出伪轨迹；复述论文报告的 seen-unseen 成功率差距收窄结果（30.7% 到 11.7%，Wang 等，2019，R2R 验证集）。</li>
+      <li>推导 SIL 目标函数：从「回报加权的策略梯度」写到「伪标签交叉熵」，说清两种写法等价的条件与差别。</li>
+      <li>会算：指令长度归一化对跨指令可比性的影响；取 K 条候选最大值的期望选择偏差；一轮 SIL 的采样步数预算。</li>
+      <li>会实现：采样多条轨迹、评论家打分、回放缓冲、模仿更新四步闭环，并正确处理停止动作与步数上限。</li>
+      <li>会判断：SIL 与 beam search、自模仿学习的异同，以及标准评测协议与预探索协议的数字为何不能混用。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 025 讲把 RCM 的全局与局部跨模态匹配讲完了：回环重建奖励充当内在奖励，引导策略让整条轨迹与指令对齐。这套方法在已见环境训练，然后零样本迁移到未见环境。Wang 等（2019）的原文报告了一个持续存在的现象：未见环境的成功率明显低于已见环境，泛化仍是主要矛盾。</p>
+    <p>难点在于监督缺口。未见环境既没有人类演示轨迹，也没有目标位置，行为克隆（behavior cloning）无从下手；纯强化学习又只能拿到稀疏的成功信号，长轨迹上的信用分配效率低。论文提出的场景是「测试前允许探索」：智能体抵达新环境后先自行探索，把过去的好决策沉淀为监督，再执行指令。家用机器人在新居先熟悉环境、再按指令取物，正是这个场景的现实动机。</p>
+    <p>SIL 的思路是把「探索数据」和「伪监督」接起来：策略采样多条候选轨迹，评论家给每条轨迹与指令的匹配度打分，分数最高的一条进入回放缓冲（replay buffer），下一轮更新时被当作演示来模仿。整个过程中没有外部目标位置参与，监督信号完全来自自监督打分器，这也是方法名中 self-supervised 的含义。</p>
+    <p>本讲要解决四件事：第一，写清 SIL 目标的两种等价形式与适用条件；第二，算清长度归一化与最大选择偏差带来的影响；第三，给出可实现的伪轨迹生成流程；第四，界定它的协议边界，避免把预探索数字与标准零样本榜单直接对比。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 设定与监督缺口</h3>
+    <p>沿用第 025 讲的记号：指令 X = &lt;x<sub>1</sub>, x<sub>2</sub>, …, x<sub>n</sub>&gt;，n 为词数；策略 π<sub>θ</sub>(a<sub>t</sub>|s<sub>t</sub>) 在状态 s<sub>t</sub> 输出可导航方向的分布；一条轨迹 τ = &lt;(s<sub>1</sub>, a<sub>1</sub>), (s<sub>2</sub>, a<sub>2</sub>), …, (s<sub>T</sub>, a<sub>T</sub>)&gt;。RCM 阶段已经训练出一个可用的策略与一个匹配评论家 V<sub>β</sub>，评论家把轨迹编码后自回归地重建指令，输出 p<sub>β</sub>(X|τ)。</p>
+    <p>SIL 阶段的输入只有 (X, 起点) 与一个没有标注的探索环境。目标位置 s* 不可见，演示动作 a<sub>t</sub>* 不存在，成功与否也无法在探索时判定。整个监督缺口由评论家填补：它给候选轨迹排序，排序靠前的轨迹携带「与指令语义一致」的信号。</p>
+    <div class="box key">
+      <span class="box-title">关键约定：评论家预训练后冻结</span>
+      <p>论文用人类演示对评论家做监督预训练，在策略学习与 SIL 阶段保持参数冻结。冻结的意义在下一节展开：它保证伪标签的评判标准不随策略漂移，也让 SIL 损失中的回报项与策略参数解耦。</p>
+    </div>
+
+    <h3>2. 评论家打分与长度归一化</h3>
+    <p>评论家输出的是指令在给定轨迹下的似然。把逐词概率连乘写成对数域求和：</p>
+    <div class="formula">
+      log p<sub>β</sub>(X|τ) = Σ<sub>i=1</sub><sup>n</sup> log p<sub>β</sub>(x<sub>i</sub> | x<sub>&lt;i</sub>, τ)
+      <span class="note">x<sub>&lt;i</sub> 表示第 i 个词之前的词序列；轨迹 τ 经轨迹编码器压缩为条件向量</span>
+    </div>
+    <p>论文报告内在回报 R<sub>intr</sub> 时按指令长度 n 做归一化。归一化的作用需要精确表述：对同一条指令的 K 条候选轨迹，n 完全相同，排序不受影响；跨指令比较时，长指令的词数多，未归一化的对数似然天然更低，批次内不同指令的回报尺度因此不可比。归一化让不同长度的指令进入同一个尺度，这对批次内混合计算的 RL 与 SIL 目标都必要。</p>
+    <table>
+      <tr><th>指令 A（12 词）</th><th>指令 B（30 词）</th><th>读法</th></tr>
+      <tr><td>每词平均概率 0.35，逐词独立近似下总和 log 似然 −12.60</td><td>每词平均概率 0.45，总和 log 似然 −23.96</td><td>不归一化时 A 比 B 高 11.36 nats，短指令占优，尽管 B 的逐词质量更高</td></tr>
+      <tr><td>每词平均对数概率 −1.0498</td><td>每词平均对数概率 −0.7985</td><td>按长度归一化后 B 胜出 0.2513 nats，排序恢复为「逐词质量优先」</td></tr>
+    </table>
+    <p>上表为按独立逐词假设的算例（Python 实算），用于展示方向，不复现论文数值。工程上归一化有两种等价排序的实现：词均对数概率，或它的指数形式（几何平均概率）。后者落在 (0, 1]，可作为正数回报直接乘进损失；前者为负数，直接相乘会翻转下降方向。后文代码采用几何平均形式。</p>
+    <p>一个典型量级：29 词指令、每词平均对数概率 −0.9 时，总和对数似然为 −26.1，几何平均约 0.4066。评论家分数既不接近 0 也不接近 1，说明它在训练分布上给出的匹配概率是中间值，伪标签之间靠相对排序区分。</p>
+
+    <h3>3. 伪轨迹生成与选择偏差</h3>
+    <p>SIL 的每一次伪标签生成分三步。第一步，对同一条指令从当前策略采样 K 条轨迹；第二步，用冻结的评论家给每条轨迹计算 R<sub>intr</sub>；第三步，取分数最高的轨迹写入回放缓冲：</p>
+    <div class="formula">
+      τ̂ = argmax<sub>τ ∈ {τ<sup>(1)</sup>, …, τ<sup>(K)</sup>}</sub> V<sub>β</sub>(X, τ)
+      <span class="note">K 为候选条数；论文只说明「多次 rollout」，未给出公开的 K 默认值，工程上按算力预算取 3 到 10</span>
+    </div>
+    <p>这里存在一个必须量化的问题：取 K 条候选的最大值，会系统性高估策略的真实水平。把每条候选的评论家分数看成「真实匹配度 + 独立噪声」，当噪声近似标准正态时，K 条最大值的期望如下（蒙特卡洛实算，200 万样本）：</p>
+    <table>
+      <tr><th>K</th><th>1</th><th>3</th><th>5</th><th>10</th><th>20</th></tr>
+      <tr><td>E[max]（单位：噪声标准差）</td><td>0.00</td><td>0.85</td><td>1.16</td><td>1.54</td><td>1.87</td></tr>
+    </table>
+    <p>读法：K 从 1 增到 5，伪标签分数平均抬高约 1.16 个噪声标准差；K 增到 10 抬高约 1.54 个标准差。K 的作用是「用算力换监督质量」，代价是噪声也被放大。三条缓解手段在论文设计中都能找到对应：评论家冻结防止评判标准漂移；SIL 与已有监督数据配合使用，让伪标签只占更新的一部分；探索范围限定在无标注的未见环境，不覆盖评测指令的目标位置。</p>
+    <p>采样必须保证多样性。若 rollout 用贪心解码，K 条候选完全相同，argmax 失去区分度，伪标签退化为当前策略的复制。论文在训练期使用类别采样（categorical sampling），本讲代码沿用这一约定，并允许在需要时调整采样温度。</p>
+
+    <h3>4. SIL 目标与等价推导</h3>
+    <p>选出 τ̂ 后，论文给出两种写法。第一种把评论家分数当作回报，对整条轨迹加权：</p>
+    <div class="formula">
+      L<sub>sil</sub>(θ) = − R<sub>intr</sub> log π<sub>θ</sub>(a<sub>t</sub>|s<sub>t</sub>)
+      <span class="note">R<sub>intr</sub> = V<sub>β</sub>(X, τ̂)，与 θ 无关（评论家冻结）；乘在同一轨迹所有步的梯度上</span>
+    </div>
+    <p>第二种把 τ̂ 的动作当作标签，做交叉熵：</p>
+    <div class="formula">
+      L<sub>sil</sub>(θ) = − E[ log π<sub>θ</sub>(â<sub>t</sub>|s<sub>t</sub>) ]，â<sub>t</sub> 为回放缓冲中 τ̂ 的第 t 步动作
+      <span class="note">期望对回放缓冲中的 (s<sub>t</sub>, â<sub>t</sub>) 样本取</span>
+    </div>
+    <p><strong>等价条件</strong>：R<sub>intr</sub> 不依赖 θ 且为正常数时，第一式对每条轨迹是第二式的常数倍；常数不改变梯度方向，只改变步长尺度。回报为负时结论反转，这也是上一节强调回报取正数的原因。</p>
+    <p>从策略梯度看，第一式正是 REINFORCE 形式：∇<sub>θ</sub> L = −R<sub>intr</sub> ∇<sub>θ</sub> log π<sub>θ</sub>(a<sub>t</sub>|s<sub>t</sub>)。与标准在策略（on-policy）算法相比，这里的轨迹由旧策略采样、存在回放缓冲里，更新时属于离策略（off-policy）蒙特卡洛回报。论文没有引入重要性权重修正，把选出的轨迹直接当演示，属于自模仿式的简化。当两轮之间策略变化过大时，旧伪标签与当前策略的分布偏离增大，更新偏差随之上升，这是该方法的一条边界。</p>
+    <p>自模仿学习（self-imitation learning）的一般结论在此适用：当采样回报高于当前策略的期望水平时，提高这些动作的概率可在局部改进策略。SIL 用评论家替代环境回报完成筛选，把该思想迁移到没有目标信号的导航任务。</p>
+
+    <h3>5. 有效性证据与协议边界</h3>
+    <p>论文在 R2R 上报告了两组结果。验证集上，去掉跨模态推理的消融行 seen / unseen 成功率为 66.4% / 35.7%，差距 30.7 个百分点；加入 SIL 在未见环境探索后为 73.0% / 61.3%，差距 11.7 个百分点。差距收窄 19.0 个百分点，相对降幅 61.9%（实算）。</p>
+    <table>
+      <tr><th>方法（R2R 测试服务器）</th><th>PL（米）</th><th>NE（米）</th><th>OSR</th><th>SR</th><th>SPL</th></tr>
+      <tr><td>RCM</td><td>15.22</td><td>6.01</td><td>50.8</td><td>43.1</td><td>35</td></tr>
+      <tr><td>RCM + SIL（训练集）</td><td>11.97</td><td>6.12</td><td>49.5</td><td>43.0</td><td>38</td></tr>
+      <tr><td>RCM + SIL（未见环境）*</td><td>9.48</td><td>4.21</td><td>66.8</td><td>60.5</td><td>59</td></tr>
+    </table>
+    <p>* 预探索协议，与其他方法的标准零样本设置不同，论文明确标注不可直接比较。数字来源：Wang 等，2019，表 1，R2R 测试服务器。</p>
+    <p>读法有三点。<strong>第一，训练集上的 SIL 主要买效率</strong>：路径长度从 15.22 米降到 11.97 米（−3.25 米，−21.4%），SPL 从 35 升到 38，成功率持平。它把「走对」改造成「更短地走对」，这正是 SPL 关注的性质。<strong>第二，未见环境探索把收益放大</strong>：相对训练集 SIL，路径再降 2.49 米（−20.8%），成功率升 17.5 个百分点，SPL 升 21 点；相对 RCM 基线，路径降 5.74 米（−37.7%）。<strong>第三，两类收益的性质不同</strong>：训练集 SIL 定义在标准协议内，可以直接与榜单比较；未见环境 SIL 属于终身学习场景，只能与同协议数字对比。</p>
+    <p>停止行为的监督缺口值得单独指出。评论家只评价指令与轨迹的语义匹配，不判断是否到达目标。论文的定性例子给出了反例：某条轨迹的回环奖励很高，大部分动作与指令一致，但智能体最终没有认出洗衣房，没能停到正确位置。这解释了为什么 SIL 在预探索协议下成功率仍明显低于已见环境：到达目标与对齐指令是两件事，后者可以用自监督逼近，前者在无目标位置时缺少监督信号。</p>
+
+    <h3>6. 与 beam search 的机制差异</h3>
+    <p>同为「多轨迹、选最优」，SIL 与 beam search 的落点不同。beam search 在测试时执行多条轨迹，按累计概率重排，选出得分最高的整条路径作为预测；它不更新参数，改进是一次性的，且执行多条轨迹导致路径长度剧增，SPL 被重罚。SIL 在训练时用最优伪轨迹更新参数，收益固化到权重里，测试时按更新后的策略执行单条轨迹，路径更短。论文的对照给出了数量级：Speaker-Follower 加 beam search 在测试集上 SR 53.5%，路径长度 1257.38 米，SPL 0.01；Regretful Agent 用贪心加回溯达到 SR 48%、SPL 0.40（Ma 等，2019，表 1 与表 5；该对照在 027 讲展开）。这说明「测试时搜索」与「训练时改进策略」是两条不同的性能曲线。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>把 SIL 落成工程系统，需要一张流程表、一套回放缓冲结构、一张超参表和一套协议对照表。</p>
+
+    <h3>1. 单轮 SIL 流程</h3>
+    <table>
+      <tr><th>阶段</th><th>输入</th><th>操作</th><th>输出</th><th>注意</th></tr>
+      <tr><td>预热</td><td>人类演示</td><td>监督学习初始化策略与评论家</td><td>可用策略、冻结评论家</td><td>论文的学习率：SL 1e-4，RL 与 SIL 1e-5（Adam）</td></tr>
+      <tr><td>采样</td><td>指令、起点</td><td>类别采样 K 条轨迹，至停止或步数上限</td><td>K 条候选动作序列</td><td>步数上限取 20，与第 005、006 讲核对的 R2R 离散协议一致</td></tr>
+      <tr><td>打分</td><td>K 条候选</td><td>评论家计算逐词似然，按词数归一化</td><td>每条轨迹一个正分数</td><td>评论家冻结，只做前向</td></tr>
+      <tr><td>选择</td><td>K 个分数</td><td>argmax，写入回放缓冲</td><td>伪轨迹 τ̂</td><td>可同时计算候选分数的均值与方差做监控</td></tr>
+      <tr><td>更新</td><td>回放缓冲</td><td>伪标签交叉熵或回报加权策略梯度</td><td>更新后的策略</td><td>学习率 1e-5；限制轮数，防止自举误差累积</td></tr>
+    </table>
+
+    <h3>2. 回放缓冲：两种重放方式</h3>
+    <table>
+      <tr><th>方式</th><th>存储内容</th><th>更新时成本</th><th>适用与风险</th></tr>
+      <tr><td>重跑环境</td><td>scan、起点、动作序列</td><td>每轮重放需与仿真器交互，还原每步视觉状态</td><td>存储小；要求环境可复现、动作可逆；仿真随机性需固定种子</td></tr>
+      <tr><td>特征缓存</td><td>每步的全景特征与动作标签</td><td>直接前向与反向，不再访问仿真器</td><td>训练快；存储为步数 × 2048 维 float32，需按预算裁剪缓冲大小</td></tr>
+    </table>
+    <p>以 R2R 训练集 14,025 条指令、K=5、平均 12 步计算，一轮采样需要 841,500 个环境步；K=10 时为 1,683,000 步（实算）。这个量级决定了 SIL 的轮数不能太大，工程上通常配合早停与固定轮数上限。本讲练习第 4 题会要求改变 K 并预测结果。</p>
+
+    <h3>3. 超参与取值依据</h3>
+    <table>
+      <tr><th>参数</th><th>取值</th><th>作用</th><th>取值依据与调控方向</th></tr>
+      <tr><td>候选数 K</td><td>3–10（论文未公开默认值）</td><td>决定伪标签质量与采样成本</td><td>K 增大抬高选择质量，也抬高偏差与算力；先扫 3/5/10</td></tr>
+      <tr><td>采样方式</td><td>类别采样（训练期）</td><td>保证候选多样性</td><td>贪心采样使候选退化，伪标签失去信息量</td></tr>
+      <tr><td>SIL 学习率</td><td>1e-5（Adam）</td><td>控制单轮策略移动幅度</td><td>与 RL 阶段一致；过大使伪标签分布快速失效</td></tr>
+      <tr><td>评论家参数</td><td>冻结</td><td>固定评判标准</td><td>联合训练会让标准随策略漂移，偏离「与演示对齐」的语义</td></tr>
+      <tr><td>内在回报归一化</td><td>按词数（几何平均）</td><td>统一跨指令尺度</td><td>不归一化时长指令回报被系统性压低</td></tr>
+      <tr><td>SIL 轮数</td><td>少量轮次加早停</td><td>控制自举误差累积</td><td>以未见验证集指标早停，报告时标注协议</td></tr>
+    </table>
+
+    <h3>4. 与相邻方法的差异</h3>
+    <table>
+      <tr><th>方法</th><th>监督来源</th><th>评测时开销</th><th>改的是</th><th>轨迹长度</th></tr>
+      <tr><td>行为克隆</td><td>人类演示</td><td>单条轨迹</td><td>策略参数</td><td>接近演示</td></tr>
+      <tr><td>Beam search</td><td>无（复用已有策略）</td><td>K 条轨迹的重排与长路径执行</td><td>仅预测结果</td><td>显著变长</td></tr>
+      <tr><td>DAgger 式交互</td><td>专家对策略访问状态的纠偏</td><td>需要专家在线</td><td>策略参数</td><td>依赖专家</td></tr>
+      <tr><td>SIL</td><td>自身最优轨迹加评论家打分</td><td>单条轨迹</td><td>策略参数</td><td>更短</td></tr>
+    </table>
+    <p>与第 025 讲的关系可以一句话概括：025 讲用回环重建奖励驱动 RL 更新，026 讲把同一个评论家改造成伪标签生成器，在没有目标位置的场景里继续改进策略。两者的共同前提是评论家可信；评论家的误差会沿两条路径分别进入回报与标签。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>以下片段以论文方法与公开实现的接口习惯为参照，接口命名随版本演进，重点是机制，具体 API 只作示意。三个片段依次覆盖采样、选择与更新。</p>
+
+    <p><strong>片段 1：K 条候选轨迹采样</strong></p>
+    <pre class="code"><code>def sample_trajectories(policy, env, instr, K=5, max_steps=20, greedy=False):
+    # max_steps 取 R2R 离散协议上限 20（第 005、006 讲已核对仓库 max_episode_len 口径）
+    trajs = []
+    for _ in range(K):
+        env.reset(instr["scan"], instr["path"][0], instr["heading"])
+        actions, feats, done = [], [], False
+        while not done and len(actions) &lt; max_steps:
+            p = policy(instr["tokens"], feats, actions)      # 当前步可导航方向的概率
+            if greedy:
+                a = int(p.argmax())                          # 诊断用：会退化候选多样性
+            else:
+                a = int(torch.multinomial(p, 1))             # 类别采样，保证 K 条轨迹互不相同
+            feats_new, _, done = env.step(a)
+            actions.append(a)
+            feats.append(feats_new)
+        trajs.append({"instr_id": instr["instr_id"], "actions": actions, "feats": feats})
+    return trajs</code></pre>
+    <p>解读：<strong>（1）</strong>环境复位到同一条指令的起点，保证 K 条候选可比；若起点随机化，评论家分数混入位置差异。<strong>（2）</strong>训练期采用类别采样，这是候选多样性的来源；贪心分支仅用于对照实验，执行时会出现 K 条完全相同的序列。<strong>（3）</strong>「到停止或步数上限」两个终止条件都要保留，否则与评测口径不一致，统计出的伪标签长度分布也会失真。<strong>（4）</strong>缓存每步全景特征，为片段 3 的特征重放做准备；若改用重跑环境，可只保留动作序列。</p>
+
+    <p><strong>片段 2：评论家打分与伪轨迹选择</strong></p>
+    <pre class="code"><code>def select_pseudo_trajectory(critic, instr, trajs, topk=1):
+    # 评论家冻结，只做前向；输出逐词对数概率之和
+    scored = []
+    for t in trajs:
+        logp = critic.log_prob(instr["tokens"], t["actions"])       # 轨迹条件似然，log 域
+        n = max(len(instr["tokens"]), 1)
+        score = float(torch.exp(logp / n))                          # 几何平均，落在 (0, 1]
+        scored.append((score, t))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    picked = [t for _, t in scored[:topk]]                          # 默认取最优一条
+    best = scored[0][0]
+    mean = sum(s for s, _ in scored) / len(scored)
+    return picked, {"best": best, "mean": mean, "gap": best - mean}</code></pre>
+    <p>解读：<strong>（1）</strong>按词数归一化用几何平均实现，分数落在 (0, 1]，可直接作为正回报；它与词均对数概率排序等价，数值上更适合乘进损失。<strong>（2）</strong>返回最优分与候选均值的差，作为选择偏差的在线监控量；差值长期偏大说明候选噪声大或 K 过大。<strong>（3）</strong>topk 参数为扩展设计（多选伪轨迹按分数加权），论文默认取最优一条，扩展时需处理重复轨迹。<strong>（4）</strong>评论家冻结在训练脚本层面由 requires_grad 关闭与优化器不注册双重保证，防止误更新。</p>
+
+    <p><strong>片段 3：伪标签模仿更新</strong></p>
+    <pre class="code"><code>def sil_update(policy, optimizer, pseudo, critic_score, max_grad=5.0):
+    # 把伪轨迹动作当标签；critic_score 与策略参数无关，作为整条轨迹的正权重
+    loss = torch.zeros((), device=next(policy.parameters()).device)
+    for t, a_hat in enumerate(pseudo["actions"]):
+        p = policy(pseudo["tokens"], pseudo["feats"][t], pseudo["actions"][:t])
+        loss = loss - critic_score * torch.log(p[a_hat] + 1e-8)     # 回报加权的伪标签交叉熵
+    optimizer.zero_grad()
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(policy.parameters(), max_grad)   # 防止单条伪标签把参数带偏
+    optimizer.step()
+    return float(loss.detach())</code></pre>
+    <p>解读：<strong>（1）</strong>损失是片段 2 的几何平均分数乘以负对数似然；常数权重只缩放梯度，不改变方向，与纯交叉熵写法在固定评论家下等价。<strong>（2）</strong>每步的状态特征与历史动作从回放缓冲读取，保证标签与输入对齐；若重跑环境，此处的 feats 改为在线重新编码。<strong>（3）</strong>梯度裁剪是工程护栏：K 较大时最优候选的分数可能显著高于均值，单条伪轨迹的梯度尺度相应偏大。<strong>（4）</strong>学习率保持 1e-5，与 RL 阶段一致；伪标签更新属于离策略数据，步长过大会让旧标签迅速失效。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>把 SIL 当作普通行为克隆再训练</strong>：伪标签未经筛选直接使用，指标先升后降。根因：自身轨迹的错误动作被当成标签，误差在轮次间累积。修复：按评论家归一化分数取 argmax（或分位数筛选），限制轮数并配合早停。</li>
+      <li><strong>评论家与策略联合更新</strong>：训练中期伪标签质量突然波动，成功率曲线出现台阶。根因：评判标准随策略一起漂移，评论家输出不再对应演示分布。修复：SIL 阶段冻结评论家；若要更新，采用低频快照并保留历史版本做一致性检查。</li>
+      <li><strong>rollout 使用贪心解码</strong>：K 条候选几乎相同，argmax 选择退化为复制当前策略，SIL 贡献接近 0。根因：缺少采样噪声，候选集合没有覆盖策略分布的尾部。修复：训练期使用类别采样或带温度采样，并监控候选两两之间的动作序列差异率。</li>
+      <li><strong>回报不按长度归一化</strong>：长指令的伪标签被系统性压低，批次内短指令垄断更新。根因：对数似然随词数单调下降，跨指令尺度不可比。修复：统一使用词均对数概率或几何平均；同一条指令内部无需归一化，排序本来就不变。</li>
+      <li><strong>把预探索数字与标准榜单混用</strong>：用 60.5% 的成功率宣称超过零样本方法。根因：SIL 在未见环境探索属于不同评测协议，论文脚注已声明不可直接比较。修复：表格分栏标注标准协议与预探索协议，引用数字时写明环境是否在测试前被探索。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>指令 A 为 12 词、逐词平均概率 0.35，指令 B 为 30 词、逐词平均概率 0.45。分别计算不归一化与词均归一化下的分数，并说明归一化在「同一条指令内部排序」与「跨指令比较」两种场景中的作用差别。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>不归一化：A 为 12 × ln 0.35 ≈ −12.60，B 为 30 × ln 0.45 ≈ −23.96，A 占优；词均归一化后 A 为 −1.0498，B 为 −0.7985，B 占优。同一条指令的候选词数相同，归一化不改变排序；跨指令时它消除词数带来的尺度差。</div></details>
+      </li>
+      <li>写出 SIL 的回报加权形式与伪标签交叉熵形式，证明二者在评论家冻结时只差一个正常数因子，并说明回报为负时会发生什么。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>R<sub>intr</sub> 与 θ 无关时，L = −R<sub>intr</sub> log π 的梯度方向与 L = −log π 相同，尺度相差 R<sub>intr</sub>；若 R<sub>intr</sub> 为负，梯度方向翻转，更新会降低所选动作的概率。因此回报必须取正值，几何平均概率天然满足。</div></details>
+      </li>
+      <li>实现本讲片段 1、2、3 的最小闭环，在验证集上统计两个量：评论家分数最高的候选轨迹中未在 3 米内停止的比例；候选最优分与均值的平均差。用这两个量解释选择偏差。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>第一个量用验证集的目标位置做诊断（仅用于分析，不进入训练）；第二个量直接由片段 2 返回。若最优分与均值差随 K 增大而上升，同时未达目标比例保持高位，说明评论家排序捕捉指令对齐，停止判断仍是缺口。</div></details>
+      </li>
+      <li>把 K 从 5 改为 1 与 10，把 SIL 学习率放大 10 倍，再把训练期采样改为贪心。分别预测成功率、路径长度与训练稳定性的变化方向，并说明理由。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>K=1 无选择效应，伪标签质量下降；K=10 质量上升但偏差与算力上升。学习率放大使旧伪标签快速失效，指标可能先升后崩。贪心采样使候选退化，SIL 接近无效。三项都属于选择偏差与分布漂移的相互作用。</div></details>
+      </li>
+      <li>设计一套「停止动作自监督」方案：在不知道目标位置的条件下，为停止动作构造伪监督信号。要求给出伪标签构造规则、损失形式、至少一个反例场景、评价协议与与主流程的消融对照。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>可选信号包括：轨迹回环奖励随步数的饱和点、相邻候选轨迹的停止位一致性、评论家对「短轨迹加停止」与「长轨迹」的分数差。损失可写成停止动作的二分类加权交叉熵，伪标签取多数票。反例：地标外观相似导致多轮探索都在同一房间停止。评价时把「到达目标」与「指令对齐」分开统计，避免把停止正确率混入匹配分数。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>SIL 面向无标注、无目标位置的未见环境：评论家给 K 条自采样轨迹打分，取最优者写入回放缓冲，作为伪标签做模仿更新，监督信号完全来自自监督打分。</li>
+      <li>目标函数有两种等价写法：回报加权策略梯度与伪标签交叉熵；等价条件是评论家冻结、回报取正常数。回报为负会翻转更新方向。</li>
+      <li>数字要点：seen-unseen 成功率差距从 30.7 收窄到 11.7 个百分点（相对降幅 61.9%）；测试集上 SIL（训练集）把路径从 15.22 米降到 11.97 米、SPL 从 35 升到 38；SIL（未见环境）达到 SR 60.5、SPL 59，但属于预探索协议。</li>
+      <li>统计要点：长度归一化消除跨指令尺度差；取 K 条最大值平均抬高伪标签分数（K=5 约 1.16 个噪声标准差，K=10 约 1.54 个），K 的收益与偏差同步增长；一轮 SIL（K=5、平均 12 步、14,025 条指令）约 841,500 个环境步。</li>
+      <li>边界：停止行为没有目标监督，高匹配分不保证到达目标；离策略更新缺少重要性修正，轮数过多会引入偏差；预探索协议数字不能与标准零样本榜单混用。</li>
+      <li>下一讲把「探索」换成「搜索」：Regretful Agent 用学习到的进度估计做启发式，让智能体自己决定何时回溯，以贪心解码逼近搜索的效果。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch025.html">← 第 025 讲：RCM：强化跨模态匹配</a>
+    <a class="next" href="ch027.html">第 027 讲：Regretful Agent：回溯与进度标记 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.06 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:11.5px !important;letter-spacing:.06em !important;color:rgba(71,85,105,.45) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#7e8ba0 !important;font-size:11.5px !important;line-height:1.8 !important;text-align:center !important;padding:5px 12px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

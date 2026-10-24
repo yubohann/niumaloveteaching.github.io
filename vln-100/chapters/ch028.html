@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 028 讲｜EnvDrop：环境丢弃与回译 | 视觉语言导航课程 · VLN-100</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 离散方法谱系：从模块到预训练</span>
+    <span class="sep">/</span>
+    <span>第 028 讲</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 离散方法谱系：从模块到预训练</div>
+    <h1>第 028 讲｜EnvDrop：环境丢弃与回译</h1>
+    <p class="lead">把同一场景的整套视觉特征按环境级掩码随机遮蔽，模拟一批「没见过的房间」；再让说话者模型在这些虚拟环境里为新路线生成指令，与路线一起构成训练三元组。环境丢弃（environmental dropout）与回译（back translation）的组合把 R2R 未见测试集的单次成功率推到 51.5%。</p>
+    <ul class="meta">
+      <li>主题：数据增广 / 环境扰动 / 回译 / 泛化</li>
+      <li>关键公式：E′ = envdrop<sub>p</sub>(E)，f′ = f ⊙ ξ<sup>E</sup>，I′ = P(E′, R′)</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置讲：第 027 讲（Regretful Agent：回溯与进度标记）</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>复述两阶段训练流程与「环境多样性是瓶颈」的证据：训练环境内约 190K 条候选路线只有约 14K 条获得人工标注（约 7%），论文预测全部标注时成功率上界约 52%（Tan 等，2019，NAACL，R2R）。</li>
+      <li>推导环境丢弃：掩码在同一环境的所有视角与视点间共享、只作用于图像特征、按 1/(1−p) 缩放保持期望；对比逐元素独立丢弃的跨视角不一致问题。</li>
+      <li>会算：p = 0.4、2048 维图像特征下期望丢弃 819.2 维；掩码方差 0.6667；同一维在 36 个视角独立丢弃后保持同状态的概率约 1.0×10<sup>−8</sup>。</li>
+      <li>会实现：环境级掩码构造、说话者与跟随者共用同一掩码、监督与半监督各半批的微调循环。</li>
+      <li>会判断：合成指令噪声、训练环境回译与未见环境回译的收益差距、预探索结果不能当作标准零样本结论、按未见验证集早停的协议注意点。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 022 讲的 Speaker-Follower 已经用说话者模型合成指令扩充过训练数据，第 026 讲的 SIL 在无标注环境里构造伪监督，第 027 讲把回溯能力放进策略结构。三条线的共同目标是拉近已见与未见环境的差距，但数据侧的缺口始终存在：R2R 的训练场景里存在大量可通行路线，只有一小部分被人工标注，模型反复看到的是同一批房间。</p>
+    <p>EnvDrop（Tan 等，2019）换了一个视角：数据增广只增指令不够，环境的数量才是瓶颈。论文用一个外推实验支撑这个判断：把训练环境内的候选路线从约 14K 扩到全部 190K，如果新增部分全部由人标注，预测的成功率上界约 52%；仅靠指令层面的扩增无法突破环境重复带来的局限。</p>
+    <p>方法分两阶段。第一阶段用模仿学习与强化学习的混合目标训练基础智能体，兼顾离策略演示与在策略探索；第二阶段在「环境丢弃」制造的虚拟环境上做回译，生成新的环境、路线、指令三元组，再用同样的混合目标微调。第一阶段的具体配方与稳定性问题留到第 029 讲展开，本讲聚焦第二阶段的机制与数字。</p>
+    <p>论文报告的结果是：单次执行（single run）在 R2R 未见测试集上成功率 51.5%、SPL 0.47，当时榜单排名第一；在 beam search 与预探索两种设置下也取得同批最好成绩。本讲要解决四件事：环境丢弃与普通特征丢弃的区别、掩码绑定的必要性、增广强度的取值依据、以及协议边界。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 任务与两阶段流程</h3>
+    <p>沿用全课记号：环境 E 给出全景视角序列，路线 R 是导航图上的视点序列，指令 I 为自然语言。智能体每步在可导航方向里选择动作，观测由 36 个单视角图像组成，每个视角的特征为 ResNet 特征与四维朝向的拼接。第一阶段的目标是得到一个在训练环境上可靠的策略；第二阶段的目标是让它适应「没见过的房间」。</p>
+    <table>
+      <tr><th>阶段</th><th>数据</th><th>目标</th><th>产出</th></tr>
+      <tr><td>第一阶段</td><td>人工标注三元组 (E, R, I)</td><td>混合模仿与强化学习，兼顾演示与探索</td><td>基础策略与说话者模型</td></tr>
+      <tr><td>第二阶段</td><td>原始三元组加回译三元组 (E′, R′, I′)</td><td>半监督微调，提升未见环境泛化</td><td>最终策略</td></tr>
+    </table>
+    <p>第二阶段的输入有三样：人工标注数据、环境丢弃生成器、以及第一阶段训练好的说话者。三者协同的方式在 3 至 5 小节展开。需要先强调的是，微调阶段的损失仍采用混合形式，监督样本与半监督样本各占半个批次，具体权重与训练细节见第 029 讲。</p>
+
+    <h3>2. 回译的数据逻辑</h3>
+    <p>回译（back translation）借自机器翻译的半监督做法，在导航里的对应关系是：前向模型为导航智能体 P(E, I → R)，从环境与指令找路线；反向模型为说话者 P(E, R → I)，从环境与路线生成指令。人工标注给出成对数据，未标注的路线提供单边数据，用说话者补出指令后即可构成新三元组。</p>
+    <p>论文明确定量：R2R 在训练环境里标注了约 14K 条（论文按「一条路线一条指令」的口径统计），而候选最短路线共约 190K 条，标注覆盖率约 7.37%（实算）；没有新环境时，用说话者给剩余路线补指令的收益只有 1.7 个百分点（验证未见集成功率 46.5% 到 48.2%）。</p>
+    <p>瓶颈因此指向环境。论文做了两组对照。第一组在「更多环境」与「更多数据」之间比较：数据量相同的前提下，逐步增加环境数量的曲线增长率高于在全部环境中随机选数据的曲线。第二组把回译直接放到未见验证环境上做：成功率从训练环境回译的 46.5% 跳到 61.9%，再加环境丢弃升到 64.5%。这两组结果说明，回译的质量取决于它面对的环境是否真的「新」。</p>
+    <div class="box warn">
+      <span class="box-title">协议提醒</span>
+      <p>「在未见验证环境上回译」意味着测试环境在评测前已被用于训练，属于预探索（pre-exploration）协议，与标准零样本设置不同。它对应扫地机器人先熟悉全屋再执行指令的场景，可以报告，但不能与标准榜单数字直接比较。后续引用 61.9% 与 64.5% 时必须标注协议。</p>
+    </div>
+
+    <h3>3. 特征丢弃为何失败</h3>
+    <p>直观做法是对图像特征逐元素随机置零，即传统特征丢弃（feature dropout）。掩码的每个元素独立服从伯努利分布并按 1/(1−p) 缩放。问题出在独立性假设：同一个物体在不同视角、不同视点的成像彼此关联，而逐元素独立的掩码无法保持这种关联。</p>
+    <p>论文用椅子的例子说明：左椅子出现在视角 1 与视角 2 中，独立掩码可能只在视角 2 把它抹掉，视角 1 里仍然可见；下一视点的视角又可能给出互相矛盾的信息。其后果是说话者仍然引用被抹掉的物体，跟随者看到的画面却残缺，增广出来的数据自相矛盾。</p>
+    <p>把「不一致」量化：p = 0.4、同一环境 36 个视角时，某个特征维度在全部视角保持同一保留或丢弃状态的概率为 0.6<sup>36</sup> + 0.4<sup>36</sup> ≈ 1.03×10<sup>−8</sup> + 4.72×10<sup>−15</sup> ≈ 1.03×10<sup>−8</sup>（实算）。也就是说，独立掩码下几乎不存在「在环境内被一致地移除」的特征维度，遮蔽模式几乎处处矛盾。</p>
+
+    <h3>4. 环境丢弃：定义与统计性质</h3>
+    <p>环境丢弃（environmental dropout）把掩码的采样单位从「特征元素」提升到「环境」：每个环境采样一张掩码 ξ<sup>E</sup>，该环境内所有视角、所有视点的图像特征共用这张掩码；朝向特征保持不动，空间结构不被破坏。新的虚拟环境与特征变换为：</p>
+    <div class="formula">
+      E′ = envdrop<sub>p</sub>(E)， f′<sub>t,i</sub> = f<sub>t,i</sub> ⊙ ξ<sup>E</sup>， ξ<sup>E</sup><sub>e</sub> ~ (1/(1−p)) · Ber(1−p)
+      <span class="note">f<sub>t,i</sub> 为第 t 步、第 i 个视角的图像特征；掩码 ξ<sup>E</sup> 与视角、视点无关，只与环境有关</span>
+    </div>
+    <p>掩码元素的期望为 1，方差为 p/(1−p)：p = 0.4 时方差 0.6667，标准差 0.8165（实算）。乘性缩放的目的是保持特征期望不变，这一点与传统 dropout 的推理期缩放一致。2048 维特征下，每个环境平均遮蔽 819.2 维，保留 1228.8 维。</p>
+    <p>语义上，共享掩码等价于「从整个场景里一致地移除某类结构」：如果某些维度承载椅子的视觉模式，掩码把它们连同所有出现位置一起遮蔽，说话者与跟随者面对的是同一个「没有椅子」的房间。论文还用语义视角做了对照实验：把 ResNet 特征换成按物体类型着色的语义特征，环境丢弃让成功率从 50.5% 升到 52.0%，而特征丢弃只有 50.2%，两者相差 1.8 个百分点；关键结构标签（墙、地板、天花板）在实验中不参与丢弃，避免场景骨架被破坏。</p>
+    <p>三个工程约定必须同时满足才算论文意义上的环境丢弃：<strong>掩码按环境采样</strong>、<strong>同一环境全视角共享</strong>、<strong>只丢图像特征并保留朝向</strong>。三者缺一，性质就退化为特征丢弃或破坏空间结构。</p>
+
+    <h3>5. 掩码绑定：说话者与跟随者必须看到同一个环境</h3>
+    <p>回译时，说话者根据虚拟环境 E′ 与路线 R′ 生成指令 I′，随后跟随者在同一批三元组上微调。这里的隐形陷阱是掩码的身份：如果说话者与跟随者各自采样掩码，说话者在「没有椅子的房间」里写出包含椅子的指令，跟随者却在「有椅子的房间」里学习对齐，标签与环境互相矛盾。</p>
+    <p>论文对此做了消融：把说话者与跟随者的掩码绑定（tying）时，验证未见集成功率 52.2%；各自独立采样时降到 49.0%，相差 3.2 个百分点；而完全不使用环境丢弃的原始回译是 48.2%。绑定带来的收益大于「生成指令更多样」本身，说明一致的环境语义是机制成立的前提。另一条实现细节是批次内稳定性：同一批次里不同环境共享一张掩码表会让训练更稳，论文正文与附录都提到了这一点。</p>
+
+    <h3>6. 训练协议与早停</h3>
+    <p>微调阶段按半个批次监督、半个批次半监督组织。监督样本来自人工三元组，半监督样本来自回译三元组；掩码在每个训练迭代重新采样，因此不需要把虚拟环境物化成额外数据，显存与存储开销恒定。论文的实现细节：图像特征为 ResNet-152 的 2048 维；词嵌入 256 维、动作嵌入 64 维；LSTM 512 维（双向部分 256 维）；折扣因子 0.9；奖励塑形取到目标距离的减少量；最大动作长度 35；RMSprop 学习率 1e-4；批大小 64；梯度范数裁剪 40；环境丢弃率 0.4，网络内部 dropout 层 0.5。说话者采用路线编码器与上下文编码器堆叠的双向 LSTM，BLEU-4 相对上一代提升约 3 分。</p>
+    <p>早停按未见验证集成功率执行。这是一条需要标注的协议选择：未见验证集参与了模型选择，严格报告时应说明「快照由未见验证集选出」；同时也解释了为什么论文的验证与测试数字接近（单次执行 52.2% 对 51.5%，差 0.7 个百分点）：快照选择与最终评测都发生在未见环境上，只是场景集合不同。</p>
+
+    <h3>7. 实验证据</h3>
+    <table>
+      <tr><th>配置（R2R 验证未见集，单次执行）</th><th>SR</th><th>相对上一行的增量</th></tr>
+      <tr><td>行为克隆（IL）</td><td>43.6</td><td>未加增广的模仿基线</td></tr>
+      <tr><td>强化学习（A2C）</td><td>24.0</td><td>纯在策略训练不稳定</td></tr>
+      <tr><td>IL + RL 混合</td><td>46.5</td><td>+2.9（相对 IL），混合训练细节见第 029 讲</td></tr>
+      <tr><td>+ 回译（不加环境丢弃）</td><td>48.2</td><td>+1.7，环境重复下的收益有限</td></tr>
+      <tr><td>+ 特征丢弃</td><td>48.4</td><td>+0.2，几乎无效</td></tr>
+      <tr><td>+ 环境丢弃（掩码不绑定）</td><td>49.0</td><td>+0.6，仍低于绑定版本</td></tr>
+      <tr><td>+ 环境丢弃（掩码绑定）</td><td>52.2</td><td>+3.2，完整模型</td></tr>
+    </table>
+    <p>完整模型相对混合训练基线提升 5.7 个百分点，相对原始回译提升 4.0 个百分点，相对特征丢弃提升 3.8 个百分点（实算）。测试集上，单次执行成功率 51.5%、SPL 0.47，比同批 RCM 的 43.1% 高 8.4 个百分点，比 Self-Monitoring 的 48.0% 高 3.5 个百分点；beam search 设置下成功率 68.9%，预探索设置下 63.9% 与 SPL 0.61（Tan 等，2019，表 1）。</p>
+    <p>预探索数字还有一组补充：回译在训练环境上只到 46.5%，换到未见验证环境是 61.9%，叠加环境丢弃是 64.5%。差距之大从另一个方向证明，主要瓶颈是环境多样性，路线数量次之。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>工程落地围绕三张表：两阶段流水线、超参数取值、以及增广强度的扫描设计。</p>
+
+    <h3>1. 第二阶段流水线</h3>
+    <table>
+      <tr><th>步骤</th><th>输入</th><th>操作</th><th>输出</th></tr>
+      <tr><td>采样路线</td><td>训练环境导航图</td><td>取未标注的候选最短路线 R′</td><td>路线集合</td></tr>
+      <tr><td>采样掩码</td><td>环境编号</td><td>每个环境一张 2048 维掩码，同批共享、每迭代重采样</td><td>掩码表</td></tr>
+      <tr><td>生成指令</td><td>E′、R′、说话者</td><td>说话者在遮蔽后的视觉特征上解码</td><td>合成指令 I′</td></tr>
+      <tr><td>构造批次</td><td>人工三元组、回译三元组</td><td>各取半个批次</td><td>训练批次</td></tr>
+      <tr><td>微调</td><td>跟随者、混合损失</td><td>掩码绑定的半监督更新，早停用未见验证集</td><td>最终策略</td></tr>
+    </table>
+
+    <h3>2. 超参数与取值依据</h3>
+    <table>
+      <tr><th>参数</th><th>取值</th><th>作用</th><th>依据</th></tr>
+      <tr><td>环境丢弃率 p</td><td>0.4</td><td>控制虚拟环境与真实环境的距离</td><td>论文附录 A.1；网络内部 dropout 另取 0.5，两者不要混用</td></tr>
+      <tr><td>掩码作用范围</td><td>图像特征 2048 维</td><td>模拟物体缺失</td><td>朝向四维保留，维持空间结构；语义实验里墙地顶不丢</td></tr>
+      <tr><td>掩码共享</td><td>环境级、批内共享、每迭代重采样</td><td>保证跨视角一致与训练稳定</td><td>共享掩码使 36 视角的状态完全一致，独立掩码仅约 1.0e-8</td></tr>
+      <tr><td>掩码绑定</td><td>说话者与跟随者共用</td><td>指令与环境语义一致</td><td>不绑定掉 3.2 个百分点</td></tr>
+      <tr><td>批组成</td><td>64 = 32 监督 + 32 半监督</td><td>锚定人工分布，同时吸收增广</td><td>附录 A.1 的半批策略</td></tr>
+      <tr><td>优化器</td><td>RMSprop，学习率 1e-4</td><td>微调稳定性</td><td>附录 A.1；梯度范数裁剪 40</td></tr>
+      <tr><td>折扣因子</td><td>0.9</td><td>强化学习回报视界</td><td>约为 10 步量级的有效视界，与动作长度上限 35 配合</td></tr>
+    </table>
+
+    <h3>3. 增广强度扫描的设计</h3>
+    <p>论文选择 p = 0.4，正文没有给出系统的强度扫描表。下表是按机制给出的实验设计，预测方向供第 4 题使用，实际数值需自行运行。</p>
+    <table>
+      <tr><th>p</th><th>虚拟环境与真实环境的距离</th><th>预测的验证未见 SR</th><th>预测的风险</th></tr>
+      <tr><td>0.2</td><td>偏小，遮蔽不足</td><td>略低于 0.4 档</td><td>多样性不足，增益接近原始回译</td></tr>
+      <tr><td>0.4</td><td>单环境平均遮蔽 819 维</td><td>最高档</td><td>说话者与跟随者仍能对齐场景骨架</td></tr>
+      <tr><td>0.6</td><td>偏大，保留 819 维</td><td>下降</td><td>语义内容破坏严重，合成指令退化或空泛</td></tr>
+    </table>
+    <p>扫描时必须固定三件事：说话者权重、微调步数、早停准则。若每档使用不同步数，强度效应会与训练预算混淆。监控量建议记录合成指令的平均长度、词表外词比例、以及与人工指令的分布距离，用于解释曲线形状。</p>
+
+    <h3>4. 与相邻方法的差异与分工</h3>
+    <table>
+      <tr><th>路线</th><th>增广对象</th><th>新增信息</th><th>本课位置</th></tr>
+      <tr><td>说话者合成指令</td><td>指令</td><td>同环境、新路线的语言监督</td><td>022 讲</td></tr>
+      <tr><td>SIL 伪轨迹</td><td>轨迹与策略</td><td>未见环境的自监督动作标签</td><td>026 讲</td></tr>
+      <tr><td>环境丢弃与回译</td><td>环境与指令</td><td>虚拟的新场景分布</td><td>本讲</td></tr>
+      <tr><td>数据规模化</td><td>真实环境数量</td><td>新场景与新轨迹的物理真实性</td><td>061 讲起</td></tr>
+    </table>
+    <p>选择判据：环境数量可继续扩张时，优先采集真实新场景；受标注成本限制时，环境丢弃是低成本的分布逼近手段；若任务对视觉保真度敏感（例如需要识别具体物体外观），虚拟遮蔽的语义损失可能成为上限，需要与真实数据混合使用。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>以下片段按论文公式与公开实现习惯编写，聚焦掩码的一致性、绑定与半监督批次组织。接口命名随版本演进。</p>
+
+    <p><strong>片段 1：环境级掩码与特征应用</strong></p>
+    <pre class="code"><code>def envdrop_masks(env_ids, feat_dim=2048, p=0.4):
+    # 同一环境一张掩码；掩码元素按 1/(1-p) 缩放，保持特征期望不变
+    unique = sorted(set(env_ids))
+    table = {}
+    for e in unique:
+        keep = (torch.rand(feat_dim) &gt;= p).float()      # 每环境独立采样一次
+        table[e] = keep / (1.0 - p)                     # 乘性缩放，期望回到 1
+    return torch.stack([table[e] for e in env_ids])     # 批内每个环境一行掩码
+
+def apply_envdrop(step_feats, masks, img_dim=2048):
+    # step_feats: [环境数, 步数, 36, img_dim+4]，朝向四维必须保留
+    img, ori = step_feats[..., :img_dim], step_feats[..., img_dim:]
+    dropped = img * masks[:, None, None, :]             # 广播到步数与视角维度
+    return torch.cat([dropped, ori], dim=-1)</code></pre>
+    <p>解读：<strong>（1）</strong>掩码的采样单位是环境，环境内所有视角、所有视点通过广播共用同一行向量，跨视角一致性由此保证。<strong>（2）</strong>除以 1−p 是期望校正，否则遮蔽会让特征幅值系统性衰减，跟随者学到的尺度与推理期不一致。<strong>（3）</strong>朝向特征从掩码作用中排除，空间方向的信息不参与遮蔽。<strong>（4）</strong>所谓「同批共享」指同一批次内相同环境只采样一次；若每个样本单独采样，回译指令与跟随者观测会失去对应。</p>
+
+    <p><strong>片段 2：掩码绑定与回译三元组构造</strong></p>
+    <pre class="code"><code>def make_triplet(batch, speaker, p=0.4):
+    # 每个微调迭代重新采样掩码；说话者与跟随者必须使用同一张表
+    masks = envdrop_masks(batch["env_id"], p=p)
+    route_feats = apply_envdrop(batch["route_feats"], masks)      # 说话者看到的虚拟环境
+    step_feats = apply_envdrop(batch["step_feats"], masks)        # 跟随者看到的同一环境
+    tokens = speaker.generate(batch["routes"], route_feats)       # 合成指令 I'
+    return {"tokens": tokens, "feats": step_feats,
+            "routes": batch["routes"], "env_id": batch["env_id"]}</code></pre>
+    <p>解读：<strong>（1）</strong>同一个函数调用里同时生成说话者与跟随者的特征，从源头上杜绝两次独立采样。<strong>（2）</strong>掩码在每个训练迭代重采样，等价于在线生成无穷多个虚拟环境，不需要预先物化数据。<strong>（3）</strong>返回字典保持与人工批次相同的字段结构，后续损失无需区分数据来源。<strong>（4）</strong>若要复现不绑定消融，把 route_feats 与 step_feats 的掩码分开采样即可，其余代码不变。</p>
+
+    <p><strong>片段 3：半监督微调循环</strong></p>
+    <pre class="code"><code>for step, batch in enumerate(loader):
+    # 批次组织：一半人工三元组，一半回译三元组
+    sup, raw = batch["supervised"], batch["raw"]
+    semi = make_triplet(batch["unlabeled"], speaker, p=0.4)
+    logits_sup = follower(raw["tokens"], raw["feats"])          # 监督前向
+    logits_semi = follower(semi["tokens"], semi["feats"])       # 半监督前向，掩码已绑定
+    loss_sup = mix_loss(logits_sup, raw)                        # IL+RL 混合损失，见第 029 讲
+    loss_semi = mix_loss(logits_semi, semi)                     # 同一损失函数，标签来自说话者
+    loss = 0.5 * loss_sup + 0.5 * loss_semi                     # 半批加权，锚定人工分布
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(follower.parameters(), 40.0) # 论文附录：梯度范数裁剪
+    optimizer.step(); optimizer.zero_grad()
+    # 每轮在未见验证集上评估，按成功率早停并保存最优快照</code></pre>
+    <p>解读：<strong>（1）</strong>半批组织让每个梯度步都同时包含人工分布与虚拟分布，防止模型只贴合合成指令的语言风格。<strong>（2）</strong>半监督分支与监督分支共用同一损失函数，区别仅在标签来源与输入环境。<strong>（3）</strong>梯度裁剪 40 与 RMSprop、学习率 1e-4 都来自论文附录，属于稳定训练的经验配置。<strong>（4）</strong>早停按未见验证集成功率执行，报告结果时需要声明快照选择规则。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>用逐元素独立丢弃冒充环境丢弃</strong>：增广后指标几乎不动，说话者指令与现实矛盾。根因：掩码按元素独立采样，同一物体在 36 个视角忽隐忽现，一致状态概率仅约 1.0×10<sup>−8</sup>。修复：把采样单位提升到环境，全视角、全视点共享一张掩码。</li>
+      <li><strong>说话者与跟随者各自采样掩码</strong>：合成指令包含跟随者看不到的物体，微调指标比原始回译还低。根因：标签与环境语义不匹配。修复：同一次调用里生成两侧特征，实现掩码绑定；对照实验显示绑定带来 3.2 个百分点的差距。</li>
+      <li><strong>忘记 1/(1−p) 缩放</strong>：训练期特征幅值比推理期低约四成，策略对亮度与对比度敏感，成功率整体下滑。根因：伯努利掩码的均值不等于 1。修复：按标准 dropout 的缩放规则处理，并写单元测试断言掩码元素期望为 1。</li>
+      <li><strong>把朝向特征也丢进掩码</strong>：动作的空间结构被破坏，回译指令与真实几何错位。根因：把整套特征当作同质输入。修复：只遮蔽图像特征，四维朝向原样保留；语义实验里同样保留墙、地、顶等骨架标签。</li>
+      <li><strong>把预探索结果当标准零样本结论</strong>：用 64.5% 的成功率宣称方法在未见环境即达到该水平。根因：未见环境在评测前参与了回译训练，属于预探索协议。修复：表格分栏标注标准与预探索，引用时写明环境是否在测试前被使用。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>p = 0.4、图像特征 2048 维。计算掩码的缩放系数、每个环境期望遮蔽的维数；若不缩放，特征期望保留比例是多少，训练与推理的分布差如何量化？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>缩放系数 1/(1−0.4) ≈ 1.6667；期望遮蔽 819.2 维；不缩放时训练期特征期望只有推理期的 0.6，幅度差约四成，可用每层激活均值在两种模式下做对比测量。</div></details>
+      </li>
+      <li>推导掩码元素的期望与方差，并说明共享掩码与独立掩码对「同一环境不同视角特征相关性」的不同影响。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>ξ = B/(1−p)，E[ξ] = 1，E[ξ²] = 1/(1−p)，方差 p/(1−p) = 0.6667。共享掩码让不同视角的同一维度完全相关（同时保留或同时丢弃）；独立掩码下相关性为 0，物体在视角间忽隐忽现。</div></details>
+      </li>
+      <li>实现片段 1 与一致性测试：验证同一环境不同视角的掩码逐元素相同，并统计不同环境掩码之间的期望汉明距离；讨论该距离随 p 的变化。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>不同环境独立采样时，某个维度状态不同的概率为 2p(1−p) = 0.48，2048 维期望汉明距离 983.04；p = 0.5 时取最大 1024，p 接近 0 或 1 时趋于 0，说明极端强度下环境之间趋于同质。</div></details>
+      </li>
+      <li>设计 p ∈ {0.2, 0.4, 0.6} 的增广强度扫描实验：列出固定量、记录量、评价指标与预期曲线形状，并解释 p 过大时合成指令可能出现什么退化。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>固定说话者权重、微调步数、早停准则与随机种子。记录合成指令长度分布、词表外词比例、与人工指令的 n-gram 距离。预期曲线在 0.4 附近最高；p 过大时视觉证据缺失，说话者输出空泛模板，指令与环境的对应关系变弱。</div></details>
+      </li>
+      <li>设计一套「回译质量审计」实验：在不知道合成指令真伪的条件下，训练判别器区分人工与合成指令，并研究判别器得分与训练增益的关系。要求给出数据划分、控制变量、判定阈值、防泄漏边界，以及当审计发现合成数据有害时的处置策略。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>判别器用人工与合成指令同环境同路线配对训练，交叉验证防泄漏；把训练增益按判别难度分层统计。若某批合成数据的可区分度极高且训练增益为负，可降低该批权重或更换说话者快照。边界：判别器学到的是语言风格差异，与语义正确性不完全对应，需要人工抽查与下游指标双重确认。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>EnvDrop 的两阶段：先混合模仿与强化学习训练基础策略，再在环境丢弃生成的虚拟环境上回译，用新三元组 (E′, R′, I′) 半监督微调。环境多样性是主要瓶颈，训练环境内约 190K 条候选路线仅约 14K 条被标注（约 7.37%）。</li>
+      <li>环境丢弃三约定：掩码按环境采样、同环境全视角共享、只丢图像特征并保留朝向；按 1/(1−p) 缩放保持期望。p = 0.4 时平均遮蔽 819.2 维，掩码方差 0.6667；独立掩码下 36 视角一致概率仅约 1.03×10<sup>−8</sup>。</li>
+      <li>数字链：IL 43.6 → IL+RL 46.5 → 原始回译 48.2 → 特征丢弃 48.4 → 环境丢弃（不绑定）49.0 → 环境丢弃（绑定）52.2；完整模型测试集单次 51.5% / SPL 0.47，beam 68.9%，预探索 63.9% / SPL 0.61（均为验证或测试口径下的论文报告值）。</li>
+      <li>机制要点：掩码绑定让说话者与跟随者面对同一虚拟环境，绑定相对不绑定提升 3.2 个百分点；半批监督加半批半监督锚定人工分布；掩码每迭代重采样，不增加数据存储。</li>
+      <li>边界：p 过大破坏语义；预探索数字不能当零样本结论；早停使用未见验证集，报告需声明快照选择规则；合成指令噪声需要审计。</li>
+      <li>下一讲把第一阶段的混合训练彻底展开：BC 预热、RL 微调、奖励设计与训练稳定性，把 46.5% 这个数字背后的配方讲清楚。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch027.html">← 第 027 讲：Regretful Agent：回溯与进度标记</a>
+    <a class="next" href="ch029.html">第 029 讲：混合训练：IL + RL 两阶段 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.06 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:11.5px !important;letter-spacing:.06em !important;color:rgba(71,85,105,.45) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#7e8ba0 !important;font-size:11.5px !important;line-height:1.8 !important;text-align:center !important;padding:5px 12px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

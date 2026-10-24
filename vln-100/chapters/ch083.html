@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 083 讲｜NavGPT-2：冻结 LLM + 策略网络 | 视觉语言导航课程 · VLN-100</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第五篇 · 基础模型与 2026 前沿</span>
+    <span class="sep">/</span>
+    <span>第 083 讲</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第五篇 · 基础模型与 2026 前沿</div>
+    <h1>第 083 讲｜NavGPT-2：冻结 LLM + 策略网络</h1>
+    <p class="lead">本讲解剖 NavGPT-2（Zhou、Hong、Wang、Wang、Wu 2024，ECCV 2024，arXiv:2407.12366v1）：把多视图观测对齐进冻结视觉语言模型的隐空间，用拓扑图策略网络承担动作决策。R2R val-unseen 单跑口径下，5B 编码器版本配 PREVALENT 合成数据达到 72 SR、3.13 NE，与同规模训练的 DUET（72 SR）持平，同时保留生成导航理由的语言能力。学完能搭出「冻结 VLM + 可训策略」的两阶段复现骨架。</p>
+    <ul class="meta">
+      <li>主题：基础模型接口 / 冻结隐状态 / 拓扑图策略 / 数据效率</li>
+      <li>关键公式：H′<sup>v</sup> = f<sub>φ</sub>(H<sup>v</sup>)，π(a<sub>t</sub> | W, O<sub>t</sub>; Θ)</li>
+      <li>预计学时：75 分钟</li>
+      <li>前置章节：第 082 讲（NavGPT：纯 LLM 零样本推理）</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>会算：视觉 token 的压缩比、参数口径（1.5B / 5B 与全量 3B / 11B 的换算）、数据效率相对增量与消融落差。</li>
+      <li>会解释：冻结 LLM 为什么保留语言能力、策略网络为什么必须承担空间决策、视觉-语言联合隐状态为什么可以作为策略输入。</li>
+      <li>会实现：指令感知 Q-former 对齐、拓扑图节点嵌入与图感知自注意力、两阶段训练循环（行为克隆加 DAgger）三段示意代码。</li>
+      <li>会判断：零样本提示、微调 LLM、冻结 LLM 加策略三条路线的适用条件，以及「必须微调 LLM 才能解决 VLN」这一论断是否成立。</li>
+      <li>会设计：10K 条导航推理数据的生成与校验流程，以及从离散图迁移到连续环境的接口替换方案。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 081 讲把基础模型进入导航系统的方式归为四类接口，第 082 讲走完了纯提示路线：NavGPT 把观测转成文本，交给 GPT-4 逐步推理。那条路线在 R2R val-unseen 上得到 34 SR、6.46 NE（NavGPT，GPT-4，单跑，783 条轨迹），与专用模型 66 至 81 SR 的区间相差几十个点。论文摘要把零样本提示路线与专用模型之间的差距记为约 40 个百分点（R2R 口径），并指出两类极端做法各自的代价。</p>
+    <p>零样本提示一侧的代价有三项：提示工程复杂且脆弱，每步调用昂贵，视觉描述与历史摘要的噪声持续损耗信息。微调 LLM 一侧同样有代价：把观测经编码表示或文本描述喂给语言模型、把动作转成结构化文本，训练目标与「多视图图像对齐局部指令」这一任务不匹配；更要紧的是通用语言能力在微调中退化，智能体变成不可解释的黑盒。论文明言，这两种做法都没有把语言作为交互媒介的潜力用起来。</p>
+    <p>NavGPT-2 的立场是第三条路：视觉内容对齐进冻结 LLM，语言能力原样保留；动作决策交给专门的拓扑图策略网络，空间建模不依赖语言模型的先天空间感。本讲拆解这套「冻结对齐加可训策略」的配方，并用它的数据效率与消融结果划出边界。第 084 讲的 MapGPT 会回到零样本路线，用语言化地图补上全局视野，两讲形成「冻结训练」与「提示地图」的对照。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p>本节按「问题形式化、视觉对齐、隐状态表征、图策略、训练配方、结果与数据效率、边界」七步展开。数字均来自 NavGPT-2 论文（Zhou 等 2024，arXiv:2407.12366v1）表 1、表 3 至表 6，协议为 R2R 单跑、MP3D 61 场景训练规模，除零样本迁移实验外不引入额外环境数据。</p>
+
+    <h3>1. 问题形式化</h3>
+    <p>给一条指令，其词嵌入序列为 W = {w<sub>i</sub>}（i = 1…L）；智能体在无向图 G = {V, E} 上导航，V 为可导航节点，E 为连通边。第 t 步观测候选集 O<sub>t</sub> ≜ {⟨o<sub>i</sub>, a<sub>i</sub>⟩}<sub>i=1</sub><sup>N</sup>：o<sub>i</sub> 为第 i 个候选节点的视角图像，a<sub>i</sub> 为该视角相对智能体朝向的角度，N 为候选数。模型要学的是选择策略：</p>
+    <div class="formula">
+      π(a<sub>t</sub> | W, O<sub>t</sub>; Θ)
+      <span class="note">W 为指令，O<sub>t</sub> 为本步候选观测，a<sub>t</sub> 从候选视角的相对角度中选择，Θ 为可训练参数</span>
+    </div>
+    <p>形式化本身与第 021 讲的 Seq2Seq、第 036 讲的 DUET 同源，差别在参数 Θ 的构造：Θ 分为视觉对齐参数与策略参数两组，语言模型主体冻结、不进入 Θ。</p>
+
+    <h3>2. 视觉对齐：把多视图塞进冻结 LLM</h3>
+    <p>视觉侧采用 InstructBLIP 的 Q-former 设计：冻结的 EVA-CLIP ViT-g/14 视觉编码器把每张候选视图 o<sub>i</sub> 编码为特征 Z<sub>i</sub><sup>v</sup> = ViT(o<sub>i</sub>)。32 个可学习查询 Q<sub>i</sub> ∈ R<sup>32×768</sup> 先与指令文本嵌入 W 做自注意力，得到指令感知查询 Q′<sub>i</sub>；再用 Q′<sub>i</sub> 对视觉特征做交叉注意力，最后经线性投影 W<sub>p</sub> 得到送给 LLM 的图像 token：</p>
+    <div class="formula">
+      H<sub>i</sub><sup>v</sup> = Q′<sub>i</sub> · W<sub>p</sub>，Q′<sub>i</sub> = CrossAttn(SelfAttn(Q<sub>i</sub>, W), Z<sub>i</sub><sup>v</sup>)
+      <span class="note">固定 32 个查询控制单视图 token 长度；「指令感知」让查询先知道要找什么，再决定从视图里取什么</span>
+    </div>
+    <p>固定长度查询解决工程问题：全景候选可达 12 个视角，若每个视角按 ViT 的 patch 数直接拼 token，单步上下文会迅速膨胀。论文的折中是每视图 32 个 token，上界 12 个候选时视觉 token 为 12 × 32 = 384 个；进入策略网络前再经 MLP 合并为每视图 1 个 token，压缩 32 倍。方向信息通过结构化提示注入，模板为「Candidate i, facing a<sub>i</sub> degree, {direction}」，图像与指令用 &lt;IMG&gt;、&lt;INST&gt; 等特殊 token 分隔。</p>
+
+    <h3>3. 冻结隐状态作为视觉-语言表征</h3>
+    <p>设 LLM 为 f<sub>φ</sub>(·)，φ 全程冻结。图像 token 与指令 token 经过前向计算后，取编码器（或解码器）最后一层的隐状态：</p>
+    <div class="formula">
+      H′<sup>v</sup> = {f<sub>φ</sub>(H<sub>i</sub><sup>v</sup>)}<sub>i=1</sub><sup>N</sup>，H′<sup>l</sup> = f<sub>φ</sub>(W)
+      <span class="note">encoder-decoder 模型取编码器末层，decoder-only 模型取解码器末层；两者都在同一隐空间内</span>
+    </div>
+    <p>这些隐状态同时服务两个出路：解码方向生成导航理由（语言能力来自冻结权重），以及作为策略网络的输入特征。关键判断在于：<strong>LLM 隐空间提供了把「视图内容」与「指令语义」融合好的表征，空间决策未必需要 LLM 亲自完成。</strong>第 2 小节的消融会验证这一判断。</p>
+
+    <h3>4. 拓扑图策略网络</h3>
+    <p>策略网络沿用 DUET 的全局动作分支设计，维护在线拓扑图记忆。节点嵌入分两类：已访问节点用该节点全部候选视图的平均池化表示；未探索节点用其在轨迹中相邻已访问节点的视图做部分池化。每个视图的向量为视觉特征 H̄′<sup>v</sup> 加方向嵌入 E<sup>d</sup> 加步序嵌入 E<sup>s</sup>；未探索节点的步序嵌入置零，另加一个 stop 节点。节点表示经多层 Transformer 建模空间关系：</p>
+    <div class="formula">
+      V = SelfAttn( (1/M) Σ<sub>i=1</sub><sup>M</sup> (H̄′<sub>i</sub><sup>v</sup> + E<sub>i</sub><sup>d</sup> + E<sub>i</sub><sup>s</sup>) )
+      <span class="note">M 为表示该节点的视图数；平均池化聚合同一节点的多视角，步序嵌入记录遍历顺序</span>
+    </div>
+    <p>随后是跨模态编码：节点嵌入与 LLM 编码的指令做交叉注意力，再进入图感知自注意力（Graph-Aware Self-Attention, GASA）。GASA 在标准注意力的 logits 上加一个空间亲和矩阵 A(E<sub>t</sub>)，矩阵元素由已观测节点两两之间的 L2 距离构成：</p>
+    <div class="formula">
+      GASA(V) = Softmax( V W<sub>q</sub> (V W<sub>k</sub>)<sup>T</sup> / √d + A(E<sub>t</sub>) ) V W<sub>v</sub>
+      <span class="note">A(E<sub>t</sub>) 把「图上离得近」这一先验注入注意力；d 为特征维度</span>
+    </div>
+    <p>动作预测用两层前馈网络对 GASA 输出打分，取分值最高的节点，并在图记忆里沿最短路移动过去；同时屏蔽已访问节点的分数，鼓励探索。把「选节点」升级为「图上选目标、再走最短路」，是这套策略与逐边分类的关键差异。</p>
+
+    <h3>5. 两阶段训练配方</h3>
+    <p>阶段一训练视觉对齐：初始化自 InstructBLIP 检查点，只微调 Q-former 与投影层，ViT 与 LLM 冻结。数据为 GPT-4V 自动生成的 10K 条导航推理样本：从 R2R 训练集轨迹中随机抽 10K 个中间步，输入智能体朝向中心的等距柱面投影全景图，要求 GPT-4V 描述周边环境并给出下一步方向或动作。训练超参：200K 步、批大小 8、AdamW、权重衰减 0.05、学习率前 1,000 步从 1e-8 线性升到 1e-5 再余弦衰减到 0。阶段二冻结整个 VLM，接上策略网络单独训练，批大小 2、学习率 1e-5，损失为</p>
+    <div class="formula">
+      L = λ L<sub>BC</sub> + L<sub>DAG</sub>，L<sub>BC</sub> = −Σ log π(v<sub>t</sub><sup>*</sup> | W, G<sub>t</sub>)，L<sub>DAG</sub> = −Σ log π(ṽ<sub>t</sub><sup>*</sup> | W, G̃<sub>t</sub>)
+      <span class="note">v<sub>t</sub><sup>*</sup> 为专家动作；ṽ<sub>t</sub><sup>*</sup> 为在智能体实际生成的部分图 G̃<sub>t</sub> 上沿最短路确定的伪标签；λ 为平衡因子（论文未披露具体取值）</span>
+    </div>
+    <p>全部实验在单张 A100 上完成。数据效率的核验（论文表 3）：50% 训练数据时，NavGPT-2 的 val-unseen SR 为 63.30，DUET 全量数据为 63.90，相差 0.60 个点；10% 数据时两者为 52.02 与 48.19。按阶段一 200K 步、批大小 8 计算，样本访问量为 1.6M 次，对 10K 数据相当于 160 轮，推理监督信号被反复使用。</p>
+
+    <h3>6. 主结果与消融</h3>
+    <p>R2R 单跑主结果（MP3D 61 场景训练规模）如下表。为控制口径，全部数字来自同一论文表 1，val-unseen 与 test-unseen 分列。评测遵循 R2R 标准离散协议（成功判定为终点距离小于 3 米）；离散图不设低层动作步数上限，复现时按所选代码库的 episode 视界单独记录。</p>
+    <table>
+      <tr><th>方法（协议 R2R 单跑）</th><th>val-unseen SR / SPL</th><th>test-unseen SR / SPL</th><th>备注</th></tr>
+      <tr><td>NavGPT（GPT-4，零样本）</td><td>34 / 29</td><td>未报告</td><td>纯提示，每步多专家调用</td></tr>
+      <tr><td>DUET（训练）</td><td>72 / 60</td><td>69 / 59</td><td>同规模基线</td></tr>
+      <tr><td>DUET 去掉局部分支</td><td>68 / 59</td><td>67 / 58</td><td>全局分支主导，SR 仅降 2 至 4 个点</td></tr>
+      <tr><td>NavGPT-2 FlanT5-XL（1.5B）</td><td>68 / 56</td><td>未报告</td><td>不加合成数据</td></tr>
+      <tr><td>NavGPT-2 FlanT5-XL + PREVALENT 数据</td><td>70 / 59</td><td>71 / 60</td><td>test 上领先 DUET 约 2 个点</td></tr>
+      <tr><td>NavGPT-2 FlanT5-XXL（5B）+ PREVALENT 数据</td><td>72 / 61</td><td>71 / 60</td><td>val OSR 81，NE 3.13</td></tr>
+    </table>
+    <p>参数口径需要说明：论文只使用 LLM 编码器参与导航计算，所谓 1.5B 与 5B 对应 FlanT5-XL / XXL 的编码器部分，全量参数为 3B 与 11B，比例分别为 50.0% 与 45.5%。与 7B 级微调路线对比时，必须把这一口径写清楚。</p>
+    <p>消融给出两个判断。其一，去掉策略网络（删除 Q-former 与策略里的视觉-语言交叉注意力，仅留一层图感知自注意力加一层前馈），val-unseen SR 从 67.52 跌到 21.46，落差 46.06 个点（相对降幅 68.22%）。<strong>冻结 LLM 的隐状态本身推不出可靠动作表征，策略网络是必要条件。</strong>其二，去掉推理数据预训练的 Q-former，SR 为 66.75，与完整的 67.52 相差 0.77 个点（1.14%），推理预训练带来小幅增益，主要作用是维持可解释的导航理由质量。LLM 家族对照同样有价值：FlanT5 从 1.5B 升到 5B（val-unseen SR 67.52 到 71.31，增加 3.79 个点），而 Vicuna-13B 的 48.28 低于 Vicuna-7B 的 53.77（低 5.49 个点）。论文把原因归于训练数据差异与注意力结构：多选题式动作选择更契合 FlanT5 编码器的全注意力，因果注意力在视觉与指令序列对齐上表现较差。</p>
+    <p>跨数据集零样本迁移（论文表 4）：RxR 英文上 SR 28.75，比 DUET 高 3.68 个点（14.68%）；HM3D 上 SR 47.20、SPL 27.99，比 DUET 的 25.60 与 13.32 高 21.6 与 14.67 个点。导航理由的生成质量由人类研究把关：30 条留出样本、10 位评分者、0 至 3 分制，NavGPT-2 在准确、信息量、合理性三项得 1.66 / 1.93 / 1.78，GPT-4V 教师为 2.31 / 2.95 / 2.34。</p>
+
+    <h3>7. 边界与失效模式</h3>
+    <ul>
+      <li><strong>动作空间仍是离散图</strong>：策略在预先给定的可导航节点间选择并用最短路执行，R2R-CE 一类的连续环境需要替换图接口、补低层控制器，论文未做该实验。</li>
+      <li><strong>训练环境规模受限</strong>：主结果在 MP3D 61 场景规模内比较，与引入 HM3D、Gibson 的 DUET+ScaleVLN（val-unseen 79 SR，论文表 1）不在同一训练规模，跨规模排名没有意义。</li>
+      <li><strong>推理数据质量决定语言侧上限</strong>：理由由 GPT-4V 生成，人类研究显示教师自身三项得分为 2.31 / 2.95 / 2.34（满分 3 分），同样留有提升空间，学生模型难以超出教师分布。</li>
+      <li><strong>冻结的代价</strong>：语言能力保留，但 LLM 对空间结构的先天理解不足，全部空间能力由策略承担；消融中 21.46 的结果说明这条分工没有冗余。</li>
+      <li><strong>评估口径</strong>：72 场景子集、val-unseen 783 条、test-unseen 与 RxR / HM3D 迁移是四套协议，SR 不可混排；与零样本方法比较时还要标注推理预算（训练数据量与每步调用次数）。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>把方法落成一个可复现工程，需要固定四件事：视觉对齐的 token 形态、策略网络的图接口、两阶段训练的冻结边界、评估口径。下面按数据流顺序给出设计决策与参数依据。</p>
+
+    <h3>数据流</h3>
+    <ol>
+      <li>环境给出本步候选节点与各节点视角图，组装为 {⟨o<sub>i</sub>, a<sub>i</sub>⟩}；</li>
+      <li>冻结 ViT 编码各视图，Q-former 用 32 个指令感知查询压缩；</li>
+      <li>图像 token 与指令文本进入冻结 LLM，取末层隐状态；</li>
+      <li>隐状态既解码导航理由（可选输出），又经 MLP 合并后写入节点嵌入；</li>
+      <li>策略网络在更新后的拓扑图上打分、屏蔽已访问节点、选目标；</li>
+      <li>沿图最短路移动，重复至 stop 节点或步数上限。</li>
+    </ol>
+
+    <h3>三条路线的取舍</h3>
+    <table>
+      <tr><th>维度</th><th>零样本提示（082）</th><th>微调 LLM</th><th>冻结 LLM + 策略（本讲）</th></tr>
+      <tr><td>可训练参数</td><td>无</td><td>LLM 主体</td><td>Q-former 与策略网络</td></tr>
+      <tr><td>语言能力</td><td>保留</td><td>退化风险高</td><td>保留</td></tr>
+      <tr><td>空间决策</td><td>依赖提示与文本描述</td><td>依赖 LLM 微调</td><td>专用图策略承担</td></tr>
+      <tr><td>R2R val-unseen SR</td><td>34（NavGPT，GPT-4）</td><td>40（NavCoT，LLaMA2-7B）</td><td>70 至 72</td></tr>
+      <tr><td>主要代价</td><td>每步 API 调用、提示脆弱</td><td>训练数据需求大、黑盒</td><td>需要推理数据与两阶段训练</td></tr>
+    </table>
+    <p>选择判据：若目标是保留人机交互与理由生成且训练预算有限，选冻结路线；若动作空间连续、观测带深度，先改策略侧接口再考虑是否解冻视觉编码器；除有大规模指令-轨迹语料，不建议解冻 LLM 主体。</p>
+
+    <h3>超参数表</h3>
+    <table>
+      <tr><th>参数</th><th>取值</th><th>作用</th><th>依据</th></tr>
+      <tr><td>Q-former 查询数</td><td>32</td><td>控制单视图 token 长度</td><td>InstructBLIP 设计；12 候选上界 384 token</td></tr>
+      <tr><td>阶段一训练步数</td><td>200K（批 8）</td><td>对齐视觉与指令</td><td>对 10K 数据约 160 轮，单卡 A100 可行</td></tr>
+      <tr><td>阶段一学习率</td><td>1e-8 升至 1e-5，余弦衰减到 0</td><td>小步预热，防对齐初期震荡</td><td>论文配置；预热占 0.5%</td></tr>
+      <tr><td>权重衰减</td><td>0.05</td><td>抑制 Q-former 过拟合</td><td>论文配置</td></tr>
+      <tr><td>阶段二批大小 / 学习率</td><td>2 / 1e-5</td><td>策略网络训练</td><td>冻结 VLM 后显存主要用于图批</td></tr>
+      <tr><td>损失权重 λ</td><td>论文列为平衡因子，未披露数值</td><td>平衡专家监督与 DAgger 伪标签</td><td>复现时先取 λ = 1 观察两项量级，再按 val-seen 调</td></tr>
+      <tr><td>已访问节点屏蔽</td><td>开启</td><td>防原地打转、鼓励探索</td><td>沿用 DUET 设计；关掉后 SPL 下降</td></tr>
+    </table>
+
+    <h3>与上一讲的差异</h3>
+    <p>第 082 讲的 NavGPT 在推理时逐步调用冻结 GPT-4，能力来自提示；本讲把「理解」冻结在权重里、把「决策」移入可训策略，推理阶段无 API 依赖。相对第 036 讲 DUET，本讲换了语言侧表征：12 层、由 LXMERT 初始化的 Transformer 换成冻结 LLM 隐状态，其余全局分支设计相近，这也是表 1 中 DUET 去掉局部分支后仍接近的原因。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>三段代码分别给出指令感知 Q-former 对齐、拓扑图节点嵌入与 GASA、两阶段训练循环。均为按论文结构重写的 PyTorch 示意，接口名称随开源实现版本演进。</p>
+
+    <p><strong>片段 1：指令感知 Q-former 与 token 合并</strong></p>
+    <pre class="code"><code>import torch
+import torch.nn as nn
+
+class InstructionAwareQFormer(nn.Module):
+    """每视图 32 个查询；先与指令自注意力，再对视图特征交叉注意力。"""
+    def __init__(self, dim=768, num_queries=32, heads=8):
+        super().__init__()
+        self.query = nn.Parameter(torch.randn(num_queries, dim) * 0.02)  # 可学习查询
+        self.self_attn = nn.MultiheadAttention(dim, heads, batch_first=True)   # 指令感知
+        self.cross_attn = nn.MultiheadAttention(dim, heads, batch_first=True)  # 取视觉信息
+        self.norm1, self.norm2 = nn.LayerNorm(dim), nn.LayerNorm(dim)
+        self.project = nn.Linear(dim, dim)          # 投到 LLM 词嵌入空间
+        self.merge = nn.Sequential(nn.Linear(dim * num_queries, dim),
+                                   nn.GELU(), nn.Linear(dim, dim))
+
+    def forward(self, view_feats, instr_emb):
+        """view_feats: (B, V, P, D)  ViT patch; instr_emb: (B, L, D)"""
+        B, V = view_feats.shape[:2]
+        instr = instr_emb.unsqueeze(1).expand(B, V, -1, -1)
+        instr = instr.reshape(B * V, instr_emb.size(1), instr_emb.size(-1))
+        q = self.query.unsqueeze(0).expand(B * V, -1, -1)              # (B*V, 32, D)
+        q = self.norm1(q + self.self_attn(q, instr, instr)[0])         # 指令感知
+        kv = view_feats.reshape(B * V, -1, view_feats.size(-1))
+        q = self.norm2(q + self.cross_attn(q, kv, kv)[0])              # 交叉注意力取视图
+        tokens = self.project(q).reshape(B, V, -1)                     # 每视图 32 个 token
+        return self.merge(tokens)                                      # 并为每视图 1 个 token</code></pre>
+    <p>解读：<strong>（1）</strong>查询与指令先自注意力，让「找什么」进入查询，再对视图做交叉注意力；顺序颠倒会退化为通用视觉摘要。<strong>（2）</strong>查询数 32 是 token 长度的硬约束，12 个候选时图像 token 上界 384。<strong>（3）</strong>merge 把 32 个 token 合成 1 个（压缩 32 倍），供策略网络使用；LLM 侧仍看完整的 32 个 token，两条路共享同一批特征。</p>
+
+    <p><strong>片段 2：节点嵌入与 GASA</strong></p>
+    <pre class="code"><code>class GraphAwareBlock(nn.Module):
+    """带距离偏置的多头注意力加前馈，即 GASA 的一层。"""
+    def __init__(self, dim, heads):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(dim, heads, batch_first=True)
+        self.ffn = nn.Sequential(nn.Linear(dim, dim * 4), nn.GELU(),
+                                 nn.Linear(dim * 4, dim))
+        self.n1, self.n2 = nn.LayerNorm(dim), nn.LayerNorm(dim)
+
+    def forward(self, x, attn_bias):
+        a, _ = self.attn(self.n1(x), self.n1(x), self.n1(x), attn_mask=attn_bias)
+        x = x + a
+        return x + self.ffn(self.n2(x))
+
+class GraphPolicyEncoder(nn.Module):
+    """节点嵌入 + 图感知自注意力；距离矩阵作为注意力偏置。"""
+    def __init__(self, dim=768, heads=8, layers=2):
+        super().__init__()
+        self.blocks = nn.ModuleList([GraphAwareBlock(dim, heads) for _ in range(layers)])
+        self.dir_embed = nn.Embedding(12, dim)     # 12 个方向编号
+        self.step_embed = nn.Embedding(64, dim)    # 步序；未探索节点取 0 号位
+        self.scorer = nn.Sequential(nn.Linear(dim, dim), nn.GELU(),
+                                    nn.Linear(dim, 1))  # 节点打分头
+
+    def forward(self, view_tokens, dir_ids, step_ids,
+                node_of_view, node_pos, visited_mask):
+        """view_tokens: (B, V, D)；node_of_view 指明视图归属节点。"""
+        emb = view_tokens + self.dir_embed(dir_ids) + self.step_embed(step_ids)
+        node_emb = scatter_mean(emb, node_of_view)             # 平均/部分池化按节点聚合
+        dist = torch.cdist(node_pos, node_pos)                 # 成对 L2 距离
+        bias = -dist.unsqueeze(1)                              # (B,1,N,N)，广播到多头
+        for block in self.blocks:
+            node_emb = block(node_emb, attn_bias=bias)         # GASA：距离偏置进注意力
+        scores = self.scorer(node_emb).squeeze(-1)
+        scores = scores.masked_fill(visited_mask, float("-inf"))  # 屏蔽已访问节点
+        return scores</code></pre>
+    <p>解读：<strong>（1）</strong>未探索节点的步序嵌入必须置零（0 号位），否则顺序信息泄漏、策略会把「先看到的空缺」当成偏好。<strong>（2）</strong>距离偏置取负 L2，近邻获得更高注意力权重；与逐边分类不同，这里一次性对图内全部节点打分。<strong>（3）</strong>visited_mask 屏蔽已访问节点，防止原地打转；该屏蔽与 DUET 一致，是 SPL 稳定的前提。</p>
+
+    <p><strong>片段 3：两阶段训练循环</strong></p>
+    <pre class="code"><code>import torch.nn.functional as F
+
+def stage_one(vlm, loader, steps=200_000, bs=8):
+    """冻结 LLM 与 ViT，只训 Q-former 与投影层。"""
+    for p in vlm.llm.parameters():
+        p.requires_grad_(False)
+    for p in vlm.vision_encoder.parameters():
+        p.requires_grad_(False)
+    opt = torch.optim.AdamW([p for p in vlm.qformer.parameters()
+                             if p.requires_grad], lr=1e-5, weight_decay=0.05)
+    warmup = torch.optim.lr_scheduler.LinearLR(opt, 1e-8 / 1e-5, 1.0, 1000)
+    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(opt, steps - 1000, eta_min=0.0)
+    sched = torch.optim.lr_scheduler.SequentialLR(opt, [warmup, cosine], [1000])
+    for step, (views, instr, reason) in enumerate(loader):
+        loss = vlm.compute_lm_loss(views, instr, reason)   # 自回归目标
+        loss.backward(); opt.step(); sched.step(); opt.zero_grad()
+        if step + 1 &gt;= steps:
+            break
+
+def stage_two(vlm, policy, loader, lam=1.0, lr=1e-5):
+    """冻结 VLM，只训策略网络；BC 与 DAgger 联合损失。"""
+    vlm.eval()
+    for p in vlm.parameters():
+        p.requires_grad_(False)
+    opt = torch.optim.AdamW(policy.parameters(), lr=lr)
+    for graphs, instr, expert_action, dagger_action in loader:
+        with torch.no_grad():
+            feats = vlm.encode_latents(graphs.views, instr)  # LLM 隐状态
+        logits = policy(feats, graphs)                       # 全局节点打分
+        bc = F.cross_entropy(logits, expert_action)          # 专家监督
+        dag = F.cross_entropy(logits, dagger_action)         # DAgger 伪标签
+        (lam * bc + dag).backward()                          # L = λ L_BC + L_DAG
+        opt.step(); opt.zero_grad()</code></pre>
+    <p>解读：<strong>（1）</strong>阶段一显式冻结 LLM 与 ViT，只把 Q-former 与投影层交给优化器；这是保留语言能力的机制保证。<strong>（2）</strong>预热从 1e-8 起步，避免对齐初期把查询推离初始分布；占 200K 步的 0.5%。<strong>（3）</strong>阶段二用冻结 VLM 预抽隐状态，DAgger 伪标签来自部分图上的最短路；两批数据同源，拼在一个循环里即可。<strong>（4）</strong>λ 未在论文披露，复现时先设 1.0，观察 BC 与 DAgger 两项量级后再调。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>顺手解冻 LLM 主体</strong>：认为「语言模型不够懂空间，应一起微调」。症状是训练损失下降但导航 SR 停滞，且理由生成质量退化。根因是把空间建模寄托在语言权重上，训练信号又不足以改写预训练表征。修复：按论文冻结 LLM 与 ViT，只训 Q-former 与策略；消融里去掉策略网络的 21.46 说明策略缺位时冻结隐状态无法单独支撑动作。</li>
+      <li><strong>参数口径混用</strong>：把「1.5B / 5B」当成完整模型规模，与 7B 级微调模型直接比较。实际口径是只用 LLM 编码器参与导航，全量为 3B / 11B。修复：报告时写清「参与计算规模 = 全量的 50.0% / 45.5%」，并标注是否含 LLM 解码器。</li>
+      <li><strong>未探索节点步序嵌入未置零</strong>：把全部节点按创建顺序编号。症状是策略偏好早期出现的未探索节点，回访与探索失衡。根因是步序泄漏了遍历顺序。修复：未探索节点统一用 0 号步序位，已访问节点按实际步号写入。</li>
+      <li><strong>漏掉已访问节点屏蔽</strong>：打分不设 mask。症状是轨迹反复回到已访问节点，NE 尚可而 SPL 明显偏低。根因是策略把「当前节点」当成高相似候选。修复：打分前对已访问位置填负无穷，与 DUET 的探索策略保持一致。</li>
+      <li><strong>评估协议混排</strong>：把 72 场景子集、val-unseen 783 条、test-unseen、RxR / HM3D 零样本迁移放在同一张排名表。四套协议的数据规模与是否引入额外视觉数据都不同。修复：分组出表并标注 split、步数上限、训练数据规模与推理预算；本讲所有数字均注明 R2R 单跑或对应迁移协议。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>参数与数据效率核算：(a) 只用编码器的 1.5B / 5B 相对全量 3B / 11B 的占比；(b) 10% / 50% / 100% 数据下 NavGPT-2 相对 DUET 的 SR 绝对差与相对增量；(c) 50% 数据的 NavGPT-2 与全量数据的 DUET 差多少个点；(d) 阶段一 200K 步、批 8 对 10K 数据的等效轮数。 <span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>(a) 50.0% 与 45.5%。(b) 3.83 / 3.40 / 3.62 个点，相对 7.95% / 5.68% / 5.67%。(c) 63.30 对 63.90，差 0.60 个点。(d) 200000 × 8 / 10000 = 160 轮。</div></details>
+      </li>
+      <li>主表解读：把 NavGPT-2 FlanT5-XL（68）、XL 加合成数据（70）、XXL 加合成数据（72）与 NavGPT 零样本（34）、DUET（72）、DUET 去掉局部分支（68）放在一起，分别指出哪些差异来自训练数据、哪些来自模型结构、哪些来自推理预算。 <span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>零样本与训练方法之间的差距来自训练数据与提示预算；XL 到 XXL 的 2 个点来自编码器规模；加合成数据的 2 个点来自数据；与 DUET 的对照在同一训练规模内比结构，去掉局部分支只降 2 到 4 个点说明全局分支主导。</div></details>
+      </li>
+      <li>消融解释：(a) 去掉策略网络对 val-unseen SR 的影响量与相对降幅；(b) 去掉推理数据预训练的影响量；(c) 为什么前者是必要条件而后者只是小幅增益？(d) Vicuna-13B 低于 Vicuna-7B 说明了什么？ <span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>(a) 67.52 到 21.46，降 46.06 个点，相对 68.22%。(b) 下降到 66.75，降 0.77 个点（1.14%）。(c) 结论：空间决策必须由专门策略完成；推理预训练主要服务理由生成质量，对动作只提供弱先验。(d) VLN 动作选择是多选题式对齐任务，全注意力编码器比同级因果注意力解码器更合适，规模无法自动弥补结构差异。</div></details>
+      </li>
+      <li>改超参并预测：把阶段一从 200K 步减到 20K 步（数据不变），预测数据效率表在 10% 与 50% 数据档上的走势，并给出验证实验设计（控制哪些变量、看哪些指标、怎样判断是否值得保留 200K 步配置）。 <span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>对齐不足时 Q-former 产出的图像 token 信息量下降，10% 档会首先恶化，50% 档降幅较小；控制变量：同一批 10K 推理数据、同学习率计划、同策略训练配置；指标：val-seen / val-unseen 的 SR 与理由人工评分；若 20K 步在对齐损失与 SR 上均接近 200K，则说明有效训练量远小于名义步数。</div></details>
+      </li>
+      <li>迁移设计：把 NavGPT-2 迁到 R2R-CE。要求 (a) 列出需要替换的接口（图节点选择、路点控制、停止判定）；(b) 说明冻结隐状态能否直接支持连续控制，若不能，新增哪些可训模块；(c) 给出两阶段训练预算估计与一个最小消融计划。 <span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>(a) 全局节点打分保留，图最短路执行改为路点预测加低层控制器，stop 节点改为距离阈值与显式停止的组合判定。(b) 隐状态是节点级语义特征，缺少连续度量信息，需补路点回归头（可参考第 043 讲）与局部避障控制器（第 047 讲）；Q-former 与路点头可训，LLM 继续冻结。(c) 预算按单卡 A100 数量级估计，阶段一不变、阶段二增加连续控制损失（BC 与 DAgger 在路点空间重定义）；最小消融：冻结对解冻 LLM、有对无路点头。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>NavGPT-2 把多视图观测经指令感知 Q-former（每视图 32 查询）对齐进冻结 LLM；隐状态同时服务导航理由生成与策略输入，ViT、LLM 全程冻结。</li>
+      <li>空间决策交给拓扑图策略：节点嵌入（方向与步序）加图感知自注意力（距离偏置），全局节点打分后屏蔽已访问节点，沿最短路执行。</li>
+      <li>两阶段配方：阶段一在 10K 条 GPT-4V 推理数据上训 Q-former（200K 步、批 8、单卡 A100），阶段二训练策略（批 2、学习率 1e-5、BC 加 DAgger）。</li>
+      <li>R2R val-unseen 单跑：FlanT5-XL 加合成数据 70 SR / 59 SPL，FlanT5-XXL 加合成数据 72 SR / 61 SPL、NE 3.13，与同规模 DUET（72 / 60）持平；50% 数据即接近 DUET 全量（63.30 对 63.90）。</li>
+      <li>消融划出分工边界：去掉策略网络 SR 降到 21.46，去掉推理预训练只降 0.77 个点；冻结 LLM 提供语言与对齐，空间能力必须由策略承担。</li>
+      <li>下一讲回到零样本路线。MapGPT 把在线拓扑地图序列化进提示词，用单专家加自适应规划补上全局视野；它是本讲「训练策略」路线的直接对照（第 084 讲）。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch082.html">← 第 082 讲：NavGPT：纯 LLM 零样本推理</a>
+    <a class="next" href="ch084.html">第 084 讲：MapGPT：语言化地图与自适应规划 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.06 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:11.5px !important;letter-spacing:.06em !important;color:rgba(71,85,105,.45) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#7e8ba0 !important;font-size:11.5px !important;line-height:1.8 !important;text-align:center !important;padding:5px 12px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

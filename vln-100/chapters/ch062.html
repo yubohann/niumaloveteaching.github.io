@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 062 讲｜ScaleVLN II：合成管线拆解 | 视觉语言导航课程 · VLN-100</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第四篇 · 规模、记忆与泛化方法论</span>
+    <span class="sep">/</span>
+    <span>第 062 讲</span>
+    <span class="sep">/</span>
+    <a href="ch063.html">下一讲 →</a>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第四篇 · 规模、记忆与泛化方法论</div>
+    <h1>第 062 讲｜ScaleVLN II：合成管线拆解</h1>
+    <p class="lead">第 061 讲给出规模结论，本讲把生成 4,941,710 条指令-轨迹对的合成管线拆成四道工序：800 个 HM3D 训练场景加 491 个 Gibson 场景共 1291 个真实扫描，如何被构造成全可通行的导航图（节点密度 1.16 个每平方米、平均边长 1.41 米、平均度 4.55）；Co-Mod GAN 如何修复破损渲染图；3 至 5 个中间节点的最短路采样如何产出 2,890,267 与 2,051,443 条轨迹；EnvDrop Speaker 如何逐条生成指令。最后用论文的表 6 与表 7 讲清数据在预训练、微调两阶段的分配规律。</p>
+    <ul class="meta">
+      <li>主题：数据工厂 / 导航图构建 / 渲染修复 / 轨迹采样 / 预训练与微调配比</li>
+      <li>关键数字：1291 场景、4,941,710 条指令-轨迹对、节点密度 1.16 个每平方米、平均边长 1.41 米、微调增益 +2.51 个百分点</li>
+      <li>预计学时：65 分钟</li>
+      <li>前置讲：第 061 讲（ScaleVLN I：1200+ 场景与 4.9M 轨迹）</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>会算：核对 1291 个场景、超过 15 万平方米可导航面积、4,941,710 条轨迹与相对 R2R 训练集 352.35 倍的口径；核算 20k × 256 与 200k × 16 两段训练预算。</li>
+      <li>会解释：节点过采样、层次聚类、边筛选与图精化四步如何决定采样空间的质量，穿障边比例为什么能把增广数据从收益变成噪声。</li>
+      <li>会实现：写出图构建、轨迹采样与训练预算核对三段示意代码，并给出每一段的质检断言。</li>
+      <li>会判断：图像修复、更多场景、更多样本三个变量的收益排序与适用条件，识别 Gibson 低质资产进入微调的风险。</li>
+      <li>会设计：把增广数据分配到预训练与微调的最优组合，解释 PREV 在微调阶段有害、HM-E 在微调阶段有益的实验依据。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 061 讲确认了三件事：环境数量与监督数量共同决定泛化；单模型在 R2R test 上可以到 80% 成功率；seen 与 unseen 的差距可以压到 1 个百分点以内。这些结论都建立在一套自动合成数据之上。本讲要回答的是这套数据怎么造：哪些环节决定质量，哪些参数决定规模，哪些步骤容易把噪声带进训练。</p>
+    <p>ScaleVLN 管线（Wang 等 2023，ICCV 2023，arXiv:2307.15644v2）的定位是「全自动、可复现」。论文明确与 MARVAL 对照：后者依赖未公开的语言生成模型 Marky、视觉编码器 MURAL 与图像到图像的 GAN；ScaleVLN 只使用公开资产与公开模型，四道工序分别是收集环境、构建导航图、修复渲染图、采样轨迹并生成指令。可复现是数据工厂能被社区采用的前提，也让每一步的收益都可以单独检验。</p>
+    <p>拆解管线还有一层课程意义。第 063 讲进入环境资产本身，解释 HM3D 与 HM3DSEM 的采集、语义标注与评测资产；第 064 讲回到数据工程的采购、清洗、许可与版本纪律。本讲位于两者之间，回答「拿到资产之后做什么」；三讲合起来构成第四篇的数据供给侧。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p>本讲按「资源盘点、图构建、图像修复、轨迹采样、指令生成、使用配方、结果与边界」七步展开；论文数字全部标注来源（arXiv:2307.15644v2，ICCV 2023），估算值单独标注口径。</p>
+
+    <h3>1. 资源盘点：1291 个场景与四道工序</h3>
+    <p>数据源选了两个真实扫描数据集：HM3D 的 800 个训练场景（HM3D 论文口径为 800 / 100 / 100 划分），以及 Gibson 的 491 个训练与验证场景（与 MARVAL 的选择一致）。两者合计 1291 个场景，HM3D 占 61.97%，Gibson 占 38.03%。论文报告可导航面积超过 15 万平方米，约为下游 MP3D 训练集（61 个扫描、2 万平方米）的 7.5 倍。<strong>结论一：规模先来自环境侧，再来自轨迹侧；场景数决定了视觉分布的上限。</strong></p>
+    <p>面积口径可以做一次跨来源核对。HM3D 论文报告 1000 个场景共 112.5k 平方米可导航面积，平均每场景 112.5 平方米；Gibson 报告 571 个场景共 81.84k 平方米，平均每场景 143.3 平方米。按此折算 800 个 HM3D 场景约 9.0 万平方米，491 个 Gibson 场景约 7.0 万平方米，合计约 16.0 万平方米，与论文「超过 15 万」一致。核算脚本应把这条交叉检查写成断言，防止后续换版本时口径漂移。</p>
+    <div class="formula">
+      A ≈ (112.5 m² × 800) + (143.3 m² × 491) ≈ 90,000 + 70,374 = 160,374 m²
+      <span class="note">A 为可导航面积估计；两个单场景均值分别来自 HM3D 论文（112.5k / 1000）与 Gibson 论文口径（81.84k / 571）；论文报告值大于 15 万 m²，估计值比该下界高 6.9%，属正常折算误差</span>
+    </div>
+    <p>四道工序的数据流如下：环境集合先离散成导航图；渲染图经修复模型恢复到接近相机拍摄质量；在图上采样轨迹；用语言模型为轨迹生成指令。之后还有一道使用工序：把合成数据按比例分配到预训练与微调。前四道工序决定数据的质量与数量，第五道决定这些质量能不能转化为指标。</p>
+
+    <h3>2. 图构建：把真实场景变成可采样空间</h3>
+    <p>导航图要满足四项要求：覆盖尽量多的开放空间以保证视觉多样；边必须真实可通行；边长控制在采样合理的范围；节点尽量落在开放空间中轴上，避免贴墙。论文先批评了两类做法：AutoVLN 的图稀疏且存在穿障边，限制了可采样轨迹的数量并产生不切实际的路径；MARVAL 训练模型预测可通行方向，会引入预测误差与额外复杂度。</p>
+    <p>ScaleVLN 采用四步启发式。第一，用 Habitat 的可导航位置采样函数过量采样视点，覆盖几乎全部开放空间，同时限制任意两视点的测地距离大于 0.4 米。第二，用层次聚类（agglomerative clustering）把相邻视点合并成单一视点，距离阈值为 1.0 米，使节点自动落到开放空间中轴附近。第三，在 5.0 米以内随机连边，并把每个节点的最大边数限制为 5，得到粗图。第四，调用已有的图精化方法（Hong 等 2022）删除穿障边并补齐连通性，得到全连通、全可通行的图。</p>
+    <p>最终图统计：平均边长 1.41 米，平均节点度 4.55，节点密度 1.16 个每平方米。对照 AutoVLN，节点密度为 0.36 个每平方米，穿障边比例为 29.35%，ScaleVLN 的穿障边比例为 0%。密度比值为 1.16 / 0.36 ≈ 3.22，即开放空间的可采样位置约为对照图的三倍。<strong>结论二：图质量是增广数据有效性的门槛，穿障边会把监督信号变成错误监督。</strong></p>
+    <table>
+      <tr><th>图</th><th>节点密度（个每平方米）</th><th>穿障边比例</th><th>val unseen SR</th><th>val unseen SPL</th></tr>
+      <tr><td>不使用增广（R2R + PREV）</td><td>不适用</td><td>不适用</td><td>72.92</td><td>62.82</td></tr>
+      <tr><td>AutoVLN 图</td><td>0.36</td><td>29.35%</td><td>72.75</td><td>62.56</td></tr>
+      <tr><td>ScaleVLN 图</td><td>1.16</td><td>0.00%</td><td>76.01</td><td>66.94</td></tr>
+    </table>
+    <p>表中三行都只用 800 个 HM3D 场景且未做图像修复，变量只有图。AutoVLN 图的增广数据没有带来收益，甚至略低于不增广的基线；ScaleVLN 图的增广把 unseen SR 拉升 3.09 个百分点。<strong>结论三：不是所有增广数据都有正收益，采样空间的质量决定增广的方向。</strong></p>
+
+    <h3>3. 图像修复：渲染质量是隐形门槛</h3>
+    <p>HM3D 与 Gibson 的网格来自真实扫描，渲染图像与相机拍摄图像存在明显质量差：破洞、扭曲、缺失区域。论文把恢复任务建模成图像到图像的转换，使用 Co-Modulated GAN（Co-Mod GAN，Zhao 等 2020 的生成模型设计），先在 Matterport3D 的「渲染图与相机图」成对数据上训练，再把模型应用到 HM3D 与 Gibson 的渲染图上。采用配对监督的原因很直接：MP3D 同时提供两种图像，修复目标可以逐像素核对；无监督转换缺少这样的直接信号。</p>
+    <p>修复的收益按资产质量分层。HM3D 的扫描质量较高，修复带来的变化有限；Gibson 的网格质量参差，大量场景存在严重破损，修复收益明显。对照实验给出了一个尖锐的数字：在已修复的 HM3D 增广数据上加入未修复的 Gibson 数据，环境数增加 61%，val unseen SR 却从 76.59 降到 76.33；换成修复后的 Gibson 数据，SR 升到 78.08，SPL 从 67.74 升到 68.31。<strong>结论四：数据规模只有在质量达标时才有正向作用；低质样本会抵消新增环境带来的多样性。</strong></p>
+    <table>
+      <tr><th>增广数据组合</th><th>val seen SR</th><th>val seen SPL</th><th>val unseen SR</th><th>val unseen SPL</th></tr>
+      <tr><td>HM-E 未修复</td><td>79.82</td><td>75.06</td><td>76.01</td><td>66.94</td></tr>
+      <tr><td>HM-E 已修复</td><td>79.24</td><td>73.34</td><td>76.59</td><td>67.74</td></tr>
+      <tr><td>HM-E 已修复 + Gib-E 未修复</td><td>81.00</td><td>75.44</td><td>76.33</td><td>66.97</td></tr>
+      <tr><td>HM-E 已修复 + Gib-E 已修复</td><td>80.51</td><td>74.88</td><td>78.08</td><td>68.31</td></tr>
+    </table>
+
+    <h3>4. 轨迹采样：数量、长度与分布</h3>
+    <p>采样策略沿用 PREVALENT（第 030 讲）：在任意两个由 3 至 5 个中间节点相连的视点之间取全部最短路。路径的边数为 4 至 6，恰好对齐 R2R 的短指令形态。HM3D 产出 2,890,267 条路径，Gibson 产出 2,051,443 条，合计 4,941,710 条，构成本讲标题里的 4.9M。实算：HM3D 每场景约 3612.8 条，Gibson 每场景约 4178.1 条，全库平均每场景约 3827.8 条；相对 R2R 训练集的 14,025 条指令，倍数为 352.35（论文口径为约 352 倍）；相对 PREVALENT 的 178,270 条（ScaleVLN 论文口径，即论文的 4.62 倍表述所对应的分母），倍数为 27.72。</p>
+    <p>合成路径的长度需要用图统计做一次估算。平均边长为 1.41 米，边数取 4 至 6，路径长度为 5.64 至 8.46 米；若边数在区间内均匀分布，期望为 5 × 1.41 = 7.05 米。R2R 论文口径为平均 7 个节点、约 10 米。按 7.05 米计算，合成路径比 R2R 训练轨迹短约 29.5%。<strong>结论五：合成轨迹的分布与下游并不完全一致，长度偏短是这套管线的已知偏差。</strong></p>
+    <div class="formula">
+      L<sub>合成</sub> = k × ℓ，k ∈ {4,5,6}，ℓ = 1.41 m
+      <span class="note">L 为路径长度，k 为边数，ℓ 为平均边长；区间 5.64 至 8.46 米，均匀假设下期望 7.05 米；R2R 平均约 10 米，比值 70.5%</span>
+    </div>
+    <p>这条估算有两个使用条件：一是边长 1.41 米是全库平均，单条路径的实际长度取决于局部图结构；二是均匀假设未必成立，不同中间节点数量的路径条数受图度数分布影响。把估算写成带假设的表达式，目的是让复现报告可审计，避免把 7.05 米当成论文数字引用。</p>
+
+    <h3>5. 指令生成：LSTM Speaker 与 GPT-2 的对照</h3>
+    <p>指令由在 R2R 指令-路径对上训练的 EnvDrop Speaker 生成，第 022 讲介绍过它的机制：编码路径、逐词解码描述。论文同时试了更强的 GPT-2，结果分成两层。语言指标上，EnvDrop 的 Bleu-4 为 27.66，高于 GPT-2 的 24.36；下游指标上，EnvDrop 数据的 val unseen SR 为 76.59，GPT-2 数据为 75.82，SPL 为 67.74 对 66.08。<strong>结论六：合成指令的文本指标与导航可用性弱相关，Bleu-4 不能单独作为数据验收判据。</strong></p>
+    <p>论文对差距的解释是：GPT-2 生成的描述更丰富，但指令-轨迹的对齐程度未必更高；EnvDrop 的词表与句式直接来自 R2R，与下游评测分布更近。把这条结论与第 033 讲的 BnB 对照：两张数据工厂都验证了「分布贴近下游优先于生成模型更强」。合成指令的短板也很明确：它们是对轨迹的再描述，不包含人类标注者在终点附近独有的停止线索；数据侧只能靠数量与架构侧（第 061 讲的停止判定分析）共同消化。</p>
+
+    <h3>6. 使用配方：预训练与微调的配比实验</h3>
+    <p>合成数据只有放进正确的阶段才产生收益。论文把 R2R、PREV、HM-E 三类数据在预训练与微调两个阶段的组合逐个对照，本表节选与结论直接相关的五行（val seen / val unseen 的成功率与 SPL，百分比；编号沿用论文表 6 的 Method 序号）。</p>
+    <table>
+      <tr><th>编号</th><th>预训练数据</th><th>微调数据</th><th>val seen SR / SPL</th><th>val unseen SR / SPL</th></tr>
+      <tr><td>2</td><td>R2R + PREV</td><td>R2R</td><td>76.89 / 69.71</td><td>72.92 / 62.82</td></tr>
+      <tr><td>3</td><td>R2R + HM-E</td><td>R2R</td><td>75.02 / 68.71</td><td>74.96 / 65.90</td></tr>
+      <tr><td>4</td><td>R2R + PREV + HM-E</td><td>R2R</td><td>79.24 / 73.34</td><td>76.59 / 67.74</td></tr>
+      <tr><td>6</td><td>R2R + PREV + HM-E</td><td>R2R + HM-E</td><td>80.02 / 73.52</td><td>79.10 / 68.66</td></tr>
+      <tr><td>7</td><td>R2R + PREV + HM-E</td><td>R2R + PREV + HM-E</td><td>80.71 / 75.29</td><td>77.10 / 67.23</td></tr>
+    </table>
+    <p>读表三句。第一，对比编号 2、3、4：PREV 与 HM-E 在预训练阶段互补，三类数据合用把 unseen SR 从 72.92 推到 76.59。第二，对比编号 4 与 6：微调阶段保留 HM-E 把 unseen SR 再推 2.51 个百分点到 79.10，同时把 seen 与 unseen 的差距压到 0.92 个百分点；论文据此给出「大数据训练降低过拟合」的解释。第三，对比编号 6 与 7：微调阶段加入 PREV 有害（77.10 低于 79.10），原因指向对 61 个 MP3D 场景的过拟合。Gibson 增广数据也被验证只适合预训练，进入微调会引入与 Matterport 风格差距过大的噪声。</p>
+    <p>预训练任务的选择同样有明确结论。MLM（掩码语言建模，Masked Language Modeling）单独使用时 val unseen SR 为 69.14，SAP（单步动作预测，Single Action Prediction）单用为 74.20，两者合用为 76.59；在两者之上再加 MRM（掩码区域建模，Masked Region Modeling）降到 75.82。<strong>结论七：预训练目标要与数据特性匹配；大规模多样数据已经提供了丰富的语义监督，再叠加区域级预测会引入噪声。</strong>最终配方是 MLM + SAP，预训练数据为 R2R + PREV + ScaleVLN，微调数据为 R2R + HM-E。</p>
+
+    <h3>7. 结果与适用边界</h3>
+    <p>训练预算（论文口径）：预训练在 2 张 A100 上训练 2 万次迭代，批大小 256，学习率 5×10<sup>−5</sup>，约 72 GPU 小时；微调在单卡上训练 20 万次迭代，批大小 16，约 48 GPU 小时；视觉编码器默认 CLIP ViT-B/16，最好结果换用 CLIP ViT-H/14 并加 EnvEdit 图像增广。实算：预训练共过 512 万样本，折合每次迭代约 12.96 秒；微调共过 320 万样本，折合每次迭代约 0.86 秒；按批 16 计，4.94M 条数据对应约 30.9 万个批。</p>
+    <p>结果汇总：R2R test unseen 上，DUET + ScaleVLN 为 77 SR / 68 SPL，换强编码器与增广后为 80 SR / 70 SPL 与 2.27 米导航误差；人类跟随者为 86 SR / 76 SPL，前作 BEVBert 为 73 SR / 62 SPL。CVDN 的测试 GP 为 6.97，论文报告相对前作提升 1.41 米（相对 25.26%）。REVERIE 测试为 56.13 SR / 39.52 SPL，相对 AutoVLN 提升 0.96 / 0.64。R2R-CE 上，HAMT + ScaleVLN 的 val unseen 为 55 SR / 51 SPL / 4.80 米 NE，test unseen 为 55 SR / 50 SPL / 5.11 米 NE；论文摘要报告该项任务相对对照口径提升 5 个百分点 SR，本讲引用的同表中，val unseen 比最强对照（InternVideo 的 53 SR）高 2 个百分点，两个口径并存，引用时须写明来源。</p>
+    <p>边界与失效模式：</p>
+    <ul>
+      <li><strong>离散与连续的动作空间差</strong>：合成数据是图上的离散监督，进入 R2R-CE 需要候选路点预测器（第 043 讲）把动作空间桥接起来，离散轨迹不能直接当连续监督。</li>
+      <li><strong>场景与下游不相交</strong>：HM3D 与 Gibson 的场景集合和 MP3D 不重叠，风格差距是真实存在的域迁移；微调阶段只用 HM-E 而排除 Gib-E 正是对差距的让步。</li>
+      <li><strong>合成指令的分布窄</strong>：EnvDrop Speaker 的句式与词表来自 R2R，长尾参考表达与模糊指代覆盖不足；换任务（如 REVERIE 的物体指代）时需要单独构造数据。</li>
+      <li><strong>估算值不可当论文数字</strong>：路径长度 7.05 米依赖均匀边数假设；报告时必须带假设与来源，防止在跨论文表格中误用。</li>
+      <li><strong>复现依赖资产版本</strong>：HM3D 与 Gibson 的版本、许可与场景清单都会影响数字，复现报告必须写明资产版本与采样脚本版本。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>把本讲落成一套可执行的数据工厂，需要四件东西：工序表、超参表、数据分配对照表与选择判据。所有接口以论文与公开实现的设计为参照，版本演进时以仓库为准。</p>
+
+    <h3>工序与质检</h3>
+    <table>
+      <tr><th>工序</th><th>输入</th><th>操作</th><th>输出与质检判据</th></tr>
+      <tr><td>收集环境</td><td>HM3D / Gibson 资产</td><td>取训练场景并统一到 Habitat</td><td>1291 场景清单；记录版本号与许可</td></tr>
+      <tr><td>构建图</td><td>场景网格</td><td>过采样、聚类、连边、精化</td><td>密度与穿障率断言；抽查中心性与连通性</td></tr>
+      <tr><td>修复图像</td><td>渲染图</td><td>Co-Mod GAN 转换</td><td>修复前后成对抽检；分区报告缺陷率变化</td></tr>
+      <tr><td>采样轨迹</td><td>导航图</td><td>3 至 5 中间节点的最短路</td><td>条数、长度分布、度数分布；去重与自环检查</td></tr>
+      <tr><td>生成指令</td><td>轨迹图像序列</td><td>EnvDrop Speaker 解码</td><td>抽检指令与轨迹一致；记录生成模型版本</td></tr>
+      <tr><td>训练分配</td><td>全库数据</td><td>按阶段与比例组合</td><td>两阶段配比表；对照实验记录</td></tr>
+    </table>
+
+    <h3>超参与取值依据</h3>
+    <table>
+      <tr><th>参数</th><th>论文取值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>视点最小间距</td><td>0.4 m</td><td>控制过采样密度</td><td>覆盖开放空间并限制冗余</td></tr>
+      <tr><td>聚类阈值</td><td>1.0 m</td><td>合并相邻视点</td><td>节点落到空间中部</td></tr>
+      <tr><td>连边上限</td><td>5.0 m</td><td>粗图边长</td><td>与单步移动尺度匹配</td></tr>
+      <tr><td>节点度上限</td><td>5</td><td>控制候选动作规模</td><td>与细粒度动作选择配套</td></tr>
+      <tr><td>路径中间节点</td><td>3 至 5</td><td>对齐 R2R 短指令</td><td>PREVALENT 采样口径</td></tr>
+      <tr><td>预训练迭代 / 批</td><td>20k / 256</td><td>表示学习</td><td>2 张 A100 约 72 GPU 小时</td></tr>
+      <tr><td>微调迭代 / 批</td><td>200k / 16</td><td>下游适配</td><td>单卡约 48 GPU 小时</td></tr>
+      <tr><td>预训练目标</td><td>MLM + SAP</td><td>语言与动作对齐</td><td>消融中优于加入 MRM</td></tr>
+    </table>
+
+    <h3>数据分配对照</h3>
+    <table>
+      <tr><th>数据</th><th>放预训练</th><th>放微调</th><th>证据</th></tr>
+      <tr><td>R2R</td><td>是</td><td>是</td><td>下游数据，两阶段都需要</td></tr>
+      <tr><td>PREV（MP3D 增广）</td><td>是</td><td>否</td><td>放入微调降到 77.10</td></tr>
+      <tr><td>HM-E（HM3D 增广）</td><td>是</td><td>是</td><td>放入微调升到 79.10，seen/unseen 差 0.92</td></tr>
+      <tr><td>Gib-E（Gibson 增广）</td><td>是</td><td>否</td><td>修复后仅利于预训练</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：先修图，再扩量，最后调分配</span>
+      <p>四道工序的投入顺序应按收益排序：图质量决定数据可用性（穿障图无收益）；图像质量决定新增环境能否转成收益（未修复 Gibson 数据抵消 61% 的环境增量）；规模在两者达标后才按预算扩张；分配实验最后做，因为它调的是同一批数据的用法。判据是固定评测口径下的 val unseen SR：每一步只引入一个变量，收益低于一个百分点时停止加码。</p>
+    </div>
+    <p>与相邻讲的分工：第 061 讲给出规模与结果的全景；本讲拆管线与配方；第 063 讲进入 HM3D 与 HM3DSEM 资产本身，解释 800 / 100 / 100 划分与语义标注的来源；第 064 讲把采集、清洗、许可、版本写成可审计的工程流程。三讲共用同一套报告口径：SR、SPL、NE 的 split 与步数上限必须与评测协议一同标注。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>三段代码分别给出图构建、轨迹采样与训练预算核对。接口以论文与公开实现的设计为参照，版本演进时以仓库为准。</p>
+
+    <p><strong>片段 1：四步图构建（示意）</strong></p>
+    <pre class="code"><code>import numpy as np
+
+def build_nav_graph(navmesh, spacing=0.4, cluster=1.0,
+                    edge_max=5.0, degree_cap=5):
+    """从可导航网格构建全可通行图：过采样、聚类、连边、精化。"""
+    pts = navmesh.sample_navigable_points()
+    kept = []
+    for p in pts:                                  # 第一步：过采样并去冗余
+        if all(np.linalg.norm(p - q) &gt; spacing for q in kept):
+            kept.append(p)
+    centers = cluster_adjacent(kept, threshold=cluster)   # 第二步：层次聚类
+    edges = []
+    for i, c in enumerate(centers):                # 第三步：近邻连边，度上限 5
+        neighbors = sorted(range(len(centers)),
+                           key=lambda j: np.linalg.norm(c - centers[j]))
+        deg = 0
+        for j in neighbors:
+            if j == i or deg &gt;= degree_cap:
+                continue
+            d = float(np.linalg.norm(c - centers[j]))
+            if d &lt;= edge_max and (j, i) not in edges:
+                edges.append((i, j)); deg += 1
+    edges = refine_graph(centers, edges, navmesh)  # 第四步：删穿障边、补连通
+    return centers, edges
+
+def graph_audit(centers, edges, navmesh, area_m2):
+    """质检：密度与穿障率是两条硬断言。"""
+    density = len(centers) / area_m2
+    collide = sum(0 if navmesh.edge_is_free(*e) else 1 for e in edges)
+    return density, collide / len(edges)</code></pre>
+    <p>解读：<strong>（1）</strong>四步与论文一致，spacing、cluster、edge_max、degree_cap 四个参数对应 0.4 / 1.0 / 5.0 / 5 的取值；改动任何一项都要重跑 graph_audit。<strong>（2）</strong>密度与穿障率是硬断言：论文口径下密度 1.16 个每平方米、穿障率 0%；AutoVLN 的 0.36 与 29.35% 是反面参照。<strong>（3）</strong>refine_graph 承担删除穿障边与补齐连通性两项职责，缺少这一步的图会产生不存在的移动，采样出的轨迹会把错误动作当作监督。</p>
+
+    <p><strong>片段 2：3 至 5 个中间节点的最短路采样</strong></p>
+    <pre class="code"><code>from collections import deque
+
+def bfs_depth(graph, src, max_depth):
+    """返回 src 到其余节点的最短路步数与父节点。"""
+    dist = {src: 0}
+    parent = {src: None}
+    queue = deque([src])
+    while queue:
+        u = queue.popleft()
+        if dist[u] == max_depth:
+            continue
+        for v in graph[u]:
+            if v not in dist:
+                dist[v] = dist[u] + 1
+                parent[v] = u
+                queue.append(v)
+    return dist, parent
+
+def sample_routes(graph, lo=3, hi=5):
+    """任意两点间由 lo 至 hi 个中间节点相连的最短路，全部收集。"""
+    routes = []
+    for src in graph:
+        dist, parent = bfs_depth(graph, src, max_depth=hi + 1)
+        for dst, hops in dist.items():             # hops 为边数
+            if lo + 1 &lt;= hops &lt;= hi + 1 and src &lt; dst:
+                path = []
+                cur = dst
+                while cur is not None:             # 回溯父指针得到路径
+                    path.append(cur)
+                    cur = parent[cur]
+                routes.append(list(reversed(path)))  # 边数 4 至 6
+    return routes</code></pre>
+    <p>解读：<strong>（1）</strong>lo 与 hi 是中间节点数量的下界与上界，对应路径边数 4 至 6；论文报告 HM3D 产出 2,890,267 条、Gibson 产出 2,051,443 条。<strong>（2）</strong>对无序对做 src &lt; dst 过滤可避免重复计数；若图是有向的则需按可达方向单独处理。<strong>（3）</strong>全对最短路在 1291 个场景上耗时可控，因为单场景节点数有限且深度上限只有 6；采样完要对条数与长度分布做断言，长度期望按平均边长 1.41 米折算约为 5.64 至 8.46 米。</p>
+
+    <p><strong>片段 3：训练预算与配比核对</strong></p>
+    <pre class="code"><code>hm, gib = 2_890_267, 2_051_443
+total = hm + gib
+print(total, round(total / 14_025, 2))          # 4941710 352.35
+print(round(hm / 800, 1), round(gib / 491, 1))  # 3612.8 4178.1
+print(round(5 * 1.41, 2), round(6 * 1.41, 2))   # 7.05 8.46
+
+pre_samples = 20_000 * 256                      # 5120000
+ft_samples = 200_000 * 16                       # 3200000
+print(pre_samples, round(72 * 3600 / 20_000, 2))    # 12.96 秒每次迭代
+print(ft_samples, round(48 * 3600 / 200_000, 3))    # 0.864 秒每次迭代
+
+rows = {"2": (72.92, 62.82), "4": (76.59, 67.74),
+        "6": (79.10, 68.66), "7": (77.10, 67.23)}
+print(round(rows["6"][0] - rows["4"][0], 2))    # 2.51 微调保留 HM-E 的 SR 增益
+print(round(79.10 - 77.10, 2))                  # 2.00 微调保留 PREV 的损失
+print(round(80.02 - 79.10, 2))                  # 0.92 seen 与 unseen 差距（百分点）</code></pre>
+    <p>解读：<strong>（1）</strong>前三行核对数据规模与路径长度估算，是复现报告的基础断言；4,941,710 与 352.35 必须与论文口径一致，估算值 7.05 与 8.46 要带假设标注。<strong>（2）</strong>中段把两段训练预算换算成每次迭代的墙钟时间，用于判断换卡后的可行性：预训练每次迭代约 13 秒，微调约 0.9 秒，后者对数据吞吐更敏感。<strong>（3）</strong>末段把表 6 的关键差值写成断言：微调保留 HM-E 增益 2.51 个百分点，保留 PREV 损失 2.00 个百分点，seen 与 unseen 差距 0.92 个百分点。三行数字来自同一张表，跨表混用会失真。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>图不验证可通行就采样</strong>：训练正常收敛，val unseen 指标低于不增广的基线。根因是粗连边跨越了墙体与家具，监督信号指向不存在的移动；AutoVLN 图的 29.35% 穿障率给出了这种退化的量级。修复：采样前跑穿障率断言，目标为 0%；用图精化补齐连通性后再统计密度与度数分布。</li>
+      <li><strong>用 Bleu-4 挑选合成指令模型</strong>：选出的模型文本指标更高，导航指标更低或持平。根因是文本相似度与指令可执行性脱钩。修复：验收以固定验证集上的导航指标为主，Bleu 只作为诊断量；同时抽检指令与轨迹的一致性。</li>
+      <li><strong>把低质资产直接并入增广库</strong>：环境数增加，unseen 指标不动或下降。根因是破损渲染图引入与下游不一致的视觉分布；未修复 Gibson 数据在环境数 +61% 时让 SR 从 76.59 退到 76.33。修复：按资产分层报告修复前后的缺陷率，质量不达标的分区在微调阶段排除。</li>
+      <li><strong>微调阶段堆入全部增广数据</strong>：seen 指标变好，unseen 指标变差。根因是 PREV 的 61 个 MP3D 场景与下游高度重叠，微调时造成过拟合；三条数据全开的编号 7 为 77.10，低于只保留 HM-E 的 79.10。修复：微调只用与下游场景不相交的增广数据，把重叠数据放预训练。</li>
+      <li><strong>把估算路径长度当论文数字引用</strong>：在跨论文表格里写「合成路径平均 7.05 米」，与原始描述无法对应。根因是均匀边数假设被省略。修复：引用时写明「由平均边长 1.41 米与边数 4 至 6 估算」，并同时给出假设失效的检查方法（统计实际长度分布）。</li>
+      <li><strong>忽略资产版本与许可</strong>：同一条命令在不同时间复现出不同场景清单，评测数字不可比。根因是 HM3D 与 Gibson 的版本、许可范围与下载策略会变化。修复：数据卡片记录资产版本、场景清单的校验值、许可条款与获取日期；清单变化时重跑基线。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>完成规模核对：1291 个场景、4,941,710 条轨迹。计算：(a) HM3D 与 Gibson 各自的轨迹占比；(b) 两库每场景平均轨迹数；(c) 相对 R2R 训练集 14,025 条与 PREVALENT 178,270 条的倍数。 <span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>(a) 2,890,267 / 4,941,710 = 58.49%，2,051,443 / 4,941,710 = 41.51%。(b) 合计平均 4,941,710 / 1291 = 3827.8，HM3D 为 3612.8，Gibson 为 4178.1。(c) 相对 R2R 训练集 4,941,710 / 14,025 = 352.35 倍；相对 PREVALENT 4,941,710 / 178,270 = 27.72 倍。</div></details>
+      </li>
+      <li>把路径采样的中间节点区间从 3 至 5 改为 2 至 4，其他条件不变。预测三件事的方向：轨迹总条数、平均路径长度、以及模型在短指令上的表现；写出预测依据与一个可证伪的观测指标。 <span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>区间下移使边数从 4 至 6 变为 3 至 5：满足条件的点对数增加，总条数上升；平均边数从 5 降到 4，按 1.41 米折算平均长度从 7.05 米降到 5.64 米；短指令样本占比上升，短指令子集指标可能改善，但长程样本变少，整体分布与 R2R 的偏差变大。可证伪指标：按路径长度分箱统计验证集 SR，观察短程与长程两端的相对变化。</div></details>
+      </li>
+      <li>推导题：已知平均边长 ℓ = 1.41 米、边数 k ∈ {4,5,6}。要求 (a) 写出路径长度区间的推导；(b) 说明均匀假设下期望为 7.05 米的条件；(c) 给出一个不依赖均匀假设、直接从数据统计期望的操作步骤。 <span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>(a) L = kℓ，k 取 4 与 6 得 5.64 与 8.46 米。(b) E[L] = E[k]ℓ = 5 × 1.41 = 7.05，需要 k 在 {4,5,6} 上均匀或至少 E[k] = 5；图度数分布不均匀时 E[k] 会偏移。(c) 采样完成后直接统计所有路径的实际长度与边数，报告分位数与均值，并与估计值对照；估计只用于预算是校核，最终数字以统计为准。</div></details>
+      </li>
+      <li>设计图像修复的消融实验：给定 HM-E 与 Gib-E 两库各含修复前后两个版本，要求 (a) 写出固定项与变量；(b) 给出四组最小对照；(c) 预测哪一组最能分离「环境多样性」与「图像质量」两个因素；(d) 说明结果如何影响微调数据的选择。 <span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>(a) 固定智能体、预训练配方、训练步数与评测 split，只换增广库的版本组合。(b) HM-E(R)；HM-E(R)+Gib-E(F)；HM-E(R)+Gib-E(R)；HM-E(F) 可选作对照。(c) 已修复 HM-E 与「已修复 HM-E + 未修复 Gibson」两组之差分离图像质量，环境增量相同；后者与前者的环境数不同，需同时报告场景数。(d) 若未修复组合不升反降，微调阶段排除低质分区，预训练阶段可保留。</div></details>
+      </li>
+      <li>复现方案设计：给定一套新的真实扫描资产库（约 500 个场景），要求按本讲四道工序写出完整方案，包含 (a) 图构建参数与三条质检断言；(b) 轨迹采样口径与规模预估公式；(c) 指令生成方案与验收指标；(d) 预训练与微调的数据分配表及一个最小对照实验设计；(e) 列出三个预期失效点与检查方法。 <span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>(a) 参数以 0.4 / 1.0 / 5.0 / 5 为起点；断言为穿障率 0%、密度在合理区间、图全连通。(b) 中间节点 3 至 5，规模按场景数乘每场景条数（参考 3827.8 的均值量级）估上界。(c) 指令模型沿用 EnvDrop Speaker，验收以固定验证集的导航指标为主、Bleu 为辅。(d) 分配仿表 6：预训练混入全部增广，微调只保留与下游不相交的增广。(e) 预期失效点示例：聚类阈值失配导致节点贴墙、低质资产拉低微调分布、指令分布窄于评测集；检查方法分别是中心性抽检、分层指标与指令长度分布对照。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>ScaleVLN 管线由 1291 个真实场景（800 HM3D + 491 Gibson，可导航面积超过 15 万平方米，折合约 7.5 倍 MP3D 训练集）出发，经图构建、图像修复、轨迹采样、指令生成四道工序产出 4,941,710 条指令-轨迹对。</li>
+      <li>图构建四步为过采样（0.4 米间距）、层次聚类（1.0 米阈值）、连边（5.0 米上限、度上限 5）与图精化；结果为密度 1.16 个每平方米、平均边长 1.41 米、平均度 4.55、穿障率 0%，对照图的穿障率为 29.35% 且无增广收益。</li>
+      <li>图像修复用 Co-Mod GAN 在 MP3D 成对数据上训练；未修复 Gibson 数据在环境数增加 61% 时让 val unseen SR 从 76.59 降到 76.33，修复后升到 78.08。</li>
+      <li>轨迹采样沿用 3 至 5 个中间节点的最短路口径，HM3D 产出 2,890,267 条、Gibson 产出 2,051,443 条；按平均边长估算路径长度区间为 5.64 至 8.46 米，期望 7.05 米，比 R2R 的 10 米口径短约 29.5%。</li>
+      <li>使用配方：预训练用 MLM + SAP（比加入 MRM 高 0.77 个百分点）；PREV 与 HM-E 在预训练互补；微调保留 HM-E 的增益为 2.51 个百分点，保留 PREV 的损失为 2.00 个百分点；最终 R2R test 为 77 / 68，换强编码器后 80 / 70。</li>
+      <li>下一讲进入环境资产本身：HM3D 如何用 1000 个建筑重建把可导航面积推到 112.5k 平方米，HM3DSEM 如何为 216 个场景标注 142,646 个实例，以及这些资产怎样支撑 ObjectNav 的评测与泛化实验（第 063 讲）。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch061.html">← 第 061 讲：ScaleVLN I：1200+ 场景与 4.9M 轨迹</a>
+    <a class="next" href="ch063.html">第 063 讲：HM3D / HM3DSEM：环境规模化 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.06 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:11.5px !important;letter-spacing:.06em !important;color:rgba(71,85,105,.45) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#7e8ba0 !important;font-size:11.5px !important;line-height:1.8 !important;text-align:center !important;padding:5px 12px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

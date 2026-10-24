@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 088 讲｜NaVid：视频 VLM 端到端 | 视觉语言导航课程 · VLN-100</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第五篇 · 基础模型与 2026 前沿</span>
+    <span class="sep">/</span>
+    <span>第 088 讲</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第五篇 · 基础模型与 2026 前沿</div>
+    <h1>第 088 讲｜NaVid：视频 VLM 端到端</h1>
+    <p class="lead">本讲拆解 Zhang 等 2024 的 NaVid（arXiv:2402.15852v7，RSS 2024）：只输入单目 RGB 视频流与指令，不依赖地图、里程计与深度，由视频视觉语言模型直接输出「动作类型加定量参数」的下一步动作。R2R-CE val-unseen 上 SR 37.4、SPL 35.9、NE 5.47 米，在低层动作空间方法中路径效率与误差最优；真机 200 条指令约 66% 成功。学完能设计视频 token 接口、数据配方与带协议的动作评测。</p>
+    <ul class="meta">
+      <li>主题：视频视觉语言模型 / 端到端导航 / 纯 RGB 输入 / 仿真到真机迁移</li>
+      <li>关键数字：R2R-CE val-unseen SR 37.4、SPL 35.9、NE 5.47 米；510k 导航样本加 763k 网页样本；真机 200 条约 66%；单步 1.2 到 1.5 秒</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置讲：第 087 讲（InstructNav：动态导航链与多源价值图）</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>会算：视频 token 预算随历史帧数的增长、导航与网页数据的配比、跨数据集相对提升、真机与仿真的协议差换算。</li>
+      <li>会解释：指令相关 token 与指令无关 token 的分工，当前帧与历史帧为何采用不同稀疏度，以及动作参数如何由语言模型生成。</li>
+      <li>会实现：帧 token 化与特殊标记拼接、动作文本格式化与正则解析、训练样本组装与损失掩码三段示意代码。</li>
+      <li>会判断：历史信息的三种替代表示（纯文本、地图文本、自我视角文本）各自损失了什么，以及一组对比是否受动作空间脚注影响。</li>
+      <li>会设计：真机评测协议（指令分层、成功半径、样本量）与历史压缩方案，并预测对成功率与延迟的影响。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 087 讲的 InstructNav 走组合路线：语言模型做规划，分割模型建语义点云，价值图合成，A 星规划。系统能力强，代价是每步多次模型调用，输入依赖深度与位姿，链路长、误差来源多。另一条路线是把决策整体交给一个端到端模型。Zhang 等 2024 指出，过往方法在泛化上有两类断点：走出分布场景时的性能衰减，以及仿真到真实（Sim-to-Real）迁移时因里程计噪声、深度感知与地图域差带来的衰减。如果输入只剩机器人自带相机拍到的视频流，两类断点各少一条通道。</p>
+    <p>NaVid 的定位是首个面向连续环境、仅用单目 RGB 视频的语言导航视觉语言模型。它把每帧编码为少量视觉 token，与指令 token 拼接后送入语言模型，自回归生成下一步动作；动作带定量参数（前进距离、旋转角度），可由真实机器人直接执行。训练侧用仿真收集的 51 万条导航样本与 76.3 万条网页数据联合微调。本讲回答三个问题：视频历史如何压进上下文，动作如何以语言形式生成与校验，这套配方在跨数据集与真机上分别表现如何。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p>本节按「问题形式化、模型结构、动作接口、训练配方、证据、边界」六步展开。数字来自 Zhang 等 2024（arXiv:2402.15852v7）；R2R-CE 与 RxR-CE 使用 Habitat 评测，成功判定为停止点距目标 3 米内，真机为 1.5 米内，差异在证据与坑两节重点讨论。</p>
+
+    <h3>1. 问题形式化</h3>
+    <p>连续环境导航形式化为部分可观测马尔可夫决策过程：时刻 t 收到自然语言指令 I 与该时刻为止的视频观察 O<sub>t</sub> = {x<sub>0</sub>, …, x<sub>t</sub>}，输出底层动作 a<sub>t+1</sub> ∈ A，环境转移后得到新的观测帧 x<sub>t+1</sub>。与第 041 讲的标准设定相比，这里的观察空间被压缩到只剩单目 RGB，动作空间是「动作类型加定量参数」。<strong>输入被裁剪得越干净，与真实部署的接口差就越小，这是全讲的设计主轴。</strong></p>
+
+    <h3>2. 视频 token 化与模型结构</h3>
+    <p>NaVid 建立在视频视觉语言模型 LLaMA-VID 之上，组件包括 EVA-CLIP 视觉编码器、Q-Former 查询生成器、视觉到语言的两个投影器，以及 Vicuna-7B 语言模型。每帧图像先经编码器得到 256 个图像块特征，随后分两路压缩：</p>
+    <div class="formula">
+      E<sup>Q</sup><sub>t</sub> = P<sub>Q</sub>( Pool( Softmax(Q<sub>t</sub> X<sub>t</sub><sup>T</sup>) X<sub>t</sub> ) )，&nbsp; E<sup>V</sup><sub>t</sub> = P<sub>V</sub>( GridPool(X<sub>t</sub>) )
+      <span class="note">X<sub>t</sub> 为单帧图像块特征；Q<sub>t</sub> 为 Q-Former 依指令生成的查询；E<sup>Q</sup> 经池化得 1 个指令相关 token；E<sup>V</sup> 为指令无关 token，数目决定细粒度</span>
+    </div>
+    <p>每帧因此表示为 1 个指令相关 token 加若干指令无关 token。当前帧是动作推理的主要依据，指令无关 token 取 64 个以保留几何信息；历史帧只提供进度上下文，每帧取 4 个。拼接用三个特殊标记分隔：历史段包在位移标记内，当前帧包在观察标记内，导航标记提示语言模型开始处理指令并输出动作。token 预算可以精算：总视觉 token 为 65 + 5 × (T − 1)，T 为累计帧数。T = 10 时 110 个，T = 100 时 560 个，T = 300 时 1,560 个，加上指令与特殊标记约 50 个，总量约 1,610 个，具体占用取决于所选语言模型的上下文长度。<strong>按每帧 2 token 的朴素设计，T = 300 时只需 600 个 token，本设计花费 2.6 倍预算换当前帧的几何细节。</strong></p>
+
+    <h3>3. 动作接口：语言形式的类型加参数</h3>
+    <p>动作类型取自离散集合：前进、左转、右转、停止。前进还预测移动距离，转向预测旋转角度，形成可直接执行的定量指令。评测与部署时用正则表达式解析语言输出，提取类型与参数。论文报告该解析器在 R2R-CE val-unseen 上的有效动作获得率为 100%。这一接口有两个设计含义：动作历史天然以文本保存，可直接放进后续上下文；动作与语言共用一个生成通道，说明与推理共享参数。<strong>把控制量写进语言输出，等于让语言模型承担了控制器的一部分职责，好处是迁移容易，风险是数值精度与格式合规需要外部校验。</strong></p>
+
+    <h3>4. 训练配方：混合数据与协同训练</h3>
+    <p>数据由两块组成。导航侧共 51 万条样本：来自 61 个 MP3D 室内场景的 32 万条专家轨迹逐步样本，加 18 万条按 DAgger 思路收集的非专家轨迹样本，再加 1 万条指令推理辅助任务样本（给定视频轨迹反推指令）。网页侧沿用基座模型的 76.3 万条视频问答与描述数据，占比 59.94%，导航样本占 40.06%，两者比例约 1 比 1.5。非专家轨迹的作用是让模型见到自己的错误状态，缩小训练分布与部署分布的差距；指令推理辅助任务强化环境理解与指令跟随。</p>
+    <p>训练在 24 张 A100 上约 28 小时，合计 672 个显卡小时，全部数据只过 1 轮。各模块加载基座预训练权重，仅优化语言模型与文本编码器的可训练参数，视觉编码器与查询生成器保持冻结。数据采样上有两处区别：网页视频按每秒 1 帧抽帧以去除冗余，导航数据保留全部帧，单条序列多数少于 300 帧。<strong>数据配方与帧策略共同决定了上下文预算：把导航帧也按 1 帧每秒抽取，会删掉转向与避障所需的关键时刻。</strong></p>
+
+    <h3>5. 证据</h3>
+    <p>仿真主结果（R2R-CE val-unseen，1,839 条回合）：NaVid 轨迹长 7.63 米、NE 5.47 米、可到达率 49.1、SR 37.4、SPL 35.9。在只预测底层动作的方法里，路径效率、误差与可到达率三项最优，SR 与最佳低层方法 WS-MGMap 的 38.9 接近；相对共享纯 RGB 设定的基线，SR 从 5.00 提升到 37.4，SPL 从 4.43 提升到 35.9。同表内使用高层动作空间或共享路点预测器的方法可达 SR 55 至 57（HAMT、ETPNav），引用时必须注明动作空间脚注，两档不能直接排名。</p>
+    <p>跨数据集（在 R2R 训练，零样本迁到 RxR-CE val-unseen，1,517 条）：NE 8.41 米、可到达率 34.5、SR 23.8、SPL 21.2。相对当时零样本最佳的 GPT 规划方法（论文表列 SR 16.8、SPL 6.3），SR 相对提升 41.67%，SPL 相对提升 236.51%。子集对照（随机 100 条 R2R-CE val-unseen）更能说明训练的作用：未微调的视觉语言模型频繁输出环境描述，无法给出合法动作；微调后的同族模型可获得 91.3% 的合法动作率；NaVid 在子集上 SR 38.0、SPL 35.4，GPT-4V 提示方式为 SR 5.00、SPL 3.11。</p>
+    <p>历史表示的消融给出了本讲最值得记住的一组数字（R2R-CE val-unseen）：纯文本历史 SR 0.0、地图文本 9.13、自我视角文本 23.5、视频表示 37.4，SPL 分别为 0.0、8.97、20.8、35.9。从自我视角文本换成视频，SR 提高 13.9 个点。<strong>时序视觉上下文是这套方法的主要增益来源，把历史压成文本会让系统几乎失去决策能力。</strong></p>
+    <p>真机实验在四类室内场景（会议室、办公室、实验室、休息室）各设计 25 条单地标指令与 25 条组合指令，共 200 条，成功率约 66%，单步推理耗时 1.2 至 1.5 秒。轨迹难度分布：指令通常需要 30 至 90 步、约 5 至 20 米；训练集中超过 90 步的回合占 5.91%，35 至 75 步的占 74.3%，模型在长指令上保持稳定表现。</p>
+
+    <h3>6. 边界与失效模式</h3>
+    <ul>
+      <li><strong>导航训练数据仅来自仿真。</strong>专家与非专家轨迹均采集自 61 个 MP3D 场景，真机性能依赖基座模型的开放世界知识迁移，未见场景的真实光照与动态障碍仍是断点。</li>
+      <li><strong>成功判定口径不同。</strong>仿真 3 米、真机 1.5 米，真机 66% 与仿真 37.4% 不可直接比较，且两者指令分布不同。</li>
+      <li><strong>历史上下文线性增长。</strong>每历史帧 5 个 token，长回合的上下文与延迟随帧数增长；论文数据中超过 90 步的回合占比不高，更长任务缺少证据。</li>
+      <li><strong>动作参数依赖解析器。</strong>定量参数由语言生成，粒度受训练分布限制；解析失败时的回退策略直接决定闭环能否继续。</li>
+      <li><strong>推理尚未达到实时。</strong>单步 1.2 至 1.5 秒，约 31 步的回合需 37.2 至 46.5 秒；移动机器人需要底层避障兜底。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>把方法落成部署系统需要四块：帧编码与 token 拼接、动作生成与解析、混合数据训练循环、真机执行接口。设计目标是在纯 RGB 输入下保持可用精度，并让接口尽量窄。</p>
+
+    <h3>输入输出接口</h3>
+    <table>
+      <tr><th>接口项</th><th>规格</th><th>说明</th></tr>
+      <tr><td>观测输入</td><td>单目 RGB 视频流，保留全部导航帧</td><td>不使用深度、里程计、地图；网页数据按 1 帧每秒采样</td></tr>
+      <tr><td>历史编码</td><td>每历史帧 4 个指令无关 token 加 1 个指令相关 token</td><td>5 × (T − 1) 个视觉 token</td></tr>
+      <tr><td>当前帧编码</td><td>64 个指令无关 token 加 1 个指令相关 token</td><td>保留几何细节，支撑定量动作参数</td></tr>
+      <tr><td>动作输出</td><td>类型集合加定量参数，文本形式</td><td>前进配距离，转向配角度；正则解析器提取</td></tr>
+      <tr><td>成功判定</td><td>仿真 3 米内停止；真机 1.5 米内停止</td><td>报告时必须标注半径与数据集版本</td></tr>
+    </table>
+
+    <h3>方案取舍</h3>
+    <table>
+      <tr><th>方案</th><th>输入</th><th>优势</th><th>代价与判据</th></tr>
+      <tr><td>组合系统（第 087 讲）</td><td>RGB-D 加位姿加分割</td><td>可解释、可插拔、零样本多任务</td><td>每步多次调用；适合任务类型多、能接受延迟的场景</td></tr>
+      <tr><td>VLM 端到端（NaVid）</td><td>单目 RGB 视频</td><td>接口窄、动作直接可执行、跨数据集迁移好</td><td>需要导航数据微调；单步 1.2 至 1.5 秒；适合部署导向的单一任务</td></tr>
+      <tr><td>专用模型（HAMT、ETPNav 类）</td><td>RGB-D 加位姿，部分共享路点预测器</td><td>指标最高</td><td>依赖训练域；路点预测器与 MP3D 拓扑绑定，跨域风险高</td></tr>
+    </table>
+    <p>训练配置表：视觉编码器与查询生成器冻结；语言模型与文本编码器可训练；24 张 A100、约 28 小时、672 显卡小时；全数据 1 轮；导航样本保留全部帧且多数少于 300 帧；网页样本 1 帧每秒。按全部 127.3 万条样本摊算，每条样本的平均训练时间是 1.90 秒；只看 51 万条导航样本则为 4.74 秒，量级上说明单轮训练同样不轻量。</p>
+    <div class="box key">
+      <span class="box-title">设计决策：把归纳偏置从模块搬到数据</span>
+      <p>组合系统用显式地图与价值图表达空间先验，NaVid 把先验交给 51 万条轨迹与视频上下文。两条路线的接口宽度不同：前者宽而可解释，后者窄而难插桩。<strong>当部署目标明确、可获得域内轨迹时，窄接口换来的迁移收益通常更大；当任务类型频繁变化时，宽接口更稳。</strong></p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>三段代码分别给出帧 token 化与标记拼接、动作格式化与解析、训练样本组装。示意实现，编码器组由初始化函数注入。</p>
+
+    <p><strong>片段 1：视频 token 化与特殊标记</strong></p>
+    <pre class="code"><code>import torch
+
+ENC = None                                          # 由初始化函数注入编码器组
+
+def encode_frame(frame, instruction, n_agnostic):
+    """把单帧压成 1 个指令相关 token 加 n_agnostic 个指令无关 token。"""
+    x = ENC.vision(frame)                           # (256, C) 图像块特征
+    q = ENC.query_gen(x, instruction)               # 指令条件下的查询
+    e_q = ENC.proj_q(cross_attend(q, x))            # (1, C) 指令相关 token
+    e_v = ENC.proj_v(grid_pool(x, n_agnostic))      # (n_agnostic, C) 指令无关 token
+    return torch.cat([e_q, e_v], dim=0)
+
+def build_nav_input(history_frames, current_frame, instruction):
+    """历史帧 4 token，当前帧 64 token，用特殊标记分隔三类信息。"""
+    hist = [encode_frame(f, instruction, 4) for f in history_frames]
+    cur = encode_frame(current_frame, instruction, 64)
+    tokens = [HIS] + flatten(hist) + [HIS_END, OBS] + cur + [OBS_END, NAV]
+    return tokens, instruction                       # 拼接后送入语言模型</code></pre>
+    <p>解读：<strong>（1）</strong>指令相关 token 由 Q-Former 在指令条件下生成，负责提取与当前任务相关的视觉内容；指令无关 token 保留整体几何，两者互补。<strong>（2）</strong>当前帧 64 个、历史帧 4 个的稀疏度差异，直接对应「动作依据」与「进度上下文」两类需求。<strong>（3）</strong>特殊标记让语言模型能区分历史、当前与指令三段，避免位置错乱；标记本身不携带视觉信息，只做分界。</p>
+
+    <p><strong>片段 2：动作格式化与解析</strong></p>
+    <pre class="code"><code>import re
+
+ACTION_TYPES = ("FORWARD", "TURN-LEFT", "TURN-RIGHT", "STOP")
+ACTION_RE = re.compile(
+    r"(FORWARD|TURN-LEFT|TURN-RIGHT|STOP)"          # 动作类型
+    r"(?:\s+([0-9]+(?:\.[0-9]+)?))?"                # 可选的定量参数
+)
+
+def format_action(action_type, arg):
+    """生成训练目标文本：类型加定量参数。"""
+    if action_type == "FORWARD":
+        return f"FORWARD {arg:.2f} m"               # 前进距离，米
+    if action_type in ("TURN-LEFT", "TURN-RIGHT"):
+        return f"{action_type} {arg:.0f} degrees"   # 旋转角度，度
+    return "STOP"
+
+def parse_action(text):
+    """解析模型输出；缺参数的非停止动作视为非法。"""
+    m = ACTION_RE.search(text.upper())
+    if m is None:
+        return None
+    kind = m.group(1)
+    if kind == "STOP":
+        return (kind, 0.0)
+    if m.group(2) is None:
+        return None
+    return (kind, float(m.group(2)))</code></pre>
+    <p>解读：<strong>（1）</strong>格式化与解析使用同一套类型集合与参数约定，训练目标与部署解析不会漂移。<strong>（2）</strong>缺参数的非停止动作判为非法，避免猜测默认值后执行不可控指令；论文报告该解析在 val-unseen 上获得有效动作的比例为 100%。<strong>（3）</strong>实际部署还需对参数做范围裁剪（距离上限、角度上限），这一层在解析之后、执行之前，与本解析器解耦。</p>
+
+    <p><strong>片段 3：训练样本组装与损失掩码</strong></p>
+    <pre class="code"><code>def build_sample(traj, instruction, tokenizer):
+    """traj 含帧序列与真实动作；只在动作答案上计算损失。"""
+    frames = traj["frames"]                          # 导航视频帧，保留全部帧
+    prompt_tokens, instruction = build_nav_input(
+        frames[:-1], frames[-1], instruction)
+    answer = format_action(traj["action_type"], traj["action_arg"])
+    ids_p = tokenizer(prompt_tokens, instruction)    # 前缀 token 序列
+    ids_a = tokenizer(answer)                        # 监督答案 token 序列
+    labels = [-100] * len(ids_p) + ids_a             # 前缀不参与损失
+    return torch.tensor(ids_p + ids_a), torch.tensor(labels)
+
+def mixed_batches(nav_loader, web_loader, nav_weight=0.4):
+    """导航样本占 40.06%，网页样本占 59.94%，按比例交替取批。"""
+    while True:
+        yield next(web_loader) if random.random() &gt; nav_weight else next(nav_loader)</code></pre>
+    <p>解读：<strong>（1）</strong>损失只作用于动作答案，前缀里的视觉与指令 token 不提供监督，避免模型学会复述输入。<strong>（2）</strong>导航样本与网页样本按 0.40 比 0.60 混合，维持通用知识的同时注入导航能力；采样权重可根据遗忘程度调整。<strong>（3）</strong>导航序列保留全部帧是设计要点，帧数上限与上下文预算共同约束单条样本长度。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>把语言输出当自由文本处理。</strong>症状：未微调的模型输出环境描述，闭环中拿不到动作。根因：生成通道没有格式约束，评测端缺少校验。修复：固定动作模板训练，推理端用正则解析并拒绝非法输出；论文中未微调的 LLaMA-VID 有效动作率为 0%，微调后为 91.3%，NaVid 为 100%，三个数说明了格式约束的跨度。</li>
+      <li><strong>真机与仿真数字直接对比。</strong>症状：宣称真机 66% 远高于仿真 37.4%。根因：成功半径不同（1.5 米对 3 米，判别面积差 4 倍）且指令分布不同。修复：分表报告，标注半径、场景数与指令类型；需要对比时改用同一半径口径重算。</li>
+      <li><strong>忽略动作空间脚注。</strong>症状：把 NaVid SR 37.4 与 ETPNav 57 直接排名。根因：后者使用高层动作空间或共享路点预测器（表中以星号与剑标标注）。修复：按动作空间分层比较；NaVid 的结论限定在低层动作空间方法内。</li>
+      <li><strong>帧采样策略错配。</strong>症状：把网页数据的 1 帧每秒采样套到导航数据，转向决策抖动。根因：导航动作对齐每一帧，跳帧会丢失关键时刻。修复：导航保留全部帧，网页数据抽帧；单条序列多数控制在 300 帧以内以约束上下文。</li>
+      <li><strong>把历史压成文本或地图。</strong>症状：系统在长指令上迷路，成功率崩塌。根因：消融显示纯文本历史 SR 0.0、地图文本 9.13、自我视角文本 23.5，均远低于视频的 37.4。修复：保留视频历史；需要省上下文时优先压历史帧 token 数（4 个一帧），不改成文本。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>Token 预算：视觉 token 数为 65 + 5 × (T − 1)。(a) 计算 T 取 10、100、300 时的数量；(b) 与每帧 2 token 的朴素设计比较三种长度的倍数；(c) 若把历史帧的指令无关 token 从 4 增到 8，T = 300 时的总量与增幅是多少。 <span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>(a) 110、560、1,560。(b) 5.5 倍、2.8 倍、2.6 倍，历史越长倍数越低。(c) 每历史帧从 5 变 9，总量 1 + 64 + 9 × 299 = 2,756，增幅约 76.7%，需评估上下文是否放得下。</div></details>
+      </li>
+      <li>数据配比：导航样本 32 万专家加 18 万非专家加 1 万指令推理，网页样本 76.3 万。(a) 验证导航总数与网页占比；(b) 计算两类样本的比例；(c) 说明非专家轨迹与指令推理任务各自解决的问题。 <span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>(a) 51 万条，占比 40.06%，网页 59.94%。(b) 网页对导航约 1.50 比 1。(c) 非专家轨迹让模型见过自身错误状态、缓解分布错位；指令推理强化环境理解与指令跟随，二者都不增加动作标注成本。</div></details>
+      </li>
+      <li>跨数据集增益：NaVid 在 RxR-CE val-unseen 零样本 SR 23.8、SPL 21.2，对照零样本 GPT 规划方法的 16.8 与 6.3。(a) 计算两组相对提升；(b) 说明 SPL 相对提升远大于 SR 的原因；(c) 该对照中哪些条件保证了「零样本」口径成立。 <span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>(a) SR +41.67%，SPL +236.51%。(b) 对照方法路径效率极低（SPL 6.3），分母小放大了相对提升；SR 提升受任务难度限制。(c) 训练只用 R2R 轨迹，RxR-CE 未参与训练；两法均在 RxR-CE val-unseen 评测，成功判定同为 3 米。</div></details>
+      </li>
+      <li>消融解读：历史表示四档为纯文本（SR 0.0、SPL 0.0）、地图文本（9.13、8.97）、自我视角文本（23.5、20.8）、视频（37.4、35.9）。(a) 说明纯文本历史完全失败的可能机制；(b) 自我视角文本与视频差 13.9 个点，指出这部分增益来自哪些视觉线索；(c) 设计一个把视频历史压到原来一半 token 的方案并预测掉点方向。 <span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>(a) 动作历史文本失去视角与空间线索，模型难以判断进度与朝向。(b) 增益来自时序连续的运动线索、视野变化与障碍布局。(c) 可对历史帧做时间下采样加注意力池化；预测 SR 小幅下降、SPL 下降更明显，需在 val-unseen 上验证并报告掉点。</div></details>
+      </li>
+      <li>真机协议设计：为 200 条指令的真机评测写一份对比方案，要求 (a) 说明单地标与组合指令的划分与配比；(b) 定义成功半径、超时步数与人工接管规则；(c) 给出一组消融把「RGB 输入」「视频历史」「非专家轨迹」三项贡献拆开；(d) 预测三项中哪项对真机成功率影响最大，并给出验收阈值。 <span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>(a) 四类场景各 25 条单地标与 25 条组合，共 200 条。(b) 真机成功半径 1.5 米；设超时步数与最大时长；人工接管后该条计失败并记录。(c) 消融一：仅当前帧无历史；消融二：历史用文本替代；消融三：训练去掉非专家轨迹，其余配置固定。(d) 预测视频历史影响最大（仿真消融相差 13.9 个点）；验收可设组合指令成功率不低于单地标的 70%，否则判定长程能力不足。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>NaVid 是首个面向连续环境、仅用单目 RGB 视频流的语言导航视觉语言模型，动作以「类型加定量参数」的文本形式输出，可直接执行。</li>
+      <li>每帧压成 1 个指令相关 token 加若干指令无关 token：当前帧 64 个保几何，历史帧 4 个省预算；视觉 token 总量 65 + 5 × (T − 1)，T = 300 时约 1,560 个。</li>
+      <li>训练配方为混合协同训练：51 万条导航样本（32 万专家、18 万非专家、1 万指令推理）加 76.3 万条网页样本，24 张 A100 约 28 小时、1 轮，仅微调语言模型与文本编码器。</li>
+      <li>R2R-CE val-unseen 上 SR 37.4、SPL 35.9、NE 5.47 米，低层动作空间方法中效率与误差最优；RxR-CE 零样本 SR 23.8（相对 +41.67%）、SPL 21.2（相对 +236.51%）；真机 200 条约 66%。</li>
+      <li>历史表示的消融是核心证据：纯文本 0.0、地图文本 9.13、自我视角文本 23.5、视频 37.4，视频上下文带来最大单项增益。</li>
+      <li>边界与协议：训练数据来自 61 个仿真场景，真机 1.5 米与仿真 3 米口径不可混比，单步 1.2 至 1.5 秒。下一讲 Uni-NaVid 把这类视频视觉语言动作模型统一到多任务单模型上（第 089 讲）。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch087.html">← 第 087 讲：InstructNav：动态导航链与多源价值图</a>
+    <a class="next" href="ch089.html">第 089 讲：Uni-NaVid：统一导航 VLA →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.06 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:11.5px !important;letter-spacing:.06em !important;color:rgba(71,85,105,.45) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#7e8ba0 !important;font-size:11.5px !important;line-height:1.8 !important;text-align:center !important;padding:5px 12px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

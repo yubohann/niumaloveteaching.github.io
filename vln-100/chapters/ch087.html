@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 087 讲｜InstructNav：动态导航链与多源价值图 | 视觉语言导航课程 · VLN-100</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第五篇 · 基础模型与 2026 前沿</span>
+    <span class="sep">/</span>
+    <span>第 087 讲</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第五篇 · 基础模型与 2026 前沿</div>
+    <h1>第 087 讲｜InstructNav：动态导航链与多源价值图</h1>
+    <p class="lead">本讲拆解 Long 等 2024 的 InstructNav（arXiv:2406.04882v1）：用动态导航链 DCoN 把物体目标、视觉语言、需求驱动三类指令统一为「动作加地标」序列，再用语义、动作、轨迹、直觉四张价值图把语言规划落成可执行轨迹。R2R-CE val-unseen 零样本 SR 31、SPL 24；HM3D 物体目标成功率 58.0，相对零样本前最佳提升 10.48%；DDN 成功率 30.0，相对提升 86.34%。学完能复现这套无需导航训练的系统，并算清每步的调用成本。</p>
+    <ul class="meta">
+      <li>主题：零样本通用指令导航 / 动态导航链 / 价值图融合</li>
+      <li>关键数字：R2R-CE val-unseen SR 31、SPL 24（零样本）；ObjNav SR 58.0（+10.48%）；DDN SR 30.0（+86.34%）；每条约 31 个决策步</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置讲：第 086 讲（NavCoT：可学习导航思维链）</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>会算：价值图归一化与四图求和的取值示例，决策步数与语言模型调用次数的成本账，以及相对提升与绝对提升的换算。</li>
+      <li>会解释：DCoN 为什么必须在每个决策步重新推理，以及「语义、动作、轨迹、直觉」四张图各自解决哪一类失败。</li>
+      <li>会实现：DCoN 规划循环、价值图构建与融合、A 星路径与底层接口三段示意代码。</li>
+      <li>会判断：闭源与开源大模型替换后哪类任务先退化，等权融合在什么情况下会走向错误的折中。</li>
+      <li>会设计：针对遮挡与地标漏检的恢复机制，以及带调用预算的评估方案。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 086 讲的 NavCoT 证明了链式推理可训练，但它面向离散导航图，且需要导航数据。更普遍的需求是：机器人在没有预建地图、没有导航训练数据的陌生室内环境里，执行各式各样的自然语言指令。指令类型差异极大：物体目标导航（Object Goal Navigation, ObjNav）要求高效探索找到目标物体；视觉语言导航（VLN）要求逐步跟随路线；需求驱动导航（Demand-driven Navigation, DDN）要求从「我渴了」这类抽象需求推理出目标。Long 等 2024 指出，指令导航数据的稀缺使过往方法各自绑定一类指令，无法互相迁移。</p>
+    <p>InstructNav 的思路是把「统一」放在规划层：任何指令都转写为「动作 1 加地标 1 → 动作 2 加地标 2 → …」的链条，再为链上的语言元素建立几何价值表示。它无需导航训练、无需预建地图，是首个零样本完成 R2R-CE 的系统。本讲要回答三个问题：链条如何随环境动态更新，四张价值图如何合成一个可执行目标，以及这套系统每步付出多少调用成本。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p>本节按「任务口径、导航链形式化、四类价值图、决策合成、证据、边界」六步展开。数字均来自 Long 等 2024（arXiv:2406.04882v1）；R2R-CE val-unseen 使用 Habitat 仿真与标准协议，ObjNav 使用 HM3D 与 Habitat 挑战赛设定，DDN 使用 AI2-THOR 与 ProcTHOR 场景的未见场景、未见指令划分。</p>
+
+    <h3>1. 任务口径</h3>
+    <p>通用指令导航要求机器人依据一条自然语言指令 I，在未探索连续环境中到达目标位置。每步可获自我中心 RGB 图 V<sub>t</sub>、深度图 D<sub>t</sub> 与相机位姿 P<sub>t</sub>，系统输出底层动作 a<sub>t</sub>，且全程不允许预建地图。注意一个容易忽略的前提：系统允许使用深度与位姿，这与第 088 讲 NaVid 的纯 RGB 设定不同，两条路线的对比须先对齐输入口径。</p>
+
+    <h3>2. 动态导航链</h3>
+    <p>对指令做一次性分解会碰到三个难题：指令里的地标（如「拱形木门」）与语义分割输出的类别（如「门洞」）对不上；目标地标尚未进入视野，计划需要转化为探索；抽象需求（如「我渴了」）无法直接分解为具体地标。DCoN 的对策是把分解本身变成每步重推理的函数。记第 i 段为「动作 A<sub>i</sub> 加地标 L<sub>i</sub>」，链条形如：</p>
+    <div class="formula">
+      I →（A<sub>1</sub>, L<sub>1</sub>）→（A<sub>2</sub>, L<sub>2</sub>）→ … →（A<sub>n</sub>, L<sub>n</sub>），Flag = True 时终止
+      <span class="note">每个决策步以当前观测到的物体集合与剩余指令为输入重新推理，只执行链首一段；Flag 表示任务完成</span>
+    </div>
+    <p>提示由四部分构成：机器人定义、导航策略、预测格式、回合信息。候选动作集合包含 Explore、Approach、Move Forward、Turn Left、Turn Right 等；<strong>地标要求优先选择已观测物体，以便语义价值图能立刻检索到</strong>；预测格式固定为含 Reason、Action、Landmark、Flag 四个字段的结构化输出。每步重新推理带来三种能力：把「拱形木门」对齐到分割类别「门洞」；在没看到沙发时先探索有电视的区域（利用房间布局常识）；把「口渴」转译为寻找水瓶。一个指令的分解示例如下（第 1、5 条为本讲按 DCoN 格式构造，其余取自论文示例）：</p>
+    <table>
+      <tr><th>编号</th><th>指令</th><th>DCoN 分解</th><th>依赖的机制</th></tr>
+      <tr><td>1</td><td>先走过厨房，在走廊左转，到窗边停下</td><td>Move Forward（走廊）→ Turn Left（走廊转角）→ Approach（窗户）→ Flag</td><td>多段串联</td></tr>
+      <tr><td>2</td><td>穿过那扇拱形木门</td><td>Approach（门洞，由「拱形木门」对齐）</td><td>语义标签对齐</td></tr>
+      <tr><td>3</td><td>找到沙发</td><td>Explore（电视区域）→ Approach（沙发）</td><td>布局常识与探索</td></tr>
+      <tr><td>4</td><td>我渴了</td><td>Explore（厨房）→ Approach（水瓶）</td><td>需求常识推理</td></tr>
+      <tr><td>5</td><td>走过客厅，到前面那张餐桌旁</td><td>Move Forward（客厅）→ Approach（前侧餐桌）→ Approach（椅子）</td><td>指代区分由直觉图完成</td></tr>
+    </table>
+
+    <h3>3. 四类价值图</h3>
+    <p>语言链条不能直接驱动底盘，系统把关键要素投到四张同尺寸的价值图上，全部定义在可通行区域 PCD<sub>nav</sub> 上（由点云中去掉障碍的地面组成）。记每个可通行位置为 p，地标点集为 PCD<sub>obj</sub>，历史轨迹点集为 PCD<sub>traj</sub>。</p>
+    <p><strong>语义价值图</strong> m<sub>s</sub>：把 RGB-D 与二维语义分割掩码提升为三维语义点云，计算 p 到地标点集的最小距离 d<sub>sem</sub>，再做反向归一化：</p>
+    <div class="formula">
+      d<sub>sem</sub> = min<sub>q ∈ PCD<sub>obj</sub></sub> ‖p − q‖，&nbsp; C<sub>sem</sub> = 1 − (d<sub>sem</sub> − min d<sub>sem</sub>) / (max d<sub>sem</sub> − min d<sub>sem</sub>)
+      <span class="note">离地标越近取值越高；min 与 max 在当前可通行区域上统计</span>
+    </div>
+    <p>距离序列 2、5、9 米归一化后为 1.000、0.571、0.000，最近点取满值。<strong>归一化是全图操作，必须处理所有位置等距的退化情形，否则分母为零。</strong></p>
+    <p><strong>动作价值图</strong> m<sub>a</sub>：按当前动作 A<sub>i</sub> 的类型赋值。前进、后转、右转、左转分别在当前位置的前、后、右、左扇区赋值 1，每个扇区占全景视场四分之一；Explore 在已探索区域边界（前沿）赋值 1；Enter 与 Exit 一律替换为 Approach 并把地标设为「门洞」，因为进出房间都要穿过门形区域；Approach 本身不写动作图，靠语义图实现。</p>
+    <p><strong>轨迹价值图</strong> m<sub>t</sub>：鼓励机器人离开走过的区域，取值与到历史轨迹的最小距离同向：</p>
+    <div class="formula">
+      C<sub>traj</sub> = (d<sub>traj</sub> − min d<sub>traj</sub>) / (max d<sub>traj</sub> − min d<sub>traj</sub>)，&nbsp; d<sub>traj</sub> = min<sub>h ∈ PCD<sub>traj</sub></sub> ‖p − h‖
+      <span class="note">方程方向与语义图相反：远离历史轨迹的位置取值更高，用于抑制往复</span>
+    </div>
+    <p><strong>直觉价值图</strong> m<sub>i</sub>：处理「前面的餐桌」「在中间穿过」这类语义图无法区分的多模态指代。系统在当前位置等间隔采样 N 个方向的 RGB 图并标号，拼成全景输入多模态大模型，模型先输出链式分析再给出下一移动方向 Dir<sub>i</sub>；该方向的视场在图中赋值 1。若预测方向的区域内没有可通行位置，失败信号返回模型触发重预测。</p>
+
+    <h3>4. 决策合成与执行</h3>
+    <p>四张图逐元素相加得到决策图，障碍区域清零后取最大值位置作为导航目标：</p>
+    <div class="formula">
+      m = m<sub>i</sub> + m<sub>a</sub> + m<sub>t</sub> + m<sub>s</sub>，&nbsp; (x<sub>i</sub>, y<sub>i</sub>, z<sub>i</sub>) = argmax<sub>(x,y,z) ∈ m</sub> P(x, y, z)
+      <span class="note">每张图取值在 [0, 1]，和值范围 [0, 4]；四图等权</span>
+    </div>
+    <p>目标确定后用 A 星算法在决策图上规划路径。仿真器的动作空间是离散的，用「先旋转再前进」跟踪路径；真机直接控制速度。停止条件有两条通道：DCoN 的 Flag 为真，或直觉图的大模型输出停止判断，任一触发即结束。等权融合有一个直观后果：接近性、动作方向、探索倾向、模型直觉各占一分，任何一路强烈反对都可能被其余三路抵消。用一个数值例子说明取值方法与翻转条件：</p>
+    <table>
+      <tr><th>候选位置</th><th>语义</th><th>动作</th><th>轨迹</th><th>直觉</th><th>等权和</th><th>加权和（语义权重 2）</th></tr>
+      <tr><td>A</td><td>0.9</td><td>1.0</td><td>0.2</td><td>0.0</td><td>2.1</td><td>3.0</td></tr>
+      <tr><td>B</td><td>0.5</td><td>0.0</td><td>0.8</td><td>1.0</td><td>2.3</td><td>2.8</td></tr>
+      <tr><td>C</td><td>0.8</td><td>0.0</td><td>0.9</td><td>0.0</td><td>1.7</td><td>2.5</td></tr>
+      <tr><td>D</td><td>0.4</td><td>0.0</td><td>0.3</td><td>0.0</td><td>0.7</td><td>1.1</td></tr>
+    </table>
+    <p>等权时 B 胜出，把语义权重提到 2 后 A 胜出。<strong>四图权重是任务先验的载体：靠近地标与跟随动作方向哪一项优先，直接改变轨迹走向，论文的消融也显示任一张图被移除都会在多类任务上掉点。</strong></p>
+
+    <h3>5. 证据</h3>
+    <p>三类任务的读数（协议见本节开头）：HM3D 物体目标上，InstructNav 的 NE 2.58 米、SR 58.0、SPL 20.9，超过零样本前最佳 VLMF 的 SR 52.5（+5.5 个点，相对 +10.48%）；训练方法 OVRL 的 SR 62.0 仍更高，且 InstructNav 的 SPL 20.9 比 VLMF 的 30.4 低 9.5 个点，说明它更常成功但路径更长。R2R-CE val-unseen 上零样本得到 TL 7.74 米、NE 6.89 米、SR 31、SPL 24，超过多数需训练方法（如 Ego2Map-NaViT 的 SR 30/SPL 29、Seq2Seq 的 SR 25/SPL 22），低于 CMA 的 32/30，与第 088 讲 NaVid 的 37/36 相比 SR 差 6 个点、SPL 差 12 个点。DDN 上 SR 30.0、SPL 14.2，超过任务训练模型 DDN 的 16.1 与 8.4，绝对提升 13.9 个点、相对提升 86.34%。</p>
+    <p>消融实验（每任务随机抽 100 条指令）给出各组件贡献：R2R-CE 上完整系统 SR 30、SPL 22；去掉 DCoN 降到 23 与 18；去掉语义图降到 21 与 17；去掉轨迹图降到 19 与 16；去掉直觉图降到 17 与 11。物体目标上去掉 DCoN 或语义图都从 SR 56 降到 44；DDN 上去掉 DCoN 从 SR 33 降到 22。<strong>DCoN 与语义图是跨任务共同支柱，直觉图的贡献集中在需要多模态指代的任务上。</strong>换成开源模型后（Llama3 70B 配 GPT-4V），物体目标仍可到 SR 50，但 R2R-CE 从 30 降到 23，说明语言规划对模型能力的依赖高于探索类任务。</p>
+
+    <h3>6. 边界与失效模式</h3>
+    <ul>
+      <li><strong>依赖闭源大模型。</strong>最优配置使用 GPT-4 与 GPT-4V 的特定版本，开源替换在语言规划环节退化明显，且服务版本变化会改变结果。</li>
+      <li><strong>遮挡侵蚀语义图。</strong>论文自述语义价值图受遮挡影响，被挡住的地标无法进入点云，近邻赋值失效。</li>
+      <li><strong>等权融合的折中风险。</strong>四路信号冲突时容易选出中庸位置，既不靠近地标也不遵循动作方向。</li>
+      <li><strong>调用成本随步数线性增长。</strong>每步至少一次语言模型与一次多模态模型调用，长回合的成本高。</li>
+      <li><strong>真机验证规模有限。</strong>真机实验覆盖办公室、公寓、图书馆、画廊、教学楼等场景，以定性展示为主，未给出大规模统计功效结论。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>系统由四层组成：感知与建图、语言规划、价值图、执行。设计目标是把语言层的不确定性与几何层的确定性分开，让任何一层替换都不破坏整体接口。</p>
+
+    <h3>数据流</h3>
+    <ol>
+      <li>感知：RGB-D 与位姿累积为场景点云，去除障碍得到可通行区域；二维语义分割结果经深度提升为语义点云。</li>
+      <li>规划：每个决策步把剩余指令、已观测物体列表、上一段执行结果送入语言模型，得到结构化的动作、地标、Flag。</li>
+      <li>建图：按当前动作与地标生成四张价值图；直觉图额外调用多模态模型一次（N 取 6 的全景拼图）。</li>
+      <li>决策与执行：四图求和、障碍清零、取最大位置、A 星规划；仿真用旋转加前进跟踪，真机直接控速。</li>
+      <li>终止：Flag 为真或直觉模型输出停止。</li>
+    </ol>
+
+    <h3>选择与取舍</h3>
+    <table>
+      <tr><th>设计点</th><th>取值</th><th>取舍说明</th><th>依据</th></tr>
+      <tr><td>全景采样数 N</td><td>6（12 个方向中的间隔采样）</td><td>N 小会漏关键视觉信息，N 大会加重模型理解负担</td><td>消融中 N 取 6 在三类任务上一致更优</td></tr>
+      <tr><td>语义分割模型</td><td>GLEE，单张 RTX 4090</td><td>开放词表分割支持类别对齐</td><td>论文实现配置</td></tr>
+      <tr><td>语言模型</td><td>GPT-4（gpt-4-0613）</td><td>开源替换在语言规划上退化</td><td>闭源对开源对照表</td></tr>
+      <tr><td>多模态模型</td><td>GPT-4V（gpt-4-vision-preview）</td><td>负责直觉图方向与停止判断</td><td>论文实现配置</td></tr>
+      <tr><td>四图权重</td><td>等权，各 1</td><td>先验简单、少调参；可用权重表达任务偏好</td><td>本文数值示例显示权重会翻转选择</td></tr>
+      <tr><td>停止条件</td><td>Flag 或模型停止，任一触发</td><td>召回优先，可能过早停止</td><td>论文设定；工程上可加距离校验</td></tr>
+    </table>
+    <p>调用成本可以估算。R2R-CE 平均轨迹长度 7.74 米，仿真前进一步为 0.25 米，平移步数至少 30.96 步；旋转动作还会增加决策次数。完整 val-unseen（1839 条）跑一遍至少 1839 × 30.96 ≈ 56,935 个决策步，每步一次语言模型加一次多模态调用，共约 11.4 万次模型调用。<strong>把调用预算写进协议、在报告时给出步数口径，是这类系统公平比较的前提。</strong></p>
+    <div class="box key">
+      <span class="box-title">设计决策：把语言的不确定性关进几何价值图</span>
+      <p>语言模型的输出只影响四张图的少数区域，其余区域由几何与历史决定；即使某一步的方向判断有偏差，轨迹仍受可通行性与轨迹抑制约束。这个「语言提建议、几何做否决」的结构，是无需训练仍能稳定运行的技术支点。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>三段代码分别给出 DCoN 规划循环、价值图构建与融合、路径规划与执行接口。示意实现，坐标与索引细节按 Habitat 风格组织。</p>
+
+    <p><strong>片段 1：DCoN 规划循环</strong></p>
+    <pre class="code"><code>def dcon_step(llm, instruction, observed_objects, history_summary):
+    """每个决策步重新推理一次，只返回链首的动作与地标。"""
+    prompt = (
+        f"Instruction: {instruction}\n"
+        f"Observed objects: {observed_objects}\n"      # 优先使用已观测物体做地标
+        f"History: {history_summary}\n"
+        "Candidate Actions: Explore, Approach, Move Forward, Turn Left, Turn Right\n"
+        "Output Format: {'Reason': str, 'Action': str, 'Landmark': str, 'Flag': bool}"
+    )
+    out = llm(prompt)                                  # 结构化解析后的字典
+    return out["Action"], out["Landmark"], out["Flag"]</code></pre>
+    <p>解读：<strong>（1）</strong>每步重推理是动态性的来源：新的观测物体进入提示后，地标可被替换为能检索到的类别。<strong>（2）</strong>已观测物体列表放在提示前排，配合「地标优先取已观测物体」的策略，提高语义图的命中率。<strong>（3）</strong>Flag 只由语言模型给出，执行层不解释任务是否完成，职责边界清晰。</p>
+
+    <p><strong>片段 2：价值图构建与融合</strong></p>
+    <pre class="code"><code>import numpy as np
+
+def min_dist(pts, refs):
+    """pts: (N, 3) 可通行位置；refs: (M, 3) 参考点集。"""
+    if len(refs) == 0:
+        return np.zeros(len(pts))                      # 无参考点时退化为常数
+    return np.linalg.norm(pts[:, None, :] - refs[None, :, :], axis=-1).min(axis=1)
+
+def semantic_value_map(pts, landmark_pts):
+    d = min_dist(pts, landmark_pts)
+    span = d.max() - d.min()
+    if span &lt; 1e-6:
+        return np.zeros_like(d)                        # 全等距时避免除零
+    return 1.0 - (d - d.min()) / span
+
+def trajectory_value_map(pts, traj_pts):
+    d = min_dist(pts, traj_pts)
+    span = d.max() - d.min()
+    return np.zeros_like(d) if span &lt; 1e-6 else (d - d.min()) / span
+
+def fuse(m_sem, m_act, m_traj, m_int, obstacle_mask):
+    m = m_sem + m_act + m_traj + m_int                  # 等权求和，范围 [0, 4]
+    m[obstacle_mask] = 0.0                             # 障碍清零，保证目标可达
+    return m</code></pre>
+    <p>解读：<strong>（1）</strong>两个归一化函数方向相反：语义图取 1 减归一化距离，轨迹图直接取归一化距离，对应「靠近地标」与「远离历史」两种偏好。<strong>（2）</strong>零参考点与等距两种退化都返回零图，随后由其余图主导决策，避免无效信号放大。<strong>（3）</strong>障碍清零放在求和之后，保证任何组合下目标点都可通行；若放在求和之前，动作扇区可能覆盖障碍。</p>
+
+    <p><strong>片段 3：路径规划与执行接口</strong></p>
+    <pre class="code"><code>import heapq
+
+def astar(m, start_idx, goal_idx):
+    """在决策图 m 上做 A 星；m 为二维网格，正值表示可通行。"""
+    open_heap = [(0.0, start_idx)]
+    g = {start_idx: 0.0}
+    parent = {start_idx: None}
+    while open_heap:
+        _, cur = heapq.heappop(open_heap)
+        if cur == goal_idx:
+            break
+        for nxt in neighbors(cur):
+            if m[nxt] &lt;= 0:
+                continue                               # 障碍或未探索区域不进入
+            cost = 1.0 / max(m[nxt], 1e-3)             # 值越高，通行代价越低
+            ng = g[cur] + cost
+            if ng &lt; g.get(nxt, float("inf")):
+                g[nxt] = ng
+                parent[nxt] = cur
+                heapq.heappush(open_heap, (ng + heuristic(nxt, goal_idx), nxt))
+    return reconstruct(parent, start_idx, goal_idx)
+
+def track_sim(path, action_space):
+    """仿真：对路径下一路点先旋转对齐朝向，再前进一步。"""
+    nxt = path[1] if len(path) &gt; 1 else path[0]
+    return action_space.rotate_then_forward(nxt)</code></pre>
+    <p>解读：<strong>（1）</strong>把价值图转成通行代价（值越高代价越低）后，A 星会沿高价值走廊前行，价值图因此同时承担目标选择与路径偏置两个职责。<strong>（2）</strong>未探索区域取零值被排除，探索动作的价值由前沿赋值负责，探索与利用因此解耦。<strong>（3）</strong>仿真跟踪器只做旋转加前进，真机替换为速度控制即可，接口宽度保持两个字。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>归一化除零。</strong>症状：某步价值图出现非数，argmax 结果异常。根因：地标点集为空或所有可通行位置等距时，分母为零。修复：加跨度阈值判断，退化时返回零图并把该图排除出本步决策（片段 2 已给出写法）。</li>
+      <li><strong>等权融合压掉关键信号。</strong>症状：地标就在旁边，机器人却被直觉图方向拉走。根因：四图等权时单路强信号最多贡献 1 分，可被三路弱信号合计超过。修复：按任务类型调权重或加否决规则；数值示例中等权 B 胜出、语义权重 2 时 A 胜出，说明权重即任务先验。</li>
+      <li><strong>地标漏检与遮挡。</strong>症状：目标物体在视野里，语义图却没有近邻高点。根因：开放词表分割漏检，或物体被遮挡未进入点云。修复：多视角累积点云、对未覆盖区域降权、把探索动作的目标地标改为可观测的关联物（论文自述遮挡为已知局限）。</li>
+      <li><strong>每步两次模型调用的成本失控。</strong>症状：一次完整评测的调用费用远超预算，长回合延迟显著。根因：DCoN 与直觉图都按步调用。修复：设置调用预算上限，场景无变化时缓存 DCoN 结果，每 k 步才重规划一次，并在报告中给出步数与调用口径（val-unseen 全量至少约 5.7 万个决策步）。</li>
+      <li><strong>停止条件双通道不一致。</strong>症状：任务未完成却提前停止，或已到目标仍在原地。根因：Flag 与多模态停止判断任一触发即终，两个通道的判据与时机不同。修复：真机上叠加距离阈值或要求两通道一致；在报告中写明终止规则。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>提升量核算：HM3D 物体目标上 InstructNav SR 58.0、前最佳 VLMF SR 52.5；DDN 上 30.0 对 16.1。(a) 计算两组绝对差与相对提升；(b) 说明为什么 SR 更高时 SPL 可能更低（InstructNav 20.9 对 VLMF 30.4）。 <span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>(a) ObjNav +5.5 点、相对 10.48%；DDN +13.9 点、相对 86.34%。(b) SPL 惩罚路径长度：探索式成功轨迹往往更长，SR 与 SPL 度量不同侧面，报告须成对给出。</div></details>
+      </li>
+      <li>调用成本：R2R-CE 平均轨迹 7.74 米，前进一步 0.25 米。(a) 估算平移步数下界；(b) 全量 val-unseen 1839 条至少多少决策步；(c) 若每步调用费用固定，把重规划周期从每步改为每 3 步，成本与响应迟滞各如何变化。 <span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>(a) 7.74 / 0.25 = 30.96，取 31 步下界（旋转还会增加）。(b) 约 5.7 万步。(c) 规划调用约降到三分之一，代价是环境变化后最长 2 步才更新计划，方向性错误的环境里风险上升。</div></details>
+      </li>
+      <li>融合数值：给定候选 A（语义 0.9、动作 1.0、轨迹 0.2、直觉 0.0）与 B（0.5、0.0、0.8、1.0）。(a) 等权和；(b) 语义权重 2、其余 1 时的加权和；(c) 指出该结果对「权重选择」的启示，并设计一组消融验证权重敏感性。 <span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>(a) A 2.1、B 2.3，B 胜出。(b) A 3.0、B 2.8，A 胜出。(c) 权重可翻转决策，消融取多组权重在验证集上比较 SR 与 SPL；若结果对权重敏感，应报告权重选择的依据。</div></details>
+      </li>
+      <li>指令分解：为以下三条指令各写一条 DCoN 链并标注依赖机制：(a)「进厨房倒杯水」；(b)「在走廊尽头右转，找一张能坐的椅子」；(c)「帮我检查阳台的门有没有关」。 <span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>(a) Explore（厨房）→ Approach（水杯），需求常识。(b) Move Forward（走廊）→ Turn Right（尽头）→ Approach（椅子），布局常识加指代区分。(c) Approach（阳台门）→ 检查状态（视觉问答），需要把「检查」转译为到达加验证；DCoN 本身只输出到达类动作，验证接口是扩展点。</div></details>
+      </li>
+      <li>失效恢复设计：某场景中冰箱被柜门遮挡，语义图在该区域无高点，机器人反复徘徊。(a) 诊断四张图各自的取值状态；(b) 设计三种恢复机制并说明触发条件；(c) 预测恢复机制对 SR 与 SPL 的影响方向，并给出验证实验的最小设计。 <span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>(a) 语义图平；轨迹图因徘徊把周围压低；动作图可能一直给前沿；直觉图给出大致方向但无高点。(b) 机制一：多视角累积与遮挡降权；机制二：把地标换成可观测关联物（冰箱旁的台面）；机制三：检测连续 k 步原地打转后强制切换探索目标。(c) SR 预期上升；SPL 方向不定，绕行可能变长，需以 SR 为主指标、SPL 作对照，在 100 条指令上做对照实验并固定随机种子。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>InstructNav 用动态导航链把物体目标、视觉语言、需求驱动三类指令统一为「动作加地标」序列，每个决策步重新推理，解决了标签对齐、探索与常识三类难题。</li>
+      <li>四张价值图各司其职：语义图拉近地标，动作图编码方向与前沿，轨迹图抑制往复，直觉图处理多模态指代；四图等权求和后取最大位置，障碍清零，A 星规划路径。</li>
+      <li>零样本结果：R2R-CE val-unseen SR 31、SPL 24；HM3D 物体目标 SR 58.0，相对零样本前最佳提升 10.48%；DDN SR 30.0，相对提升 86.34%；代价是 SPL 普遍低于专用方法。</li>
+      <li>消融显示 DCoN 与语义图是跨任务支柱（R2R-CE 去掉语义图 SR 从 30 掉到 21），直觉图在多模态指代任务上关键（R2R-CE 子集去掉后 SPL 从 22 掉到 11）。</li>
+      <li>边界明确：依赖闭源模型、遮挡侵蚀语义图、等权融合可能走向折中、每步多次调用成本高、真机验证以定性为主。</li>
+      <li>下一讲 NaVid 走相反的路线：去掉地图、深度与里程计，只保留单目 RGB 视频流，用视频视觉语言模型端到端输出下一步动作（第 088 讲）。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch086.html">← 第 086 讲：NavCoT：可学习导航思维链</a>
+    <a class="next" href="ch088.html">第 088 讲：NaVid：视频 VLM 端到端 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.06 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:11.5px !important;letter-spacing:.06em !important;color:rgba(71,85,105,.45) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#7e8ba0 !important;font-size:11.5px !important;line-height:1.8 !important;text-align:center !important;padding:5px 12px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

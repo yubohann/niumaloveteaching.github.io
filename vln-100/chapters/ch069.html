@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 069 讲｜网格记忆与指令相关性 | 视觉语言导航课程 · VLN-100</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第四篇 · 规模、记忆与泛化方法论</span>
+    <span class="sep">/</span>
+    <span>第 069 讲</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第四篇 · 规模、记忆与泛化方法论</div>
+    <h1>第 069 讲｜网格记忆与指令相关性</h1>
+    <p class="lead">本讲把 GridMM（Wang 等 2023，ICCV 2023，arXiv:2307.12907v4）当作“动态记忆”的工程样本：每步以智能体为中心重建 N×N 俯视网格，588 个 CLIP 网格特征按深度投影入格，单元内用指令相关性聚合取代平均池化。实算给出记忆容量、缓存收益、分辨率-成本曲线与更新时效四份账，并交付网格尺寸-性能小表与动态分辨率判据。</p>
+    <ul class="meta">
+      <li>主题：动态网格更新 / 指令相关性聚合 / 分辨率-性能 / 缓存与时效</li>
+      <li>关键公式：α<sub>j</sub> = max<sub>l</sub> A<sub>j,l</sub>；L<sub>t</sub> = 2·max(max|x<sup>rel</sup>|, max|y<sup>rel</sup>|)</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置讲：第 068 讲（全局拓扑与跨尺度推理）</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>会算：每步特征数与记忆库容量、相关性计算的缓存收益比、分辨率对应的地图 token 数与键值注意力成本。</li>
+      <li>会写：增量更新、指令相关性聚合与缓存失效、分辨率核算三段核心代码。</li>
+      <li>会判断：单元内聚合函数的选择、地图分辨率 N 的取值、几何重建与内容写入的更新频率。</li>
+      <li>会诊断：特征与深度分辨率不一致、旋转符号错误、缓存跨 episode 复用、空单元参与归一化四类问题。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 067 讲把短程空间推理交给固定窗口的局部度量地图，第 068 讲用全局拓扑图承担规划与纠错。两者之间留出一块空白：全局已访问环境里的稠密视觉证据如何保留。拓扑节点是压缩向量，回看某段走廊时看不到墙面的颜色与物体细节；局部度量窗口只有 10.5 米见方，走出窗口的证据全部失效。GridMM 用全局动态网格填补这块空白：把历史观测的网格特征按绝对坐标投进统一俯视地图，每步以智能体当前位置重建坐标系，地图随访问范围扩张。</p>
+    <p>第 038 讲已经完整介绍过 GridMM 的机制与总体结果。本讲把同一方法拆成两个工程维度做深：第一，动态更新的真实代价，包括每步新增、历史变换、分格聚合与缓存四件事各自的账，以及更新频率与时效的取舍；第二，单元内聚合与分辨率的选择，前者决定“一块区域里保留什么”，后者决定“一块区域有多大”。两个维度共同组成网格记忆的三角账：内存、延迟、精度。</p>
+    <p>本讲方法数字来自 GridMM（Wang 等 2023，ICCV 2023，arXiv:2307.12907v4）与课程 038 讲口径；容量、缓存与判别实验的数字先经 Python 实算，脚本逻辑见第 5 节片段 3。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p>本讲按“载体定位、动态更新、相关性聚合、分辨率、更新频率、结果、边界”七步展开，论文结果标注表号与 split。</p>
+
+    <h3>1. 载体定位：一句话对照</h3>
+    <p>与三类已有载体相比，GridMM 的网格记忆同时具备三个属性：覆盖全局已访问环境、每个导航步重建、单元表示受指令调制。拓扑图覆盖全局但节点内部细节少；局部度量图细节多但窗口固定；俯视语义图空间关系清楚但受预定义标签表限制。网格记忆绕开标签表，用 CLIP 特征直接承载“那里看起来是什么”，并按与指令的相关性决定单元里保留哪些特征。<strong>本讲的两个维度都围绕“全局且动态”这一属性展开：全局带来容量问题，动态带来重建与时效问题。</strong></p>
+
+    <h3>2. 动态更新的四件事</h3>
+    <p>设每步全景含 K = 12 张视角图，每张经 CLIP-ViT-B/32 提取 7 × 7 网格特征（通道 768），则每步新增特征数 I = 12 × 7 × 7 = 588，float32 下每步约 1.72 MiB。特征与其绝对坐标成对存入记忆库，库容量随步数线性增长：</p>
+    <table>
+      <tr><th>步数 t</th><th>特征条目</th><th>float32 容量</th><th>float16 容量</th><th>无缓存 / 有缓存的相关性行数</th></tr>
+      <tr><td>10</td><td>5,880</td><td>17.23 MiB</td><td>8.61 MiB</td><td>32,340 / 5,880（5.50 倍）</td></tr>
+      <tr><td>15</td><td>8,820</td><td>25.84 MiB</td><td>12.92 MiB</td><td>70,560 / 8,820（8.00 倍）</td></tr>
+      <tr><td>30</td><td>17,640</td><td>51.68 MiB</td><td>25.84 MiB</td><td>273,420 / 17,640（15.50 倍）</td></tr>
+    </table>
+    <p>每步的更新分四件事。第一，新增：588 个新特征与新坐标入库。第二，变换：把所有历史特征旋转平移进当前以智能体为中心、朝向为正向的坐标系，计算量随 t·I 线性增长。第三，分格聚合：按新坐标系把特征落入 N×N 单元；历史特征的相对坐标每步都变，单元归属需要重算，只有内容投影可以缓存复用。第四，内容聚合：单元内特征向量按指令相关性加权求和，这一步只在特征首次进入单元时计算，并配合缓存复用。</p>
+    <p>记忆库用三维张量的形状对齐检查最方便：每步追加 [588, 768] 的特征块与 [588, 2] 的坐标块；若某步全景观测不足 12 张（视角有遮挡、仿真器返回不同视图数），需按实际数量补齐或丢弃，保证库里不混入缺失标记。<strong>结论一：动态更新的成本主体落在几何侧的全量变换与分格；内容侧靠缓存压到每步 588 条，几何侧压不下去，只能通过更新频率设计取舍。</strong></p>
+
+    <h3>3. 指令相关性聚合：先取最大，后归一化</h3>
+    <p>单元内特征数 J 在导航末段可超过 600，平均池化会让少数关键线索被背景稀释。GridMM 先算每个特征与每个指令词元的分数，再聚合成单元向量：</p>
+    <div class="formula">
+      A = (M<sup>rel</sup> W<sub>1</sub><sup>A</sup>) (W′ W<sub>2</sub><sup>A</sup>)<sup>T</sup>；α<sub>j</sub> = max<sub>l</sub> A<sub>j,l</sub>；η = softmax({α<sub>j</sub>})；E<sub>m,n</sub> = Σ<sub>j</sub> η<sub>j</sub> (W<sup>E</sup> ĝ<sub>j</sub>)
+      <span class="note">A ∈ ℝ<sup>J×L</sup> 为特征与词元的分数矩阵；先对词元维取最大得到特征级相关性 α<sub>j</sub>，再在单元内做 softmax 归一化，最后对特征加权求和</span>
+    </div>
+    <p>用固定随机种子的实算展示两类背景分布下的行为。单线索场景：1 个与任务相关的特征加 599 个背景特征，背景含一个公共方向（模拟墙面、地板这类相关背景）。平均池化输出与目标特征的余弦相似度为 −0.0016，方向被公共背景主导；相关性聚合在 α<sub>f</sub> = 6、8、12 时的权重与余弦为：</p>
+    <table>
+      <tr><th>目标特征分数 α<sub>f</sub></th><th>目标权重</th><th>聚合输出与目标的余弦</th></tr>
+      <tr><td>6</td><td>0.2646</td><td>0.9773</td></tr>
+      <tr><td>8</td><td>0.7266</td><td>0.9996</td></tr>
+      <tr><td>12</td><td>0.9932</td><td>1.0000</td></tr>
+    </table>
+    <p>第二组为房间级描述：100 个特征同等相关，599 个背景特征（含同一公共方向）。平均池化余弦为 0.1996；相关性聚合在 α<sub>rel</sub> = 4 与 6 时，相关特征群的权重质量分别为 0.8429 与 0.9742，余弦为 0.9908 与 0.9998。<strong>结论二：加权和里互不相关的背景向量相互抵消，目标方向被保留，所以即使目标权重只有 0.26，输出方向也已由它主导；平均池化在背景相关时被公共方向占满，这正是两类指令都受益的原因。</strong></p>
+    <p>聚合矩阵 A 的规模为 J × L：J = 600、L = 32 时 A 有 19,200 个元素，按 2·J·L·D 估计单格计算量约 29.5 MFLOPs。三个投影（特征侧、指令侧、值侧）都可预先算好：指令侧在整条 episode 内不变，特征侧与值侧对同一特征不变。缓存把每个时刻的全部行数压到只算新增的 588 行，收益比为 (t + 1) / 2，t = 30 时为 15.50 倍。</p>
+
+    <h3>4. 分辨率：N 固定、单元边长随范围变化</h3>
+    <p>地图边长 L<sub>t</sub> 取全部历史特征相对坐标在两轴上的最大绝对值，随访问范围扩张；论文统计显示导航过程中边长约从 10 米增到 20 米。地图均分为 N × N 个单元，论文默认 N = 14。三档分辨率的实算与论文消融放在一起看：</p>
+    <table>
+      <tr><th>N</th><th>单元边长（10 m 范围 / 20 m 范围）</th><th>地图 token 数</th><th>地图内存</th><th>键值注意力成本（单层）</th><th>R2R-CE val unseen SR / SPL</th></tr>
+      <tr><td>8</td><td>1.250 m / 2.500 m</td><td>64</td><td>192 KiB</td><td>0.246 GFLOPs（0.43 倍）</td><td>47.07 / 39.49</td></tr>
+      <tr><td>14</td><td>0.714 m / 1.429 m</td><td>196</td><td>588 KiB</td><td>0.572 GFLOPs（1.00 倍）</td><td>49.05 / 40.99</td></tr>
+      <tr><td>20</td><td>0.500 m / 1.000 m</td><td>400</td><td>1,200 KiB</td><td>1.076 GFLOPs（1.88 倍）</td><td>49.86 / 42.52</td></tr>
+    </table>
+    <p>论文消融（GridMM 表 7，R2R-CE val unseen）给出边际：N 从 8 到 14，SR 提升 1.98；从 14 到 20，SR 只提升 0.81，SPL 提升 1.53，而 token 数增至 2.04 倍，键值成本接近翻倍。默认取 14 的理由是收益与代价的比值在这一点转向。<strong>结论三：N 的选择本质上是“末段单元边长”的选择：20 米范围下 N = 8 的单元达 2.5 米，已经粗于一个房间的尺度；N = 20 的 1.0 米单元适合细粒度目标，代价是键值长度翻倍。任务的指令粒度决定下限，算力预算决定上限。</strong></p>
+
+    <h3>5. 更新频率与时效</h3>
+    <p>坐标系每步变化，更新的时效直接决定地图与全景的对齐程度。课程口径的相邻视点平均间距取 3.0 米，折算成单元数：末段单元边长 1.429 米时，一步移动约 2.10 格；早期单元边长 0.714 米时，一步移动约 4.20 格。若把几何重建改成每两步一次，地图中心最多偏移约 2.10 格（末段）至 4.20 格（早期），指令中的方位词与地图单元的对应关系随之漂移。</p>
+    <p>内容侧的压力小得多：每步只有 588 个新特征需要写入，缓存后的相关性计算行数与新增量同阶；几何侧的全量变换是线性操作，不需要重新跑特征提取。工程上的默认做法是每步重建几何、增量写入内容；若延迟预算极紧，可以降频，但需要把偏移量写入监控并接受对齐误差。<strong>结论四：更新频率的设计对象是几何，内容有缓存兜底，几何没有；每步重建在室内规模下是可承受的默认选择。</strong></p>
+
+    <h3>6. 结果与统计</h3>
+    <p>结果回放（来源：GridMM 论文，与 038 讲口径一致）：REVERIE val unseen 51.37 SR / 36.47 SPL，对照 DUET 的 46.98 / 33.73，提升 4.39 与 2.74；R2R-CE val unseen 49.05 / 40.99，在同一航点预测器的协议下对照 DUET 提升约 2 SR；R2R val unseen 75 / 64 与 BEVBert 持平，说明逐步指令的短路径任务上局部度量方案已接近饱和；SOON val unseen 37.46 / 24.81。统计侧两个数字支撑本讲的设计分析：地图边长在导航过程中约从 10 米增至 20 米；末段单元内特征数最大值超过 600，而 t = 15 时的单元平均值约 45，t = 25 时约 75，分布高度不均。</p>
+
+    <h3>7. 适用边界与失效模式</h3>
+    <ul>
+      <li><strong>多楼层未解决</strong>：平面网格假设单一楼层，楼梯与上下层对象需要高度维度或分层地图。</li>
+      <li><strong>深度与定位依赖</strong>：坐标来自深度与位姿，镜面、玻璃与弱纹理区域的无效深度会投出错误坐标。</li>
+      <li><strong>记忆库线性增长</strong>：每步 1.72 MiB，长 episode 与大批量并行时显存压力大；缓存省计算，不省存储。</li>
+      <li><strong>动态环境</strong>：地图只增不改，物体移动或光照剧变后旧特征成为过期证据。</li>
+      <li><strong>协议混合风险</strong>：R2R-CE 数字依赖航点预测器与迁移管线，跨论文比较前先对齐两项配置。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>把本讲落成工程对象需要接口张量表、超参表、分辨率策略对照与交付物“网格尺寸-性能小表”。所有默认值取自 GridMM 论文配置，接口以论文公开设计为参照。</p>
+
+    <h3>接口与张量形状</h3>
+    <table>
+      <tr><th>模块</th><th>输入</th><th>输出</th><th>形状示例（B 为批大小）</th></tr>
+      <tr><td>特征提取</td><td>视角图（K 张）</td><td>CLIP 网格特征</td><td>[B, K, 7, 7, 768]</td></tr>
+      <tr><td>坐标投影</td><td>网格特征、深度、位姿</td><td>特征与绝对坐标对</td><td>[B, 588, 768] 与 [B, 588, 2]</td></tr>
+      <tr><td>记忆库</td><td>历史特征与坐标</td><td>逐步增大的集合</td><td>步数 t 时 [t·588, 768]</td></tr>
+      <tr><td>动态地图</td><td>记忆库、当前位姿</td><td>单元聚合表示</td><td>[B, 14, 14, 768] 与位置嵌入</td></tr>
+      <tr><td>相关性聚合</td><td>单元内特征、指令</td><td>单元向量</td><td>键值缓存 + 每步新增 588 行</td></tr>
+      <tr><td>动作头</td><td>地图、轨迹、指令</td><td>局部与全局融合分数</td><td>[B, 候选数]</td></tr>
+    </table>
+
+    <h3>超参与取值依据</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>地图分辨率 N</td><td>14</td><td>俯视网格边长（单元数）</td><td>论文表 7：8 / 14 / 20 三档中 14 的收益代价比最高</td></tr>
+      <tr><td>网格骨干</td><td>CLIP-ViT-B/32</td><td>单元视觉特征来源</td><td>论文实现；语义空间大于物体检测特征</td></tr>
+      <tr><td>特征维度 D</td><td>768</td><td>全部隐藏维</td><td>与预训练骨干一致</td></tr>
+      <tr><td>相关性最大池化维</td><td>词元维</td><td>特征对指令的分数</td><td>保留“一特征对一线索”的稀疏结构</td></tr>
+      <tr><td>几何重建频率</td><td>每步</td><td>地图与朝向对齐</td><td>一步偏移约 2.10 至 4.20 格，降频需权衡</td></tr>
+      <tr><td>缓存范围</td><td>按 episode</td><td>复用三个投影</td><td>指令侧投影在 episode 内不变，跨 episode 失效</td></tr>
+    </table>
+
+    <h3>网格尺寸-性能小表（交付物）</h3>
+    <table>
+      <tr><th>策略</th><th>早期单元边长</th><th>末期单元边长</th><th>token 数变化</th><th>延迟特征</th><th>适用条件</th></tr>
+      <tr><td>固定 N = 8</td><td>1.250 m</td><td>2.500 m</td><td>64（常数）</td><td>最低</td><td>显存极紧、只关心粗布局</td></tr>
+      <tr><td>固定 N = 14</td><td>0.714 m</td><td>1.429 m</td><td>196（常数）</td><td>中等</td><td>通用首选，论文默认</td></tr>
+      <tr><td>固定 N = 20</td><td>0.500 m</td><td>1.000 m</td><td>400（常数）</td><td>较高</td><td>细粒度目标、算力充足</td></tr>
+      <tr><td>固定单元 1.0 m</td><td>N = 10（100 token）</td><td>N = 20（400 token）</td><td>100 增至 400</td><td>随范围增长</td><td>要求物理粒度一致、可接受内存增长</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：固定 N 与固定单元边长</span>
+      <p>两条路线各有明确代价。固定 N 让每步的计算与内存预算可预测，单元物理边长随访问范围变粗（N = 14 时 0.714 米到 1.429 米），后期分辨率下降；固定单元边长让物理粒度全程一致，代价是 N 随范围增长，20 米范围下 N 从 10 涨到 20，token 数在 100 到 400 之间变化，内存与键值成本随之波动。判据有两条：若部署环境对峰值延迟敏感，选固定 N，并在数据卡片中记录单元边长的漂移区间；若任务依赖细小的空间关系（“第二扇门”“桌子左侧”），选固定边长，并为末期范围预留 400 token 的预算。论文取固定 N = 14，是在 R2R-CE 与 REVERIE 的指令粒度下对两条判据的折中。</p>
+    </div>
+    <p>与相邻讲的分工：第 038 讲介绍 GridMM 的机制与跨数据集结果；本讲做更新、聚合、分辨率的工程账；第 067 讲度量图回答“固定窗口内如何聚合观测”，本讲回答“全局范围如何以可控 token 数保留证据”；第 070 讲把地图上的监督目标单独拿出来设计，本讲给出的缓存与掩码接口是其前提。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>三段代码分别给出记忆库的增量更新与分格、指令相关性聚合与缓存约定、容量与分辨率的核算。数字与正文一致，可直接作为审计脚本骨架。</p>
+
+    <p><strong>片段 1：记忆库更新与动态分格</strong></p>
+    <pre class="code"><code>import numpy as np
+
+class GridMemoryBank:
+    """保存网格特征与绝对坐标；每步在智能体坐标系重建俯视网格。"""
+    def __init__(self, feat_dim=768):
+        self.feat_dim = feat_dim
+        self.feats = []        # 每项 (588, D)
+        self.coords = []       # 每项 (588, 2)，单位米
+
+    def add_step(self, feats, depths, angles, pose):
+        # feats: (K, 7, 7, D)；depths: (K, 7, 7)；angles: (K, 7, 7)
+        assert feats.shape[:3] == depths.shape == angles.shape   # 分辨率必须一致
+        k, h, w = depths.shape
+        cos_a, sin_a = np.cos(angles), np.sin(angles)
+        xs = pose[0] + depths * cos_a
+        ys = pose[1] + depths * sin_a
+        self.feats.append(feats.reshape(k * h * w, self.feat_dim))
+        self.coords.append(np.stack([xs.reshape(-1), ys.reshape(-1)], axis=-1))
+
+    def egocentric(self, pose, n_cells=14, yaw=0.0):
+        """把全部历史特征旋转平移进当前坐标系，返回分格索引与边长。"""
+        f = np.concatenate(self.feats, axis=0)
+        c = np.concatenate(self.coords, axis=0) - np.asarray(pose)
+        rot = np.array([[np.cos(yaw), np.sin(yaw)], [-np.sin(yaw), np.cos(yaw)]])
+        rel = c @ rot.T                       # 旋转到当前朝向
+        side = 2.0 * float(np.abs(rel).max()) # 两轴最大绝对值决定正方形边长
+        cells = np.clip(((rel + side / 2) / side * n_cells).astype(int), 0, n_cells - 1)
+        return f, cells, side</code></pre>
+    <p>解读：<strong>（1）</strong>入口断言特征、深度、角度三者形状一致，这是投影正确的前提，也是最常见的错误来源。<strong>（2）</strong>边长取两轴最大绝对值，保证旧特征不会掉出地图；<code>clip</code> 只处理浮点边界，越界坐标应先告警再截断。<strong>（3）</strong>真实实现按批张量化，并对历史特征缓存变换结果；示例每步全量重算，突出“先变换、后分格”的顺序。</p>
+
+    <p><strong>片段 2：指令相关性聚合与缓存约定</strong></p>
+    <pre class="code"><code>import numpy as np
+
+class RelevancePool:
+    """单元内按指令相关性聚合特征；投影在 episode 内缓存。"""
+    def __init__(self, dim=768, seed=0):
+        rng = np.random.default_rng(seed)
+        self.w1 = rng.normal(size=(dim, dim)) / dim ** 0.5   # 特征侧投影
+        self.w2 = rng.normal(size=(dim, dim)) / dim ** 0.5   # 指令侧投影
+        self.we = rng.normal(size=(dim, dim)) / dim ** 0.5   # 值投影
+        self.ins_cache = None
+
+    def encode_instruction(self, instruction):
+        self.ins_cache = instruction @ self.w2   # 只依赖指令，整条 episode 复用
+        return self.ins_cache
+
+    def pool(self, cell_feats):
+        a = (cell_feats @ self.w1) @ self.ins_cache.T       # (J, L)
+        alpha = a.max(axis=1)                               # 对词元取最大
+        eta = np.exp(alpha - alpha.max())
+        eta /= eta.sum()                                    # 单元内归一化
+        return (eta[:, None] * (cell_feats @ self.we)).sum(axis=0)
+
+# 约定：换 episode 必须重新 encode_instruction；特征侧投影可跨步复用。</code></pre>
+    <p>解读：<strong>（1）</strong><code>max(axis=1)</code> 沿词元维取最大，含义是“该特征最相关的词元分数”；归一化放在特征维，两者顺序颠倒会摊平稀疏结构。<strong>（2）</strong>指令侧投影与特征侧、值侧投影都可以缓存；缓存键必须包含指令标识，换 episode 时显式失效。<strong>（3）</strong>空单元在 <code>pool</code> 前过滤，j = 0 的单元不参与归一化，返回零向量并标记无效，避免在注意力中被当成有效位置。</p>
+
+    <p><strong>片段 3：容量、缓存与分辨率核算</strong></p>
+    <pre class="code"><code>K, H, W, D = 12, 7, 7, 768
+I = K * H * W
+step_mib = I * D * 4 / 2 ** 20
+print("I =", I, "step =", round(step_mib, 4), "MiB")     # 588 / 1.7227
+
+for t in (10, 15, 30):
+    nocache = I * t * (t + 1) // 2
+    cache = I * t
+    print(t, round(t * I * D * 4 / 2 ** 20, 2), "MiB",
+          nocache, cache, round((t + 1) / 2, 2))
+# t=30 时 51.68 MiB，无缓存 273420 行，有缓存 17640 行，收益 15.50 倍
+
+for n in (8, 14, 20):
+    print("N=%d" % n, n * n, "tokens", round(n * n * D * 4 / 1024, 1), "KiB",
+          round(20 / n, 3), "m per cell at 20 m")
+# 8 -&gt; 64 / 192.0 KiB / 2.500 m；14 -&gt; 196 / 588.0 KiB / 1.429 m；20 -&gt; 400 / 1200.0 KiB / 1.000 m
+
+step_len, cells = 3.0, (0.714, 1.429)
+for c in cells:
+    print("cell=%.3f m 一步移动 %.2f 格" % (c, step_len / c))
+# 早期 0.714 m 对应 4.20 格；末期 1.429 m 对应 2.10 格</code></pre>
+    <p>解读：<strong>（1）</strong>记忆库按步线性增长，t = 30 时 float32 已需 51.68 MiB，长 episode 训练要把它计入单样本预算。<strong>（2）</strong>缓存收益比 (t + 1) / 2 与 t = 30 时的 15.50 倍一致，说明内容侧的重算在无缓存时增长迅速。<strong>（3）</strong>折算格数用来设置更新频率：一步跨过 2 至 4 格意味着几何重建每步进行才不产生可见漂移，降频需要把偏移量纳入监控。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>特征与深度分辨率不一致</strong>：地图出现重影，指标不升。根因：CLIP 网格特征为 7 × 7，深度仍按原图尺寸。修复：投影入口断言形状相等，把缩放写进同一预处理函数，用已知三角形做单测核对坐标。</li>
+      <li><strong>旋转方向或角度符号错误</strong>：地图相对真实环境镜像，短期指标随机波动。根因：相对坐标变换的旋转方向与正朝向定义相反。修复：用“目标在正前方”“目标在正右方”两个合成样例验证，输出坐标应分别为 y 正、x 正。</li>
+      <li><strong>缓存跨 episode 复用</strong>：换新指令后旧的相关性分数仍在用，训练损失正常下降但评测偏低。根因：缓存了依赖指令的中间量却没有按 episode 失效。修复：缓存键包含指令标识，只缓存与指令无关的特征侧投影；换 episode 时显式清空指令侧缓存。</li>
+      <li><strong>空单元参与归一化</strong>：无特征单元聚合出零向量后被当成有效位置，注意力被稀释。根因：没有单元掩码，softmax 在空集合上退化。修复：构造有效掩码，空单元在注意力中屏蔽；聚合函数对 j = 0 直接返回零并标记无效。</li>
+      <li><strong>用固定单元边长解读动态地图</strong>：把 1.4 米末期单元与固定 0.5 米单元当同粒度比较，得出网格更粗的结论。根因：忽略边长随访问范围变化。修复：报告分辨率时同时给出边长区间与随步数曲线，比较前统一换算到同一物理边长。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>按 I = 588、D = 768 实算：(a) t = 25 时记忆库的 float32 与 float16 容量；(b) 地图边长 15 米时，N = 14 与 N = 20 的单元边长。 <span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>(a) 25 × 588 × 768 × 4 / 2<sup>20</sup> ≈ 43.07 MiB，float16 为 21.53 MiB。(b) 15 / 14 ≈ 1.0714 米；15 / 20 = 0.75 米。分辨率越高单元越细，token 数与键值成本同步上升。</div></details>
+      </li>
+      <li>说明缓存把相关性计算压到多少：计算 t = 20 时无缓存与有缓存的行数、比值；解释为什么这个比值随 t 线性增长，以及缓存不能跨 episode 使用的原因。 <span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>无缓存为 I · t(t + 1)/2 = 588 × 210 = 123,480 行；有缓存为 I · t = 11,760 行；比值 10.5。每步新增只有 I 行，历史步的重复计算随 t 累积；指令侧投影依赖指令，换 episode 后失效。</div></details>
+      </li>
+      <li>更新频率实验设计：把几何重建从每步一次改为每 2 步与每 4 步一次。用一步移动 2.10 至 4.20 格的折算，预测地图中心偏移对两类指令（含方位词、无方位词）的影响差异，并写出固定变量、评价指标与预期曲线形态。 <span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>偏移量按 (f − 1) 步折算（f 为重建间隔步数）：每 2 步重建时约 2.10 格（末期）至 4.20 格（早期）；每 4 步重建时约 6.30 格至 12.60 格。含方位词的指令（“桌子左边”）对偏移敏感，SR 随降频单调下降；无方位词指令主要受目标区域聚合质量影响，下降较缓。固定骨干、训练预算与 N，报告 SR、SPL、延迟三条曲线，并给出偏移量与掉点的散点图。</div></details>
+      </li>
+      <li>相关性聚合的敏感度：沿用本讲的合成实验（1 个目标特征、599 个相关背景），把目标分数 α<sub>f</sub> 取 9，计算目标权重与聚合输出的余弦。解释为什么余弦在高权重区间接近饱和，以及这对“强地标指令”意味着什么。 <span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>α<sub>f</sub> = 9 时目标权重约 0.8784，余弦约 0.9999。softmax 在高分区间的权重增长快，而余弦在本合成设置下由背景相互抵消后已接近饱和；对“强地标指令”，聚合近似只保留该地标特征，单元向量成为可检索的局部证据。真实场景中背景相关性更强，饱和度会低于合成值。</div></details>
+      </li>
+      <li>动态分辨率设计：要求单元边长始终落在 [0.8, 1.2] 米，写出 N 随边长变化的取整规则（给出上下限），分析它相对固定 N 与固定边长的内存与延迟差异；设计三组对照（固定 14、固定 20、动态 N），给出固定变量、评价指标与预期结论方向。 <span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>可取 N = round(L<sub>t</sub> / 1.0)，夹在 [10, 20]；10 米范围取 N = 10（100 token），20 米取 N = 20（400 token）。固定 20 全程 400 token，峰值内存与延迟最高；固定 14 全程 196 token，末期单元 1.429 米；动态 N 早期省算力、末期贴近固定 20 的粒度，代价是每步 N 变化需要重建分格。三组对照固定骨干、数据与训练预算，报告 SR / SPL 与地图 token 数曲线；预期动态 N 的净效果取决于任务平均路径长度与末期指令占比。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>GridMM 的网格记忆同时具备覆盖全局、逐步重建、指令调制三个属性；本讲把它的设计空间拆成更新频率、单元聚合、分辨率三块。</li>
+      <li>动态更新中内容侧可控：每步新增 588 个特征（1.72 MiB），相关性投影缓存把行数压到每步新增量，t = 30 时收益 15.50 倍；几何侧每步全量变换压不下去。</li>
+      <li>指令相关性聚合先对词元取最大、再对特征做 softmax；合成实验显示平均池化在相关背景下与目标余弦约 0（单线索）与 0.1996（百线索），相关性聚合达到 0.97 以上。</li>
+      <li>分辨率实算：N = 8 / 14 / 20 对应 20 米范围单元 2.500 / 1.429 / 1.000 米，token 64 / 196 / 400，单层键值成本 0.246 / 0.572 / 1.076 GFLOPs；论文消融 SR 47.07 / 49.05 / 49.86，默认取 14 是收益代价比的拐点。</li>
+      <li>更新时效：一步移动折算 2.10 至 4.20 格，几何重建按步进行；内容写入按新增。结果回放（来源：GridMM 论文）：REVERIE val unseen 51.37 / 36.47，R2R-CE val unseen 49.05 / 40.99，R2R 与 BEVBert 持平。</li>
+      <li>下一讲把这些地图特征之上的监督目标单独设计：掩码对象、监督形状、预算分配与下游对齐（第 070 讲）。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch068.html">← 第 068 讲：全局拓扑与跨尺度推理</a>
+    <a class="next" href="ch070.html">第 070 讲：地图预训练目标设计 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.06 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:11.5px !important;letter-spacing:.06em !important;color:rgba(71,85,105,.45) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#7e8ba0 !important;font-size:11.5px !important;line-height:1.8 !important;text-align:center !important;padding:5px 12px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

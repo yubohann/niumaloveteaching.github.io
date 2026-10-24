@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 036 讲｜DUET：双尺度图 Transformer | 视觉语言导航课程 · VLN-100</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 离散方法谱系：从模块到预训练</span>
+    <span class="sep">/</span>
+    <span>第 036 讲</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 离散方法谱系：从模块到预训练</div>
+    <h1>第 036 讲｜DUET：双尺度图 Transformer</h1>
+    <p class="lead">本讲把动作空间从“当前节点的邻居加停止”扩展为“在线拓扑图上的全部已观测节点”：DUET（Chen 等 2022，CVPR 2022）边导航边建图，用粗尺度图 Transformer 做全局规划、细尺度编码做当前位置的语言接地，再由动态门控融合两路分数；R2R test unseen 达到 69% SR / 59% SPL，REVERIE test unseen 52.51 SR / 22.06 RGSPL，相对 HAMT 提升 22.11 与 8.98 个百分点。</p>
+    <ul class="meta">
+      <li>主题：在线拓扑图 / 全局动作空间 / 图感知自注意力 / 双尺度动态融合</li>
+      <li>关键公式：GASA 的距离偏置；s<sub>i</sub> = σ<sub>t</sub> s<sub>i</sub><sup>c</sup> + (1 − σ<sub>t</sub>) s<sub>i</sub><sup>f′</sup></li>
+      <li>预计学时：60 分钟</li>
+      <li>前置讲：第 035 讲（HOP：历史与顺序预训练）</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>会写：在线拓扑图的节点分类、更新规则与三类节点表示的构造方式，说明 stop 节点与边权如何进入全局动作空间。</li>
+      <li>会算：按平均度 4.1 的估计口径推算节点数增长、粗尺度与细尺度的注意力评分量，以及“回退 N 步”相对“全局一步”的代价倍数。</li>
+      <li>会实现：图感知自注意力（GASA）的距离偏置、局部分数到全局分数的升维、动态门控融合，以及 Floyd 最短路与伪交互演示者的伪标签。</li>
+      <li>会判断：细尺度、粗尺度与融合三种打分各自的失败模式，动态融合相对平均融合的收益来源，回溯比例在 seen 与 unseen 上的差异。</li>
+      <li>会诊断：地图节点重复、已访问节点未掩码、回退分数升维错误、离线图与在线图分布漂移四类实现问题。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>034 与 035 两讲把历史做成了显式 token 并用顺序目标训练表示，动作空间却没有变化：每一步只在当前节点的邻居与停止之间选择，即局部动作空间。局部动作空间有两个连锁后果：其一，迷路后回退 N 步要运行模型 N 次，误差与计算随回退距离增长；其二，动作决策看不到“已经观测但暂未访问”的节点，探索只能靠一步步试探。此前用地图的方法（EGP、GBE、SSM 一类）支持全局动作，却依赖循环状态跟踪导航状态，且节点只用压缩特征表示，细粒度接地能力弱。</p>
+    <p>DUET（Chen 等 2022，CVPR 2022，arXiv:2202.11742v1，任务：REVERIE / SOON / R2R）同时解决这两点：一边导航一边构建拓扑图，把动作空间扩展为图上全部已观测节点；用图 Transformer 编码地图获得粗尺度表示，用当前全景与物体特征获得细尺度表示，两路分数经门控动态融合。结果上，REVERIE test unseen 相对此前最好的 HAMT 提升 22.11 SR 与 8.98 RGSPL；SOON test unseen 相对 GBE 提升 20.54 SR 与 12.19 SPL；R2R test unseen 69 SR / 59 SPL。本讲的产出是“在线拓扑更新流程推演”：每步新增什么、更新什么、动作分数怎么算、下一讲 BEVBert 的混合地图与它如何衔接。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p>本讲按“在线建图、粗尺度编码、细尺度编码、动态融合、训练、推理、结果、边界”展开。论文数字标注 DUET（Chen 等 2022，CVPR 2022，arXiv:2202.11742v1）与 split；规模估计与数值例由 Python 实算，见第 5 节片段 3。</p>
+
+    <h3>1. 在线拓扑图：三类节点与更新流程</h3>
+    <p>环境对智能体而言起初未知。设第 t 步时可观测子图 G<sub>t</sub> = {V<sub>t</sub>, E<sub>t</sub>}，节点分三类：已访问节点（智能体停留过，持有全景）、当前节点、边界节点（navigable，指从已访问位置观察到的可达但未探索的节点）。每一步执行动作后，智能体到达新位置并收到全景；图更新做三件事：把当前节点及其未访问邻居加入节点集；补上新节点与旧节点之间的边；更新节点表示。</p>
+    <p>节点表示分两档。已访问节点与当前节点能拿到完整全景，经空间自注意力编码图像特征与物体特征后取平均，得到紧凑节点特征 v<sub>i</sub>；边界节点只被部分观测，把观察它的视图嵌入按多次观测取平均累积。同一物理位置可能被多次观测，必须合并为同一节点，论文用坐标与可达关系建立对应，工程上以坐标匹配阈值去重。紧凑表示服务于整图推理的效率，论文明确指出它的代价是细粒度信息不足，因此当前节点的细粒度表示（图像与物体特征原序列）被单独保留，供细尺度编码使用。</p>
+    <p>图还加入一个零向量的 stop 节点 v<sub>0</sub>，与所有节点相连，停止动作由此进入同一打分空间。节点特征附加两类嵌入：位置嵌入编码节点相对当前节点的朝向与距离（自我中心口径），步序嵌入对已访问节点记最近访问步、对边界节点记 0。动作空间由此扩展为全局动作空间：所有已观测节点加 stop。</p>
+    <p>规模估计：MP3D 单场景导航图平均度约 4.1（001 讲口径）。若每步新增最多 d − 1 个边界节点，则 K<sub>t</sub> ≈ (t + 1) + (d − 1) · t = 1 + 4.1t，实算 t = 6、10、20 时约为 25.6、42.0、83.0 个节点。这是上界估计，真实值取决于环境里的重复观测与去重效果。<strong>节点数是全局动作空间的直接规模，也是后面所有复杂度账的出发点。</strong></p>
+
+    <h3>2. 粗尺度编码：图感知自注意力与全局打分</h3>
+    <p>粗尺度编码器把地图节点当作 token，与指令做跨模态融合。每层含一个双向交叉注意力子层、两个自注意力子层与两个前馈子层，架构与 LXMERT 同源。关键改动是自注意力：标准注意力只用特征相似度计算权重，可能忽略“近处节点比远处节点更相关”这一空间事实。DUET 提出图感知自注意力（Graph-Aware Self-Attention, GASA），在注意力 logits 上加一个由图上成对距离生成的偏置：</p>
+    <div class="formula">
+      GASA(X) = Softmax( X W<sub>q</sub> (X W<sub>k</sub>)<sup>T</sup> / √d + M ) X W<sub>v</sub>，M = E W<sub>e</sub> + b<sub>e</sub>
+      <span class="note">X 为节点表示序列；E 为从边集得到的成对距离矩阵；W<sub>e</sub> 与 b<sub>e</sub> 为可学习参数；偏置进入 Softmax 前与相似度相加，使注意力同时考虑内容与图结构</span>
+    </div>
+    <p>数值例说明机制（片段 3 实算）：三个节点的相似度 logits 为 [−0.2, 0.4, 0.5]，图上距离为 [0, 2, 5]；取 W<sub>e</sub> = −1、b<sub>e</sub> = 0 时偏置为 [0, −2, −5]，加入偏置后的 softmax 为 [0.7935, 0.1957, 0.0108]，远处节点几乎被抑制；不加偏置则为 [0.2068, 0.3768, 0.4164]，权重最高的节点与当前位置相隔 5 米，内容相似度盖过了空间邻近性。真实的 W<sub>e</sub> 由训练学习，示例只是把“方向可控”这件事显式化：偏置可以学会惩罚远距离节点，距离条目直接取自在线图的边集。</p>
+    <p>打分与掩码：每个节点经两层前馈网络得到导航分数 s<sub>i</sub><sup>c</sup>，stop 节点得到停止分数。多数 VLN 任务不鼓励重访，论文把已访问节点的分数掩掉（特殊任务除外），这在工程上很关键：若不掩码，全局动作空间里的历史节点会反复吸引智能体来回移动，轨迹长度膨胀。<strong>结论一：全局动作空间把“回退”从多步决策压缩为一次选择，代价是打分集合随地图增长，图结构偏置与掩码是控制这一代价的两件工具。</strong></p>
+
+    <h3>3. 细尺度编码：当前位置的精细接地</h3>
+    <p>细尺度编码器只处理当前节点：把停止 token r<sub>0</sub>、全景视图特征 {r<sub>i</sub>} 与物体特征 {o<sub>i</sub>} 拼成视觉序列，与指令做标准跨模态注意力，输出用于局部动作打分与物体接地。视觉 token 附加两类位置嵌入：第一类是当前节点相对起点的位置（帮助理解“一楼客厅”这类绝对位置表述），第二类是邻居节点相对当前节点的方位（帮助理解“右转”这类自我中心表述）。停止动作由 r<sub>0</sub> 承载，物体接地由单独的头部在停止位置输出物体分数。</p>
+    <p>细尺度的动作空间是局部动作空间 A<sub>t</sub>：当前节点的邻居视图加 stop。它无法直接跳到远处节点，但因为输入是未压缩的视图与物体特征，语言接地的精度高于粗尺度。两个尺度由此形成互补：粗尺度擅长探索与长程规划（OSR 高），细尺度擅长判断“是否到达了指令描述的位置”（停止正确率高）。消融给出了证据（REVERIE val unseen，DUET 表 1）：单独细尺度 SR 28.86 / SPL 23.57 / OSR 30.96；单独粗尺度 SR 36.52 / SPL 25.98 / OSR 46.44。细尺度的 SR/OSR 之比最高（93.22），说明它一旦走到目标附近，停止判定更准；粗尺度的 OSR 大幅领先，说明它探索得更远。</p>
+
+    <h3>4. 动态融合：把局部分数升维到全局</h3>
+    <p>两个尺度的分数口径不同，必须先对齐。局部候选是 stop 与邻居 N(V<sub>t</sub>)，全局候选是地图全部节点；对不在局部的节点，智能体要经邻居回退才能到达，因此论文把邻居中已访问节点的局部分数求和，作为统一的回退分数 s<sub>back</sub>，其余节点在全局比较时统一取该常数：</p>
+    <div class="formula">
+      s<sub>i</sub><sup>f′</sup> = s<sub>back</sub>（V<sub>i</sub> ∈ V<sub>t</sub> − N(V<sub>t</sub>)）；s<sub>i</sub><sup>f′</sup> = s<sub>i</sub><sup>f</sup>（其余），s<sub>back</sub> = Σ<sub>V<sub>j</sub> ∈ 已访问邻居</sub> s<sub>j</sub><sup>f</sup>
+      <span class="note">V<sub>t</sub> 为当前地图节点集；N(V<sub>t</sub>) 为当前节点的邻居集合；s<sub>j</sub><sup>f</sup> 为局部打分</span>
+    </div>
+    <p>融合权重由智能体状态门控生成：取粗尺度的 stop 嵌入 v̂<sub>0</sub> 与细尺度的 stop 嵌入 r̂<sub>0</sub> 拼接，经前馈网络与 sigmoid 得到 σ<sub>t</sub>，最终分数为 σ<sub>t</sub> s<sub>i</sub><sup>c</sup> + (1 − σ<sub>t</sub>) s<sub>i</sub><sup>f′</sup>。数值例（片段 3）：σ<sub>t</sub> = 0.45、s<sub>i</sub><sup>c</sup> = 2.30、s<sub>i</sub><sup>f′</sup> = 1.70 时融合分数 1.97；σ<sub>t</sub> 调到 0.60 则升到 2.06，方向是“σ<sub>t</sub> 越大越信任全局探索”。论文统计了门控的阶段性：粗尺度平均权重在开始、中段、结束分别为 0.36、0.45、0.42。开始阶段不需要回退，局部判断为主；中段需要探索，全局分支权重上升；停止前要确认目标物体，局部分支重新占优。<strong>结论二：动态门控把“何时探索、何时确认”交给状态决定，这比固定权重更贴合任务的时间结构。</strong></p>
+    <p>融合的收益（REVERIE val unseen）：平均融合 SR 45.81 / SPL 31.94 / RGSPL 22.78，动态融合 46.98 / 33.73 / 23.03，SPL 相对提升 1.79。GASA 的消融同样在动态融合下进行：去掉图结构偏置为 45.24 / 32.88，加入后 46.98 / 33.73，SPL 提升 0.85，说明图结构信息对效率指标的作用大于对成功率的作用。</p>
+
+    <h3>5. 训练：行为克隆加伪交互演示者</h3>
+    <p>预训练用离线专家轨迹做行为克隆，目标包括掩码语言建模（MLM）、掩码区域分类（MRC）、单步动作预测（SAP）与物体接地（OG）：</p>
+    <div class="formula">
+      L<sub>SAP</sub> = Σ<sub>t=1..T</sub> − log p( a<sub>t</sub><sup>*</sup> | W, P<sub>&lt;t</sub><sup>*</sup> )，L<sub>OG</sub> = − log p( o<sup>*</sup> | W, P<sub>T</sub> )
+      <span class="note">P<sup>*</sup> 为专家路径，a<sub>t</sub><sup>*</sup> 为第 t 步专家动作，o<sup>*</sup> 为终点目标物体；W 为指令</span>
+    </div>
+    <p>行为克隆的分布漂移用伪交互演示者（Pseudo Interactive Demonstrator, PID）缓解：训练时可访问环境真值图，PID 在当前节点的邻居里选“经该邻居到终点的图上总距离最小”的动作作为伪标签，按类 DAgger 的方式在策略自己走过的状态上继续监督：</p>
+    <div class="formula">
+      L<sub>PID</sub> = Σ<sub>t=1..T</sub> − log p( a<sub>t</sub><sup>π*</sup> | W, P<sub>&lt;t</sub> )，L = λ L<sub>SAP</sub> + L<sub>PID</sub> + L<sub>OG</sub>
+      <span class="note">P 为当前策略采样的轨迹；a<sub>t</sub><sup>π*</sup> 为 PID 给出的伪目标；λ 为专家数据与伪演示的平衡因子，论文附录给出扫描</span>
+    </div>
+    <p>损失消融（REVERIE val unseen，SR / SPL）：只用 SAP 为 35.30 / 24.55；加 OG 为 37.80 / 26.40；加辅助任务为 36.81 / 27.19；把 PID 换成 RL 为 42.35 / 32.97；用 PID 为 46.98 / 33.73。PID 优于 RL 与纯行为克隆，且不引入稀疏奖励的方差。数据增广方面，合成指令在预训练阶段带来 SPL 1.63 与 RGSPL 1.76 的提升，但在策略微调阶段不再带来增益，论文解释为策略学习需要更干净的数据，辅助任务才适合消化噪声语料。</p>
+    <p>配置（DUET 4.3 与附录 B.4）：REVERIE 预训练批 32、10 万次迭代、2 张 P100；微调批 8、2 万次迭代、单张 P100。R2R 预训练批 64、20 万次迭代；微调批 8、2 万次迭代。模型层数为文本 9、全景 2、粗尺度 4、细尺度 4，隐藏维 768，用预训练 LXMERT 初始化。图像特征用 ImageNet 预训练的 ViT-B/16；物体特征在 REVERIE 用数据提供的候选框，在 SOON 用自动检测器（BUTD 一类）。</p>
+
+    <h3>6. 推理与计算账</h3>
+    <p>推理每步更新地图、计算全局动作分数，选出节点后由 Floyd 全源最短路给出到该节点的具体路径并逐边执行；若超过最大动作步数则强制停止，并回退到停止概率最高的节点；到达后从物体分数中选目标。计算账（片段 3 实算，n = 36 视图、m = 15 物体、指令 L = 80 的课程口径）：细尺度单步注意力评分量 (36 + 15 + 1)<sup>2</sup> + 2 × 52 × 80 = 2,704 + 8,320 = 11,024；t = 10 时 K<sub>t</sub> ≈ 42，粗尺度一步为 43<sup>2</sup> + 2 × 43 × 80 = 1,849 + 6,880 = 8,729。回退 5 步若靠局部决策需要 5 次细尺度前向，合计 55,120 次评分，约为一次全局选择的 6.31 倍；Floyd 在 42 个节点上约 42<sup>3</sup> ≈ 7.4 万次基本操作，与注意力相比可忽略。地图继续增大到 t = 20（约 83 个节点）时，粗尺度一步升到 20,496，倍数降到 2.69。<strong>结论三：全局动作空间的收益随回退距离放大，其自身代价随地图规模平方增长，室内 episode 的步数上限让两者在可接受区间内相遇。</strong></p>
+
+    <h3>7. 结果</h3>
+    <table>
+      <tr><th>基准与 split（离散协议）</th><th>指标</th><th>DUET</th><th>对照</th></tr>
+      <tr><td>R2R val unseen</td><td>SR / SPL / NE (m)</td><td>72 / 60 / 3.31</td><td>HAMT-e2e 66 / 61 / 2.29</td></tr>
+      <tr><td>R2R test unseen</td><td>SR / SPL / NE (m)</td><td>69 / 59 / 3.65</td><td>HAMT-e2e 65 / 60 / 3.93</td></tr>
+      <tr><td>REVERIE val unseen</td><td>SR / SPL / RGS / RGSPL</td><td>46.98 / 33.73 / 32.15 / 23.03</td><td>HAMT 32.95 / 30.20 / 18.92 / 17.28</td></tr>
+      <tr><td>REVERIE test unseen</td><td>SR / SPL / RGS / RGSPL</td><td>52.51 / 36.06 / 31.88 / 22.06</td><td>HAMT 30.40 / 26.67 / 14.88 / 13.08</td></tr>
+      <tr><td>SOON test unseen</td><td>SR / SPL / RGSPL</td><td>33.44 / 21.42 / 4.17</td><td>GBE 12.90 / 9.23 / 0.45</td></tr>
+    </table>
+    <p>两个值得注意的细节。第一，R2R 上 DUET 的 SR 高于 HAMT（val +6、test +4），SPL 却低 1 个百分点，论文解释为地图方案的“鼓励回退”使轨迹更长，效率指标被拉低，这提醒我们地图类方法要用 SR 与 SPL 成对解读。第二，回溯比例（附录 C.2）：REVERIE val seen 只有 13.7% 的轨迹发生全局回退，val unseen 达 48.6%；R2R val unseen 为 23.2%。<strong>结论四：全局动作空间在未见环境中被大量使用，它提供的是“探索失败后的纠错能力”，这与 REVERIE 一组高低指令的探索需求直接对应。</strong></p>
+
+    <h3>8. 适用边界与失效模式</h3>
+    <ul>
+      <li><strong>限定离散环境</strong>：图由仿真器提供的节点与连通关系构建，连续环境需要先有路点与连通修正（第三篇讨论），论文结论只对离散协议成立。</li>
+      <li><strong>节点表示仍然紧凑</strong>：粗尺度节点的平均池化特征丢失细节，论文以细尺度分支补偿；若把细尺度关掉，物体接地与停止判定都会变差。</li>
+      <li><strong>地图误差会累积</strong>：节点去重依赖坐标匹配与观测一致性，重复节点与错连边会同时污染动作空间与 GASA 的距离偏置；长 episode 下错误更难消除。</li>
+      <li><strong>PID 依赖真值图</strong>：伪标签需要环境连通性，仿真中可得，真机与无图场景需要替代方案。</li>
+      <li><strong>跨数据集指标不可混用</strong>：REVERIE 提供物体框，SOON 需要自动检测器，两边的 RGS/RGSPL 口径不同；报告时要标注框来源与检测器版本。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>把本讲落成工程对象需要接口与张量表、超参表、双尺度方案对照表，并写清与 035、037 的分工。</p>
+
+    <h3>接口与张量形状</h3>
+    <table>
+      <tr><th>模块</th><th>输入</th><th>输出</th><th>形状示例（K 为节点数，B 为批大小）</th></tr>
+      <tr><td>地图更新</td><td>当前全景、坐标、可达节点</td><td>节点特征、边集</td><td>节点特征 [K, 768]，边表 [E]</td></tr>
+      <tr><td>成对距离</td><td>地图拓扑与坐标</td><td>距离矩阵</td><td>[K, K]</td></tr>
+      <tr><td>粗尺度编码器</td><td>节点 token、指令</td><td>节点表示与分数</td><td>[K+1, 768]，分数 [K+1]</td></tr>
+      <tr><td>细尺度编码器</td><td>r<sub>0</sub>、视图、物体、指令</td><td>局部分数与物体分数</td><td>视觉 [n+m+1, 768]，分数 [n+1]</td></tr>
+      <tr><td>动态门控</td><td>两个 stop 嵌入</td><td>融合系数 σ<sub>t</sub></td><td>[B, 1]</td></tr>
+      <tr><td>路径规划</td><td>地图与目标节点</td><td>逐边动作序列</td><td>[K, K] 距离与前驱</td></tr>
+    </table>
+
+    <h3>超参与取值依据</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>文本 / 全景 / 粗 / 细层数</td><td>9 / 2 / 4 / 4</td><td>各分支容量</td><td>论文配置，与 LXMERT 骨架对齐</td></tr>
+      <tr><td>隐藏维</td><td>768</td><td>表示宽度</td><td>LXMERT 惯例</td></tr>
+      <tr><td>预训练迭代（REVERIE / R2R）</td><td>10 万 / 20 万</td><td>收敛</td><td>论文配置，R2R 数据更多</td></tr>
+      <tr><td>批大小（预训练 / 微调）</td><td>32 / 8（REVERIE）</td><td>显存与稳定性</td><td>单张 P100 可容纳</td></tr>
+      <tr><td>平衡因子 λ</td><td>论文附录扫描</td><td>专家与伪演示配比</td><td>与增广数据的取舍相关</td></tr>
+      <tr><td>已访问节点掩码</td><td>开启</td><td>抑制重访</td><td>任务不要求重访时的默认口径</td></tr>
+      <tr><td>去重坐标阈值</td><td>按数据集标定</td><td>节点合并</td><td>阈值过大误合并、过小重复建点</td></tr>
+    </table>
+
+    <h3>双尺度方案对照</h3>
+    <table>
+      <tr><th>方案</th><th>动作空间</th><th>OSR</th><th>SR</th><th>SPL</th><th>RGSPL</th><th>适用条件</th></tr>
+      <tr><td>仅细尺度</td><td>局部</td><td>30.96</td><td>28.86</td><td>23.57</td><td>16.64</td><td>停止判定要求高、探索需求低</td></tr>
+      <tr><td>仅粗尺度</td><td>全局</td><td>46.44</td><td>36.52</td><td>25.98</td><td>无法接地</td><td>探索为主、无物体目标</td></tr>
+      <tr><td>平均融合</td><td>全局</td><td>51.86</td><td>45.81</td><td>31.94</td><td>22.78</td><td>无门控实现时的近似</td></tr>
+      <tr><td>动态融合（本讲）</td><td>全局</td><td>51.07</td><td>46.98</td><td>33.73</td><td>23.03</td><td>算力允许、要求效率</td></tr>
+    </table>
+    <p>数据为 REVERIE val unseen（DUET 表 1）。动态融合相对平均融合的 SR 高 1.17、SPL 高 1.79，OSR 略低 0.79，说明门控把权重从“广撒网”调向“确认后停止”，代价是到达率略降、成功率与效率上升。</p>
+    <div class="box key">
+      <span class="box-title">设计决策：全局动作空间加双尺度门控</span>
+      <p>动作空间的规模与精度存在直接矛盾：全局空间把回退压缩为一次选择，却让每个候选的动作表示变粗；局部空间接地精细，却无法纠错。双尺度的判据是“两路错误不同源”：粗尺度的错误多来自探索不足，细尺度的错误多来自停止误判，两者的失败相关性低，融合的增益空间大。门控由状态生成，不设为全局固定值，是因为各阶段的需求不同（开始 0.36、中段 0.45、结束 0.42 的粗尺度权重统计）。工程上建议先实现粗尺度全局动作空间与停止掩码，再接入细尺度分支与门控，逐层验证回溯比例与 SPL 的变化。</p>
+    </div>
+    <p>与前后讲的衔接：035 讲给的是历史顺序的预训练监督，本讲把历史组织成图并扩展到全局动作空间；下一讲 BEVBert 在本讲的拓扑图之外增加局部度量地图，用鸟瞰视图的网格特征补足细粒度空间推理，并把这套双地图结构用于预训练。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>三段代码分别给出在线拓扑图更新、GASA 与动态融合打分、Floyd 规划与 PID 伪标签及规模实算。接口以公开实现（VLN-DUET）的设计为参照，版本演进时以仓库为准。</p>
+
+    <p><strong>片段 1：在线拓扑图更新</strong></p>
+    <pre class="code"><code>import math
+
+class TopoMap:
+    """DUET 风格的在线拓扑图：三类节点状态与特征的增量维护。"""
+    def __init__(self, pos_tol=0.5):
+        self.nodes = {}          # 键 -> {"feat": 张量, "type": 类型, "pos": (x, y)}
+        self.edges = {}          # 键 -> 邻居键集合
+        self.pos_tol = pos_tol   # 坐标匹配阈值，抑制同一物理节点重复入图
+
+    def key_of(self, xy):
+        for k, nd in self.nodes.items():
+            if math.dist(xy, nd["pos"]) &lt; self.pos_tol:
+                return k                       # 命中已有节点
+        return "n%d" % len(self.nodes)         # 新节点分配键
+
+    def update(self, xy, pano_feat, navigable_xy):
+        """到达 xy 并观测全景后：登记当前节点、注册边界节点、补边。"""
+        cur = self.key_of(xy)
+        self.nodes[cur] = {"feat": pano_feat, "type": "cur", "pos": xy}
+        for nxy in navigable_xy:
+            nb = self.key_of(nxy)
+            if nb not in self.nodes:
+                self.nodes[nb] = {"feat": pano_feat, "type": "nav", "pos": nxy}
+            else:
+                old = self.nodes[nb]
+                old["feat"] = 0.5 * (old["feat"] + pano_feat)   # 多次部分观测取平均
+            self.edges.setdefault(cur, set()).add(nb)
+            self.edges.setdefault(nb, set()).add(cur)
+        return cur, sorted(self.edges[cur] | {cur})</code></pre>
+    <p>解读：<strong>（1）</strong>三类节点用类型字段区分，当前节点在下一步会转成已访问；边界节点的特征是累积平均，这是“部分观测”的工程写法。<strong>（2）</strong>去重阈值是全流程最敏感的参数：过大会把相邻两个真实节点并成一个，过小会让同一节点分裂，动作空间与距离偏置同时失真。<strong>（3）</strong>真实实现按批张量化，并维护节点到全局下标的一致映射；示例用字典便于阅读。</p>
+
+    <p><strong>片段 2：GASA 与动态融合</strong></p>
+    <pre class="code"><code>import torch
+import torch.nn as nn
+
+class GasaLayer(nn.Module):
+    """教学版单头 GASA：在注意力 logits 上加图距离偏置（式 3、4）。"""
+    def __init__(self, dim=768):
+        super().__init__()
+        self.qkv = nn.Linear(dim, dim * 3)
+        self.proj = nn.Linear(dim, dim)
+        self.we = nn.Linear(1, 1)            # 距离偏置的斜率，可学习
+        self.be = nn.Parameter(torch.zeros(1))
+        self.norm = nn.LayerNorm(dim)
+
+    def forward(self, x, dist):
+        # x: (K, D) 节点表示；dist: (K, K) 图上成对距离
+        q, k, v = self.qkv(x).chunk(3, dim=-1)
+        logits = q @ k.transpose(-1, -2) / q.size(-1) ** 0.5
+        attn = torch.softmax(logits + self.we(dist.unsqueeze(-1)).squeeze(-1) + self.be, dim=-1)
+        return self.norm(x + self.proj(attn @ v))
+
+def fuse_global(s_c, s_f_local, local_ids, back_ids, k_total, sigma):
+    """式 6 与式 8：局部分数升维后与粗尺度分数按门控融合。
+    s_c: (K,) 粗尺度分数；s_f_local: (L,) 局部候选分数（含 stop）；
+    local_ids: 局部候选的全局下标；back_ids: 已访问邻居的全局下标；
+    sigma: 标量门控，实际由两个 stop 嵌入经 FFN 与 sigmoid 生成。"""
+    s_back = s_f_local[back_ids].sum()       # 回退分数：邻居中已访问节点分数之和
+    s_f = torch.zeros(k_total) + s_back      # 其余节点统一取 s_back
+    s_f[local_ids] = s_f_local               # 本地候选保留原分数
+    return sigma * s_c + (1.0 - sigma) * s_f</code></pre>
+    <p>解读：<strong>（1）</strong>距离偏置在 softmax 前相加，形状为 (K, K)，与内容相似度逐元素相加后才归一化；多头实现按头广播偏置。<strong>（2）</strong><code>fuse_global</code> 对应式 6 的升维：先整体填 s_back，再把局部候选覆盖回原值，顺序不能颠倒。<strong>（3）</strong>门控以标量参数传入，实际由两个 stop 嵌入经 FFN 与 sigmoid 生成；式 8 的加权在函数末尾完成，σ<sub>t</sub> 越大越信任粗尺度。</p>
+
+    <p><strong>片段 3：规划、伪标签与规模实算</strong></p>
+    <pre class="code"><code>def floyd(nodes, edges, edge_w=3.0):
+    """Floyd 全源最短路；返回距离矩阵与下标映射。"""
+    idx = {k: i for i, k in enumerate(nodes)}
+    n = len(nodes)
+    inf = float("inf")
+    dist = [[inf] * n for _ in range(n)]
+    for i in range(n):
+        dist[i][i] = 0.0
+    for u, nbrs in edges.items():
+        for v in nbrs:
+            dist[idx[u]][idx[v]] = edge_w     # 相邻视点边权示例 3 米
+    for k in range(n):
+        for i in range(n):
+            for j in range(n):
+                if dist[i][k] + dist[k][j] &lt; dist[i][j]:
+                    dist[i][j] = dist[i][k] + dist[k][j]
+    return dist, idx
+
+def pid_target(dist, idx, cur, dest, neighbors):
+    """PID：在邻居中选“经它到终点总距离最小”的节点作为伪监督。"""
+    best, best_cost = None, float("inf")
+    for nb in neighbors:
+        cost = dist[idx[cur]][idx[nb]] + dist[idx[nb]][idx[dest]]
+        if cost &lt; best_cost:
+            best, best_cost = nb, cost
+    return best
+
+# 规模实算：平均度 4.1、n=36 视图、m=15 物体、指令 L=80
+d, L, n, m = 4.1, 80, 36, 15
+fine = (n + m + 1) ** 2 + 2 * (n + m + 1) * L
+for t in (6, 10, 20):
+    k = (t + 1) + t * (d - 1)                 # 已访问 + 边界节点估计
+    coarse = (k + 1) ** 2 + 2 * (k + 1) * L
+    print(t, round(k, 1), round(coarse), fine, round(5 * fine / coarse, 2))
+# 6 25.6 4964 11024 11.11 / 10 42.0 8729 11024 6.31 / 20 83.0 20496 11024 2.69</code></pre>
+    <p>解读：<strong>（1）</strong>Floyd 每步重算的复杂度为 O(K<sup>3</sup>)，K = 42 时约 7.4 万次基本操作，相对注意力可忽略；真实实现可用增量式最短路或 Dijkstra 只求单源。<strong>（2）</strong>PID 的伪目标只在当前邻居中选，保证伪标签对应可执行动作；训练时策略采样与伪标签在同一状态空间上对齐。<strong>（3）</strong>实算给出回退 5 步相对全局一步的倍数从 11.11 降到 2.69，说明地图越大全局动作的相对优势越小，验证了正文结论三。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>地图节点重复入图</strong>：动作空间出现多个几乎相同的候选，注意力与规划都被稀释，指标随 episode 变长而下降。根因：坐标匹配阈值过小或多个坐标来源（里程计与真值）混用。修复：固定坐标口径，用去重阈值扫描验证节点数与真值图规模的偏差，并在日志中记录每步新增节点数。</li>
+      <li><strong>已访问节点未掩码</strong>：智能体在地图上反复横跳，TL 明显高于对照。根因：全局打分保留了历史节点分数。修复：按任务口径掩掉已访问节点，仅保留 stop 与边界节点；需要重访的任务单独配置并写入报告。</li>
+      <li><strong>回退分数升维写错</strong>：所有远端节点共享同一 s_back 时，分数尺度被重复累加或局部候选被覆盖。根因：先覆盖后填充的顺序颠倒，或把 s_back 加到局部候选上。修复：对照式 6 写单测，断言“局部候选分数等于 s<sub>i</sub><sup>f</sup>、其余等于 s_back”这一性质。</li>
+      <li><strong>离线图与在线图分布漂移</strong>：预训练指标正常，在线微调掉点。根因：预训练按完整专家轨迹构图，在线阶段按智能体实际走过的前缀构图，节点类型分布与距离矩阵口径不同。修复：预训练也从轨迹前缀随机截断构图，并复用同一份地图更新代码。</li>
+      <li><strong>评测口径混用</strong>：把 REVERIE 的 RGS/RGSPL 与 SOON 的同类指标直接比较，或跨 split 拼表。根因：两个数据集的物体框来源不同（人工候选框与自动检测器），成功率定义随之不同。修复：报告时标注框来源与检测器版本，跨数据集只做方法级定性比较。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>按平均度 4.1 的估计口径，计算 t = 15 时的节点数估计与粗尺度一步的注意力评分量；再把估计式改为 K<sub>t</sub> = 2t + 1（去重更强时），比较两种口径下 t = 20 的差异。 <span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>K<sub>15</sub> ≈ 1 + 4.1 × 15 = 62.5，粗尺度一步为 (63.5)<sup>2</sup> + 2 × 63.5 × 80，约为 14,192 的量级（对照实算表 t = 15 行）；K<sub>20</sub> 在 2t + 1 口径下为 41，比 1 + 4.1t 的 83 小一半，评分量约降为四分之一。去重口径直接决定全局动作空间的规模。</div></details>
+      </li>
+      <li>复算动态融合的数值例：σ<sub>t</sub> = 0.45、s<sub>i</sub><sup>c</sup> = 2.30、s<sub>i</sub><sup>f′</sup> = 1.70；再把 σ<sub>t</sub> 改为 0.60 与 0.30，分别计算融合分数并说明门控偏向的变化。 <span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>σ<sub>t</sub> = 0.45 得 1.97；0.60 得 2.06；0.30 得 1.88。σ<sub>t</sub> 越大越信任粗尺度（探索），越小越信任细尺度（接地与停止确认）。注意 σ<sub>t</sub> 由状态生成，训练时会随阶段变化，论文统计中段权重最高。</div></details>
+      </li>
+      <li>把动态门控替换为固定 σ = 0.5 的平均融合，预测 REVERIE val unseen 上 SR、SPL、OSR、RGSPL 的变化方向与量级，并说明哪一个指标的变化最难预测。 <span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>论文数据：平均融合 45.81 / 31.94 / 51.86 / 22.78，动态融合 46.98 / 33.73 / 51.07 / 23.03。方向为 SR 与 SPL 下降、OSR 略升。最难预测的是 RGSPL，它同时受停止判定与物体接地影响，两个尺度的分工在终点附近切换最频繁。</div></details>
+      </li>
+      <li>关闭 GASA（M = 0），分别预测 R2R 与 REVERIE 上 SR 与 SPL 的变化方向，并设计一个能区分“图结构收益”与“参数量收益”的对照实验。 <span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>论文消融：动态融合下 SR 45.24 到 46.98、SPL 32.88 到 33.73，SPL 的相对变化更大。对照实验需要给关闭 GASA 的模型补上等量参数（例如在 logits 上加同形状的可学习偏置但不含距离输入），若补参数后仍显著低于 GASA，则收益来自图结构。</div></details>
+      </li>
+      <li>设计“回溯预算”实验：在同一策略上限制每个 episode 的全局回退次数上限（0、1、3、无限制），在 REVERIE val unseen 与 R2R val unseen 上测量 SR、SPL、TL 与回溯比例，预测四条曲线形态并解释 seen 与 unseen 的差异；再讨论该实验对真机部署的启示。 <span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>预测：REVERIE unseen 的回溯比例基线 48.6%，限制到 0 时 SR 大跌、TL 下降但 SPL 未必上升（探索不足导致失败）；放宽上限收益递减。R2R unseen 回溯基线 23.2%，曲线更平，说明逐步指令对回退的依赖小。seen 环境回溯仅 13.7%，限制影响小。部署启示：回退是纠错能力，预算应优先给未知环境；同时把“回退次数”作为可观测的运行时指标。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>DUET 在线构建拓扑图，节点分已访问、当前与边界三类；已访问节点用全景特征平均池化表示，边界节点用多次部分观测累积；stop 节点接入全局动作空间。</li>
+      <li>粗尺度图 Transformer 用 GASA 把图上距离作为注意力偏置（M = EW<sub>e</sub> + b<sub>e</sub>），在全局动作空间打分并掩掉已访问节点；细尺度编码用当前全景与物体特征做局部动作与接地。</li>
+      <li>动态融合先把局部分数升维（非局部节点取已访问邻居分数之和 s<sub>back</sub>），再用状态门控 σ<sub>t</sub> 融合；粗尺度平均权重开始 0.36、中段 0.45、结束 0.42。</li>
+      <li>训练用行为克隆加 PID 伪交互演示者；效果消融（REVERIE val unseen SR）：SAP 35.30、加 OG 37.80、PID 46.98，优于 RL 的 42.35。</li>
+      <li>结果（离散协议）：R2R test unseen 69 SR / 59 SPL；REVERIE test unseen 52.51 SR / 22.06 RGSPL，相对 HAMT 提升 22.11 与 8.98；SOON test unseen 33.44 SR / 21.42 SPL；R2R 上 SR 高而 SPL 略低于 HAMT，与地图鼓励回退的轨迹变长一致。</li>
+      <li>下一讲 BEVBert 在拓扑图之外增加局部度量地图，用鸟瞰视图网格特征补足细粒度空间推理，并把双地图结构写进预训练目标（第 037 讲）。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch035.html">← 第 035 讲：HOP：历史与顺序预训练</a>
+    <a class="next" href="ch037.html">第 037 讲：BEVBert：度量+拓扑混合地图 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.06 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:11.5px !important;letter-spacing:.06em !important;color:rgba(71,85,105,.45) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#7e8ba0 !important;font-size:11.5px !important;line-height:1.8 !important;text-align:center !important;padding:5px 12px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

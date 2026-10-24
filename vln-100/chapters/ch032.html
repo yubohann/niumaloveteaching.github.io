@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 032 讲｜Recurrent VLN-BERT：时间感知 | 视觉语言导航课程 · VLN-100</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 离散方法谱系：从模块到预训练</span>
+    <span class="sep">/</span>
+    <span>第 032 讲</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 离散方法谱系：从模块到预训练</div>
+    <h1>第 032 讲｜Recurrent VLN-BERT：时间感知</h1>
+    <p class="lead">本讲把图文预训练的打分模型推进成逐步决策的导航器：用状态 token 承载跨模态历史，语言只编码一次并充当键与值，末层注意力权重直接充当动作分布，再用 A2C 与模仿学习的混合目标微调；同时以实算的序列长度与显存账解释递归设计为何能把长序列代价压成常数。</p>
+    <ul class="meta">
+      <li>主题：循环状态 / 历史压缩 / 注意力即策略 / 显存与复杂度核算</li>
+      <li>关键公式：s<sub>t</sub> = VLN↻BERT(s<sub>t−1</sub>, X, V<sub>t</sub>)；p<sup>a</sup><sub>t</sub> = Ã<sup>s,v</sup></li>
+      <li>预计学时：60 分钟</li>
+      <li>前置讲：第 031 讲（VLN-BERT：网页图文预训练）</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>会写：给出状态 token 的递归更新式与状态精炼（语言与视觉注意力加权、逐元素相乘、动作方向编码回注）的完整形式。</li>
+      <li>会算：给定指令长度 L、每步视觉 token 数 K 与步数 T，实算全历史编码与循环状态两种设计的序列长度、注意力规模与激活显存。</li>
+      <li>会实现：把多头注意力权重平均后直接用作动作分布，理解其归一化条件与停止动作的零向量实现。</li>
+      <li>会判断：预训练初始化（随机初始化、域外图文预训练、域内导航预训练）对收敛速度与最终指标的影响，并设计对照实验。</li>
+      <li>会诊断：固定大小循环状态的失效模式（早期记忆衰减、历史信息不可逆压缩），并说明它与第 034 讲分层历史编码的接口。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 031 讲处理的是 VLN-BERT（Majumdar 等 2020）式的图文预训练：模型学会对指令与路径的兼容性打分，服务于波束搜索中的路径选择。打分模型不产生逐步动作，它的输出是一条完整路径的分数。本讲处理它的直接后续：把同一个多模态 BERT 主体改造为逐步决策的策略网络，相关工作为 Recurrent VLN-BERT（Hong 等 2021，CVPR 2021，arXiv:2011.13922v2）。</p>
+    <p>把 BERT 直接用作导航策略面临两个障碍。第一是部分可观测：每一步只有局部全景，决策依赖历史，而 BERT 的自注意力作用于固定输入序列，没有天然的时序状态。第二是显存：若把每步的全部视觉 token 与历史拼成一个序列，序列长度随步数线性增长，注意力代价按长度平方增长；论文指出，对长 episode 逐步做全序列自注意力，训练显存开销过大。</p>
+    <p>论文的解法是把历史压缩进一个状态 token：初始状态取自指令 [CLS] 的输出，之后每步用同一个 BERT 以自回归方式更新该状态；语言 token 在初始化阶段编码一次，之后只作为键与值参与注意力，不再被重编码。决策不接额外分类器，直接取末层注意力权重对候选方向的平均，作为动作分布。该设计把训练成本压到单张 2080Ti 即可完成，论文报告在 R2R test unseen 上取得 63% SR 与 57% SPL。</p>
+    <p>本讲要回答三件事：状态递归的数学形式是什么，为什么这样写能兼顾历史与显存，以及这种固定大小状态在什么条件下失效。第三点直接引出第 034 讲的分层历史编码。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p>本讲沿用第 001 讲的 POMDP 语言，把导航器写成带历史的策略，再逐层展开循环状态、状态精炼、注意力决策与混合训练四个机制。所有符号第一次出现时给出含义，论文数字标注来源与版本。</p>
+
+    <h3>1. 问题与符号</h3>
+    <p>智能体在导航图上移动，环境部分可观测。第 t 步的观测是一幅全景，论文把全景拆成 K 张单视图图像，记为</p>
+    <div class="formula">
+      O<sub>t</sub> ≜ ([v<sup>o</sup><sub>1</sub>; a<sup>o</sup><sub>1</sub>], …, [v<sup>o</sup><sub>K</sub>; a<sup>o</sup><sub>K</sub>])
+      <span class="note">v<sup>o</sup><sub>i</sub> 为第 i 张视图的视觉特征，a<sup>o</sup><sub>i</sub> 为朝向该视图的相对角度；论文按公开实现采用 12 个水平朝向（间隔 30°）与 3 个俯仰角（±30°），K = 36</span>
+    </div>
+    <p>其中可导航视图构成决策空间 O<sup>c</sup><sub>t</sub> = ([v<sup>c</sup><sub>1</sub>; a<sup>c</sup><sub>1</sub>], …, [v<sup>c</sup><sub>n</sub>; a<sup>c</sup><sub>n</sub>])，智能体每一步只需在 O<sup>c</sup><sub>t</sub> 中选一个候选。截至第 t 步的历史记为 H<sub>t</sub> = ([O<sub>1</sub>; a<sup>h</sup><sub>1</sub>], …, [O<sub>t−1</sub>; a<sup>h</sup><sub>t−1</sub>])，其中 a<sup>h</sup><sub>i</sub> 是第 i 步执行动作对应的转镜角度。策略写成 π(a<sub>t</sub> | W, H<sub>t</sub>, O<sub>t</sub>, O<sup>c</sup><sub>t</sub>; Θ)，W 为指令词序列。</p>
+    <p>视觉 token 的构造包含两类信息：场景特征与方向编码。论文使用 ResNet-152（Places365 预训练）的 2048 维网格特征 f<sup>v,i</sup><sub>t</sub>，拼接 128 维方向编码 d<sup>i</sup><sub>t</sub>，后者由 (cos θ<sup>i</sup><sub>t</sub>, sin θ<sup>i</sup><sub>t</sub>, cos φ<sup>i</sup><sub>t</sub>, sin φ<sup>i</sup><sub>t</sub>) 复制 32 次构成，因此单个视觉 token 输入维度为 2048 + 128 = 2176。停止动作通过在同一列表中追加一个 2176 维零向量实现。</p>
+
+    <h3>2. 两条历史建模路线与复杂度</h3>
+    <p>历史 H<sub>t</sub> 进入决策有两类写法。<strong>全历史拼接</strong>把截至当前的全部视图 token 依次排入序列，长度约为 L + tK；<strong>循环状态</strong>把历史压缩进固定长度的状态 token，序列长度恒为 L + K + 1。两者的注意力评分次数都是序列长度的平方级，差别随 T 放大。下面给出实算（L = 80，K = 12，按课程公共口径取每步 12 个候选视角；论文决策空间取可导航视图数 n，此处以 K 近似）。</p>
+    <table>
+      <tr><th>步数 T</th><th>全历史序列长度</th><th>全历史评分次数 n²</th><th>循环序列长度</th><th>循环评分次数 n²</th><th>比值</th></tr>
+      <tr><td>5</td><td>141</td><td>19,881</td><td>93</td><td>8,649</td><td>2.30</td></tr>
+      <tr><td>10</td><td>201</td><td>40,401</td><td>93</td><td>8,649</td><td>4.67</td></tr>
+      <tr><td>20</td><td>321</td><td>103,041</td><td>93</td><td>8,649</td><td>11.91</td></tr>
+    </table>
+    <p>把评分次数换算成激活显存：12 层、12 头、float32 的注意力矩阵在 T = 20 时，全历史方案约 4,830 KiB/层/样本，12 层合计约 56.6 MiB；循环方案恒为约 405.4 KiB/层/样本，合计约 4.8 MiB。按批大小 16 外推，两者分别约 0.88 GiB 与 0.07 GiB。<strong>结论一：循环状态把随步数增长的注意力代价压成常数，T 越大收益越大。</strong>注意这只是注意力矩阵一项，真实训练还包含前馈与梯度，但量级关系成立。</p>
+    <p>论文给出的实测可作交叉验证：在 2080Ti 上，循环状态方案以批大小 16 训练占用 9.2 GB，而逐步重编码语言的三种对照方案以批大小 6 训练各占 11.0 GB。折算到单样本为 0.575 GB 与 1.833 GB，相差约 3.19 倍。<strong>结论二：显存优势有实测支撑，循环方案以批大小 16 训练时占用 9.2 GB，逐步重编码语言的三组对照以批大小 6 训练各占用 11.0 GB。</strong></p>
+
+    <h3>3. 状态初始化与递归更新</h3>
+    <p>初始状态借自 BERT 的 [CLS]。在 OSCAR 系预训练中，[CLS] 被训练来聚合全序列的图文线索，论文直接把它当作“理解整条指令后的智能体状态”：</p>
+    <div class="formula">
+      s<sub>0</sub>, X = VLN↻BERT([CLS], U, [SEP])
+      <span class="note">U 为指令词序列；X 为整个指令的深度表示；s<sub>0</sub> 为初始状态。该式只在 t = 0 执行一次，X 在全 episode 中复用</span>
+    </div>
+    <p>导航步 t &gt; 0 时，输入变为“上一状态 + 指令特征 + 当前视觉 token”，输出更新后的状态与决策所需的注意力：</p>
+    <div class="formula">
+      s<sub>t</sub>, p<sup>a</sup><sub>t</sub> = VLN↻BERT(s<sub>t−1</sub>, X, V<sub>t</sub>)
+      <span class="note">V<sub>t</sub> 为当前观测的视觉 token；语言 token 在后续步只作键与值，不作查询。移除逐步重编码是把显存从 11.0 GB 降到 9.2 GB 的关键</span>
+    </div>
+    <p>这一步的建模含义要写清楚：状态 s<sub>t</sub> 是“截至当前的全部语言与视觉线索、以及全部已做决策”的摘要，更新方式是自回归的，上一状态作为本步输入序列的首 token，经跨模态自注意力后成为下一状态的载体。与环境交互时，智能体每步只把 s<sub>t</sub> 和当前观测送入网络，不需要重放历史。</p>
+
+    <h3>4. 状态精炼：为什么还要一次跨模态匹配</h3>
+    <p>在常规 BERT 中，[CLS] 会被下游分类损失直接监督，因而被迫抓住任务要点；而本模型的状态不直接接分类器，若放任自流，状态可能记不住最关键的图文线索。论文因此增加状态精炼：用末层注意力对原始文本与原始视觉特征做加权，再逐元素相乘，作为形状约束注入状态。</p>
+    <div class="formula">
+      A<sup>s,x</sup><sub>l,k</sub> = Q<sup>s</sup><sub>l,k</sub> (K<sup>x</sup><sub>l,k</sub>)<sup>T</sup> / √d<sub>h</sub>，Ã<sup>s,x</sup><sub>l</sub> = Softmax( (1/K) Σ<sub>k=1..K</sub> A<sup>s,x</sup><sub>l,k</sub> )
+      <span class="note">l 为末层（论文为第 12 层），k 为注意力头编号，共 K = 12 头；d<sub>h</sub> 为单头维度。先按头平均再 Softmax，得到状态对指令 token 的注意力权重 Ã<sup>s,x</sup><sub>l</sub></span>
+    </div>
+    <div class="formula">
+      F<sup>x</sup><sub>t</sub> = Ã<sup>s,x</sup><sub>l</sub> X，F<sup>v</sup><sub>t</sub> = Ã<sup>s,v</sup><sub>l</sub> V<sub>t</sub>，s<sup>f</sup><sub>t</sub> = [ s<sup>r</sup><sub>t</sub> ; F<sup>x</sup><sub>t</sub> ⊙ F<sup>v</sup><sub>t</sub> ] W<sup>r</sup>
+      <span class="note">s<sup>r</sup><sub>t</sub> 为末层状态输出；⊙ 为逐元素相乘，迫使语言摘要与视觉摘要在同一坐标上对齐；W<sup>r</sup> 为可学习投影</span>
+    </div>
+    <div class="formula">
+      s<sub>t</sub> = [ s<sup>f</sup><sub>t</sub> ; a<sub>t</sub> ] W<sup>s</sup>
+      <span class="note">a<sub>t</sub> 为所选动作方向的 128 维方向编码（论文与视觉方向编码同源）。把“刚刚做了什么”写回状态，智能体才能追踪进度</span>
+    </div>
+    <p>式中的两次加权含义不同：对文本的加权定位“指令的哪一段与当前进度相关”，对视觉的加权定位“当前观测中哪些方向与指令相关”，逐元素相乘相当于二者的共现打分。<strong>结论三：状态精炼把“状态应记住什么”写成结构先验，替代了常规 BERT 里分类损失的部分监督作用。</strong>REVERIE 的高层指令场景下，论文把 F<sup>x</sup> ⊙ F<sup>v</sup> 退化为只用 F<sup>v</sup>，理由是高层指令与单帧视觉的逐步匹配价值较低。</p>
+
+    <h3>5. 决策：注意力权重即动作分布</h3>
+    <p>多数 VLN 智能体用“状态与候选视觉特征的内积”打分再选择，本模型直接把 BERT 末层状态的注意力权重当作分数：</p>
+    <div class="formula">
+      p<sup>a</sup><sub>t</sub> = Ã<sup>s,v</sup><sub>l</sub>
+      <span class="note">对 12 个头求平均后的注意力权重；因状态查询对应的那一行在候选 token 上来自 Softmax，逐头平均后仍是一条概率分布，可直接作为动作分布参与交叉熵与策略梯度。数值上，任取 12 条随机归一分布做逐元素平均，总和恒为 1</span>
+    </div>
+    <p>停止动作的实现是在视觉 token 列表中追加零向量：R2R 下当 stop token 的权重最大时智能体停止；REVERIE 下视觉 token 由场景 token 与候选物体 token 拼接，当任一物体 token 的分数超过全部场景 token 时停止，并把该物体作为接地结果。REVERIE 的写法把“是否找到目标”与“是否停止”绑定，使物体接地也进入强化学习信号。</p>
+
+    <h3>6. 训练：A2C 与模仿学习的混合目标</h3>
+    <p>训练目标是强化项与模仿项之和。强化项用 A2C：采样动作的 log 概率乘以优势，优势由折扣回报减批判器估计得到；模仿项用教师动作的交叉熵，权重为 λ。</p>
+    <div class="formula">
+      L = − Σ<sub>t</sub> a<sup>s</sup><sub>t</sub> log(p<sup>a</sup><sub>t</sub>) A<sub>t</sub> − λ Σ<sub>t</sub> a<sup>*</sup><sub>t</sub> log(p<sup>a</sup><sub>t</sub>)
+      <span class="note">a<sup>s</sup><sub>t</sub> 为按策略采样的动作，a<sup>*</sup><sub>t</sub> 为教师动作，A<sub>t</sub> 为优势估计；每批样本一半走强化项、一半走模仿项。λ 的数值以开源配置为准，论文可核实的部分只报告其作用</span>
+    </div>
+    <p>奖励由三部分组成：进度奖励按每一步到目标距离的变化给出 +1 或 −1 的信号；停止奖励在 3 米内停给 +2、否则给 −2；再叠加归一化动态时间规整（normalized Dynamic Time Warping, nDTW）保真项，鼓励贴合指令路径，抑制单纯抄近路的行为。批判器是多层感知机，以更新后的状态表示估计当前状态的期望价值（论文附录式 19）。</p>
+    <p>具体配置：R2R 用原始训练集与 PREVALENT 的增广数据混合，AdamW，学习率 10<sup>−5</sup>，批大小 16（强化与模仿各 8），训练 300,000 次迭代；REVERIE 批大小 8，训练 200,000 次迭代；全流程在单张 2080Ti 上完成。论文对比了初始化方式的收敛速度：OSCAR 初始化 600,000 次迭代约 7 天、最佳结果出现在 3.5 天；PREVALENT 初始化约 4.5 天、最佳结果 1 天。<strong>结论四：域内导航预训练（PREVALENT）比域外图文预训练（OSCAR）收敛快得多，且最终指标更高。</strong></p>
+
+    <h3>7. 结果与消融</h3>
+    <p>R2R 评测采用单次运行（贪心解码，不再先探索）。初始化为 PREVALENT 时，val seen 为 72% SR / 68% SPL，val unseen 为 63% / 57%，test unseen 为 63% / 57%，NE 4.09 米；随机初始化时 test 为 51% / 47%，OSCAR 初始化为 57% / 53%。相对随机初始化，PREVALENT 在 test 上提升 12 个百分点 SR 与 10 个百分点 SPL。人类在 test 上的参考值为 86% SR / 76% SPL，差距仍为 23 与 19 个百分点。</p>
+    <p>组件消融（init OSCAR，val unseen SR/SPL）显示：基线 EnvDrop 为 49.81 / 43.45；仅把语言编码器换成预训练 BERT 且不微调，降到 44.15 / 39.64；语言与视觉都用 BERT 编码升到 52.11 / 45.75；逐步覆盖状态、决策、匹配与微调后达到 58.71 / 53.41。语言注意力方式的对照更直接：每一步对原始词嵌入做自注意力（Emb-Attn）为 55.60 / 51.00；每一步对初始化语言特征重编码（Init-Attn）为 53.47 / 49.05；每一步对上一时刻语言输出重编码（Re-Attn）为 37.76 / 35.78；只编码一次（本模型）为 58.71 / 53.41。前三者均在批大小 6 下占 11.0 GB，本模型在批大小 16 下占 9.2 GB。</p>
+    <p>REVERIE 的联合任务（导航加远程指代）以 PREVALENT 初始化时，val unseen 为 30.67% 导航 SR、24.90% 导航 SPL、18.77% 接地 RGS、15.27% RGSPL；test unseen 为 29.61% / 23.99% / 16.50% / 13.51%。相比 OSCAR 初始化的 val unseen（25.53 / 21.06 / 14.20 / 12.00），各项分别提升 5.14、3.84、4.57、3.27 个百分点。</p>
+
+    <h3>8. 适用边界与失效模式</h3>
+    <ul>
+      <li><strong>固定大小状态是信息瓶颈</strong>：全部历史被压进一个向量，早期观测的细节会衰减。论文以 R2R-Back 类回程任务为例说明循环状态难以支撑长程依赖，该问题由第 034 讲的显式历史编码直接回应。</li>
+      <li><strong>“语言只编码一次”依赖指令全程不变</strong>：R2R/RxR 的指令是固定条件，假设成立；对话导航中信息逐步揭示，该假设失效，须把对话历史并入状态。</li>
+      <li><strong>注意力权重当概率的前提是候选集一致</strong>：候选 token 的集合、顺序与掩码变化会改变分布语义；换协议时要重新核对 stop token 与候选视图的构造。</li>
+      <li><strong>特征口径敏感</strong>：论文用 2176 维场景特征（2048 网格 + 128 方向）与 2176 维物体特征；换 backbone 或方向编码维度时，投影层与停止向量都要同步重建。</li>
+      <li><strong>评测协议敏感</strong>：结果来自单次运行、无预探索；与波束搜索或集成口径的数字不可直接比较，引用时必须标注。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>把本讲内容落成工程对象需要三件事：一张模块接口表、一张超参表、一张与替代方案的取舍表。代码接口以公开实现的设计为参照，具体名称随版本演进。</p>
+
+    <h3>模块接口</h3>
+    <table>
+      <tr><th>模块</th><th>输入</th><th>输出</th><th>形状示例</th></tr>
+      <tr><td>语言编码（仅 t=0）</td><td>词 id 序列</td><td>token 特征 X 与初始状态 s<sub>0</sub></td><td>[B, L, 768]，L 最大 80</td></tr>
+      <tr><td>视觉投影</td><td>场景特征 + 方向编码</td><td>视觉 token V<sub>t</sub></td><td>[B, n+1, 2176] 到 [B, n+1, 768]</td></tr>
+      <tr><td>递归主体</td><td>s<sub>t−1</sub>, X, V<sub>t</sub></td><td>新状态与末层注意力</td><td>状态 [B, 1, 768]</td></tr>
+      <tr><td>状态精炼</td><td>末层状态、文本与视觉注意力</td><td>精炼状态 s<sup>f</sup><sub>t</sub></td><td>拼接后 [B, 1, 1536] 到 [B, 1, 768]</td></tr>
+      <tr><td>决策</td><td>末层状态对候选的注意力</td><td>动作分布 p<sup>a</sup><sub>t</sub></td><td>[B, n+1]</td></tr>
+    </table>
+
+    <h3>超参与取值依据</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>优化器与学习率</td><td>AdamW，1e-5</td><td>微调预训练主体</td><td>论文配置；大学习率会破坏预训练权重</td></tr>
+      <tr><td>批大小（R2R）</td><td>16（强化 8 + 模仿 8）</td><td>平衡两类梯度</td><td>单卡 2080Ti 显存可容纳的上限</td></tr>
+      <tr><td>训练迭代数</td><td>300k（R2R）/ 200k（REVERIE）</td><td>收敛预算</td><td>论文配置，早停按 val unseen SPL</td></tr>
+      <tr><td>候选集</td><td>可导航视图 n + stop</td><td>决策空间</td><td>Speaker-Follower 系全景动作约定的延续</td></tr>
+      <tr><td>停止实现</td><td>2176 维零向量</td><td>引入停止动作</td><td>与视觉 token 同维，注意力可直接比较</td></tr>
+      <tr><td>模仿权重 λ</td><td>论文未报告数值</td><td>平衡强化与模仿</td><td>按开源配置确定，属复现必查项</td></tr>
+    </table>
+
+    <h3>方案取舍</h3>
+    <table>
+      <tr><th>方案</th><th>历史容量</th><th>显存随 T 的增长</th><th>适用条件</th></tr>
+      <tr><td>全历史拼接</td><td>完整</td><td>平方级</td><td>episode 短、显存充足、追求精确回放</td></tr>
+      <tr><td>循环状态（本讲）</td><td>压缩为固定向量</td><td>常数</td><td>指令固定、单卡训练、精度要求中等</td></tr>
+      <tr><td>分层显式历史（预告 034）</td><td>全部历史 token 的层级摘要</td><td>线性加局部平方</td><td>长程依赖强、算力充足</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：语言编码一次，状态负责时间</span>
+      <p>把“语言理解”和“历史跟踪”拆开：语言由预训练主体在 t = 0 处理一次，全 episode 复用；时间信息全部由状态 token 的递归更新承载。该拆分的收益有两处：计算上避免每步重编码长指令，显存实测差距 3.19 倍；训练上语言特征稳定，模仿损失不被语言编码抖动干扰。代价是状态成为唯一的长程记忆载体，超出其容量的信息不可恢复，这正是显式历史方法的立足点。</p>
+    </div>
+
+    <h3>与第 031 讲的差异</h3>
+    <p>031 的 VLN-BERT 输出指令与整条路径的兼容性分数，用于对候选路径重排序；本讲输出每步的动作分布，可直接驱动导航。前者是“打分器”，后者是“策略器”；训练目标也从对比匹配换成强化学习加模仿的混合目标。判据很直接：需要端到端部署或与强化学习结合时选策略器；只需要对既有路径重排序时选打分器，成本更低。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>三段代码分别给出递归主体的最小实现、显存核算脚本与混合目标写法。所有输出与本讲正文数字一致，接口以公开实现为参照。</p>
+
+    <p><strong>片段 1：状态递归与注意力决策</strong></p>
+    <pre class="code"><code>import torch
+import torch.nn as nn
+
+class RecurrentNavBERT(nn.Module):
+    """语言只编码一次；状态 token 自回归更新；末层注意力即动作分布。"""
+    def __init__(self, bert, hidden=768):
+        super().__init__()
+        self.bert = bert
+        self.vis_proj = nn.Linear(2176, hidden)   # 2048 网格特征 + 128 方向编码
+        self.act_proj = nn.Linear(128, hidden)    # 已执行动作的方向编码
+        self.state_fuse = nn.Linear(2 * hidden, hidden)
+        self.stop_token = nn.Parameter(torch.zeros(1, 1, hidden))
+
+    @torch.no_grad()
+    def encode_language_once(self, ids, types):
+        out = self.bert(ids, token_type_ids=types, output_hidden_states=True)
+        return out.last_hidden_state            # X：全程复用的指令特征
+
+    def step(self, state, lang, vis_feats, act_dir):
+        vis = self.vis_proj(vis_feats)          # (B, n, hidden)
+        seq = torch.cat([state, lang, vis, self.stop_token.expand(vis.size(0), -1, -1)], dim=1)
+        out = self.bert(inputs_embeds=seq, output_attentions=True)
+        attn = out.attentions[-1].mean(dim=1)   # 末层 12 头平均：(B, T, T)
+        scores = attn[:, 0, 1 + lang.size(1):]  # 状态对视觉与 stop 的注意力
+        fused = self.state_fuse(torch.cat([out.last_hidden_state[:, :1],
+                                           self.act_proj(act_dir)], dim=-1))
+        return fused, scores                    # 新状态与动作分布</code></pre>
+    <p>解读：<strong>（1）</strong><code>encode_language_once</code> 放在 <code>torch.no_grad</code> 下并返回缓存，对应“语言只编码一次”的显存与稳定性设计；若允许每步重编码，实测指标会显著下降（见常见坑第 1 条）。<strong>（2）</strong><code>step</code> 里状态恒为首 token，候选视觉与 stop 依次拼接；<code>scores</code> 直接切出状态行对候选的注意力，无需再叠分类头。<strong>（3）</strong>动作方向编码经 <code>act_proj</code> 回注状态，对应公式中 s<sub>t</sub> = [s<sup>f</sup><sub>t</sub>; a<sub>t</sub>] W<sup>s</sup>。真实实现还需处理不同样本候选数不等的情况，用掩码把无效候选的分数置为负无穷。</p>
+
+    <p><strong>片段 2：序列长度与显存核算</strong></p>
+    <pre class="code"><code>L, K, heads, layers = 80, 12, 12, 12
+
+for T in (5, 10, 20):
+    n_full = 1 + L + T * K          # 状态 + 指令 + 全部历史视图
+    n_rec = 1 + L + K               # 状态 + 指令 + 当前观测
+    print(T, n_full ** 2, n_rec ** 2, round((n_full / n_rec) ** 2, 2))
+# 输出：5 19881 8649 2.30
+#       10 40401 8649 4.67
+#       20 103041 8649 11.91
+
+per_entry = heads * layers * 4       # 单条注意力评分的字节数（float32）
+print(per_entry * 103041 * 16 / 2 ** 30)   # 全历史，batch 16：约 0.88 GiB
+print(per_entry * 8649 * 16 / 2 ** 30)     # 循环状态，batch 16：约 0.07 GiB</code></pre>
+    <p>解读：<strong>（1）</strong>公式只统计注意力矩阵，不含前馈与优化器状态，用于量级判断；比值一列与正文表格一致。<strong>（2）</strong>该脚本在实验设计阶段先跑一遍，可以在训练前决定批大小与历史策略，避免显存超限后再回退。<strong>（3）</strong>若换成 float16，两个数字各减半，但相对比值不变；真实显存还受各层缓存梳理策略影响，论文实测的 9.2 GB 与 11.0 GB 均高于此处的裸矩阵估算。</p>
+
+    <p><strong>片段 3：强化与模仿的混合目标</strong></p>
+    <pre class="code"><code>import torch
+import torch.nn.functional as F
+
+def mixed_loss(logits, values, act_sampled, act_expert, rewards, lam=0.5):
+    """每个迭代一半样本走强化、一半走模仿，两项共享同一份前向。"""
+    logp = F.log_softmax(logits, dim=-1)
+    picked = logp.gather(1, act_sampled.unsqueeze(1)).squeeze(1)
+    advantage = (rewards - values).detach()          # A2C 优势估计
+    rl = -(picked * advantage).mean()                # 策略梯度项
+    il = F.cross_entropy(logits, act_expert)         # 教师动作交叉熵
+    return rl + lam * il
+
+# 训练循环：批 16 中 8 条用采样动作与回报，8 条用专家动作
+# 停止奖励：3 米内 +2，否则 -2；进度奖励按距离增减给 +1 / -1</code></pre>
+    <p>解读：<strong>（1）</strong>log 概率取自直接作为动作分布的注意力分数，与公式 L 的两项一致；<code>values</code> 来自批判器对状态乘积的估计。<strong>（2）</strong><code>detach</code> 只切断优势的梯度，策略项仍可训练；这是 A2C 的标准写法。<strong>（3）</strong>λ 控制模仿强度，强化主导时指标波动更大，模仿主导时探索不足，混合是论文报告的稳定点。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>每一步重编码语言</strong>：训练可以跑通，但显存上涨且指标明显下降。论文对照中，逐步重编码上一时刻语言输出的变体 val unseen SR 仅 37.76%，而只编码一次为 58.71%；显存从 9.2 GB（批 16）恶化到 11.0 GB（批 6）。根因：语言特征被反复改写，状态与语言的对齐不再稳定。修复：把语言输出冻结为键与值，仅允许状态与视觉 token 作为查询。</li>
+      <li><strong>把注意力权重当 logits 再做一次 Softmax</strong>：双重归一化改变分布形状，训练初期动作置信度异常。根因：末层注意力已按候选做过归一，逐头平均后仍是一条概率分布。修复：直接使用平均注意力，或在文档中明确约定“若改用可学习温度，须重新校准”。</li>
+      <li><strong>停止向量维度或位置错误</strong>：模型要么永不停止，要么在首步停止。根因：stop token 必须与投影后的视觉 token 同维，并追加在候选列表末尾；R2R 与 REVERIE 的停止语义不同（前者比 stop 分数，后者比物体与场景分数）。修复：写单测验证 stop 分数参与 Softmax、候选掩码不覆盖 stop。</li>
+      <li><strong>用随机初始化的对照解读预训练收益</strong>：同一套代码，初始化不同会让 test SR 相差 12 个百分点（51 到 63）。根因：把“架构收益”与“初始化收益”混在一个数字里。修复：固定随机种子与训练预算，报告随机、OSCAR、PREVALENT 三档初始化；引用他人数字时注明初始化来源。</li>
+      <li><strong>忽略单次运行与预探索的口径差别</strong>：把本模型的 63% 与带波束搜索或集成的数字并排。根因：解码方式与候选路径来源不同。修复：报告时标注解码策略（贪心、单次运行）、是否预探索、是否集成，跨口径只做定性比较。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>取 L = 80、K = 12。计算 T = 15 时全历史编码与循环状态的序列长度与注意力评分次数之比；再按 12 层、12 头、float32、批大小 16 估算两者注意力矩阵的显存。 <span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>全历史 n = 1 + 80 + 15 × 12 = 261，n² = 68,121；循环 n = 93，n² = 8,649；比值约 7.88。单条评分 12 × 12 × 4 = 576 字节；全历史 576 × 68,121 × 16 ≈ 0.58 GiB，循环约 0.07 GiB。</div></details>
+      </li>
+      <li>已知 12 条已经归一化的注意力分布，说明逐元素平均后总和仍为 1，并解释为什么这让“平均注意力权重”可以直接作为动作概率使用。 <span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>每条分布求和为 1，均值分布的求和等于各条求和的均值，仍为 1；非负性在平均下保持，因此是一条合法概率分布。平均操作只做权重组合，不改变支撑集，可直接进入交叉熵与策略梯度。</div></details>
+      </li>
+      <li>设计对照实验验证“语言只编码一次”的收益：给出两组配置（逐步重编码与只编码一次），说明需要固定的变量、预期指标方向与显存差异，并指出该实验无法排除的一个混淆因素。 <span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>固定数据、初始化、学习率、总迭代数，只改语言处理方式；预期只编码一次在 SR 与 SPL 上更高、显存更低（参照论文 58.71 对 37.76）。混淆因素：逐步重编码会增加有效计算量，若不控制总前向次数，收益可能部分来自算力差异。</div></details>
+      </li>
+      <li>把混合目标的批内比例从 8 + 8 改为 12 强化 + 4 模仿，预测 val unseen 的 SR 与 SPL 变化方向，并说明需要观察的稳定性信号。 <span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>强化占比上升通常推高 SR、SPL 提升较小，方差增大；模仿占比上升指标更稳但探索不足。稳定性信号：训练回报曲线波动、val unseen 与 val seen 的落差、停止动作的错误率。</div></details>
+      </li>
+      <li>证明固定大小状态的容量限制：构造一个两阶段任务（先到 A 观察线索，再到 B 执行），分析线性高斯假设下状态向量的均方误差如何随步数增长；再设计一个用 R2R-Back 式回程指令验证状态衰减的实验，给出指标与对照。 <span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>线性高斯模型中，递归状态等价于对历史做指数加权压缩，远距离观测的权重随步数指数下降，均方误差随 T 增长。实验：在 R2R 指令末尾追加回程句，比较本模型与显式历史模型（第 034 讲）的回程成功率、nDTW 与 SDTW；对照固定总迭代数与参数量，并记录历史长度对显存的边际成本。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>Recurrent VLN-BERT 把多模态 BERT 改造成递归策略：s<sub>0</sub> 取自 [CLS]，每步以 s<sub>t</sub> = VLN↻BERT(s<sub>t−1</sub>, X, V<sub>t</sub>) 更新，语言只编码一次并充当键与值。</li>
+      <li>状态精炼用末层注意力对文本与视觉加权，再做逐元素相乘与动作方向回注；决策直接取 12 头平均注意力作为动作分布，停止由零向量或物体分数实现。</li>
+      <li>实算：T = 20、L = 80、K = 12 时，全历史序列 321 个 token，循环恒定 93 个，注意力评分次数比为 11.91；批 16 的注意力矩阵约 0.88 GiB 对 0.07 GiB，与论文实测 9.2 GB/批 16 对 11.0 GB/批 6 的量级关系一致。</li>
+      <li>训练用 A2C 与模仿交叉熵混合，进度奖励 ±1、停止奖励 ±2、再叠加 nDTW 保真项；PREVALENT 初始化在 R2R test 上达到 63% SR / 57% SPL，比随机初始化高 12 / 10 个百分点。</li>
+      <li>固定大小状态是信息瓶颈，早期记忆随步数衰减；长程依赖需要显式历史编码，下一讲先补齐预训练数据的域内化，再进入 034 的分层历史方案。</li>
+    </ul>
+    <p>下一讲处理预训练数据本身：Airbert 与 BnB 数据集把网站房源图片转成百万级路径-指令对，用域内数据与乱序损失继续压低 seen 与 unseen 的落差。</p>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch031.html">← 第 031 讲：VLN-BERT：网页图文预训练</a>
+    <a class="next" href="ch033.html">第 033 讲：Airbert / BnB：域内数据工程 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.06 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:11.5px !important;letter-spacing:.06em !important;color:rgba(71,85,105,.45) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#7e8ba0 !important;font-size:11.5px !important;line-height:1.8 !important;text-align:center !important;padding:5px 12px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

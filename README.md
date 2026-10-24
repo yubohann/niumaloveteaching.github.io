@@ -1,6 +1,6 @@
 # niumaloveteaching · 机器人学习课程库
 
-8 门课程、800 讲，全部为独立 HTML 页面，双击即可阅读。
+10 门课程、1000 讲，全部为独立 HTML 页面。
 
 | # | 课程 | 主题 |
 |---|------|------|
@@ -15,8 +15,7 @@
 
 ## 使用
 
-- 打开根目录 index.html 选择课程；每门课程的 index.html 为 100 讲目录。
-- 本地服务器：python -m http.server 8000，访问 http://localhost:8000。
+- 从首页进入课程；每门课程的 index.html 为 100 讲目录。
 - 第 01 门课附运行脚本：pip install -r rl-course-100/requirements.txt；python rl-course-100/code/ch001.py --quick。
 
 ## 版权

@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 030 讲｜PREVALENT：预训练-微调范式 | 视觉语言导航课程 · VLN-100</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 离散方法谱系：从模块到预训练</span>
+    <span class="sep">/</span>
+    <span>第 030 讲</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 离散方法谱系：从模块到预训练</div>
+    <h1>第 030 讲｜PREVALENT：预训练-微调范式</h1>
+    <p class="lead">本讲讲透视觉语言导航的第一个预训练-微调范式：把 658 万级「图像-文本-动作」三元组装进「双流单模态编码器 + 跨模态编码器」，用图像参与的掩码语言建模与动作预测做自监督预训练，再把语言表征作为即插接口交给下游 LSTM 解码器微调。R2R 测试集 SPL 从 47% 提升到 51%，R2R、CVDN、HANNA 三条任务同时验证迁移性。</p>
+    <ul class="meta">
+      <li>主题：预训练-微调 / 图文动作三元组 / 跨模态编码器 / 特征化与微调</li>
+      <li>关键公式：L<sub>pre</sub> = L<sub>MLM</sub> + L<sub>AP</sub>；f<sub>θE</sub>: {s<sub>t</sub>, x} → z<sub>t</sub></li>
+      <li>预计学时：60 分钟</li>
+      <li>前置讲：第 029 讲（混合训练：IL + RL 两阶段）</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>会复述：PREVALENT（Hao 等，CVPR 2020）的两目标预训练流程，说明「图像-文本-动作」三元组如何从 R2R 与 speaker 合成数据构造，并写出编码器分解 π = f<sub>θE</sub> ∘ f<sub>θD</sub>。</li>
+      <li>会算：核算预训练规模（104K + 6,482K 三元组、合成占 98.48%）、总规模与训练指令的倍数关系，以及按 BERT-base 几何估算的约 1.18 亿参数量。</li>
+      <li>会设计：15% 掩码的图像参与语言建模、[CLS] 动作预测头、语言特征对接下游解码器三个接口，并说明各接口的输入输出维度。</li>
+      <li>会判断：依据算力与复现目标在「特征化微调」与「两段式微调」之间取舍，说明 val-unseen 成功率 54% 与 58% 的差距来源。</li>
+      <li>会诊断：注意力掩码方向、预训练数据泄漏、微调学习率三类实现错误的症状与修复。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 029 讲把训练配方推到两阶段混合：IL 加 RL、回译加环境丢弃，val-unseen 成功率达到 52.2%。但这条路线有两个结构性限制。第一，每个任务从零训练：R2R 学到的图文对齐不能迁移给 CVDN 或 HANNA，新任务要重新标注、重新调参。第二，监督信号只在 14,025 条训练指令上产生，语言与视觉的联合表征在如此小的语料上难以充分学习，指令里出现的罕见地标词汇没有任何先验可依。</p>
+    <p>PREVALENT（Pre-trained vision-and-language based navigator，Hao、Li、Li、Carin 与 Gao，CVPR 2020，arXiv:2002.10638v2）给出第一个面向 VLN 的预训练-微调范式。它的核心问题是：能否把「每一步的图像、指令文本与该步动作」组成可自监督的三元组，在大规模语料上预训练一个通用编码器，使下游任务只做轻量适配。论文报告：R2R 测试集 SPL 从 47%（EnvDrop）提升到 51%，成功率 51% 提升到 54%；预训练表征迁移到 CVDN 与 HANNA 时同样取得当时最好结果。第 074 讲会从数据边界角度重读这类预训练的语料问题。</p>
+    <p>本讲解决四件事：预训练数据从哪里来、两个自监督目标如何定义、编码器的跨模态结构如何组织、微调接口如何与既有 LSTM 解码器对接。第 031 讲的 VLN-BERT 会把数据从「域内合成」推到「网页图文」，两者构成第二篇预训练主线的两块基石。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 范式：预训练编码器，微调下游任务</h3>
+    <p>VLN 是部分可观测马尔可夫决策过程 M = ⟨S, A, P<sub>s</sub>, r⟩：智能体观测 RGB 图像 s<sub>t</sub>，执行动作 a<sub>t</sub>，环境按未知转移 P<sub>s</sub> 给出下一帧。主流做法用最大似然估计策略 π<sub>θ</sub>(τ | x) = Π<sub>t</sub> π<sub>θ</sub>(a<sub>t</sub> | s<sub>t</sub>, x)，并把策略分解为编码器与解码器两段：</p>
+    <div class="formula">
+      π<sub>θ</sub> = f<sub>θE</sub> ∘ f<sub>θD</sub>，f<sub>θE</sub>: {s<sub>t</sub>, x} → z<sub>t</sub>，f<sub>θD</sub>: {s<sub>t</sub>, z<sub>t</sub>} → a<sub>t</sub>
+      <span class="note">x 为指令；z<sub>t</sub> 为视觉与语言的联合表征。预训练只针对编码器 f<sub>θE</sub>，解码器按任务重建</span>
+    </div>
+    <p>把编码器单独拿出来预训练的理由是它承担了绝大部分跨模态语义学习：视觉状态与语言的对齐质量决定下游能走多远，而动作解码器结构简单、逐任务重训成本低。预训练把每个时间步的 (s<sub>t</sub>, x, a<sub>t</sub>) 当作独立样本学习联合表征，目标并不要求重建某条轨迹的完整序列。论文对轨迹内状态-动作对给出独立同分布假设 (s<sub>t</sub>, a<sub>t</sub>) ~ p(τ)。这个假设丢弃了时序结构，换来的是可以用同一批三元组同时优化两个自监督目标，并使样本量的统计单位从轨迹数下沉到步数。</p>
+
+    <h3>2. 输入嵌入：360 度全景与指令的两种序列</h3>
+    <p>视觉侧沿用离散方法的全景口径：每个全景位姿由 36 张视图组成，12 个水平朝向与 3 个俯仰档的网格。每张视图先表示为 2176 维向量，由 2048 维 ResNet 特征与 128 维朝向特征拼接；朝向特征由 [sin ψ, cos ψ, sin ω, cos ω] 四维向量重复 32 次得到，ψ 与 ω 分别为朝向角和俯仰角。拼接后经全连接层投影到模型维度 d<sub>h</sub> = 768，再过层归一化：</p>
+    <div class="formula">
+      h = LayerNorm(W<sub>e</sub>·s + b<sub>e</sub>)，s ∈ ℝ<sup>2176</sup>，W<sub>e</sub> ∈ ℝ<sup>768×2176</sup>
+      <span class="note">2176 = 2048 + 128；128 = 4 × 32。朝向信息在输入层一次性写入，后续注意力不再单独处理角度</span>
+    </div>
+    <p>文本侧遵循标准 Transformer：词元嵌入与位置嵌入相加后再做层归一化，词表与序列上限沿用 BERT 习惯。为看清两个模态的规模差异，做一次内存核算：单帧 36 × 2176 个浮点数，float32 下 313,344 字节，合 306 KiB；6 帧历史为 1.79 MiB。相对像素输入（36 张 640 × 480 的 RGB 图约 32 MiB），特征表示把内存压到约 1%。</p>
+
+    <h3>3. 编码器：双流单模态层加跨模态层</h3>
+    <p>主干由三个模块组成：视觉单模态编码器、文本单模态编码器、跨模态编码器，全部是 Transformer 层。单层的通用形式为 H<sub>ℓ</sub> = T(H<sub>ℓ−1</sub>, H′, M)，其中 H′ 是注意力的来源特征，M 是掩码矩阵（允许注意为 0，禁止为负无穷）。单模态层的 H′ 取本模态上一层的输出，掩码全零，等价于标准自注意力；跨模态层的查询来自另一模态，键与值来自本模态，让每个位置都能看到全部跨模态位置。</p>
+    <div class="formula">
+      A<sub>ℓ</sub> = Softmax(QK<sup>⊤</sup>/√d<sub>k</sub> + M)·V，Q = W<sup>Q</sup>H′，K = W<sup>K</sup>H<sub>ℓ−1</sub>，V = W<sup>V</sup>H<sub>ℓ−1</sub>
+      <span class="note">跨模态层中 H′ 与 H<sub>ℓ−1</sub> 来自不同模态；掩码方向写反会让语言看不到图像，是常见实现错误</span>
+    </div>
+    <p>三个模块的层数分别为文本 9 层、视觉 1 层、跨模态 3 层。这种不对称设计把参数集中到文本侧与交互侧：视觉特征本身已由 ImageNet 预训练的 ResNet 提供语义，单层投影足够；跨模态层负责两模态的逐词-逐视图对齐。特殊词元 [CLS] 的末层输出即融合表征，也是动作预测目标的输入；下游微调时只取语言侧的词元表征，视觉流的参数被冻结或轻量调整。</p>
+
+    <h3>4. 预训练目标：掩码语言建模与动作预测</h3>
+    <p>论文定义两个自监督目标。第一个是图像参与的掩码语言建模（Attended Masked Language Modeling）：随机掩蔽 15% 的指令词元，用其余词元与全部图像预测被掩蔽词，最小化负对数似然：</p>
+    <div class="formula">
+      L<sub>MLM</sub> = −E<sub>s~p(τ), (τ,x)~D</sub> log p(x<sub>i</sub> | x<sub>\i</sub>, s)
+      <span class="note">x<sub>\i</sub> 为除第 i 个词外的上下文；与 BERT 的填空区别在于额外注意力到全部 36 张视图，词嵌入因此被视觉接地</span>
+    </div>
+    <p>第二个是动作预测（Action Prediction, AP）：从轨迹 τ 中采样状态-动作对 (s, a)，把 [CLS] 的融合表示经全连接层映射到动作空间，用交叉熵监督当步动作：</p>
+    <div class="formula">
+      L<sub>AP</sub> = −E<sub>(a,s)~p(τ), (τ,x)~D</sub> log p(a | x<sub>[CLS]</sub>, s)，L<sub>pre</sub> = L<sub>MLM</sub> + L<sub>AP</sub>
+      <span class="note">动作标签取当步教师动作在候选视点中的编号；两个目标共享主干，梯度相加</span>
+    </div>
+    <p>两个目标互补：MLM 把词嵌入锚定到视觉内容，AP 让 [CLS] 学习「当前指令片段与当前视图对应哪一步动作」。论文尝试过掩码图像建模，训练效果不佳，从目标集合剔除。需要注意 AP 的输入不包含历史：它强迫模型仅凭当前视图与整条指令判断下一步，历史建模留给下游解码器；这一取舍降低了预训练难度，也解释了为什么微调时仍然使用带注意力的 LSTM 解码器。</p>
+
+    <h3>5. 预训练数据：104K 加 6,482K 的构成</h3>
+    <p>预训练语料由两部分组成。第一部分是 R2R 训练集的 104K 个三元组，来自 14,025 条训练指令对应的轨迹逐步展开；除法后平均每条指令贡献约 7.42 个三元组，说明统计口径落在「步」上。第二部分是 speaker 模型在训练环境最短路轨迹上合成的 1,020K 条指令，展开为 6,482K 个三元组，平均每条合成指令约 6.35 个。论文给出的总量为 6,582K，合成数据占 98.48%。</p>
+    <table>
+      <tr><th>来源</th><th>指令/轨迹</th><th>三元组</th><th>占比</th><th>复算口径</th></tr>
+      <tr><td>R2R 训练集（人标）</td><td>14,025 条指令</td><td>104K</td><td>1.58%</td><td>104K ÷ 14,025 ≈ 7.42 三元组/指令</td></tr>
+      <tr><td>speaker 合成（训练环境最短路）</td><td>1,020K 条指令</td><td>6,482K</td><td>98.48%</td><td>6,482K ÷ 1,020K ≈ 6.35 三元组/指令</td></tr>
+      <tr><td>合计</td><td>不适用</td><td>6,582K</td><td>100%</td><td>相对 R2R 三元组 63.29 倍；相对 14,025 条指令 469.3 倍</td></tr>
+    </table>
+    <p>有一个数字细节必须写明：两组分量按原文四舍五入值直接相加为 104K + 6,482K = 6,586K，与原文总数 6,582K 相差 4K。这是原文在千位精度上的舍入所致，本课程引用时以原文总数 6,582K 为准，并保留两组分量便于核算。读者若要复现精确比值，应使用未取整的原始计数。</p>
+    <p>合成数据的构造条件限制了语料的分布：指令由 speaker 在最短路轨迹上生成，只覆盖 60 个训练环境，且不包含人类在真实评测环境中的表述习惯。这份语料能提供规模，提供的环境多样性仍然有限，这正是 031 讲网页图文数据与 033 讲域内数据工程要补的位置。</p>
+
+    <h3>6. 微调接口与两段式策略</h3>
+    <p>预训练完成后，编码器输出被接回既有框架：R2R 微调沿用 EnvDrop 的日程，把「注意力上下文化的词嵌入」替换原词嵌入，送入 LSTM 编码器-解码器；CVDN 使用更长文本上限（300 词元），HANNA 在求助模式触发时用预训练模型编码子任务指令。论文验证了两种使用方式：</p>
+    <ul>
+      <li><strong>特征化（feature-based）</strong>：冻结全部预训练参数，只训练任务头。显著优势是先预计算一次昂贵表征，后续实验成本低。</li>
+      <li><strong>两段式（two-stage）</strong>：先按特征化训练，再解冻跨模态层继续微调 20k 迭代，批大小 10，学习率 2×10<sup>−6</sup>。</li>
+    </ul>
+    <p>结果表显示两段式在几乎全部指标上更好：val-unseen 成功率 58% 对 54%、SPL 53% 对 51%，val-seen 成功率 69% 对 66%。差值 4 个百分点说明跨模态层包含可继续适配的语义，冻结策略损失了这部分收益；特征化的价值在实验吞吐，做消融与扫参时仍值得保留。</p>
+    <table>
+      <tr><th>协议</th><th>val-seen SR / SPL</th><th>val-unseen SR / SPL</th><th>test-unseen SR / SPL</th></tr>
+      <tr><td>EnvDrop（029 讲终点，单次运行口径）</td><td>62 / 59</td><td>52 / 48</td><td>51 / 47</td></tr>
+      <tr><td>PREVALENT 单指令</td><td>69 / 65</td><td>58 / 53</td><td>54 / 51</td></tr>
+      <tr><td>PREVALENT 多指令</td><td>67 / 63</td><td>60 / 57</td><td>59 / 56</td></tr>
+    </table>
+    <p>多指令设置（同一观测下允许使用该路径的三条指令）把 test 成功率进一步推到 59%。两组数字的口径差异说明：预训练编码器对指令表述变化更稳健，多条指令提供了互补的语义线索。</p>
+
+    <h3>7. 跨任务迁移与泛化间隙</h3>
+    <p>PREVALENT 的第二个卖点是迁移性。在 CVDN（对话历史导航）上，目标进度（Goal Progress, GP）在三种监督路径下均超过 Seq2Seq 基线：val-unseen 分别为 2.58 / 2.99 / 3.15，对基线的 1.23 / 1.98 / 2.10，增量 1.35 / 1.01 / 1.05。在 HANNA（交互式模仿学习）上，未见环境成功率 52.91% 对基线 Anna 的 47.45%（+5.46 点），SPL 28.72% 对 25.50%。</p>
+    <p>更有信息量的是泛化间隙：HANNA 的 seen 与 unseen 之间，SPL 差距由 Anna 的 63.92 − 25.50 = 38.42 收缩到 59.38 − 28.72 = 30.66。预训练降低了对训练环境的过拟合，这一现象与 R2R 上 seen-unseen 间隙的缩小一致。需要标明口径：HANNA 的 seen 成功率 PREVALENT 为 83.82%，低于 Anna 的 88.37%，说明收益在指标与 split 两个维度上都不单调，报告时应完整列出而不只呈现有利项。</p>
+
+    <h3>8. 适用边界与失效模式</h3>
+    <ul>
+      <li><strong>域内预训练</strong>：语料全部来自 Matterport3D 的 60 个训练环境，环境多样性未增加；对建筑风格与物体分布的泛化仍受限于 028 讲讨论的同一瓶颈。跨域数据要等 031 与 033 讲。</li>
+      <li><strong>合成主导的语料偏差</strong>：98.48% 的指令来自 speaker，句式与用词分布偏向模型自身；人类指令只占 1.58%。用真实验证集早停、保留真实标注锚点是必要的对冲手段。</li>
+      <li><strong>时序信息未进入预训练</strong>：AP 只看单步状态，历史建模仍由下游解码器承担；需要长程记忆的任务（RxR、REVERIE）不能指望该编码器直接解决。</li>
+      <li><strong>参数量与算力门槛</strong>：主干约 1.18 亿参数（估算口径见实现节），预训练在 8 卡 V100、批大小 96/卡、20 轮的规模下完成；小于此规模的复现应按特征化模式做缩比实验。</li>
+      <li><strong>预训练与评测的语料交叉</strong>：任何把 val/test 环境或指令混入预训练语料的实现都会抬高报告数字。第 074 讲给出完整的泄漏检查方法，本讲要求至少做环境级隔离核对。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>本讲把预训练方案落成三张可执行卡：数据与目标配置卡、参数量估算卡、微调模式选择卡。</p>
+
+    <h3>产出 1：预训练配置卡</h3>
+    <table>
+      <tr><th>环节</th><th>配置</th><th>取值</th><th>依据</th></tr>
+      <tr><td>视觉输入</td><td>全景 36 视图，特征 2176 维</td><td>12 朝向 × 3 俯仰</td><td>论文采用的全景离散口径</td></tr>
+      <tr><td>模型维度</td><td>d<sub>h</sub></td><td>768</td><td>论文实验设置</td></tr>
+      <tr><td>层数</td><td>文本 / 视觉 / 跨模态</td><td>9 / 1 / 3</td><td>论文架构说明</td></tr>
+      <tr><td>掩码比例</td><td>MLM</td><td>15%</td><td>沿用 BERT 惯例</td></tr>
+      <tr><td>目标函数</td><td>L<sub>pre</sub> = L<sub>MLM</sub> + L<sub>AP</sub></td><td>等权求和</td><td>论文消融显示两目标均有效</td></tr>
+      <tr><td>预训练</td><td>8 × V100，批 96/卡，20 轮，AdamW</td><td>学习率 10<sup>−5</sup> 量级</td><td>论文实验节；属于上界，读者按算力缩放即可</td></tr>
+      <tr><td>微调（跨模态段）</td><td>20k 迭代，批 10，学习率 2×10<sup>−6</sup></td><td>1080Ti 单卡可跑</td><td>论文实验节；低学习率保护预训练权重</td></tr>
+      <tr><td>早停</td><td>val-unseen SR</td><td>沿用各任务原日程</td><td>与 R2R 榜单协议一致</td></tr>
+    </table>
+
+    <h3>产出 2：参数量估算卡</h3>
+    <p>论文未报告总参数量，这里按 BERT-base 几何（d = 768、FFN = 3072、12 头）与论文公布的层数做估算，所有假设显式列出，便于读者替换。单层参数 = 4d²（注意力）+ 2d·d<sub>FFN</sub>（前馈） = 2,359,296 + 4,718,592 = 7,077,888；13 层主干 = 92,012,544。</p>
+    <table>
+      <tr><th>模块</th><th>计算式</th><th>参数量（估算）</th></tr>
+      <tr><td>13 层 Transformer 主干（9 + 1 + 3）</td><td>13 × 7,077,888</td><td>92.0M</td></tr>
+      <tr><td>词嵌入（词表 30,522）</td><td>30,522 × 768</td><td>23.4M</td></tr>
+      <tr><td>位置嵌入（上限 512）</td><td>512 × 768</td><td>0.39M</td></tr>
+      <tr><td>视觉投影（2176 → 768）</td><td>2176 × 768 + 768</td><td>1.67M</td></tr>
+      <tr><td>动作预测头（约 40 类）</td><td>768 × 40</td><td>0.03M</td></tr>
+      <tr><td>合计</td><td>不适用</td><td>约 117.5M（1.18 亿）</td></tr>
+    </table>
+    <p>估算的用途是给复现者一个显存档位：该量级在单卡 24 GiB 显存下可以用批 8 至 16 做特征化实验，全量预训练则需要多卡。实际参数量与词表、动作空间、层宽的最终配置有关，报告时应注明本估算所用的假设。</p>
+
+    <h3>产出 3：微调模式选择卡</h3>
+    <table>
+      <tr><th>模式</th><th>训练参数</th><th>训练成本</th><th>val-unseen SR</th><th>适用判据</th></tr>
+      <tr><td>特征化</td><td>仅任务头</td><td>表征预计算一次，最省</td><td>54%</td><td>消融扫参、显存紧张、快速迭代</td></tr>
+      <tr><td>两段式</td><td>任务头 + 跨模态层</td><td>增加 20k 迭代</td><td>58%</td><td>追求最终指标、算力允许</td></tr>
+      <tr><td>全量微调</td><td>全部参数</td><td>最高，易过拟合</td><td>论文未采用为主配置</td><td>仅当下游数据规模显著变大时考虑</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：预训练只做编码器，解码器逐任务重建</span>
+      <p>把动作解码留给下游，使预训练语料可以来自任何轨迹数据，也避免了预训练阶段锁定动作空间与历史窗口。代价是时序能力不被预训练覆盖，长程任务仍要自备历史模块（第 032 至 038 讲展开）。</p>
+    </div>
+
+    <h3>与第 029 讲训练配方的差异</h3>
+    <table>
+      <tr><th>维度</th><th>EnvDrop 两阶段（029 讲）</th><th>PREVALENT（本讲）</th></tr>
+      <tr><td>表征起点</td><td>随机初始化 + ResNet 固定特征</td><td>自监督预训练的跨模态编码器</td></tr>
+      <tr><td>监督来源</td><td>教师动作、任务奖励、回译三元组</td><td>掩码词、当步动作两类自监督信号</td></tr>
+      <tr><td>增广机制</td><td>环境丢弃制造新环境</td><td>speaker 合成指令放大语料</td></tr>
+      <tr><td>迁移方式</td><td>同任务继续微调</td><td>即插接口，跨任务复用</td></tr>
+      <tr><td>代表结果</td><td>test SR 51.5 / SPL 47</td><td>test SR 54 / SPL 51（单指令）</td></tr>
+    </table>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>三段代码分别覆盖输入嵌入、双目标预训练、两段式微调三个环节，均为 PyTorch 风格示意，接口命名随实现版本演进。</p>
+
+    <p><strong>片段 1：全景与指令的输入嵌入</strong></p>
+    <pre class="code"><code>import torch
+import torch.nn as nn
+
+class VLNEmbedding(nn.Module):
+    def __init__(self, feat_dim=2176, d_model=768,
+                 vocab_size=30522, max_len=80):
+        super().__init__()
+        self.vis_proj = nn.Linear(feat_dim, d_model)      # 2176 -> 768
+        self.vis_norm = nn.LayerNorm(d_model)
+        self.tok_emb = nn.Embedding(vocab_size, d_model)
+        self.pos_emb = nn.Embedding(max_len, d_model)
+
+    def forward(self, views, tokens):
+        # views: (B, 36, 2176)，朝向已在特征里拼接；tokens: (B, L)
+        pos = torch.arange(tokens.size(1), device=tokens.device)
+        text = self.tok_emb(tokens) + self.pos_emb(pos)   # 词元 + 位置
+        vis = self.vis_norm(self.vis_proj(views))         # 每张视图独立投影
+        return vis, text
+
+embed = VLNEmbedding()
+views = torch.randn(2, 36, 2176)
+tokens = torch.randint(0, 30522, (2, 29))
+vis, text = embed(views, tokens)
+print(vis.shape, text.shape)          # torch.Size([2, 36, 768]) torch.Size([2, 29, 768])</code></pre>
+    <p>解读：<strong>（1）</strong>orientation 特征在数据侧拼进 2176 维，模块内不再重复编码角度，保证与下游特征文件口径一致。<strong>（2）</strong>视觉与文本各自保留序列维度，跨模态交互交给编码器内部的层处理，嵌入层不做提前融合。<strong>（3）</strong>位置嵌入上限 80 与 R2R 基线训练设置一致（029 讲超参表），长指令任务（CVDN 上限 300）需要单独扩大该值，否则超长文本被截断。</p>
+
+    <p><strong>片段 2：掩码语言建模与动作预测的联合损失</strong></p>
+    <pre class="code"><code>import torch.nn.functional as F
+
+def mask_tokens(tokens, mask_id, prob=0.15, generator=None):
+    """随机掩蔽词元；返回替换后的序列与布尔掩码。"""
+    mask = torch.rand(tokens.shape, generator=generator) &lt; prob
+    masked = tokens.clone()
+    masked[mask] = mask_id
+    return masked, mask
+
+def pretrain_loss(model, views, tokens, actions):
+    """两个自监督目标共享一次前向：MLM 接地词嵌入，AP 学习动作。"""
+    masked, mask = mask_tokens(tokens, model.mask_id, prob=0.15)
+    vis, text = model.embed(views, masked)
+    out = model.encoder(vis, text)                 # 双流 + 跨模态
+    loss_mlm = F.cross_entropy(out.text_logits[mask], tokens[mask])
+    logits_act = model.action_head(out.cls)        # [CLS] 融合表示
+    loss_ap = F.cross_entropy(logits_act, actions)
+    return loss_mlm + loss_ap
+
+loss = pretrain_loss(model, views, tokens, torch.tensor([2, 0]))
+print(round(float(loss), 4))</code></pre>
+    <p>解读：<strong>（1）</strong>mask_tokens 的随机数生成器可传入，便于固定种子复现；掩蔽位置同时用作标签索引。<strong>（2）</strong>MLM 损失只在被掩蔽位置计算（out.text_logits[mask]），未掩蔽位置不产生梯度。<strong>（3）</strong>AP 与 MLM 在同一前向中计算，[CLS] 可借助未掩蔽词元与图像补齐语义；若担心掩码干扰动作监督，可拆成两次前向分别计算，代价是显存与算力翻倍。<strong>（4）</strong>动作标签按每个时间步采样得到，对应论文对 (s<sub>t</sub>, a<sub>t</sub>) 的独立同分布假设。</p>
+
+    <p><strong>片段 3：两段式微调的参数组</strong></p>
+    <pre class="code"><code>def build_finetune(model, head_dim=768, num_actions=6, mode="two_stage"):
+    """冻结预训练主干；两段式再解冻跨模态层并使用低学习率。"""
+    for p in model.parameters():
+        p.requires_grad = False
+    head = nn.Sequential(nn.Linear(head_dim, 512), nn.ReLU(),
+                         nn.Linear(512, num_actions))
+    groups = [{"params": head.parameters(), "lr": 1e-4}]
+    if mode == "two_stage":
+        for p in model.cross_encoder.parameters():
+            p.requires_grad = True
+        groups.append({"params": model.cross_encoder.parameters(), "lr": 2e-6})
+    total = sum(p.numel() for g in groups for p in g["params"])
+    return head, groups, total
+
+head, groups, n = build_finetune(model, mode="two_stage")
+print(n)                                 # 可训练参数量，便于核对显存
+optimizer = torch.optim.AdamW(groups)    # 不同参数组使用不同学习率</code></pre>
+    <p>解读：<strong>（1）</strong>主干默认冻结，与论文「特征化」模式一致；进入两段式时只解冻跨模态层，文本与视觉单模态层保持冻结。<strong>（2）</strong>跨模态层学习率 2×10<sup>−6</sup>，比任务头低约 50 倍，避免在 20k 迭代内破坏预训练对齐。<strong>（3）</strong>返回可训练参数量用于显存预算；若显存不足，先降到特征化模式再排查 batch 与序列长度。<strong>（4）</strong>优化器接收参数组列表，这是实现差异学习率的标准写法，避免为两组参数维护两个优化器。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>跨模态注意力的方向写反</strong>：代码能跑、损失会降，但语言注意力始终看不到图像，可视化时文本注意力均匀铺在所有视图上。根因是把查询与记忆的来源写反（查询应来自另一模态）。修复：用一个两词、一图的玩具样本做单元测试，检查语言位置的注意力权重是否随图像内容变化。</li>
+      <li><strong>预训练语料混入评测环境</strong>：在 val-unseen 或 test 的环境上跑了 speaker 合成，预训练见过评测建筑，指标虚高。根因是数据管线按轨迹拆分而环境集合未隔离。修复：按环境核对预训练语料与四个 split 的交集，交集必须为空；把该检查写成数据加载时的断言。</li>
+      <li><strong>用特征化结果复现论文的全量数字</strong>：冻结主干后 val-unseen 只有 54%，误判方法无效。根因是两段式比特征化高 4 个百分点，跨模态层需要继续适配。修复：先确认是否解冻跨模态层、是否用 2×10<sup>−6</sup> 的低学习率跑满 20k 迭代。</li>
+      <li><strong>合成语料占比过高带来的风格过拟合</strong>：模型对 speaker 句式敏感，换一批人类指令后掉分。98.48% 的合成占比放大了该风险。根因是损失被大量模板化句式主导。修复：保留人类指令的验证与锚点作用，必要时对合成样本降权或按环境分层采样。</li>
+      <li><strong>微调学习率过高</strong>：训练集指标快速上升、val-unseen 同步下跌。根因是预训练权重被大步长更新覆盖。修复：任务头与主干分组配置学习率，主干取 10<sup>−6</sup> 量级；用 val-unseen 早停并观察 seen-unseen 间隙是否扩大。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>核算预训练规模：由 104K、6,482K、6,582K 三个数字计算合成占比、相对 R2R 三元组的倍数、相对 14,025 条训练指令的倍数，并解释 104K + 6,482K 与总数 6,582K 相差 4K 的原因。 <span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>合成占比 6,482 / 6,582 ≈ 98.48%；总量是 R2R 三元组的 63.29 倍、训练指令的 469.3 倍；差值为原文千位精度舍入。</div></details>
+      </li>
+      <li>按 d = 768、FFN = 3072 的几何，计算单层 Transformer 参数量与 13 层主干总量；再补上词嵌入、位置嵌入与视觉投影，核对本讲约 1.18 亿的估算。若词表缩小到 10,000，总量降到多少？ <span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>单层 4d² + 2d·3072 = 7,077,888；13 层 92.0M；词表 30,522 时词嵌入 23.4M，总数约 117.5M。词表 10,000 时词嵌入 7.68M，总量约 101.8M，差额 15.8M。</div></details>
+      </li>
+      <li>改超参并预测：把 MLM 掩码比例从 15% 调到 40%、把预训练轮数从 20 降到 5，分别预测预训练损失、下游 val-unseen 成功率与训练成本的变化方向，并说明哪个改动风险更大。 <span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>掩码 40% 使上下文严重缺失，语言建模难度上升，词嵌入接地可能变差，下游泛化下滑的风险更大；轮数降到 5 是欠训练，表征尚未收敛，损失与下游同步变差，属于可恢复的成本问题。恢复手段：先小规模扫掩码比例（15% 至 30%），确认曲线拐点。</div></details>
+      </li>
+      <li>设计题：为实现「特征化、两段式、全量微调」三种模式的公平比较，写出实验协议（数据、迭代预算、早停、报告指标），并预测三种模式在 val-seen 与 val-unseen 上的排列顺序，说明理由。 <span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>预算应固定总梯度步数或总计算量，不应固定轮数；早停统一用 val-unseen SR。预测：全量微调 val-seen 最高但 unseen 可能下降；两段式 unseen 最优；特征化两侧都略低。理由：可训练参数越多，越容易拟合训练环境。</div></details>
+      </li>
+      <li>设计题（★★★）：为「预训练语料与评测协议交叉检查」设计一套可执行的检查流程，要求：给出环境级、路径级、指令级三层检查的判据；说明每层检查的预期基率与可能的误报；再设计一个实验，量化「若不检查，泄漏会给 val-unseen SR 带来多大虚高」。最后讨论 speaker 合成语料与人类指令风格差异是否也应纳入检查。 <span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>环境级：预训练语料环境集合与 val-unseen/test 场景集合交集为 0；路径级：轨迹起止视点对不得与评测 split 重合；指令级：用 n-gram 与语义相似度扫描近似复制。误报来源：不同环境中相似的路径形状与模板句。泄漏量化实验：人为在 val-unseen 环境上合成一小批指令加入预训练，对比加入前后 SR 差值。风格检查：把合成句与人类句的困惑度、词频分布差异作为数据质量指标，与下游指标做相关性分析，不直接当作泄漏判据。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>核心范式：只预训练视觉语言编码器 f<sub>θE</sub>，把 Z = {s<sub>t</sub>, x} 映射为联合表征；解码器逐任务重建。预训练数据按 (s<sub>t</sub>, x, a<sub>t</sub>) 三元组逐步采样，共 6,582K 个，其中 98.48% 来自 speaker 合成。</li>
+      <li>两个自监督目标：图像参与的掩码语言建模（15% 掩码）负责视觉接地，[CLS] 动作预测负责指令与动作的对齐；L<sub>pre</sub> = L<sub>MLM</sub> + L<sub>AP</sub>，掩码图像建模效果不佳被剔除。</li>
+      <li>编码器为文本 9 层、视觉 1 层、跨模态 3 层的 Transformer 结构，跨模态层让两模态互相注意；按 BERT-base 几何估算总参数约 1.18 亿。</li>
+      <li>微调接口即插即用：特征化模式只训任务头（val-unseen SR 54%），两段式再解冻跨模态层、以 2×10<sup>−6</sup> 学习率训 20k 迭代（58%）；R2R 测试集 SPL 47% 提升到 51%。</li>
+      <li>迁移性在 CVDN 与 HANNA 上得到验证，seen-unseen 间隙缩小；合成语料主导与域内环境限制是下一步要解决的边界。</li>
+      <li>下一讲把预训练语料从「域内合成」扩展到「网页图文」：VLN-BERT 用 Conceptual Captions 学习视觉概念接地，再迁移到路径-指令兼容性打分（第 031 讲）。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch029.html">← 第 029 讲：混合训练：IL + RL 两阶段</a>
+    <a class="next" href="ch031.html">第 031 讲：VLN-BERT：网页图文预训练 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.06 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:11.5px !important;letter-spacing:.06em !important;color:rgba(71,85,105,.45) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#7e8ba0 !important;font-size:11.5px !important;line-height:1.8 !important;text-align:center !important;padding:5px 12px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

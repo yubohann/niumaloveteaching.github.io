@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 092 讲｜AO-Planner：affordance 低层规划 | 视觉语言导航课程 · VLN-100</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第五篇 · 基础模型与 2026 前沿</span>
+    <span class="sep">/</span>
+    <span>第 092 讲</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第五篇 · 基础模型与 2026 前沿</div>
+    <h1>第 092 讲｜AO-Planner：affordance 低层规划</h1>
+    <p class="lead">第 091 讲把三个现成模块拼成零样本管线，低层运动仍交给独立的学习式策略。本讲把低层运动规划也交给基础模型：Chen、Lin、Liu、Ma、Liang、Wong 2024（arXiv:2407.05890v2，AAAI 2025 发表）的 AO-Planner 用 Grounded SAM 分割可视地面得到导航可供性（navigational affordance），在可供性上均匀撒点并编号做视觉提示，让多模态 LLM 选路点并连点成径；高层 PathAgent 在标好候选路径的四视图上选一条；像素路径经相机内参与深度反投影为三维坐标，再按旋转-前进控制器执行。零样本结果：R2R-CE val-unseen 全量 25.5 SR / 16.6 SPL，RxR-CE val-unseen 500 条子集 22.4 SR / 15.1 SPL；把 VAP 当伪标签标注器蒸出路点预测器后，接 ETPNav 代理在 R2R-CE 达到 47 SR。学完能复算像素到动作的整条换算链，并判断这套两阶段零样本方案的适用边界。</p>
+    <ul class="meta">
+      <li>主题：可供性（affordance）/ 视觉提示（visual prompting）/ 两阶段零样本规划 / 路点蒸馏</li>
+      <li>关键公式：X=(u−c<sub>x</sub>)/f<sub>x</sub>·Z；bearing=atan2(X, Z)；n<sub>rot</sub>=round(bearing/15°)；n<sub>fwd</sub>=floor(d/0.25)</li>
+      <li>预计学时：70 分钟</li>
+      <li>前置讲：第 091 讲（LM-Nav：组合式零样本）</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>会解释：导航可供性如何把连续环境的低层规划改写为「在编号点集里选点与连点」，以及这一改写对候选规模与几何精度的含义。</li>
+      <li>会算：给定相机内参、深度与像素坐标，反投影出三维点，并换算成 15° 旋转步与 0.25 米前进步，给出量化残差。</li>
+      <li>会实现：地面掩码采样、像素路径转动作、LLM 伪标签蒸馏三段示意代码。</li>
+      <li>会判断：两阶段分工与四项消融（指令、路点定义、可供性、PathAgent）各自贡献多少，哪些差异来自协议。</li>
+      <li>会设计：把 LLM 路点能力蒸馏为学习式预测器的数据管线，并估算调用规模与成本。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>从第 082 讲到第 091 讲，LLM 智能体在 VLN 里的角色大体停在高层：读指令、维护历史、在预定导航图上选下一个节点。连续环境拿走了这张图，动作变成 0.25 米前进与 15° 旋转，智能体必须在没有路点的条件下自己决定往哪走。已有桥梁是学习式路点预测器：第 043 讲的 Waypoint 模型与第 046 讲 ETPNav 的预测器，从 RGB 或 RGBD 预测近邻可通行点，为高层提供候选。这类预测器的一个现实约束在数据上：ETPNav 用 MP3D 离散导航图的真实路点作为监督，训练需要仿真器特有的图结构，跨环境使用时泛化能力受采集条件限制。</p>
+    <p>AO-Planner 提出的问题是：LLM 能否同时承担低层运动规划？其做法绕开三维预测，把规划全部放进 RGB 空间。Grounded SAM（Ren 等 2024）负责把可通行地面从图像里分出来，分割结果称为导航可供性；智能体在可供性上撒下带编号的点，LLM 的任务变成「从这些编号里挑出路点，并把部分编号连成绕开障碍的路径」。路径由像素坐标表达，最后用深度与相机内参反投影回三维，交给与 ETPNav 相同的旋转-前进控制器。整个过程零样本，不需要任何仿真器路点数据。</p>
+    <p>这条路线还有第二重价值：LLM 选出的路点与路径可以反过来当伪标签，训练一个学习式路点预测器。论文报告 4 万张图的标注成本约 84 美元，而在线调用 LLM 充当预测器完成同等训练规模的微调需要约 960 万次调用、约 2 万美元，成本相差 240 倍。本讲先拆管线，再核对实验数字，最后讨论蒸馏的规模与质量控制。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p>本节按「任务接口、可供性、视觉可供性提示、PathAgent、像素到动作、蒸馏、结果与边界」七步展开；所有数字先经 Python 实算，论文数字标注来源与协议。</p>
+
+    <h3>1. 任务接口：四视图与低层动作</h3>
+    <p>AO-Planner 面向 VLN-CE：智能体收到固定指令 I，从起点走到目标附近；动作集为 FORWARD（0.25 米）、ROTATE LEFT / RIGHT（15°）与 STOP。观测为四个不重叠的透视视图：相机视场角（field of view, FOV）设为 90°，按逆时针顺序取前、左、后、右四向，四视场恰好覆盖 360°，每个方向的半宽为 45°。这个几何设定是本讲后续所有坐标计算的底座。</p>
+    <p>与离散环境的差异可以写成一句话：离散动作是在给定的 12 个全景视角编号里选一个并瞬移，连续动作是先选一个三维路点、再把它展开成一串旋转与前进。AO-Planner 的两阶段结构正是为这两件事分配模块：低层负责「生成候选路点与候选路径」，高层负责「在候选里做决策」。</p>
+    <div class="formula">
+      W<sub>t</sub>, P<sub>t</sub> = LLM(D<sub>L</sub>, I, V<sub>t</sub><sup>*</sup>)；T<sub>t</sub>, a<sub>t</sub> = LLM(D<sub>H</sub>, I, H<sub>t</sub>, O<sub>t</sub><sup>′</sup>, W<sub>t</sub>, P<sub>t</sub>)
+      <span class="note">V<sub>t</sub><sup>*</sup> 为撒点编号后的视图；W<sub>t</sub>、P<sub>t</sub> 为路点与路径候选；O<sub>t</sub><sup>′</sup> 为标注候选路径的四视图；T<sub>t</sub> 为思维过程，a<sub>t</sub> 为选中的路径编号；D<sub>L</sub>、D<sub>H</sub> 分别为低层与高层的任务说明</span>
+    </div>
+
+    <h3>2. 导航可供性与掩码融合</h3>
+    <p>可供性（affordance）在机器人领域指环境中允许某个动作发生的区域；导航语境下即「视觉上可站立、可通行的地面」。论文用 Grounded SAM 零样本获得该区域：Grounding DINO（Liu 等 2023）以文本提示「ground」做开放词表检测，给出候选框；SAM（Kirillov 等 2023）在每个框内分割出实例掩码；对同一视图的 k 个掩码做逐像素融合，得到该方向的可供性掩码 A<sub>t</sub><sup>i</sup>（i 为四个方向之一）。</p>
+    <p>掩码之上再做均匀点采样：在掩码覆盖的像素区域内按网格取点，按顺序编号并绘制在图像上，得到增强视图 V<sub>t</sub><sup>*</sup>。编号把空间选择问题转成符号选择问题，LLM 只需回答「哪些编号是路点、哪些编号连成路径」，避开直接输出像素或三维坐标。这里的机制与第 088 讲视频 VLM 的端到端动作头形成对照：AO-Planner 让 LLM 在离散符号上发挥强项，几何换算留给确定性代码。</p>
+
+    <h3>3. 视觉可供性提示（VAP）</h3>
+    <p>低层提示由三部分组成：任务描述 D<sub>L</sub>、当前指令 I、增强视图 V<sub>t</sub><sup>*</sup>。D<sub>L</sub> 给出路点与路径的定义性条件，例如路点应与障碍保持距离、落在关键区域，路径要绕开障碍连接若干编号点。四个方向各查一次，得到四个方向的候选，再合并成两组全局候选列表 W<sub>t</sub>（路点）与 P<sub>t</sub>（路径）。</p>
+    <p>消融给出每个提示组件的作用（R2R-CE val-unseen 100 条子集，SR / SPL）：完整 VAP 为 27 / 16.9；去掉指令为 24 / 14.6，SR 下降 3 个百分点，相对降幅 11.1%；去掉路点定义为 23 / 14.7，SR 下降 4 个百分点，相对降幅 14.8%；去掉可供性、直接在全图撒点为 15 / 7.2，SR 下降 12 个百分点，相对降幅 44.4%，SPL 从 16.9 掉到 7.2。<strong>四项里可供性最不可替代：没有地面掩码约束时，点会落在障碍与墙面，候选池变大，LLM 的低层规划准确率显著恶化。指令与定义的贡献较小但方向稳定，说明语义条件确实参与了点选。</strong></p>
+
+    <h3>4. 高层 PathAgent 与路径编号决策</h3>
+    <p>高层的输入是「标注过的观测」。系统把低层产生的候选路点与路径按编号渲染到四视图上，得到 O<sub>t</sub><sup>′</sup>；再附上指令、历史 H<sub>t</sub> 与高层说明 D<sub>H</sub>，要求 LLM 输出思维过程并选择一个路径编号。与 MapGPT 式做法（用文本描述或渲染候选点的独立图像）相比，这里强调四张图保留全部观测信息，同时编号让路径选择在 RGB 空间完成。</p>
+    <p>两阶段组合消融（同一 100 条子集，OSR / SR / SPL）显示分工收益：零样本预测器配基线智能体为 31 / 20 / 12.4；换成 PathAgent 为 39 / 27 / 16.9，SR 提升 7 个百分点、OSR 提升 8 个百分点；监督预测器配基线为 34 / 23 / 13.1，配 PathAgent 为 42 / 29 / 17.6，SR 同样提升 6 个百分点、OSR 提升 8 个百分点。反过来固定 PathAgent 换预测器（零样本对监督），SR 只差 2 个百分点，SPL 只差 0.7。<strong>在同一提示体系下，高层决策器对结果的贡献大于预测器来源：PathAgent 的增益约 6 至 7 个 SR 点，而零样本预测器与监督预测器的差距只有 2 个 SR 点，这条对照是「LLM 能承担低层规划」最有分量的证据。</strong></p>
+    <p>低层与高层各自用哪个模型也有交叉效应。四组配置（OSR / SR / SPL）：低层 Gemini-1.5-Pro 配高层 Gemini-1.5-Pro 为 25 / 14 / 9.1；低层 Gemini 配高层 GPT-4o 为 39 / 27 / 16.9（默认配置）；低层 GPT-4o 配高层 GPT-4o 为 34 / 16 / 9.4；低层 GPT-4o 配高层 Gemini 为 23 / 11 / 6.9。保持低层为 Gemini 不变、把高层从 Gemini 换成 GPT-4o，SR 从 14 升到 27，提升 13 个百分点；保持低层 GPT-4o 不变做同样替换，SR 从 16 掉到 11。<strong>模型能力分布与角色匹配，跨模型替换不能按单一排序外推。</strong></p>
+
+    <h3>5. 像素路径到三维动作：反投影与量化</h3>
+    <p>选中的路径在图像上是一串像素点。设相机针孔模型内参为 f<sub>x</sub>、f<sub>y</sub>、c<sub>x</sub>、c<sub>y</sub>，像素 (u, v) 处深度为 Z，则相机坐标系下的三维点为</p>
+    <div class="formula">
+      X = (u − c<sub>x</sub>) / f<sub>x</sub> · Z；Y = (v − c<sub>y</sub>) / f<sub>y</sub> · Z；f = (W/2) / tan(HFOV/2)
+      <span class="note">W 为图像宽度；HFOV 为水平视场角；论文未报告图像分辨率，本讲以一个 512×512、90° 视场的相机作为数值例</span>
+    </div>
+    <p>512 宽、90° 水平视场对应 f<sub>x</sub> = 256 像素。对路径首点 (u − c<sub>x</sub>) = 64 像素、Z = 2.0 米：X = 64/256 × 2.0 = 0.5 米，方位角 bearing = atan2(0.5, 2.0) = 14.04°，按 15° 量化需要 1 步旋转，残余误差 0.96°；水平距离 d = √(0.5² + 2.0²) = 2.0616 米，按 0.25 米量化前进 8 步，实际推进 2.0 米，剩余 0.0616 米。再看 (u − c<sub>x</sub>) = 128 像素、Z = 3.0 米：X = 1.5 米，bearing = 26.57°，2 步旋转后残余 3.43°；d = 3.3541 米，13 步前进后剩余 0.1041 米。控制器按「先旋转、再前进」逐段执行，每到一个路点重新读取下一段的像素坐标。</p>
+    <p>量化误差有上界：旋转半步为 7.5°，在 3 米处的横向偏差约 3 × tan 7.5° = 0.395 米；前进半步为 0.125 米。两段之间不做累计补偿时，误差按段独立有界，这是选小步长动作空间的直接收益，也是第 042 讲低层控制器设计的同一逻辑。</p>
+
+    <h3>6. 路点蒸馏：把 LLM 变成标注器</h3>
+    <p>VAP 的输出不只能在线使用，还能作为伪真值训练学习式预测器。论文采样约 1 万个位置、4 万张图像，让 LLM 逐图给出路点，训练 ETPNav 框架中的路点预测器（Chamfer 距离监控预测与伪标签的对齐度）。结果：蒸馏预测器的 Chamfer 距离为 1.08，ETPNav 用 MP3D 真值训练为 1.04，相对差 3.85%；把蒸馏预测器接回 ETPNav 代理，R2R-CE val-unseen 达到 47 SR，不依赖任何仿真器路点数据。成本一侧：4 万次调用的总价约 84 美元，单次约 0.0021 美元；若在强化学习式微调循环里持续查询 LLM 当预测器，需要约 960 万次调用，按同一单价约 2 万美元，两者相差 240 倍。</p>
+    <p>需要看清蒸馏结果的定位：47 SR 高于 NaVid 的 37 SR（R2R-CE 全量，SPL 33 对 36，路径效率略低），低于 ETPNav 的 57 SR（其预测器用 MP3D 导航图真值训练，属另一档数据条件）。<strong>蒸馏说明「无仿真器路点数据也能得到可用的低层预测器」，并未说明伪标签已全面替代真值。</strong></p>
+
+    <h3>7. 结果核对与协议边界</h3>
+    <p>零样本主表的对照（R2R-CE 为全量 val-unseen；RxR-CE 为 val-unseen 随机 500 条子集；SR / SPL 单位均为百分点）：</p>
+    <table>
+      <tr><th>方法（零样本/无指令示范）</th><th>低层数据依赖</th><th>R2R-CE SR / SPL</th><th>RxR-CE SR / SPL</th></tr>
+      <tr><td>AO-Planner（Chen 等 2024）</td><td>无仿真器训练数据</td><td>25.5 / 16.6</td><td>22.4 / 15.1</td></tr>
+      <tr><td>A2Nav（Chen 等 2023）</td><td>仿真器采样训练低层策略</td><td>22.6 / 11.1</td><td>16.8 / 6.3</td></tr>
+      <tr><td>ZSON（Majumdar 等 2022）</td><td>仿真器采样</td><td>19.3 / 9.3</td><td>14.2 / 4.8</td></tr>
+      <tr><td>Cow（Gadre 等 2022）</td><td>无</td><td>7.8 / 5.8</td><td>7.9 / 6.1</td></tr>
+    </table>
+    <p>相对 A2Nav：R2R-CE 的 SR 差为 +2.9 个百分点（相对 +12.83%），SPL 差为 +5.5（相对 +49.55%）；RxR-CE 的 SR 差为 +5.6（相对 +33.33%），SPL 差为 +8.8（相对 +139.68%）。<strong>两套数据同一提示、无任何数据集特化修改，这是跨任务迁移的正面证据；同时要注意子集协议：RxR-CE 只跑了 500 条，消融只在 100 条上做，报告数字时应与本讲一样标注「子集」。</strong>论文自己披露的失败面包括：LLM 对 Habitat 重建图像不熟悉、连续场景画质低于 MP3D 原图、分割与反投影误差会逐段传递。这三点构成下一讲系统评测的伏笔：单方法数字之外，还要看系统层面的执行与验证可靠性。</p>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>把方法落成工程需要五步数据流：掩码生成、点采样与编号、低层查询、高层渲染与选择、反投影与控制器。每步都有值得固定的接口，下面给出模块与参数，再讨论与相邻讲的分工。</p>
+
+    <h3>管线五步</h3>
+    <ol>
+      <li>分割：对四视图各跑一次 Grounded SAM（提示词「ground」），融合掩码得到 A<sub>t</sub><sup>i</sup>。</li>
+      <li>采样：在掩码内网格取点，编号并渲染增强视图 V<sub>t</sub><sup>*</sup>；四方向各自独立查询。</li>
+      <li>低层：LLM(D<sub>L</sub>, I, V<sub>t</sub><sup>*</sup>) 输出路点与路径候选；四方向合并为 W<sub>t</sub> 与 P<sub>t</sub>。</li>
+      <li>高层：把候选渲染进四视图得 O<sub>t</sub><sup>′</sup>，LLM 输出思维与路径编号；未选中的候选作废。</li>
+      <li>执行：对选中路径逐段反投影，先旋转后前进，到点后进入下一决策步。</li>
+    </ol>
+
+    <h3>模块与接口</h3>
+    <table>
+      <tr><th>组件</th><th>输入</th><th>输出</th><th>要点</th></tr>
+      <tr><td>Grounded SAM</td><td>单视图 RGB</td><td>地面掩码</td><td>零样本开放词表；掩码融合前先做置信度阈值</td></tr>
+      <tr><td>点采样器</td><td>掩码</td><td>带编号点集</td><td>网格步长控制候选密度与 token 数</td></tr>
+      <tr><td>低层 LLM</td><td>增强视图 + 指令 + 定义</td><td>路点与路径编号</td><td>四方向独立查询，合并时去重</td></tr>
+      <tr><td>PathAgent</td><td>标注四视图 + 历史</td><td>路径编号 + 思维</td><td>编号即动作接口；思维供审计</td></tr>
+      <tr><td>反投影与控制</td><td>像素路径 + 深度 + 内参</td><td>低层动作序列</td><td>逐段重算 bearing，避免误差累计</td></tr>
+      <tr><td>蒸馏器</td><td>伪标签 + 渲染图</td><td>学习式路点预测器</td><td>Chamfer 距离监控伪标签质量</td></tr>
+    </table>
+
+    <h3>参数与取值依据</h3>
+    <table>
+      <tr><th>参数</th><th>取值</th><th>作用</th><th>依据</th></tr>
+      <tr><td>相机水平视场角</td><td>90°</td><td>四视图拼满 360°</td><td>论文实现设定；半宽 45° 决定编号点最远角</td></tr>
+      <tr><td>前进步长</td><td>0.25 米</td><td>连续位移量化单位</td><td>与 ETPNav 控制器一致，残差上界 0.125 米</td></tr>
+      <tr><td>旋转步长</td><td>15°</td><td>朝向量化单位</td><td>与 ETPNav 控制器一致，残差上界 7.5°</td></tr>
+      <tr><td>低层模型</td><td>Gemini-1.5-Pro</td><td>路点与路径生成</td><td>消融中低层表现优于 GPT-4o（27 对 16 SR，100 条子集）</td></tr>
+      <tr><td>高层模型</td><td>GPT-4o</td><td>路径选择与思维</td><td>消融中高层表现显著优于 Gemini（27 对 14 SR）</td></tr>
+      <tr><td>蒸馏规模</td><td>1 万点位 / 4 万图</td><td>伪标签总量</td><td>与 ETPNav 原预测器的训练数据同量级，成本约 84 美元</td></tr>
+    </table>
+
+    <h3>与相邻讲的分工</h3>
+    <p>第 091 讲的组合式管线把低层交给 ViNG 类学习策略，本讲把低层也交给基础模型，代价是每步多次 LLM 查询与分割开销。第 046 / 047 讲的 ETPNav 用学习式预测器加图规划，本讲的预测器蒸馏复用其 Chamfer 选择口径。第 093 讲开始转向 2026 年系统评测：当模型同时接管高低层后，评测单位从「方法」变成「系统」，协议维度需要重新设计，本讲末尾披露的三类失败面（图像域差异、画质、误差传递）会在那里获得量化。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>三段代码分别给出地面掩码采样、像素路径转动作、伪标签蒸馏循环。均为示意实现，接口按公开论文描述重写，可直接对接 Habitat 风格渲染器。</p>
+
+    <p><strong>片段 1：可供性掩码与编号点采样</strong></p>
+    <pre class="code"><code>import numpy as np
+
+def navigational_affordances(rgb, grounded_sam, grid_step=32):
+    """用 Grounded SAM 分割可视地面，返回掩码与网格采样点。"""
+    boxes = grounded_sam.detect(rgb, prompt="ground")   # 开放词表检测地面框
+    masks = grounded_sam.segment(rgb, boxes)            # 每个框生成实例掩码
+    afford = np.zeros(rgb.shape[:2], dtype=bool)        # 与图像同尺寸的二值掩码
+    for m in masks:
+        afford |= (m &gt; 0.5)                            # 阈值化后逐像素融合
+    h, w = afford.shape
+    ys, xs = np.mgrid[0:h:grid_step, 0:w:grid_step]     # 均匀网格控制候选密度
+    keep = afford[ys, xs]                               # 只保留落在可通行区内的点
+    points = np.stack([xs[keep], ys[keep]], axis=1)     # (N, 2) 像素坐标
+    return afford, points                               # 编号与渲染交给调用方</code></pre>
+    <p>解读：<strong>（1）</strong>掩码按 0.5 阈值化后做按位或，保证融合结果只保留高置信地面；融合前不做阈值容易把检测框边缘的墙面并入可供性。<strong>（2）</strong>网格步长同时控制候选点数量与提示长度，步长越大 token 越省、几何分辨率越粗；论文正文未强调该值的固定设定，复现时应把它作为受控参数报告。<strong>（3）</strong>函数只返回像素坐标，不返回三维；几何换算集中在执行阶段一次完成，减少 LLM 与几何代码的耦合面。</p>
+
+    <p><strong>片段 2：像素路径转低层动作</strong></p>
+    <pre class="code"><code>import math
+
+def backproject(u, v, depth, K):
+    """针孔模型反投影：像素加深度，得到相机坐标系三维点。"""
+    fx, fy, cx, cy = K
+    z = float(depth[int(v), int(u)])        # 取该像素的深度读数（米）
+    x = (u - cx) / fx * z                   # 水平偏移按焦距折算
+    y = (v - cy) / fy * z                   # 垂直偏移同理，用于检查地面点高度
+    return x, y, z
+
+def segment_to_actions(p0, p1, depth, K, fwd=0.25, turn=15.0):
+    """对一段像素路径：先算朝向，再算距离，量化为旋转与前进动作。"""
+    u0, v0 = p0
+    x, y, z = backproject(u0, v0, depth, K)     # 段起点决定本段朝向
+    bearing = math.degrees(math.atan2(x, z))    # 相对当前朝向的方位角
+    n_rot = round(bearing / turn)               # 15 度量化，残差不超过半步
+    turn_actions = ["RIGHT" if n_rot &gt; 0 else "LEFT"] * abs(n_rot)
+    dist = math.hypot(x, z)                     # 水平距离，忽略地面高度差
+    n_fwd = int(dist // fwd)                    # 前进步数向下取整
+    residual = dist - n_fwd * fwd               # 剩余距离交给下一段补足
+    return turn_actions + ["FORWARD"] * n_fwd, residual</code></pre>
+    <p>解读：<strong>（1）</strong>用段起点反投影决定整段朝向与长度，路径上后续像素点用于视觉展示，这一简化与「先旋转后前进」的控制器一致。<strong>（2）</strong>旋转取整使用四舍五入，残差上界 7.5°；前进使用向下取整，残差上界 0.125 米，两者都有明确上界，便于与第 042 讲的执行误差分析对接。<strong>（3）</strong>返回剩余距离供下一段吸收；若把残差直接丢弃，长路径会出现系统性欠走。</p>
+
+    <p><strong>片段 3：LLM 伪标签蒸馏循环</strong></p>
+    <pre class="code"><code>def distill_waypoint_predictor(envs, annotator, num_images=40000):
+    """把 VAP 输出的路点当伪真值，训练学习式路点预测器。"""
+    samples = []
+    per_env = num_images // len(envs)                # 均分渲染预算
+    for env in envs:
+        for loc in env.sample_locations(per_env // 4)  # 每个位置取四方向视图
+            for view in env.render_four_views(loc):
+                rgb, depth = view
+                afford, points = navigational_affordances(rgb, annotator.sam)
+                if len(points) == 0:
+                    continue                             # 无地面点的视图不产生标签
+                waypoints, paths = annotator.query_vap(rgb, afford, points)
+                if waypoints:
+                    samples.append(("rgb_depth", rgb, depth, waypoints))
+                if len(samples) &gt;= num_images:
+                    return train_predictor(samples)      # 达到预算即停止采样
+    return train_predictor(samples)
+
+def train_predictor(samples):
+    """训练路点预测器；用 Chamfer 距离评估与伪标签的对齐度。"""
+    cleaned = [(s, wp) for s, _, _, wp in samples if wp]
+    return fit_waypoint_net(cleaned, select_metric="chamfer", max_epochs=20)</code></pre>
+    <p>解读：<strong>（1）</strong>采样预算按环境与位置均分，保证伪标签在地点维度上散布，避免少数场景主导训练集。<strong>（2）</strong>空掩码视图直接跳过，不生成空标签；若把空标签当负样本，预测器会学到「无地面」的错误先验。<strong>（3）</strong>训练完成后用 Chamfer 距离评估与伪标签的对齐度，与 ETPNav 的模型选择口径一致，1.08 与 1.04 即按此口径比较。<strong>（4）</strong>伪标签带 LLM 的几何误差，训练前按距离阈值过滤离群点，这是蒸馏管线里最容易被忽略的质控步骤。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>深度与 RGB 未对齐就反投影</strong>：路径点跳到障碍或墙面上，控制器执行后碰撞或原地打转。根因是深度图与彩色图存在分辨率或裁剪差异时直接按同坐标取值。修复：在重采样到同分辨率后建立像素对应，采样点落在掩码腐蚀后的内区，深度取小窗口的下分位以避开前景边缘。</li>
+      <li><strong>把单帧掩码当全局地图</strong>：LLM 把两个互不可见区域的编号点连成一条直线，路径穿过障碍。根因是可供性只有当前视野内信息，掩码之间没有遮挡与拓扑约束。修复：只允许同一连通域内的点相连，跨区域路径拆成多段，由下一决策步重新规划。</li>
+      <li><strong>量化残差逐段丢弃</strong>：长走廊行走后系统性偏离，靠近目标时方位误差增大，最终停在错误房间。根因是每段独立取整且未吸收剩余距离。修复：到点判定用半步阈值（0.125 米），段间重算 bearing；对累计偏差做记录，连续两段偏同侧时降低步长或重新分割掩码。</li>
+      <li><strong>跨数据集沿用同一提示却不报告</strong>：RxR-CE 上数字下滑时无法归因。论文的做法恰恰是把「两套数据不做任何提示修改」作为泛化性证据报告出来。修复：把提示版本作为实验变量记录，跨数据集测试时保留同一版本；若要改提示，另行报告改动列表。</li>
+      <li><strong>把蒸馏 47 SR 与监督 57 SR 当同协议结论</strong>：得出「零数据接近监督」的越界判断。根因是 ETPNav 的预测器与高层都额外用了 MP3D 图真值与监督数据。修复：分表陈述，标注每行的数据依赖（蒸馏行仅 4 万图伪标签），比较预测器质量时用 Chamfer 等中间指标。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>协议差核算：AO-Planner 与 A2Nav 在 R2R-CE 与 RxR-CE 上的 SR、SPL 绝对差与相对差各是多少？其中哪一个差值来自「无仿真器训练数据」这一条件，哪一部分可能来自评价子集差异？ <span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>R2R-CE：SR +2.9（相对 +12.83%），SPL +5.5（相对 +49.55%）；RxR-CE：SR +5.6（相对 +33.33%），SPL +8.8（相对 +139.68%）。数据依赖差异是方法条件；RxR-CE 只有 500 条子集、消融只有 100 条，子集口径需单独标注。</div></details>
+      </li>
+      <li>几何换算：512×512 图、90° 水平视场，取 (u − c<sub>x</sub>) = 64 像素、Z = 2.0 米。求 f、X、bearing、旋转步数与残余角、前进距离、前进步数与剩余距离；并说明为什么到达路点后必须重算下一段。 <span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>f = 256；X = 0.5 米；bearing = 14.04°；1 步旋转，残余 0.96°；d = 2.0616 米；8 步前进，剩余 0.0616 米。重算的原因：每段执行后朝向与位置都改变，残差与新的像素坐标只能在到达后取得。</div></details>
+      </li>
+      <li>消融推断：在 100 条子集上，去掉可供性使 SR 从 27 降到 15。请估算成功局数变化，并解释为什么「去掉可供性」的损失远大于「去掉指令」与「去掉路点定义」，这一结论对采样网格步长的选择有什么启示。 <span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>100 条上 27 对 15，成功局数从约 27 局降到约 15 局，差约 12 局。可供性约束的是「点能不能落在可通行区域」，属几何可行性；指令与定义影响的是「选得对不对」，属语义偏好。网格步长决定障碍附近点的密度，步长过大时可供性收益被稀释，需要在 token 成本与避障精度之间取折中。</div></details>
+      </li>
+      <li>成本与规模：4 万张图的标注用 4 万次调用、约 84 美元。求单次调用成本；再算 960 万次调用的预算与倍数；若只蒸馏 2 万张图，预算约为多少？并指出这一估算忽略了哪些成本项。 <span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>单次约 0.0021 美元；960 万次约 2 万美元，是 4 万次的 240 倍；2 万张约 42 美元。忽略项：分割与渲染的本地算力、重试与失败调用、深度图采集、训练预测器本身的显卡成本。</div></details>
+      </li>
+      <li>设计题：为一种新场景（例如大学教学楼走廊）写一份「LLM 伪标签蒸馏路点预测器」的方案。要求给出 (a) 采样规模与点位分布；(b) 伪标签质量控制规则（含 Chamfer 曲线的用途）；(c) 停止蒸馏的判据；(d) 如何避免把 LLM 的几何错误固化进预测器；(e) 两级验收标准。 <span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>(a) 按环境数均分点位，每点位四方向，规模参考 1 万点位 / 4 万图。(b) 过滤空掩码与离群路点，用 Chamfer 距离分布监控；对与 MP3D 真值小样本对比的校准集定期抽检。(c) 判据用验证集 Chamfer 连续两轮不再下降，或相对上一版改善低于阈值。(d) 保留真值校准集做旁路验收；对高频几何错误（例如贴墙点）设规则级过滤器。(e) 一级验收为预测器 Chamfer 与基线持平，二级验收为接入高层代理后 SR 不低于基线 2 个百分点。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>AO-Planner 把连续环境的低层规划改写为「在可供性编号点里选点与连点」：Grounded SAM 分割地面，VAP 撒点编号，低层 LLM 生成候选路点与路径，高层 PathAgent 在标注四视图上选路径。</li>
+      <li>消融显示可供性最关键：去掉后 SR 从 27 降到 15（相对降幅 44.4%）；PathAgent 相对基线提升 6 至 7 个 SR 点，零样本预测器与监督预测器的差距只有 2 个 SR 点。</li>
+      <li>像素路径经反投影变为三维点：512 图 90° 视场下 f = 256，(64, 2.0) 像素米例对应 14.04°、1 步旋转、8 步前进、剩余 0.0616 米；旋转与前进的残差上界分别为 7.5° 与 0.125 米。</li>
+      <li>零样本主结果：R2R-CE 全量 25.5 SR / 16.6 SPL，RxR-CE 500 条子集 22.4 SR / 15.1 SPL；蒸馏路点预测器（4 万图、约 84 美元，成本比在线查询低 240 倍）接 ETPNav 代理在 R2R-CE 达到 47 SR。</li>
+      <li>下一讲进入 2026 快照：当通用模型直接充当导航系统，评测单位从方法变成系统，harness、episode 子集、动作预算与运行次数共同决定数字，同一模型家族可以出现 29.3 个百分点的跨度（第 093 讲）。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch091.html">← 第 091 讲：LM-Nav：组合式零样本（“NavLM”正名）</a>
+    <a class="next" href="ch093.html">第 093 讲：2026 快照 I：通用模型零样本系统评测 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.06 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:11.5px !important;letter-spacing:.06em !important;color:rgba(71,85,105,.45) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#7e8ba0 !important;font-size:11.5px !important;line-height:1.8 !important;text-align:center !important;padding:5px 12px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

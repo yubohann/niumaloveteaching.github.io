@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 024 讲｜Self-Monitoring：共定位与进度估计 | 视觉语言导航课程 · VLN-100</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 离散方法谱系：从模块到预训练</span>
+    <span class="sep">/</span>
+    <span>第 024 讲</span>
+    <span class="sep">/</span>
+    <a href="ch025.html">下一讲 →</a>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 离散方法谱系：从模块到预训练</div>
+    <h1>第 024 讲｜Self-Monitoring：共定位与进度估计</h1>
+    <p class="lead">本讲把「走到哪了」变成可训练的标量：视觉与文本的共定位模块用共享记忆状态互相约束，进度监控器用从起点到当前的距离归一化出监督目标，并进入束搜索打分与回退规则。学完能复现共定位注意力链、设计进度标签、推导加权损失，并解释该机制在 val-unseen 上的增益来源。</p>
+    <ul class="meta">
+      <li>主题：视觉文本共定位 / 进度监控 / 辅助损失 / 束搜索打分</li>
+      <li>关键公式：h<sub>t</sub> = LSTM([x̂<sub>t</sub>, v̂<sub>t</sub>, a<sub>t−1</sub>])；p<sup>pm</sup><sub>t</sub> = tanh(W<sub>pm</sub>[α<sub>t</sub>, h<sup>pm</sup><sub>t</sub>])；L = λL<sub>动作</sub> + (1 − λ)L<sub>进度</sub>，λ = 0.5</li>
+      <li>关键数字：val-unseen 成功率 0.27 → 0.57（无数据增广、含束搜索）；λ = 0.5；进度目标在 3 m 处截断为 1</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置讲：第 023 讲</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>会实现：共定位注意力的三步计算（文本注意力、视觉注意力、动作打分），并说清每步使用的隐藏状态与数据依赖。</li>
+      <li>会设计：进度标签的生成规则（起点为 0、接近目标趋近 1、距离小于 3 m 截断为 1、可低于 0），并用最短路径距离实现。</li>
+      <li>会推导：加权损失 L = λL<sub>动作</sub> + (1 − λ)L<sub>进度</sub> 的梯度来源，解释 λ = 0.5 的平衡作用与 tanh 饱和带来的训练困难。</li>
+      <li>会判断：何时把进度分数用于束搜索打分、何时用于回退规则，并核算两者的步数开销。</li>
+      <li>会复核：共定位与进度监控各自的消融增益（未见环境 +15.0 与 +2.0 个百分点），以及束搜索口径对 OSR 与 SPL 的影响。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 023 讲把动作空间整理成候选直选：每个位姿在可通行方向上加停止上做一次选择，观测由 36 个视角组成。动作接口好用了，注意力机制却仍有结构性问题。Seq2Seq 风格的基线只用历史隐藏状态去对齐指令，随轨迹拉长，注意力的落点容易漂移：模型可能把已经完成的子句当成下一步指令，也可能把尚未说到的地标提前对齐。原文把这一现象讲得很直接：基线方法不知道「哪段指令已完成、哪段接下来要用、当前离目标还有多远」（Ma 等，2019，ICLR，摘要与第 1 节）。</p>
+    <p>自监控（Self-Monitoring）用两个互补部件应对：视觉文本共定位（visual-textual co-grounding）让文本注意力与视觉注意力经由同一个记忆状态互相约束，动作决策同时依赖记忆状态与定位后的指令特征；进度监控器（progress monitor）用一条辅助回归目标估计「指令完成度」，既作为训练正则，又在推理期参与束搜索打分与动作回退。原文报告该机制把未见环境（val-unseen）成功率从基线的 27% 提到 57%（无数据增广、含束搜索），测试集未见环境达到 61% 成功率、4.48 m 导航误差（Ma 等，2019，表 1 与表 2）。</p>
+    <p>本讲解决四个问题：第一，共定位的注意力链怎样计算、各步用哪一个隐藏状态；第二，进度标签如何由距离生成，边界行为如何定义；第三，辅助损失如何与动作损失加权，tanh 输出带来什么训练特性；第四，推理期如何把进度分数接进束搜索与回退规则，代价是多少。第 025 讲的匹配奖励与第 026 讲的自监督模仿都沿用「用可验证的中间量给策略提供密集信号」这一思路。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+
+    <h3>1. 共定位：一条互相约束的注意力链</h3>
+    <p>设定与第 023 讲一致：指令 X = {x<sub>1</sub>, …, x<sub>L</sub>} 由词编码器给出词特征；每个时间步，代理在位姿上看到一组可通行方向上的视图特征 {v<sub>t,1</sub>, …, v<sub>t,K</sub>}，K 为候选数。原文有一个值得记住的工程结论：只用可通行方向上的图像做注意力，效果略好于使用全部 36 个视角（Ma 等，2019，2.1 节脚注 1）。这一步把候选直选的动作接口与视觉注意力接口对齐，注意力输出与候选打分共享同一组视图特征。</p>
+    <p>共定位的核心是状态回路：解码器 LSTM 以「定位后的文本特征、定位后的视觉特征、上一步动作」为输入，输出记忆状态：</p>
+    <div class="formula">
+      h<sub>t</sub> = LSTM( [ x̂<sub>t</sub> ; v̂<sub>t</sub> ; a<sub>t−1</sub> ] )
+      <span class="note">x̂<sub>t</sub> 为文本定位特征，v̂<sub>t</sub> 为视觉定位特征，a<sub>t−1</sub> 为上一步动作的嵌入；三者拼接后进入 LSTM</span>
+    </div>
+    <p>两个定位模块都以上一步记忆 h<sub>t−1</sub> 为查询，各自产生注意力分布。文本侧先把位置编码 PE(·) 加到词特征上，再与查询做点积：</p>
+    <div class="formula">
+      z<sup>textual</sup><sub>t,l</sub> = (W<sub>x</sub> h<sub>t−1</sub>)<sup>T</sup> PE(x<sub>l</sub>)，α<sub>t</sub> = softmax(z<sup>textual</sup><sub>t</sub>)，x̂<sub>t</sub> = α<sub>t</sub><sup>T</sup> X
+      <span class="note">l 遍历 L 个词；位置编码让注意力分布包含词序信息，是序列对齐的关键（原文 2.2 节）</span>
+    </div>
+    <p>视觉侧对可通行视图做同样的注意力，并把加权结果记作 v̂<sub>t</sub>。随后动作打分同时使用更新后的记忆状态与定位后的文本特征：</p>
+    <div class="formula">
+      o<sub>t,k</sub> = (W<sub>a</sub> [ h<sub>t</sub> ; x̂<sub>t</sub> ])<sup>T</sup> g(v<sub>t,k</sub>)，p<sub>t</sub> = softmax(o<sub>t</sub>)
+      <span class="note">g(·) 为一层多层感知机，与视觉注意力共享；原文强调动作选择同时依赖 h<sub>t</sub> 与 x̂<sub>t</sub>，而基线的解码决策只依赖定位后的指令特征</span>
+    </div>
+    <p>把三个公式连起来看，共定位与基线的差别在两处。第一处是查询来源：文本与视觉定位都使用 h<sub>t−1</sub>，而动作打分使用 h<sub>t</sub>，信息在回路内单向流动，当前步的动作不会泄漏进步骤前的注意力。第二处是决策输入：动作打分使用 [h<sub>t</sub>; x̂<sub>t</sub>]，历史与指令同时在场。原文把这套结构相对基线的增益量化为：验证集未见环境成功率从 0.27 提升到 0.42，验证集已见环境从 0.54 提升到 0.65（无束搜索、无数据增广，表 2 第 1 行与基线行）。训练期动作按类别采样（categorical sampling），测试期才使用束搜索或取最大，训练与推理形成对照。</p>
+
+    <h3>2. 进度监控器与训练目标</h3>
+    <p>共定位解决了「指令用到哪一段」，还有一个问题没有解决：模型是否知道「任务完成了多少」。进度监控器估计指令完成度 p<sup>pm</sup><sub>t</sub>，输入有三类：记忆状态与细胞状态（历史）、当前全景视图的定位特征（现状）、文本注意力的权重分布 α<sub>t</sub>（指令用到哪一段的位置信息）。原文的计算为：</p>
+    <div class="formula">
+      h<sup>pm</sup><sub>t</sub> = σ( W<sub>h</sub> [ h<sub>t−1</sub> ; v̂<sub>t</sub> ] ⊙ tanh(c<sub>t</sub>) )，p<sup>pm</sup><sub>t</sub> = tanh( W<sub>pm</sub> [ α<sub>t</sub> ; h<sup>pm</sup><sub>t</sub> ] )
+      <span class="note">σ 为 sigmoid，⊙ 为逐元素乘，c<sub>t</sub> 为 LSTM 细胞状态；拼接 α<sub>t</sub> 让进度估计读取「指令位置」这一结构线索</span>
+    </div>
+    <p>监督目标的定义决定了整个模块的语义。原文的文字描述给出四个边界行为：起点处目标为 0；随靠近目标趋近 1；距离小于 3 m 时置 1；若当前距离比起点更远，目标可低于 0（Ma 等，2019，2.4 节）。把这四个行为写成可执行公式，取线性归一化：</p>
+    <div class="formula">
+      y<sup>pm</sup><sub>t</sub> = 1 − d<sub>G</sub>(v<sub>t</sub>, v*) / d<sub>G</sub>(v<sub>0</sub>, v*)，当 d<sub>G</sub>(v<sub>t</sub>, v*) &lt; 3 m 时置 1
+      <span class="note">d<sub>G</sub> 为导航图最短路径距离（第 006 讲口径），d<sub>G</sub>(v<sub>0</sub>, v*) 为起点到目标的距离；分子大于分母时目标为负值。截断半径与成功判定的 3 m 一致</span>
+    </div>
+    <p>用一组示例距离实算（起点距离 10 m）：d 序列 [10.0, 8.2, 6.1, 3.4, 2.1] 对应目标 [0.00, 0.18, 0.39, 0.66, 1.00]，最后一项因为 2.1 &lt; 3 被截断为 1；若绕路到 15.1 m，目标为 −0.51。这个范围跨越负值与 1，说明输出用 tanh 是合理的（值域 (−1, 1)），但也埋下一个训练特性：接近目标时目标值贴近 1，tanh 的梯度迅速变小。实算梯度：预激活 1.5 时 tanh 输出 0.9051、导数 0.1807；预激活 2.0 时输出 0.9640、导数 0.0707；预激活 3.0 时输出 0.9951、导数 0.0099。训练后期目标端的回归主要靠较小的梯度推进。</p>
+    <p>损失函数把动作交叉熵与进度均方误差加权相加：</p>
+    <div class="formula">
+      L = − λ Σ<sub>t</sub> y<sup>nv</sup><sub>t</sub> log p<sub>k,t</sub> − (1 − λ) Σ<sub>t</sub> ( y<sup>pm</sup><sub>t</sub> − p<sup>pm</sup><sub>t</sub> )²，λ = 0.5
+      <span class="note">y<sup>nv</sup> 为教师动作的独热标签，p<sub>k,t</sub> 为动作概率；λ = 0.5 表示两项等权。注意输出端 tanh 的值域与目标端的负值、截断值需要配套</span>
+    </div>
+    <p>做一个五步的损失算例，教师动作概率取 [0.55, 0.62, 0.48, 0.51, 0.70]，进度预测取 [0.05, 0.22, 0.40, 0.70, 0.60]，目标按上表 [0.00, 0.18, 0.39, 0.66, 1.00]。逐步结果：动作交叉熵 [0.5978, 0.4780, 0.7340, 0.6733, 0.3567]，进度均方误差 [0.0025, 0.0016, 0.0001, 0.0016, 0.1600]，合计 1.5028（按两项取正的最小化口径；若照搬公式里的负号写法，数值为 −1.5028，符号约定要在实验中统一）。末步的进度误差 0.16 占据主导，原因是预测 0.60 与截断目标 1.00 相差 0.40；这提示实现时要把「接近目标但预测偏低」的样本单独观察，避免进度项压制动作项。</p>
+
+    <h3>3. 推理：进度进入束搜索与回退规则</h3>
+    <p>进度分数在推理期有两种用法。束搜索中把进度与动作概率相乘，作为路线得分的一部分：</p>
+    <div class="formula">
+      p<sup>beam</sup><sub>t</sub> = p<sup>pm</sup><sub>t</sub> × p<sub>k,t</sub>
+      <span class="note">p<sup>pm</sup> 归一化在 0 到 1；该分数随步累乘，与状态因子化搜索配合使用（第 023 讲）</span>
+    </div>
+    <p>乘法的效果用一个小型两段束算例实算。第一步动作 a1 概率 0.60、a2 概率 0.40；进度输出为 a1 之后 0.30、a2 之后 0.65。第二步条件概率：a1 之后 b1 为 0.70、b2 为 0.30；a2 之后 c1 为 0.55、c2 为 0.45；进度输出：b1 后 0.40、b2 后 0.80、c1 后 0.75、c2 后 0.50。四类完整路线的动作联合概率分别为 0.4200、0.1800、0.2200、0.1800；带上进度因子后分别为 0.0504、0.0432、0.1073、0.0585。只看动作概率时贪婪选 a1 → b1（0.4200），引入进度因子后 a2 → c1（0.1073）胜出。第一步的束因子分别为 0.18 与 0.26，进度分数在第一步就已经把排序翻转。</p>
+    <p>贪婪模式下还有一条回退规则（progress inference）：若某一步的进度输出比上一步下降，代理退回上一个视点并改选次高概率动作，重复该过程直到所选动作使进度上升（Ma 等，2019，2.4 节）。触发判据用一个序列说明：进度序列 [0.05, 0.25, 0.50, 0.40, 0.62] 在第 4 步（索引 3）从 0.50 降到 0.40，触发回退。回退的开销可以估算：设每步触发概率 0.10、平均 5.44 步的动作数（第 023 讲候选直选口径），期望回退次数约为 0.54 次，每次多执行 2 个动作（退回、重选），约 1.09 个额外动作，折算路径长度约 1.09 × 2.25 ≈ 2.45 m，相当于 10 m 路径的 24.5%。回退规则在路线干净时几乎不触发，在混乱对照实验中开销不可忽略，且会与步数上限互相挤压。</p>
+    <p>原文的增量对比值得逐项拆开（表 2，val-unseen，无束搜索的行）：基线 0.27；共定位 0.42（+15.0 个百分点）；在共定位上加进度监控 0.44（+2.0）；加进度推断（回退）0.46（+2.0）。束搜索一节：不带进度监控的束搜索 0.49（相对共定位 +7.0 个百分点）；把进度分数接入束搜索 0.57（相对 0.44 提升 13.0 个百分点）；再叠加数据增广 0.58，测试集未见环境 0.61 SR、4.48 m NE、0.70 OSR、0.56 SPL（Ma 等，2019，表 1）。原文特别指出：数据增广带来的增益比 Speaker-Follower 中的对应增益小，说明自监控机制对合成数据的依赖更低（表 2 讨论）。同时也报告了束搜索下的口径细节：消融表中只取最后选中的轨迹计算 OSR 与 SPL；挑战赛提交要求记录全部经过视点，SPL 因此降到 0.01 至 0.02 的量级。</p>
+
+    <h3>4. 适用条件与边界</h3>
+    <ul>
+      <li><strong>进度标签依赖真实距离</strong>：训练期需要导航图与目标位置计算 d<sub>G</sub>；测试期标签不可用，只有预测参与打分。若环境无图或目标隐藏，进度监督要另找代理量。</li>
+      <li><strong>归一化基准是起点距离</strong>：起点离目标越近，分母越小，同样距离变化的标签斜率越大，靠近目标的样本对回归项更敏感。跨 split 比较误差时需注意这个尺度差异。</li>
+      <li><strong>截断半径与成功判定一致</strong>：3 m 截断让「已经成功但未停止」的步都取目标 1，避免在阈值附近来回摆动；阈值改动必须与评测口径同步。</li>
+      <li><strong>回退依赖环境可逆</strong>：离散导航图允许退回上一视点；连续环境里回退要由控制器完成，代价与安全性都要重新评估（第三篇 047 讲展开）。</li>
+      <li><strong>进度与动作的耦合风险</strong>：进度分数进入束打分后，模型可以用「停在进度高的位置」取巧。原文用动作损失与进度损失等权、并用成功信号约束最终停止来缓解，工程上建议单独统计停止步的进度分布。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>复现这套机制需要三张表与一条数据流：模块接线、参数默认值、标签与推理规则。</p>
+    <h3>模块接线</h3>
+    <table>
+      <tr><th>模块</th><th>输入</th><th>输出</th><th>训练监督</th></tr>
+      <tr><td>词编码器</td><td>指令词序列（位置编码叠加）</td><td>词特征 X</td><td>无独立监督</td></tr>
+      <tr><td>文本定位</td><td>X 与 h<sub>t−1</sub></td><td>注意力 α 与定位特征 x̂</td><td>经动作损失反传</td></tr>
+      <tr><td>视觉定位</td><td>候选视图特征与 h<sub>t−1</sub></td><td>注意力 β 与定位特征 v̂</td><td>经动作损失反传</td></tr>
+      <tr><td>记忆与控制</td><td>[x̂; v̂; a<sub>t−1</sub>]</td><td>h<sub>t</sub>、动作分布 p</td><td>交叉熵</td></tr>
+      <tr><td>进度监控</td><td>h<sub>t−1</sub>、v̂、c<sub>t</sub>、α</td><td>完成度 p<sup>pm</sup></td><td>均方误差</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：进度监控作为辅助任务，不替代停止判定</span>
+      <p>进度分数用于打磨排序与回退，最终是否停止仍由动作分类决定，停止标签来自教师轨迹。这样进度项只影响训练正则与推理排序，不会引入新的停止阈值；若要改成独立停止判据，必须重新标定阈值并核对与 3 m 成功判定的关系。</p>
+    </div>
+    <h3>参数默认值与依据</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>损失权重 λ</td><td>0.5</td><td>动作与进度两项的配比</td><td>原文设定（Ma 等，2019，公式 6）</td></tr>
+      <tr><td>进度输出激活</td><td>tanh</td><td>值域 (−1, 1)，覆盖负值与截断值</td><td>原文公式 5；配套目标可低于 0</td></tr>
+      <tr><td>截断半径</td><td>3 m</td><td>接近目标时目标置 1</td><td>与 R2R 成功判定一致，避免阈值抖动</td></tr>
+      <tr><td>视觉注意力范围</td><td>可通行方向</td><td>注意力输入集合</td><td>原文脚注：略优于全部 36 视角</td></tr>
+      <tr><td>束因子形式</td><td>p<sup>pm</sup> × p<sub>k</sub></td><td>路线得分的进度分量</td><td>原文 2.4 节</td></tr>
+      <tr><td>回退判据</td><td>进度下降即回退</td><td>贪婪模式的纠错</td><td>原文 progress inference；需评估步数开销</td></tr>
+      <tr><td>隐藏维度</td><td>按动作网络同宽配置（复现建议 512）</td><td>LSTM 与注意力维度</td><td>原文未公布具体数值，复现时与基线保持一致</td></tr>
+    </table>
+    <h3>数据流与标签生成</h3>
+    <p>训练样本的构造分四步：读取一条 episode 的指令与视点序列；用导航图计算起点到目标的距离 d<sub>0</sub> 与各视点到目标的距离序列；按 y = 1 − d<sub>t</sub>/d<sub>0</sub> 生成进度目标，距离小于 3 m 处截断为 1；与动作标签一起打包。推理数据流则在每步输出动作分布与进度预测，束搜索用两者相乘作为累计得分；贪婪模式额外维护上一步进度与上一视点，用于触发回退。与第 023 讲的衔接是动作口径（候选直选加停止），差异是本讲在策略网络内部增加了两条注意力回路与一个辅助回归头；与第 025 讲的衔接是奖励设计：本讲的进度由距离监督，025 讲的内在奖励由指令重建概率产生，两者都属于给策略补充密集信号的工程手段。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>三段代码覆盖共定位前向、进度标签与损失、束打分与回退；数值与正文算例一致。</p>
+
+    <p><strong>片段 1：共定位前向计算</strong></p>
+    <pre class="code"><code>import torch
+import torch.nn as nn
+
+class CoGrounding(nn.Module):
+    """视觉与文本共定位：定位用 h_{t-1}，动作打分用更新后的 h_t。"""
+    def __init__(self, dim=512, view_dim=2048):
+        super().__init__()
+        self.lstm = nn.LSTMCell(dim + view_dim + dim, dim)
+        self.wx = nn.Linear(dim, dim, bias=False)        # 文本查询投影
+        self.wv = nn.Linear(dim, dim, bias=False)        # 视觉查询投影
+        self.wa = nn.Linear(2 * dim, dim, bias=False)    # 动作侧投影
+        self.g = nn.Sequential(nn.Linear(view_dim, dim), nn.ReLU())
+
+    def forward(self, words, views, a_prev, h_prev, c_prev):
+        # words: (B, L, dim)；views: (B, K, view_dim)；a_prev: (B, dim)
+        z_text = torch.einsum("bd,bld->bl", self.wx(h_prev), words)
+        alpha = torch.softmax(z_text, dim=-1)            # 文本注意力权重
+        x_hat = torch.einsum("bl,bld->bd", alpha, words)  # 定位后的指令特征
+        z_vis = torch.einsum("bd,bkd->bk", self.wv(h_prev), self.g(views))
+        beta = torch.softmax(z_vis, dim=-1)              # 视觉注意力权重
+        v_hat = torch.einsum("bk,bkd->bd", beta, views)  # 定位后的视图特征
+        h_now, c_now = self.lstm(torch.cat([x_hat, v_hat, a_prev], -1),
+                                 (h_prev, c_prev))
+        logits = torch.einsum("bd,bkd->bk",
+                              self.wa(torch.cat([h_now, x_hat], -1)),
+                              self.g(views))
+        return torch.softmax(logits, -1), alpha, beta, v_hat, h_now, c_now</code></pre>
+    <p>解读：<strong>（1）</strong>文本与视觉的查询都用 h_prev，动作打分用更新后的 h_now；顺序颠倒会让当前动作信息泄漏进定位注意力，训练集分数虚高。<strong>（2）</strong>视觉定位与候选打分共享同一个 g(·) 与同一组视图特征，这是「注意力范围取可通行方向」这一经验结论的直接落地：K 个候选同时服务感知与决策。<strong>（3）</strong>文本特征在这里省略了位置编码的叠加，复现时应在词编码后逐词加上 PE(x<sub>l</sub>)，原文明确使用位置编码。<strong>（4）</strong>α 与 β 都返回给调用方，α 是进度监控的输入之一，β 可用于可视化审计。</p>
+
+    <p><strong>片段 2：进度标签与加权损失</strong></p>
+    <pre class="code"><code>import torch
+
+def progress_target(dist_now, dist_start, stop_radius=3.0):
+    """进度目标：起点为 0，靠近目标趋近 1；小于 3m 置 1；可低于 0。"""
+    if dist_now &lt; stop_radius:
+        return 1.0
+    return 1.0 - dist_now / dist_start
+
+def weighted_loss(p_action, a_star, p_pm, y_pm, lam=0.5):
+    """动作交叉熵与进度均方误差的加权和；按时间步求和，与论文公式一致。"""
+    ce = -torch.log(p_action.gather(1, a_star.unsqueeze(1)).squeeze(1))
+    mse = (y_pm - p_pm) ** 2
+    return (lam * ce + (1.0 - lam) * mse).sum()
+
+# 五步算例（正文表）：教师概率、进度预测、距离序列
+pk = torch.tensor([[0.55], [0.62], [0.48], [0.51], [0.70]])
+a_star = torch.zeros(5, dtype=torch.long)
+pm = torch.tensor([0.05, 0.22, 0.40, 0.70, 0.60])
+dist = [10.0, 8.2, 6.1, 3.4, 2.1]
+y = torch.tensor([progress_target(d, 10.0) for d in dist])
+print(y)                                        # [0.0, 0.18, 0.39, 0.66, 1.0]
+print(weighted_loss(pk, a_star, pm, y))         # 约 1.5028</code></pre>
+    <p>解读：<strong>（1）</strong>标签函数保留负值分支：当 dist_now 大于 dist_start 时不截断，目标为负，与 tanh 的负半轴对应；若实现中把目标限制在 [0, 1]，绕路惩罚会消失。<strong>（2）</strong>损失按时间步求和，与论文公式一致；工程实现若改为按步平均，梯度尺度缩小到 0.3006（1.5028 ÷ 5），需要与学习率配套调整。<strong>（3）</strong>算例输出 1.5028，与正文逐步表一致；末步 MSE 0.16 的来源是 0.60 与截断值 1.0 的差。</p>
+
+    <p><strong>片段 3：束打分与进度回退</strong></p>
+    <pre class="code"><code>def beam_factor(action_prob, progress):
+    """束得分因子：动作概率乘进度估计（原文 2.4 节）。"""
+    return action_prob * progress
+
+def progress_inference(probs, progresses, prev_progress):
+    """贪婪模式：进度不升就按动作概率降序改选，直到进度不再下降。"""
+    order = sorted(range(len(probs)), key=lambda i: probs[i], reverse=True)
+    for idx in order:
+        if progresses[idx] >= prev_progress:
+            return idx                              # 进度不再下降即接受
+    return order[0]                                 # 全部下降时退回首选
+
+# 算例：第一步 a1/a2 的动作概率与进度
+p1 = [0.60, 0.40]
+pm1 = [0.30, 0.65]
+print(beam_factor(p1[0], pm1[0]), beam_factor(p1[1], pm1[1]))
+# 0.18 与 0.26：进度因子把第一步排序从 a1 翻到 a2
+print(progress_inference([0.7, 0.3], [0.4, 0.8], prev_progress=0.5))
+# 1：首选动作进度 0.4 低于 0.5，改选进度 0.8 的次高分动作</code></pre>
+    <p>解读：<strong>（1）</strong>束因子用乘法，进度对候选路线的作用是单调加权；配合状态因子化搜索时，进度分同样进入同一状态最优路径的比较。<strong>（2）</strong>回退函数返回动作下标，调用方负责把环境退回上一视点；真实实现要记录被退回过的动作，避免同一动作反复触发。<strong>（3）</strong>算例显示第一步束因子 0.18 与 0.26 的翻转效果；这正是正文两段束表中 a2 → c1 最终胜出的起点。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>进度目标口径不一致</strong>：任务能跑通但进度头学不动，或学出常量输出。<strong>根因</strong>：目标值域与输出激活不匹配，例如把目标限制在 [0, 1] 却允许绕路样本，或用 sigmoid 输出却回传负目标。<strong>修复</strong>：按起点归一的线性公式生成目标，允许负值，3 m 处截断为 1；输出端用 tanh；上线前打印目标分布核对负值比例。</li>
+      <li><strong>定位注意力的查询用错状态</strong>：训练损失明显更低，验证集提升有限。<strong>根因</strong>：把 h<sub>t</sub> 当作文本与视觉注意力的查询（正确做法是用 h<sub>t−1</sub>），当前动作信息泄漏进注意力，训练与推理分布不一致。<strong>修复</strong>：严格按原文顺序实现，定位查询 h<sub>t−1</sub>、动作打分 [h<sub>t</sub>; x̂<sub>t</sub>]，并在单元测试里断言前向依赖。</li>
+      <li><strong>tanh 饱和导致后期学不动</strong>：接近目标的样本误差大、梯度小。<strong>根因</strong>：目标截断为 1 时持续拉高输出，tanh 在 0.9 以上的导数不足 0.19，在 0.99 以上不足 0.02。<strong>修复</strong>：监控预激活分布；必要时对进度项做梯度截断或把均方误差换成对饱和更友好的形式，并保持与动作项的权重平衡。</li>
+      <li><strong>回退规则与步数上限互相挤压</strong>：模型频繁回退，episode 被截断，指标随之下降。<strong>根因</strong>：回退每次多 2 个动作，10% 触发率下单条 5.44 步路径平均多 1.09 步（约 24.5% 长度开销），与 20 步上限叠加后余量变小。<strong>修复</strong>：统计回退触发率与额外步数；对同一动作设置回退次数上限；在离线评估中把回退开销计入路径长度再比较。</li>
+      <li><strong>束搜索下的评测口径混用</strong>：同一模型 OSR 与 SPL 差异巨大。<strong>根因</strong>：消融表只取最后选中轨迹计算 OSR 与 SPL，挑战赛提交要求记录全部经过视点，SPL 会被轨迹长度放大项压到 0.01 至 0.02 量级。<strong>修复</strong>：在实验记录中写明两者，报告时优先给出可复现的执行轨迹口径，并单列提交数字（口径定义见第 006、007 讲）。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>给定起点距离 12 m，距离序列 [12.0, 9.0, 5.5, 2.8, 1.5]，写出进度目标序列；若某步距离为 14 m，目标是多少？<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>目标为 1 − d/12：0.00、0.25、0.54、1.00（2.8 m 与 1.5 m 都小于 3 m，截断为 1.00）；14 m 时目标为 1 − 14/12 ≈ −0.17，说明绕路进入负半轴。</div></details>
+      </li>
+      <li>用正文五步算例的数据，把 λ 改为 0.8 与 0.2，重算总损失，说明进度项在训练早期与晚期分别起什么作用。<span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>动作交叉熵之和 2.8398，进度均方误差之和 0.1658。λ = 0.8 时 L ≈ 2.3050；λ = 0.2 时 L ≈ 0.7006。λ 偏大时动作项主导，进度正则弱；λ 偏小时进度项主导，动作梯度被稀释。</div></details>
+      </li>
+      <li>复现两段束搜索算例：动作联合概率 0.42、0.18、0.22、0.18；进度因子下 0.0504、0.0432、0.1073、0.0585。说明为什么进度因子能翻转排序，再给出一组使排序不翻转的概率。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>动作概率高的路线（a1 → b1）进度低，动作概率低的路线（a2 → c1）进度高，乘积后后者胜出。若把 a2 的进度降到 0.30 以下或把 a1 的进度提到 0.70 以上，排序回到 a1 → b1。</div></details>
+      </li>
+      <li>推导共定位模块的参数规模：设词特征与隐藏维度均为 512、视图特征 2048，列出各线性层与 LSTMCell 的参数量，并说明与视图数 K 是否相关。<span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>LSTMCell 输入 512 + 2048 + 512 = 3072，隐藏 512，参数约 4 × 512 × (3072 + 512) ≈ 7.34 M；W<sub>x</sub>、W<sub>v</sub>、W<sub>a</sub> 各 512² ≈ 0.26 M；g 第一层 2048 × 512 ≈ 1.05 M。所有投影对视图共享，参数量与 K 无关，K 只影响前向计算量。</div></details>
+      </li>
+      <li>设计一套「进度监督可靠性」诊断流程：在 val-unseen 上采集轨迹，比较进度预测与真实归一化距离的关系，至少给出三个诊断信号、各自的判据与误报来源，并论证为什么「进度拟合好」不必然带来「导航成功率提升」；给出改进方案与至少三组对照实验。<span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>信号一：预测与目标的相关系数（判据：先升后降或高位平台；误报来源：目标集中在 1）。信号二：回退触发率与额外步数（判据：触发率异常高说明进度噪声大）。信号三：停止步的进度分布（判据：停止时进度普遍偏低说明头尾不一致）。拟合好但策略差的原因可能在于辅助信号被动作头忽略、或数据分布覆盖不足；对照实验：去掉进度项、只用进度做束打分、把进度换成距离直接回归。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>共定位把文本注意力与视觉注意力接到同一记忆回路：定位查询用 h<sub>t−1</sub>，动作打分用 [h<sub>t</sub>; x̂<sub>t</sub>]；视觉注意力范围取可通行方向（原文脚注：略优于全部 36 视角）。</li>
+      <li>进度监控器以历史状态、定位视图与文本注意力权重为输入，输出 tanh 完成度；目标按 y = 1 − d<sub>t</sub>/d<sub>0</sub> 生成，3 m 处截断为 1，绕路可为负值。</li>
+      <li>损失为动作交叉熵与进度均方误差等权相加（λ = 0.5）；tanh 在接近目标处饱和，实算预激活 2.0 与 3.0 的导数分别为 0.0707 与 0.0099，训练后期需要监控。</li>
+      <li>推理期进度分数乘进束得分（p<sup>pm</sup> × p<sub>k</sub>），两段束算例中把最优路线从 0.4200 的 a1 → b1 翻到束分 0.1073 的 a2 → c1；贪婪模式用「进度下降即回退」纠错。</li>
+      <li>消融与口径：共定位 +15.0、进度监控 +2.0、进度回退 +2.0、带进度的束搜索 +13.0 个百分点（val-unseen，均无数据增广）；完整系统测试集未见环境 0.61 SR、4.48 m NE、0.56 SPL。</li>
+      <li>下一讲把「密集信号」从距离监督换成指令重建概率：匹配评论器给整条轨迹打出回环式分数，用内在奖励与外部奖励混合训练导航器（第 025 讲）。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch023.html">← 第 023 讲：全景动作空间的设计抉择</a>
+    <a class="next" href="ch025.html">第 025 讲：RCM：强化跨模态匹配 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.06 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:11.5px !important;letter-spacing:.06em !important;color:rgba(71,85,105,.45) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#7e8ba0 !important;font-size:11.5px !important;line-height:1.8 !important;text-align:center !important;padding:5px 12px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

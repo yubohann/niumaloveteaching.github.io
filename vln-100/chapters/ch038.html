@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 038 讲｜GridMM：动态网格记忆 | 视觉语言导航课程 · VLN-100</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第二篇 · 离散方法谱系：从模块到预训练</span>
+    <span class="sep">/</span>
+    <span>第 038 讲</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第二篇 · 离散方法谱系：从模块到预训练</div>
+    <h1>第 038 讲｜GridMM：动态网格记忆</h1>
+    <p class="lead">本讲把历史记忆从“图节点”和“局部栅格”推进到全局动态网格：CLIP 网格特征按深度投影到统一坐标系，每步以智能体为中心重建 N×N 的俯视地图，单元内用指令相关性聚合替代平均池化；在 R2R-CE val unseen 上把成功率从无地图基线的 45.19 推到 49.05，并给出分辨率-内存-精度三者的实算对照。</p>
+    <ul class="meta">
+      <li>主题：网格记忆 / 动态自中心地图 / 指令相关性聚合 / 跨数据集评测</li>
+      <li>关键公式：L<sub>t</sub> = 2·max(max|x<sup>rel</sup>|, max|y<sup>rel</sup>|)；α<sub>j</sub> = max<sub>l</sub> A<sub>j,l</sub></li>
+      <li>预计学时：60 分钟</li>
+      <li>前置讲：第 037 讲（BEVBert：度量+拓扑混合地图）</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>会写：GridMM 的数据流（网格特征提取、深度投影、绝对坐标、动态自中心变换、网格聚合、动作融合）与每一步的张量形状。</li>
+      <li>会算：按 CLIP-ViT-B/32 与 12 视角实算每步特征数、记忆库容量、地图 token 数，并对比 N = 8/14/20 三种分辨率的收益与代价。</li>
+      <li>会实现：指令相关性聚合模块与缓存机制，说明它能替代平均池化并减少重复计算的原因。</li>
+      <li>会判断：在拓扑图、语义图、物体特征、网格记忆之间做选择，给出以任务与传感器条件为依据的判据。</li>
+      <li>会诊断：坐标变换、深度对齐、缓存失效、空单元掩码、动态分辨率五类问题，能写出检查清单。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 036 讲用在线拓扑图解决了“全局动作空间”问题，第 037 讲用局部度量图解决了“短程空间推理”问题，两者的记忆载体分别是图节点与固定大小的栅格。GridMM（Wang 等 2023，ICCV 2023，arXiv:2307.12907v4）论文把已有的历史记忆方式归成三类并逐一点出缺口：循环状态把历史压进固定向量，信息随步数衰减；拓扑图保留节点连接，节点特征是压缩向量，物体与场景的空间关系损失较多；俯视语义图空间关系清楚，但语义类别由预定义标签限定，“冰箱”这类未列入标签表的物体与“蓝色沙发”这类属性无法表达。</p>
+    <p>论文提出的第四类载体是全局动态网格：把历史观测的网格特征按绝对坐标投进统一俯视地图，地图随访问范围扩大，每步以智能体当前位置与朝向重建坐标系，并把每个网格单元内的特征按与指令的相关性聚合成一个向量。与 BEVBert 的局部度量图相比，三处差异被论文明确列出：GridMM 的网格覆盖全局已访问环境，同时服务局部与全局动作预测；地图单元表示中同时含视觉与语言信息；地图随环境扩张，尺寸不固定。</p>
+    <p>本讲需要解决三个工程问题：坐标从哪里来（深度与位姿如何折算成平面坐标）、单元内特征如何聚合（数量可超过 600 个）、分辨率怎么选（论文默认 14×14，主表消融给出 8/14/20 三档）。这三个问题决定内存、延迟与精度，也是 039 讲四范式横评的素材来源。</p>
+    <p>读完本讲，你应能独立核算 GridMM 在任意历史长度下的显存与计算量，并说明它相对拓扑图与语义图的增益在哪些数据集上出现、在哪些数据集上消失。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p>本讲按“四类载体对比、特征与坐标、动态地图、聚合方法、位置编码、动作融合、训练、结果与边界”展开。所有实算数字先经 Python 验证，论文结果标注来源、表号与 split。</p>
+
+    <h3>1. 四类环境表示的定位</h3>
+    <p>论文引言给出的对照可以整理成下表。前三类在 032 至 037 讲均已出现过，第四行为本讲方法。</p>
+    <table>
+      <tr><th>载体</th><th>代表工作</th><th>空间关系</th><th>信息粒度</th><th>主要缺口</th></tr>
+      <tr><td>循环或显式历史</td><td>RecBERT（032）、HAMT（034）</td><td>仅时序，无显式几何</td><td>全景摘要 token</td><td>不显式建模物体间位置关系</td></tr>
+      <tr><td>在线拓扑图</td><td>DUET（036）</td><td>节点连接与距离</td><td>压缩节点特征</td><td>节点内空间细节少</td></tr>
+      <tr><td>俯视语义图</td><td>CM2 等语义图方法</td><td>精确的空间位置</td><td>预定义语义类别</td><td>标签表外的物体与属性缺失</td></tr>
+      <tr><td>动态网格记忆</td><td>GridMM（038）</td><td>全局俯视网格</td><td>CLIP 网格特征，受指令调制</td><td>记忆库随步数增长，多楼层待解</td></tr>
+    </table>
+    <p>选择第四类的判据是“指令提到的视觉证据是否超出预定义标签”。当指令频繁引用属性与背景结构（“木桌旁”“蓝色沙发后面”）时，语义图的标签表成为信息瓶颈，网格特征可以绕过该瓶颈。</p>
+
+    <h3>2. 网格特征与绝对坐标</h3>
+    <p>设第 t 步全景含 K 张视角图，每张经 CLIP-ViT-B/32 提取网格特征 g<sub>t,k</sub> ∈ ℝ<sup>H×W×D</sup>，其中 H、W 为特征图高宽，D 为通道数。按 224×224 输入与 patch 32 推演，H = W = 7，D = 768，K 按课程公共口径取 12，则每步特征数 I = K·H·W = 12 × 7 × 7 = 588。深度图缩放到同一分辨率后记为 d′<sub>t,k</sub>，两者逐元素对应是投影正确的前提。</p>
+    <p>把视角内像素索引 (k, h, w) 统一记作 i，其绝对坐标由射线的水平距离与画幅角度给出：</p>
+    <div class="formula">
+      P(ĝ<sub>t,i</sub>) = ( 𝒳<sub>t</sub> + d<sup>line</sup><sub>t,i</sub> · cos θ<sub>t,i</sub>, 𝒴<sub>t</sub> + d<sup>line</sup><sub>t,i</sub> · sin θ<sub>t,i</sub> )
+      <span class="note">(𝒳<sub>t</sub>, 𝒴<sub>t</sub>) 为智能体当前平面坐标；θ<sub>t,i</sub> 为特征 i 的方位角（视角角加 patch 偏移）；d<sup>line</sup><sub>t,i</sub> 由该点深度与俯仰角折算的欧氏水平距离。智能体定位由仿真器提供</span>
+    </div>
+    <p>记忆库按集合并集增长，特征与其坐标成对保存：M<sub>t</sub> = M<sub>t−1</sub> ∪ { [ĝ<sub>t,i</sub>, P(ĝ<sub>t,i</sub>)] }<sub>i=1..I</sub>。每步新增 588 个条目，每条约 3 KiB（768 维 float32），合计约 1.72 MiB；t = 15 时记忆库约 25.84 MiB，换 float16 为 12.92 MiB。这是 GridMM 相对稀疏载体最主要的代价，第 9 小节与代码片段 3 给出完整账目。</p>
+
+    <h3>3. 动态自中心地图与边长</h3>
+    <p>绝对坐标地图存在两个问题：与指令对齐效率低；没有先验时难以确定固定地图的尺度。论文改用动态相对坐标：每步以智能体位置为原点、当前朝向为 y 轴正向，把 M<sub>t</sub> 中全部特征旋转平移：</p>
+    <div class="formula">
+      P<sup>rel</sup><sub>t</sub>(ĝ<sub>s,i</sub>) = ( (x<sub>s,i</sub> − 𝒳<sub>t</sub>) cos Θ<sub>t</sub> + (y<sub>s,i</sub> − 𝒴<sub>t</sub>) sin Θ<sub>t</sub>, (y<sub>s,i</sub> − 𝒴<sub>t</sub>) cos Θ<sub>t</sub> − (x<sub>s,i</sub> − 𝒳<sub>t</sub>) sin Θ<sub>t</sub> )
+      <span class="note">Θ<sub>t</sub> 为两坐标系的朝向差；变换后地图始终以智能体为中心且与当前全景朝向对齐</span>
+    </div>
+    <p>地图边长取所有历史特征相对坐标的最大绝对值：</p>
+    <div class="formula">
+      L<sub>t</sub> = 2 · max( max<sub>s≤t</sub> max<sub>i</sub> |x<sup>rel</sup><sub>s,i</sub>|, max<sub>s≤t</sub> max<sub>i</sub> |y<sup>rel</sup><sub>s,i</sub>| )
+      <span class="note">L<sub>t</sub> 随访问范围扩张；地图为正方形，边长取两轴最大值以保证全部历史特征落入</span>
+    </div>
+    <p>随后把地图均分为 N×N 个单元，特征按相对坐标落入单元，每单元聚合为 1 个向量，得到地图特征 M<sub>t</sub> ∈ ℝ<sup>N×N×D</sup>。论文统计显示，各数据集上地图边长在导航过程中从约 10 m 增至约 20 m；按 N = 14 计算，单元边长从约 0.714 m 变到约 1.429 m，早期分辨率高于末期，这与 BEVBert 固定 0.5 m 单元、全图 10.5 m×10.5 m 的设计形成对照。<strong>动态边长同时解决了“地图不知道要多大”和“早期单元过粗”两个问题。</strong></p>
+    <p>论文对比了绝对坐标消融（仅去掉坐标变换、保留动态边长）：R2R-CE val unseen 上相对坐标系得 49.05 SR / 40.99 SPL，绝对坐标系得 48.72 / 40.14，说明对齐效率带来约 0.33 个百分点 SR 与 0.85 SPL 的差距。</p>
+
+    <h3>4. 指令相关性聚合</h3>
+    <p>单元内特征数 J 在导航末段可超过 600。平均池化会让少数关键线索被大量背景特征稀释，论文改为先给每个特征一个与整条指令的相关性分数，再加权求和。设单元内特征矩阵为 M<sup>rel</sup><sub>t,m,n</sub> ∈ ℝ<sup>J×D</sup>，指令词元表示为 W′ ∈ ℝ<sup>L×D</sup>：</p>
+    <div class="formula">
+      A = (M<sup>rel</sup> W<sub>1</sub><sup>A</sup>) (W′ W<sub>2</sub><sup>A</sup>)<sup>T</sup>；α<sub>j</sub> = max<sub>l</sub> A<sub>j,l</sub>；η = softmax({α<sub>j</sub>})；E<sub>t,m,n</sub> = Σ<sub>j</sub> η<sub>j</sub> (W<sup>E</sup> ĝ<sub>t,j</sub>)
+      <span class="note">A ∈ ℝ<sup>J×L</sup>，每个特征与每个词元各有一个分数；先对词元取最大，得到“该特征最相关的那条线索有多相关”；softmax 在单元内归一化，再对特征加权求和</span>
+    </div>
+    <p>先取最大再归一化的顺序值得解释：若先对词元做 softmax 再取最大，会强迫每个特征把权重摊给所有词元；先取最大保留了“特征只需对应一个词元”的稀疏结构，符合“某块区域可能只承载指令中的一处描述”的先验。单个单元在 J = 600、L = 32 时，A 有 19,200 个元素，按 2·J·L·D 估计约 29.5 MFLOPs；这部分计算只在特征首次进入某单元时发生，配合缓存可以避免重复。</p>
+    <p>缓存思想来自论文附录 D：W′W<sub>2</sub><sup>A</sup> 在整条 episode 内不变，ĝW<sub>1</sub><sup>A</sup> 与 W<sup>E</sup>ĝ 对同一特征也不变，因此可以预先算好并在后续步复用，地图更新时只重算特征落入哪个单元。按每步新增 I = 588 个特征计算，t = 15 时无缓存需要 70,560 行相关性计算，有缓存为 8,820 行，比值为 8.00；t = 30 时比值为 15.50。这解释了论文“缓存显著降低计算量”的表述。</p>
+
+    <h3>5. 位置编码与地图特征</h3>
+    <p>聚合后的单元向量还缺少该单元相对当前位置的几何信息，论文把每个单元中心与智能体的连线距离 q<sup>M</sup><sub>t</sub> 与相对水平角 h<sup>M</sup><sub>t</sub> = (sin Φ, cos Φ) 编码后相加：</p>
+    <div class="formula">
+      M<sub>t</sub> = LN(E<sub>t</sub>) + LN(W<sup>M</sup> [q<sup>M</sup><sub>t</sub>; h<sup>M</sup><sub>t</sub>])
+      <span class="note">E<sub>t</sub> 为全部单元聚合结果；两项分别做 LayerNorm 以平衡视觉与几何量纲</span>
+    </div>
+    <p>这一写法与 034 讲观测编码、037 讲单元极坐标嵌入同源：内容向量与位置向量分路归一化后相加，避免位置量纲压过视觉量纲。空单元的处理论文未单独说明，实现上应把无特征的单元掩码掉，不参与后续注意力，也不让其在相关性软最大化中分走权重。</p>
+
+    <h3>6. 轨迹记忆与跨模态推理</h3>
+    <p>地图之外，论文保留一条轨迹记忆：历史访问节点的全景平均特征、当前节点特征与候选节点特征，各自加上相对距离、相对角与步数嵌入，形成 T<sub>t</sub>；stop token 同时加入观测序列与轨迹序列。推理分两段：第一段把 [M<sub>t</sub>; T<sub>t</sub>] 与指令做跨模态融合，并用历史环境推理（HER）目标监督；第二段用查询为 [O′<sub>t</sub>; T′<sub>t</sub>]、键值为 [W′; T′<sub>t</sub>; M′<sub>t</sub>] 的交叉注意力做动作推理，输出局部动作分数 S<sup>O</sup><sub>t</sub>（当前全景候选视角）与全局动作分数 S<sup>T</sup><sub>t</sub>（地图中可导航节点），再按 DUET 的门控方式融合：</p>
+    <div class="formula">
+      S<sup>fusion</sup><sub>t</sub> = λ<sub>t</sub> S<sup>O</sup><sub>t</sub> + (1 − λ<sub>t</sub>) S<sup>T</sup><sub>t</sub>，λ<sub>t</sub> = sigmoid(FFN([Ô<sub>t,0</sub>; T̂<sub>t,0</sub>]))
+      <span class="note">Ô<sub>t,0</sub> 与 T̂<sub>t,0</sub> 为两个模态的 stop token 输出；权重由当前状态决定，逐帧变化</span>
+    </div>
+    <p>该融合接口沿用 DUET 的设计，说明 036 至 038 三讲在动作层共享同一套“局部加全局”范式，差异集中在记忆载体。<strong>读论文时把“记忆模块”与“动作模块”分开看，能更快定位创新点与复用点。</strong></p>
+
+    <h3>7. 预训练与微调配方</h3>
+    <p>预训练使用四个目标：掩码语言建模（MLM，15% 掩码）、掩码视角建模（MVM，15% 掩码，目标为 ImageNet 分类分布）、单步动作预测（SAP，对融合分数做交叉熵）、历史环境推理（HER，只给地图与轨迹、不给全景，仍要求预测教师动作，损失与 SAP 同式）。HER 的作用是逼迫地图与轨迹承载可决策的信息，防止模型只在全景上做反应。</p>
+    <p>微调沿用 DAgger 思想：监督来自伪交互演示器，它在每个状态下选择到终点总距离最短的可导航节点作为目标。编码器层数为语言 9、全景 2、地图与轨迹 1、跨模态推理 4，隐藏维 768，Transformer 参数用 LXMERT 初始化。训练配置按数据集不同：REVERIE 与 R2R 预训练批 32、学习率 5e-5、100k 迭代，微调批 4、学习率 1e-5、50k 迭代，3 张 RTX3090；SOON 预训练批 16、40k 迭代，微调批 2、20k 迭代；R2R-CE 从 R2R 预训练模型迁移，微调批 8、学习率 1e-5、30 个 epoch。所有数据集以 val unseen 的 SPL 选择最优模型。</p>
+
+    <h3>8. 结果：离散与连续两线</h3>
+    <p>离散环境下论文报告 REVERIE、R2R、SOON 三个数据集，连续环境报告 R2R-CE，附录补 RxR-CE。关键数字整理如下，均标注来源表与 split。</p>
+    <table>
+      <tr><th>数据集与 split</th><th>指标</th><th>GridMM</th><th>对照（DUET 或 BEVBert）</th><th>差值</th></tr>
+      <tr><td>REVERIE val unseen（来源：GridMM 论文表 1）</td><td>SR / SPL</td><td>51.37 / 36.47</td><td>46.98 / 33.73（DUET）</td><td>+4.39 / +2.74</td></tr>
+      <tr><td>REVERIE test unseen（同上）</td><td>SR / SPL / RGS</td><td>53.13 / 36.60 / 34.87</td><td>52.51 / 36.06 / 31.88（DUET）</td><td>+0.62 / +0.54 / +2.99</td></tr>
+      <tr><td>R2R val unseen（来源：GridMM 论文表 2）</td><td>SR / SPL</td><td>75 / 64</td><td>75 / 64（BEVBert）</td><td>持平</td></tr>
+      <tr><td>SOON val unseen（来源：GridMM 论文表 3）</td><td>SR / SPL</td><td>37.46 / 24.81</td><td>36.28 / 22.58（DUET）</td><td>+1.18 / +2.23</td></tr>
+      <tr><td>R2R-CE val unseen（来源：GridMM 论文表 4，†同一航点预测器）</td><td>OSR / SR / SPL</td><td>61 / 49 / 41</td><td>58 / 47 / 39（DUET†）</td><td>+3 / +2 / +2</td></tr>
+      <tr><td>R2R-CE test unseen（同上）</td><td>OSR / SR / SPL</td><td>56 / 46 / 39</td><td>50 / 42 / 36（DUET†）</td><td>+6 / +4 / +3</td></tr>
+      <tr><td>RxR-CE test unseen（来源：GridMM 论文附录表 8）</td><td>NE / SR / SPL / nDTW</td><td>8.42 / 36.26 / 30.14 / 48.17</td><td>9.78 / 29.93 / 23.12 / 42.46（DUET）</td><td>SR +6.33 / SPL +7.02</td></tr>
+    </table>
+    <p>三条读法。<strong>第一</strong>，REVERIE 与 SOON 的增益最大，两者都是目标导向、指令描述房间与物体，细粒度空间线索价值高。<strong>第二</strong>，R2R 上与 BEVBert 持平，说明在逐步指令的短路径任务上，局部度量图的收益已接近饱和，网格的全局展开没有额外贡献。<strong>第三</strong>，R2R-CE 的增益明显但需注意协议：表 4 中带 † 的方法共用同一航点预测器，GridMM 与 DUET† 可比；该表与 BEVBert 论文表 2 的 59/50 使用不同迁移管线，两数不宜直接放入同一结论。</p>
+
+    <h3>9. 消融、统计与计算账</h3>
+    <p>地图对照消融（R2R-CE val unseen，GridMM 论文表 5）：无地图 45.19 / 37.82；DUET 拓扑图 47.02 / 38.86；俯视语义图 46.36 / 38.41；VinVL 物体特征 47.61 / 40.13；GridMM 49.05 / 40.99。三个结论：建图本身带来约 1.83 至 3.86 个百分点 SR；语义图受标签表限制，甚至低于拓扑图；CLIP 网格特征优于物体特征，论文归因于语义空间更大、能覆盖结构与背景。</p>
+    <p>组件消融（同上表 6）：只用地网格 45.19；加绝对坐标但含轨迹与相关性聚合 48.72；去掉轨迹 47.42；去掉相关性聚合改用平均池化 48.63；全模型 49.05。轨迹与相关性聚合各自贡献约 1.6 与 0.4 个百分点 SR。分辨率消融（表 7）：8×8 为 47.07 / 39.49；14×14 为 49.05 / 40.99；20×20 为 49.86 / 42.52。14 到 20 分辨率单元数增至 2.04 倍，SR 仅增 0.81 个百分点，SPL 增 1.53，论文据此取 14×14 为平衡点。</p>
+    <p>计算账（本讲实算，脚本见代码片段 3）：每步网格特征 588 个，按 CLIP-ViT-B/32 推演；记忆库 t = 15 为 25.84 MiB（float32）；地图张量 14×14 为 588 KiB；交叉注意力中地图作键值的 token 数为 196，论文指出 BEVBert 的度量图特征超过 400 个；按论文附录交叉注意力公式估算，查询长度 37 时键值 196 与 441 的单层成本约为 0.57 与 1.18 GFLOPs，比值约 2.06。这些量级解释了 GridMM 强调“地图 token 少且只作键值”的原因。</p>
+    <p>论文统计还给出两个边界数字：地图边长在导航过程中约从 10 m 增至 20 m；末段单元内特征数最大值超过 600，而 t = 15 时的平均值约为 45，说明特征分布高度不均，平均池化会把少量高相关特征淹没在数百个背景特征中。这一分布事实是相关性聚合的实证依据。</p>
+
+    <h3>10. 适用边界与失效模式</h3>
+    <ul>
+      <li><strong>多楼层未解决</strong>：论文结论明确把多层建筑列为遗留问题。平面网格假设同一楼层，楼梯与上下层对象需要额外的高度维度或分层地图。</li>
+      <li><strong>记忆库随步数线性增长</strong>：每步 1.72 MiB，长 episode 或大批量并行时显存压力大；缓存减少的是计算，压缩存储需要额外设计。</li>
+      <li><strong>深度与定位依赖</strong>：坐标来自深度与位姿，深度噪声、镜面与玻璃导致的无效深度会投出错误坐标；真机部署要评估深度传感器可用性。</li>
+      <li><strong>动态环境</strong>：地图只增不改，物体移动或光照剧变后旧特征仍留在记忆库，产生过期证据。</li>
+      <li><strong>协议混合风险</strong>：R2R-CE 数字依赖航点预测器与迁移管线，跨论文比较前先对齐这两项。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>把 GridMM 落成工程对象需要一张接口与张量表、一张超参表、一张分辨率取舍表，并说清与 036、037 讲的分工。</p>
+
+    <h3>接口与张量形状</h3>
+    <table>
+      <tr><th>模块</th><th>输入</th><th>输出</th><th>形状示例（B 为批大小）</th></tr>
+      <tr><td>网格特征提取</td><td>视角图（K 张）</td><td>CLIP 网格特征</td><td>[B, K, H×W, D]，H = W = 7、D = 768</td></tr>
+      <tr><td>坐标投影</td><td>网格特征、深度、位姿</td><td>特征与绝对坐标对</td><td>[B, I, D] 与 [B, I, 2]，I = K·H·W = 588</td></tr>
+      <tr><td>记忆库</td><td>历史特征与坐标</td><td>不断增大的集合</td><td>步数 t 时条目数 t·I</td></tr>
+      <tr><td>动态地图</td><td>记忆库、当前位姿</td><td>地图特征</td><td>[B, N, N, D]，N = 14</td></tr>
+      <tr><td>轨迹记忆</td><td>历史与候选节点</td><td>轨迹 token</td><td>[B, t + n + 1, D]（含 stop）</td></tr>
+      <tr><td>动作头</td><td>局部与全局嵌入</td><td>融合分数</td><td>[B, 局部候选数 + 全局节点数 + 1]</td></tr>
+    </table>
+
+    <h3>超参与取值依据</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>地图分辨率 N</td><td>14</td><td>俯视网格边长（单元数）</td><td>论文表 7：8/14/20 三档中 14 的收益代价比最高</td></tr>
+      <tr><td>网格骨干</td><td>CLIP-ViT-B/32</td><td>单元视觉特征来源</td><td>论文实现；语义空间大于物体检测特征</td></tr>
+      <tr><td>视角骨干</td><td>ViT-B/16（ImageNet）</td><td>全景与轨迹特征</td><td>与 036、037 讲口径一致，便于比较</td></tr>
+      <tr><td>特征维度 D</td><td>768</td><td>全部 transformer 隐藏维</td><td>LXMERT 初始化要求</td></tr>
+      <tr><td>编码器层数</td><td>9 / 2 / 1 / 4</td><td>语言、全景、地图与轨迹、跨模态</td><td>论文配置，与 DUET 保持可比</td></tr>
+      <tr><td>相关性最大池化维度</td><td>词元维</td><td>特征对指令的相关性</td><td>保留“一特征对一线索”的稀疏结构</td></tr>
+      <tr><td>预训练掩码比例</td><td>15%</td><td>MLM 与 MVM</td><td>论文配置，与 BERT 传统一致</td></tr>
+    </table>
+
+    <h3>分辨率取舍表（实算加论文消融）</h3>
+    <table>
+      <tr><th>N</th><th>单元数</th><th>地图 token 数</th><th>20 m 边长时单元边长</th><th>R2R-CE val unseen SR / SPL</th><th>适用条件</th></tr>
+      <tr><td>8</td><td>64</td><td>64</td><td>2.500 m</td><td>47.07 / 39.49</td><td>显存极紧、只关心粗布局</td></tr>
+      <tr><td>14</td><td>196</td><td>196</td><td>1.429 m</td><td>49.05 / 40.99</td><td>论文默认，通用首选</td></tr>
+      <tr><td>20</td><td>400</td><td>400</td><td>1.000 m</td><td>49.86 / 42.52</td><td>细粒度目标，算力与显存充足</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：地图内容与地图几何分离</span>
+      <p>GridMM 把“单元里是什么”（指令相关性聚合的视觉向量）与“单元在哪里”（动态相对坐标与边长）分成两条通路更新：内容在特征进入单元时算一次并缓存，几何每步重算一次且只更新坐标。判据是两者的时间尺度不同，视觉内容不随智能体移动改变，几何关系每步都变。若把两者绑在一起重算，t = 30 时相关性计算量会是无缓存账目的 15.50 倍；若只更新内容不动几何，地图与当前朝向脱节，候选与指令的对齐失效。036 讲的拓扑节点更新是同一思路的图版本。</p>
+    </div>
+    <p>与前后讲的衔接：036 讲提供全局动作空间与门控融合接口，037 讲提供局部度量图与地图预训练目标，本讲把地图从局部扩到全局并引入指令相关性聚合。下一讲把 032 至 038 的四类记忆载体放进同一张对比表，给出内存、延迟、精度三笔账与选择决策树。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>三段代码分别给出记忆库更新、指令相关性聚合、分辨率与容量核算。接口以论文公开设计为参照，实现随版本演进以仓库为准。</p>
+
+    <p><strong>片段 1：记忆库更新与坐标投影</strong></p>
+    <pre class="code"><code>import torch
+
+class GridMemoryBank:
+    """保存 CLIP 网格特征与其绝对坐标；每步在智能体坐标系重建俯视地图。"""
+    def __init__(self, dim=768):
+        self.dim = dim
+        self.feats = []      # 每项 (K*H*W, D)
+        self.coords = []     # 每项 (K*H*W, 2)，单位米
+
+    def add_step(self, feats, depths, angles, pose):
+        # feats: (K, H, W, D) 取 CLIP-ViT-B/32 在 MLP 头之前的输出
+        # depths: (K, H, W) 已缩放到与 feats 同一分辨率；angles 为每个 patch 的绝对水平角
+        # pose: (x, y)，来自仿真器定位；俯仰贡献已折算进水平距离
+        k, h, w = depths.shape
+        cos_a, sin_a = torch.cos(angles), torch.sin(angles)
+        dx = depths * cos_a
+        dy = depths * sin_a
+        xs = pose[0] + dx
+        ys = pose[1] + dy
+        self.feats.append(feats.reshape(k * h * w, self.dim))
+        self.coords.append(torch.stack([xs.reshape(-1), ys.reshape(-1)], dim=-1))
+
+    def egocentric_map(self, pose, n_cells=14, yaw=0.0):
+        """把所有历史特征变换到当前坐标系并统计边长，再按 N×N 分格。"""
+        f = torch.cat(self.feats, dim=0)                 # (t*I, D)
+        c = torch.cat(self.coords, dim=0)                # (t*I, 2)
+        rel = c - torch.tensor(pose)                     # 平移
+        rot = torch.tensor([[torch.cos(yaw), torch.sin(yaw)],
+                            [-torch.sin(yaw), torch.cos(yaw)]])
+        rel = rel @ rot.t()                              # 旋转到当前朝向
+        side = 2.0 * rel.abs().max().item()              # 论文式(4)：取两轴最大
+        cell = torch.clamp(((rel + side / 2) / side * n_cells).long(),
+                           min=0, max=n_cells - 1)       # 落到单元索引
+        return f, cell, side</code></pre>
+    <p>解读：<strong>（1）</strong>特征与深度必须同分辨率，否则投影出的坐标与特征失去一一对应，这是实现中最先出现的错误来源。<strong>（2）</strong>边长取所有历史特征两轴绝对值的最大值，保证旧特征不会掉出地图；<code>clamp</code> 只处理数值边界，真正越界的坐标应先告警再截断。<strong>（3）</strong>真实实现还需处理同一单元多个特征的聚合、无特征单元的掩码与批量并行；示例只保留投影主干，突出“先投影、后分格、再聚合”的顺序。</p>
+
+    <p><strong>片段 2：指令相关性聚合</strong></p>
+    <pre class="code"><code>import torch
+import torch.nn as nn
+
+class InstructionRelevance(nn.Module):
+    """把单元内 J 个网格特征按与指令的相关性聚合成 1 个向量。"""
+    def __init__(self, dim=768):
+        super().__init__()
+        self.w1 = nn.Linear(dim, dim)     # 特征侧投影，可全 episode 缓存
+        self.w2 = nn.Linear(dim, dim)     # 指令侧投影，可全 episode 缓存
+        self.we = nn.Linear(dim, dim)     # 聚合时的值投影，可缓存
+
+    def forward(self, cell_feats, instruction):
+        # cell_feats: (J, D)；instruction: (L, D)
+        a = self.w1(cell_feats) @ self.w2(instruction).t()   # (J, L) 相关性矩阵
+        alpha = a.max(dim=1).values                          # (J,) 对词元取最大
+        eta = torch.softmax(alpha, dim=0)                    # (J,) 单元内归一化
+        return (eta.unsqueeze(-1) * self.we(cell_feats)).sum(dim=0)
+
+# 关键写法：max 在词元维，softmax 在特征维；顺序颠倒会摊平稀疏结构。
+# 缓存三处投影后，每步只需重算特征到单元的分格关系。</code></pre>
+    <p>解读：<strong>（1）</strong><code>a.max(dim=1)</code> 沿词元维取最大，含义是“该特征最相关的词元分数”；若改为沿特征维取最大，得到的是每个词元的活跃特征，与聚合目标不符。<strong>（2）</strong>softmax 沿特征维归一化，保证单元内权重和为 1；空单元会得到无定义的权重，需在外层按有效特征数过滤。<strong>（3）</strong>三个线性投影在指令不变时结果不变，工程上可按 episode 缓存键值，只对每步新增特征计算，与论文附录 D 的缓存口径一致。</p>
+
+    <p><strong>片段 3：分辨率与容量核算</strong></p>
+    <pre class="code"><code>K, H, W, D = 12, 7, 7, 768          # 12 视角；CLIP-ViT-B/32 在 224 输入下 7x7
+I = K * H * W
+print("每步特征数", I)              # 588
+for t in (10, 15, 30):
+    print(t, round(t * I * D * 4 / 2**20, 2), "MiB f32",
+          round(t * I * D * 2 / 2**20, 2), "MiB f16")
+# 10 -&gt; 17.23/8.61; 15 -&gt; 25.84/12.92; 30 -&gt; 51.68/25.84
+
+for n in (8, 14, 20):
+    print("N=%d" % n, n * n, "个地图 token", round(n * n * D * 4 / 1024, 1), "KiB")
+# 64/192.0; 196/588.0; 400/1200.0
+
+for t in (15, 30):                  # 相关性计算的缓存收益
+    print(t, I * t * (t + 1) // 2, I * t, (t + 1) / 2)
+
+def cross_attn_flops(s, t, h=D):    # 论文附录 D 的交叉注意力公式
+    return 4 * s * h * h + 4 * t * h * h + 4 * s * t * h
+print(round(cross_attn_flops(37, 196) / 1e9, 2),
+      round(cross_attn_flops(37, 441) / 1e9, 2))   # 0.57 对 1.18 GFLOPs</code></pre>
+    <p>解读：<strong>（1）</strong>记忆库按步线性增长，t = 30 时 float32 已需约 51.68 MiB，长 episode 训练要把它计入单样本预算。<strong>（2）</strong>地图 token 从 196 增到 400 只是线性，但交叉注意力里键值长度翻倍会让成本近似翻倍，分辨率取舍要同时看精度与这部分延迟。<strong>（3）</strong>缓存收益比值为 (t+1)/2，t = 30 时约 15.5，是无缓存重算与增量计算的差距；脚本中的 GFLOPs 只统计注意力内核，用于设计比较，不代表整机延迟。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>特征与深度分辨率不一致</strong>：坐标投错位置，地图出现重影，指标不升。根因：网格特征取 7×7，深度仍按原图缩放。修复：在投影入口断言两者形状相等，把缩放写进同一预处理函数，并写一个已知三角形的单测核对坐标。</li>
+      <li><strong>旋转方向或角度符号错误</strong>：地图相对真实环境镜像，短期指标随机波动。根因：相对坐标变换的旋转矩阵方向与自己定义的正朝向相反。修复：用“目标在正前方”“目标在正右方”两个合成样例验证，输出坐标应分别为 y 正、x 正。</li>
+      <li><strong>缓存跨 episode 复用</strong>：换成新指令后旧的相关性分数仍在用，训练损失正常下降但评测偏低。根因：缓存了依赖指令的中间量却没有按 episode 失效。修复：缓存键包含指令标识，只缓存与指令无关的特征侧投影；换 episode 时显式清空。</li>
+      <li><strong>空单元参与归一化</strong>：无特征的单元聚合出零向量后被当作有效位置，注意力被无效位置稀释。根因：没给单元掩码，softmax 在空集合上退化。修复：构造单元有效掩码，空单元在注意力中屏蔽，聚合函数对 J = 0 直接返回零并标记无效。</li>
+      <li><strong>用固定单元边长解读动态地图</strong>：把 1.4 m 的末期单元与 BEVBert 的 0.5 m 单元当作同粒度对比，得出网格更粗的结论。根因：忽略 GridMM 的边长随访问范围变化。修复：报告分辨率时同时给出边长区间与单元边长随步数曲线，比较前统一换算到同一物理边长。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>按 K = 12、H = W = 7、D = 768、float32 实算：每步网格特征数、t = 20 时记忆库容量、t = 20 时 float16 容量，并说明把精度换成 float16 的收益与风险。 <span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>I = 588；float32 每步 1.72 MiB，t = 20 为 34.45 MiB；float16 为 17.23 MiB。风险在相关性分数与坐标的数值稳定性，坐标建议保留 float32。</div></details>
+      </li>
+      <li>地图边长 20 m，N 取 8、14、20 时单元边长分别为多少？结合论文消融（SR 47.07、49.05、49.86；SPL 39.49、40.99、42.52）解释默认值取 14 的理由。 <span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>边长依次为 2.500、1.429、1.000 m。8 到 14 的 SR 增量为 +1.98，14 到 20 只有 +0.81，而 token 数从 196 涨到 400，交叉注意力键值成本近似翻倍；14 在收益与代价之间取平衡。</div></details>
+      </li>
+      <li>写一段代码，在单个单元上比较平均池化与指令相关性聚合；构造“1 个高相关特征加 599 个背景特征”的合成样例，输出两种聚合向量的余弦相似度，并解释结果对两类指令（含明确地标、仅含房间级描述）分别意味着什么。 <span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>平均池化会被背景特征主导，与高相关特征的余弦相似度接近零；相关性聚合在分数差距大时接近该特征本身。地标型指令受益明显，房间级描述因多个特征同等相关，两种方法差距缩小。</div></details>
+      </li>
+      <li>解释论文附录 D 缓存的三个张量分别是什么，并计算 t = 30 时无缓存与有缓存的相关性计算行数比值；说明缓存为什么不能跨 episode 使用。 <span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>缓存 ĝW<sub>1</sub>、W′W<sub>2</sub> 与 W<sup>E</sup>ĝ；比值 (t+1)/2 = 15.5。其中 W′W<sub>2</sub> 依赖指令，换 episode 后指令变化，缓存失效。</div></details>
+      </li>
+      <li>为动态分辨率设计一条更新规则：让单元边长始终落在 [0.8 m, 1.2 m]，写出 N 随边长变化的取整方式，分析它相对固定 N 的记忆与延迟影响，并设计一个消融实验比较固定 14×14、固定 20×20 与动态 N 三种配置，要求给出固定变量、评价指标与预期结论方向。 <span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>可取 N = round(L/1.0) 并夹在 [10, 20]；平方复杂度范围内单元数只随边长平方波动。消融固定骨干、数据与训练迭代，只改分辨率策略，报告 SR/SPL 与地图 token 数的曲线；预期动态 N 早期省算力、末期接近 20×20 精度，净效果取决于任务平均路径长度。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>GridMM 用全局动态网格承载历史：CLIP 网格特征按深度投影到统一坐标系，每步以智能体为中心重建 N×N 俯视地图，边长 L<sub>t</sub> 取历史特征相对坐标的最大绝对值。</li>
+      <li>单元内聚合先算特征与词元的相关性矩阵，对词元取最大、对特征做 softmax 再加权；该设计针对末段单元内特征数超过 600、平均约 45 的高度不均分布。</li>
+      <li>实算：每步 588 个网格特征、1.72 MiB；地图 14×14 为 588 KiB；记忆库 t = 15 为 25.84 MiB；缓存把相关性计算量按 (t+1)/2 倍压缩，t = 30 时为 15.5 倍。</li>
+      <li>结果：REVERIE val unseen 51.37 / 36.47（对 DUET +4.39 / +2.74）；R2R-CE val unseen 49 / 41（同一航点预测器下对 DUET +2 / +2）；R2R 上与 BEVBert 持平。</li>
+      <li>分辨率消融给出默认 14×14：8 到 14 收益大（SR +1.98），14 到 20 收益小（SR +0.81）而 token 数翻倍；地图 token 少于 200 是相对 BEVBert 度量图的成本优势。</li>
+      <li>下一讲把递归、拓扑、度量、网格四类记忆载体放进同一张对比表，用内存、延迟、精度三笔账与决策树收束第二篇的方法线（第 039 讲）。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch037.html">← 第 037 讲：BEVBert：度量+拓扑混合地图</a>
+    <a class="next" href="ch039.html">第 039 讲：记忆与地图范式横评 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.06 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:11.5px !important;letter-spacing:.06em !important;color:rgba(71,85,105,.45) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#7e8ba0 !important;font-size:11.5px !important;line-height:1.8 !important;text-align:center !important;padding:5px 12px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

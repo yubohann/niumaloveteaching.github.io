@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 067 讲｜局部度量地图与预训练 | 视觉语言导航课程 · VLN-100</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第四篇 · 规模、记忆与泛化方法论</span>
+    <span class="sep">/</span>
+    <span>第 067 讲</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第四篇 · 规模、记忆与泛化方法论</div>
+    <h1>第 067 讲｜局部度量地图与预训练</h1>
+    <p class="lead">第 037 讲把 BEVBert（An 等 2023，ICCV 2023，arXiv:2212.04385v2）放进混合地图对照，本讲只做一件事：把局部度量地图推到能写公式、能算误差、能设计消融的深度。21 × 21 单元、0.5 米边长的地图把 14 × 14 网格特征投影到以智能体为中心的 10.5 米空间，三层预训练目标把从零训练 60.24 SR 推到 74.88；误差算例显示，5 米处 2 度朝向噪声配 10% 深度误差、30 步历史下投影偏差约 2.18 个单元，这是默认只整合一阶历史的原因。</p>
+    <ul class="meta">
+      <li>主题：局部度量地图 / 网格投影 / 地图预训练 / 误差传播</li>
+      <li>关键公式：σ<sub>总</sub><sup>2</sup> ≈ (c/√12)<sup>2</sup> + (r·σ<sub>ψ</sub>·√t)<sup>2</sup> + (r·ε)<sup>2</sup>；可靠距离上界 r &lt; c/(2·δψ)</li>
+      <li>预计学时：70 分钟</li>
+      <li>前置讲：第 066 讲（记忆范式总览（承 039））</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>会算：投影量化误差（0.289 个单元）、单点方位与深度误差、随机游走累积误差与可靠距离上界；核对 κ 与地图尺寸消融。</li>
+      <li>会解释：局部度量图如何聚合不完整观察、消除重复与处理碰撞；极坐标位置编码与可导航嵌入各自的作用。</li>
+      <li>会实现：网格特征投影与平均池化、κ 阶历史整合与 node 到 cell 映射、HSAP 动态融合与 MSI 多标签损失三段代码。</li>
+      <li>会判断：地图尺寸、单元边长、历史阶数与深度来源四个设计变量的取舍，并说明各自的证据。</li>
+      <li>会设计：为新平台写地图预训练目标与误差预算表，明确可靠半径与降级路径。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>离散全景输入有两个结构性缺陷：单视角观察不完整，跨视角存在重复观察。BEVBert 论文的引例是「书柜对面的第二间卧室」：卧室与书柜在不同视角里各出现一次，模型无法判断眼前的两张图描述同一个物体还是两个实例。地图路线把观察投影到统一的俯视平面，重复在投影中自然合并，不完整被邻域补全；代价是引入位姿与深度两类噪声，误差还会随历史整合累积。</p>
+    <p>第 066 讲把度量图列为固定尺寸载体：21 × 21 单元、1.29 MiB 每样本、2 GiB 门槛下轻松通过；但固定尺寸不等于低成本，短期 transformer 计算量随地图边长近似平方增长（11 / 21 / 31 对应 4.5 / 15.2 / 32.7 GFLOPs）。第 037 讲讲了混合地图的结构与结果，本讲补三块：投影的几何推导、三层预训练目标的具体形式、以及误差如何决定可靠半径与历史阶数。这三块决定地图方案在真机与估计深度条件下的可用性。</p>
+    <p>本讲的产出是一张地图误差预算表、一张预训练目标消融表与一段投影代码，直接服务第 068 讲的全局拓扑与跨尺度推理：局部地图管短程推理，全局拓扑管长程规划，两者的分工边界由误差半径决定。训练与评测的协议细节（R2R-CE 低层 500 步、规划 15 步、val 集已知 8 条标注错误）在第 048 讲已建立，本讲引用时沿用。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p>本讲按「问题、地图构建、混合结构、预训练目标、误差传播、尺寸与计算、训练配置、失效模式」八步展开；数字以 arXiv:2212.04385v2 的表 1 至表 8 为准，误差算例由 Python 实算，属本讲推导口径。</p>
+
+    <h3>1. 地图构建：从 14 × 14 网格特征到 21 × 21 单元</h3>
+    <p>输入侧用 ViT-B/16-CLIP 提取两类特征：每个视角的图像级向量与 MLP 头之前的 14 × 14 网格特征；深度图下采样到同一尺度（14 × 14），位姿由仿真器提供（离散环境由导航图推导）。局部度量图以当前节点为中心，把 κ 阶以内已访问节点的网格特征按深度与位姿投影到地面，落在同一单元的多个特征做逐元素平均。</p>
+    <div class="formula">
+      q = (x<sub>t</sub> + r·cos φ, y<sub>t</sub> + r·sin φ)，(u, v) = floor((q − o<sub>t</sub>) / c + N/2)
+      <span class="note">(x<sub>t</sub>, y<sub>t</sub>) 为世界坐标中的落点，r 为水平距离，φ 为方位角，o<sub>t</sub> 为智能体位置，c 为单元边长 0.5 米，N = 21</span>
+    </div>
+    <table>
+      <tr><th>步骤</th><th>输入</th><th>操作</th><th>输出与参数</th></tr>
+      <tr><td>特征提取</td><td>224 × 224 单视角 RGB</td><td>ViT-B/16-CLIP 前向</td><td>图像向量与 14 × 14 网格特征</td></tr>
+      <tr><td>深度对齐</td><td>视角深度图</td><td>下采样</td><td>14 × 14 粗糙深度</td></tr>
+      <tr><td>邻域查询</td><td>拓扑图与当前节点</td><td>取 κ 阶内已访问节点</td><td>默认 κ = 1，含当前与前一节点</td></tr>
+      <tr><td>投影与池化</td><td>网格特征、深度、位姿</td><td>地面投影加逐元素平均</td><td>21 × 21 × 768 地图张量</td></tr>
+      <tr><td>单元嵌入</td><td>地图张量</td><td>叠加极坐标位置编码与可导航嵌入</td><td>p = [cos θ, sin θ, 归一化距离]</td></tr>
+      <tr><td>动作空间</td><td>拓扑图</td><td>node 到 cell 映射</td><td>局部空间为当前与相邻节点</td></tr>
+    </table>
+    <p>规模实算：单个全景 12 个视角、每视角 196 个网格特征，合计 2,352 个特征；κ = 1 时最多整合两个节点的 4,704 个特征，摊到 441 个单元平均 10.67 个特征每单元（上界口径，实际受遮挡与视场限制更少）。<strong>极坐标编码让同一几何位置在不同步获得相近表示，可导航嵌入把「单元属于局部动作空间」这一先验显式注入；两者共同承担跨步的几何一致性。</strong></p>
+
+    <h3>2. 混合结构：局部推理与全局规划的分工</h3>
+    <p>地图只覆盖局部视野，全局依赖由拓扑图承担：节点分已访问、当前与 ghost（可导航未探索）三类；ghost 节点由多个位置的观察累积表示；全局动作空间包含所有已观测节点，长距离动作选完后用 Dijkstra 在图上规划最短路径。把两侧单独使用与合用做对照（R2R val unseen，论文表 5），分工的必要性直接体现在数字上。</p>
+    <table>
+      <tr><th>地图变体</th><th>深度来源</th><th>NE</th><th>OSR</th><th>SR</th><th>SPL</th></tr>
+      <tr><td>只用拓扑</td><td>无</td><td>3.39</td><td>78.01</td><td>70.25</td><td>61.29</td></tr>
+      <tr><td>只用度量图</td><td>估计深度</td><td>3.91</td><td>70.35</td><td>60.64</td><td>52.17</td></tr>
+      <tr><td>只用度量图</td><td>真值深度</td><td>3.93</td><td>70.95</td><td>60.90</td><td>52.80</td></tr>
+      <tr><td>混合</td><td>估计深度</td><td>2.88</td><td>82.63</td><td>74.67</td><td>63.63</td></tr>
+      <tr><td>混合</td><td>真值深度</td><td>2.81</td><td>83.65</td><td>74.88</td><td>63.60</td></tr>
+    </table>
+    <p>读数三条。只用拓扑时轨迹短、规划强但缺局部几何（OSR 78.01，SR 70.25）；只用度量图时 OSR 掉到 70 档，长程探索与回退能力不足，论文解释为路线变长、无效探索增多；混合版本同时抬高 OSR 与 SPL。真值与估计深度的差异只有 0.21 SR（74.88 对 74.67），度量图在特征空间构建、深度仅用 14 × 14 粗糙值，这一设计对深度噪声不敏感。</p>
+
+    <h3>3. 地图预训练：三层目标</h3>
+    <p>预训练在离线的专家轨迹上构建混合地图，用三个目标学习地图表示，再在仿真器里在线微调。三层目标的分工是：语言建模学通用对齐，动作预测学决策相关表示，语义想象学补全未观察区域。</p>
+    <ul>
+      <li><strong>MLM（掩码语言建模，masked language modeling）</strong>：指令按 15% 概率掩码，拓扑与度量两路输出的词表示相加后预测被掩词，负对数似然损失。它提供跨模态基础对齐。</li>
+      <li><strong>HSAP（混合单步动作预测，hybrid single action prediction）</strong>：把局部动作单元经 cell 到 node 反变换对齐到全局动作空间，节点分数与单元分数按智能体状态动态融合。</li>
+      <li><strong>MSI（掩码语义想象，masked semantic imagination）</strong>：地图单元按 15% 概率掩码，用多标签分类预测 40 类语义（标签来自 Matterport3D），二值交叉熵损失；目标是补全未观察区域、降低决策不确定性。</li>
+    </ul>
+    <div class="formula">
+      s<sub>i</sub> = δ<sub>t</sub>·s<sub>i</sub><sup>G</sup> + (1 − δ<sub>t</sub>)·s<sub>i</sub><sup>M</sup>（i ∈ A<sup>G</sup> ∩ A<sup>G′</sup>），否则 s<sub>i</sub> = s<sub>i</sub><sup>G</sup>；δ<sub>t</sub> = σ(FFN([ñ<sub>0</sub>; m̃<sub>c,c</sub>]))
+      <span class="note">s<sup>G</sup> 为节点分数，s<sup>M</sup> 为转回全局空间的单元分数；ñ<sub>0</sub> 为 stop 节点表示，m̃<sub>c,c</sub> 为中心单元表示，两者共同决定门控系数</span>
+    </div>
+    <p>消融账（R2R val unseen，论文表 6）：从零训练 60.24 SR / 48.29 SPL；加 MLM 到 73.52 / 60.13；再加 HSAP 到 74.03 / 63.03（SPL +2.90，轨迹效率显著改善）；再加 MSI 到 74.88 / 63.60（SR +0.85、SPL +0.57）。<strong>增量最大的两项是 MLM 与 HSAP：前者说明地图表示需要大规模语言监督，后者说明表示要按决策目标塑形；MSI 提供的是对未观察区域的补全先验。</strong></p>
+
+    <h3>4. 误差传播：投影误差如何累积</h3>
+    <p>投影误差有四个来源：单元量化、方位角误差、深度相对误差与位姿漂移。量化误差在单元内均匀分布，均方根为 c/√12；方位角误差 δψ 把距离 r 处的落点沿切向平移 r·δψ；深度相对误差 ε 造成径向平移 r·ε；位姿漂移按随机游走近似，t 步后角度标准差约为每步标准差的 √t 倍。四者近似独立，合成误差取平方和：</p>
+    <div class="formula">
+      σ<sub>总</sub><sup>2</sup> ≈ (c/√12)<sup>2</sup> + (r·σ<sub>ψ</sub>·√t)<sup>2</sup> + (r·ε)<sup>2</sup>；可靠距离上界 r &lt; c / (2·δψ)
+      <span class="note">c = 0.5 米；σ<sub>ψ</sub> 为每步朝向噪声标准差；ε 为深度相对误差；要求单步切向误差不超过半个单元时取右式</span>
+    </div>
+    <p>数值算例（Python 实算，取 r = 5 米）：量化项 0.1443 米，折 0.289 个单元；方位误差 1 度 / 2 度 / 5 度分别给出 0.087 / 0.175 / 0.436 米，折 0.17 / 0.35 / 0.87 个单元；深度误差 5% / 10% / 20% 分别给出 0.25 / 0.50 / 1.00 米，折 0.50 / 1.00 / 2.00 个单元。可靠距离上界：朝向噪声 1 度时 14.32 米，2 度时 7.16 米，5 度时 2.86 米。累积漂移：每步 2 度、30 步后角度漂移 10.95 度，切向误差 0.956 米，折 1.91 个单元；与 10% 深度误差和量化项合成后总均方根 1.088 米，折 2.18 个单元。</p>
+    <table>
+      <tr><th>误差源</th><th>量级设定</th><th>5 米处位置误差</th><th>折合单元</th><th>缓解手段</th></tr>
+      <tr><td>单元量化</td><td>c = 0.5 米</td><td>0.144 米</td><td>0.289</td><td>减小单元边长（计算量上升）</td></tr>
+      <tr><td>方位误差（单步）</td><td>2 度</td><td>0.175 米</td><td>0.35</td><td>提高位姿精度、缩短可靠半径</td></tr>
+      <tr><td>深度相对误差</td><td>10%</td><td>0.500 米</td><td>1.00</td><td>特征空间投影、粗糙深度图</td></tr>
+      <tr><td>朝向漂移（30 步）</td><td>2 度每步随机游走</td><td>0.956 米</td><td>1.91</td><td>限制历史阶数 κ、重定位</td></tr>
+      <tr><td>合成</td><td>上四项平方和</td><td>1.088 米</td><td>2.18</td><td>误差预算表逐项验收</td></tr>
+    </table>
+    <p>这张表解释了三个设计。第一，可靠半径由朝向噪声决定：2 度噪声下超过 7.16 米的投影不再可靠，10.5 米窗口内只有内圈可信，外圈主要提供背景与房间轮廓。第二，历史整合的阶数要小：κ 从 1 增到 2 时（论文表 8），SR 从 74.88 升到 75.18（+0.30），SPL 从 63.60 降到 62.71（−0.89）；更久历史带来更多已漂移的投影，污染近场判断。第三，深度噪声影响有限：真值与估计深度在混合设置下只差 0.21 SR，因为投影发生在特征空间，深度分辨率为 14 × 14，粗糙深度已足够决定大致的落点区域。</p>
+
+    <h3>5. 尺寸与计算：覆盖半径比分辨率更关键</h3>
+    <p>论文表 7 给出四种地图配置的对照。单元数按 N<sup>2</sup> 增长，短期 transformer 计算量近似正比于单元数（边长平方）：单元数比 441 / 121 = 3.645 与 961 / 441 = 2.179，对应计算量比 15.2 / 4.5 = 3.378 与 32.7 / 15.2 = 2.151，两组比值接近。</p>
+    <table>
+      <tr><th>地图</th><th>单元边长</th><th>覆盖边长</th><th>计算量</th><th>SR</th><th>SPL</th></tr>
+      <tr><td>11 × 11</td><td>0.5 米</td><td>5.5 米</td><td>4.5 GFLOPs</td><td>73.27</td><td>63.07</td></tr>
+      <tr><td>11 × 11</td><td>1.0 米</td><td>11.0 米</td><td>4.5 GFLOPs</td><td>74.58</td><td>63.37</td></tr>
+      <tr><td>21 × 21</td><td>0.5 米</td><td>10.5 米</td><td>15.2 GFLOPs</td><td>74.88</td><td>63.60</td></tr>
+      <tr><td>31 × 31</td><td>0.5 米</td><td>15.5 米</td><td>32.7 GFLOPs</td><td>74.84</td><td>64.88</td></tr>
+    </table>
+    <p>关键对照是第二行与第三行：11 × 11 配 1.0 米单元以 4.5 GFLOPs 拿到 74.58 / 63.37，与 21 × 21 配 0.5 米单元的 74.88 / 63.60 只差 0.30 / 0.23。<strong>在同一覆盖半径下，粗糙单元几乎没有损失；把计算从 15.2 GFLOPs 降到 4.5 的代价可以接受。</strong>继续扩到 31 × 31 时 SR 略降 0.04，计算量却增到 2.15 倍，说明全局依赖已由拓扑承担，局部地图扩边界的边际收益消失；默认配置因此取 21 × 21、0.5 米。</p>
+
+    <h3>6. 训练与评测配置</h3>
+    <p>预训练在离线专家轨迹上以批 64 训练 10 万次迭代（4 张 A100，约 10 小时，共 640 万样本）；微调在仿真器里交替使用 teacher-forcing 与 student-forcing，批 16、4 万次迭代（约 20 小时，共 64 万样本）。两个编码器各 4 层、文本编码器 9 层、隐藏维度 768，用 LXMERT 预训练权重初始化（RxR 用 RoBERTa）。推理时在线构建混合地图，贪心选择分数最高的节点或 stop；选中非相邻节点时用 Dijkstra 规划最短路径；触发 stop 或达到步数上限时结束（R2R-CE 低层 500 步、规划 15 步，沿用第 048 讲口径）。</p>
+    <table>
+      <tr><th>数据集</th><th>val unseen</th><th>test unseen</th><th>协议说明</th></tr>
+      <tr><td>R2R</td><td>75 SR / 64 SPL</td><td>73 SR / 62 SPL</td><td>单次运行，贪心解码</td></tr>
+      <tr><td>R2R-CE</td><td>59 SR / 50 SPL</td><td>59 SR / 50 SPL</td><td>航点预测器加拓扑，val 集有 8 条已知标注错误</td></tr>
+      <tr><td>RxR</td><td>68.5 SR / 58.6 SDTW</td><td>64.4 SR / 54.2 SDTW</td><td>去除 Marky 合成指令时 val 为 64.1 SR</td></tr>
+      <tr><td>REVERIE</td><td>51.78 SR / 24.44 RGSPL</td><td>52.81 SR / 22.09 RGSPL</td><td>目标导向任务，val 与 test 存在分布差</td></tr>
+    </table>
+    <p>读数提醒：R2R-CE 行与 ETPNav 的 57 / 49 在同一航点预测器与迁移管线内可比（+2 SR）；RxR 行去掉合成指令后仍高于 HAMT，说明增益不能全部归给增广，预训练配方与地图结构的贡献需要分开记账；REVERIE 的 test 提升小于 val，论文归因于两个 split 的分布差。跨论文比较以 test 与同管线为优先。</p>
+
+    <h3>7. 适用边界与失效模式</h3>
+    <ul>
+      <li><strong>没有高度维度</strong>：地图为平面俯视，多楼层需要楼层标识与楼梯节点显式建模，论文把多楼层列为未解问题。</li>
+      <li><strong>可靠半径受限</strong>：2 度朝向噪声下可靠半径约 7.16 米，小于 10.5 米窗口；外圈单元用于背景推断，不可用于精确落点判断。</li>
+      <li><strong>历史整合受漂移约束</strong>：κ 增大带来的收益被污染抵消，默认取 1。</li>
+      <li><strong>位姿依赖</strong>：投影直接使用位姿；真机的位姿漂移若超过每步 2 度，误差预算需重算，可靠半径收缩。</li>
+      <li><strong>特征空间投影的对偶性</strong>：对深度噪声鲁棒，但地图单元停留在特征空间，无法直接用于精细避障，低层控制仍由独立控制器承担（第 042 讲）。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>本讲的工程交付物是地图误差预算表、预训练目标消融表与超参默认值表。设计决策按「先覆盖半径、后分辨率、再历史阶数」的顺序展开。</p>
+
+    <h3>地图误差预算表（deliverable）</h3>
+    <table>
+      <tr><th>条目</th><th>设定值</th><th>验收判据</th><th>超限处理</th></tr>
+      <tr><td>单元边长 c</td><td>0.5 米</td><td>量化误差低于 0.3 单元</td><td>降到 0.25 米（计算量升 4 倍）</td></tr>
+      <tr><td>覆盖边长 N·c</td><td>10.5 米</td><td>半边长 5.25 米处单步切向误差低于半个单元</td><td>改用 11 × 11 配 1.0 米单元或提高定位精度</td></tr>
+      <tr><td>朝向噪声</td><td>每步 2 度以内</td><td>30 步漂移低于 2 个单元</td><td>限制 κ、提高定位频率</td></tr>
+      <tr><td>深度相对误差</td><td>20% 以内</td><td>5 米处径向误差不超过 2 个单元</td><td>改用单目深度并做域内微调</td></tr>
+      <tr><td>历史阶数 κ</td><td>1</td><td>κ 增大时 SPL 不下降</td><td>回到 1，或对历史投影响应加权衰减</td></tr>
+    </table>
+
+    <h3>预训练目标消融表</h3>
+    <table>
+      <tr><th>目标组合</th><th>监督来源</th><th>R2R val unseen SR / SPL</th><th>增量</th></tr>
+      <tr><td>从零训练</td><td>无预训练</td><td>60.24 / 48.29</td><td>基线</td></tr>
+      <tr><td>加 MLM</td><td>指令掩码 15%</td><td>73.52 / 60.13</td><td>SR +13.28</td></tr>
+      <tr><td>加 HSAP</td><td>教师动作</td><td>74.03 / 63.03</td><td>SPL +2.90</td></tr>
+      <tr><td>加 MSI</td><td>40 类语义标签</td><td>74.88 / 63.60</td><td>SR +0.85、SPL +0.57</td></tr>
+    </table>
+
+    <h3>超参数与默认值</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>地图尺寸 / 单元边长</td><td>21 × 21 / 0.5 米</td><td>短程推理视野与精度</td><td>表 7：31 × 31 无增益，11 × 11 配 1.0 米是低算力替代</td></tr>
+      <tr><td>历史阶数 κ</td><td>1</td><td>整合近邻观察</td><td>表 8：κ = 1 使 SPL +1.23，κ = 2 时 SPL 回落</td></tr>
+      <tr><td>网格特征尺度</td><td>14 × 14</td><td>投影粒度与深度分辨率</td><td>论文配置；特征空间投影对深度噪声鲁棒</td></tr>
+      <tr><td>MLM 与 MSI 掩码率</td><td>15%</td><td>预训练任务难度</td><td>论文配置；MSI 期望掩码 66.15 个单元</td></tr>
+      <tr><td>语义类别数</td><td>40</td><td>MSI 多标签分类头</td><td>Matterport3D 语义标注类别</td></tr>
+      <tr><td>编码器层数</td><td>9 / 4 / 4</td><td>文本与两路地图编码器</td><td>论文配置，隐藏维度 768</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：先定覆盖半径，再定分辨率</span>
+      <p>预算有限时的顺序是：先按朝向噪声算可靠半径，据此确定覆盖边长（使半边长不超过可靠半径，2 度噪声下 5.25 米小于 7.16 米）；在覆盖边长固定后，单元边长取 0.5 米与 1.0 米两档做对照，用近距离指代类指令的成功率判断分辨率是否需要提高；最后调节历史阶数，判据是 SPL 不下降。判据来自表 7 与表 8 的两组证据：覆盖半径的收益远大于分辨率，历史只在近场有正贡献。</p>
+    </div>
+    <p>与相邻讲的分工：第 037 讲给出混合地图的结构与主结果；本讲补投影几何、预训练目标形式与误差传播；第 066 讲提供内存预算口径（1.29 MiB 每样本、批 64 时 82.69 MiB）；第 068 讲接过全局一侧，讨论拓扑抽象与跨尺度推理。三讲合起来构成「局部度量加全局拓扑」的完整方法学。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>三段代码：网格投影与平均池化、κ 阶历史整合与单元嵌入、HSAP 融合与 MSI 多标签损失。</p>
+
+    <p><strong>片段 1：网格特征投影与碰撞池化</strong></p>
+    <pre class="code"><code>import torch
+
+def project_view(grid, depth, pose, c=0.5, n=21):
+    """把单视角 14x14 网格特征投影到以智能体为中心的俯视网格。
+    grid: (14, 14, D)；depth: (14, 14)；pose: (x, y, psi)；返回 (n, n, D) 与计数。
+    """
+    h, w, d = grid.shape
+    _, cols = torch.meshgrid(torch.arange(h), torch.arange(w), indexing="ij")
+    # 以视场中心为参考的方位与俯仰近似；实际实现按相机内参展开
+    phi = (cols - (w - 1) / 2) / w * torch.pi / 2 + pose[2]
+    rng = depth  # 简化口径：水平距离取深度值
+    qx = pose[0] + rng * torch.cos(phi)
+    qy = pose[1] + rng * torch.sin(phi)
+    u = torch.floor((qx - pose[0]) / c + n / 2).long().clamp(0, n - 1)
+    v = torch.floor((qy - pose[1]) / c + n / 2).long().clamp(0, n - 1)
+    acc = torch.zeros(n * n, d)
+    cnt = torch.zeros(n * n, 1)
+    flat = (u * n + v).reshape(-1)
+    acc.index_add_(0, flat, grid.reshape(-1, d))     # 落点相同的特征累加
+    cnt.index_add_(0, flat, torch.ones(h * w, 1))
+    return acc / cnt.clamp(min=1), cnt                # 逐元素平均处理碰撞</code></pre>
+    <p>解读：<strong>（1）</strong>投影以当前节点为原点，u、v 由世界坐标相对位移除以单元边长得到，clamp 把视野外落点并到边界；<strong>（2）</strong>index_add_ 把落在同一单元的特征累加，再除以计数实现平均池化，计数向量可用于掩码空单元；<strong>（3）</strong>示例把水平距离简化为深度值，真实实现要按相机内参与俯仰角分解；无论是简化还是完整版本，误差预算都按本讲的四个来源逐项核算。</p>
+
+    <p><strong>片段 2：κ 阶历史整合与单元嵌入</strong></p>
+    <pre class="code"><code>def build_local_map(topology, current, kappa, project_fn):
+    """整合 κ 阶内已访问节点的投影，生成局部度量图。"""
+    nodes = topology.visited_within(current, kappa)   # 含当前节点，按阶数排序
+    maps, counts = [], []
+    for node in nodes:
+        g, c = project_fn(node.grid, node.depth, node.pose)
+        maps.append(g)
+        counts.append(c)
+    stack = torch.stack(maps)                          # (K, n, n, D)
+    cnt = torch.stack(counts).sum(0)
+    merged = stack.sum(0) / cnt.clamp(min=1)           # 跨节点再次平均
+    cnt_embed = (cnt &gt; 0).float()                      # 空单元掩码
+    return merged, cnt_embed
+
+def cell_embedding(merged, cnt_embed):
+    """叠加极坐标位置编码与可导航嵌入。"""
+    n = merged.shape[0]
+    idx = torch.arange(n) - (n - 1) / 2
+    yy, xx = torch.meshgrid(idx, idx, indexing="ij")
+    theta = torch.atan2(yy, xx)
+    dis = torch.sqrt(xx ** 2 + yy ** 2) / (n / 2)      # 归一化距离
+    pos = torch.stack([torch.cos(theta), torch.sin(theta), dis], -1)
+    return torch.cat([merged, pos, cnt_embed], -1)     # 拼接后送入短期 transformer</code></pre>
+    <p>解读：<strong>（1）</strong>历史节点按阶数 Q 查询，κ = 1 只整合当前与前一节点，与误差预算的结论一致；<strong>（2）</strong>跨节点平均与单元内平均共用同一套计数逻辑，落到同一单元的历史观察被稀释；<strong>（3）</strong>极坐标编码取相对中心的角度与归一化距离，可导航嵌入以「单元是否有投影」近似表达通行先验，真实实现中由局部动作空间显式标注。</p>
+
+    <p><strong>片段 3：HSAP 融合与 MSI 多标签损失</strong></p>
+    <pre class="code"><code>import torch.nn.functional as F
+
+def hsap_loss(node_score, cell_score, delta, target, global_ids):
+    """混合单步动作预测：两路分数按门控系数融合后做交叉熵。"""
+    fused = node_score.clone()
+    inter = global_ids                                  # 单元转回全局后的下标
+    fused[:, inter] = delta * node_score[:, inter] + (1 - delta) * cell_score
+    return F.cross_entropy(fused, target)               # 已访问节点在外部掩码
+
+def msi_loss(pred_logits, labels, mask_ratio=0.15):
+    """掩码语义想象：对被掩单元做 40 类多标签二值交叉熵。"""
+    b, n2, c = pred_logits.shape
+    keep = (torch.rand(b, n2, device=pred_logits.device) &lt; mask_ratio)
+    logits = pred_logits[keep]                          # 只监督被掩码的位置
+    target = labels[keep].float()                       # 每单元可含多个类别
+    bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
+    return bce.sum(-1).mean()                           # 先按类求和，再按单元平均</code></pre>
+    <p>解读：<strong>（1）</strong>门控系数 δ 由 stop 节点与中心单元表示共同生成，融合只发生在两路都覆盖的全局动作上，其余动作保留节点分数；<strong>（2）</strong>MSI 的掩码比例与 MLM 一致取 15%，监督只作用于被掩单元，未掩单元不产生梯度；<strong>（3）</strong>多标签设定下先对 40 类求和再按单元平均，避免类别数放大损失尺度；标签来自 Matterport3D 语义层，跨数据集迁移时要核对类别映射。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>把单元边长当覆盖范围</strong>：0.5 米与 21 两个数放在一起，误以为地图覆盖 21 米。根因是漏乘单元边长。修复：配置表同时写 N、c 与 N·c 三个值；扩尺寸前先按表 7 算计算量倍数。</li>
+      <li><strong>训练与评测的深度来源不一致且未标注</strong>：训练用真值、评测用估计，或反之。根因是协议脚注缺失。修复：统一来源并标注；若要混用，按论文口径做真值与估计的对照（混合设置差 0.21 SR），把差值写进误差预算。</li>
+      <li><strong>地图尺度取偶数</strong>：智能体落在四个单元的交界，极坐标编码失去唯一中心。根因是未遵守奇数尺度约定。修复：N 取 11 / 21 / 31 这类奇数，中心单元即智能体位置。</li>
+      <li><strong>历史阶数一味加大</strong>：以为历史越多越稳，SPL 却下降。根因是漂移投影混入近场（κ = 2 时 SPL −0.89）。修复：κ 默认取 1，增大前先跑 SPL 对照，必要时对历史投影做衰减加权。</li>
+      <li><strong>把预训练收益记到地图结构名下</strong>：从零训练 60.24 到 74.88 的增量主体来自三层预训练目标，地图结构本身的边际贡献要用「同预训练配方下只改载体」的对照来测。修复：结构消融与配方消融分表，报告时说明预训练数据与轮数。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>误差实算：取 r = 3 米、朝向噪声 2 度、深度相对误差 10%、单元边长 0.5 米。计算 (a) 量化项、切向项与径向项的数值；(b) 合成均方根误差与折合单元数；(c) 与正文 r = 5 米算例相比哪一项占比变化最大。 <span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>(a) 量化 0.144 米；切向 3 × 0.0349 = 0.105 米；径向 0.300 米。(b) 平方和开根 0.349 米，折 0.70 个单元。(c) 距离缩短使切向项按比例缩小，径向项同样缩小，量化项不变，占比上升。</div></details>
+      </li>
+      <li>改参数并预测：把地图从 21 × 21、0.5 米改为 15 × 15、0.7 米（覆盖边长保持 10.5 米）。预测 (a) 单元数与计算量相对 21 × 21 档的比值；(b) SR 与 SPL 的方向；(c) 一个可证伪的观测指标。 <span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>(a) 单元数 225 / 441 ≈ 0.51，计算量近似同比例降到约 7.8 GFLOPs。(b) 覆盖半径不变、分辨率略降，SR 接近或略低，SPL 接近。(c) 指标：小物体指代与「第二扇门」类空间关系指令的成功率，若明显下降说明 0.7 米单元开始损失细节。</div></details>
+      </li>
+      <li>推导与设计：已知朝向噪声每步 1 度、要求投影切向误差不超过半个单元。要求 (a) 推导可靠距离上界并给出数值；(b) 说明为什么历史整合会把该上界进一步压缩，写出含 √t 的表达式；(c) 设计一个把 κ 与可靠半径联动的地图参数选择流程。 <span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>(a) r &lt; c/(2δψ) = 0.5/(2 × 0.01745) = 14.32 米。(b) t 步历史的角度漂移约为 σ·√t，切向误差 r·σ·√t，仍要求不超过半个单元时上界收缩为 c/(2σ√t)，t = 30 时约 2.62 米。(c) 先测每步朝向噪声，再按 κ 与目标可靠半径解 r 的可行域；可行域过小时限制 κ 或提高定位频率。</div></details>
+      </li>
+      <li>消融设计：设计一组实验分离 MLM、HSAP、MSI 三个目标的贡献，要求 (a) 给出目标组合与训练预算的对照表；(b) 预测 SPL 变化最大的组合并说明依据；(c) 给出一个「目标冲突」的检验方法。 <span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>(a) 四行：无预训练、MLM、MLM + HSAP、三层全开；预算与数据固定。(b) MLM 加 HSAP 的 SPL 增量最大（+2.90），因为动作预测直接塑形决策相关表示。(c) 冲突检验：MSI 掩码率从 15% 提到 30% 后，若 SR 降而语义指标升，说明想象监督与导航目标在此数据上不完全同向。</div></details>
+      </li>
+      <li>完整方案：为一个无深度传感器、位姿噪声每步 3 度的真机平台写地图方案。要求 (a) 用单目深度估计替代深度传感器并写出误差预算表；(b) 给出地图尺寸、单元边长与历史阶数的选择及理由；(c) 设计验证可靠半径的实验；(d) 写出两个失效模式与降级路径。 <span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>(a) 深度相对误差按 20% 计，5 米处径向 1 米；量化 0.144 米；3 度朝向每步 0.262 米。(b) 3 度噪声下单步可靠半径 r &lt; 0.5/(2 × 0.0524) = 4.77 米，建议 15 × 15、0.7 米覆盖 10.5 米或 11 × 11、1.0 米；κ 取 1，30 步漂移 3 × √30 ≈ 16.4 度，历史投影仅作背景。(c) 在已知走廊放置标记，比较投影落点与真值随距离的偏差曲线，取偏差达到半单元的距离为可靠半径。(d) 失效一：单目深度在弱纹理处失效，降级为无度量拓扑加视觉位姿；失效二：位姿漂移超限，降级为缩短可靠半径并提高重定位频率。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>局部度量地图把 14 × 14 网格特征投影到 21 × 21 单元、0.5 米边长的俯视平面（覆盖 10.5 米），用平均池化处理碰撞，用极坐标位置编码与可导航嵌入保持几何一致性。</li>
+      <li>混合结构的分工有消融支撑：只用拓扑 70.25 / 61.29，只用度量 60.64 / 52.17，混合 74.67 / 63.63（均为 R2R val unseen、估计深度口径）。</li>
+      <li>预训练三层目标：MLM 把从零训练 60.24 SR 推到 73.52，HSAP 再补 2.90 SPL，MSI 再补 0.85 SR；增量主体属于预训练配方，不属于地图结构。</li>
+      <li>误差算例：量化 0.289 个单元；5 米处 2 度朝向误差折 0.35 个单元、10% 深度误差折 1.00 个单元；30 步随机游走漂移折 1.91 个单元，合成 2.18 个单元。可靠距离上界 r &lt; c/(2δψ)，2 度噪声下为 7.16 米。</li>
+      <li>κ 默认取 1：κ = 2 时 SR +0.30 但 SPL −0.89；覆盖半径比分辨率更关键，11 × 11 配 1.0 米与 21 × 21 配 0.5 米只差 0.30 SR，计算量降到 4.5 GFLOPs。</li>
+      <li>下一讲转到全局一侧：拓扑抽象层级、跨尺度注意力与大场景效率（第 068 讲），局部误差半径将作为局部与全局分工的输入条件。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch066.html">← 第 066 讲：记忆范式总览（承 039）</a>
+    <a class="next" href="ch068.html">第 068 讲：全局拓扑与跨尺度推理 →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.06 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:11.5px !important;letter-spacing:.06em !important;color:rgba(71,85,105,.45) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#7e8ba0 !important;font-size:11.5px !important;line-height:1.8 !important;text-align:center !important;padding:5px 12px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>

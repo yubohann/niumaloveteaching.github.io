@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 071 讲｜长程历史编码工程 | 视觉语言导航课程 · VLN-100</title>
+<link rel="stylesheet" href="../assets/style.css">
+<meta name="author" content="yubohann"><meta name="copyright" content="Copyright (c) yubohann · github.com/yubohann · 版权所有，禁止抓取与再分发"><meta name="robots" content="index, follow, noai, noimageai"></head>
+<body>
+<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>
+<div class="page">
+  <nav class="topnav">
+    <a href="../index.html">课程目录</a>
+    <span class="sep">/</span>
+    <span>第四篇 · 规模、记忆与泛化方法论</span>
+    <span class="sep">/</span>
+    <span>第 071 讲</span>
+  </nav>
+
+  <header class="lesson-head">
+    <div class="kicker">第四篇 · 规模、记忆与泛化方法论</div>
+    <h1>第 071 讲｜长程历史编码工程</h1>
+    <p class="lead">第 034 讲确立了层级历史编码的表示方案，本讲把它放进流式推理回路，按工程口径核算三层成本：每步重算全部历史视觉编码与只编码当前步相差 t 倍（t = 20 时为 720 次对 36 次视图编码）；层级方案的跨模态注意力矩阵为 3.54 MiB，全铺开方案为 118.07 MiB（批 8、12 头、半精度）；窗口与步长重采样对时序段有平方级收益，对跨模态段只有约 14% 的收益。最后由 R2R-Back 证据给出记忆深度的选择判据。</p>
+    <ul class="meta">
+      <li>主题：长程历史 / 流式推理 / 键值缓存 / 窗口与重采样 / 显存与延迟预算</li>
+      <li>关键公式：n(t) = L + t + K + 3；M<sub>attn</sub> = B·H·n²·b；M<sub>kv</sub> = t·B·N<sub>x</sub>·2·d·b</li>
+      <li>预计学时：60 分钟</li>
+      <li>前置讲：第 070 讲（地图预训练目标设计）与第 034 讲（层级 ViT 与长程历史）</li>
+    </ul>
+  </header>
+
+  <section class="sec" id="goals">
+    <h2>学习目标</h2>
+    <ul>
+      <li>会算：重算与缓存两种口径下的每步视图编码次数、注意力矩阵显存、键值缓存显存与令牌预算，能按硬件档位换算单步延迟。</li>
+      <li>会实现：带缓存的流式历史编码器、窗口加步长的重采样函数，以及一个把延迟与显存折进口预算的核算函数。</li>
+      <li>会判断：给定控制频率、显存上限与任务时程，选择全历史、定窗或压缩历史，并给出降级路径。</li>
+      <li>会验证：证明增量缓存与全量重算在数值上等价，写出可执行的等价性断言。</li>
+      <li>会诊断：缓存跨回合泄漏、训练与推理窗口不一致、池化丢失动作角、特征版本漂移四类工程问题。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="why">
+    <h2>背景与动机</h2>
+    <p>第 034 讲把历史从循环状态改为显式令牌序列，第 036 至 038 讲把记忆扩展到图与网格，第 070 讲讨论了地图类预训练目标。这些工作回答的是结构与监督问题，本讲回答运行问题：训练完成之后，每一步决策要在多长时间内算完，显存里同时存在多少份历史副本，窗口该开多长。</p>
+    <p>问题的紧迫性来自长时程任务。HAMT（Chen 等 2021，NeurIPS 2021，arXiv:2110.13309v2）在 R2R-Back 上的消融显示，val unseen 成功率从循环状态的 41.1 提升到层级历史的 56.5，端到端微调后为 57.2。作为对照，HAMT 在 R2R 上的历史编码消融中，层级历史相对循环状态的成功率为 54.4 对 52.2，差 2.2 个百分点，远小于回程任务的 15.4。回程任务要求智能体记住到达目标的路径，历史深度直接决定能力上限。论文附录给出的推理总时长（单卡 P100，val unseen 全部 2,349 条指令 104 秒，循环基线 69 秒）说明相对代价可控，绝对数字则高度依赖编码是否批处理与缓存，复现时应把它当作倍数证据，按本讲的核算口径自行测量。</p>
+    <p>本讲与第 072 讲分工：072 处理监督信号，本讲处理计算与存储。产出是一张历史策略对照表、一组预算公式与三段可嵌入训练代码的缓存实现。</p>
+  </section>
+
+  <section class="sec" id="theory">
+    <h2>核心原理</h2>
+    <p>本讲按「成本结构、决策序列显存、硬件档位、窗口与重采样、键值缓存、记忆深度、边界」七步展开。论文数字标注 HAMT（Chen 等 2021，NeurIPS 2021）与协议；其余数字为本讲实算，参数取批大小 B = 8、层数 N<sub>x</sub> = 4、头数 H = 12、隐藏维 d = 768、半精度每元素 2 字节，与第 034 讲口径一致。</p>
+
+    <h3>1. 流式历史的成本结构：三层开销与两种口径</h3>
+    <p>设第 t 步决策时历史有 t 个全景摘要。单步计算分成三段：第一段把当前全景的 36 张视图送入共享 ViT，第二段用全景 Transformer 聚合为摘要，第三段把历史摘要与当前观测、指令一起送入时序与跨模态 Transformer。第一、二段只依赖当前步的观测，历史摘要一旦算出就不随步数变化。</p>
+    <div class="formula">
+      C<sub>重算</sub>(t) = t·(C<sub>视图</sub> + C<sub>全景</sub>) + C<sub>时序</sub>(t) + C<sub>跨模态</sub>(t)
+      <span class="note">每个决策步重新编码全部历史；C<sub>视图</sub> 为单张视图的 ViT 前向，C<sub>全景</sub> 为该步 36 张视图的空间聚合</span>
+    </div>
+    <div class="formula">
+      C<sub>缓存</sub>(t) = C<sub>视图</sub> + C<sub>全景</sub> + C<sub>时序</sub>(t) + C<sub>跨模态</sub>(t)
+      <span class="note">历史摘要按回合缓存，单步只编码新到达的全景；单步节省 36·(t−1) 次视图编码，到第 t 步累计节省 36·t(t−1)/2 次</span>
+    </div>
+    <p>实算每步视图编码次数：t = 10 时重算 360 次、缓存 36 次，比值 10.00；t = 20 时 720 对 36，比值 20.00；t = 40 时 1,440 对 36，比值 40.00。基础 Transformer 部分两条口径相同，差别只在前两段。<strong>结论一：历史摘要的缓存是流式推理的第一优先级，跳过它则视图编码成本随步数线性放大，而它本身只需一次前向。</strong></p>
+
+    <h3>2. 决策序列的显存：令牌数与注意力矩阵</h3>
+    <p>跨模态融合的序列由三部分构成：指令 L 个词元加起始标记，历史 t 个摘要加历史标记，当前观测 K 张视图加停止标记。取 L = 80、K = 36，则层级方案长度与全铺开方案长度分别为：</p>
+    <div class="formula">
+      n(t) = L + t + K + 3 = t + 119；n<sub>铺开</sub>(t) = L + t·K + 3
+      <span class="note">3 为文本起始标记、历史起始标记与停止标记；全铺开方案把每步的 36 张视图全部 token 化后拼接</span>
+    </div>
+    <div class="formula">
+      M<sub>attn</sub>(n) = B·H·n²·b
+      <span class="note">单层自注意力矩阵的峰值显存；b 为每元素字节数，半精度取 2；四层时乘 4（若逐层释放则按单层峰值估）</span>
+    </div>
+    <p>实算（B = 8、H = 12、b = 2）：t = 10 时层级 n = 129、矩阵 3.047 MiB，铺开 n = 443、矩阵 35.934 MiB，比值 11.79；t = 20 时层级 3.538 MiB 对 118.068 MiB，比值 33.37；t = 40 时层级 4.629 MiB 对 424.718 MiB，比值 91.75。层级方案中历史令牌只占总长度的约 14%（t = 20 时 139 个中的 20 个），因此增加历史步数对融合段的影响接近线性。<strong>结论二：层级方案把融合段显存从随步数平方增长压到近似线性，长时程下两个方案的差距按 t 的倍数扩大。</strong></p>
+
+    <h3>3. 硬件档位与延迟预算：2 Hz 控制回路下的分水岭</h3>
+    <p>延迟预算由控制频率决定。取室内机器人常见的 2 Hz 决策频率，每步 500 毫秒。ViT-B/16 对 224×224 输入的前向约 17.6 G 次乘加，按不同加速器与利用率估算单张视图耗时，再乘 36 张得到单步视觉段成本。实算给出三档：A100 级（半精度峰值 312 TFLOPS、利用率 25%），单视图 0.45 毫秒，全景段 16.2 毫秒；V100 级（125 TFLOPS、25%），1.13 毫秒与 40.6 毫秒；P100 级（19 TFLOPS、20%），9.26 毫秒与 333.5 毫秒。</p>
+    <p>把视觉段与约 20 毫秒的融合段相加：t = 20 时缓存口径三档分别约 36、61、353 毫秒；重算口径分别约 345、831、6,689 毫秒。A100 档两口径都在预算内，V100 档重算超预算约 66%，P100 档缓存口径仍在上限之内，但余量只剩约三成，重算口径超过预算一个数量级。<strong>结论三：缓存在 P100 与 V100 档位下是 2 Hz 回路的可运行前提；是否进一步压缩历史，要在测量出瓶颈段之后决定。</strong>本讲的档位为估算，复现时以目标机器的实测 profile 替换单视图耗时即可复用同一套核算。</p>
+
+    <h3>4. 窗口与重采样：两段收益差异明显</h3>
+    <p>当延迟或显存仍不满足时，压缩历史按三种手段推进：定窗只保留最近 W 步；步长 s 对旧段抽稀；池化把相邻历史摘要合并。定义压缩后的保留令牌数 t<sub>压缩</sub> = ⌈t / s⌉。实算 t = 20：s = 1 时时序段评分数 400、融合段 n = 139 与 n² = 19,321；s = 2 时时序段 100、融合段 n = 129 与 16,641；s = 4 时时序段 25、融合段 n = 124 与 15,376。时序段降幅为 4 倍与 16 倍，融合段降幅只有 13.9% 与 20.4%。</p>
+    <p>这个差异来自两项在序列中的占比：层级历史只占融合序列的约七分之一，而时序 Transformer 的全部输入都是历史令牌。<strong>结论四：重采样的收益先落在时序段；若要压缩融合段，必须减少文本或观测令牌，或减少层数，靠压缩历史收效有限。</strong>池化实现要保留两类信息：该步动作的转镜角嵌入与步序嵌入。只平均视觉摘要会把“在哪一步转向”抹掉，而回程任务正需要这类信息。</p>
+
+    <h3>5. 键值缓存：增量解码的存储账</h3>
+    <p>Transformer 解码时每层缓存历史令牌的键与值，新令牌只追加、不修改旧项。缓存显存按下式核算：</p>
+    <div class="formula">
+      M<sub>kv</sub> = t·B·N<sub>x</sub>·2·d·b
+      <span class="note">t 为历史令牌数，B 为批大小，N<sub>x</sub> 为跨模态层数，系数 2 为键与值两份，d 为隐藏维，b 为每元素字节数</span>
+    </div>
+    <p>实算：t = 20 时 1.875 MiB，t = 40 时 3.750 MiB，显存压力可忽略。缓存的真正价值在计算：追加一个令牌只需对已有 t 个键做注意力，单步代价 O(t·d)，整条轨迹累计 O(T²·d)，免除的是第一、二段的重复前向。必要条件是旧摘要与当前模型参数同版本：微调 ViT 或全景 Transformer 后，旧缓存随即失效，必须清空重建。</p>
+
+    <h3>6. 记忆深度：全历史在什么任务上不可替代</h3>
+    <p>HAMT 的 R2R-Back 消融给出四行对照（val unseen 成功率）：循环状态 41.1，仅时序历史 45.1，层级历史 56.5，层级加端到端微调 57.2。相对循环基线，层级方案提升 15.4 个百分点，仅时序方案提升 4.0 个百分点。R2R-Back 的指令在末尾追加“走回起点”一类返回命令，正朝向视图记录的是出发时看到的画面，回程时朝向不同，仅时序历史取不到关键证据，这是它落后于层级方案的主因（HAMT 附录 D.5 的解释与数据）。</p>
+    <p>由此得到记忆深度的选择判据：任务的决策是否引用起点或早期地标。引用（R2R-Back、R4R 等长时程任务）则保留全历史或长窗口，W 取任务步数的分位数，只取均值不够；不引用（多为短指令定位任务）则 W 取 6 至 10 即可覆盖局部上下文。窗口过短与训练窗口不一致这两类错误在短程任务上不易暴露，在回程任务上直接掉点，评测时必须按任务分别设定与报告。</p>
+
+    <h3>7. 边界与失效模式</h3>
+    <ul>
+      <li><strong>缓存与反向传播不相容</strong>：缓存内容若是前向激活，训练阶段的梯度需要重算或记录，缓存只用于推理与无梯度 rollout，不能混入需要反向的路径。</li>
+      <li><strong>窗口改变导致分布漂移</strong>：训练时按全历史学习位置分布，推理时截断窗口，位置嵌入与注意力分布都会偏移，正确做法是训练时对窗口与步长做随机采样。</li>
+      <li><strong>池化改变时序粒度</strong>：平均两个相邻摘要后，动作角与时间间隔信息需要单独保留，否则指令里的“然后”“接着”失去对齐对象。</li>
+      <li><strong>缓存显存外的隐性成本</strong>：副本随批内最大步数对齐会浪费显存，变长批需要按实际长度打包，否则显存账比公式高数倍。</li>
+      <li><strong>测量口径不可比</strong>：论文总时长口径可能不含视觉特征预抽取、批处理与缓存差异，跨硬件比较只用相对倍数，绝对延迟以本讲口径复测。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="design">
+    <h2>实现思路与设计</h2>
+    <p>把工程决策落成三件套：历史策略对照表、参数表与核算脚本。全部参数以第 034 讲的模型规格为基座，数值为本讲实算。</p>
+
+    <h3>历史策略对照表</h3>
+    <table>
+      <tr><th>策略</th><th>单步视图编码</th><th>历史段计算</th><th>记忆深度</th><th>适用任务</th><th>主要风险</th></tr>
+      <tr><td>循环状态（对照）</td><td>36</td><td>常数</td><td>单向量</td><td>短程、低预算</td><td>早期记忆衰减</td></tr>
+      <tr><td>全历史重算</td><td>36t</td><td>O(t²)</td><td>完整</td><td>离线评测</td><td>延迟随步数线性放大</td></tr>
+      <tr><td>全历史加缓存</td><td>36</td><td>O(t²)</td><td>完整</td><td>长时程回程</td><td>缓存版本管理</td></tr>
+      <tr><td>定窗 W 加缓存</td><td>36</td><td>O(W²)</td><td>最近 W 步</td><td>短程、局部指代</td><td>窗口不足时掉点</td></tr>
+      <tr><td>窗口加步长 s</td><td>36</td><td>O((W/s)²)</td><td>最近 W 步稀疏</td><td>延迟受限平台</td><td>粒度损失、需训练配合</td></tr>
+      <tr><td>池化压缩</td><td>36</td><td>O(t²/s²)</td><td>全时程粗粒度</td><td>超长时程</td><td>动作角与时序细节丢失</td></tr>
+    </table>
+
+    <h3>参数表与取值依据</h3>
+    <table>
+      <tr><th>参数</th><th>默认值</th><th>作用</th><th>取值依据</th></tr>
+      <tr><td>窗口 W</td><td>6 至 10（短程）；全历史（回程）</td><td>保留的最近步数</td><td>R2R 平均步数附近取上分位；R2R-Back 需要起点记忆</td></tr>
+      <tr><td>步长 s</td><td>1 或 2</td><td>旧段抽稀比</td><td>s = 2 时时序段省 4 倍而融合段仅省约 14%</td></tr>
+      <tr><td>缓存精度</td><td>半精度</td><td>缓存字节数</td><td>3.75 MiB（t = 40）远低于显存上限，不需更低精度</td></tr>
+      <tr><td>批大小 B</td><td>8</td><td>吞吐与显存</td><td>与第 034 讲微调配置一致，注意力矩阵随 B 线性增长</td></tr>
+      <tr><td>控制周期</td><td>500 毫秒（2 Hz）</td><td>延迟预算</td><td>室内移动平台常见决策频率，可按平台上调或下调</td></tr>
+      <tr><td>随机窗训练</td><td>开</td><td>消除训练推理窗口错配</td><td>每个 batch 在 [W/2, T] 内采样窗口与步长</td></tr>
+    </table>
+    <div class="box key">
+      <span class="box-title">设计决策：先测瓶颈，再压历史</span>
+      <p>压缩的优先级由 profile 决定。若单步耗时主要落在 36 张视图的 ViT 段，先做缓存与批处理，压缩历史无收益；若落在时序 Transformer，按步长 s = 2 抽稀；若落在融合段，考虑减少层数或文本令牌，压缩历史收益有限。判据是各段耗时占比与目标控制周期之差，任何压缩改动都要在训练侧同步随机化窗口，保证策略没有见过固定截断。</p>
+    </div>
+    <p>与相邻讲的分工：034 讲推导层级编码结构与复杂度，本讲把同一结构放进流式回路做预算核算；066 至 070 讲处理记忆内容与预训练目标，本讲处理它们的运行代价。072 讲转向监督信号与消融读法，与本讲构成历史议题的工程与学习两面。</p>
+  </section>
+
+  <section class="sec" id="code">
+    <h2>关键代码与解读</h2>
+    <p>三段代码分别给出缓存式历史编码器、窗口与步长重采样、以及单步预算核算。接口以 PyTorch 风格示意，与公开实现的分层编码设计保持一致。</p>
+
+    <p><strong>片段 1：按回合缓存的历史编码器</strong></p>
+    <pre class="code"><code>class HistoryCache:
+    """缓存每步全景摘要；历史解码只追加，不重算旧步。"""
+    def __init__(self, dtype=torch.float16):
+        self.dtype = dtype
+        self.tokens = []               # 每步全景摘要 v_i^h
+        self.angles = []               # 每步动作转镜角 (theta, phi)
+
+    def reset(self):
+        # 回合边界必须清空，否则上一条轨迹的记忆泄漏进当前决策
+        self.tokens.clear()
+        self.angles.clear()
+
+    def append(self, pano_feature, action_angle):
+        # 全景摘要只对当前步计算一次，转半精度存放以省显存
+        self.tokens.append(pano_feature.to(self.dtype))
+        self.angles.append(action_angle)
+
+    def build(self, step_embed, angle_embed):
+        # 步序与角度嵌入在送入时序 Transformer 前拼上，缓存里只存原始摘要
+        seq = []
+        for i, (tok, ang) in enumerate(zip(self.tokens, self.angles)):
+            seq.append(tok + step_embed(i) + angle_embed(ang))
+        return torch.stack(seq, dim=1) if seq else None</code></pre>
+    <p>解读：<strong>（1）</strong>缓存键取「回合内步序」，回合开始时调用 reset，防止跨轨迹注意力；<strong>（2）</strong>只缓存全景摘要，36 张视图特征不进入缓存，缓存规模由 t 决定（t = 40 时约 3.75 MiB，按 4 层键值计），变为常数级；<strong>（3）</strong>角度与步序在解码时拼接，避免池化或重采样后丢失“何时转向”的信息；<strong>（4）</strong>该缓存仅用于推理与无梯度 rollout，训练时需要梯度穿过历史时改走重算路径。</p>
+
+    <p><strong>片段 2：窗口与步长重采样</strong></p>
+    <pre class="code"><code>def history_window(tokens, angles, window=10, stride=1):
+    """取最近 window 步并按 stride 抽稀旧段；总是保留最新一步。"""
+    start = max(0, len(tokens) - window)
+    idx = list(range(start, len(tokens), stride))   # 均匀抽稀
+    if not idx:
+        return [], [], []
+    if idx[-1] != len(tokens) - 1:                  # 最新一步不可丢
+        idx.append(len(tokens) - 1)
+    return [tokens[i] for i in idx], [angles[i] for i in idx], idx
+
+def token_budget(t, K=36, L=80, extra=3):
+    """返回融合序列长度与自注意力单层评分数，口径与第 034 讲一致。"""
+    n = L + t + K + extra          # 文本 + 历史 + 观测 + 三个特殊位
+    return n, n * n
+
+# 实算：t=20 时 n=139、评分 19321；抽稀到 10 后 n=129、评分 16641，
+# 时序段从 400 降到 100，融合段只降 13.9%，压缩前先确认瓶颈在哪一段</code></pre>
+    <p>解读：<strong>（1）</strong>窗口按时间尾部对齐，最新观测永远进入序列，它是动作决策的直接依据；<strong>（2）</strong>抽稀对旧段均匀降采样，保留步序嵌入后可恢复粗粒度时间轴；<strong>（3）</strong>token_budget 同时返回长度与评分上界，供上层断言与日志使用；<strong>（4）</strong>训练侧应复用同一函数并随机化 window 与 stride，使策略见过多种历史粒度。</p>
+
+    <p><strong>片段 3：单步预算核算</strong></p>
+    <pre class="code"><code>def decision_budget(t, window=None, stride=1, batch=8, heads=12, layers=4,
+                    dim=768, elem_bytes=2, view_ms=0.45, ms_per_token=0.2):
+    """核算单步延迟与峰值显存；view_ms 与 ms_per_token 为实测档位输入。"""
+    kept = min(t, window) if window else t
+    hist = -(-kept // stride)                      # 向上取整的历史令牌数
+    n = 80 + hist + 36 + 3                         # 融合序列长度
+    attn_bytes = batch * heads * n * n * elem_bytes
+    kv_bytes = hist * batch * layers * 2 * dim * elem_bytes
+    latency_ms = 36 * view_ms + ms_per_token * n   # 视觉段加线性近似段
+    ok = latency_ms &lt;= 500 and attn_bytes &lt; 512 * 2**20
+    return {"n": n, "attn_mib": attn_bytes / 2**20,
+            "kv_mib": kv_bytes / 2**20, "latency_ms": latency_ms, "ok": ok}
+
+# A100 档 view_ms=0.45：t=20 时延迟约 44 毫秒，满足 2 Hz 预算；
+# P100 档 view_ms=9.26：同配置约 361 毫秒，需要确认融合段实测再上线</code></pre>
+    <p>解读：<strong>（1）</strong>输入只有实测档位参数，公式固定，换机器只需替换 view_ms 与 ms_per_token，便于随实验归档；<strong>（2）</strong>断言同时检查延迟与注意力显存，任一越界返回失败，CI 中可直接作为训练配置的准入条件；<strong>（3）</strong>显存账按单层峰值估，若逐层保留全部注意力图则乘层数，实现时要与框架的实际保留策略对齐；<strong>（4）</strong>线性近似段只用于容量规划，正式延迟以实测为准。</p>
+  </section>
+
+  <section class="sec" id="pitfalls">
+    <h2>常见坑</h2>
+    <ul>
+      <li><strong>每步重算全部历史视觉编码</strong>：评测能跑但延迟随步数增长，P100 档 t = 20 时单步约 6.7 秒，控制回路无法闭合。根因是把编码当纯函数逐次调用，未利用摘要的步内可缓存性。修复：按本讲片段 1 缓存每步摘要，只编码新到达的全景。</li>
+      <li><strong>缓存未按回合清空</strong>：指标异常偏高，验证集上尤其明显。根因是缓冲区在 episode 之间复用，上一回合的观测成为当前决策的额外历史。修复：回合开始显式 reset；批处理时按 episode 掩码隔离，做成单元测试。</li>
+      <li><strong>训练全历史、推理截窗</strong>：离线指标正常，上线后长时程任务掉点。根因是策略只在固定长度历史上学过位置与注意力分布。修复：训练时随机采样窗口与步长，推理窗口落在训练分布内；对回程任务保持全历史。</li>
+      <li><strong>池化时丢掉动作角与步序</strong>：指令中的先后关系与转向描述失去对齐对象，回程任务掉点。根因是把摘要向量直接平均，未保留结构化字段。修复：角度与步序单独缓存并在解码时注入；池化只作用于视觉摘要部分。</li>
+      <li><strong>缓存与模型版本不一致</strong>：微调视觉编码器后沿用旧缓存，输出静默错误。根因是缓存未绑定权重版本。修复：缓存随「权重标识 + 特征配置」命名，版本变化即失效重建；评测脚本把版本写入日志。</li>
+    </ul>
+  </section>
+
+  <section class="sec" id="exercises">
+    <h2>练习与思考</h2>
+    <ol class="exlist">
+      <li>实算 t = 20、步长 s = 2 时的保留令牌数、时序段评分数、融合序列长度与评分数（L = 80、K = 36、特殊位 3 个），并解释两段降幅差异的来源。 <span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>保留 10 个令牌；时序段 10² = 100（原来 400，降 4 倍）；融合 n = 80 + 10 + 36 + 3 = 129，n² = 16,641（原来 19,321，降 13.9%）。融合段被文本 80 与观测 36 主导，历史只占约 7.8%，所以压缩历史的边际收益有限。</div></details>
+      </li>
+      <li>把记忆策略从「全历史加缓存」改为「定窗 W = 6 加缓存」，预测 R2R 与 R2R-Back 两个任务 val unseen 成功率的变化方向，给出依据与一个可证伪的观测指标。 <span class="lv">★</span>
+        <details class="hint"><summary>提示</summary><div>R2R 平均步数在 6 附近，窗口 6 覆盖大部分轨迹，短指令定位受影响小；R2R-Back 需要记住起点方向，最早的步数被截断后回程失去依据，预期掉点明显（论文消融中仅时序历史对层级历史在 R2R-Back 上低 11.4 个百分点，可作旁证）。可证伪指标：按轨迹步数分层统计 SR，若掉点集中在长轨迹层则支持该解释。</div></details>
+      </li>
+      <li>推导键值缓存显存公式 M<sub>kv</sub> = t·B·N<sub>x</sub>·2·d·b，并实算 t = 40、B = 8、N<sub>x</sub> = 4、d = 768、b = 2 的数值；再与同配置单层注意力矩阵（n = 159）比较，说明哪一项才是缓存的主要价值。 <span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>M<sub>kv</sub> = 40×8×4×2×768×2 字节 = 3,932,160 字节 = 3.750 MiB；单层注意力矩阵 = 8×12×159²×2 = 4,853,952 字节 = 4.629 MiB，同量级。缓存省下的是每步 t 次视图与全景编码（t = 40 时 1,440 次对 36 次），显存代价可忽略，计算代价才是关键。</div></details>
+      </li>
+      <li>等价性验证：设计一个可执行断言，证明「增量缓存路径」与「全量重算路径」在相同输入与相同权重的输出差异仅来自浮点累加次序，并给出容差与失败诊断方法。 <span class="lv">★★</span>
+        <details class="hint"><summary>提示</summary><div>对同一段 20 步输入分别走两条路径，比较最终动作 logits 与每步历史摘要；浮点误差随 t 增长，容差取 1e-3（半精度缓存时放宽到 1e-2），逐元素最大差超限即定位到第一个偏差步；注意两条路径必须使用同一 dtype 做对比，否则误差会被混合精度放大。</div></details>
+      </li>
+      <li>系统设计：目标平台决策频率 2 Hz、单卡显存 8 GiB、任务为 R2R-Back 长时程。给出完整历史策略（窗口、步长、缓存精度、批大小）、预算核算表、三个验收断言，以及当实测延迟超标时的优先级降级路径。 <span class="lv">★★★</span>
+        <details class="hint"><summary>提示</summary><div>从全历史加缓存起步：预算按本讲片段 3 的表头填写，先确认单步延迟与注意力显存；降级顺序为缓存与批处理、步长 s = 2、层数或文本令牌、最后才考虑截窗，因为回程任务对早期记忆敏感。验收断言示例：任一 episode 单步延迟不超过 500 毫秒；回合切换时缓存为空；两条路径输出差在容差内。</div></details>
+      </li>
+    </ol>
+  </section>
+
+  <section class="sec" id="summary">
+    <h2>小结</h2>
+    <ul class="summary">
+      <li>流式历史的成本分三段：视图编码、全景聚合、时序与跨模态融合；缓存历史摘要后，单步视图编码从 36t 降到 36（t = 20 时 720 对 36）。</li>
+      <li>层级方案把融合序列压到 n = t + 119（t = 20 时 139），单层注意力矩阵 3.538 MiB；全铺开方案 118.068 MiB，比值 33.37，步数越大差距越大。</li>
+      <li>按 A100、V100、P100 三档实算，t = 20 缓存口径单步约 36、61、353 毫秒；重算口径约 345、831、6,689 毫秒。P100 与 V100 档下缓存是 2 Hz 回路的前提。</li>
+      <li>窗口与步长重采样对时序段有平方级收益（s = 2 时 4 倍），对融合段只有 13.9%；压缩前先测量瓶颈段。</li>
+      <li>键值缓存显存为 t·B·N<sub>x</sub>·2·d·b，t = 40 时 3.750 MiB，代价可忽略；真正省下的是重复的视觉编码，且缓存必须绑定权重版本。</li>
+      <li>记忆深度按任务选择：回程类任务保留全历史（R2R-Back 上层级历史比循环状态高 15.4 个百分点），短程定位任务可用 6 至 10 步窗口；训练时随机化窗口以消除分布错配。</li>
+      <li>下一讲转入监督信号：在同样的历史结构上，TOM、GOM 与 APH 怎样设计顺序与动作目标，以及如何读它们的消融表（第 072 讲）。</li>
+    </ul>
+  </section>
+
+  <nav class="bottomnav">
+    <a class="prev" href="ch070.html">← 第 070 讲：地图预训练目标设计</a>
+    <a class="next" href="ch072.html">第 072 讲：顺序建模深化（TOM/GOM/APH） →</a>
+  </nav>
+</div>
+<style id="sgw-s">#sgw-w{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}body::before{content:"";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E");background-repeat:repeat;background-size:420px 260px;}#sgw-t{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}.ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}.ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}</style><div id="sgw-w" aria-hidden="true"></div><div id="sgw-t" aria-hidden="true"><a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;pointer-events:auto">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div><script id="sgw-j">(function(){var W="sgw-w",T="sgw-t",S="sgw-s";var IMG='url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27420%27%20height%3D%27260%27%3E%3Cg%20transform%3D%27translate%28210%2C130%29%20rotate%28-30%29%27%3E%3Ctext%20x%3D%27-215%27%20y%3D%278%27%20font-size%3D%2724%27%20font-weight%3D%27600%27%20fill%3D%27%23334155%27%20font-family%3D%27ui-monospace%2C%20SFMono-Regular%2C%20Consolas%2C%20monospace%27%20letter-spacing%3D%271%27%3Egithub.com%2Fyubohann%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E")';var SC="#"+W+"{position:fixed;inset:0;z-index:2147483646;pointer-events:none;opacity:0.06;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " body::before{content:\"\";position:fixed;inset:0;z-index:2147483645;pointer-events:none;opacity:0.04;background-image:"+IMG+";background-repeat:repeat;background-size:420px 260px;}"+ " #"+T+"{position:fixed;left:0;right:0;bottom:5px;z-index:2147483647;text-align:center;font-size:11.5px;letter-spacing:.06em;color:rgba(71,85,105,.45);font-weight:600;pointer-events:none;}"+ " .ybar{background:#0b1220;color:#7e8ba0;font-size:11.5px;line-height:1.8;text-align:center;padding:5px 12px;letter-spacing:.03em;position:relative;z-index:20;}"+ " .ybar a{color:#a5b4fc;font-weight:600;text-decoration:none;}";var D1="position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;opacity:0.06 !important;background-image:"+IMG+" !important;background-repeat:repeat !important;background-size:420px 260px !important;display:block !important;visibility:visible !important";var D2="position:fixed !important;left:0 !important;right:0 !important;bottom:5px !important;z-index:2147483647 !important;text-align:center !important;font-size:11.5px !important;letter-spacing:.06em !important;color:rgba(71,85,105,.45) !important;font-weight:600 !important;pointer-events:none !important;display:block !important;visibility:visible !important";var DY="background:#0b1220 !important;color:#7e8ba0 !important;font-size:11.5px !important;line-height:1.8 !important;text-align:center !important;padding:5px 12px !important;letter-spacing:.03em !important;position:relative !important;z-index:20 !important;display:block !important;visibility:visible !important";var HT='<a href="https://github.com/yubohann" target="_blank" rel="noopener" style="color:inherit !important;text-decoration:none !important;pointer-events:auto !important">github.com/yubohann</a> · 版权所有，禁止抓取与再分发';var YB='<div class="ybar">本课程体系由 <a href="https://github.com/yubohann" target="_blank" rel="noopener">yubohann</a> 制作与维护 · <a href="https://github.com/yubohann" target="_blank" rel="noopener">github.com/yubohann</a> · 版权所有，禁止抓取与再分发</div>';function fx(){try{var b=document.body;if(!b)return;var s=document.getElementById(S);if(!s){s=document.createElement("style");s.id=S;(document.head||document.documentElement).appendChild(s);s.textContent=SC;}else if(s.textContent.length<200){s.textContent=SC;}var w=document.getElementById(W);if(!w){w=document.createElement("div");w.id=W;w.setAttribute("aria-hidden","true");b.appendChild(w);}w.style.cssText=D1;var t=document.getElementById(T);if(!t){t=document.createElement("div");t.id=T;t.setAttribute("aria-hidden","true");b.appendChild(t);}t.style.cssText=D2;if(t.innerHTML!==HT)t.innerHTML=HT;var y=b.querySelector(".ybar");if(!y){b.insertAdjacentHTML("afterbegin",YB);}else{y.style.cssText=DY;if(y.innerHTML.indexOf("yubohann")<0)y.innerHTML=YB;}}catch(e){}}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",fx);}else{fx();}setInterval(fx,1200);})();</script></body>
+</html>
