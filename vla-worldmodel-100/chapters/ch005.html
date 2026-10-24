@@ -71,7 +71,7 @@
       L = Σ<sub>i</sub> [ (1/2σ<sub>i</sub><sup>2</sup>)·L<sub>i</sub> + log σ<sub>i</sub> ]
       <span class="note">实现时常令 s<sub>i</sub> = log σ<sub>i</sub><sup>2</sup>，损失写作 0.5·exp(-s<sub>i</sub>)·L<sub>i</sub> + 0.5·s<sub>i</sub></span>
     </div>
-    <p>两项的作用方向相反：第一项让损失大的任务获得小权重（精度项 exp(-s<sub>i</sub>) 随 s<sub>i</sub> 增大而减小），第二项 log σ<sub>i</sub> 惩罚权重过小（σ<sub>i</sub> 过大）。平衡点是 σ<sub>i</sub><sup>2</sup> ≈ L<sub>i</sub>，即权重自动校准到损失的当前量级，与手工归一化殊途同归，但过渡由梯度驱动且逐样本自适应。<strong>主要风险是坍缩：某一任务的 σ 持续增大、梯度贡献趋零，模型实质放弃该任务。</strong>防护手段是对 s<sub>i</sub> 设上界（如 log 20），并在监控中强制检查每路损失是否仍在下降。</p>
+    <p>两项的作用方向相反：第一项让损失大的任务获得小权重（精度项 exp(-s<sub>i</sub>) 随 s<sub>i</sub> 增大而减小），第二项 log σ<sub>i</sub> 惩罚权重过小（σ<sub>i</sub> 过大）。平衡点是 σ<sub>i</sub><sup>2</sup> ≈ L<sub>i</sub>，即权重自动校准到损失的当前量级，与手工归一化殊途同归，但过渡由梯度驱动且逐任务自适应。<strong>主要风险是坍缩：某一任务的 σ 持续增大、梯度贡献趋零，模型实质放弃该任务。</strong>防护手段是对 s<sub>i</sub> 设上界（如 log 20），并在监控中强制检查每路损失是否仍在下降。</p>
 
     <h3>4. 多步预测的时域折扣</h3>
     <p>世界模型在 m 步展开上求和时，远端步骤的监督信噪比更低：误差累积使 ô<sub>t+k</sub> 的梯度经过 k 次动力学 Jacobian 连乘，方差随之放大。时域折扣给远端项降权：</p>
@@ -127,7 +127,7 @@
       <tr><th>方案</th><th>参数量</th><th>优点</th><th>风险</th></tr>
       <tr><td>固定权重</td><td>0</td><td>简单可复现</td><td>跨阶段失衡，需手工搜索</td></tr>
       <tr><td>运行归一化</td><td>0</td><td>权重可解释、迁移性好</td><td>需维护滑动统计</td></tr>
-      <tr><td>不确定性加权</td><td>每路 1 个</td><td>逐样本自适应</td><td>坍缩风险，需上界防护</td></tr>
+      <tr><td>不确定性加权</td><td>每路 1 个</td><td>逐任务自适应</td><td>坍缩风险，需上界防护</td></tr>
       <tr><td>课程式调度</td><td>0</td><td>阶段性目标清晰</td><td>调度表依赖实验</td></tr>
     </table>
     <h3>关键参数起点</h3>
@@ -136,7 +136,7 @@
       <tr><td>初始权重 λ</td><td>0.5</td><td>策略损失相对权重</td><td>与 001 章一致，归一化后可迁移</td></tr>
       <tr><td>折扣系数 γ</td><td>0.9</td><td>预测时域折扣</td><td>m=8 时末步权重约 0.48</td></tr>
       <tr><td>EMA 动量</td><td>0.99</td><td>量级统计平滑度</td><td>覆盖约百步窗口，兼顾灵敏与稳定</td></tr>
-      <tr><td>s<sub>i</sub> 上界</td><td>log 20</td><td>防权重坍缩</td><td>等效最小权重约 1/20</td></tr>
+      <tr><td>s<sub>i</sub> 上界</td><td>log 20</td><td>防权重坍缩</td><td>等效最小权重约 1/40（2.5%）</td></tr>
       <tr><td>预测步长 m</td><td>8</td><td>多步监督长度</td><td>与全课程约定一致</td></tr>
       <tr><td>批量大小</td><td>128</td><td>梯度估计方差</td><td>损失量级统计的稳定前提</td></tr>
     </table>
@@ -160,8 +160,11 @@
 
     def __call__(self, name, loss):
         # 用指数滑动平均跟踪量级；detach 切断统计量与损失图的梯度联系
-        s = self.scale.get(name, 0.0)
-        s = self.momentum * s + (1 - self.momentum) * float(loss.detach())
+        s = self.scale.get(name)
+        if s is None:
+            s = float(loss.detach())          # 首次调用用当前损失初始化
+        else:
+            s = self.momentum * s + (1 - self.momentum) * float(loss.detach())
         self.scale[name] = s
         # 除以自身近期量级：所有项回到同一尺度，权重参数可跨任务迁移
         return loss / (s + self.eps)</code></pre>
@@ -198,16 +201,22 @@ class UncertaintyWeighting(nn.Module):
                   weighting, gamma=0.9):
     """多步预测按时域折扣求和，策略损失按有效步掩码加权。"""
     # 世界模型损失：预测越远信噪比越低，用 γ 的幂次压缩远期项权重
-    l_wm = frame_preds.new_zeros(())
+    l_wm = 0.0
+    wsum = 0.0
     for k, (pred, gt) in enumerate(zip(frame_preds, frames_gt), start=1):
-        l_wm = l_wm + (gamma ** (k - 1)) * nn.functional.l1_loss(pred, gt)
+        wk = gamma ** (k - 1)
+        step_mask = mask[:, k - 1]
+        l_wm = l_wm + wk * nn.functional.l1_loss(
+            pred, gt, reduction="none").mean(dim=(1, 2, 3)) * step_mask
+        wsum = wsum + wk * step_mask
+    l_wm = l_wm.sum() / wsum.sum().clamp(min=1.0)
     # 策略损失：变长 episode 的补齐步不贡献梯度，用掩码逐样本剔除
     per_step = nn.functional.huber_loss(act_pred, act_gt, reduction="none").mean(-1)
     l_pol = (per_step * mask).sum() / mask.sum().clamp(min=1.0)
     # 两路经归一化或自适应加权合成；分项字典贯穿整个训练日志
     total, parts = weighting({"world": l_wm, "policy": l_pol})
     return total, parts</code></pre>
-    <p>解读：<strong>（1）</strong>折扣系数以闭式幂次施加在每一项上，避免在外层对整体求和后再缩放，保证每步的贡献可单独审计。<strong>（2）</strong>掩码分母用 clamp 兜底，空掩码批次不产生除零异常。<strong>（3）</strong>weighting 既可以是固定权重字典，也可以传入片段 2 的模块，接口统一使消融实验只改一处配置。</p>
+    <p>解读：<strong>（1）</strong>折扣系数以闭式幂次施加在每一项上，避免在外层对整体求和后再缩放，保证每步的贡献可单独审计。<strong>（2）</strong>世界模型与策略两路都按掩码归一化，空掩码批次由 clamp 兜底。<strong>（3）</strong>weighting 既可以是固定权重字典，也可以传入片段 2 的模块，接口统一使消融实验只改一处配置。</p>
   </section>
 
   <section class="sec" id="pitfalls">
@@ -247,7 +256,7 @@ class UncertaintyWeighting(nn.Module):
     <ul class="summary">
       <li>两路损失在量纲、曲率、有效样本上不可比，固定权重需要被更系统的机制替代。</li>
       <li>运行归一化把权重变成可解释、可迁移的相对系数，统计量必须 detach 并保留梯度裁剪。</li>
-      <li>不确定性加权让权重逐样本自适应，理论平衡点为 σ<sup>2</sup> ≈ L，必须设置上界防坍缩。</li>
+      <li>不确定性加权让权重逐任务自适应，理论平衡点为 σ<sup>2</sup> ≈ L，必须设置上界防坍缩。</li>
       <li>多步预测按时域折扣加权，γ 默认 0.9，长程任务设 0.8 下界。</li>
       <li>掩码与分项监控是损失设计的组成部分，<strong>先监控、再自适应</strong>是工程纪律。</li>
       <li>下一章开始使用这套损失设施：用世界模型生成想象轨迹。</li>
